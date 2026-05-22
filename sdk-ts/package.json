@@ -1,6 +1,6 @@
 {
   "name": "ai-hist",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "TypeScript SDK for reading the ai-hist SQLite database (recent prompts, sessions, search).",
   "license": "MIT",
   "private": false,

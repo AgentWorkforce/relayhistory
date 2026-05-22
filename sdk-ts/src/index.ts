@@ -13,9 +13,10 @@
  */
 
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
-import { readFileSync, statSync } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { scanLocalSources, LOCAL_SOURCE_PATHS } from './jsonl-sources.js';
 
 export type Source = 'claude' | 'codex' | 'cursor' | 'relay';
 
@@ -75,28 +76,98 @@ function getSqlJs(): Promise<SqlJsStatic> {
   return _sqlPromise;
 }
 
+export interface OpenOptions {
+  /** Override the SQLite path (default: `$AI_HIST_DB` or `~/.local/share/ai-hist/ai-history.db`). */
+  dbPath?: string;
+  /**
+   * What to do when the SQLite DB is missing:
+   *   - `'jsonl'` (default): scan local Claude/Codex/Cursor history files
+   *     directly into an in-memory SQLite — works without the Python
+   *     `ai-hist sync` tool installed.
+   *   - `'error'`: throw with an install hint (legacy 0.1.x behavior).
+   */
+  fallback?: 'jsonl' | 'error';
+}
+
+export interface OpenSourceInfo {
+  /** `'sqlite'` when the on-disk DB was used, `'jsonl'` when the fallback scan was. */
+  kind: 'sqlite' | 'jsonl';
+  /** SQLite DB path or, in jsonl mode, the paths that were scanned. */
+  path: string;
+}
+
 /**
  * Open an `AiHist` reader. Async because sql.js initializes its WASM
- * runtime lazily. Each call reads the DB file from disk; the resulting
- * instance is a snapshot — to see new prompts written by the Python sync,
- * call `reload()` (or open a fresh instance).
+ * runtime lazily and the DB file is read asynchronously so the host
+ * process's event loop isn't blocked.
+ *
+ * Each call snapshots the data; to pick up later writes, call `reload()`
+ * (or open a fresh instance).
  */
-export async function openAiHist(opts: { dbPath?: string } = {}): Promise<AiHist> {
+export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   const dbPath = opts.dbPath ?? defaultDbPath();
-  // Surface a clearer error than sql.js's bare "file not found" when the
-  // user hasn't run the Python sync at least once yet.
-  try {
-    statSync(dbPath);
-  } catch {
+  const fallback = opts.fallback ?? 'jsonl';
+
+  const SQL = await getSqlJs();
+
+  // Fast path: SQLite written by `ai-hist sync`.
+  if (await pathExists(dbPath)) {
+    const fileBuffer = await readFile(dbPath);
+    const db = new SQL.Database(fileBuffer);
+    return new AiHist(db, { kind: 'sqlite', path: dbPath });
+  }
+
+  if (fallback === 'error') {
     throw new Error(
       `ai-hist database not found at ${dbPath}. Run \`ai-hist sync\` first ` +
-        `(see https://github.com/khaliqgant/ai-hist).`,
+        `(see https://github.com/AgentWorkforce/ai-hist).`,
     );
   }
-  const SQL = await getSqlJs();
-  const fileBuffer = readFileSync(dbPath);
-  const db = new SQL.Database(fileBuffer);
-  return new AiHist(db, dbPath);
+
+  // Fallback: scan local source files (Claude/Codex/Cursor) directly.
+  // No Python dependency; uses the same parsers documented in the Python
+  // CLI's source. Yields control to the event loop between sources so a
+  // large local history doesn't freeze the host.
+  const db = new SQL.Database();
+  db.run(`CREATE TABLE history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT,
+    project TEXT,
+    prompt TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    UNIQUE(source, timestamp_ms, prompt)
+  )`);
+  db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
+  db.run('CREATE INDEX idx_history_session ON history (session_id)');
+
+  // scanLocalSources is async with yields between sources so the event
+  // loop stays responsive while we scan many MB of JSONL.
+  const rows = await scanLocalSources();
+
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms) VALUES (?, ?, ?, ?, ?)',
+  );
+  try {
+    db.exec('BEGIN');
+    for (const row of rows) {
+      insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs]);
+    }
+    db.exec('COMMIT');
+  } finally {
+    insert.free();
+  }
+  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}`;
+  return new AiHist(db, { kind: 'jsonl', path: scannedPaths });
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 interface RawHistoryRow {
@@ -156,17 +227,26 @@ function runQuery<T>(db: Database, sql: string, params: unknown[]): T[] {
 
 export class AiHist {
   private readonly db: Database;
-  private readonly _dbPath: string;
+  private readonly _source: OpenSourceInfo;
   private closed = false;
 
-  /** @internal — use `openAiHist({ dbPath })` to construct. */
-  constructor(db: Database, dbPath: string) {
+  /** @internal — use `openAiHist(...)` to construct. */
+  constructor(db: Database, source: OpenSourceInfo) {
     this.db = db;
-    this._dbPath = dbPath;
+    this._source = source;
   }
 
+  /**
+   * Path the data came from. SQLite mode: the .db path. JSONL fallback
+   * mode: a comma-separated list of the scanned source paths.
+   */
   get dbPath(): string {
-    return this._dbPath;
+    return this._source.path;
+  }
+
+  /** Which data path was used: `'sqlite'` (Python tool) or `'jsonl'` (fallback). */
+  get sourceKind(): 'sqlite' | 'jsonl' {
+    return this._source.kind;
   }
 
   close(): void {
