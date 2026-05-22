@@ -27,6 +27,11 @@ SOURCES = {
     "codex": Path.home() / ".codex" / "history.jsonl",
 }
 
+CODEX_SESSIONS_DIRS = [
+    Path.home() / ".codex" / "sessions",
+    Path.home() / ".codex" / "archived_sessions",
+]
+
 CURSOR_ROOT = Path.home() / ".cursor" / "projects"
 
 # --- Schema ------------------------------------------------------------------
@@ -47,6 +52,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, prompt, project)
+    VALUES('delete', old.id, old.prompt, old.project);
+    INSERT INTO history_fts(rowid, prompt, project)
+    VALUES (new.id, new.prompt, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, prompt, project)
+    VALUES('delete', old.id, old.prompt, old.project);
 END;
 """
 
@@ -86,6 +101,153 @@ PARSERS = {
     "claude": parse_claude,
     "codex": parse_codex,
 }
+
+
+# --- Codex session enrichment ------------------------------------------------
+# Codex `history.jsonl` entries don't carry the working directory. The rollout
+# files under ~/.codex/sessions/**/rollout-*.jsonl do — their first line is a
+# `session_meta` event with `payload.id` and `payload.cwd`. We build a
+# session_id → cwd map at sync time and use it to populate `project`.
+
+def _read_codex_session_meta(path: Path):
+    """Read a codex rollout file's first line; return (session_id, cwd) or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    first = first.strip()
+    if not first:
+        return None
+    try:
+        obj = json.loads(first)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("type") != "session_meta":
+        return None
+    payload = obj.get("payload") or {}
+    session_id = payload.get("id")
+    cwd = payload.get("cwd")
+    if not session_id or not cwd:
+        return None
+    return session_id, cwd
+
+
+def build_codex_session_map(state: dict) -> dict:
+    """Walk codex rollout dirs; cache and return {session_id: cwd}.
+
+    Rollout files are write-once after the session_meta header — we key the
+    rollout cache by path and skip any file whose mtime hasn't changed since
+    we last scanned it.
+    """
+    seen = state.get("codex_rollouts", {})
+    cwds = state.get("codex_session_cwds", {})
+    scanned = 0
+    for root in CODEX_SESSIONS_DIRS:
+        if not root.exists():
+            continue
+        for rollout in root.rglob("rollout-*.jsonl"):
+            key = str(rollout)
+            try:
+                mtime = int(rollout.stat().st_mtime)
+            except OSError:
+                continue
+            if seen.get(key) == mtime:
+                continue
+            meta = _read_codex_session_meta(rollout)
+            seen[key] = mtime
+            scanned += 1
+            if meta:
+                sid, cwd = meta
+                cwds[sid] = cwd
+    state["codex_rollouts"] = seen
+    state["codex_session_cwds"] = cwds
+    if scanned:
+        print(f"  [codex] scanned {scanned:,} new rollout files; {len(cwds):,} sessions mapped")
+    return cwds
+
+
+def _backfill_codex_projects(conn: sqlite3.Connection, cwds: dict) -> int:
+    """Set project for codex rows with NULL project whose session_id is mapped."""
+    if not cwds:
+        return 0
+    sids = conn.execute(
+        "SELECT DISTINCT session_id FROM history "
+        "WHERE source='codex' AND project IS NULL AND session_id IS NOT NULL"
+    ).fetchall()
+    updated = 0
+    for (sid,) in sids:
+        cwd = cwds.get(sid)
+        if not cwd:
+            continue
+        cur = conn.execute(
+            "UPDATE history SET project = ? "
+            "WHERE source='codex' AND project IS NULL AND session_id = ?",
+            (cwd, sid),
+        )
+        updated += cur.rowcount
+    if updated:
+        conn.commit()
+    return updated
+
+
+def sync_codex(conn: sqlite3.Connection, state: dict):
+    """Import ~/.codex/history.jsonl, enriching `project` from rollout session_meta."""
+    path = SOURCES["codex"]
+    if not path.exists():
+        print(f"  [codex] not found: {path} (skipped)")
+        return
+
+    cwds = build_codex_session_map(state)
+
+    file_size = path.stat().st_size
+    offset = state.get("codex", 0)
+    inserted = 0
+    errors = 0
+
+    if offset < file_size:
+        print(f"  [codex] syncing {file_size - offset:,} new bytes...")
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = parse_codex(line)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    errors += 1
+                    continue
+                if row is None:
+                    continue
+                sid = row.get("session_id")
+                if sid and not row.get("project"):
+                    row["project"] = cwds.get(sid)
+                try:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO history "
+                        "(source, session_id, project, prompt, timestamp_ms) "
+                        "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                        row,
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+                except sqlite3.Error:
+                    errors += 1
+        conn.commit()
+        state["codex"] = file_size
+
+    backfilled = _backfill_codex_projects(conn, cwds)
+
+    if offset >= file_size and not backfilled:
+        print("  [codex] up to date")
+        return
+    parts = [f"+{inserted:,} rows"] if inserted or offset < file_size else []
+    if backfilled:
+        parts.append(f"backfilled {backfilled:,} project values")
+    if errors:
+        parts.append(f"{errors} errors")
+    print(f"  [codex] " + ", ".join(parts))
 
 
 def parse_cursor_line(line: str):
@@ -397,6 +559,9 @@ def cmd_sync(args=None):
     state = load_state()
 
     for name, path in SOURCES.items():
+        if name == "codex":
+            # Codex is handled by sync_codex with rollout-derived cwd enrichment.
+            continue
         if not path.exists():
             print(f"  [{name}] not found: {path} (skipped)")
             continue
@@ -440,6 +605,9 @@ def cmd_sync(args=None):
         conn.commit()
         state[name] = file_size
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    # Sync Codex history with cwd enrichment from rollout files
+    sync_codex(conn, state)
 
     # Sync Cursor agent transcripts (auto-discovered, no config needed)
     sync_cursor(conn, state)
