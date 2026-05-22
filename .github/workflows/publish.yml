@@ -1,0 +1,435 @@
+name: Publish ai-hist (TS SDK)
+
+# Single-package adaptation of workforce's publish workflow.
+# Publishes `ai-hist` from the `sdk-ts/` subdirectory to npm via
+# OIDC trusted-publisher flow (no NPM_TOKEN). The Python `ai-hist`
+# script in the repo root is independent and not published here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version bump type (ignored if custom_version is set)'
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prepatch
+          - preminor
+          - premajor
+          - prerelease
+          - none
+      custom_version:
+        description: 'Exact version (e.g. 0.1.0). Overrides version type when set.'
+        required: false
+      prerelease_id:
+        description: 'Prerelease identifier for pre* bumps (e.g. "next", "beta")'
+        required: false
+        default: next
+      tag:
+        description: 'npm dist-tag'
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - next
+          - beta
+          - alpha
+      dry_run:
+        description: 'Dry run (no actual publish, no version commit, no git tag)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      npm_name: ${{ steps.bump.outputs.npm_name }}
+    defaults:
+      run:
+        working-directory: sdk-ts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          CUSTOM='${{ github.event.inputs.custom_version }}'
+          BUMP='${{ github.event.inputs.version }}'
+          PREID='${{ github.event.inputs.prerelease_id }}'
+          if [ -n "$CUSTOM" ]; then
+            npm version "$CUSTOM" --no-git-tag-version --allow-same-version
+          elif [ "$BUMP" = "none" ]; then
+            : # keep existing version (useful for first publish or re-publish)
+          elif [[ "$BUMP" == pre* ]]; then
+            npm version "$BUMP" --no-git-tag-version --preid="$PREID"
+          else
+            npm version "$BUMP" --no-git-tag-version
+          fi
+          NEW=$(node -p "require('./package.json').version")
+          NPM_NAME=$(node -p "require('./package.json').name")
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "npm_name=$NPM_NAME" >> "$GITHUB_OUTPUT"
+
+      # Belt-and-suspenders: even if the local version looks right, the
+      # computed bump might still collide with an existing npm version (e.g.
+      # a one-off publish from another branch). Catch it before npm rejects
+      # with a less specific error.
+      - name: Verify new version is not yet published
+        run: |
+          set -euo pipefail
+          NPM_NAME='${{ steps.bump.outputs.npm_name }}'
+          VERSION='${{ steps.bump.outputs.version }}'
+          EXISTS=$(npm view "$NPM_NAME@$VERSION" version 2>/dev/null || true)
+          if [ -n "$EXISTS" ]; then
+            echo "::error title=Version already published::$NPM_NAME@$VERSION is already on npm. Pick a different bump type or set custom_version to a higher version."
+            exit 1
+          fi
+          echo "$NPM_NAME@$VERSION: unpublished — OK"
+
+      # CHANGELOG.md generation. If `## [Unreleased]` contains hand-curated
+      # content, promote it verbatim into the new `## [x.y.z] - DATE` block.
+      # Otherwise infer from git log since the last `sdk-ts-v*` tag. Skips
+      # silently for prereleases and first publishes with no prior tag.
+      - name: Generate changelog
+        if: ${{ github.event.inputs.version != 'none' || github.event.inputs.custom_version != '' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          NPM_NAME: ${{ steps.bump.outputs.npm_name }}
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%Y-%m-%d)
+          cat > /tmp/gen-changelog.mjs << 'GENEOF'
+          import { execSync } from 'node:child_process';
+          import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+
+          const newVersion = process.env.VERSION;
+          const npmName = process.env.NPM_NAME;
+          const today = process.env.TODAY;
+          const path = 'sdk-ts/CHANGELOG.md';
+
+          if (newVersion.includes('-')) {
+            console.log(`prerelease ${newVersion}: skipping changelog`);
+            process.exit(0);
+          }
+
+          const existing = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+          if (existing.includes(`## [${newVersion}]`)) {
+            console.log(`${path} already has ${newVersion}, skipping`);
+            process.exit(0);
+          }
+
+          const tagPrefix = 'sdk-ts-v';
+          const tags = execSync(`git tag -l '${tagPrefix}*' --sort=-v:refname`, { encoding: 'utf-8' })
+            .trim().split('\n').filter(Boolean);
+          const semverRe = new RegExp(`^${tagPrefix.replace(/\./g, '\\.')}\\d+\\.\\d+\\.\\d+$`);
+          const lastTag = tags.find((t) => semverRe.test(t));
+
+          // Extract any hand-curated [Unreleased] content.
+          function splitAtUnreleased(raw) {
+            const headerRe = /^## \[Unreleased\][^\n]*\n/m;
+            const headerMatch = raw.match(headerRe);
+            if (!headerMatch) return null;
+            const headerStart = headerMatch.index;
+            const afterHeader = headerStart + headerMatch[0].length;
+            const tail = raw.slice(afterHeader);
+            const nextMatch = tail.match(/^## \[/m);
+            const bodyEnd = nextMatch ? afterHeader + nextMatch.index : raw.length;
+            return {
+              before: raw.slice(0, headerStart),
+              headerLine: headerMatch[0],
+              body: raw.slice(afterHeader, bodyEnd),
+              after: raw.slice(bodyEnd),
+            };
+          }
+
+          const parts = splitAtUnreleased(existing);
+          const unreleasedBody = parts ? parts.body.trim() : '';
+
+          let newEntryBody = '';
+          if (unreleasedBody.length > 0) {
+            newEntryBody = unreleasedBody + '\n';
+            console.log(`promoting [Unreleased] content into ${newVersion}`);
+          } else if (!lastTag) {
+            console.log(`empty [Unreleased] and no prior stable tag, skipping`);
+            process.exit(0);
+          } else {
+            const log = execSync(
+              `git log ${lastTag}..HEAD --pretty=format:"%H|%s|%b%x00" --no-merges -- sdk-ts`,
+              { encoding: 'utf-8' }
+            ).trim();
+            if (!log) {
+              console.log(`empty [Unreleased] and no commits since ${lastTag}, skipping`);
+              process.exit(0);
+            }
+
+            const commits = log.split('\0').filter(Boolean).map((record) => {
+              const idx = record.indexOf('|');
+              const idx2 = record.indexOf('|', idx + 1);
+              return {
+                subject: record.slice(idx + 1, idx2).trim(),
+                body: record.slice(idx2 + 1).trim(),
+              };
+            });
+
+            const extractPR = (subject, body) => {
+              const m = (subject + ' ' + body).match(/#(\d+)/);
+              return m ? `(#${m[1]})` : '';
+            };
+            const formatTitle = (subject) => {
+              const cleaned = subject
+                .replace(/^(feat|fix|refactor|perf|chore|test|ci|docs|build|style)(\([^)]+\))?!?:\s*/i, '')
+                .replace(/\s*\(#\d+\)\s*$/, '');
+              return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+            };
+            const getType = (subject) => {
+              const m = subject.match(/^(feat|fix|refactor|perf|chore|test|ci|docs|build|style)(\([^)]+\))?(!)?:/i);
+              if (m) {
+                const type = m[1].toLowerCase();
+                if (m[3] === '!') return 'breaking';
+                if (type === 'feat') return 'feat';
+                if (type === 'fix') return 'fix';
+                if (type === 'refactor' || type === 'perf' || type === 'build') return 'changed';
+                if (type === 'test' || type === 'ci') return 'reliability';
+                if (type === 'docs') return 'docs';
+                if (type === 'chore') return 'deps';
+                return 'other';
+              }
+              const trimmed = subject.trim();
+              if (/^(add|implement|introduce|create|support|enable|expose|wire|allow)\b/i.test(trimmed)) return 'feat';
+              if (/^(fix|resolve|correct|patch|prevent|guard|stop)\b/i.test(trimmed)) return 'fix';
+              if (
+                /^(refactor|rename|extract|reorganize|restructure|simplify|move|split|consolidate|rewrite|replace)\b/i.test(trimmed) ||
+                /^(update|bump|upgrade|migrate|switch|tighten|loosen|tweak|adjust|improve|clarify|polish|cleanup|clean\s+up|harden)\b/i.test(trimmed)
+              ) return 'changed';
+              if (/^(test|cover|verify)\b/i.test(trimmed)) return 'reliability';
+              if (/^(document|docs?\b|readme)\b/i.test(trimmed)) return 'docs';
+              return 'other';
+            };
+
+            const cats = { breaking: [], feat: [], fix: [], changed: [], reliability: [], deps: [], docs: [], other: [] };
+            for (const c of commits) {
+              const type = getType(c.subject);
+              cats[type].push({ title: formatTitle(c.subject), pr: extractPR(c.subject, c.body) });
+            }
+
+            const sections = [
+              ['Breaking Changes', cats.breaking, true],
+              ['Added', cats.feat, true],
+              ['Fixed', cats.fix, false],
+              ['Changed', [...cats.changed, ...cats.other], false],
+              ['Reliability', cats.reliability, false],
+              ['Documentation', cats.docs, false],
+              ['Dependencies', cats.deps, false],
+            ];
+
+            const bodyLines = [];
+            let anyContent = false;
+            for (const [header, bucket, bold] of sections) {
+              if (bucket.length === 0) continue;
+              anyContent = true;
+              bodyLines.push(`### ${header}`, '');
+              for (const c of bucket) {
+                const title = bold ? `**${c.title}**` : c.title;
+                bodyLines.push(`- ${title}${c.pr ? ' ' + c.pr : ''}`);
+              }
+              bodyLines.push('');
+            }
+            if (!anyContent) {
+              bodyLines.push('### Released', '', `- v${newVersion}`, '');
+            }
+            newEntryBody = bodyLines.join('\n');
+            console.log(`inferred ${newVersion} body from git log`);
+          }
+
+          const newEntry = `## [${newVersion}] - ${today}\n\n${newEntryBody}`;
+
+          if (!existing) {
+            const header = `# Changelog\n\nAll notable changes to \`${npmName}\` will be documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),\nand this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n## [Unreleased]\n\n`;
+            writeFileSync(path, header + newEntry + '\n');
+          } else if (parts) {
+            const rebuilt =
+              parts.before +
+              parts.headerLine +
+              '\n' +
+              newEntry +
+              (parts.after.startsWith('\n') ? '' : '\n') +
+              parts.after;
+            writeFileSync(path, rebuilt);
+          } else {
+            const firstVer = existing.match(/\n## \[\d/);
+            if (firstVer && firstVer.index !== undefined) {
+              writeFileSync(
+                path,
+                existing.slice(0, firstVer.index + 1) + newEntry + '\n' + existing.slice(firstVer.index + 1),
+              );
+            } else {
+              writeFileSync(path, existing.trimEnd() + '\n\n' + newEntry + '\n');
+            }
+          }
+          console.log(`${path} updated with ${newVersion}`);
+          GENEOF
+
+          TODAY="$TODAY" VERSION="$VERSION" NPM_NAME="$NPM_NAME" node /tmp/gen-changelog.mjs
+
+      - name: Commit version bump
+        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sdk-ts/package.json sdk-ts/CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No version changes to commit."
+          else
+            git commit -m "chore(release): ${{ steps.bump.outputs.npm_name }}@${{ steps.bump.outputs.version }}"
+          fi
+
+      # npm >= 11.5.1 is required for the OIDC trusted-publisher flow.
+      - name: Install latest npm
+        run: npm install -g npm@latest
+
+      # Authentication note: this workflow does NOT use an NPM_TOKEN. It relies
+      # on npm's OIDC trusted-publisher flow — the `id-token: write` permission
+      # above lets `npm publish --provenance` exchange the GitHub workflow's
+      # OIDC identity for a short-lived publish token. The package must be
+      # registered as a trusted publisher on npmjs.com under this
+      # repo/workflow path for the first publish.
+      - name: Publish to npm
+        run: |
+          set -euo pipefail
+          FLAGS="--access public --tag ${{ github.event.inputs.tag }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS+=" --dry-run"
+          else
+            FLAGS+=" --provenance"
+          fi
+          echo "==> npm publish $FLAGS"
+          npm publish $FLAGS
+
+      # Annotated tag (-a) so `git push --follow-tags` actually pushes it.
+      - name: Tag + push
+        if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          git tag -a "sdk-ts-v${{ steps.bump.outputs.version }}" -m "${{ steps.bump.outputs.npm_name }}@${{ steps.bump.outputs.version }}"
+          git push origin HEAD --follow-tags
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "- \`${{ steps.bump.outputs.npm_name }}@${{ steps.bump.outputs.version }}\`"
+            echo "- **dist-tag**: \`${{ github.event.inputs.tag }}\`"
+            echo "- **dry run**: \`${{ github.event.inputs.dry_run }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One GitHub Release per publish run. The release body inlines the
+  # CHANGELOG block for this version.
+  create-release:
+    name: Create GitHub Release
+    needs: publish
+    if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve canonical release
+        id: release
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.publish.outputs.version }}'
+          # Fall back to reading sdk-ts/package.json on the just-pushed HEAD
+          # if the publish job's output is empty (e.g. version=none re-runs).
+          if [ -z "$VERSION" ]; then
+            echo "::error::publish job did not report a version"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=sdk-ts-v$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          NPM_NAME: ${{ needs.publish.outputs.npm_name }}
+        run: |
+          cat > /tmp/build-release-notes.mjs << 'GENEOF'
+          import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+
+          const version = process.env.VERSION;
+          const npmName = process.env.NPM_NAME;
+          const path = 'sdk-ts/CHANGELOG.md';
+
+          function escapeRegExp(value) {
+            return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          }
+          function extractChangelogBody(raw, ver) {
+            const headerRe = new RegExp(`^## \\[${escapeRegExp(ver)}\\][^\\n]*\\n`, 'm');
+            const header = raw.match(headerRe);
+            if (!header || header.index === undefined) return '';
+            const start = header.index + header[0].length;
+            const tail = raw.slice(start);
+            const next = tail.match(/^## \[/m);
+            const end = next && next.index !== undefined ? start + next.index : raw.length;
+            return raw.slice(start, end).trim();
+          }
+
+          const notes = existsSync(path)
+            ? extractChangelogBody(readFileSync(path, 'utf8'), version)
+            : '';
+          const body = notes.length > 0
+            ? `## Release Notes\n\n${notes}\n`
+            : `## Release Notes\n\n_No changelog entries were generated for this release._\n`;
+          writeFileSync('/tmp/release-notes.md', body);
+          GENEOF
+          node /tmp/build-release-notes.mjs
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: ${{ needs.publish.outputs.npm_name }}@${{ steps.release.outputs.version }}
+          body_path: /tmp/release-notes.md
+          prerelease: ${{ steps.release.outputs.prerelease }}
