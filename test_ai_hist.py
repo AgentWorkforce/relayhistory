@@ -1609,3 +1609,229 @@ class TestSyncCursor:
         captured = capsys.readouterr()
         assert "cursor-agent --resume=sess-x" in captured.out
         assert "cd " not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Export / Import tests
+# ---------------------------------------------------------------------------
+
+class TestCmdExport:
+    def test_export_jsonl_to_stdout(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("hello world", 1700000001000, "/proj", "sess1"),
+            make_claude_entry("fix the bug", 1700000002000, "/proj", "sess1"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(output=None, format="jsonl", source=None, project=None, since=None)
+        ai_hist.cmd_export(args)
+        captured = capsys.readouterr()
+        lines = [l for l in captured.out.strip().splitlines() if l]
+        assert len(lines) == 2
+        row = json.loads(lines[0])
+        assert row["source"] == "claude"
+        assert row["prompt"] == "hello world"
+        assert row["session_id"] == "sess1"
+        assert "timestamp_ms" in row
+        assert "prompt_hash" in row
+
+    def test_export_jsonl_to_file(self, tmp_env, tmp_path, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("export me", 1700000001000, "/proj", "s1"),
+        ])
+        capsys.readouterr()
+        out_file = str(tmp_path / "out.jsonl")
+        args = SimpleNamespace(output=out_file, format="jsonl", source=None, project=None, since=None)
+        ai_hist.cmd_export(args)
+        rows = [json.loads(l) for l in Path(out_file).read_text().splitlines() if l]
+        assert len(rows) == 1
+        assert rows[0]["prompt"] == "export me"
+
+    def test_export_jsonl_gz(self, tmp_env, tmp_path, capsys):
+        import gzip
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("compressed", 1700000001000, "/proj", "s1"),
+        ])
+        capsys.readouterr()
+        out_file = str(tmp_path / "out.jsonl.gz")
+        args = SimpleNamespace(output=out_file, format="jsonl", source=None, project=None, since=None)
+        ai_hist.cmd_export(args)
+        with gzip.open(out_file, "rt", encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        assert len(rows) == 1
+        assert rows[0]["prompt"] == "compressed"
+
+    def test_export_sqlite(self, tmp_env, tmp_path, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("sqlite export", 1700000001000, "/proj", "s1"),
+        ])
+        capsys.readouterr()
+        out_file = str(tmp_path / "export.db")
+        args = SimpleNamespace(output=out_file, format="sqlite", source=None, project=None, since=None)
+        ai_hist.cmd_export(args)
+        captured = capsys.readouterr()
+        assert "1" in captured.out
+        conn = sqlite3.connect(out_file)
+        rows = conn.execute("SELECT prompt FROM history").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "sqlite export"
+
+    def test_export_filter_by_source(self, tmp_env, capsys):
+        seed_db(tmp_env,
+            claude_lines=[make_claude_entry("claude prompt", 1700000001000)],
+            codex_lines=[make_codex_entry("codex prompt", 1700000001, "cs1")],
+        )
+        capsys.readouterr()
+        args = SimpleNamespace(output=None, format="jsonl", source="claude", project=None, since=None)
+        ai_hist.cmd_export(args)
+        captured = capsys.readouterr()
+        rows = [json.loads(l) for l in captured.out.strip().splitlines() if l]
+        assert all(r["source"] == "claude" for r in rows)
+        assert len(rows) == 1
+
+    def test_export_filter_by_since(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("old entry", 1000000000000, "/p"),   # 2001
+            make_claude_entry("new entry", 1700000000000, "/p"),   # 2023
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(output=None, format="jsonl", source=None, project=None, since="2020-01-01")
+        ai_hist.cmd_export(args)
+        captured = capsys.readouterr()
+        rows = [json.loads(l) for l in captured.out.strip().splitlines() if l]
+        assert len(rows) == 1
+        assert rows[0]["prompt"] == "new entry"
+
+    def test_export_no_db(self, tmp_env, capsys):
+        # Remove the DB
+        if tmp_env.db_path.exists():
+            tmp_env.db_path.unlink()
+        args = SimpleNamespace(output=None, format="jsonl", source=None, project=None, since=None)
+        with pytest.raises(SystemExit) as exc_info:
+            ai_hist.cmd_export(args)
+        assert exc_info.value.code == 1
+
+
+class TestCmdImport:
+    def test_import_jsonl(self, tmp_env, tmp_path, capsys):
+        # Write a JSONL export file
+        export_file = tmp_path / "import.jsonl"
+        rows = [
+            {"source": "claude", "session_id": "s1", "project": "/proj",
+             "prompt": "imported prompt", "prompt_hash": "abc123", "timestamp_ms": 1700000001000},
+        ]
+        export_file.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        capsys.readouterr()
+        args = SimpleNamespace(file=str(export_file), dry_run=False)
+        ai_hist.cmd_import(args)
+        captured = capsys.readouterr()
+        assert "+1" in captured.out
+        # Verify it's in the DB
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        found = conn.execute("SELECT prompt FROM history WHERE prompt = 'imported prompt'").fetchone()
+        conn.close()
+        assert found is not None
+
+    def test_import_dedup(self, tmp_env, tmp_path, capsys):
+        export_file = tmp_path / "import.jsonl"
+        row = {"source": "claude", "session_id": "s1", "project": "/proj",
+               "prompt": "dedup me", "prompt_hash": "abc", "timestamp_ms": 1700000001000}
+        export_file.write_text(json.dumps(row) + "\n")
+        args = SimpleNamespace(file=str(export_file), dry_run=False)
+        # Import twice
+        capsys.readouterr()
+        ai_hist.cmd_import(args)
+        capsys.readouterr()
+        ai_hist.cmd_import(args)
+        captured = capsys.readouterr()
+        assert "+0" in captured.out or "already existed" in captured.out
+
+    def test_import_sqlite(self, tmp_env, tmp_path, capsys):
+        # Create a source SQLite DB with entries
+        src_db = str(tmp_path / "src.db")
+        conn = sqlite3.connect(src_db)
+        ai_hist.init_db(conn)
+        conn.execute(
+            "INSERT INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+            "VALUES ('codex', 'cs1', '/myproj', 'from sqlite import', 'hash1', 1700000001000)"
+        )
+        conn.commit()
+        conn.close()
+        capsys.readouterr()
+        args = SimpleNamespace(file=src_db, dry_run=False)
+        ai_hist.cmd_import(args)
+        captured = capsys.readouterr()
+        assert "+1" in captured.out
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        found = conn.execute("SELECT prompt FROM history WHERE prompt = 'from sqlite import'").fetchone()
+        conn.close()
+        assert found is not None
+
+    def test_import_dry_run(self, tmp_env, tmp_path, capsys):
+        export_file = tmp_path / "dry.jsonl"
+        row = {"source": "claude", "session_id": "s1", "project": "/p",
+               "prompt": "dry run prompt", "prompt_hash": "x", "timestamp_ms": 1700000001000}
+        export_file.write_text(json.dumps(row) + "\n")
+        capsys.readouterr()
+        args = SimpleNamespace(file=str(export_file), dry_run=True)
+        ai_hist.cmd_import(args)
+        captured = capsys.readouterr()
+        assert "dry-run" in captured.out
+        # Nothing written — DB should not have been created
+        assert not tmp_env.db_path.exists()
+
+    def test_import_jsonl_gz(self, tmp_env, tmp_path, capsys):
+        import gzip
+        export_file = str(tmp_path / "import.jsonl.gz")
+        row = {"source": "cursor", "session_id": "cs1", "project": "/p",
+               "prompt": "gzip import", "prompt_hash": "y", "timestamp_ms": 1700000001000}
+        with gzip.open(export_file, "wt", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        capsys.readouterr()
+        args = SimpleNamespace(file=export_file, dry_run=False)
+        ai_hist.cmd_import(args)
+        captured = capsys.readouterr()
+        assert "+1" in captured.out
+
+    def test_import_missing_prompt_hash_backfilled(self, tmp_env, tmp_path, capsys):
+        # Rows without prompt_hash (older export format) should still import
+        export_file = tmp_path / "old.jsonl"
+        row = {"source": "claude", "session_id": "s1", "project": "/p",
+               "prompt": "no hash row", "timestamp_ms": 1700000001000}
+        export_file.write_text(json.dumps(row) + "\n")
+        capsys.readouterr()
+        args = SimpleNamespace(file=str(export_file), dry_run=False)
+        ai_hist.cmd_import(args)
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        found = conn.execute(
+            "SELECT prompt_hash FROM history WHERE prompt = 'no hash row'"
+        ).fetchone()
+        conn.close()
+        assert found is not None
+        assert found[0] is not None  # hash was backfilled
+
+    def test_roundtrip_jsonl(self, tmp_env, tmp_path, capsys):
+        """Export then import into a fresh DB produces identical entries."""
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("roundtrip test", 1700000001000, "/proj", "sess-rt"),
+        ])
+        export_file = str(tmp_path / "rt.jsonl")
+        capsys.readouterr()
+        ai_hist.cmd_export(SimpleNamespace(
+            output=export_file, format="jsonl", source=None, project=None, since=None
+        ))
+        # Import into a fresh DB
+        fresh_db = str(tmp_path / "fresh.db")
+        monkeypatch_db = patch.object(ai_hist, "DB_PATH", Path(fresh_db))
+        with monkeypatch_db:
+            capsys.readouterr()
+            ai_hist.cmd_import(SimpleNamespace(file=export_file, dry_run=False))
+            captured = capsys.readouterr()
+            assert "+1" in captured.out
+            conn = sqlite3.connect(fresh_db)
+            row = conn.execute("SELECT source, session_id, project, prompt FROM history").fetchone()
+            conn.close()
+        assert row[0] == "claude"
+        assert row[1] == "sess-rt"
+        assert row[2] == "/proj"
+        assert row[3] == "roundtrip test"

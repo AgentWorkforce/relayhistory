@@ -7,6 +7,7 @@ Zero dependencies — Python 3.8+ standard library only.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -1065,6 +1066,228 @@ def cmd_watch(args):
         time.sleep(interval)
 
 
+# --- Export / Import ---------------------------------------------------------
+
+_EXPORT_FIELDS = ["source", "session_id", "project", "prompt", "prompt_hash", "timestamp_ms"]
+
+
+def _parse_date_to_ms(date_str):
+    try:
+        t = time.strptime(date_str, "%Y-%m-%d")
+        return int(time.mktime(t)) * 1000
+    except ValueError:
+        print(f"Invalid date '{date_str}'. Use YYYY-MM-DD.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _open_file(path, mode="rt"):
+    """Open a file, transparently handling .gz compression."""
+    if path.endswith(".gz"):
+        return gzip.open(path, mode, encoding="utf-8")
+    return open(path, mode, encoding="utf-8")
+
+
+def _query_export_rows(conn, args):
+    sql = (
+        "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms "
+        "FROM history WHERE 1=1"
+    )
+    params = []
+    if getattr(args, "source", None):
+        sql += " AND source = ?"
+        params.append(args.source)
+    if getattr(args, "project", None):
+        sql += " AND project LIKE ?"
+        params.append(f"%{args.project}%")
+    if getattr(args, "since", None):
+        sql += " AND timestamp_ms >= ?"
+        params.append(_parse_date_to_ms(args.since))
+    sql += " ORDER BY timestamp_ms ASC"
+    return conn.execute(sql, params).fetchall()
+
+
+def cmd_export(args):
+    """Export history to a portable JSONL or SQLite file.
+
+    JSONL is the default — one JSON object per line, gzip-friendly, easy to
+    inspect. SQLite exports a self-contained DB file that can be directly used
+    as $AI_HIST_DB on another machine.
+
+    Examples:
+        ai-hist export                          # JSONL to stdout
+        ai-hist export history.jsonl            # JSONL to file
+        ai-hist export history.jsonl.gz         # gzip-compressed JSONL
+        ai-hist export backup.db --format sqlite
+        ai-hist export --source claude --since 2025-01-01 recent.jsonl
+    """
+    if not DB_PATH.exists():
+        print(f"No database found at {DB_PATH}. Run `ai-hist sync` first.", file=sys.stderr)
+        sys.exit(1)
+
+    fmt = getattr(args, "format", "jsonl") or "jsonl"
+    output = getattr(args, "output", None)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = _query_export_rows(conn, args)
+    conn.close()
+
+    if not rows:
+        print("No entries matched the export filters.", file=sys.stderr)
+        sys.exit(1)
+
+    if fmt == "sqlite":
+        dest = output or "ai-hist-export.db"
+        dst = sqlite3.connect(dest)
+        init_db(dst)
+        inserted = 0
+        for row in rows:
+            cur = dst.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        dst.commit()
+        dst.close()
+        print(f"Exported {inserted:,} entries to {dest}")
+        return
+
+    # JSONL (default) — stdout or file
+    def write_jsonl(f):
+        for row in rows:
+            f.write(json.dumps(dict(zip(_EXPORT_FIELDS, row))) + "\n")
+
+    if output:
+        with _open_file(output, "wt") as f:
+            write_jsonl(f)
+        print(f"Exported {len(rows):,} entries to {output}", file=sys.stderr)
+    else:
+        write_jsonl(sys.stdout)
+
+
+def _load_rows_from_sqlite(path):
+    """Load rows from an exported SQLite DB, tolerating missing prompt_hash."""
+    try:
+        src = sqlite3.connect(path)
+        cols = {r[1] for r in src.execute("PRAGMA table_info(history)").fetchall()}
+        if "prompt_hash" in cols:
+            sql = "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms FROM history"
+            fields = _EXPORT_FIELDS
+        else:
+            sql = "SELECT source, session_id, project, prompt, timestamp_ms FROM history"
+            fields = ["source", "session_id", "project", "prompt", "timestamp_ms"]
+        rows = [dict(zip(fields, r)) for r in src.execute(sql).fetchall()]
+        src.close()
+        return rows
+    except sqlite3.Error as e:
+        print(f"Error reading SQLite file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _load_rows_from_jsonl(path):
+    """Load rows from a JSONL (optionally gzip-compressed) export file."""
+    rows = []
+    try:
+        with _open_file(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except (OSError, EOFError) as e:
+        print(f"Error reading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    return rows
+
+
+def cmd_import(args):
+    """Import history from a JSONL or SQLite export file.
+
+    Entries that already exist (same source + timestamp + prompt) are silently
+    skipped, so it is safe to import the same file multiple times or merge
+    overlapping exports from different machines.
+
+    Examples:
+        ai-hist import colleague.jsonl
+        ai-hist import colleague.jsonl.gz
+        ai-hist import colleague.db
+        ai-hist import colleague.jsonl --dry-run
+    """
+    path = args.file
+    dry_run = getattr(args, "dry_run", False)
+
+    if path.endswith(".db") or path.endswith(".sqlite"):
+        rows = _load_rows_from_sqlite(path)
+    else:
+        rows = _load_rows_from_jsonl(path)
+
+    if not rows:
+        print("No entries found in file.")
+        return
+
+    total = len(rows)
+
+    if dry_run:
+        print(f"[dry-run] {total:,} entries in {path} — none written.")
+        print()
+        for row in rows[:5]:
+            source = row.get("source", "?")
+            project = row.get("project") or ""
+            prompt = row.get("prompt", "")[:80].replace("\n", " ")
+            ts_ms = row.get("timestamp_ms", 0)
+            dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000)) if ts_ms else "?"
+            proj = f" [{project}]" if project else ""
+            print(f"  {dt}  ({source}){proj}  {prompt}")
+        if total > 5:
+            print(f"  ... and {total - 5:,} more")
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    inserted = 0
+    errors = 0
+    for row in rows:
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("source", ""),
+                    row.get("session_id"),
+                    row.get("project"),
+                    prompt,
+                    row.get("prompt_hash") or _prompt_hash(prompt),
+                    row.get("timestamp_ms", 0),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error:
+            errors += 1
+
+    conn.commit()
+    conn.close()
+
+    skipped = total - inserted - errors
+    parts = [f"+{inserted:,} new entries"]
+    if skipped:
+        parts.append(f"{skipped:,} already existed")
+    if errors:
+        parts.append(f"{errors} errors")
+    print(f"Imported from {path}: {', '.join(parts)}")
+
+
 # --- MCP Server --------------------------------------------------------------
 
 MCP_TOOLS = [
@@ -1554,12 +1777,24 @@ def main():
 
     sub.add_parser("mcp", help="Run as an MCP server over stdio (for Claude Code / Cursor)")
 
+    exp = sub.add_parser("export", help="Export history to a portable JSONL or SQLite file")
+    exp.add_argument("output", nargs="?", help="Output file (default: stdout). Use .gz for compression.")
+    exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
+    exp.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    exp.add_argument("--project", help="Filter by project path (substring)")
+    exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
+
+    imp = sub.add_parser("import", help="Import history from an exported JSONL or SQLite file")
+    imp.add_argument("file", help="File to import (.jsonl, .jsonl.gz, or .db)")
+    imp.add_argument("--dry-run", action="store_true", help="Preview what would be imported without writing")
+
     args = p.parse_args()
     cmds = {
         "sync": cmd_sync, "search": cmd_search, "recent": cmd_recent,
         "show": cmd_show, "session": cmd_session, "context": cmd_context,
         "stats": cmd_stats, "pack": cmd_pack, "resume": cmd_resume,
         "watch": cmd_watch, "mcp": cmd_mcp,
+        "export": cmd_export, "import": cmd_import,
     }
 
     if args.command in cmds:
