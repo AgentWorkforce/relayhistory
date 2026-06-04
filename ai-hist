@@ -7,6 +7,8 @@ Zero dependencies — Python 3.8+ standard library only.
 """
 
 import argparse
+import gzip
+import hashlib
 import json
 import os
 import sqlite3
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS history (
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,
+    prompt_hash TEXT,
     timestamp_ms INTEGER NOT NULL,
     UNIQUE(source, timestamp_ms, prompt)
 );
@@ -65,6 +68,82 @@ CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
 END;
 """
 
+# --- Helpers -----------------------------------------------------------------
+
+def _prompt_hash(prompt):
+    """First 16 hex chars of SHA-256 of the prompt — stored for future dedup queries."""
+    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
+def _shell_quote(value):
+    import re
+    if re.match(r'^[A-Za-z0-9_./-]+$', value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _resume_cmd(source, session_id, project):
+    """Build the CLI command to resume a session. Returns None for sources without resume."""
+    if not session_id:
+        return None
+    if source == "claude":
+        if project:
+            return f"cd {_shell_quote(project)} && claude --resume {_shell_quote(session_id)}"
+        return f"claude --resume {_shell_quote(session_id)}"
+    if source == "codex":
+        return f"codex resume {_shell_quote(session_id)}"
+    if source == "cursor":
+        cmd = f"cursor-agent --resume={_shell_quote(session_id)}"
+        if project:
+            return f"cd {_shell_quote(project)} && {cmd}"
+        return cmd
+    return None
+
+
+def _build_fts_query(terms, raw=False):
+    """Build an FTS5 query string from a list of terms.
+
+    Auto-detects FTS5 operators (uppercase AND/OR/NOT, trailing *,
+    pre-quoted phrases) and passes through raw. Leading - terms are converted
+    to FTS5 NOT clauses. Otherwise quotes each term for literal matching,
+    which is the safe default for most user input.
+    Use raw=True or --fts to force raw FTS5 expression passthrough.
+    """
+    if raw:
+        return " ".join(terms)
+    fts_ops = {"AND", "OR", "NOT"}
+    positives = []
+    negatives = []
+    for t in terms:
+        if t in fts_ops or t.endswith("*") or (t.startswith('"') and t.endswith('"')):
+            return " ".join(terms)
+        if t.startswith("-") and len(t) > 1:
+            negatives.append(t[1:])
+        else:
+            positives.append(t)
+    if negatives and not positives:
+        return '"__ai_hist_no_positive_terms__"'
+    query = " ".join(_quote_fts_term(t) for t in positives)
+    if negatives:
+        query += " NOT " + " NOT ".join(_quote_fts_term(t) for t in negatives)
+    return query
+
+
+def _quote_fts_term(term):
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _row_to_dict(id_, source, session_id, project, prompt, ts_ms):
+    return {
+        "id": id_,
+        "source": source,
+        "session_id": session_id,
+        "project": project,
+        "prompt": prompt,
+        "timestamp_ms": ts_ms,
+    }
+
+
 # --- Parsers -----------------------------------------------------------------
 
 def parse_claude(line: str):
@@ -78,6 +157,7 @@ def parse_claude(line: str):
         "session_id": obj.get("sessionId"),
         "project": obj.get("project"),
         "prompt": display,
+        "prompt_hash": _prompt_hash(display),
         "timestamp_ms": obj.get("timestamp", 0),
     }
 
@@ -93,6 +173,7 @@ def parse_codex(line: str):
         "session_id": obj.get("session_id"),
         "project": None,
         "prompt": text,
+        "prompt_hash": _prompt_hash(text),
         "timestamp_ms": int(obj.get("ts", 0) * 1000),
     }
 
@@ -226,8 +307,8 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
                 try:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, timestamp_ms) "
-                        "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
                         row,
                     )
                     if cur.rowcount > 0:
@@ -334,9 +415,9 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
                         try:
                             cur = conn.execute(
                                 "INSERT OR IGNORE INTO history "
-                                "(source, session_id, project, prompt, timestamp_ms) "
-                                "VALUES (?, ?, ?, ?, ?)",
-                                ("cursor", session_id, project_path, text, ts_ms),
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                ("cursor", session_id, project_path, text, _prompt_hash(text), ts_ms),
                             )
                             if cur.rowcount > 0:
                                 inserted += 1
@@ -408,8 +489,8 @@ def sync_relaycast(conn: sqlite3.Connection, state: dict):
                         try:
                             cur = conn.execute(
                                 "INSERT OR IGNORE INTO history "
-                                "(source, session_id, project, prompt, timestamp_ms) "
-                                "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
                                 row,
                             )
                             if cur.rowcount > 0:
@@ -455,8 +536,8 @@ def sync_relaycast(conn: sqlite3.Connection, state: dict):
                         try:
                             cur = conn.execute(
                                 "INSERT OR IGNORE INTO history "
-                                "(source, session_id, project, prompt, timestamp_ms) "
-                                "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
                                 row,
                             )
                             if cur.rowcount > 0:
@@ -490,22 +571,20 @@ def _relay_msg_to_row(msg: dict, channel: str):
         return None
     sender = msg.get("from_name") or msg.get("from_id") or ""
     created_at = msg.get("created_at", "")
-    # Parse ISO timestamp to ms
     ts_ms = _iso_to_ms(created_at) if created_at else 0
-    # Prefix with sender for searchability
     prompt = f"[{sender}] {text}" if sender else text
     return {
         "source": "relay",
         "session_id": msg.get("thread_id") or channel,
         "project": RELAYCAST_WORKSPACE_ID,
         "prompt": prompt,
+        "prompt_hash": _prompt_hash(prompt),
         "timestamp_ms": ts_ms,
     }
 
 
 def _iso_to_ms(iso_str: str) -> int:
     """Parse ISO 8601 datetime string to milliseconds since epoch."""
-    # Handle common formats: 2026-03-07T20:13:00.000Z or 2026-03-07T20:13:00Z
     iso_str = iso_str.rstrip("Z").split("+")[0]
     frac = 0
     if "." in iso_str:
@@ -524,6 +603,13 @@ def _iso_to_ms(iso_str: str) -> int:
 def init_db(conn: sqlite3.Connection):
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
+    # Migration: add prompt_hash column to existing DBs that predate it.
+    try:
+        conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)")
 
 
 def load_state() -> dict:
@@ -593,8 +679,8 @@ def cmd_sync(args=None):
                 try:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, timestamp_ms) "
-                        "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
                         row,
                     )
                     if cur.rowcount > 0:
@@ -624,15 +710,14 @@ def cmd_sync(args=None):
 def cmd_search(args):
     """Full-text search across prompts."""
     conn = sqlite3.connect(str(DB_PATH))
-    # Quote each term so hyphens/special chars are treated as literals by FTS5
-    query = " ".join(f'"{t}"' for t in args.query)
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
 
     sql = (
-        "SELECT h.id, h.source, h.project, h.prompt, h.timestamp_ms "
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
         "FROM history_fts f JOIN history h ON f.rowid = h.id "
         "WHERE history_fts MATCH ? "
     )
-    params: list = [query]
+    params = [query]
     if args.source:
         sql += "AND h.source = ? "
         params.append(args.source)
@@ -646,17 +731,26 @@ def cmd_search(args):
     conn.close()
 
     if not rows:
-        print("No results.")
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print("No results.")
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
         return
-    for row in rows:
-        print(fmt_row(*row))
+
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms))
 
 
 def cmd_recent(args):
     """Show N most recent entries."""
     conn = sqlite3.connect(str(DB_PATH))
-    sql = "SELECT id, source, project, prompt, timestamp_ms FROM history "
-    params: list = []
+    sql = "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history "
+    params = []
     wheres = []
     if args.source:
         wheres.append("source = ?")
@@ -670,8 +764,14 @@ def cmd_recent(args):
     params.append(args.n)
     rows = conn.execute(sql, params).fetchall()
     conn.close()
-    for row in rows:
-        print(fmt_row(*row))
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
+        return
+
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms))
 
 
 def cmd_show(args):
@@ -684,10 +784,29 @@ def cmd_show(args):
     ).fetchone()
     if not row:
         conn.close()
-        print(f"No entry with id {args.id}")
-        return
+        if getattr(args, "json", False):
+            print(json.dumps({"error": f"no entry with id {args.id}"}))
+        else:
+            print(f"No entry with id {args.id}")
+        sys.exit(1)
+
     id_, source, session_id, project, prompt, ts_ms = row
     dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000))
+    resume = _resume_cmd(source, session_id, project)
+
+    if getattr(args, "json", False):
+        session_count = None
+        if session_id:
+            session_count = conn.execute(
+                "SELECT COUNT(*) FROM history WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+        conn.close()
+        out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
+        out["resume_cmd"] = resume
+        out["session_count"] = session_count
+        print(json.dumps(out))
+        return
+
     print(f"  ID:        {id_}")
     print(f"  Source:    {source}")
     print(f"  Session:   {session_id or '(none)'}")
@@ -697,23 +816,14 @@ def cmd_show(args):
     print()
     print(prompt)
 
-    # Hints
     print()
     if session_id:
         session_count = conn.execute(
             "SELECT COUNT(*) FROM history WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
         print(f"  Session has {session_count} entries: ai-hist session {session_id}")
-        if source == "claude" and project:
-            print(f"  Resume:  cd {project} && claude --resume {session_id}")
-        elif source == "codex" and session_id:
-            print(f"  Resume:  codex resume {session_id}")
-        elif source == "cursor":
-            cmd = f"cursor-agent --resume={session_id}"
-            if project:
-                print(f"  Resume:  cd {project} && {cmd}")
-            else:
-                print(f"  Resume:  {cmd}")
+        if resume:
+            print(f"  Resume:  {resume}")
     print(f"  Context: ai-hist context {id_}")
     conn.close()
 
@@ -729,7 +839,7 @@ def cmd_context(args):
     if not row:
         conn.close()
         print(f"No entry with id {args.id}")
-        return
+        sys.exit(1)
     id_, source, session_id, project, ts_ms = row
 
     # Same session
@@ -769,17 +879,26 @@ def cmd_session(args):
     """Show all prompts in a given session."""
     conn = sqlite3.connect(str(DB_PATH))
     rows = conn.execute(
-        "SELECT id, source, project, prompt, timestamp_ms "
+        "SELECT id, source, session_id, project, prompt, timestamp_ms "
         "FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
         (args.session_id,),
     ).fetchall()
     conn.close()
     if not rows:
-        print(f"No entries for session {args.session_id}")
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print(f"No entries for session {args.session_id}")
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
         return
+
     print(f"  Session {args.session_id} ({len(rows)} entries):\n")
-    for row in rows:
-        print(fmt_row(*row, verbose=args.full))
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms, verbose=args.full))
 
 
 def cmd_stats(args=None):
@@ -787,28 +906,168 @@ def cmd_stats(args=None):
     conn = sqlite3.connect(str(DB_PATH))
 
     total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-    print(f"\nTotal entries: {total:,}")
-
-    print("\nBy source:")
-    for source, count in conn.execute(
-        "SELECT source, COUNT(*) FROM history GROUP BY source ORDER BY source"
-    ):
-        print(f"  {source}: {count:,}")
-
+    by_source = {
+        source: count
+        for source, count in conn.execute(
+            "SELECT source, COUNT(*) FROM history GROUP BY source ORDER BY source"
+        )
+    }
+    top_projects = [
+        {"project": p, "count": c}
+        for p, c in conn.execute(
+            "SELECT project, COUNT(*) as c FROM history "
+            "WHERE project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 10"
+        )
+    ]
     r = conn.execute("SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history").fetchone()
+    conn.close()
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "total": total,
+            "by_source": by_source,
+            "top_projects": top_projects,
+            "first_timestamp_ms": r[0],
+            "last_timestamp_ms": r[1],
+        }))
+        return
+
+    print(f"\nTotal entries: {total:,}")
+    print("\nBy source:")
+    for source, count in by_source.items():
+        print(f"  {source}: {count:,}")
     if r[0]:
         print(f"\nDate range:")
         print(f"  {time.strftime('%Y-%m-%d', time.localtime(r[0] / 1000))} to "
               f"{time.strftime('%Y-%m-%d', time.localtime(r[1] / 1000))}")
-
     print("\nTop 10 projects:")
-    for project, count in conn.execute(
-        "SELECT project, COUNT(*) as c FROM history "
-        "WHERE project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 10"
-    ):
-        print(f"  {count:>6,}  {project}")
+    for item in top_projects:
+        print(f"  {item['count']:>6,}  {item['project']}")
 
+
+def cmd_pack(args):
+    """Generate a token-budget-aware evidence bundle for LLM handoff.
+
+    Searches the same way as `search` and formats results as a numbered list
+    with resume commands — ready to paste into an LLM context window.
+    Use --tokens to truncate each prompt to approximately N tokens (4 chars/token).
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
+
+    sql = (
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? "
+    )
+    params = [query]
+    if args.source:
+        sql += "AND h.source = ? "
+        params.append(args.source)
+    if args.project:
+        sql += "AND h.project LIKE ? "
+        params.append(f"%{args.project}%")
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
+
+    if not rows:
+        if getattr(args, "json", False):
+            print(json.dumps({"query": " ".join(args.query), "entries": []}))
+        else:
+            print("No results.")
+        sys.exit(1)
+
+    chars_budget = args.tokens * 4 if args.tokens else None
+    query_str = " ".join(args.query)
+    now_ms = int(time.time() * 1000)
+
+    if getattr(args, "json", False):
+        entries = []
+        for r in rows:
+            id_, source, session_id, project, prompt, ts_ms = r
+            text = prompt[:chars_budget] if chars_budget and len(prompt) > chars_budget else prompt
+            entries.append({
+                "id": id_,
+                "source": source,
+                "session_id": session_id,
+                "project": project,
+                "prompt": text,
+                "timestamp_ms": ts_ms,
+                "resume_cmd": _resume_cmd(source, session_id, project),
+            })
+        print(json.dumps({
+            "query": query_str,
+            "generated_ms": now_ms,
+            "token_budget": args.tokens,
+            "entries": entries,
+        }))
+        return
+
+    dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(now_ms / 1000))
+    print(f'=== ai-hist pack: "{query_str}" | {dt} | {len(rows)} entries ===\n')
+    for i, r in enumerate(rows, 1):
+        id_, source, session_id, project, prompt, ts_ms = r
+        entry_dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000))
+        proj = f"  {project}" if project else ""
+        if chars_budget and len(prompt) > chars_budget:
+            text = prompt[:chars_budget].replace("\n", " ") + "..."
+        else:
+            text = prompt.replace("\n", " ")
+        print(f"[{i}/{len(rows)}] #{id_}  {entry_dt}  {source}{proj}")
+        print(f"      {text}")
+        if session_id:
+            cmd = _resume_cmd(source, session_id, project)
+            sid_short = session_id[:16] + "..." if len(session_id) > 16 else session_id
+            if cmd:
+                print(f"      Resume: {cmd}")
+            else:
+                print(f"      Session: {sid_short}")
+        print()
+
+
+def cmd_resume(args):
+    """Find the best session matching a query and print its resume command.
+
+    Exits 0 and prints the command on success; exits 1 if no matching session
+    is found. Ideal for shell aliases:
+        alias rai='$(ai-hist resume)'
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
+
+    sql = (
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? AND h.session_id IS NOT NULL AND h.session_id != '' "
+        "ORDER BY h.timestamp_ms DESC LIMIT 1"
+    )
+    row = conn.execute(sql, [query]).fetchone()
+    conn.close()
+
+    if not row:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "no session found", "query": " ".join(args.query)}))
+        else:
+            print("No session found.", file=sys.stderr)
+        sys.exit(1)
+
+    id_, source, session_id, project, prompt, ts_ms = row
+    cmd = _resume_cmd(source, session_id, project)
+
+    if getattr(args, "json", False):
+        out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
+        out["resume_cmd"] = cmd
+        print(json.dumps(out))
+        return
+
+    if cmd:
+        print(cmd)
+    else:
+        print(f"No resume command available for source '{source}'", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_watch(args):
@@ -823,6 +1082,238 @@ def cmd_watch(args):
         time.sleep(interval)
 
 
+# --- Export / Import ---------------------------------------------------------
+
+_EXPORT_FIELDS = ["source", "session_id", "project", "prompt", "prompt_hash", "timestamp_ms"]
+
+
+def _parse_date_to_ms(date_str):
+    try:
+        t = time.strptime(date_str, "%Y-%m-%d")
+        return int(time.mktime(t)) * 1000
+    except ValueError:
+        print(f"Invalid date '{date_str}'. Use YYYY-MM-DD.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _open_file(path, mode="rt"):
+    """Open a file, transparently handling .gz compression."""
+    if path.endswith(".gz"):
+        return gzip.open(path, mode, encoding="utf-8")
+    return open(path, mode, encoding="utf-8")
+
+
+def _query_export_rows(conn, args):
+    sql = (
+        "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms "
+        "FROM history WHERE 1=1"
+    )
+    params = []
+    if getattr(args, "source", None):
+        sql += " AND source = ?"
+        params.append(args.source)
+    if getattr(args, "project", None):
+        sql += " AND project LIKE ?"
+        params.append(f"%{args.project}%")
+    if getattr(args, "since", None):
+        sql += " AND timestamp_ms >= ?"
+        params.append(_parse_date_to_ms(args.since))
+    sql += " ORDER BY timestamp_ms ASC"
+    return conn.execute(sql, params).fetchall()
+
+
+def cmd_export(args):
+    """Export history to a portable JSONL or SQLite file.
+
+    JSONL is the default — one JSON object per line, gzip-friendly, easy to
+    inspect. SQLite exports a self-contained DB file that can be directly used
+    as $AI_HIST_DB on another machine.
+
+    Examples:
+        ai-hist export                          # JSONL to stdout
+        ai-hist export history.jsonl            # JSONL to file
+        ai-hist export history.jsonl.gz         # gzip-compressed JSONL
+        ai-hist export backup.db --format sqlite
+        ai-hist export --source claude --since 2025-01-01 recent.jsonl
+    """
+    if not DB_PATH.exists():
+        print(f"No database found at {DB_PATH}. Run `ai-hist sync` first.", file=sys.stderr)
+        sys.exit(1)
+
+    fmt = getattr(args, "format", "jsonl") or "jsonl"
+    output = getattr(args, "output", None)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    rows = _query_export_rows(conn, args)
+    conn.close()
+
+    if not rows:
+        print("No entries matched the export filters.", file=sys.stderr)
+        sys.exit(1)
+
+    if fmt == "sqlite":
+        dest = output or "ai-hist-export.db"
+        if Path(dest).resolve() == DB_PATH.resolve():
+            print("Refusing to export SQLite over the active AI_HIST_DB.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            Path(dest).unlink()
+        except FileNotFoundError:
+            pass
+        dst = sqlite3.connect(dest)
+        init_db(dst)
+        inserted = 0
+        for row in rows:
+            cur = dst.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        dst.commit()
+        dst.close()
+        print(f"Exported {inserted:,} entries to {dest}")
+        return
+
+    # JSONL (default) — stdout or file
+    def write_jsonl(f):
+        for row in rows:
+            f.write(json.dumps(dict(zip(_EXPORT_FIELDS, row))) + "\n")
+
+    if output:
+        with _open_file(output, "wt") as f:
+            write_jsonl(f)
+        print(f"Exported {len(rows):,} entries to {output}", file=sys.stderr)
+    else:
+        write_jsonl(sys.stdout)
+
+
+def _load_rows_from_sqlite(path):
+    """Load rows from an exported SQLite DB, tolerating missing prompt_hash."""
+    try:
+        src = sqlite3.connect(path)
+        cols = {r[1] for r in src.execute("PRAGMA table_info(history)").fetchall()}
+        if "prompt_hash" in cols:
+            sql = "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms FROM history"
+            fields = _EXPORT_FIELDS
+        else:
+            sql = "SELECT source, session_id, project, prompt, timestamp_ms FROM history"
+            fields = ["source", "session_id", "project", "prompt", "timestamp_ms"]
+        rows = [dict(zip(fields, r)) for r in src.execute(sql).fetchall()]
+        src.close()
+        return rows
+    except sqlite3.Error as e:
+        print(f"Error reading SQLite file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _load_rows_from_jsonl(path):
+    """Load rows from a JSONL (optionally gzip-compressed) export file."""
+    rows = []
+    try:
+        with _open_file(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except (OSError, EOFError) as e:
+        print(f"Error reading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    return rows
+
+
+def cmd_import(args):
+    """Import history from a JSONL or SQLite export file.
+
+    Entries that already exist (same source + timestamp + prompt) are silently
+    skipped, so it is safe to import the same file multiple times or merge
+    overlapping exports from different machines.
+
+    Examples:
+        ai-hist import colleague.jsonl
+        ai-hist import colleague.jsonl.gz
+        ai-hist import colleague.db
+        ai-hist import colleague.jsonl --dry-run
+    """
+    path = args.file
+    dry_run = getattr(args, "dry_run", False)
+
+    if path.endswith(".db") or path.endswith(".sqlite"):
+        rows = _load_rows_from_sqlite(path)
+    else:
+        rows = _load_rows_from_jsonl(path)
+
+    if not rows:
+        print("No entries found in file.")
+        return
+
+    total = len(rows)
+
+    if dry_run:
+        print(f"[dry-run] {total:,} entries in {path} — none written.")
+        print()
+        for row in rows[:5]:
+            source = row.get("source", "?")
+            project = row.get("project") or ""
+            prompt = row.get("prompt", "")[:80].replace("\n", " ")
+            ts_ms = row.get("timestamp_ms", 0)
+            dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000)) if ts_ms else "?"
+            proj = f" [{project}]" if project else ""
+            print(f"  {dt}  ({source}){proj}  {prompt}")
+        if total > 5:
+            print(f"  ... and {total - 5:,} more")
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    inserted = 0
+    errors = 0
+    for row in rows:
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("source", ""),
+                    row.get("session_id"),
+                    row.get("project"),
+                    prompt,
+                    row.get("prompt_hash") or _prompt_hash(prompt),
+                    row.get("timestamp_ms", 0),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error:
+            errors += 1
+
+    conn.commit()
+    conn.close()
+
+    skipped = total - inserted - errors
+    parts = [f"+{inserted:,} new entries"]
+    if skipped:
+        parts.append(f"{skipped:,} already existed")
+    if errors:
+        parts.append(f"{errors} errors")
+    print(f"Imported from {path}: {', '.join(parts)}")
+
+
+# --- CLI ---------------------------------------------------------------------
+
 # --- CLI ---------------------------------------------------------------------
 
 def main():
@@ -832,37 +1323,70 @@ def main():
     sub.add_parser("sync", help="Import new entries from history files")
 
     s = sub.add_parser("search", help="Full-text search prompts")
-    s.add_argument("query", nargs="+", help="Search terms")
+    s.add_argument("query", nargs="+", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
     s.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    s.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    s.add_argument("--json", action="store_true", help="Output as JSON array")
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
     r.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
     r.add_argument("--project", help="Filter by project path (substring match)")
+    r.add_argument("--json", action="store_true", help="Output as JSON array")
 
     sh = sub.add_parser("show", help="Show full details for an entry by ID")
     sh.add_argument("id", type=int, help="Entry ID (shown as #NNN in search/recent)")
+    sh.add_argument("--json", action="store_true", help="Output as JSON object")
 
     se = sub.add_parser("session", help="Show all prompts in a session")
     se.add_argument("session_id", help="Session ID")
     se.add_argument("--full", action="store_true", help="Show full prompt text (no truncation)")
+    se.add_argument("--json", action="store_true", help="Output as JSON array")
 
     cx = sub.add_parser("context", help="Show entries around an ID (same session + nearby)")
     cx.add_argument("id", type=int, help="Entry ID to get context for")
     cx.add_argument("--window", type=int, default=5, help="Time window in minutes (default: 5)")
 
-    sub.add_parser("stats", help="Show summary statistics")
+    st = sub.add_parser("stats", help="Show summary statistics")
+    st.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    pk = sub.add_parser("pack", help="Evidence bundle for LLM handoff (search + resume commands)")
+    pk.add_argument("query", nargs="+", help="Search terms")
+    pk.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    pk.add_argument("--project", help="Filter by project path (substring match)")
+    pk.add_argument("--limit", type=int, default=10, help="Max entries (default: 10)")
+    pk.add_argument("--tokens", type=int, default=0, help="Truncate each prompt to ~N tokens (4 chars/token)")
+    pk.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    pk.add_argument("--json", action="store_true", help="Output as JSON")
+
+    rv = sub.add_parser("resume", help="Find best matching session and print its resume command")
+    rv.add_argument("query", nargs="+", help="Search terms to find the session")
+    rv.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    rv.add_argument("--json", action="store_true", help="Output as JSON object")
 
     w = sub.add_parser("watch", help="Continuous sync loop")
     w.add_argument("--interval", type=int, default=60, help="Seconds between syncs (default: 60)")
+
+    exp = sub.add_parser("export", help="Export history to a portable JSONL or SQLite file")
+    exp.add_argument("output", nargs="?", help="Output file (default: stdout). Use .gz for compression.")
+    exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
+    exp.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    exp.add_argument("--project", help="Filter by project path (substring)")
+    exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
+
+    imp = sub.add_parser("import", help="Import history from an exported JSONL or SQLite file")
+    imp.add_argument("file", help="File to import (.jsonl, .jsonl.gz, or .db)")
+    imp.add_argument("--dry-run", action="store_true", help="Preview what would be imported without writing")
 
     args = p.parse_args()
     cmds = {
         "sync": cmd_sync, "search": cmd_search, "recent": cmd_recent,
         "show": cmd_show, "session": cmd_session, "context": cmd_context,
-        "stats": cmd_stats, "watch": cmd_watch,
+        "stats": cmd_stats, "pack": cmd_pack, "resume": cmd_resume,
+        "watch": cmd_watch,
+        "export": cmd_export, "import": cmd_import,
     }
 
     if args.command in cmds:

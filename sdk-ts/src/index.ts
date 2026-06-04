@@ -406,6 +406,32 @@ export class AiHist {
     ).map(rowToEntry);
   }
 
+  /** Single entry by id, or `null` if not found. */
+  getEntry(id: number): HistoryEntry | null {
+    const rows = runQuery<RawHistoryRow>(
+      this.db,
+      `SELECT id, source, session_id, project, prompt, timestamp_ms
+       FROM history WHERE id = ?`,
+      [id],
+    );
+    return rows.length > 0 ? rowToEntry(rows[0]) : null;
+  }
+
+  /**
+   * All entries whose timestamp falls within [timestampMs - windowMs,
+   * timestampMs + windowMs], ordered oldest first. Used by get_context.
+   */
+  getInTimeWindow(timestampMs: number, windowMs: number): HistoryEntry[] {
+    return runQuery<RawHistoryRow>(
+      this.db,
+      `SELECT id, source, session_id, project, prompt, timestamp_ms
+       FROM history
+       WHERE timestamp_ms BETWEEN ? AND ?
+       ORDER BY timestamp_ms ASC`,
+      [timestampMs - windowMs, timestampMs + windowMs],
+    ).map(rowToEntry);
+  }
+
   /** Counts + date range, mirroring `ai-hist stats`. */
   stats(): Stats {
     const total =

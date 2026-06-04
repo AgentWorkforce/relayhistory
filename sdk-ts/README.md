@@ -1,8 +1,8 @@
-# ai-hist (TypeScript SDK)
+# ai-hist (TypeScript SDK and MCP server)
 
-Thin TypeScript SDK for the [ai-hist](../README.md) SQLite database. Reads the same file the Python `ai-hist sync` tool writes — this package never writes, sync stays the Python tool's job.
+TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, and Agent Relay.
 
-Built to let Electron / Node consumers (e.g. the `pear` desktop app) render a Codex/Claude-style "previous conversations" list backed by your local ai-hist history.
+The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file the Python `ai-hist sync` tool writes, or falls back to scanning local Claude/Codex/Cursor JSONL files when the database is missing.
 
 ## Install
 
@@ -10,14 +10,12 @@ Built to let Electron / Node consumers (e.g. the `pear` desktop app) render a Co
 npm install ai-hist
 ```
 
-`better-sqlite3` is a native dep — when bundling into an Electron app, run `electron-rebuild` (or your bundler's equivalent) after install.
-
 ## Quick start
 
 ```ts
-import { AiHist, resumeCommand } from 'ai-hist';
+import { openAiHist, resumeCommand } from 'ai-hist';
 
-const hist = new AiHist();              // uses $AI_HIST_DB or ~/.local/share/ai-hist/ai-history.db
+const hist = await openAiHist(); // uses $AI_HIST_DB or ~/.local/share/ai-hist/ai-history.db
 try {
   const sessions = hist.listSessions({ limit: 20 });
   for (const s of sessions) {
@@ -29,17 +27,48 @@ try {
 }
 ```
 
+To require the Python-managed SQLite database instead of JSONL fallback:
+
+```ts
+const hist = await openAiHist({ fallback: 'error' });
+```
+
+## MCP server
+
+After the package is published, run the local stdio MCP server with:
+
+```bash
+npx -p ai-hist ai-hist-mcp
+```
+
+From a local checkout:
+
+```bash
+npm install
+npm run build
+node dist/mcp-server.js
+```
+
+The MCP server exposes tools for search, recent history, session lookup, temporal context, evidence packing, and stats over stdio. It runs on the user's machine and uses the same data-opening behavior as the SDK: SQLite first, then local JSONL fallback.
+
 ## API
 
 ```ts
-new AiHist(opts?: { dbPath?: string })       // readonly open
-hist.close()
+openAiHist(opts?: {
+  dbPath?: string;
+  fallback?: 'jsonl' | 'error';
+}): Promise<AiHist>
+
+hist.close(): void
 hist.dbPath: string
+hist.sourceKind: 'sqlite' | 'jsonl'
 
 hist.recent(opts?): HistoryEntry[]            // newest prompts first
-hist.listSessions(opts?): SessionSummary[]    // grouped by session_id, last-activity DESC
+hist.listSessions(opts?): SessionSummary[]    // grouped by session_id, last activity DESC
 hist.getSession(sessionId): HistoryEntry[]    // all prompts in a session, oldest first
-hist.search(query, opts?): HistoryEntry[]     // FTS5 query, recent matches first
+hist.getEntry(id): HistoryEntry | null
+hist.getInTimeWindow(timestampMs, windowMs): HistoryEntry[]
+hist.search(query, opts?): HistoryEntry[]     // literal substring search, recent matches first
 hist.stats(): Stats                           // counts + date range
 ```
 
@@ -50,15 +79,18 @@ resumeCommand(entry): string | null           // shell command per source; null 
 defaultDbPath(): string                       // resolve env / OS default
 ```
 
-## Schema (canonical, owned by the Python tool)
+## Schema
+
+The canonical schema is owned by the Python tool:
 
 ```sql
 CREATE TABLE history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source TEXT NOT NULL,         -- 'claude' | 'codex' | 'cursor' | 'relay'
+  source TEXT NOT NULL,
   session_id TEXT,
   project TEXT,
   prompt TEXT NOT NULL,
+  prompt_hash TEXT,
   timestamp_ms INTEGER NOT NULL,
   UNIQUE(source, timestamp_ms, prompt)
 );
@@ -66,7 +98,7 @@ CREATE TABLE history (
 CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
 ```
 
-If the Python sync tool's schema changes, bump this SDK's major version. Consumers pin the SDK version they were built against.
+The SDK reads the table columns directly. In JSONL fallback mode it creates an in-memory table with the columns it needs for the public reader API.
 
 ## License
 

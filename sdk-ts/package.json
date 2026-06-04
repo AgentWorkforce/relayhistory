@@ -1,19 +1,42 @@
 {
   "name": "ai-hist",
-  "version": "0.2.3",
-  "description": "TypeScript SDK for browsing your Claude / Codex / Cursor history — reads the ai-hist SQLite DB when present, falls back to scanning the local JSONL files directly when not.",
+  "version": "0.3.0",
+  "description": "TypeScript SDK and MCP server for AI coding agent session history — Claude Code, Codex, Cursor, and Agent Relay in one searchable index. Works with or without ai-hist sync via automatic JSONL fallback.",
   "license": "MIT",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "ai-hist-mcp": "./dist/mcp-server.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./mcp-server": {
+      "types": "./dist/mcp-server.d.ts",
+      "default": "./dist/mcp-server.js"
+    },
     "./package.json": "./package.json"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "codex",
+    "cursor",
+    "history",
+    "search",
+    "sqlite",
+    "ai-agent",
+    "ai-cli",
+    "coding-agent",
+    "session-history"
+  ],
+  "homepage": "https://github.com/AgentWorkforce/ai-hist",
   "files": [
     "dist",
     "README.md",
@@ -36,7 +59,9 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "sql.js": "^1.13.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "sql.js": "^1.13.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
