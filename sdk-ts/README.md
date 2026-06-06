@@ -2,18 +2,18 @@
 
 TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, and Agent Relay.
 
-The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file the Python `ai-hist sync` tool writes, or falls back to scanning local Claude/Codex/Cursor JSONL files when the database is missing.
+The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file the Python `ai-hist sync` tool writes, or falls back to scanning local Claude/Codex/Cursor JSONL files and compacted trajectory JSON when the database is missing.
 
 ## Install
 
 ```bash
-npm install ai-hist
+npm install ai-hist-mcp
 ```
 
 ## Quick start
 
 ```ts
-import { openAiHist, resumeCommand } from 'ai-hist';
+import { openAiHist, resumeCommand } from 'ai-hist-mcp';
 
 const hist = await openAiHist(); // uses $AI_HIST_DB or ~/.local/share/ai-hist/ai-history.db
 try {
@@ -38,7 +38,7 @@ const hist = await openAiHist({ fallback: 'error' });
 After the package is published, run the local stdio MCP server with:
 
 ```bash
-npx -p ai-hist ai-hist-mcp
+npx -y ai-hist-mcp
 ```
 
 From a local checkout:
@@ -49,7 +49,17 @@ npm run build
 node dist/mcp-server.js
 ```
 
-The MCP server exposes tools for search, recent history, session lookup, temporal context, evidence packing, and stats over stdio. It runs on the user's machine and uses the same data-opening behavior as the SDK: SQLite first, then local JSONL fallback.
+The MCP server exposes tools for search, recent history, session lookup, temporal context, evidence packing, stats, trajectory search, and task WHY lookup over stdio. It runs on the user's machine and uses the same data-opening behavior as the SDK: SQLite first, then local fallback scanning.
+
+Contract tools:
+
+- `search_history(query, limit?)`
+- `recent_entries(limit?, project?)`
+- `get_session(session_id)`
+- `get_context(id)`
+- `stats()`
+- `search_trajectories(query, limit?)`
+- `why_for_task(query)`
 
 ## API
 
@@ -69,6 +79,8 @@ hist.getSession(sessionId): HistoryEntry[]    // all prompts in a session, oldes
 hist.getEntry(id): HistoryEntry | null
 hist.getInTimeWindow(timestampMs, windowMs): HistoryEntry[]
 hist.search(query, opts?): HistoryEntry[]     // literal substring search, recent matches first
+hist.searchTrajectories(query, opts?): TrajectoryEntry[]
+hist.whyForTask(query): TrajectoryEntry | null
 hist.stats(): Stats                           // counts + date range
 ```
 
@@ -77,6 +89,49 @@ All list-style methods accept `{ source?, project?, limit?, beforeMs? }`. `befor
 ```ts
 resumeCommand(entry): string | null           // shell command per source; null for relay
 defaultDbPath(): string                       // resolve env / OS default
+```
+
+## Trajectories
+
+ai-hist indexes compacted per-run trajectory JSON files as the decision WHY. Set `TRAJECTORY_ROOT` to an explicit root; the scanner reads:
+
+```text
+$TRAJECTORY_ROOT/**/compacted/*.json
+```
+
+Without `TRAJECTORY_ROOT`, default discovery scans:
+
+```text
+~/Projects/**/.trajectories/**/compacted/*.json
+```
+
+The runtime contract is one JSON file per completed run:
+
+```json
+{
+  "id": "run-id",
+  "version": 1,
+  "personaId": "planner",
+  "projectId": "agent-workforce",
+  "task": { "title": "Task title", "description": "Task description" },
+  "status": "completed",
+  "startedAt": "2026-06-06T10:00:00.000Z",
+  "completedAt": "2026-06-06T10:05:00.000Z",
+  "decisions": [
+    {
+      "question": "What should we do?",
+      "chosen": "Chosen option",
+      "reasoning": "Why this option won",
+      "alternatives": ["Other option"]
+    }
+  ],
+  "retrospective": {
+    "summary": "What happened",
+    "approach": "How the work was done",
+    "learnings": ["What to carry forward"],
+    "confidence": 0.8
+  }
+}
 ```
 
 ## Schema
@@ -98,7 +153,7 @@ CREATE TABLE history (
 CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
 ```
 
-The SDK reads the table columns directly. In JSONL fallback mode it creates an in-memory table with the columns it needs for the public reader API.
+Trajectory sync also creates a structured `trajectories` table and inserts each per-run compact file into `history` with `source='trajectory'`, so general history search and WHY-specific lookup both work.
 
 ## License
 

@@ -44,6 +44,9 @@ def tmp_env(tmp_path, monkeypatch):
     # Point cursor at an empty tmp dir so it never reads real ~/.cursor.
     cursor_root = tmp_path / "cursor_projects"
     monkeypatch.setattr(ai_hist, "CURSOR_ROOT", cursor_root)
+    trajectory_root = tmp_path / ".trajectories"
+    monkeypatch.setattr(ai_hist, "TRAJECTORY_ROOT", str(trajectory_root))
+    monkeypatch.setattr(ai_hist, "DEFAULT_TRAJECTORY_SEARCH_ROOT", tmp_path / "Projects")
 
     return SimpleNamespace(
         db_path=db_path,
@@ -51,6 +54,7 @@ def tmp_env(tmp_path, monkeypatch):
         claude_hist=claude_hist,
         codex_hist=codex_hist,
         cursor_root=cursor_root,
+        trajectory_root=trajectory_root,
         tmp_path=tmp_path,
     )
 
@@ -1496,6 +1500,79 @@ class TestDecodeCursorProject:
         assert ai_hist._decode_cursor_project(
             "Users-khaliq-Projects-AgentWorkforce"
         ) == "/Users/khaliq/Projects/AgentWorkforce"
+
+
+class TestSyncTrajectories:
+    def _write_runtime_compact(self, tmp_env, run_id="run-1"):
+        compacted = tmp_env.trajectory_root / "planner" / "compacted"
+        compacted.mkdir(parents=True, exist_ok=True)
+        path = compacted / f"{run_id}.json"
+        path.write_text(json.dumps({
+            "id": run_id,
+            "version": 1,
+            "personaId": "planner",
+            "projectId": "agent-workforce",
+            "task": {
+                "title": "Retry strategy",
+                "description": "Choose retry behavior for API calls.",
+            },
+            "status": "completed",
+            "startedAt": "2026-06-06T10:00:00.000Z",
+            "completedAt": "2026-06-06T10:05:00.000Z",
+            "decisions": [{
+                "question": "How should retries behave?",
+                "chosen": "capped exponential backoff",
+                "reasoning": "Protect downstream services.",
+                "alternatives": ["fixed delay", "no retry"],
+            }],
+            "retrospective": {
+                "summary": "Retry policy selected.",
+                "approach": "Compared failure modes.",
+                "learnings": ["Bound retries by elapsed time."],
+                "confidence": 0.82,
+            },
+        }))
+        return path
+
+    def test_parse_runtime_compacted_trajectory(self, tmp_env):
+        path = self._write_runtime_compact(tmp_env)
+        row = ai_hist.parse_trajectory_file(path)
+        assert row["id"] == "run-1"
+        assert row["persona_id"] == "planner"
+        assert row["project_id"] == "agent-workforce"
+        assert "capped exponential backoff" in row["search_text"]
+        assert row["timestamp_ms"] > 0
+
+    def test_sync_imports_runtime_files_and_skips_aggregate_compaction(self, tmp_env, capsys):
+        self._write_runtime_compact(tmp_env)
+        aggregate_dir = tmp_env.trajectory_root / "compacted"
+        aggregate_dir.mkdir(parents=True, exist_ok=True)
+        (aggregate_dir / "aggregate.json").write_text(json.dumps({
+            "id": "aggregate-1",
+            "type": "compacted",
+            "sourceTrajectories": ["run-1"],
+            "decisionGroups": [],
+        }))
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        ai_hist.init_db(conn)
+        state = {}
+        ai_hist.sync_trajectories(conn, state)
+        trajectory_rows = conn.execute(
+            "SELECT id, persona_id, project_id FROM trajectories"
+        ).fetchall()
+        history_rows = conn.execute(
+            "SELECT source, session_id, project, prompt FROM history WHERE source='trajectory'"
+        ).fetchall()
+        conn.close()
+
+        assert trajectory_rows == [("run-1", "planner", "agent-workforce")]
+        assert len(history_rows) == 1
+        assert history_rows[0][1] == "run-1"
+        assert "Retry strategy" in history_rows[0][3]
+        assert "aggregate-1" not in state.get("trajectory", {})
+        captured = capsys.readouterr()
+        assert "[trajectory] +1 rows" in captured.out
 
 
 class TestSyncCursor:

@@ -12,7 +12,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { openAiHist, resumeCommand, type AiHist } from "./index.js";
+import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry } from "./index.js";
 
 // ---------------------------------------------------------------------------
 // Lazy singleton — opens on first tool call and reuses across all calls.
@@ -41,6 +41,34 @@ function fmtEntry(
       ? e.prompt.slice(0, maxChars).replace(/\n/g, " ") + "..."
       : e.prompt.replace(/\n/g, " ");
   return `#${e.id}  ${dt}  (${e.source})${proj}\n  session_id: ${e.sessionId ?? "(none)"}\n  ${text}`;
+}
+
+function fmtTrajectory(t: TrajectoryEntry, maxChars = 500): string {
+  const dt = new Date(t.timestampMs).toISOString().slice(0, 16).replace("T", " ");
+  const title = t.task.title ?? "(untitled task)";
+  const project = t.projectId ? `  [${t.projectId}]` : "";
+  const persona = t.personaId ? `  persona: ${t.personaId}` : "";
+  const decisions = t.decisions
+    .map((d, index) => {
+      const alternatives = d.alternatives.length > 0 ? ` alternatives: ${d.alternatives.join(", ")}` : "";
+      return `${index + 1}. ${d.question}\n   chosen: ${d.chosen}\n   reasoning: ${d.reasoning}${alternatives}`;
+    })
+    .join("\n");
+  const retroParts = [
+    t.retrospective.summary ? `summary: ${t.retrospective.summary}` : "",
+    t.retrospective.approach ? `approach: ${t.retrospective.approach}` : "",
+    t.retrospective.learnings.length > 0 ? `learnings: ${t.retrospective.learnings.join("; ")}` : "",
+    t.retrospective.confidence != null ? `confidence: ${String(t.retrospective.confidence)}` : "",
+  ].filter(Boolean);
+  const body = [
+    `trajectory_id: ${t.id}`,
+    `${dt}${project}${persona}`,
+    `task: ${title}`,
+    t.task.description ? `description: ${t.task.description}` : "",
+    decisions ? `decisions:\n${decisions}` : "",
+    retroParts.length > 0 ? `retrospective:\n${retroParts.join("\n")}` : "",
+  ].filter(Boolean).join("\n");
+  return body.length > maxChars ? body.slice(0, maxChars).replace(/\n/g, " ") + "..." : body;
 }
 
 const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
@@ -94,6 +122,12 @@ and Agent Relay — all searchable in a single index.
 
 - **history_stats** — Get a quick overview of what is indexed: total counts by
   source, date range, and top projects.
+
+- **search_trajectories** — Search compacted per-run decision trajectories: the
+  WHY behind persona work, including decisions and retrospectives.
+
+- **why_for_task** — Return the best matching trajectory's decisions and
+  retrospective for a task query.
 
 ## Tips
 
@@ -155,6 +189,62 @@ server.tool(
       const lines = [`Found ${results.length} result(s):\n`];
       for (const e of results) lines.push(fmtEntry(e));
       return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "search_trajectories",
+  "Search compacted per-run decision trajectories: task title/description, decisions, " +
+    "alternatives, reasoning, and retrospective summaries/learnings. Use this for the WHY " +
+    "behind prior persona work.",
+  {
+    query: z.string().describe("Search query for decisions, task text, personaId, projectId, or retrospectives."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .default(10)
+      .describe("Maximum number of trajectory results to return. Default: 10."),
+  },
+  READ_ONLY,
+  async ({ query, limit }) => {
+    try {
+      const hist = await getHist();
+      const results = hist.searchTrajectories(query, { limit });
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: "No trajectories found." }] };
+      }
+      const lines = [`Found ${results.length} trajectory result(s):\n`];
+      for (const t of results) lines.push(fmtTrajectory(t));
+      return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "why_for_task",
+  "Return the decisions and retrospective for the best-matching compacted trajectory. " +
+    "Use this when starting a task and you need the prior WHY: question, chosen option, " +
+    "reasoning, alternatives, summary, approach, learnings, and confidence.",
+  {
+    query: z.string().describe("Task or decision query to match against compacted trajectories."),
+  },
+  READ_ONLY,
+  async ({ query }) => {
+    try {
+      const hist = await getHist();
+      const trajectory = hist.whyForTask(query);
+      if (!trajectory) {
+        return { content: [{ type: "text", text: "No matching trajectory found." }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(trajectory, null, 2) }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
     }
@@ -299,6 +389,39 @@ server.tool(
 );
 
 server.tool(
+  "recent_entries",
+  "List the most recent AI coding agent history entries across all sources, newest first. " +
+    "This is the contract alias for recent_history.",
+  {
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .default(20)
+      .describe("Number of entries to return. Default: 20."),
+    project: z
+      .string()
+      .optional()
+      .describe('Filter by project directory/path or projectId (exact match in the SDK).'),
+  },
+  READ_ONLY,
+  async ({ limit, project }) => {
+    try {
+      const hist = await getHist();
+      const entries = hist.recent({ limit, project });
+      if (entries.length === 0) return { content: [{ type: "text", text: "No history entries found." }] };
+      const lines = [`Most recent ${entries.length} entries:\n`];
+      for (const e of entries) lines.push(fmtEntry(e, 150));
+      return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
   "pack_evidence",
   "Search history and assemble a concise evidence bundle ready to paste into a new " +
     "LLM context window. Returns numbered entries with timestamps, source, project path, " +
@@ -383,6 +506,40 @@ server.tool(
       }
       lines.push(`\nData source: ${hist.sourceKind} (${hist.dbPath})`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "stats",
+  "Contract alias for history_stats. Return total counts by source, date range, top projects, and data source.",
+  READ_ONLY,
+  async () => {
+    try {
+      const hist = await getHist();
+      const s = hist.stats();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                total: s.total,
+                bySource: s.bySource,
+                byProject: s.byProject,
+                firstTimestampMs: s.firstTimestampMs,
+                lastTimestampMs: s.lastTimestampMs,
+                sourceKind: hist.sourceKind,
+                dbPath: hist.dbPath,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
     }

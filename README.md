@@ -1,6 +1,6 @@
 # ai-hist
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), and [Agent Relay](https://github.com/AgentWorkforce/relay) conversation history into a local SQLite database with full-text search.
+Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
 **Zero dependencies** — Python 3.8+ standard library only. Single file.
 
@@ -36,6 +36,7 @@ ai-hist sync
 ai-hist search "authentication bug"
 ai-hist search "refactor" --source claude --limit 10
 ai-hist search "deploy" --source relay
+ai-hist search "retry policy" --source trajectory
 ai-hist search "deploy" --project relay
 
 # Recent prompts
@@ -92,7 +93,7 @@ Top 10 projects:
 
 ## How it works
 
-ai-hist supports four sources:
+ai-hist supports five sources:
 
 | Source | How | Key fields |
 |--------|-----|------------|
@@ -100,6 +101,7 @@ ai-hist supports four sources:
 | Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
 | Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
+| Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
 
 **Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
 
@@ -109,6 +111,45 @@ ai-hist supports four sources:
 export RELAYCAST_API_KEY="rk_live_..."
 export RELAYCAST_WORKSPACE_ID="ws_abc123"
 ```
+
+**Trajectories** are synced from compacted per-run JSON files. Configure an explicit root with:
+
+```bash
+export TRAJECTORY_ROOT="/path/to/repo/.trajectories"
+```
+
+ai-hist scans `$TRAJECTORY_ROOT/**/compacted/*.json`. Without `TRAJECTORY_ROOT`, it discovers `~/Projects/**/.trajectories/**/compacted/*.json`.
+
+The runtime contract is one JSON file per completed run:
+
+```json
+{
+  "id": "run-id",
+  "version": 1,
+  "personaId": "planner",
+  "projectId": "agent-workforce",
+  "task": { "title": "Task title", "description": "Task description" },
+  "status": "completed",
+  "startedAt": "2026-06-06T10:00:00.000Z",
+  "completedAt": "2026-06-06T10:05:00.000Z",
+  "decisions": [
+    {
+      "question": "What should we do?",
+      "chosen": "Chosen option",
+      "reasoning": "Why this option won",
+      "alternatives": ["Other option"]
+    }
+  ],
+  "retrospective": {
+    "summary": "What happened",
+    "approach": "How the work was done",
+    "learnings": ["What to carry forward"],
+    "confidence": 0.8
+  }
+}
+```
+
+Aggregate `trail compact` artifacts are intentionally not the ai-hist interface; ai-hist indexes the runtime-emitted per-run contract files.
 
 All sources are indexed with [FTS5](https://www.sqlite.org/fts5.html) full-text search. Deduplication uses `INSERT OR IGNORE` on a `UNIQUE(source, timestamp_ms, prompt)` constraint.
 
@@ -121,6 +162,16 @@ Override with the `AI_HIST_DB` environment variable:
 ```bash
 export AI_HIST_DB="$HOME/Dropbox/ai-history/ai-history.db"
 ```
+
+## MCP server
+
+The TypeScript package exposes a stdio MCP server that wraps the SDK and serves both HOW history and WHY trajectories:
+
+```bash
+npx -y ai-hist-mcp
+```
+
+Tools include `search_history`, `recent_entries`, `get_session`, `get_context`, `stats`, `search_trajectories`, and `why_for_task`.
 
 ## Continuous sync (macOS)
 
@@ -176,7 +227,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', or 'relay'
+    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', or 'trajectory'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,
@@ -187,6 +238,8 @@ CREATE TABLE history (
 -- FTS5 full-text search index
 CREATE VIRTUAL TABLE history_fts USING fts5(prompt, project, content='history', content_rowid='id');
 ```
+
+Trajectory sync also maintains a structured `trajectories` table for decisions and retrospectives, while inserting a searchable `source='trajectory'` row into `history`.
 
 You can query the database directly with any SQLite client:
 
