@@ -17,8 +17,14 @@ import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { scanLocalSources, LOCAL_SOURCE_PATHS } from './jsonl-sources.js';
+import {
+  scanLocalTrajectories,
+  trajectoryRootDescription,
+  type TrajectoryDecision,
+  type TrajectoryRetrospective,
+} from './trajectory-sources.js';
 
-export type Source = 'claude' | 'codex' | 'cursor' | 'relay';
+export type Source = 'claude' | 'codex' | 'cursor' | 'relay' | 'trajectory';
 
 export interface HistoryEntry {
   id: number;
@@ -61,6 +67,31 @@ export interface Stats {
   lastTimestampMs: number | null;
 }
 
+export interface TrajectoryEntry {
+  id: string;
+  version: number | null;
+  personaId: string | null;
+  projectId: string | null;
+  task: {
+    title: string | null;
+    description: string | null;
+  };
+  status: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  decisions: TrajectoryDecision[];
+  retrospective: TrajectoryRetrospective;
+  searchText: string;
+  path: string | null;
+  updatedMs: number;
+  timestampMs: number;
+}
+
+export interface TrajectorySearchOptions {
+  /** Default 20. */
+  limit?: number;
+}
+
 /** Resolve the SQLite path the Python CLI writes to. */
 export function defaultDbPath(): string {
   const fromEnv = process.env.AI_HIST_DB;
@@ -74,6 +105,28 @@ function getSqlJs(): Promise<SqlJsStatic> {
     _sqlPromise = initSqlJs();
   }
   return _sqlPromise;
+}
+
+function ensureTrajectorySchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS trajectories (
+    id TEXT PRIMARY KEY,
+    version INTEGER,
+    persona_id TEXT,
+    project_id TEXT,
+    task_title TEXT,
+    task_description TEXT,
+    status TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    decisions_json TEXT NOT NULL,
+    retrospective_json TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    path TEXT,
+    updated_ms INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)');
 }
 
 export interface OpenOptions {
@@ -114,6 +167,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   if (await pathExists(dbPath)) {
     const fileBuffer = await readFile(dbPath);
     const db = new SQL.Database(fileBuffer);
+    ensureTrajectorySchema(db);
     // The Python CLI's schema doesn't create `idx_history_session` or
     // `idx_history_timestamp`. Without them, listSessions degrades to
     // an O(sessions × rows) full table scan and freezes the WASM
@@ -150,24 +204,60 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   )`);
   db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
   db.run('CREATE INDEX idx_history_session ON history (session_id)');
+  ensureTrajectorySchema(db);
 
   // scanLocalSources is async with yields between sources so the event
   // loop stays responsive while we scan many MB of JSONL.
   const rows = await scanLocalSources();
+  const trajectories = await scanLocalTrajectories();
 
   const insert = db.prepare(
     'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms) VALUES (?, ?, ?, ?, ?)',
+  );
+  const insertTrajectory = db.prepare(
+    `INSERT OR REPLACE INTO trajectories
+     (id, version, persona_id, project_id, task_title, task_description, status,
+      started_at, completed_at, decisions_json, retrospective_json, search_text,
+      path, updated_ms, timestamp_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   try {
     db.exec('BEGIN');
     for (const row of rows) {
       insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs]);
     }
+    for (const trajectory of trajectories) {
+      insertTrajectory.run([
+        trajectory.id,
+        trajectory.version,
+        trajectory.personaId,
+        trajectory.projectId,
+        trajectory.task.title,
+        trajectory.task.description,
+        trajectory.status,
+        trajectory.startedAt,
+        trajectory.completedAt,
+        JSON.stringify(trajectory.decisions),
+        JSON.stringify(trajectory.retrospective),
+        trajectory.searchText,
+        trajectory.path,
+        trajectory.updatedMs,
+        trajectory.timestampMs,
+      ]);
+      insert.run([
+        'trajectory',
+        trajectory.id,
+        trajectory.projectId,
+        trajectory.searchText,
+        trajectory.timestampMs,
+      ]);
+    }
     db.exec('COMMIT');
   } finally {
     insert.free();
+    insertTrajectory.free();
   }
-  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}`;
+  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}, ${trajectoryRootDescription()}`;
   return new AiHist(db, { kind: 'jsonl', path: scannedPaths });
 }
 
@@ -189,6 +279,24 @@ interface RawHistoryRow {
   timestamp_ms: number;
 }
 
+interface RawTrajectoryRow {
+  id: string;
+  version: number | null;
+  persona_id: string | null;
+  project_id: string | null;
+  task_title: string | null;
+  task_description: string | null;
+  status: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  decisions_json: string;
+  retrospective_json: string;
+  search_text: string;
+  path: string | null;
+  updated_ms: number;
+  timestamp_ms: number;
+}
+
 function rowToEntry(row: RawHistoryRow): HistoryEntry {
   return {
     id: row.id,
@@ -196,6 +304,41 @@ function rowToEntry(row: RawHistoryRow): HistoryEntry {
     sessionId: row.session_id,
     project: row.project,
     prompt: row.prompt,
+    timestampMs: row.timestamp_ms,
+  };
+}
+
+function parseJson<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function rowToTrajectory(row: RawTrajectoryRow): TrajectoryEntry {
+  return {
+    id: row.id,
+    version: row.version,
+    personaId: row.persona_id,
+    projectId: row.project_id,
+    task: {
+      title: row.task_title,
+      description: row.task_description,
+    },
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    decisions: parseJson<TrajectoryDecision[]>(row.decisions_json, []),
+    retrospective: parseJson<TrajectoryRetrospective>(row.retrospective_json, {
+      summary: null,
+      approach: null,
+      learnings: [],
+      confidence: null,
+    }),
+    searchText: row.search_text,
+    path: row.path,
+    updatedMs: row.updated_ms,
     timestampMs: row.timestamp_ms,
   };
 }
@@ -404,6 +547,35 @@ export class AiHist {
        LIMIT ?`,
       [...params, limit],
     ).map(rowToEntry);
+  }
+
+  /** Search compacted per-run trajectory WHY: decisions and retrospectives. */
+  searchTrajectories(query: string, opts: TrajectorySearchOptions = {}): TrajectoryEntry[] {
+    const trimmed = query.trim();
+    if (!trimmed) return [];
+    const limit = opts.limit ?? 20;
+    const escaped = trimmed.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const pattern = `%${escaped}%`;
+    return runQuery<RawTrajectoryRow>(
+      this.db,
+      `SELECT id, version, persona_id, project_id, task_title, task_description, status,
+              started_at, completed_at, decisions_json, retrospective_json, search_text,
+              path, updated_ms, timestamp_ms
+       FROM trajectories
+       WHERE LOWER(search_text) LIKE LOWER(?) ESCAPE '\\'
+          OR LOWER(COALESCE(task_title, '')) LIKE LOWER(?) ESCAPE '\\'
+          OR LOWER(COALESCE(task_description, '')) LIKE LOWER(?) ESCAPE '\\'
+          OR LOWER(COALESCE(persona_id, '')) LIKE LOWER(?) ESCAPE '\\'
+          OR LOWER(COALESCE(project_id, '')) LIKE LOWER(?) ESCAPE '\\'
+       ORDER BY timestamp_ms DESC
+       LIMIT ?`,
+      [pattern, pattern, pattern, pattern, pattern, limit],
+    ).map(rowToTrajectory);
+  }
+
+  /** Best-matching per-run trajectory for a task query, or `null` if none match. */
+  whyForTask(query: string): TrajectoryEntry | null {
+    return this.searchTrajectories(query, { limit: 1 })[0] ?? null;
   }
 
   /** Single entry by id, or `null` if not found. */

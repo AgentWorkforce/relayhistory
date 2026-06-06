@@ -35,6 +35,8 @@ CODEX_SESSIONS_DIRS = [
 ]
 
 CURSOR_ROOT = Path.home() / ".cursor" / "projects"
+TRAJECTORY_ROOT = os.environ.get("TRAJECTORY_ROOT", "")
+DEFAULT_TRAJECTORY_SEARCH_ROOT = Path.home() / "Projects"
 
 # --- Schema ------------------------------------------------------------------
 
@@ -52,6 +54,27 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     prompt, project, content='history', content_rowid='id'
 );
+CREATE TABLE IF NOT EXISTS trajectories (
+    id TEXT PRIMARY KEY,
+    version INTEGER,
+    persona_id TEXT,
+    project_id TEXT,
+    task_title TEXT,
+    task_description TEXT,
+    status TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    decisions_json TEXT NOT NULL,
+    retrospective_json TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    path TEXT,
+    updated_ms INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
+    search_text, task_title, task_description, persona_id, project_id,
+    content='trajectories', content_rowid='rowid'
+);
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
     INSERT INTO history_fts(rowid, prompt, project)
     VALUES (new.id, new.prompt, new.project);
@@ -65,6 +88,20 @@ END;
 CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_ai AFTER INSERT ON trajectories BEGIN
+    INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_au AFTER UPDATE ON trajectories BEGIN
+    INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+    INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_ad AFTER DELETE ON trajectories BEGIN
+    INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
 END;
 """
 
@@ -598,6 +635,243 @@ def _iso_to_ms(iso_str: str) -> int:
     return int(time.mktime(t)) * 1000 + frac
 
 
+# --- Trajectories ------------------------------------------------------------
+
+def _as_text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _json_dump(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _trajectory_roots() -> list:
+    """Resolve trajectory roots from TRAJECTORY_ROOT or ~/Projects/**/.trajectories."""
+    if TRAJECTORY_ROOT.strip():
+        roots = []
+        for raw in TRAJECTORY_ROOT.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                roots.append(Path(raw).expanduser())
+        return roots
+    if not DEFAULT_TRAJECTORY_SEARCH_ROOT.exists():
+        return []
+    return sorted(
+        p for p in DEFAULT_TRAJECTORY_SEARCH_ROOT.rglob(".trajectories")
+        if p.is_dir()
+    )
+
+
+def _iter_trajectory_files() -> list:
+    files = []
+    for root in _trajectory_roots():
+        if not root.exists():
+            continue
+        if root.is_file() and root.suffix == ".json":
+            files.append(root)
+            continue
+        search_root = root.parent if root.name == "compacted" else root
+        for compacted_dir in search_root.rglob("compacted"):
+            if not compacted_dir.is_dir():
+                continue
+            for path in compacted_dir.glob("*.json"):
+                if path.name in {"index.json", ".sync-state.json"}:
+                    continue
+                files.append(path)
+    return sorted(set(files))
+
+
+def _trajectory_timestamp_ms(obj: dict, path: Path) -> int:
+    for key in ("completedAt", "startedAt", "compactedAt"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            ts = _iso_to_ms(value)
+            if ts:
+                return ts
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return 0
+
+
+def _trajectory_search_text(obj: dict) -> str:
+    task = obj.get("task") if isinstance(obj.get("task"), dict) else {}
+    retrospective = obj.get("retrospective") if isinstance(obj.get("retrospective"), dict) else {}
+    parts = [
+        _as_text(obj.get("id")),
+        _as_text(obj.get("personaId")),
+        _as_text(obj.get("projectId")),
+        _as_text(obj.get("status")),
+        _as_text(task.get("title")),
+        _as_text(task.get("description")),
+    ]
+
+    for decision in _as_list(obj.get("decisions")):
+        if not isinstance(decision, dict):
+            continue
+        parts.extend([
+            _as_text(decision.get("question")),
+            _as_text(decision.get("chosen")),
+            _as_text(decision.get("reasoning")),
+        ])
+        parts.extend(_as_text(item) for item in _as_list(decision.get("alternatives")))
+
+    parts.extend([
+        _as_text(retrospective.get("summary")),
+        _as_text(retrospective.get("approach")),
+        str(retrospective.get("confidence")) if retrospective.get("confidence") is not None else "",
+    ])
+    parts.extend(_as_text(item) for item in _as_list(retrospective.get("learnings")))
+    return "\n".join(part for part in parts if part)
+
+
+def parse_trajectory_file(path: Path):
+    """Parse a compacted trajectory JSON file using the locked A/B contract."""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    trajectory_id = obj.get("id")
+    if not isinstance(trajectory_id, str) or not trajectory_id:
+        return None
+    if (
+        obj.get("type") == "compacted"
+        and isinstance(obj.get("sourceTrajectories"), list)
+        and not any(key in obj for key in ("task", "retrospective", "personaId", "projectId"))
+    ):
+        return None
+
+    task = obj.get("task") if isinstance(obj.get("task"), dict) else {}
+    retrospective = obj.get("retrospective") if isinstance(obj.get("retrospective"), dict) else {}
+    decisions = [d for d in _as_list(obj.get("decisions")) if isinstance(d, dict)]
+    search_text = _trajectory_search_text(obj)
+    ts_ms = _trajectory_timestamp_ms(obj, path)
+    try:
+        updated_ms = int(path.stat().st_mtime * 1000)
+    except OSError:
+        updated_ms = ts_ms
+
+    return {
+        "id": trajectory_id,
+        "version": obj.get("version") if isinstance(obj.get("version"), int) else None,
+        "persona_id": obj.get("personaId") if isinstance(obj.get("personaId"), str) else None,
+        "project_id": obj.get("projectId") if isinstance(obj.get("projectId"), str) else None,
+        "task_title": task.get("title") if isinstance(task.get("title"), str) else None,
+        "task_description": task.get("description") if isinstance(task.get("description"), str) else None,
+        "status": obj.get("status") if isinstance(obj.get("status"), str) else None,
+        "started_at": obj.get("startedAt") if isinstance(obj.get("startedAt"), str) else None,
+        "completed_at": obj.get("completedAt") if isinstance(obj.get("completedAt"), str) else None,
+        "decisions_json": _json_dump(decisions),
+        "retrospective_json": _json_dump(retrospective if isinstance(retrospective, dict) else {}),
+        "search_text": search_text,
+        "path": str(path),
+        "updated_ms": updated_ms,
+        "timestamp_ms": ts_ms,
+    }
+
+
+def sync_trajectories(conn: sqlite3.Connection, state: dict):
+    """Sync compacted trajectory JSON files into structured and history indexes."""
+    trajectory_state = state.get("trajectory", {})
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    files = _iter_trajectory_files()
+
+    for path in files:
+        key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            errors += 1
+            continue
+        stamp = f"{int(stat.st_mtime)}:{stat.st_size}"
+        if trajectory_state.get(key) == stamp:
+            skipped += 1
+            continue
+        row = parse_trajectory_file(path)
+        if not row:
+            skipped += 1
+            continue
+        before = conn.execute(
+            "SELECT 1 FROM trajectories WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        try:
+            conn.execute(
+                """
+                INSERT INTO trajectories
+                (id, version, persona_id, project_id, task_title, task_description, status,
+                 started_at, completed_at, decisions_json, retrospective_json, search_text,
+                 path, updated_ms, timestamp_ms)
+                VALUES
+                (:id, :version, :persona_id, :project_id, :task_title, :task_description, :status,
+                 :started_at, :completed_at, :decisions_json, :retrospective_json, :search_text,
+                 :path, :updated_ms, :timestamp_ms)
+                ON CONFLICT(id) DO UPDATE SET
+                  version=excluded.version,
+                  persona_id=excluded.persona_id,
+                  project_id=excluded.project_id,
+                  task_title=excluded.task_title,
+                  task_description=excluded.task_description,
+                  status=excluded.status,
+                  started_at=excluded.started_at,
+                  completed_at=excluded.completed_at,
+                  decisions_json=excluded.decisions_json,
+                  retrospective_json=excluded.retrospective_json,
+                  search_text=excluded.search_text,
+                  path=excluded.path,
+                  updated_ms=excluded.updated_ms,
+                  timestamp_ms=excluded.timestamp_ms
+                """,
+                row,
+            )
+            conn.execute(
+                "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?",
+                (row["id"],),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "trajectory",
+                    row["id"],
+                    row["project_id"],
+                    row["search_text"],
+                    _prompt_hash(row["search_text"]),
+                    row["timestamp_ms"],
+                ),
+            )
+        except sqlite3.Error:
+            errors += 1
+            continue
+        trajectory_state[key] = stamp
+        if before:
+            updated += 1
+        else:
+            inserted += 1
+
+    conn.commit()
+    state["trajectory"] = trajectory_state
+    if files:
+        parts = [f"+{inserted:,} rows"]
+        if updated:
+            parts.append(f"{updated:,} updated")
+        if skipped:
+            parts.append(f"{skipped:,} unchanged")
+        if errors:
+            parts.append(f"{errors} errors")
+        print(f"  [trajectory] " + ", ".join(parts))
+
+
 # --- Core --------------------------------------------------------------------
 
 def init_db(conn: sqlite3.Connection):
@@ -610,6 +884,8 @@ def init_db(conn: sqlite3.Connection):
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.execute("CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)")
 
 
 def load_state() -> dict:
@@ -700,6 +976,9 @@ def cmd_sync(args=None):
 
     # Sync Relaycast (opt-in via env vars)
     sync_relaycast(conn, state)
+
+    # Sync compacted per-run trajectory artifacts (decision WHY)
+    sync_trajectories(conn, state)
 
     save_state(state)
     total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
@@ -1324,7 +1603,7 @@ def main():
 
     s = sub.add_parser("search", help="Full-text search prompts")
     s.add_argument("query", nargs="+", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
-    s.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    s.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
     s.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
@@ -1332,7 +1611,7 @@ def main():
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
-    r.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    r.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
     r.add_argument("--project", help="Filter by project path (substring match)")
     r.add_argument("--json", action="store_true", help="Output as JSON array")
 
@@ -1354,7 +1633,7 @@ def main():
 
     pk = sub.add_parser("pack", help="Evidence bundle for LLM handoff (search + resume commands)")
     pk.add_argument("query", nargs="+", help="Search terms")
-    pk.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    pk.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
     pk.add_argument("--project", help="Filter by project path (substring match)")
     pk.add_argument("--limit", type=int, default=10, help="Max entries (default: 10)")
     pk.add_argument("--tokens", type=int, default=0, help="Truncate each prompt to ~N tokens (4 chars/token)")
@@ -1372,7 +1651,7 @@ def main():
     exp = sub.add_parser("export", help="Export history to a portable JSONL or SQLite file")
     exp.add_argument("output", nargs="?", help="Output file (default: stdout). Use .gz for compression.")
     exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
-    exp.add_argument("--source", choices=["claude", "codex", "cursor", "relay"], help="Filter by source")
+    exp.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
     exp.add_argument("--project", help="Filter by project path (substring)")
     exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
 

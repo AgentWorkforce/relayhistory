@@ -1,0 +1,30 @@
+{
+  "name": "ai-hist-mcp",
+  "version": "0.3.0",
+  "description": "Thin npx wrapper for the ai-hist stdio MCP server.",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "ai-hist-mcp": "./bin/ai-hist-mcp.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "package.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgentWorkforce/ai-hist",
+    "directory": "mcp-package"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "ai-hist": ">=0.3.0 <1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

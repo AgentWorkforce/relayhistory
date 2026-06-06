@@ -1,9 +1,9 @@
-name: Publish ai-hist (TS SDK)
+name: Publish ai-hist packages
 
-# Single-package adaptation of workforce's publish workflow.
-# Publishes `ai-hist` from the `sdk-ts/` subdirectory to npm via
-# OIDC trusted-publisher flow (no NPM_TOKEN). The Python `ai-hist`
-# script in the repo root is independent and not published here.
+# Publishes `ai-hist` from `sdk-ts/` and the thin `ai-hist-mcp`
+# npx wrapper from `mcp-package/` to npm via OIDC trusted-publisher
+# flow (no NPM_TOKEN). The Python `ai-hist` script in the repo root is
+# independent and not published here.
 
 on:
   workflow_dispatch:
@@ -116,6 +116,27 @@ jobs:
             exit 1
           fi
           echo "$NPM_NAME@$VERSION: unpublished — OK"
+          MCP_EXISTS=$(npm view "ai-hist-mcp@$VERSION" version 2>/dev/null || true)
+          if [ -n "$MCP_EXISTS" ]; then
+            echo "::error title=Version already published::ai-hist-mcp@$VERSION is already on npm. Pick a different bump type or set custom_version to a higher version."
+            exit 1
+          fi
+          echo "ai-hist-mcp@$VERSION: unpublished — OK"
+
+      - name: Sync MCP wrapper version
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          export VERSION='${{ steps.bump.outputs.version }}'
+          node - <<'NODE'
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const version = process.env.VERSION;
+          const path = 'mcp-package/package.json';
+          const pkg = JSON.parse(readFileSync(path, 'utf8'));
+          pkg.version = version;
+          pkg.dependencies = { ...pkg.dependencies, 'ai-hist': version };
+          writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
 
       # CHANGELOG.md generation. If `## [Unreleased]` contains hand-curated
       # content, promote it verbatim into the new `## [x.y.z] - DATE` block.
@@ -310,6 +331,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sdk-ts/package.json
+          git add mcp-package/package.json
           # CHANGELOG only exists once there's been at least one release with
           # Unreleased content or a prior tag — skip silently on first publish.
           if [ -f sdk-ts/CHANGELOG.md ]; then
@@ -343,6 +365,19 @@ jobs:
           echo "==> npm publish $FLAGS"
           npm publish $FLAGS
 
+      - name: Publish MCP wrapper to npm
+        working-directory: ${{ github.workspace }}/mcp-package
+        run: |
+          set -euo pipefail
+          FLAGS="--access public --tag ${{ github.event.inputs.tag }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS+=" --dry-run"
+          else
+            FLAGS+=" --provenance"
+          fi
+          echo "==> npm publish ai-hist-mcp $FLAGS"
+          npm publish $FLAGS
+
       # Annotated tag (-a) so `git push --follow-tags` actually pushes it.
       - name: Tag + push
         if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.version != 'none' || github.event.inputs.custom_version != '') }}
@@ -357,6 +392,7 @@ jobs:
             echo "### Published"
             echo ""
             echo "- \`${{ steps.bump.outputs.npm_name }}@${{ steps.bump.outputs.version }}\`"
+            echo "- \`ai-hist-mcp@${{ steps.bump.outputs.version }}\`"
             echo "- **dist-tag**: \`${{ github.event.inputs.tag }}\`"
             echo "- **dry run**: \`${{ github.event.inputs.dry_run }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
