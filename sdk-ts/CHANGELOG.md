@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-06
+
+### Added
+
+- **Add ai-hist-mcp wrapper package**
+- **Add ai-hist MCP trajectory source**
+- **Add TypeScript MCP server and Smithery config for ai-hist-mcp**
+
+### Documentation
+
+- Keep MCP local-first
+
+### Dependencies
+
+- Apply pr-reviewer fixes for #9 (#9)
+- Apply pr-reviewer fixes for #9 (#9)
+
 ## [0.2.3] - 2026-05-22
 
 ### Changed
