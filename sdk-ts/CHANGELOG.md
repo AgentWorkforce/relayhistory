@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-12
+
+### Added
+
+- **Add MCP project scope argument**
+
+### Dependencies
+
+- Apply pr-reviewer fixes for #11 (#11)
+- Apply pr-reviewer fixes for #11 (#11)
+
 ## [0.3.1] - 2026-06-06
 
 ### Added
