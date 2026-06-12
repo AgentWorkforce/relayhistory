@@ -118,7 +118,7 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ai-hist-mcp-')));
   const dbPath = join(root, 'history.db');
   await writeScopeFixtureDb(dbPath);
-  const child = spawn(process.execPath, [new URL('./mcp-server.js', import.meta.url).pathname, '--project', '.'], {
+  const child = spawn(process.execPath, [new URL('./mcp-server.js', import.meta.url).pathname, '--project', '--project-path=.'], {
     cwd: root,
     env: {
       ...process.env,

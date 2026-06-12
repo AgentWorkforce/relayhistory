@@ -31,9 +31,12 @@ function configuredProjectScope(): string | undefined {
   for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
     if (arg === "--project" || arg === "--project-path") {
-      const value = normalizeProjectArg(process.argv[i + 1]);
-      if (value) return value;
-      i++;
+      const next = process.argv[i + 1];
+      if (next && !next.startsWith("-")) {
+        const value = normalizeProjectArg(next);
+        if (value) return value;
+        i++;
+      }
       continue;
     }
     for (const prefix of ["--project=", "--project-path="]) {
