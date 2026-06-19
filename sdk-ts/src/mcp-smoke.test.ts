@@ -218,6 +218,7 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
       'stats',
       'search_trajectories',
       'why_for_task',
+      'get_handoff',
     ]) {
       assert.ok(tools.has(name), `missing MCP tool ${name}`);
     }
@@ -241,7 +242,20 @@ async function writeScopeFixtureDb(dbPath: string): Promise<void> {
       session_id TEXT,
       project TEXT,
       prompt TEXT NOT NULL,
-      timestamp_ms INTEGER NOT NULL
+      timestamp_ms INTEGER NOT NULL,
+      git_branch TEXT
+    )`);
+    db.run(`CREATE TABLE sessions (
+      session_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      cwd TEXT,
+      git_branch TEXT,
+      first_activity_ms INTEGER,
+      last_activity_ms INTEGER,
+      last_assistant_text TEXT,
+      raw_path TEXT,
+      parser_version INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (session_id, source)
     )`);
     db.run(`CREATE TABLE trajectories (
       id TEXT PRIMARY KEY,
