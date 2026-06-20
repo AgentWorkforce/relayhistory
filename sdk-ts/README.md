@@ -145,7 +145,7 @@ The runtime contract is one JSON file per completed run:
 
 ## Schema
 
-The canonical schema is owned by the Python tool:
+The canonical ai-hist SQLite schema is:
 
 ```sql
 CREATE TABLE history (

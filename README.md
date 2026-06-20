@@ -16,6 +16,7 @@ cd ai-hist
 cargo build --release -p ai-hist-cli
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/ai-hist" ~/.local/bin/ai-hist
+export AI_HIST_RUST_BIN="$(pwd)/target/release/ai-hist"  # add to .zshrc / .bashrc
 ```
 
 Make sure `~/.local/bin` is in your `PATH`:
@@ -34,7 +35,7 @@ Escape hatches:
 ```bash
 AI_HIST_CLI=rust ai-hist search deploy
 AI_HIST_CLI=python ai-hist sync
-AI_HIST_RUST_BIN=target/release/ai-hist ai-hist search deploy
+AI_HIST_RUST_BIN=/absolute/path/to/ai-hist/target/release/ai-hist ai-hist search deploy
 ./ai-hist-rust search deploy        # from a source checkout
 ./ai-hist-python sync               # from a source checkout
 ```
@@ -211,6 +212,11 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
         <string>${HOME}/.local/bin/ai-hist</string>
         <string>sync</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_HIST_RUST_BIN</key>
+        <string>/absolute/path/to/ai-hist/target/release/ai-hist</string>
+    </dict>
     <key>StartInterval</key>
     <integer>60</integer>
     <key>RunAtLoad</key>
