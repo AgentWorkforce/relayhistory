@@ -2,9 +2,8 @@
 """
 Rust-first ai-hist dispatcher.
 
-The Rust CLI is the default for commands whose flag surface is covered by the
-cutover tests. Python remains available as the legacy fallback for sync and for
-Python-only flags while parity work continues.
+The Rust CLI is the default for user-facing commands covered by the cutover
+tests. Python remains available as an explicit legacy escape hatch.
 """
 
 import os
@@ -23,10 +22,6 @@ RUST_COMMANDS = {
     "session",
     "resume",
     "sync-opencode",
-}
-
-PYTHON_COMMANDS = {
-    "sync",
     "show",
     "context",
     "stats",
@@ -37,12 +32,12 @@ PYTHON_COMMANDS = {
     "tag",
     "untag",
     "tags",
+    "sync",
 }
 
-PYTHON_ONLY_FLAGS = {
-    "session": {"--full"},
-    "resume": {"--json"},
-}
+PYTHON_COMMANDS = set()
+
+PYTHON_ONLY_FLAGS = {}
 
 
 def main():
@@ -104,12 +99,9 @@ Usage:
 Rust-default commands:
   search         Full-text search prompts
   recent         Show most recent entries
-  session        Show all prompts in a session (except --full)
-  resume         Print a resume command (except --json)
+  session        Show all prompts in a session
+  resume         Print a resume command
   sync-opencode  Sync OpenCode history explicitly
-
-Python fallback commands:
-  sync           Full-source sync
   show           Show full details for an entry by ID
   context        Show entries around an ID
   stats          Show summary statistics
@@ -121,9 +113,8 @@ Python fallback commands:
   untag          Remove a tag from a session
   tags           List tags and tagged sessions
 
-Fallback flags:
-  session --full
-  resume --json
+Python fallback commands:
+  (none in auto mode; use the explicit escape hatches for legacy compatibility)
 
 Escape hatches:
   AI_HIST_CLI=auto|rust|python

@@ -9,15 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Add a scoped Rust-first `ai-hist` wrapper with explicit Python fallback for
-  commands and flags that are not full Rust parity yet.
-- Preserve legacy full-source sync and richer export/import/tagging behavior on
-  the Python fallback path during the cutover.
+- Make the public `ai-hist` command Rust-default for the user-facing CLI
+  surface, including sync, show/context/session, stats, pack, resume,
+  export/import, and tagging commands.
+- Add a one-command installer that builds and installs deterministic `ai-hist`,
+  `ai-hist-rust`, and `ai-hist-python` launchers without requiring users to run
+  Cargo commands manually.
+- Keep the legacy Python CLI as an explicit compatibility escape hatch via
+  `AI_HIST_CLI=python` or `ai-hist-python`.
 
 ### Fixed
 
 - Align Rust default database path with `XDG_DATA_HOME`.
 - Create legacy session metadata schema from Rust DB initialization.
+- Set WAL mode from Rust DB initialization.
 - Keep the legacy Python fallback importable on Python 3.9.6 by avoiding PEP
   604-only annotations.
 

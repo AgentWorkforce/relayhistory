@@ -2,21 +2,15 @@
 
 Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
-`ai-hist` is in a scoped Rust cutover. The public `ai-hist` command is now a
-Rust-first wrapper: parity-proven commands run through Rust, and Python-only
-commands/flags route to the legacy Python CLI with an explicit deprecation
-warning. See [DISPATCH_MATRIX.md](DISPATCH_MATRIX.md) for the tested routing
-table.
+`ai-hist` is now a Rust-default CLI. The public `ai-hist` command dispatches
+the user-facing command surface through Rust, while the legacy Python CLI
+remains available only as an explicit compatibility escape hatch. See
+[DISPATCH_MATRIX.md](DISPATCH_MATRIX.md) for the tested parity table.
 
 ## Install
 
 ```bash
-git clone https://github.com/AgentWorkforce/relayhistory.git ai-hist
-cd ai-hist
-cargo build --release -p ai-hist-cli
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/ai-hist" ~/.local/bin/ai-hist
-export AI_HIST_RUST_BIN="$(pwd)/target/release/ai-hist"  # add to .zshrc / .bashrc
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | sh
 ```
 
 Make sure `~/.local/bin` is in your `PATH`:
@@ -25,19 +19,23 @@ Make sure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
 ```
 
-Legacy fallback is still required for `sync`, `show`, `context`, `pack`,
-`watch`, `export`, `import`, `tag`, `untag`, `tags`, and richer overlapping
-flags such as `session --full` and `resume --json`. The fallback has been
-verified on Python 3.9.6 in this cutover.
+The installer owns the Rust build and installs deterministic launchers for
+`ai-hist`, `ai-hist-python`, and `ai-hist-rust`. It requires `cargo` and
+`python3`; if Rust is missing, install it from <https://rustup.rs/> and rerun
+the script.
+
+Normal use does not require manually running Cargo commands. The install script
+builds the Rust binary, places it under the ai-hist install directory, and
+writes launchers that point the wrapper at that exact binary.
 
 Escape hatches:
 
 ```bash
 AI_HIST_CLI=rust ai-hist search deploy
-AI_HIST_CLI=python ai-hist sync
-AI_HIST_RUST_BIN=/absolute/path/to/ai-hist/target/release/ai-hist ai-hist search deploy
-./ai-hist-rust search deploy        # from a source checkout
-./ai-hist-python sync               # from a source checkout
+AI_HIST_CLI=python ai-hist sync   # explicit legacy compatibility path
+AI_HIST_RUST_BIN=/absolute/path/to/ai-hist-rust-bin ai-hist search deploy
+ai-hist-rust search deploy
+ai-hist-python sync
 ```
 
 ## Usage
@@ -118,7 +116,7 @@ ai-hist supports these sources:
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
 | OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions |
 
-**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used. During the Rust cutover, full-source `ai-hist sync` still runs through the legacy Python fallback.
+**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
 
 **Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
 
@@ -215,7 +213,7 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
     <key>EnvironmentVariables</key>
     <dict>
         <key>AI_HIST_RUST_BIN</key>
-        <string>/absolute/path/to/ai-hist/target/release/ai-hist</string>
+        <string>${HOME}/.local/share/ai-hist/ai-hist-rust-bin</string>
     </dict>
     <key>StartInterval</key>
     <integer>60</integer>

@@ -73,12 +73,12 @@ def seed_via_wrapper(tmp_path):
     write_history(home)
     result = run_cli(["sync"], env)
     assert result.returncode == 0, result.stderr
-    assert "using deprecated Python fallback" in result.stderr
+    assert "using deprecated Python fallback" not in result.stderr
     assert "Total:" in result.stdout
     return env, db
 
 
-def test_sync_routes_to_python_fallback_and_preserves_db(tmp_path):
+def test_sync_routes_to_rust_and_preserves_db(tmp_path):
     env, db = seed_via_wrapper(tmp_path)
     conn = sqlite3.connect(db)
     rows = conn.execute(
@@ -108,26 +108,37 @@ def test_search_json_routes_to_rust_with_python_compatible_shape(tmp_path):
     }
 
 
-def test_session_full_routes_to_python_fallback(tmp_path):
+def test_session_full_routes_to_rust(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
     result = run_cli(["session", "claude-dispatch", "--full"], env)
     assert result.returncode == 0, result.stderr
-    assert "using deprecated Python fallback" in result.stderr
+    assert "using deprecated Python fallback" not in result.stderr
     assert "dispatch unique claude prompt" in result.stdout
 
 
-def test_json_shape_sensitive_commands_route_to_python_fallback(tmp_path):
+def test_previously_fallback_commands_route_to_rust(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
+    export_path = tmp_path / "export.jsonl"
     for args in (
         ["stats", "--json"],
         ["tag", "claude-dispatch", "release", "--source", "claude", "--json"],
         ["resume", "dispatch", "--json"],
-        ["export", "--source", "claude"],
-        ["import", str(tmp_path / "missing.jsonl"), "--dry-run"],
         ["tags", "--sessions"],
+        ["show", "1", "--json"],
+        ["context", "1"],
+        ["pack", "dispatch", "--json"],
     ):
         result = run_cli(args, env)
-        assert "using deprecated Python fallback" in result.stderr
+        assert result.returncode == 0, (args, result.stderr)
+        assert "using deprecated Python fallback" not in result.stderr
+
+    export_result = run_cli(["export", str(export_path), "--source", "claude"], env)
+    assert export_result.returncode == 0, export_result.stderr
+    assert export_path.exists()
+
+    import_result = run_cli(["import", str(export_path), "--dry-run"], env)
+    assert import_result.returncode == 0, import_result.stderr
+    assert "dry-run" in import_result.stdout
 
 
 def test_escape_hatches_force_python_or_rust(tmp_path):

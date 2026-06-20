@@ -16,6 +16,7 @@ pub const SOURCE_CHOICES: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
+    #[serde(default)]
     pub id: i64,
     pub source: String,
     #[serde(default)]
@@ -359,7 +360,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     })
 }
 
-fn normalize_tag_name(name: &str) -> String {
+pub fn normalize_tag_name(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
