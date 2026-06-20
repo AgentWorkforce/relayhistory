@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Direct Rust ai-hist entrypoint for cutover verification and escape hatch use."""
+
+import os
+import runpy
+
+os.environ["AI_HIST_CLI"] = "rust"
+runpy.run_path(os.path.join(os.path.dirname(__file__), "ai-hist"), run_name="__main__")

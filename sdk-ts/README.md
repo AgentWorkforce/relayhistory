@@ -2,7 +2,7 @@
 
 TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, and Agent Relay.
 
-The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file the Python `ai-hist sync` tool writes, or falls back to scanning local Claude/Codex/Cursor JSONL files and compacted trajectory JSON when the database is missing.
+The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file that `ai-hist sync` writes, or falls back to scanning local Claude/Codex/Cursor JSONL files and compacted trajectory JSON when the database is missing.
 
 ## Install
 
@@ -27,7 +27,7 @@ try {
 }
 ```
 
-To require the Python-managed SQLite database instead of JSONL fallback:
+To require the ai-hist SQLite database instead of JSONL fallback:
 
 ```ts
 const hist = await openAiHist({ fallback: 'error' });
@@ -145,7 +145,7 @@ The runtime contract is one JSON file per completed run:
 
 ## Schema
 
-The canonical schema is owned by the Python tool:
+The canonical ai-hist SQLite schema is:
 
 ```sql
 CREATE TABLE history (

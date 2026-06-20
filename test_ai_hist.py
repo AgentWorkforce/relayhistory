@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 import pytest
 
-# Import the ai-hist script (no .py extension)
-_path = str(Path(__file__).parent / "ai-hist")
+# Import the legacy Python ai-hist script (no .py extension)
+_path = str(Path(__file__).parent / "ai-hist-python")
 _loader = importlib.machinery.SourceFileLoader("ai_hist", _path)
 _spec = importlib.util.spec_from_loader("ai_hist", _loader, origin=_path)
 ai_hist = importlib.util.module_from_spec(_spec)
@@ -2146,7 +2146,7 @@ class TestCmdImport:
 # ---------------------------------------------------------------------------
 
 def make_claude_session_jsonl(project_dir: Path, session_id: str, git_branch: str,
-                               cwd: str, prompts: list, last_assistant: str | None = None) -> Path:
+                               cwd: str, prompts: list, last_assistant=None) -> Path:
     """Create a fake Claude per-session JSONL file."""
     project_dir.mkdir(parents=True, exist_ok=True)
     jsonl = project_dir / f"{session_id}.jsonl"

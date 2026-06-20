@@ -2,28 +2,40 @@
 
 Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
-**Zero dependencies** — Python 3.8+ standard library only. Single file.
+`ai-hist` is now a Rust-default CLI. The public `ai-hist` command dispatches
+the user-facing command surface through Rust, while the legacy Python CLI
+remains available only as an explicit compatibility escape hatch. See
+[DISPATCH_MATRIX.md](DISPATCH_MATRIX.md) for the tested parity table.
 
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin
-curl -o ~/.local/bin/ai-hist https://raw.githubusercontent.com/khaliqgant/ai-hist/main/ai-hist
-chmod +x ~/.local/bin/ai-hist
-```
-
-Or clone and symlink:
-
-```bash
-git clone https://github.com/khaliqgant/ai-hist.git
-mkdir -p ~/.local/bin
-ln -s "$(pwd)/ai-hist/ai-hist" ~/.local/bin/ai-hist
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | sh
 ```
 
 Make sure `~/.local/bin` is in your `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
+```
+
+The installer owns the Rust build and installs deterministic launchers for
+`ai-hist`, `ai-hist-python`, and `ai-hist-rust`. It requires `cargo` and
+`python3`; if Rust is missing, install it from <https://rustup.rs/> and rerun
+the script.
+
+Normal use does not require manually running Cargo commands. The install script
+builds the Rust binary, places it under the ai-hist install directory, and
+writes launchers that point the wrapper at that exact binary.
+
+Escape hatches:
+
+```bash
+AI_HIST_CLI=rust ai-hist search deploy
+AI_HIST_CLI=python ai-hist sync   # explicit legacy compatibility path
+AI_HIST_RUST_BIN=/absolute/path/to/ai-hist-rust-bin ai-hist search deploy
+ai-hist-rust search deploy
+ai-hist-python sync
 ```
 
 ## Usage
@@ -57,7 +69,7 @@ ai-hist session abc-1234-def --full   # no truncation
 
 # Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
 cd /path/to/project && claude --resume <session_id>          # claude
-codex --resume <session_id>                                   # codex
+codex resume <session_id>                                     # codex
 cd /path/to/project && cursor-agent --resume=<session_id>    # cursor
 
 # Stats overview
@@ -93,7 +105,7 @@ Top 10 projects:
 
 ## How it works
 
-ai-hist supports five sources:
+ai-hist supports these sources:
 
 | Source | How | Key fields |
 |--------|-----|------------|
@@ -102,6 +114,7 @@ ai-hist supports five sources:
 | Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
+| OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions |
 
 **Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
 
@@ -194,10 +207,14 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
     <string>com.ai-hist.sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
         <string>${HOME}/.local/bin/ai-hist</string>
         <string>sync</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_HIST_RUST_BIN</key>
+        <string>${HOME}/.local/share/ai-hist/ai-hist-rust-bin</string>
+    </dict>
     <key>StartInterval</key>
     <integer>60</integer>
     <key>RunAtLoad</key>
@@ -213,13 +230,13 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 ```
 
-> Replace `/usr/bin/python3` with your Python path if needed (e.g., from `which python3`).
+> Replace `${HOME}/.local/bin/ai-hist` with the wrapper path you installed if needed.
 
 ### Linux (cron)
 
 ```bash
 # Sync every minute
-echo "* * * * * python3 ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | crontab -
+echo "* * * * * ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | crontab -
 ```
 
 ### Alternative: watch mode
@@ -234,7 +251,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', or 'trajectory'
+    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', 'trajectory', or 'opencode'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Make the public `ai-hist` command Rust-default for the user-facing CLI
+  surface, including sync, show/context/session, stats, pack, resume,
+  export/import, and tagging commands.
+- Add a one-command installer that builds and installs deterministic `ai-hist`,
+  `ai-hist-rust`, and `ai-hist-python` launchers without requiring users to run
+  Cargo commands manually.
+- Keep the legacy Python CLI as an explicit compatibility escape hatch via
+  `AI_HIST_CLI=python` or `ai-hist-python`.
+
+### Fixed
+
+- Align Rust default database path with `XDG_DATA_HOME`.
+- Create legacy session metadata schema from Rust DB initialization.
+- Set WAL mode from Rust DB initialization.
+- Keep the legacy Python fallback importable on Python 3.9.6 by avoiding PEP
+  604-only annotations.
+
 ## [0.3.2] - 2026-06-12
 
 ### Added
@@ -46,4 +65,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Native JSONL fallback — SDK works without the Python CLI**
-

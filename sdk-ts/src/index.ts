@@ -3,9 +3,9 @@
  *
  * Backed by sql.js (WASM SQLite) so the package has zero native build
  * requirements — works in Electron, Node, and browser contexts without
- * needing electron-rebuild. The SDK reads the same file the Python CLI
- * maintains (default `~/.local/share/ai-hist/ai-history.db`, or
- * `$AI_HIST_DB`); the Python tool stays the canonical sync engine.
+ * needing electron-rebuild. The SDK reads the same ai-hist SQLite database
+ * that `ai-hist sync` writes (default
+ * `~/.local/share/ai-hist/ai-history.db`, or `$AI_HIST_DB`).
  *
  * Trade-off vs better-sqlite3: sql.js loads the whole DB file into
  * memory. Fine for the ai-hist scale (tens of thousands of rows, MBs
@@ -158,7 +158,7 @@ export interface GetHandoffOptions {
   limit?: number;
 }
 
-/** Resolve the SQLite path the Python CLI writes to. */
+/** Resolve the SQLite path that ai-hist writes to. */
 export function defaultDbPath(): string {
   const fromEnv = process.env.AI_HIST_DB;
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
