@@ -9,6 +9,8 @@ Escape hatches:
 - `AI_HIST_CLI=auto` (default): use the routing table below.
 - `AI_HIST_CLI=rust`: force the Rust CLI.
 - `AI_HIST_CLI=python`: force the legacy Python CLI.
+- `AI_HIST_RUST_BIN=/path/to/ai-hist`: use an explicit Rust binary instead of
+  `cargo run`.
 - `./ai-hist-rust`: direct Rust entrypoint for source checkouts.
 - `./ai-hist-python`: direct legacy Python entrypoint for source checkouts.
 
@@ -39,3 +41,5 @@ Compatibility fixes included in this cutover:
   `sessions` table/indexes so fresh DBs remain compatible with sync metadata.
 - The legacy Python CLI and tests no longer use PEP 604 annotations that broke
   on the local `/usr/bin/python3` 3.9.6 runtime.
+- Top-level wrapper help lists both Rust-default and Python-fallback commands so
+  fallback commands do not appear to disappear during the cutover.

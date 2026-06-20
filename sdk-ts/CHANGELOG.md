@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Add a scoped Rust-first `ai-hist` wrapper with explicit Python fallback for
+  commands and flags that are not full Rust parity yet.
+- Preserve legacy full-source sync and richer export/import/tagging behavior on
+  the Python fallback path during the cutover.
+
+### Fixed
+
+- Align Rust default database path with `XDG_DATA_HOME`.
+- Create legacy session metadata schema from Rust DB initialization.
+- Keep the legacy Python fallback importable on Python 3.9.6 by avoiding PEP
+  604-only annotations.
+
 ## [0.3.2] - 2026-06-12
 
 ### Added
@@ -46,4 +60,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Native JSONL fallback — SDK works without the Python CLI**
-

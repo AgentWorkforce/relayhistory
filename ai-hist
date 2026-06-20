@@ -60,6 +60,10 @@ def main():
     if mode == "rust":
         return run_rust(argv)
 
+    if is_top_level_help(argv):
+        print_wrapper_help()
+        return 0
+
     route, reason = route_auto(argv)
     if route == "python":
         return run_python(argv, warn=True, reason=reason)
@@ -68,9 +72,9 @@ def main():
 
 def route_auto(argv):
     if not argv:
-        return "rust", None
+        return "help", None
     first = argv[0]
-    if first in {"-h", "--help", "-V", "--version", "help"}:
+    if first in {"-V", "--version"}:
         return "rust", None
     if first in PYTHON_COMMANDS:
         return "python", f"`{first}` is still implemented by the legacy Python CLI"
@@ -86,6 +90,51 @@ def route_auto(argv):
     return "rust", None
 
 
+def is_top_level_help(argv):
+    return not argv or argv in (["-h"], ["--help"], ["help"])
+
+
+def print_wrapper_help():
+    print(
+        """ai-hist: Rust-first AI history CLI with legacy Python fallback
+
+Usage:
+  ai-hist [COMMAND] [OPTIONS]
+
+Rust-default commands:
+  search         Full-text search prompts
+  recent         Show most recent entries
+  session        Show all prompts in a session (except --full)
+  resume         Print a resume command (except --json)
+  sync-opencode  Sync OpenCode history explicitly
+
+Python fallback commands:
+  sync           Full-source sync
+  show           Show full details for an entry by ID
+  context        Show entries around an ID
+  stats          Show summary statistics
+  pack           Evidence bundle for LLM handoff
+  watch          Continuous sync loop
+  export         Export JSONL/gzip/SQLite with filters
+  import         Import JSONL/gzip/SQLite with dry-run support
+  tag            Tag a session
+  untag          Remove a tag from a session
+  tags           List tags and tagged sessions
+
+Fallback flags:
+  session --full
+  resume --json
+
+Escape hatches:
+  AI_HIST_CLI=auto|rust|python
+  AI_HIST_RUST_BIN=/path/to/ai-hist
+  ai-hist-rust
+  ai-hist-python
+
+See DISPATCH_MATRIX.md for the tested cutover routing table."""
+    )
+
+
 def run_python(argv, warn=False, reason=None):
     if warn:
         detail = f": {reason}" if reason else ""
@@ -97,9 +146,9 @@ def run_python(argv, warn=False, reason=None):
 
 
 def run_rust(argv):
-    built = find_built_rust()
-    if built:
-        cmd = [str(built), *argv]
+    rust_bin = os.environ.get("AI_HIST_RUST_BIN")
+    if rust_bin:
+        cmd = [rust_bin, *argv]
     else:
         cmd = [
             "cargo",
@@ -113,14 +162,6 @@ def run_rust(argv):
             *argv,
         ]
     return subprocess.run(cmd).returncode
-
-
-def find_built_rust():
-    exe = "ai-hist.exe" if os.name == "nt" else "ai-hist"
-    for path in (ROOT / "target" / "release" / exe, ROOT / "target" / "debug" / exe):
-        if path.exists() and os.access(path, os.X_OK):
-            return path
-    return None
 
 
 if __name__ == "__main__":

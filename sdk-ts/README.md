@@ -27,7 +27,7 @@ try {
 }
 ```
 
-To require the Python-managed SQLite database instead of JSONL fallback:
+To require the ai-hist SQLite database instead of JSONL fallback:
 
 ```ts
 const hist = await openAiHist({ fallback: 'error' });

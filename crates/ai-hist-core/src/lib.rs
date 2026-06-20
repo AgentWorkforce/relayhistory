@@ -157,6 +157,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
     let _ = conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT", []);
     let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
@@ -829,5 +830,34 @@ mod tests {
         assert_eq!(prompt, "wal opencode prompt");
 
         drop(src);
+    }
+
+    #[test]
+    fn init_db_uses_wal_and_legacy_session_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fresh.db");
+        let conn = open_db(&db_path).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        let history_cols = conn
+            .prepare("PRAGMA table_info(history)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(history_cols.contains(&"git_branch".to_string()));
+
+        let sessions_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions_exists, 1);
     }
 }

@@ -2,8 +2,8 @@
 """
 ai-hist: Sync and search AI CLI conversation history in SQLite.
 
-Supports Claude Code and Codex CLI out of the box.
-Zero dependencies — Python 3.8+ standard library only.
+Supports Claude Code, Codex CLI, Cursor, Agent Relay, trajectories, and OpenCode.
+Zero dependencies — Python standard library only.
 """
 
 import argparse

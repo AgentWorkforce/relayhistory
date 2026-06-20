@@ -34,6 +34,7 @@ Escape hatches:
 ```bash
 AI_HIST_CLI=rust ai-hist search deploy
 AI_HIST_CLI=python ai-hist sync
+AI_HIST_RUST_BIN=target/release/ai-hist ai-hist search deploy
 ./ai-hist-rust search deploy        # from a source checkout
 ./ai-hist-python sync               # from a source checkout
 ```
@@ -105,7 +106,7 @@ Top 10 projects:
 
 ## How it works
 
-ai-hist supports five sources:
+ai-hist supports these sources:
 
 | Source | How | Key fields |
 |--------|-----|------------|
@@ -114,6 +115,7 @@ ai-hist supports five sources:
 | Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
+| OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions |
 
 **Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used. During the Rust cutover, full-source `ai-hist sync` still runs through the legacy Python fallback.
 
@@ -224,7 +226,7 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 ```
 
-> Replace `/usr/bin/python3` with your Python path if needed (e.g., from `which python3`).
+> Replace `${HOME}/.local/bin/ai-hist` with the wrapper path you installed if needed.
 
 ### Linux (cron)
 
@@ -245,7 +247,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', or 'trajectory'
+    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', 'trajectory', or 'opencode'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,

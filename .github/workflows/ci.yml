@@ -27,10 +27,13 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
+      - name: Build Rust CLI for wrapper tests
+        run: cargo build -q -p ai-hist-cli
+
       - name: Python tests
         run: |
           python -m pip install pytest
-          python -m pytest -q test_ai_hist.py test_cli_dispatch.py
+          AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" python -m pytest -q test_ai_hist.py test_cli_dispatch.py
 
       - name: TypeScript tests
         working-directory: sdk-ts
@@ -39,4 +42,4 @@ jobs:
           npm test
 
       - name: End-to-end wrapper verification
-        run: ./scripts/verify-e2e.sh
+        run: AI_HIST_RUST_BIN="$PWD/target/debug/ai-hist" ./scripts/verify-e2e.sh

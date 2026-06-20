@@ -143,6 +143,31 @@ def test_escape_hatches_force_python_or_rust(tmp_path):
     assert "Total entries:" in result.stdout
 
 
+def test_explicit_rust_binary_escape_hatch(tmp_path):
+    env, _db = seed_via_wrapper(tmp_path)
+    built = ROOT / "target" / "debug" / "ai-hist"
+    if not built.exists():
+        subprocess.run(["cargo", "build", "-q", "-p", "ai-hist-cli"], cwd=ROOT, check=True)
+    result = run_cli(
+        ["search", "dispatch", "--json"],
+        env | {"AI_HIST_RUST_BIN": str(built)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(json.loads(result.stdout)) == 2
+
+
+def test_top_level_help_lists_rust_and_fallback_commands(tmp_path):
+    env, _db, _home = isolated_env(tmp_path)
+    result = run_cli(["--help"], env)
+    assert result.returncode == 0
+    assert "Rust-default commands:" in result.stdout
+    assert "Python fallback commands:" in result.stdout
+    assert "search" in result.stdout
+    assert "sync" in result.stdout
+    assert "show" in result.stdout
+    assert "DISPATCH_MATRIX.md" in result.stdout
+
+
 def test_rust_default_validates_source_choices(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
     result = run_cli(["search", "dispatch", "--source", "not-a-source"], env)
