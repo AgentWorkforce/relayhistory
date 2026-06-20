@@ -11,6 +11,14 @@ export OPENCODE_DB="$TMP/opencode.db"
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude" "$HOME/.codex" "$TRAJECTORY_ROOT/planner/compacted"
 
+rust_ai_hist() {
+  if [[ -n "${AI_HIST_RUST_BIN:-}" ]]; then
+    "$AI_HIST_RUST_BIN" "$@"
+  else
+    cargo run -q -p ai-hist-cli --manifest-path "$ROOT/Cargo.toml" -- "$@"
+  fi
+}
+
 cat > "$HOME/.claude/history.jsonl" <<'JSONL'
 {"display":"e2e claude release tagging prompt","timestamp":1700000000000,"project":"/tmp/e2e/project","sessionId":"claude-e2e"}
 JSONL
@@ -39,8 +47,8 @@ PY
 "$ROOT/ai-hist" search release --tag release-e2e --json
 "$ROOT/ai-hist" session claude-e2e --full >/dev/null
 
-cargo run -q -p ai-hist-cli -- --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
-cargo run -q -p ai-hist-cli -- --db "$AI_HIST_DB" search release --tag release-e2e --json
+rust_ai_hist --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
+rust_ai_hist --db "$AI_HIST_DB" search release --tag release-e2e --json
 
 (cd "$ROOT/sdk-ts" && npm ci && npm test)
 
