@@ -15,7 +15,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AgentWorkforce/ai-hist.git",
+    "url": "https://github.com/AgentWorkforce/relayhistory",
     "directory": "mcp-package"
   },
   "publishConfig": {

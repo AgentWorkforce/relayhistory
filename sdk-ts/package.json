@@ -36,7 +36,7 @@
     "coding-agent",
     "session-history"
   ],
-  "homepage": "https://github.com/AgentWorkforce/ai-hist",
+  "homepage": "https://github.com/AgentWorkforce/relayhistory",
   "files": [
     "dist",
     "README.md",
@@ -44,7 +44,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/AgentWorkforce/ai-hist",
+    "url": "https://github.com/AgentWorkforce/relayhistory",
     "directory": "sdk-ts"
   },
   "publishConfig": {
