@@ -24,13 +24,13 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
+      - name: Rust tests
+        run: cargo test --workspace
+
       - name: Python tests
         run: |
           python -m pip install pytest
           python -m pytest -q test_ai_hist.py test_cli_dispatch.py
-
-      - name: Rust tests
-        run: cargo test --workspace
 
       - name: TypeScript tests
         working-directory: sdk-ts
