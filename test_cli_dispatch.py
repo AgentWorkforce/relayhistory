@@ -116,6 +116,14 @@ def test_session_full_routes_to_rust(tmp_path):
     assert "dispatch unique claude prompt" in result.stdout
 
 
+def test_session_missing_json_has_no_extra_stderr(tmp_path):
+    env, _db = seed_via_wrapper(tmp_path)
+    result = run_cli(["session", "missing-session", "--json"], env)
+    assert result.returncode == 1
+    assert result.stdout == "[]\n"
+    assert result.stderr == ""
+
+
 def test_previously_fallback_commands_route_to_rust(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
     export_path = tmp_path / "export.jsonl"

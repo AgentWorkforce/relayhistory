@@ -239,7 +239,7 @@ fn main() -> Result<()> {
                 } else {
                     println!("No entries for session {session_id}");
                 }
-                anyhow::bail!("no entries for session {session_id}");
+                std::process::exit(1);
             }
             print_session_entries(&session_id, rows, json, full)
         }
