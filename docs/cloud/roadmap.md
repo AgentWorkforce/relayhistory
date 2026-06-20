@@ -8,12 +8,24 @@ The CLI must remain fully functional with zero cloud dependency. Cloud is opt-in
 
 ---
 
+## Dependency: Issue #8 (Rust Crate)
+
+Issue #8 plans to migrate core logic to a Rust crate (`ai-hist-core`) that compiles to a native binary and WASM. **This intersects directly with the cloud encryption layer.**
+
+The encryption module (Argon2id + AES-256-GCM) should ultimately live in `ai-hist-core`, not be written separately in Python and TypeScript. The recommended sequencing:
+
+**Option A (preferred):** Cloud Phase 1 begins in parallel with Issue #8. The Rust crate's `crypto.rs` module is the first deliverable of Issue #8 — it blocks nothing else in the Rust migration but provides the encryption primitive needed for cloud sync. Cloud Phase 1 integrates `ai-hist-core` via its native binary interface.
+
+**Option B (if Issue #8 is delayed):** Implement crypto in Python (`cryptography` lib) and TypeScript (`SubtleCrypto`) as V1 interim implementations, then migrate to the Rust crate when it lands. No re-encryption of stored data needed — ciphertext is algorithm-agnostic.
+
+---
+
 ## Phase 1: Foundation (Weeks 1–8)
 
 **Goal:** One user can sync encrypted history to the cloud and retrieve it on another device.
 
 ### What we build
-- [ ] Argon2id key derivation in Python CLI
+- [ ] Argon2id key derivation (in `ai-hist-core` Rust crate if Issue #8 is ready; Python `cryptography` lib as fallback)
 - [ ] AES-256-GCM encryption of history entries before sync
 - [ ] `cloud login` / `cloud sync` / `cloud pull` CLI commands
 - [ ] Minimal backend: Postgres + REST API (ingestion + query)
@@ -166,6 +178,20 @@ Langfuse and Helicone work by proxying API calls, which gives them plaintext con
 
 Reading local files is more work to integrate but gives us a privacy architecture that is genuinely differentiated.
 
+### CASS and the Intelligence Layer Question
+
+[CASS Memory System](https://github.com/Dicklesworthstone/cass_memory_system) (385 stars, alpha) takes a fundamentally different approach: it treats session history as raw material to distill into a "playbook" of procedural rules with confidence decay and evidence gates. CASS is the closest market signal that developers want AI agent memory tools.
+
+ai-hist cloud is not CASS and should not try to be in V1. Our differentiation is multi-tool aggregation, team sharing, and the privacy-first model — none of which CASS provides. However, a future "Insights" feature would move into CASS's territory:
+
+**Potential future Phase 5 — Insights (post-Enterprise):**
+- Pattern extraction across your full multi-tool history (not just one agent)
+- Surfaces repeated approaches, recurring problems, common prompts
+- Team-level: what does your team ask AI agents to do most?
+- Unlike CASS, this runs client-side over the decrypted corpus — we never process the content
+
+This is explicitly out of scope until the core storage/search/team product is proven. Note it here because it shapes the data model: storing raw history faithfully (which we do) is the right foundation for adding intelligence later. Don't optimize it away.
+
 ### Open Source the Encryption Layer First
 
-Before shipping the cloud, open source the encryption module as a standalone library (`ai-hist-crypto`). This lets the community audit the crypto before any real user data is encrypted with it. Publish a security model document alongside it. Do not ship the cloud product until the encryption layer has had at least 30 days of public review.
+Before shipping the cloud, open source the encryption module as part of `ai-hist-core` (see Issue #8). This lets the community audit the crypto before any real user data is encrypted with it. Publish the [encryption.md](./encryption.md) threat model alongside the code. Do not ship the cloud product until the encryption layer has had at least 30 days of public review.

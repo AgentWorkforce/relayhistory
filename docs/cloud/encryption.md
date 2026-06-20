@@ -152,15 +152,31 @@ Users who require zero-trust throughout should run the local MCP server. The hos
 
 ## Client Implementation
 
-**Python CLI:** Uses `cryptography` library (libsodium bindings). Key stored in OS keychain via `keyring`.
+### Target state: `ai-hist-core` Rust crate (Issue #8)
 
-**TypeScript SDK / Web:** Uses `SubtleCrypto` (WebCrypto API, built into all modern browsers and Node.js 16+). No third-party crypto dependencies.
+Issue #8 plans to migrate core logic to a Rust crate (`ai-hist-core`) that compiles to a native binary and a WASM module. **The encryption layer should live here.** Writing crypto once in Rust and compiling to native + WASM eliminates the risk of two divergent implementations (Python and TypeScript) having subtle behavioral differences — which is especially dangerous in cryptographic code.
 
-**Key storage on device:**
+**Target architecture once Issue #8 ships:**
+- `ai-hist-core/src/crypto.rs` — Argon2id KDF + AES-256-GCM encrypt/decrypt, single implementation
+- Compiled to native binary: used by the CLI sync commands
+- Compiled to WASM: loaded by the web dashboard via `@ai-hist/crypto-wasm`; no WebCrypto polyfill needed
+- Key storage via native Rust keyring bindings (`keyring` crate, same OS backends)
+
+### V1 implementation (before Issue #8 lands)
+
+If cloud Phase 1 ships before the Rust migration is complete, use these interim implementations and migrate to the Rust crate when it lands:
+
+**Python CLI:** `cryptography` library (libsodium bindings) for Argon2id and AES-256-GCM. Key stored in OS keychain via `keyring`.
+
+**TypeScript SDK / Web:** `SubtleCrypto` (WebCrypto API, built into all modern browsers and Node.js 16+). No third-party crypto dependencies.
+
+**Key storage on device (both V1 and Rust target):**
 - macOS: Keychain Services (encrypted by device password + Secure Enclave on Apple Silicon)
 - Linux: SecretService API (GNOME Keyring / KWallet)
 - Windows: Windows Credential Manager (DPAPI encrypted)
 - Fallback: `~/.ai-hist/keystore` encrypted with OS user password (warn user, not recommended)
+
+**Migration note:** Because entries are encrypted with user-derived keys (not implementation-specific keys), migrating the crypto implementation from Python/TS to Rust requires no re-encryption of stored data — the ciphertext is algorithm-agnostic.
 
 ---
 

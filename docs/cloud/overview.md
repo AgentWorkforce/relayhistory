@@ -61,6 +61,7 @@ This differentiates us from every competitor in the adjacent space, all of whom 
 
 | Tool | What they do | Gap vs. ai-hist cloud |
 |---|---|---|
+| **CASS Memory System** | Procedural memory for AI agents — extracts rules and patterns from session history | Single-agent focus; no multi-tool aggregation; no team layer; no cloud sync; no privacy-first model |
 | Langfuse | LLM tracing for app developers | Reads your data; targets API integrators not CLI users |
 | Helicone | Proxy-based API logging | Reads your data; no CLI agent support |
 | Braintrust | LLM eval + logging | Enterprise, reads your data, no multi-tool CLI aggregation |
@@ -68,7 +69,26 @@ This differentiates us from every competitor in the adjacent space, all of whom 
 | Rewind.ai | Screen recording with AI search | Reads everything on your screen; significant privacy concerns |
 | mem.ai | Personal AI memory | Not coding-specific, no multi-tool, no team sharing |
 
-**The gap:** Nobody aggregates AI coding agent history across Claude Code, Codex, Cursor, etc. into an encrypted, team-searchable layer. The multi-tool aggregation + decision trajectory tracking is unique.
+### CASS in Depth
+
+CASS (385 stars, alpha) is the closest thing in the market to a direct competitor and is worth understanding in detail.
+
+**What CASS does well:**
+- Three-layer memory: raw session logs → structured diary summaries → distilled procedural rules ("playbook")
+- Confidence decay (90-day half-life) and evidence-gated rule acceptance — rules have to prove themselves
+- Anti-pattern tracking: consistently harmful patterns get inverted into warnings
+- Cross-agent learning: a pattern found in Cursor can surface in Claude Code
+
+**Where ai-hist cloud is different:**
+- **Multi-tool aggregation** — CASS focuses on a single agent at a time; we aggregate Claude Code, Codex, Cursor, Agent Relay, and trajectories into one corpus
+- **Raw history as the product** — CASS treats session logs as input to distill *away from*; we treat them as the primary value (searchable, sharable, resumable)
+- **Team layer** — CASS has no concept of a team; we're building shared organizational memory
+- **Privacy-first** — CASS reads your sessions to extract rules; we never read content
+- **Trajectory records** — we capture structured decision logs from agentic workflows; CASS works with conversational logs only
+
+**The relationship:** These are more complementary than directly competing. CASS is an intelligence layer on top of history; we are the history layer itself. A user could run both — CASS extracting rules from sessions that ai-hist stores and makes searchable. A future "Insights" feature in ai-hist cloud (see roadmap) would move into CASS's territory, but that is not V1 scope.
+
+**The gap:** Nobody aggregates AI coding agent history across Claude Code, Codex, Cursor, etc. into an encrypted, team-searchable cloud layer. The multi-tool aggregation + decision trajectory tracking + privacy-first model is unique. CASS confirms there is real user appetite for AI agent memory tools; it does not solve the problems we solve.
 
 ---
 
