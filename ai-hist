@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -35,8 +36,10 @@ CODEX_SESSIONS_DIRS = [
 ]
 
 CURSOR_ROOT = Path.home() / ".cursor" / "projects"
+OPENCODE_DB = Path(os.environ.get("OPENCODE_DB", str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")))
 TRAJECTORY_ROOT = os.environ.get("TRAJECTORY_ROOT", "")
 DEFAULT_TRAJECTORY_SEARCH_ROOT = Path.home() / "Projects"
+SOURCE_CHOICES = ["claude", "codex", "cursor", "relay", "trajectory", "opencode"]
 
 # --- Schema ------------------------------------------------------------------
 
@@ -70,6 +73,22 @@ CREATE TABLE IF NOT EXISTS trajectories (
     path TEXT,
     updated_ms INTEGER NOT NULL,
     timestamp_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    color TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_ms INTEGER NOT NULL,
+    UNIQUE(source, session_id, tag_id)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
     search_text, task_title, task_description, persona_id, project_id,
@@ -179,6 +198,65 @@ def _row_to_dict(id_, source, session_id, project, prompt, ts_ms):
         "prompt": prompt,
         "timestamp_ms": ts_ms,
     }
+
+
+def _normalize_tag_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def _tag_filter_clause(alias: str = "h") -> str:
+    return (
+        "EXISTS ("
+        "SELECT 1 FROM session_tags st "
+        "JOIN tags t ON t.id = st.tag_id "
+        f"WHERE st.source = {alias}.source "
+        f"AND st.session_id = {alias}.session_id "
+        "AND t.name = ?"
+        ")"
+    )
+
+
+def _session_tags(conn: sqlite3.Connection, source: str, session_id: str) -> list:
+    return [
+        {"name": name, "display_name": display_name, "color": color}
+        for name, display_name, color in conn.execute(
+            "SELECT t.name, t.display_name, t.color "
+            "FROM tags t JOIN session_tags st ON st.tag_id = t.id "
+            "WHERE st.source = ? AND st.session_id = ? "
+            "ORDER BY t.name",
+            (source, session_id),
+        )
+    ]
+
+
+def _ensure_tag(conn: sqlite3.Connection, tag_name: str, color=None) -> int:
+    normalized = _normalize_tag_name(tag_name)
+    if not normalized:
+        raise ValueError("tag name cannot be empty")
+    now_ms = int(time.time() * 1000)
+    conn.execute(
+        "INSERT INTO tags (name, display_name, color, created_ms, updated_ms) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET "
+        "display_name = excluded.display_name, "
+        "color = COALESCE(excluded.color, tags.color), "
+        "updated_ms = excluded.updated_ms",
+        (normalized, tag_name.strip(), color, now_ms, now_ms),
+    )
+    return conn.execute("SELECT id FROM tags WHERE name = ?", (normalized,)).fetchone()[0]
+
+
+def _matching_sessions(conn: sqlite3.Connection, session_id: str, source=None) -> list:
+    sql = (
+        "SELECT source, session_id, MIN(project), COUNT(*), MAX(timestamp_ms) "
+        "FROM history WHERE session_id = ?"
+    )
+    params = [session_id]
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
+    sql += " GROUP BY source, session_id ORDER BY source"
+    return conn.execute(sql, params).fetchall()
 
 
 # --- Parsers -----------------------------------------------------------------
@@ -470,6 +548,90 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
     if files_seen:
         suffix = f" ({errors} errors)" if errors else ""
         print(f"  [cursor] +{inserted:,} rows from {files_seen} files{suffix}")
+
+
+def _opencode_part_text(data: str) -> str:
+    try:
+        obj = json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(obj, dict) or obj.get("type") != "text":
+        return ""
+    text = obj.get("text", "")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _sqlite_file_marker(path: Path) -> dict:
+    marker = {}
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(path) + suffix)
+        try:
+            stat = candidate.stat()
+            marker[suffix or "db"] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        except OSError:
+            marker[suffix or "db"] = None
+    return marker
+
+
+def sync_opencode(conn: sqlite3.Connection, state: dict):
+    """Sync user prompts from OpenCode's SQLite session store."""
+    if not OPENCODE_DB.exists():
+        print(f"  [opencode] not found: {OPENCODE_DB} (skipped)")
+        return
+    marker = _sqlite_file_marker(OPENCODE_DB)
+    if marker["db"] is None:
+        print(f"  [opencode] unreadable: {OPENCODE_DB} (skipped)")
+        return
+    if state.get("opencode") == marker:
+        print("  [opencode] up to date")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot = Path(tmp) / "opencode.db"
+        try:
+            src_live = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=30)
+            src_live.execute("PRAGMA busy_timeout=5000")
+            snapshot_conn = sqlite3.connect(str(snapshot))
+            src_live.backup(snapshot_conn)
+            snapshot_conn.close()
+            src_live.close()
+            src = sqlite3.connect(str(snapshot))
+            rows = src.execute(
+                "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) "
+                "FROM part p "
+                "JOIN message m ON m.id = p.message_id "
+                "JOIN session s ON s.id = p.session_id "
+                "WHERE json_extract(m.data, '$.role') = 'user' "
+                "AND json_extract(p.data, '$.type') = 'text' "
+                "ORDER BY p.time_created ASC"
+            ).fetchall()
+            src.close()
+        except (OSError, sqlite3.Error) as e:
+            print(f"  [opencode] error reading {OPENCODE_DB}: {e} (skipped)")
+            return
+
+    inserted = 0
+    errors = 0
+    for session_id, project, data, ts_ms in rows:
+        prompt = _opencode_part_text(data)
+        if not prompt:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("opencode", session_id, project, prompt, _prompt_hash(prompt), int(ts_ms or 0)),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error:
+            errors += 1
+
+    conn.commit()
+    state["opencode"] = _sqlite_file_marker(OPENCODE_DB)
+    print(f"  [opencode] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
 
 # --- Relaycast API -----------------------------------------------------------
 
@@ -886,6 +1048,9 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)")
 
 
 def load_state() -> dict:
@@ -974,6 +1139,9 @@ def cmd_sync(args=None):
     # Sync Cursor agent transcripts (auto-discovered, no config needed)
     sync_cursor(conn, state)
 
+    # Sync OpenCode SQLite history (auto-discovered, no config needed)
+    sync_opencode(conn, state)
+
     # Sync Relaycast (opt-in via env vars)
     sync_relaycast(conn, state)
 
@@ -989,6 +1157,7 @@ def cmd_sync(args=None):
 def cmd_search(args):
     """Full-text search across prompts."""
     conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
     query = _build_fts_query(args.query, getattr(args, "fts", False))
 
     sql = (
@@ -1003,6 +1172,9 @@ def cmd_search(args):
     if args.project:
         sql += "AND h.project LIKE ? "
         params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql += f"AND {_tag_filter_clause('h')} "
+        params.append(_normalize_tag_name(args.tag))
     sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
     params.append(args.limit)
 
@@ -1028,18 +1200,22 @@ def cmd_search(args):
 def cmd_recent(args):
     """Show N most recent entries."""
     conn = sqlite3.connect(str(DB_PATH))
-    sql = "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history "
+    init_db(conn)
+    sql = "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history h "
     params = []
     wheres = []
     if args.source:
-        wheres.append("source = ?")
+        wheres.append("h.source = ?")
         params.append(args.source)
     if args.project:
-        wheres.append("project LIKE ?")
+        wheres.append("h.project LIKE ?")
         params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        wheres.append(_tag_filter_clause("h"))
+        params.append(_normalize_tag_name(args.tag))
     if wheres:
         sql += "WHERE " + " AND ".join(wheres) + " "
-    sql += "ORDER BY timestamp_ms DESC LIMIT ?"
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
     params.append(args.n)
     rows = conn.execute(sql, params).fetchall()
     conn.close()
@@ -1056,6 +1232,7 @@ def cmd_recent(args):
 def cmd_show(args):
     """Show the full prompt for a given entry ID."""
     conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
     row = conn.execute(
         "SELECT id, source, session_id, project, prompt, timestamp_ms "
         "FROM history WHERE id = ?",
@@ -1075,14 +1252,17 @@ def cmd_show(args):
 
     if getattr(args, "json", False):
         session_count = None
+        tags = []
         if session_id:
             session_count = conn.execute(
-                "SELECT COUNT(*) FROM history WHERE session_id = ?", (session_id,)
+                "SELECT COUNT(*) FROM history WHERE source = ? AND session_id = ?", (source, session_id)
             ).fetchone()[0]
+            tags = _session_tags(conn, source, session_id)
         conn.close()
         out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
         out["resume_cmd"] = resume
         out["session_count"] = session_count
+        out["tags"] = tags
         print(json.dumps(out))
         return
 
@@ -1098,9 +1278,12 @@ def cmd_show(args):
     print()
     if session_id:
         session_count = conn.execute(
-            "SELECT COUNT(*) FROM history WHERE session_id = ?", (session_id,)
+            "SELECT COUNT(*) FROM history WHERE source = ? AND session_id = ?", (source, session_id)
         ).fetchone()[0]
         print(f"  Session has {session_count} entries: ai-hist session {session_id}")
+        tags = _session_tags(conn, source, session_id)
+        if tags:
+            print("  Tags:    " + ", ".join(t["display_name"] for t in tags))
         if resume:
             print(f"  Resume:  {resume}")
     print(f"  Context: ai-hist context {id_}")
@@ -1157,11 +1340,20 @@ def cmd_context(args):
 def cmd_session(args):
     """Show all prompts in a given session."""
     conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
+    init_db(conn)
+    sql = (
         "SELECT id, source, session_id, project, prompt, timestamp_ms "
-        "FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
-        (args.session_id,),
-    ).fetchall()
+        "FROM history h WHERE h.session_id = ?"
+    )
+    params = [args.session_id]
+    if getattr(args, "source", None):
+        sql += " AND h.source = ?"
+        params.append(args.source)
+    if getattr(args, "tag", None):
+        sql += f" AND {_tag_filter_clause('h')}"
+        params.append(_normalize_tag_name(args.tag))
+    sql += " ORDER BY h.timestamp_ms ASC"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     if not rows:
         if getattr(args, "json", False):
@@ -1183,22 +1375,33 @@ def cmd_session(args):
 def cmd_stats(args=None):
     """Show summary statistics."""
     conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
 
-    total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    tag = _normalize_tag_name(args.tag) if args and getattr(args, "tag", None) else None
+    where = ""
+    params = []
+    if tag:
+        where = f" WHERE {_tag_filter_clause('h')}"
+        params.append(tag)
+
+    total = conn.execute(f"SELECT COUNT(*) FROM history h{where}", params).fetchone()[0]
     by_source = {
         source: count
         for source, count in conn.execute(
-            "SELECT source, COUNT(*) FROM history GROUP BY source ORDER BY source"
+            f"SELECT source, COUNT(*) FROM history h{where} GROUP BY source ORDER BY source",
+            params,
         )
     }
     top_projects = [
         {"project": p, "count": c}
         for p, c in conn.execute(
             "SELECT project, COUNT(*) as c FROM history "
-            "WHERE project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 10"
+            f"h WHERE project IS NOT NULL {'AND ' + _tag_filter_clause('h') if tag else ''} "
+            "GROUP BY project ORDER BY c DESC LIMIT 10",
+            params,
         )
     ]
-    r = conn.execute("SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history").fetchone()
+    r = conn.execute(f"SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history h{where}", params).fetchone()
     conn.close()
 
     if getattr(args, "json", False):
@@ -1208,10 +1411,13 @@ def cmd_stats(args=None):
             "top_projects": top_projects,
             "first_timestamp_ms": r[0],
             "last_timestamp_ms": r[1],
+            "tag": tag,
         }))
         return
 
     print(f"\nTotal entries: {total:,}")
+    if tag:
+        print(f"Tag filter: {tag}")
     print("\nBy source:")
     for source, count in by_source.items():
         print(f"  {source}: {count:,}")
@@ -1232,6 +1438,7 @@ def cmd_pack(args):
     Use --tokens to truncate each prompt to approximately N tokens (4 chars/token).
     """
     conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
     query = _build_fts_query(args.query, getattr(args, "fts", False))
 
     sql = (
@@ -1246,6 +1453,9 @@ def cmd_pack(args):
     if args.project:
         sql += "AND h.project LIKE ? "
         params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql += f"AND {_tag_filter_clause('h')} "
+        params.append(_normalize_tag_name(args.tag))
     sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
     params.append(args.limit)
 
@@ -1347,6 +1557,153 @@ def cmd_resume(args):
     else:
         print(f"No resume command available for source '{source}'", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_tag(args):
+    """Tag one or more source-specific sessions."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    try:
+        tag_id = _ensure_tag(conn, args.tag_name, getattr(args, "color", None))
+    except ValueError as e:
+        conn.close()
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    matches = _matching_sessions(conn, args.session_id, getattr(args, "source", None))
+    if not matches:
+        conn.close()
+        print(f"No session found for {args.session_id}", file=sys.stderr)
+        sys.exit(1)
+
+    now_ms = int(time.time() * 1000)
+    changed = 0
+    for source, session_id, project, count, last_ms in matches:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO session_tags (source, session_id, tag_id, created_ms) "
+            "VALUES (?, ?, ?, ?)",
+            (source, session_id, tag_id, now_ms),
+        )
+        changed += cur.rowcount
+    conn.commit()
+
+    if getattr(args, "json", False):
+        out = {
+            "session_id": args.session_id,
+            "tag": _normalize_tag_name(args.tag_name),
+            "matched_sessions": [
+                {"source": s, "session_id": sid, "project": p, "entry_count": c, "last_activity_ms": lm}
+                for s, sid, p, c, lm in matches
+            ],
+            "created_assignments": changed,
+        }
+        conn.close()
+        print(json.dumps(out))
+        return
+
+    conn.close()
+    label = "session" if len(matches) == 1 else "sessions"
+    print(f"Tagged {len(matches)} {label} with '{args.tag_name.strip()}' ({changed} new assignment(s)).")
+
+
+def cmd_untag(args):
+    """Remove a tag from one or more source-specific sessions."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    normalized = _normalize_tag_name(args.tag_name)
+    matches = _matching_sessions(conn, args.session_id, getattr(args, "source", None))
+    removed = 0
+    for source, session_id, *_ in matches:
+        cur = conn.execute(
+            "DELETE FROM session_tags "
+            "WHERE source = ? AND session_id = ? "
+            "AND tag_id IN (SELECT id FROM tags WHERE name = ?)",
+            (source, session_id, normalized),
+        )
+        removed += cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if not matches:
+        print(f"No session found for {args.session_id}", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "json", False):
+        print(json.dumps({"session_id": args.session_id, "tag": normalized, "removed_assignments": removed}))
+        return
+    print(f"Removed tag '{normalized}' from {removed} session assignment(s).")
+
+
+def cmd_tags(args):
+    """List tags and tagged sessions."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    params = []
+    where = ""
+    if getattr(args, "tag", None):
+        where = "WHERE t.name = ?"
+        params.append(_normalize_tag_name(args.tag))
+    rows = conn.execute(
+        "SELECT t.name, t.display_name, t.color, COUNT(st.id) AS sessions, "
+        "MIN(st.created_ms), MAX(st.created_ms) "
+        "FROM tags t LEFT JOIN session_tags st ON st.tag_id = t.id "
+        f"{where} "
+        "GROUP BY t.id, t.name, t.display_name, t.color "
+        "ORDER BY t.name",
+        params,
+    ).fetchall()
+
+    if getattr(args, "json", False):
+        out = []
+        for name, display_name, color, sessions, first_ms, last_ms in rows:
+            item = {
+                "name": name,
+                "display_name": display_name,
+                "color": color,
+                "session_count": sessions,
+                "first_tagged_ms": first_ms,
+                "last_tagged_ms": last_ms,
+            }
+            if getattr(args, "sessions", False):
+                item["sessions"] = [
+                    {"source": s, "session_id": sid, "project": p, "entry_count": c, "last_activity_ms": lm}
+                    for s, sid, p, c, lm in conn.execute(
+                        "SELECT st.source, st.session_id, MIN(h.project), COUNT(h.id), MAX(h.timestamp_ms) "
+                        "FROM session_tags st "
+                        "JOIN tags t ON t.id = st.tag_id "
+                        "LEFT JOIN history h ON h.source = st.source AND h.session_id = st.session_id "
+                        "WHERE t.name = ? "
+                        "GROUP BY st.source, st.session_id "
+                        "ORDER BY MAX(h.timestamp_ms) DESC",
+                        (name,),
+                    )
+                ]
+            out.append(item)
+        conn.close()
+        print(json.dumps(out))
+        return
+
+    if not rows:
+        conn.close()
+        print("No tags.")
+        return
+    for name, display_name, color, sessions, first_ms, last_ms in rows:
+        color_text = f" [{color}]" if color else ""
+        print(f"  {display_name}{color_text}  {sessions} session(s)")
+        if getattr(args, "sessions", False):
+            for s, sid, p, c, lm in conn.execute(
+                "SELECT st.source, st.session_id, MIN(h.project), COUNT(h.id), MAX(h.timestamp_ms) "
+                "FROM session_tags st "
+                "JOIN tags t ON t.id = st.tag_id "
+                "LEFT JOIN history h ON h.source = st.source AND h.session_id = st.session_id "
+                "WHERE t.name = ? "
+                "GROUP BY st.source, st.session_id "
+                "ORDER BY MAX(h.timestamp_ms) DESC",
+                (name,),
+            ):
+                project = f" [{p}]" if p else ""
+                print(f"    {s}:{sid}{project} ({c} entries)")
+    conn.close()
 
 
 def cmd_watch(args):
@@ -1603,16 +1960,18 @@ def main():
 
     s = sub.add_parser("search", help="Full-text search prompts")
     s.add_argument("query", nargs="+", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
-    s.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
+    s.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
+    s.add_argument("--tag", help="Filter by session tag")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
     s.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
     s.add_argument("--json", action="store_true", help="Output as JSON array")
 
     r = sub.add_parser("recent", help="Show most recent entries")
     r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
-    r.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
+    r.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     r.add_argument("--project", help="Filter by project path (substring match)")
+    r.add_argument("--tag", help="Filter by session tag")
     r.add_argument("--json", action="store_true", help="Output as JSON array")
 
     sh = sub.add_parser("show", help="Show full details for an entry by ID")
@@ -1621,6 +1980,8 @@ def main():
 
     se = sub.add_parser("session", help="Show all prompts in a session")
     se.add_argument("session_id", help="Session ID")
+    se.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    se.add_argument("--tag", help="Only show the session if it has this tag")
     se.add_argument("--full", action="store_true", help="Show full prompt text (no truncation)")
     se.add_argument("--json", action="store_true", help="Output as JSON array")
 
@@ -1629,12 +1990,14 @@ def main():
     cx.add_argument("--window", type=int, default=5, help="Time window in minutes (default: 5)")
 
     st = sub.add_parser("stats", help="Show summary statistics")
+    st.add_argument("--tag", help="Filter stats to sessions with this tag")
     st.add_argument("--json", action="store_true", help="Output as JSON object")
 
     pk = sub.add_parser("pack", help="Evidence bundle for LLM handoff (search + resume commands)")
     pk.add_argument("query", nargs="+", help="Search terms")
-    pk.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
+    pk.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     pk.add_argument("--project", help="Filter by project path (substring match)")
+    pk.add_argument("--tag", help="Filter by session tag")
     pk.add_argument("--limit", type=int, default=10, help="Max entries (default: 10)")
     pk.add_argument("--tokens", type=int, default=0, help="Truncate each prompt to ~N tokens (4 chars/token)")
     pk.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
@@ -1651,13 +2014,31 @@ def main():
     exp = sub.add_parser("export", help="Export history to a portable JSONL or SQLite file")
     exp.add_argument("output", nargs="?", help="Output file (default: stdout). Use .gz for compression.")
     exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
-    exp.add_argument("--source", choices=["claude", "codex", "cursor", "relay", "trajectory"], help="Filter by source")
+    exp.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     exp.add_argument("--project", help="Filter by project path (substring)")
     exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
 
     imp = sub.add_parser("import", help="Import history from an exported JSONL or SQLite file")
     imp.add_argument("file", help="File to import (.jsonl, .jsonl.gz, or .db)")
     imp.add_argument("--dry-run", action="store_true", help="Preview what would be imported without writing")
+
+    tg = sub.add_parser("tag", help="Tag a session for logical grouping")
+    tg.add_argument("session_id", help="Session ID to tag")
+    tg.add_argument("tag_name", help="Tag name")
+    tg.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    tg.add_argument("--color", help="Optional display color")
+    tg.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    ut = sub.add_parser("untag", help="Remove a tag from a session")
+    ut.add_argument("session_id", help="Session ID to untag")
+    ut.add_argument("tag_name", help="Tag name")
+    ut.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    ut.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    tl = sub.add_parser("tags", help="List tags")
+    tl.add_argument("--tag", help="Show one tag")
+    tl.add_argument("--sessions", action="store_true", help="Include tagged sessions")
+    tl.add_argument("--json", action="store_true", help="Output as JSON array")
 
     args = p.parse_args()
     cmds = {
@@ -1666,6 +2047,7 @@ def main():
         "stats": cmd_stats, "pack": cmd_pack, "resume": cmd_resume,
         "watch": cmd_watch,
         "export": cmd_export, "import": cmd_import,
+        "tag": cmd_tag, "untag": cmd_untag, "tags": cmd_tags,
     }
 
     if args.command in cmds:

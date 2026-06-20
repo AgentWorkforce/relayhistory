@@ -101,6 +101,8 @@ function fmtTrajectory(t: TrajectoryEntry, maxChars = 500): string {
 }
 
 const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
+const WRITE_LOCAL = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "relay", "trajectory", "opencode"]);
 
 // ---------------------------------------------------------------------------
 // Server
@@ -152,6 +154,9 @@ and Agent Relay — all searchable in a single index.
 - **history_stats** — Get a quick overview of what is indexed: total counts by
   source, date range, and top projects.
 
+- **tag_session**, **untag_session**, **list_tags** — Organize sessions with
+  logical tags so future searches can filter to a named workstream.
+
 - **search_trajectories** — Search compacted per-run decision trajectories: the
   WHY behind persona work, including decisions and retrospectives.
 
@@ -190,8 +195,7 @@ server.tool(
           'boolean, leading - to exclude, trailing * for prefix. ' +
           'Examples: "authentication", "auth AND login", "deploy*", "refactor -test"',
       ),
-    source: z
-      .enum(["claude", "codex", "cursor", "relay"])
+    source: SOURCE_SCHEMA
       .optional()
       .describe("Filter to a single agent source. Omit to search all sources."),
     project: z
@@ -200,6 +204,7 @@ server.tool(
       .describe(
         'Filter by project directory path. Substring match — use a partial path like "/myproject" or "src/api".',
       ),
+    tag: z.string().optional().describe("Filter to sessions tagged with this tag."),
     limit: z
       .number()
       .int()
@@ -210,10 +215,10 @@ server.tool(
       .describe("Maximum number of results to return. Default: 20."),
   },
   READ_ONLY,
-  async ({ query, source, project, limit }) => {
+  async ({ query, source, project, tag, limit }) => {
     try {
       const hist = await getHist();
-      const results = hist.search(query, { source, project, limit });
+      const results = hist.search(query, { source, project, tag, limit });
       if (results.length === 0) return { content: [{ type: "text", text: "No results found." }] };
       const lines = [`Found ${results.length} result(s):\n`];
       for (const e of results) lines.push(fmtEntry(e));
@@ -281,6 +286,77 @@ server.tool(
 );
 
 server.tool(
+  "tag_session",
+  "Tag a source-specific session so future history searches can filter by logical workstream. " +
+    "If source is omitted and multiple sources have the same session_id, all matching sessions are tagged.",
+  {
+    session_id: z.string().describe("Session ID to tag."),
+    tag: z.string().min(1).describe("Tag name, for example release-plan or auth-refactor."),
+    source: SOURCE_SCHEMA.optional().describe("Optional source to disambiguate the session ID."),
+    color: z.string().optional().describe("Optional display color label."),
+  },
+  WRITE_LOCAL,
+  async ({ session_id, tag, source, color }) => {
+    try {
+      const hist = await getHist();
+      const sessions = hist.tagSession(session_id, tag, { source, color });
+      if (sessions.length === 0) {
+        return { content: [{ type: "text", text: `No session found for ${session_id}.` }], isError: true };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ tag, taggedSessions: sessions, dbPath: hist.dbPath }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "untag_session",
+  "Remove a tag from a session.",
+  {
+    session_id: z.string().describe("Session ID to untag."),
+    tag: z.string().min(1).describe("Tag name to remove."),
+    source: SOURCE_SCHEMA.optional().describe("Optional source to disambiguate the session ID."),
+  },
+  WRITE_LOCAL,
+  async ({ session_id, tag, source }) => {
+    try {
+      const hist = await getHist();
+      const removed = hist.untagSession(session_id, tag, { source });
+      return { content: [{ type: "text", text: JSON.stringify({ tag, removedAssignments: removed }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "list_tags",
+  "List available session tags and optionally include the sessions assigned to each tag.",
+  {
+    tag: z.string().optional().describe("Optional tag name to inspect."),
+    include_sessions: z.boolean().optional().default(false).describe("Include tagged session summaries."),
+  },
+  READ_ONLY,
+  async ({ tag, include_sessions }) => {
+    try {
+      const hist = await getHist();
+      const tags = hist.listTags({ tag, includeSessions: include_sessions });
+      return { content: [{ type: "text", text: JSON.stringify(tags, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
   "get_session",
   "Retrieve all prompts from a specific session ordered oldest to newest. " +
     "Use this after search_history or recent_history to read the full conversation " +
@@ -292,12 +368,14 @@ server.tool(
       .describe(
         "Session ID to retrieve. Obtain from the session_id field in search_history or recent_history results.",
       ),
+    source: SOURCE_SCHEMA.optional().describe("Optional source to disambiguate the session ID."),
+    tag: z.string().optional().describe("Only return the session if it has this tag."),
   },
   READ_ONLY,
-  async ({ session_id }) => {
+  async ({ session_id, source, tag }) => {
     try {
       const hist = await getHist();
-      const entries = hist.getSession(session_id);
+      const entries = hist.getSession(session_id, { source, tag });
       if (entries.length === 0) {
         return { content: [{ type: "text", text: `No entries found for session ${session_id}.` }] };
       }
@@ -393,20 +471,20 @@ server.tool(
       .optional()
       .default(20)
       .describe("Number of entries to return. Default: 20."),
-    source: z
-      .enum(["claude", "codex", "cursor", "relay"])
+    source: SOURCE_SCHEMA
       .optional()
       .describe("Filter to a specific agent source. Omit for all sources."),
     project: z
       .string()
       .optional()
       .describe('Filter by project directory path (substring match). Example: "/my-app" or "work/api".'),
+    tag: z.string().optional().describe("Filter to sessions tagged with this tag."),
   },
   READ_ONLY,
-  async ({ n, source, project }) => {
+  async ({ n, source, project, tag }) => {
     try {
       const hist = await getHist();
-      const entries = hist.recent({ limit: n, source, project });
+      const entries = hist.recent({ limit: n, source, project, tag });
       if (entries.length === 0) return { content: [{ type: "text", text: "No history entries found." }] };
       const lines = [`Most recent ${entries.length} entries:\n`];
       for (const e of entries) lines.push(fmtEntry(e, 150));
@@ -434,12 +512,13 @@ server.tool(
       .string()
       .optional()
       .describe('Filter by project directory/path or projectId (exact match in the SDK).'),
+    tag: z.string().optional().describe("Filter to sessions tagged with this tag."),
   },
   READ_ONLY,
-  async ({ limit, project }) => {
+  async ({ limit, project, tag }) => {
     try {
       const hist = await getHist();
-      const entries = hist.recent({ limit, project });
+      const entries = hist.recent({ limit, project, tag });
       if (entries.length === 0) return { content: [{ type: "text", text: "No history entries found." }] };
       const lines = [`Most recent ${entries.length} entries:\n`];
       for (const e of entries) lines.push(fmtEntry(e, 150));

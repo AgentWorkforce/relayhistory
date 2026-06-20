@@ -44,6 +44,7 @@ def tmp_env(tmp_path, monkeypatch):
     # Point cursor at an empty tmp dir so it never reads real ~/.cursor.
     cursor_root = tmp_path / "cursor_projects"
     monkeypatch.setattr(ai_hist, "CURSOR_ROOT", cursor_root)
+    monkeypatch.setattr(ai_hist, "OPENCODE_DB", tmp_path / "missing-opencode.db")
     trajectory_root = tmp_path / ".trajectories"
     monkeypatch.setattr(ai_hist, "TRAJECTORY_ROOT", str(trajectory_root))
     monkeypatch.setattr(ai_hist, "DEFAULT_TRAJECTORY_SEARCH_ROOT", tmp_path / "Projects")
@@ -584,6 +585,112 @@ class TestCmdRecent:
         captured = capsys.readouterr()
         assert "c relay" in captured.out
         assert len([l for l in captured.out.strip().split("\n") if l.strip()]) == 1
+
+
+class TestTags:
+    def test_tag_session_and_search_filter(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("taggable auth prompt", 1700000001000, "/proj", "sess-tag"),
+            make_claude_entry("other auth prompt", 1700000002000, "/proj", "sess-other"),
+        ])
+        capsys.readouterr()
+
+        ai_hist.cmd_tag(SimpleNamespace(session_id="sess-tag", tag_name="release", source="claude", color=None, json=False))
+        captured = capsys.readouterr()
+        assert "Tagged 1 session" in captured.out
+
+        ai_hist.cmd_search(SimpleNamespace(query=["auth"], source=None, project=None, tag="release", limit=20, fts=False, json=False))
+        captured = capsys.readouterr()
+        assert "taggable auth prompt" in captured.out
+        assert "other auth prompt" not in captured.out
+
+    def test_untag_session(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("tag me", 1700000001000, "/proj", "sess-tag")])
+        capsys.readouterr()
+        ai_hist.cmd_tag(SimpleNamespace(session_id="sess-tag", tag_name="cleanup", source="claude", color=None, json=False))
+        capsys.readouterr()
+        ai_hist.cmd_untag(SimpleNamespace(session_id="sess-tag", tag_name="cleanup", source="claude", json=False))
+        captured = capsys.readouterr()
+        assert "Removed tag" in captured.out
+        args = SimpleNamespace(query=["tag"], source=None, project=None, tag="cleanup", limit=20, fts=False, json=False)
+        with pytest.raises(SystemExit):
+            ai_hist.cmd_search(args)
+
+    def test_tags_json_lists_sessions(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[make_claude_entry("tag me", 1700000001000, "/proj", "sess-tag")])
+        capsys.readouterr()
+        ai_hist.cmd_tag(SimpleNamespace(session_id="sess-tag", tag_name="Work Stream", source="claude", color="blue", json=False))
+        capsys.readouterr()
+        ai_hist.cmd_tags(SimpleNamespace(tag=None, sessions=True, json=True))
+        out = json.loads(capsys.readouterr().out)
+        assert out[0]["name"] == "work stream"
+        assert out[0]["sessions"][0]["session_id"] == "sess-tag"
+
+    def test_sync_opencode_from_sqlite(self, tmp_env, capsys, monkeypatch):
+        opencode_db = tmp_env.tmp_path / "opencode.db"
+        src = sqlite3.connect(opencode_db)
+        src.execute("PRAGMA journal_mode=WAL")
+        src.execute("PRAGMA wal_autocheckpoint=0")
+        src.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
+        src.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+        src.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
+        src.execute("INSERT INTO session VALUES ('oc-1', '/proj/oc', 1700000000000)")
+        src.execute("INSERT INTO message VALUES ('msg-1', 'oc-1', 1700000001000, ?)", (json.dumps({"role": "user"}),))
+        src.execute("INSERT INTO part VALUES ('part-1', 'msg-1', 'oc-1', 1700000002000, ?)", (json.dumps({"type": "text", "text": "opencode prompt"}),))
+        src.commit()
+        live = sqlite3.connect(opencode_db)
+        assert live.execute("SELECT COUNT(*) FROM part").fetchone()[0] == 1
+        live.close()
+        monkeypatch.setattr(ai_hist, "OPENCODE_DB", opencode_db)
+
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        src.close()
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        row = conn.execute("SELECT source, session_id, project, prompt FROM history WHERE source = 'opencode'").fetchone()
+        conn.close()
+        assert row == ("opencode", "oc-1", "/proj/oc", "opencode prompt")
+
+    def test_sync_opencode_incremental_detects_wal_changes(self, tmp_env, capsys, monkeypatch):
+        opencode_db = tmp_env.tmp_path / "opencode.db"
+        src = sqlite3.connect(opencode_db)
+        src.execute("PRAGMA journal_mode=WAL")
+        src.execute("PRAGMA wal_autocheckpoint=0")
+        src.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
+        src.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+        src.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
+        src.execute("INSERT INTO session VALUES ('oc-wal', '/proj/oc', 1700000000000)")
+        src.execute("INSERT INTO message VALUES ('msg-1', 'oc-wal', 1700000001000, ?)", (json.dumps({"role": "user"}),))
+        src.execute("INSERT INTO part VALUES ('part-1', 'msg-1', 'oc-wal', 1700000002000, ?)", (json.dumps({"type": "text", "text": "wal prompt 1"}),))
+        src.commit()
+        monkeypatch.setattr(ai_hist, "OPENCODE_DB", opencode_db)
+
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        main_stat_before = opencode_db.stat()
+        wal_marker_before = ai_hist._sqlite_file_marker(opencode_db)["-wal"]
+
+        src.execute("INSERT INTO message VALUES ('msg-2', 'oc-wal', 1700000003000, ?)", (json.dumps({"role": "user"}),))
+        src.execute("INSERT INTO part VALUES ('part-2', 'msg-2', 'oc-wal', 1700000004000, ?)", (json.dumps({"type": "text", "text": "wal prompt 2"}),))
+        src.commit()
+        live = sqlite3.connect(opencode_db)
+        assert live.execute("SELECT COUNT(*) FROM part").fetchone()[0] == 2
+        live.close()
+        main_stat_after = opencode_db.stat()
+        wal_marker_after = ai_hist._sqlite_file_marker(opencode_db)["-wal"]
+        assert main_stat_after.st_mtime_ns == main_stat_before.st_mtime_ns
+        assert main_stat_after.st_size == main_stat_before.st_size
+        assert wal_marker_after != wal_marker_before
+
+        ai_hist.cmd_sync()
+        captured = capsys.readouterr()
+        assert "[opencode] up to date" not in captured.out
+        src.close()
+
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = [row[0] for row in conn.execute("SELECT prompt FROM history WHERE source = 'opencode' ORDER BY timestamp_ms")]
+        conn.close()
+        assert prompts == ["wal prompt 1", "wal prompt 2"]
 
 
 class TestCmdShow:

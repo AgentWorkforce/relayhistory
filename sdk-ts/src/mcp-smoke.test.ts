@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -61,6 +61,65 @@ test('SDK projectScope restricts all history and trajectory reads', async () => 
   }
 });
 
+test('SDK tags sessions, filters reads by tag, and persists SQLite writes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-tags-'));
+  const dbPath = join(root, 'history.db');
+  await writeScopeFixtureDb(dbPath);
+
+  const hist = await openAiHist({ dbPath });
+  try {
+    const tagged = hist.tagSession('shared', 'Release Work', { source: 'claude', color: 'blue' });
+    assert.equal(tagged.length, 1);
+    assert.deepEqual(
+      hist.search('prompt', { tag: 'release work', limit: 10 }).map((entry) => entry.prompt),
+      ['scoped root prompt'],
+    );
+    assert.equal(hist.listTags({ includeSessions: true })[0].sessions?.[0].sessionId, 'shared');
+  } finally {
+    hist.close();
+  }
+
+  const reopened = await openAiHist({ dbPath });
+  try {
+    assert.deepEqual(
+      reopened.recent({ tag: 'release work', limit: 10 }).map((entry) => entry.prompt),
+      ['scoped root prompt'],
+    );
+    assert.equal(reopened.untagSession('shared', 'release work', { source: 'claude' }), 1);
+    assert.deepEqual(reopened.recent({ tag: 'release work', limit: 10 }), []);
+  } finally {
+    reopened.close();
+  }
+});
+
+test('SDK projectScope restricts tag counts and included tagged sessions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-tag-scope-'));
+  const dbPath = join(root, 'history.db');
+  await writeScopeFixtureDb(dbPath);
+
+  const unscoped = await openAiHist({ dbPath });
+  try {
+    assert.equal(unscoped.tagSession('shared', 'Scoped Tag', { source: 'claude' }).length, 1);
+    assert.equal(unscoped.tagSession('shared', 'Scoped Tag', { source: 'cursor' }).length, 1);
+  } finally {
+    unscoped.close();
+  }
+
+  const scoped = await openAiHist({ dbPath, projectScope: '/work/app' });
+  try {
+    const tags = scoped.listTags({ tag: 'scoped tag', includeSessions: true });
+    assert.equal(tags.length, 1);
+    assert.equal(tags[0].sessionCount, 1);
+    assert.deepEqual(tags[0].sessions?.map((session) => session.source), ['claude']);
+    assert.deepEqual(
+      scoped.recent({ tag: 'scoped tag', limit: 10 }).map((entry) => entry.prompt),
+      ['scoped root prompt'],
+    );
+  } finally {
+    scoped.close();
+  }
+});
+
 test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-trajectory-'));
   const compacted = join(root, 'planner', 'compacted');
@@ -111,6 +170,68 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
     else process.env.TRAJECTORY_ROOT = previousRoot;
     if (previousDb === undefined) delete process.env.AI_HIST_DB;
     else process.env.AI_HIST_DB = previousDb;
+  }
+});
+
+test('SDK fallback ingests OpenCode rows committed in WAL files', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-opencode-wal-'));
+  const dbPath = join(root, 'opencode.db');
+  const readyPath = join(root, 'ready');
+  const child = spawn(
+    'python3',
+    [
+      '-c',
+      `
+import json, pathlib, sqlite3, time
+db = pathlib.Path(${JSON.stringify(dbPath)})
+ready = pathlib.Path(${JSON.stringify(readyPath)})
+conn = sqlite3.connect(db)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER)")
+conn.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+conn.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
+conn.execute("INSERT INTO session VALUES ('oc-ts-wal', '/tmp/opencode-ts', 1700000000000)")
+conn.execute("INSERT INTO message VALUES ('msg-ts-wal', 'oc-ts-wal', 1700000001000, ?)", (json.dumps({"role":"user"}),))
+conn.execute("INSERT INTO part VALUES ('part-ts-wal', 'msg-ts-wal', 'oc-ts-wal', 1700000002000, ?)", (json.dumps({"type":"text","text":"ts wal opencode prompt"}),))
+conn.commit()
+live = sqlite3.connect(db)
+assert live.execute("SELECT COUNT(*) FROM part").fetchone()[0] == 1
+live.close()
+ready.write_text("ready")
+time.sleep(60)
+`,
+    ],
+    { stdio: ['ignore', 'ignore', 'pipe'] },
+  );
+  const stderr: Buffer[] = [];
+  child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+
+  const previousDb = process.env.AI_HIST_DB;
+  const previousOpenCode = process.env.OPENCODE_DB;
+  const previousTrajectory = process.env.TRAJECTORY_ROOT;
+  process.env.AI_HIST_DB = join(root, 'missing-ai-hist.db');
+  process.env.OPENCODE_DB = dbPath;
+  process.env.TRAJECTORY_ROOT = join(root, 'missing-trajectories');
+  try {
+    await waitForFile(readyPath, () => Buffer.concat(stderr).toString('utf8'));
+    const hist = await openAiHist({ dbPath: process.env.AI_HIST_DB });
+    try {
+      assert.deepEqual(
+        hist.search('ts wal opencode', { source: 'opencode', limit: 5 }).map((entry) => entry.prompt),
+        ['ts wal opencode prompt'],
+      );
+    } finally {
+      hist.close();
+    }
+  } finally {
+    child.kill();
+    if (previousDb === undefined) delete process.env.AI_HIST_DB;
+    else process.env.AI_HIST_DB = previousDb;
+    if (previousOpenCode === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = previousOpenCode;
+    if (previousTrajectory === undefined) delete process.env.TRAJECTORY_ROOT;
+    else process.env.TRAJECTORY_ROOT = previousTrajectory;
   }
 });
 
@@ -216,6 +337,9 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
       'get_session',
       'get_context',
       'stats',
+      'tag_session',
+      'untag_session',
+      'list_tags',
       'search_trajectories',
       'why_for_task',
     ]) {
@@ -229,6 +353,19 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
 
 function writeJsonRpc(stdin: NodeJS.WritableStream, payload: unknown): void {
   stdin.write(`${JSON.stringify(payload)}\n`);
+}
+
+async function waitForFile(path: string, getError: () => string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      await stat(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  throw new Error(`timed out waiting for ${path}: ${getError()}`);
 }
 
 async function writeScopeFixtureDb(dbPath: string): Promise<void> {

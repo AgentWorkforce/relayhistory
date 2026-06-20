@@ -13,9 +13,13 @@
  */
 
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { promisify } from 'node:util';
 import { scanLocalSources, LOCAL_SOURCE_PATHS } from './jsonl-sources.js';
 import {
   scanLocalTrajectories,
@@ -24,7 +28,9 @@ import {
   type TrajectoryRetrospective,
 } from './trajectory-sources.js';
 
-export type Source = 'claude' | 'codex' | 'cursor' | 'relay' | 'trajectory';
+const execFileAsync = promisify(execFile);
+
+export type Source = 'claude' | 'codex' | 'cursor' | 'relay' | 'trajectory' | 'opencode';
 
 export interface HistoryEntry {
   id: number;
@@ -33,6 +39,23 @@ export interface HistoryEntry {
   project: string | null;
   prompt: string;
   timestampMs: number;
+}
+
+export interface Tag {
+  name: string;
+  displayName: string;
+  color: string | null;
+  sessionCount: number;
+  firstTaggedMs: number | null;
+  lastTaggedMs: number | null;
+}
+
+export interface TaggedSession {
+  source: Source;
+  sessionId: string;
+  project: string | null;
+  entryCount: number;
+  lastActivityMs: number | null;
 }
 
 export interface SessionSummary {
@@ -48,6 +71,7 @@ export interface SessionSummary {
 export interface ListOptions {
   source?: Source;
   project?: string;
+  tag?: string;
   /** Default 50. */
   limit?: number;
   /**
@@ -101,6 +125,12 @@ export function defaultDbPath(): string {
   return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
 }
 
+function defaultOpenCodeDbPath(): string {
+  return process.env.OPENCODE_DB && process.env.OPENCODE_DB.trim().length > 0
+    ? process.env.OPENCODE_DB
+    : join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
+}
+
 let _sqlPromise: Promise<SqlJsStatic> | null = null;
 function getSqlJs(): Promise<SqlJsStatic> {
   if (!_sqlPromise) {
@@ -129,6 +159,28 @@ function ensureTrajectorySchema(db: Database): void {
   )`);
   db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)');
   db.run('CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)');
+}
+
+function ensureTagSchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    color TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS session_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_ms INTEGER NOT NULL,
+    UNIQUE(source, session_id, tag_id)
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(source, session_id)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)');
 }
 
 export interface OpenOptions {
@@ -175,6 +227,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     const fileBuffer = await readFile(dbPath);
     const db = new SQL.Database(fileBuffer);
     ensureTrajectorySchema(db);
+    ensureTagSchema(db);
     // The Python CLI's schema doesn't create `idx_history_session` or
     // `idx_history_timestamp`. Without them, listSessions degrades to
     // an O(sessions × rows) full table scan and freezes the WASM
@@ -212,10 +265,12 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
   db.run('CREATE INDEX idx_history_session ON history (session_id)');
   ensureTrajectorySchema(db);
+  ensureTagSchema(db);
 
   // scanLocalSources is async with yields between sources so the event
   // loop stays responsive while we scan many MB of JSONL.
   const rows = await scanLocalSources();
+  const openCodeRows = await scanOpenCode(SQL);
   const trajectories = await scanLocalTrajectories();
 
   const insert = db.prepare(
@@ -232,6 +287,9 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     db.exec('BEGIN');
     for (const row of rows) {
       insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs]);
+    }
+    for (const row of openCodeRows) {
+      insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs]);
     }
     for (const trajectory of trajectories) {
       insertTrajectory.run([
@@ -274,6 +332,78 @@ async function pathExists(p: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function readSqliteSnapshot(dbPath: string): Promise<Buffer> {
+  const hasWal = await pathExists(`${dbPath}-wal`);
+  const hasShm = await pathExists(`${dbPath}-shm`);
+  if (!hasWal && !hasShm) {
+    return readFile(dbPath);
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'ai-hist-sqlite-snapshot-'));
+  const snapshot = join(dir, 'snapshot.db');
+  try {
+    await execFileAsync('sqlite3', [dbPath, `.backup '${snapshot.replace(/'/g, "''")}'`], {
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    return await readFile(snapshot);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+type ScannedOpenCodeRow = {
+  sessionId: string | null;
+  project: string | null;
+  prompt: string;
+  timestampMs: number;
+};
+
+async function scanOpenCode(SQL: SqlJsStatic): Promise<ScannedOpenCodeRow[]> {
+  const dbPath = defaultOpenCodeDbPath();
+  if (!(await pathExists(dbPath))) return [];
+  try {
+    const fileBuffer = await readSqliteSnapshot(dbPath);
+    const db = new SQL.Database(fileBuffer);
+    try {
+      const rows = runQuery<{
+        session_id: string;
+        project: string | null;
+        data: string;
+        timestamp_ms: number;
+      }>(
+        db,
+        `SELECT s.id AS session_id, s.directory AS project, p.data,
+                COALESCE(p.time_created, m.time_created, s.time_created) AS timestamp_ms
+         FROM part p
+         JOIN message m ON m.id = p.message_id
+         JOIN session s ON s.id = p.session_id
+         WHERE json_extract(m.data, '$.role') = 'user'
+           AND json_extract(p.data, '$.type') = 'text'
+         ORDER BY p.time_created ASC`,
+        [],
+      );
+      const scanned: ScannedOpenCodeRow[] = [];
+      for (const row of rows) {
+        const data = parseJson<{ type?: string; text?: unknown }>(row.data, {});
+        const prompt = typeof data.text === 'string' ? data.text.trim() : '';
+        if (!prompt) continue;
+        scanned.push({
+          sessionId: row.session_id,
+          project: row.project,
+          prompt,
+          timestampMs: row.timestamp_ms ?? 0,
+        });
+      }
+      return scanned;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
   }
 }
 
@@ -397,6 +527,25 @@ function appendProjectFilter(
   }
 }
 
+function normalizeTagName(tag: string): string {
+  return tag.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function appendTagFilter(clauses: string[], params: unknown[], tag: string | undefined, alias = 'history'): void {
+  const normalized = tag ? normalizeTagName(tag) : '';
+  if (!normalized) return;
+  clauses.push(
+    `EXISTS (
+      SELECT 1 FROM session_tags st
+      JOIN tags t ON t.id = st.tag_id
+      WHERE st.source = ${alias}.source
+        AND st.session_id = ${alias}.session_id
+        AND t.name = ?
+    )`,
+  );
+  params.push(normalized);
+}
+
 function buildFilters(opts: ListOptions, projectScope?: string): { sql: string; params: unknown[] } {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -405,6 +554,7 @@ function buildFilters(opts: ListOptions, projectScope?: string): { sql: string; 
     params.push(opts.source);
   }
   appendProjectFilter(clauses, params, opts.project, projectScope);
+  appendTagFilter(clauses, params, opts.tag, 'history');
   if (typeof opts.beforeMs === 'number') {
     clauses.push('timestamp_ms < ?');
     params.push(opts.beforeMs);
@@ -464,6 +614,189 @@ export class AiHist {
     if (this.closed) return;
     this.db.close();
     this.closed = true;
+  }
+
+  private persistIfWritable(): void {
+    if (this._source.kind !== 'sqlite') return;
+    writeFileSync(this._source.path, Buffer.from(this.db.export()));
+  }
+
+  private ensureTag(name: string, color?: string | null): number {
+    const normalized = normalizeTagName(name);
+    if (!normalized) throw new Error('tag name cannot be empty');
+    const displayName = name.trim();
+    const now = Date.now();
+    this.db.run(
+      `INSERT INTO tags (name, display_name, color, created_ms, updated_ms)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(name) DO UPDATE SET
+         display_name = excluded.display_name,
+         color = COALESCE(excluded.color, tags.color),
+         updated_ms = excluded.updated_ms`,
+      [normalized, displayName, color ?? null, now, now],
+    );
+    return runQuery<{ id: number }>(this.db, 'SELECT id FROM tags WHERE name = ?', [normalized])[0].id;
+  }
+
+  private matchingSessions(sessionId: string, source?: Source): TaggedSession[] {
+    const clauses = ['session_id = ?'];
+    const params: unknown[] = [sessionId];
+    if (source) {
+      clauses.push('source = ?');
+      params.push(source);
+    }
+    appendProjectFilter(clauses, params, undefined, this._projectScope);
+    return runQuery<{
+      source: string;
+      session_id: string;
+      project: string | null;
+      entry_count: number;
+      last_activity_ms: number | null;
+    }>(
+      this.db,
+      `SELECT source, session_id, MIN(project) AS project, COUNT(*) AS entry_count,
+              MAX(timestamp_ms) AS last_activity_ms
+       FROM history
+       WHERE ${clauses.join(' AND ')}
+       GROUP BY source, session_id
+       ORDER BY source`,
+      params,
+    ).map((row) => ({
+      source: row.source as Source,
+      sessionId: row.session_id,
+      project: row.project,
+      entryCount: row.entry_count,
+      lastActivityMs: row.last_activity_ms,
+    }));
+  }
+
+  tagSession(sessionId: string, tagName: string, opts: { source?: Source; color?: string | null } = {}): TaggedSession[] {
+    const sessions = this.matchingSessions(sessionId, opts.source);
+    if (sessions.length === 0) return [];
+    const tagId = this.ensureTag(tagName, opts.color);
+    const now = Date.now();
+    const insert = this.db.prepare(
+      'INSERT OR IGNORE INTO session_tags (source, session_id, tag_id, created_ms) VALUES (?, ?, ?, ?)',
+    );
+    try {
+      for (const session of sessions) {
+        insert.run([session.source, session.sessionId, tagId, now]);
+      }
+    } finally {
+      insert.free();
+    }
+    this.persistIfWritable();
+    return sessions;
+  }
+
+  untagSession(sessionId: string, tagName: string, opts: { source?: Source } = {}): number {
+    const normalized = normalizeTagName(tagName);
+    const sessions = this.matchingSessions(sessionId, opts.source);
+    let removed = 0;
+    for (const session of sessions) {
+      this.db.run(
+        `DELETE FROM session_tags
+         WHERE source = ? AND session_id = ?
+           AND tag_id IN (SELECT id FROM tags WHERE name = ?)`,
+        [session.source, session.sessionId, normalized],
+      );
+      removed += this.db.getRowsModified();
+    }
+    this.persistIfWritable();
+    return removed;
+  }
+
+  listTags(opts: { tag?: string; includeSessions?: boolean } = {}): Array<Tag & { sessions?: TaggedSession[] }> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (opts.tag) {
+      clauses.push('t.name = ?');
+      params.push(normalizeTagName(opts.tag));
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    let scopedSessionSql = 'SELECT st.tag_id, st.id, st.created_ms FROM session_tags st';
+    const scopedSessionParams: unknown[] = [];
+    if (this._projectScope) {
+      const scope = scopedPathClause('h.project', this._projectScope);
+      scopedSessionSql = `SELECT st.tag_id, st.id, st.created_ms
+        FROM session_tags st
+        WHERE EXISTS (
+          SELECT 1 FROM history h
+          WHERE h.source = st.source
+            AND h.session_id = st.session_id
+            AND ${scope.sql}
+        )`;
+      scopedSessionParams.push(...scope.params);
+    }
+    return runQuery<{
+      name: string;
+      display_name: string;
+      color: string | null;
+      session_count: number;
+      first_tagged_ms: number | null;
+      last_tagged_ms: number | null;
+    }>(
+      this.db,
+      `SELECT t.name, t.display_name, t.color, COUNT(st.id) AS session_count,
+              MIN(st.created_ms) AS first_tagged_ms, MAX(st.created_ms) AS last_tagged_ms
+       FROM tags t
+       LEFT JOIN (${scopedSessionSql}) st ON st.tag_id = t.id
+       ${where}
+       GROUP BY t.id, t.name, t.display_name, t.color
+       ORDER BY t.name`,
+      [...scopedSessionParams, ...params],
+    ).map((row) => {
+      const tag: Tag & { sessions?: TaggedSession[] } = {
+        name: row.name,
+        displayName: row.display_name,
+        color: row.color,
+        sessionCount: row.session_count,
+        firstTaggedMs: row.first_tagged_ms,
+        lastTaggedMs: row.last_tagged_ms,
+      };
+      if (opts.includeSessions) {
+        tag.sessions = this.sessionsByTag(row.name);
+      }
+      return tag;
+    });
+  }
+
+  sessionsByTag(tagName: string): TaggedSession[] {
+    const clauses = ['t.name = ?'];
+    const params: unknown[] = [normalizeTagName(tagName)];
+    if (this._projectScope) {
+      const scope = scopedPathClause('h.project', this._projectScope);
+      clauses.push(scope.sql);
+      params.push(...scope.params);
+    }
+    return runQuery<{
+      source: string;
+      session_id: string;
+      project: string | null;
+      entry_count: number;
+      last_activity_ms: number | null;
+    }>(
+      this.db,
+      `SELECT st.source, st.session_id, MIN(h.project) AS project, COUNT(h.id) AS entry_count,
+              MAX(h.timestamp_ms) AS last_activity_ms
+       FROM session_tags st
+       JOIN tags t ON t.id = st.tag_id
+       JOIN history h ON h.source = st.source AND h.session_id = st.session_id
+       WHERE ${clauses.join(' AND ')}
+       GROUP BY st.source, st.session_id
+       ORDER BY MAX(h.timestamp_ms) DESC`,
+      params,
+    ).map((row) => ({
+      source: row.source as Source,
+      sessionId: row.session_id,
+      project: row.project,
+      entryCount: row.entry_count,
+      lastActivityMs: row.last_activity_ms,
+    }));
+  }
+
+  searchByTag(tagName: string, opts: Omit<SearchOptions, 'tag'> = {}): HistoryEntry[] {
+    return this.recent({ ...opts, tag: tagName });
   }
 
   /** Most recent prompts, newest first. */
@@ -553,10 +886,15 @@ export class AiHist {
   }
 
   /** All prompts in a session, ordered oldest → newest. */
-  getSession(sessionId: string): HistoryEntry[] {
+  getSession(sessionId: string, opts: Pick<ListOptions, 'source' | 'tag'> = {}): HistoryEntry[] {
     const clauses = ['session_id = ?'];
     const params: unknown[] = [sessionId];
+    if (opts.source) {
+      clauses.push('source = ?');
+      params.push(opts.source);
+    }
     appendProjectFilter(clauses, params, undefined, this._projectScope);
+    appendTagFilter(clauses, params, opts.tag, 'history');
     return runQuery<RawHistoryRow>(
       this.db,
       `SELECT id, source, session_id, project, prompt, timestamp_ms
@@ -592,6 +930,7 @@ export class AiHist {
       params.push(opts.source);
     }
     appendProjectFilter(clauses, params, opts.project, this._projectScope);
+    appendTagFilter(clauses, params, opts.tag, 'history');
     if (typeof opts.beforeMs === 'number') {
       clauses.push('timestamp_ms < ?');
       params.push(opts.beforeMs);
