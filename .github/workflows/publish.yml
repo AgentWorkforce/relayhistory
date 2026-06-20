@@ -59,6 +59,8 @@ jobs:
     outputs:
       version: ${{ steps.bump.outputs.version }}
       npm_name: ${{ steps.bump.outputs.npm_name }}
+      sdk_published: ${{ steps.published.outputs.sdk_published }}
+      mcp_published: ${{ steps.published.outputs.mcp_published }}
     defaults:
       run:
         working-directory: sdk-ts
@@ -105,23 +107,32 @@ jobs:
       # computed bump might still collide with an existing npm version (e.g.
       # a one-off publish from another branch). Catch it before npm rejects
       # with a less specific error.
-      - name: Verify new version is not yet published
+      - name: Check published package versions
+        id: published
         run: |
           set -euo pipefail
           NPM_NAME='${{ steps.bump.outputs.npm_name }}'
           VERSION='${{ steps.bump.outputs.version }}'
           EXISTS=$(npm view "$NPM_NAME@$VERSION" version 2>/dev/null || true)
           if [ -n "$EXISTS" ]; then
-            echo "::error title=Version already published::$NPM_NAME@$VERSION is already on npm. Pick a different bump type or set custom_version to a higher version."
-            exit 1
+            echo "$NPM_NAME@$VERSION: already published — will skip SDK publish"
+            echo "sdk_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$NPM_NAME@$VERSION: unpublished — OK"
+            echo "sdk_published=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "$NPM_NAME@$VERSION: unpublished — OK"
           MCP_EXISTS=$(npm view "ai-hist-mcp@$VERSION" version 2>/dev/null || true)
           if [ -n "$MCP_EXISTS" ]; then
-            echo "::error title=Version already published::ai-hist-mcp@$VERSION is already on npm. Pick a different bump type or set custom_version to a higher version."
+            echo "ai-hist-mcp@$VERSION: already published — will skip MCP publish"
+            echo "mcp_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ai-hist-mcp@$VERSION: unpublished — OK"
+            echo "mcp_published=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$EXISTS" ] && [ -n "$MCP_EXISTS" ]; then
+            echo "::error title=Version already published::$NPM_NAME@$VERSION and ai-hist-mcp@$VERSION are already on npm. Pick a different bump type or set custom_version to a higher version."
             exit 1
           fi
-          echo "ai-hist-mcp@$VERSION: unpublished — OK"
 
       - name: Sync MCP wrapper version
         working-directory: ${{ github.workspace }}
@@ -354,6 +365,7 @@ jobs:
       # registered as a trusted publisher on npmjs.com under this
       # repo/workflow path for the first publish.
       - name: Publish to npm
+        if: ${{ steps.published.outputs.sdk_published != 'true' }}
         run: |
           set -euo pipefail
           FLAGS="--access public --tag ${{ github.event.inputs.tag }}"
@@ -366,6 +378,7 @@ jobs:
           npm publish $FLAGS
 
       - name: Publish MCP wrapper to npm
+        if: ${{ steps.published.outputs.mcp_published != 'true' }}
         working-directory: ${{ github.workspace }}/mcp-package
         run: |
           set -euo pipefail
