@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sdk-ts/package-lock.json
+
+      - name: Python tests
+        run: |
+          python -m pip install pytest
+          python -m pytest -q test_ai_hist.py test_cli_dispatch.py
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: TypeScript tests
+        working-directory: sdk-ts
+        run: |
+          npm ci
+          npm test
+
+      - name: End-to-end wrapper verification
+        run: ./scripts/verify-e2e.sh

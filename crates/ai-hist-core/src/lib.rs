@@ -136,6 +136,9 @@ pub fn default_db_path() -> PathBuf {
     std::env::var_os("AI_HIST_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
+            if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+                return PathBuf::from(xdg_data_home).join("ai-hist/ai-history.db");
+            }
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
@@ -156,6 +159,23 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     let _ = conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT", []);
+    let _ = conn.execute("ALTER TABLE history ADD COLUMN git_branch TEXT", []);
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    git_branch TEXT,
+    first_activity_ms INTEGER,
+    last_activity_ms INTEGER,
+    last_assistant_text TEXT,
+    raw_path TEXT,
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, source)
+);
+"#,
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)",
         [],
@@ -175,6 +195,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
         [],
     )?;
     Ok(())

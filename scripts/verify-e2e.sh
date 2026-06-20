@@ -37,11 +37,11 @@ PY
 "$ROOT/ai-hist" tag claude-e2e release-e2e --source claude
 "$ROOT/ai-hist" tag opencode-e2e release-e2e --source opencode
 "$ROOT/ai-hist" search release --tag release-e2e --json
+"$ROOT/ai-hist" session claude-e2e --full >/dev/null
 
 cargo run -q -p ai-hist-cli -- --db "$AI_HIST_DB" tag codex-e2e release-e2e --source codex
 cargo run -q -p ai-hist-cli -- --db "$AI_HIST_DB" search release --tag release-e2e --json
 
-(cd "$ROOT/sdk-ts" && npm test)
+(cd "$ROOT/sdk-ts" && npm ci && npm test)
 
 echo "E2E verification completed with temp DB: $AI_HIST_DB"
-

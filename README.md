@@ -2,28 +2,40 @@
 
 Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
-**Zero dependencies** — Python 3.8+ standard library only. Single file.
+`ai-hist` is in a scoped Rust cutover. The public `ai-hist` command is now a
+Rust-first wrapper: parity-proven commands run through Rust, and Python-only
+commands/flags route to the legacy Python CLI with an explicit deprecation
+warning. See [DISPATCH_MATRIX.md](DISPATCH_MATRIX.md) for the tested routing
+table.
 
 ## Install
 
 ```bash
+git clone https://github.com/AgentWorkforce/relayhistory.git ai-hist
+cd ai-hist
+cargo build --release -p ai-hist-cli
 mkdir -p ~/.local/bin
-curl -o ~/.local/bin/ai-hist https://raw.githubusercontent.com/khaliqgant/ai-hist/main/ai-hist
-chmod +x ~/.local/bin/ai-hist
-```
-
-Or clone and symlink:
-
-```bash
-git clone https://github.com/khaliqgant/ai-hist.git
-mkdir -p ~/.local/bin
-ln -s "$(pwd)/ai-hist/ai-hist" ~/.local/bin/ai-hist
+ln -sf "$(pwd)/ai-hist" ~/.local/bin/ai-hist
 ```
 
 Make sure `~/.local/bin` is in your `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
+```
+
+Legacy fallback is still required for `sync`, `show`, `context`, `pack`,
+`watch`, `export`, `import`, `tag`, `untag`, `tags`, and richer overlapping
+flags such as `session --full` and `resume --json`. The fallback has been
+verified on Python 3.9.6 in this cutover.
+
+Escape hatches:
+
+```bash
+AI_HIST_CLI=rust ai-hist search deploy
+AI_HIST_CLI=python ai-hist sync
+./ai-hist-rust search deploy        # from a source checkout
+./ai-hist-python sync               # from a source checkout
 ```
 
 ## Usage
@@ -57,7 +69,7 @@ ai-hist session abc-1234-def --full   # no truncation
 
 # Resume a conversation directly (the exact command is shown by `ai-hist show <id>`)
 cd /path/to/project && claude --resume <session_id>          # claude
-codex --resume <session_id>                                   # codex
+codex resume <session_id>                                     # codex
 cd /path/to/project && cursor-agent --resume=<session_id>    # cursor
 
 # Stats overview
@@ -103,7 +115,7 @@ ai-hist supports five sources:
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
 
-**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
+**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used. During the Rust cutover, full-source `ai-hist sync` still runs through the legacy Python fallback.
 
 **Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
 
@@ -194,7 +206,6 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
     <string>com.ai-hist.sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
         <string>${HOME}/.local/bin/ai-hist</string>
         <string>sync</string>
     </array>
@@ -219,7 +230,7 @@ launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 
 ```bash
 # Sync every minute
-echo "* * * * * python3 ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | crontab -
+echo "* * * * * ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | crontab -
 ```
 
 ### Alternative: watch mode

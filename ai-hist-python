@@ -1,0 +1,2328 @@
+#!/usr/bin/env python3
+"""
+ai-hist: Sync and search AI CLI conversation history in SQLite.
+
+Supports Claude Code and Codex CLI out of the box.
+Zero dependencies — Python 3.8+ standard library only.
+"""
+
+import argparse
+import gzip
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# --- Configuration -----------------------------------------------------------
+
+DEFAULT_DB = os.path.join(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")), "ai-hist", "ai-history.db")
+DB_PATH = Path(os.environ.get("AI_HIST_DB", DEFAULT_DB))
+STATE_PATH = DB_PATH.parent / ".sync-state.json"
+
+SOURCES = {
+    "claude": Path.home() / ".claude" / "history.jsonl",
+    "codex": Path.home() / ".codex" / "history.jsonl",
+}
+
+CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
+CODEX_SESSIONS_DIRS = [
+    Path.home() / ".codex" / "sessions",
+    Path.home() / ".codex" / "archived_sessions",
+]
+
+CURSOR_ROOT = Path.home() / ".cursor" / "projects"
+OPENCODE_DB = Path(os.environ.get("OPENCODE_DB", str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")))
+TRAJECTORY_ROOT = os.environ.get("TRAJECTORY_ROOT", "")
+DEFAULT_TRAJECTORY_SEARCH_ROOT = Path.home() / "Projects"
+SOURCE_CHOICES = ["claude", "codex", "cursor", "relay", "trajectory", "opencode"]
+
+# --- Schema ------------------------------------------------------------------
+
+SCHEMA = """\
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT,
+    project TEXT,
+    prompt TEXT NOT NULL,
+    prompt_hash TEXT,
+    timestamp_ms INTEGER NOT NULL,
+    UNIQUE(source, timestamp_ms, prompt)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    git_branch TEXT,
+    first_activity_ms INTEGER,
+    last_activity_ms INTEGER,
+    last_assistant_text TEXT,
+    raw_path TEXT,
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
+CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch);
+CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC);
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+    prompt, project, content='history', content_rowid='id'
+);
+CREATE TABLE IF NOT EXISTS trajectories (
+    id TEXT PRIMARY KEY,
+    version INTEGER,
+    persona_id TEXT,
+    project_id TEXT,
+    task_title TEXT,
+    task_description TEXT,
+    status TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    decisions_json TEXT NOT NULL,
+    retrospective_json TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    path TEXT,
+    updated_ms INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    color TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_ms INTEGER NOT NULL,
+    UNIQUE(source, session_id, tag_id)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
+    search_text, task_title, task_description, persona_id, project_id,
+    content='trajectories', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
+    INSERT INTO history_fts(rowid, prompt, project)
+    VALUES (new.id, new.prompt, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, prompt, project)
+    VALUES('delete', old.id, old.prompt, old.project);
+    INSERT INTO history_fts(rowid, prompt, project)
+    VALUES (new.id, new.prompt, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, prompt, project)
+    VALUES('delete', old.id, old.prompt, old.project);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_ai AFTER INSERT ON trajectories BEGIN
+    INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_au AFTER UPDATE ON trajectories BEGIN
+    INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+    INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES (new.rowid, new.search_text, new.task_title, new.task_description, new.persona_id, new.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trajectories_ad AFTER DELETE ON trajectories BEGIN
+    INSERT INTO trajectory_fts(trajectory_fts, rowid, search_text, task_title, task_description, persona_id, project_id)
+    VALUES('delete', old.rowid, old.search_text, old.task_title, old.task_description, old.persona_id, old.project_id);
+END;
+"""
+
+# --- Helpers -----------------------------------------------------------------
+
+def _prompt_hash(prompt):
+    """First 16 hex chars of SHA-256 of the prompt — stored for future dedup queries."""
+    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
+def _shell_quote(value):
+    import re
+    if re.match(r'^[A-Za-z0-9_./-]+$', value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _resume_cmd(source, session_id, project):
+    """Build the CLI command to resume a session. Returns None for sources without resume."""
+    if not session_id:
+        return None
+    if source == "claude":
+        if project:
+            return f"cd {_shell_quote(project)} && claude --resume {_shell_quote(session_id)}"
+        return f"claude --resume {_shell_quote(session_id)}"
+    if source == "codex":
+        return f"codex resume {_shell_quote(session_id)}"
+    if source == "cursor":
+        cmd = f"cursor-agent --resume={_shell_quote(session_id)}"
+        if project:
+            return f"cd {_shell_quote(project)} && {cmd}"
+        return cmd
+    return None
+
+
+def _build_fts_query(terms, raw=False):
+    """Build an FTS5 query string from a list of terms.
+
+    Auto-detects FTS5 operators (uppercase AND/OR/NOT, trailing *,
+    pre-quoted phrases) and passes through raw. Leading - terms are converted
+    to FTS5 NOT clauses. Otherwise quotes each term for literal matching,
+    which is the safe default for most user input.
+    Use raw=True or --fts to force raw FTS5 expression passthrough.
+    """
+    if raw:
+        return " ".join(terms)
+    fts_ops = {"AND", "OR", "NOT"}
+    positives = []
+    negatives = []
+    for t in terms:
+        if t in fts_ops or t.endswith("*") or (t.startswith('"') and t.endswith('"')):
+            return " ".join(terms)
+        if t.startswith("-") and len(t) > 1:
+            negatives.append(t[1:])
+        else:
+            positives.append(t)
+    if negatives and not positives:
+        return '"__ai_hist_no_positive_terms__"'
+    query = " ".join(_quote_fts_term(t) for t in positives)
+    if negatives:
+        query += " NOT " + " NOT ".join(_quote_fts_term(t) for t in negatives)
+    return query
+
+
+def _quote_fts_term(term):
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _row_to_dict(id_, source, session_id, project, prompt, ts_ms):
+    return {
+        "id": id_,
+        "source": source,
+        "session_id": session_id,
+        "project": project,
+        "prompt": prompt,
+        "timestamp_ms": ts_ms,
+    }
+
+def _normalize_tag_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def _tag_filter_clause(alias: str = "h") -> str:
+    return (
+        "EXISTS ("
+        "SELECT 1 FROM session_tags st "
+        "JOIN tags t ON t.id = st.tag_id "
+        f"WHERE st.source = {alias}.source "
+        f"AND st.session_id = {alias}.session_id "
+        "AND t.name = ?"
+        ")"
+    )
+
+
+def _session_tags(conn: sqlite3.Connection, source: str, session_id: str) -> list:
+    return [
+        {"name": name, "display_name": display_name, "color": color}
+        for name, display_name, color in conn.execute(
+            "SELECT t.name, t.display_name, t.color "
+            "FROM tags t JOIN session_tags st ON st.tag_id = t.id "
+            "WHERE st.source = ? AND st.session_id = ? "
+            "ORDER BY t.name",
+            (source, session_id),
+        )
+    ]
+
+
+def _ensure_tag(conn: sqlite3.Connection, tag_name: str, color=None) -> int:
+    normalized = _normalize_tag_name(tag_name)
+    if not normalized:
+        raise ValueError("tag name cannot be empty")
+    now_ms = int(time.time() * 1000)
+    conn.execute(
+        "INSERT INTO tags (name, display_name, color, created_ms, updated_ms) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET "
+        "display_name = excluded.display_name, "
+        "color = COALESCE(excluded.color, tags.color), "
+        "updated_ms = excluded.updated_ms",
+        (normalized, tag_name.strip(), color, now_ms, now_ms),
+    )
+    return conn.execute("SELECT id FROM tags WHERE name = ?", (normalized,)).fetchone()[0]
+
+
+def _matching_sessions(conn: sqlite3.Connection, session_id: str, source=None) -> list:
+    sql = (
+        "SELECT source, session_id, MIN(project), COUNT(*), MAX(timestamp_ms) "
+        "FROM history WHERE session_id = ?"
+    )
+    params = [session_id]
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
+    sql += " GROUP BY source, session_id ORDER BY source"
+    return conn.execute(sql, params).fetchall()
+
+
+# --- Session helpers ---------------------------------------------------------
+
+def _upsert_session(conn, session_id, source, cwd, git_branch, ts_ms,
+                    last_assistant_text=None, raw_path=None):
+    """Insert or update a row in the sessions table."""
+    conn.execute(
+        """
+        INSERT INTO sessions
+          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms,
+           last_assistant_text, raw_path, parser_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(session_id, source) DO UPDATE SET
+          cwd                = COALESCE(excluded.cwd, sessions.cwd),
+          git_branch         = COALESCE(excluded.git_branch, sessions.git_branch),
+          first_activity_ms  = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms),
+                                   excluded.first_activity_ms),
+          last_activity_ms   = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms),
+                                   excluded.last_activity_ms),
+          last_assistant_text= COALESCE(excluded.last_assistant_text, sessions.last_assistant_text),
+          raw_path           = COALESCE(excluded.raw_path, sessions.raw_path),
+          parser_version     = excluded.parser_version
+        """,
+        (session_id, source, cwd, git_branch, ts_ms, ts_ms,
+         last_assistant_text, raw_path),
+    )
+
+
+def _scan_claude_session_file(path: Path):
+    """
+    Extract session metadata from a Claude per-session JSONL file.
+
+    Reads the first 20 lines for sessionId/gitBranch/cwd/first-timestamp,
+    then tails the last 64 KB for the most recent assistant turn.
+    Returns a dict or None if the file can't be identified as a session.
+    """
+    MAX_TAIL = 65536
+    session_id = git_branch = cwd = None
+    first_ts = last_ts = None
+    last_assistant_text = None
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if session_id is None:
+                    session_id = obj.get("sessionId")
+                if git_branch is None:
+                    git_branch = obj.get("gitBranch")
+                if cwd is None:
+                    cwd = obj.get("cwd")
+                if first_ts is None:
+                    raw_ts = obj.get("timestamp")
+                    if isinstance(raw_ts, str):
+                        first_ts = _iso_to_ms(raw_ts)
+                    elif isinstance(raw_ts, (int, float)):
+                        first_ts = int(raw_ts)
+    except OSError:
+        return None
+
+    if not session_id:
+        return None
+
+    # Tail the file for last timestamp, last assistant text, and latest branch.
+    # Going bottom-to-top means the first gitBranch we find is the most recent one,
+    # which handles sessions that switched branches mid-way.
+    tail_branch = None
+    try:
+        file_size = path.stat().st_size
+        tail_offset = max(0, file_size - MAX_TAIL)
+        with open(path, "rb") as fb:
+            fb.seek(tail_offset)
+            tail_bytes = fb.read()
+        tail_text = tail_bytes.decode("utf-8", errors="replace")
+        for line in reversed(tail_text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if last_ts is None:
+                raw_ts = obj.get("timestamp")
+                if isinstance(raw_ts, str):
+                    last_ts = _iso_to_ms(raw_ts)
+                elif isinstance(raw_ts, (int, float)):
+                    last_ts = int(raw_ts)
+            if tail_branch is None and obj.get("gitBranch"):
+                tail_branch = obj["gitBranch"]
+            if last_assistant_text is None and obj.get("type") == "assistant":
+                msg = obj.get("message") or {}
+                content = msg.get("content")
+                if isinstance(content, str):
+                    last_assistant_text = content[:4096]
+                elif isinstance(content, list):
+                    parts = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            parts.append(str(c.get("text", "")))
+                    if parts:
+                        last_assistant_text = "\n".join(parts)[:4096]
+            if last_ts is not None and tail_branch is not None and last_assistant_text is not None:
+                break
+    except OSError:
+        pass
+    # Prefer the latest-seen branch (from tail) over the initial branch (from head).
+    if tail_branch:
+        git_branch = tail_branch
+
+    return {
+        "session_id": session_id,
+        "git_branch": git_branch,
+        "cwd": cwd,
+        "first_ts": first_ts or 0,
+        "last_ts": last_ts or first_ts or 0,
+        "last_assistant_text": last_assistant_text,
+        "raw_path": str(path),
+    }
+
+
+def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
+    """
+    Walk ~/.claude/projects/**/<session-id>.jsonl and populate the sessions table.
+    Uses per-file mtime to skip unchanged files incrementally.
+    """
+    if not CLAUDE_PROJECTS_ROOT.exists():
+        return
+
+    session_state = state.get("claude_sessions", {})
+    upserted = 0
+    scanned = 0
+    errors = 0
+
+    for project_dir in CLAUDE_PROJECTS_ROOT.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl_path in project_dir.glob("*.jsonl"):
+            key = str(jsonl_path)
+            try:
+                st = jsonl_path.stat()
+                mtime = f"{st.st_mtime_ns}:{st.st_size}"
+            except OSError:
+                errors += 1
+                continue
+            if session_state.get(key) == mtime:
+                continue
+            scanned += 1
+            meta = _scan_claude_session_file(jsonl_path)
+            session_state[key] = mtime
+            if not meta:
+                continue
+            try:
+                _upsert_session(
+                    conn,
+                    meta["session_id"],
+                    "claude",
+                    meta["cwd"],
+                    meta["git_branch"],
+                    meta["first_ts"],
+                    last_assistant_text=meta["last_assistant_text"],
+                    raw_path=meta["raw_path"],
+                )
+                # Update last_activity_ms separately (max of file mtime vs parsed ts)
+                conn.execute(
+                    "UPDATE sessions SET last_activity_ms = MAX(last_activity_ms, ?) "
+                    "WHERE session_id = ? AND source = 'claude'",
+                    (meta["last_ts"], meta["session_id"]),
+                )
+                upserted += 1
+            except sqlite3.Error:
+                errors += 1
+
+    conn.commit()
+    state["claude_sessions"] = session_state
+    if scanned:
+        suffix = f" ({errors} errors)" if errors else ""
+        print(f"  [claude-sessions] scanned {scanned} files, {upserted} sessions updated{suffix}")
+
+
+# --- Parsers -----------------------------------------------------------------
+
+def parse_claude(line: str):
+    """Parse a Claude Code history.jsonl line."""
+    obj = json.loads(line)
+    display = obj.get("display", "").strip()
+    if not display:
+        return None
+    return {
+        "source": "claude",
+        "session_id": obj.get("sessionId"),
+        "project": obj.get("project"),
+        "prompt": display,
+        "prompt_hash": _prompt_hash(display),
+        "timestamp_ms": obj.get("timestamp", 0),
+        "git_branch": obj.get("gitBranch"),
+    }
+
+
+def parse_codex(line: str):
+    """Parse a Codex CLI history.jsonl line."""
+    obj = json.loads(line)
+    text = obj.get("text", "").strip()
+    if not text:
+        return None
+    return {
+        "source": "codex",
+        "session_id": obj.get("session_id"),
+        "project": None,
+        "prompt": text,
+        "prompt_hash": _prompt_hash(text),
+        "timestamp_ms": int(obj.get("ts", 0) * 1000),
+        "git_branch": None,
+    }
+
+
+PARSERS = {
+    "claude": parse_claude,
+    "codex": parse_codex,
+}
+
+
+# --- Codex session enrichment ------------------------------------------------
+# Codex `history.jsonl` entries don't carry the working directory. The rollout
+# files under ~/.codex/sessions/**/rollout-*.jsonl do — their first line is a
+# `session_meta` event with `payload.id` and `payload.cwd`. We build a
+# session_id → cwd map at sync time and use it to populate `project`.
+
+def _read_codex_session_meta(path: Path):
+    """Read a codex rollout file's first line; return (session_id, cwd, git_branch) or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    first = first.strip()
+    if not first:
+        return None
+    try:
+        obj = json.loads(first)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("type") != "session_meta":
+        return None
+    payload = obj.get("payload") or {}
+    session_id = payload.get("id")
+    cwd = payload.get("cwd")
+    if not session_id or not cwd:
+        return None
+    git = payload.get("git") or {}
+    branch = git.get("branch") if isinstance(git, dict) else None
+    return session_id, cwd, branch
+
+
+def build_codex_session_map(state: dict) -> tuple:
+    """Walk codex rollout dirs; cache and return ({session_id: cwd}, {session_id: branch}).
+
+    Rollout files are write-once after the session_meta header — we key the
+    rollout cache by path and skip any file whose mtime hasn't changed since
+    we last scanned it.
+    """
+    seen = state.get("codex_rollouts", {})
+    cwds = state.get("codex_session_cwds", {})
+    branches = state.get("codex_session_branches", {})
+    scanned = 0
+    for root in CODEX_SESSIONS_DIRS:
+        if not root.exists():
+            continue
+        for rollout in root.rglob("rollout-*.jsonl"):
+            key = str(rollout)
+            try:
+                mtime = int(rollout.stat().st_mtime)
+            except OSError:
+                continue
+            if seen.get(key) == mtime:
+                continue
+            meta = _read_codex_session_meta(rollout)
+            seen[key] = mtime
+            scanned += 1
+            if meta:
+                sid, cwd, branch = meta
+                cwds[sid] = cwd
+                if branch:
+                    branches[sid] = branch
+    state["codex_rollouts"] = seen
+    state["codex_session_cwds"] = cwds
+    state["codex_session_branches"] = branches
+    if scanned:
+        print(f"  [codex] scanned {scanned:,} new rollout files; {len(cwds):,} sessions mapped")
+    return cwds, branches
+
+
+def _backfill_codex_projects(conn: sqlite3.Connection, cwds: dict, branches: dict) -> int:
+    """Set project/git_branch for codex rows whose session_id is mapped and keep
+    the sessions table in sync.
+
+    Only sessions that still need work are touched — those with a NULL
+    project/branch on some row, not yet recorded in `sessions`, or with newer
+    history activity than `sessions.last_activity_ms`. Fully-synced sessions are
+    skipped, so repeat syncs stay cheap regardless of total history size. The
+    per-session MIN/MAX timestamps come from the same aggregate query.
+    """
+    if not cwds and not branches:
+        return 0
+    rows = conn.execute(
+        """
+        SELECT h.session_id,
+               MIN(h.timestamp_ms), MAX(h.timestamp_ms),
+               SUM(CASE WHEN h.project IS NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN h.git_branch IS NULL THEN 1 ELSE 0 END)
+        FROM history h
+        LEFT JOIN sessions s
+          ON s.session_id = h.session_id AND s.source = 'codex'
+        WHERE h.source = 'codex' AND h.session_id IS NOT NULL
+        GROUP BY h.session_id
+        HAVING SUM(CASE WHEN h.project IS NULL THEN 1 ELSE 0 END) > 0
+            OR SUM(CASE WHEN h.git_branch IS NULL THEN 1 ELSE 0 END) > 0
+            OR MAX(s.session_id) IS NULL
+            OR MAX(h.timestamp_ms) > COALESCE(MAX(s.last_activity_ms), -1)
+        """
+    ).fetchall()
+    updated = 0
+    dirty = False
+    for sid, first_ts, last_ts, null_proj, null_branch in rows:
+        cwd = cwds.get(sid)
+        branch = branches.get(sid)
+        if not cwd and not branch:
+            continue
+        # Only write columns that are actually missing, so rowcount reflects
+        # genuine changes rather than COALESCE no-ops.
+        sets = []
+        params = []
+        if cwd and null_proj:
+            sets.append("project = COALESCE(project, ?)")
+            params.append(cwd)
+        if branch and null_branch:
+            sets.append("git_branch = COALESCE(git_branch, ?)")
+            params.append(branch)
+        if sets:
+            params.append(sid)
+            cur = conn.execute(
+                f"UPDATE history SET {', '.join(sets)} WHERE source='codex' AND session_id = ?",
+                params,
+            )
+            updated += cur.rowcount
+            dirty = True
+        if cwd:
+            # Use real timestamps from history so sessions table sorts correctly.
+            _upsert_session(conn, sid, "codex", cwd, branch, first_ts or 0)
+            if last_ts:
+                conn.execute(
+                    "UPDATE sessions SET last_activity_ms = MAX(COALESCE(last_activity_ms, 0), ?) "
+                    "WHERE session_id = ? AND source = 'codex'",
+                    (last_ts, sid),
+                )
+            dirty = True
+    if dirty:
+        conn.commit()
+    return updated
+
+
+def sync_codex(conn: sqlite3.Connection, state: dict):
+    """Import ~/.codex/history.jsonl, enriching `project` from rollout session_meta."""
+    path = SOURCES["codex"]
+    if not path.exists():
+        print(f"  [codex] not found: {path} (skipped)")
+        return
+
+    cwds, branches = build_codex_session_map(state)
+
+    file_size = path.stat().st_size
+    offset = state.get("codex", 0)
+    inserted = 0
+    errors = 0
+
+    if offset < file_size:
+        print(f"  [codex] syncing {file_size - offset:,} new bytes...")
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = parse_codex(line)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    errors += 1
+                    continue
+                if row is None:
+                    continue
+                sid = row.get("session_id")
+                if sid:
+                    if not row.get("project"):
+                        row["project"] = cwds.get(sid)
+                    row["git_branch"] = branches.get(sid)
+                try:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO history "
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
+                        row,
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+                except sqlite3.Error:
+                    errors += 1
+        conn.commit()
+        state["codex"] = file_size
+
+    backfilled = _backfill_codex_projects(conn, cwds, branches)
+
+    if offset >= file_size and not backfilled:
+        print("  [codex] up to date")
+        return
+    parts = [f"+{inserted:,} rows"] if inserted or offset < file_size else []
+    if backfilled:
+        parts.append(f"backfilled {backfilled:,} project/branch values")
+    if errors:
+        parts.append(f"{errors} errors")
+    print(f"  [codex] " + ", ".join(parts))
+
+
+def parse_cursor_line(line: str):
+    """Extract a user prompt from a cursor agent-transcripts jsonl line.
+
+    Cursor lines have shape `{role, message: {content: [{type, text}, ...]}}`
+    and carry no per-line timestamp. User prompts are wrapped in
+    `<user_query>...</user_query>`.
+    """
+    obj = json.loads(line)
+    if obj.get("role") != "user":
+        return None
+    msg = obj.get("message") or {}
+    content = msg.get("content")
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text = c.get("text", "")
+                break
+    text = text.strip()
+    if not text:
+        return None
+    if text.startswith("<user_query>") and text.endswith("</user_query>"):
+        text = text[len("<user_query>"):-len("</user_query>")].strip()
+    return text or None
+
+
+def _decode_cursor_project(name: str) -> str:
+    """Decode an encoded cursor project dir name back into a filesystem path."""
+    return "/" + name.replace("-", "/")
+
+
+def sync_cursor(conn: sqlite3.Connection, state: dict):
+    """Sync user prompts from ~/.cursor/projects/*/agent-transcripts/."""
+    if not CURSOR_ROOT.exists():
+        return
+
+    cursor_state = state.get("cursor", {})
+    inserted = 0
+    errors = 0
+    files_seen = 0
+
+    for project_dir in sorted(CURSOR_ROOT.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        ts_root = project_dir / "agent-transcripts"
+        if not ts_root.is_dir():
+            continue
+        project_path = _decode_cursor_project(project_dir.name)
+        for session_dir in sorted(ts_root.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            session_id = session_dir.name
+            jsonl = session_dir / f"{session_id}.jsonl"
+            if not jsonl.exists():
+                continue
+            files_seen += 1
+            try:
+                stat = jsonl.stat()
+            except OSError:
+                errors += 1
+                continue
+            offset = cursor_state.get(str(jsonl), 0)
+            if offset >= stat.st_size:
+                continue
+            ts_ms = int(stat.st_mtime * 1000)
+            try:
+                with open(jsonl, "r", encoding="utf-8") as f:
+                    f.seek(offset)
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            text = parse_cursor_line(line)
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            errors += 1
+                            continue
+                        if not text:
+                            continue
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                ("cursor", session_id, project_path, text, _prompt_hash(text), ts_ms),
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+            except OSError:
+                errors += 1
+                continue
+            cursor_state[str(jsonl)] = stat.st_size
+
+    conn.commit()
+    state["cursor"] = cursor_state
+    if files_seen:
+        suffix = f" ({errors} errors)" if errors else ""
+        print(f"  [cursor] +{inserted:,} rows from {files_seen} files{suffix}")
+
+
+def _opencode_part_text(data: str) -> str:
+    try:
+        obj = json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(obj, dict) or obj.get("type") != "text":
+        return ""
+    text = obj.get("text", "")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _sqlite_file_marker(path: Path) -> dict:
+    marker = {}
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(path) + suffix)
+        try:
+            stat = candidate.stat()
+            marker[suffix or "db"] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        except OSError:
+            marker[suffix or "db"] = None
+    return marker
+
+
+def sync_opencode(conn: sqlite3.Connection, state: dict):
+    """Sync user prompts from OpenCode's SQLite session store."""
+    if not OPENCODE_DB.exists():
+        print(f"  [opencode] not found: {OPENCODE_DB} (skipped)")
+        return
+    marker = _sqlite_file_marker(OPENCODE_DB)
+    if marker["db"] is None:
+        print(f"  [opencode] unreadable: {OPENCODE_DB} (skipped)")
+        return
+    if state.get("opencode") == marker:
+        print("  [opencode] up to date")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot = Path(tmp) / "opencode.db"
+        try:
+            src_live = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=30)
+            src_live.execute("PRAGMA busy_timeout=5000")
+            snapshot_conn = sqlite3.connect(str(snapshot))
+            src_live.backup(snapshot_conn)
+            snapshot_conn.close()
+            src_live.close()
+            src = sqlite3.connect(str(snapshot))
+            rows = src.execute(
+                "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) "
+                "FROM part p "
+                "JOIN message m ON m.id = p.message_id "
+                "JOIN session s ON s.id = p.session_id "
+                "WHERE json_extract(m.data, '$.role') = 'user' "
+                "AND json_extract(p.data, '$.type') = 'text' "
+                "ORDER BY p.time_created ASC"
+            ).fetchall()
+            src.close()
+        except (OSError, sqlite3.Error) as e:
+            print(f"  [opencode] error reading {OPENCODE_DB}: {e} (skipped)")
+            return
+
+    inserted = 0
+    errors = 0
+    for session_id, project, data, ts_ms in rows:
+        prompt = _opencode_part_text(data)
+        if not prompt:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("opencode", session_id, project, prompt, _prompt_hash(prompt), int(ts_ms or 0)),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error:
+            errors += 1
+
+    conn.commit()
+    state["opencode"] = _sqlite_file_marker(OPENCODE_DB)
+    print(f"  [opencode] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+
+# --- Relaycast API -----------------------------------------------------------
+
+RELAYCAST_BASE = os.environ.get("RELAYCAST_BASE_URL", "https://api.relaycast.dev")
+RELAYCAST_API_KEY = os.environ.get("RELAYCAST_API_KEY", "")
+RELAYCAST_WORKSPACE_ID = os.environ.get("RELAYCAST_WORKSPACE_ID", "")
+
+
+def relaycast_get(path: str, params: dict = None) -> dict:  # pragma: no cover
+    """Make a GET request to the Relaycast API."""
+    url = f"{RELAYCAST_BASE}/v1/{path}"
+    if params:
+        qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        if qs:
+            url += f"?{qs}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {RELAYCAST_API_KEY}",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def sync_relaycast(conn: sqlite3.Connection, state: dict):
+    """Sync messages from Relaycast API into the history table."""
+    if not RELAYCAST_API_KEY or not RELAYCAST_WORKSPACE_ID:
+        return
+
+    relay_state = state.get("relay", {})
+    inserted = 0
+    errors = 0
+
+    try:
+        # Sync channel messages
+        resp = relaycast_get("channels")
+        channels = resp.get("data", []) if resp.get("ok") else []
+
+        for ch in channels:
+            ch_name = ch.get("name", "")
+            last_id = relay_state.get(f"ch:{ch_name}")
+            params = {"limit": "100"}
+            if last_id:
+                params["after"] = last_id
+
+            max_id = last_id
+            while True:
+                resp = relaycast_get(f"channels/{ch_name}/messages", params)
+                messages = resp.get("data", []) if resp.get("ok") else []
+                if not messages:
+                    break
+                for msg in messages:
+                    row = _relay_msg_to_row(msg, f"#{ch_name}")
+                    if row:
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
+                                row,
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+                    mid = msg.get("id", "")
+                    if mid and (not max_id or mid > max_id):
+                        max_id = mid
+                # If we got fewer than limit, we're done
+                if len(messages) < 100:
+                    break
+                params["after"] = messages[-1].get("id", "")
+
+            if max_id:
+                relay_state[f"ch:{ch_name}"] = max_id
+
+        # Sync DM conversations
+        try:
+            resp = relaycast_get("dm/conversations/all")
+            conversations = resp.get("data", []) if resp.get("ok") else []
+        except urllib.error.HTTPError:
+            conversations = []
+
+        for conv in conversations:
+            conv_id = conv.get("id", "")
+            if not conv_id:
+                continue
+            last_id = relay_state.get(f"dm:{conv_id}")
+            params = {"limit": "100"}
+            if last_id:
+                params["after"] = last_id
+
+            max_id = last_id
+            while True:
+                resp = relaycast_get(f"dm/conversations/{conv_id}/messages", params)
+                messages = resp.get("data", []) if resp.get("ok") else []
+                if not messages:
+                    break
+                for msg in messages:
+                    row = _relay_msg_to_row(msg, f"dm:{conv_id}")
+                    if row:
+                        try:
+                            cur = conn.execute(
+                                "INSERT OR IGNORE INTO history "
+                                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                                "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
+                                row,
+                            )
+                            if cur.rowcount > 0:
+                                inserted += 1
+                        except sqlite3.Error:
+                            errors += 1
+                    mid = msg.get("id", "")
+                    if mid and (not max_id or mid > max_id):
+                        max_id = mid
+                if len(messages) < 100:
+                    break
+                params["after"] = messages[-1].get("id", "")
+
+            if max_id:
+                relay_state[f"dm:{conv_id}"] = max_id
+
+        conn.commit()
+        state["relay"] = relay_state
+        print(f"  [relay] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print(f"  [relay] API error: {e}")
+    except Exception as e:
+        print(f"  [relay] error: {e}")
+
+
+def _relay_msg_to_row(msg: dict, channel: str):
+    """Convert a Relaycast message to a history row."""
+    text = msg.get("text", "")
+    if not text:
+        return None
+    sender = msg.get("from_name") or msg.get("from_id") or ""
+    created_at = msg.get("created_at", "")
+    ts_ms = _iso_to_ms(created_at) if created_at else 0
+    prompt = f"[{sender}] {text}" if sender else text
+    return {
+        "source": "relay",
+        "session_id": msg.get("thread_id") or channel,
+        "project": RELAYCAST_WORKSPACE_ID,
+        "prompt": prompt,
+        "prompt_hash": _prompt_hash(prompt),
+        "timestamp_ms": ts_ms,
+    }
+
+
+def _iso_to_ms(iso_str: str) -> int:
+    """Parse ISO 8601 datetime string to milliseconds since epoch."""
+    iso_str = iso_str.rstrip("Z").split("+")[0]
+    frac = 0
+    if "." in iso_str:
+        base, frac_str = iso_str.rsplit(".", 1)
+        frac = int(frac_str.ljust(3, "0")[:3])
+        iso_str = base
+    try:
+        t = time.strptime(iso_str, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return 0
+    return int(time.mktime(t)) * 1000 + frac
+
+
+# --- Trajectories ------------------------------------------------------------
+
+def _as_text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _json_dump(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _trajectory_roots() -> list:
+    """Resolve trajectory roots from TRAJECTORY_ROOT or ~/Projects/**/.trajectories."""
+    if TRAJECTORY_ROOT.strip():
+        roots = []
+        for raw in TRAJECTORY_ROOT.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                roots.append(Path(raw).expanduser())
+        return roots
+    if not DEFAULT_TRAJECTORY_SEARCH_ROOT.exists():
+        return []
+    return sorted(
+        p for p in DEFAULT_TRAJECTORY_SEARCH_ROOT.rglob(".trajectories")
+        if p.is_dir()
+    )
+
+
+def _iter_trajectory_files() -> list:
+    files = []
+    for root in _trajectory_roots():
+        if not root.exists():
+            continue
+        if root.is_file() and root.suffix == ".json":
+            files.append(root)
+            continue
+        search_root = root.parent if root.name == "compacted" else root
+        for compacted_dir in search_root.rglob("compacted"):
+            if not compacted_dir.is_dir():
+                continue
+            for path in compacted_dir.glob("*.json"):
+                if path.name in {"index.json", ".sync-state.json"}:
+                    continue
+                files.append(path)
+    return sorted(set(files))
+
+
+def _trajectory_timestamp_ms(obj: dict, path: Path) -> int:
+    for key in ("completedAt", "startedAt", "compactedAt"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            ts = _iso_to_ms(value)
+            if ts:
+                return ts
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return 0
+
+
+def _trajectory_search_text(obj: dict) -> str:
+    task = obj.get("task") if isinstance(obj.get("task"), dict) else {}
+    retrospective = obj.get("retrospective") if isinstance(obj.get("retrospective"), dict) else {}
+    parts = [
+        _as_text(obj.get("id")),
+        _as_text(obj.get("personaId")),
+        _as_text(obj.get("projectId")),
+        _as_text(obj.get("status")),
+        _as_text(task.get("title")),
+        _as_text(task.get("description")),
+    ]
+
+    for decision in _as_list(obj.get("decisions")):
+        if not isinstance(decision, dict):
+            continue
+        parts.extend([
+            _as_text(decision.get("question")),
+            _as_text(decision.get("chosen")),
+            _as_text(decision.get("reasoning")),
+        ])
+        parts.extend(_as_text(item) for item in _as_list(decision.get("alternatives")))
+
+    parts.extend([
+        _as_text(retrospective.get("summary")),
+        _as_text(retrospective.get("approach")),
+        str(retrospective.get("confidence")) if retrospective.get("confidence") is not None else "",
+    ])
+    parts.extend(_as_text(item) for item in _as_list(retrospective.get("learnings")))
+    return "\n".join(part for part in parts if part)
+
+
+def parse_trajectory_file(path: Path):
+    """Parse a compacted trajectory JSON file using the locked A/B contract."""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    trajectory_id = obj.get("id")
+    if not isinstance(trajectory_id, str) or not trajectory_id:
+        return None
+    if (
+        obj.get("type") == "compacted"
+        and isinstance(obj.get("sourceTrajectories"), list)
+        and not any(key in obj for key in ("task", "retrospective", "personaId", "projectId"))
+    ):
+        return None
+
+    task = obj.get("task") if isinstance(obj.get("task"), dict) else {}
+    retrospective = obj.get("retrospective") if isinstance(obj.get("retrospective"), dict) else {}
+    decisions = [d for d in _as_list(obj.get("decisions")) if isinstance(d, dict)]
+    search_text = _trajectory_search_text(obj)
+    ts_ms = _trajectory_timestamp_ms(obj, path)
+    try:
+        updated_ms = int(path.stat().st_mtime * 1000)
+    except OSError:
+        updated_ms = ts_ms
+
+    return {
+        "id": trajectory_id,
+        "version": obj.get("version") if isinstance(obj.get("version"), int) else None,
+        "persona_id": obj.get("personaId") if isinstance(obj.get("personaId"), str) else None,
+        "project_id": obj.get("projectId") if isinstance(obj.get("projectId"), str) else None,
+        "task_title": task.get("title") if isinstance(task.get("title"), str) else None,
+        "task_description": task.get("description") if isinstance(task.get("description"), str) else None,
+        "status": obj.get("status") if isinstance(obj.get("status"), str) else None,
+        "started_at": obj.get("startedAt") if isinstance(obj.get("startedAt"), str) else None,
+        "completed_at": obj.get("completedAt") if isinstance(obj.get("completedAt"), str) else None,
+        "decisions_json": _json_dump(decisions),
+        "retrospective_json": _json_dump(retrospective if isinstance(retrospective, dict) else {}),
+        "search_text": search_text,
+        "path": str(path),
+        "updated_ms": updated_ms,
+        "timestamp_ms": ts_ms,
+    }
+
+
+def sync_trajectories(conn: sqlite3.Connection, state: dict):
+    """Sync compacted trajectory JSON files into structured and history indexes."""
+    trajectory_state = state.get("trajectory", {})
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    files = _iter_trajectory_files()
+
+    for path in files:
+        key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            errors += 1
+            continue
+        stamp = f"{int(stat.st_mtime)}:{stat.st_size}"
+        if trajectory_state.get(key) == stamp:
+            skipped += 1
+            continue
+        row = parse_trajectory_file(path)
+        if not row:
+            skipped += 1
+            continue
+        before = conn.execute(
+            "SELECT 1 FROM trajectories WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        try:
+            conn.execute(
+                """
+                INSERT INTO trajectories
+                (id, version, persona_id, project_id, task_title, task_description, status,
+                 started_at, completed_at, decisions_json, retrospective_json, search_text,
+                 path, updated_ms, timestamp_ms)
+                VALUES
+                (:id, :version, :persona_id, :project_id, :task_title, :task_description, :status,
+                 :started_at, :completed_at, :decisions_json, :retrospective_json, :search_text,
+                 :path, :updated_ms, :timestamp_ms)
+                ON CONFLICT(id) DO UPDATE SET
+                  version=excluded.version,
+                  persona_id=excluded.persona_id,
+                  project_id=excluded.project_id,
+                  task_title=excluded.task_title,
+                  task_description=excluded.task_description,
+                  status=excluded.status,
+                  started_at=excluded.started_at,
+                  completed_at=excluded.completed_at,
+                  decisions_json=excluded.decisions_json,
+                  retrospective_json=excluded.retrospective_json,
+                  search_text=excluded.search_text,
+                  path=excluded.path,
+                  updated_ms=excluded.updated_ms,
+                  timestamp_ms=excluded.timestamp_ms
+                """,
+                row,
+            )
+            conn.execute(
+                "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?",
+                (row["id"],),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "trajectory",
+                    row["id"],
+                    row["project_id"],
+                    row["search_text"],
+                    _prompt_hash(row["search_text"]),
+                    row["timestamp_ms"],
+                ),
+            )
+        except sqlite3.Error:
+            errors += 1
+            continue
+        trajectory_state[key] = stamp
+        if before:
+            updated += 1
+        else:
+            inserted += 1
+
+    conn.commit()
+    state["trajectory"] = trajectory_state
+    if files:
+        parts = [f"+{inserted:,} rows"]
+        if updated:
+            parts.append(f"{updated:,} updated")
+        if skipped:
+            parts.append(f"{skipped:,} unchanged")
+        if errors:
+            parts.append(f"{errors} errors")
+        print(f"  [trajectory] " + ", ".join(parts))
+
+
+# --- Core --------------------------------------------------------------------
+
+def init_db(conn: sqlite3.Connection):
+    conn.executescript(SCHEMA)
+    conn.execute("PRAGMA journal_mode=WAL")
+    for migration in (
+        "ALTER TABLE history ADD COLUMN prompt_hash TEXT",
+        "ALTER TABLE history ADD COLUMN git_branch TEXT",
+    ):
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)")
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    return {}
+
+
+def save_state(state: dict):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def fmt_row(id_, source, project, prompt, ts_ms, verbose=False):
+    """Format a single row for display."""
+    dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000))
+    proj = f" [{project}]" if project else ""
+    if verbose:
+        display = prompt
+    else:
+        display = prompt[:120] + "..." if len(prompt) > 120 else prompt
+        display = display.replace("\n", " ")
+    return f"  #{id_:<5} {dt}  ({source}){proj}  {display}"
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_sync(args=None):
+    """Import new entries from history files into SQLite."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    state = load_state()
+
+    for name, path in SOURCES.items():
+        if name == "codex":
+            # Codex is handled by sync_codex with rollout-derived cwd enrichment.
+            continue
+        if not path.exists():
+            print(f"  [{name}] not found: {path} (skipped)")
+            continue
+
+        file_size = path.stat().st_size
+        offset = state.get(name, 0)
+        if offset >= file_size:
+            print(f"  [{name}] up to date")
+            continue
+
+        print(f"  [{name}] syncing {file_size - offset:,} new bytes...")
+        parser = PARSERS[name]
+        inserted = 0
+        errors = 0
+
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = parser(line)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    errors += 1
+                    continue
+                if row is None:
+                    continue
+                try:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO history "
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
+                        row,
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+                except sqlite3.Error:
+                    errors += 1
+
+        conn.commit()
+        state[name] = file_size
+        print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    # Sync Claude per-session JSONL files for gitBranch + last assistant text
+    sync_claude_sessions(conn, state)
+
+    # Sync Codex history with cwd enrichment from rollout files
+    sync_codex(conn, state)
+
+    # Sync Cursor agent transcripts (auto-discovered, no config needed)
+    sync_cursor(conn, state)
+
+    # Sync OpenCode SQLite history (auto-discovered, no config needed)
+    sync_opencode(conn, state)
+
+    # Sync Relaycast (opt-in via env vars)
+    sync_relaycast(conn, state)
+
+    # Sync compacted per-run trajectory artifacts (decision WHY)
+    sync_trajectories(conn, state)
+
+    save_state(state)
+    total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    conn.close()
+    print(f"  Total: {total:,} entries")
+
+
+def cmd_search(args):
+    """Full-text search across prompts."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
+
+    sql = (
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? "
+    )
+    params = [query]
+    if args.source:
+        sql += "AND h.source = ? "
+        params.append(args.source)
+    if args.project:
+        sql += "AND h.project LIKE ? "
+        params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql += f"AND {_tag_filter_clause('h')} "
+        params.append(_normalize_tag_name(args.tag))
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print("No results.")
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
+        return
+
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms))
+
+
+def cmd_recent(args):
+    """Show N most recent entries."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    sql = "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history h "
+    params = []
+    wheres = []
+    if args.source:
+        wheres.append("h.source = ?")
+        params.append(args.source)
+    if args.project:
+        wheres.append("h.project LIKE ?")
+        params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        wheres.append(_tag_filter_clause("h"))
+        params.append(_normalize_tag_name(args.tag))
+    if wheres:
+        sql += "WHERE " + " AND ".join(wheres) + " "
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    params.append(args.n)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
+        return
+
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms))
+
+
+def cmd_show(args):
+    """Show the full prompt for a given entry ID."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    row = conn.execute(
+        "SELECT id, source, session_id, project, prompt, timestamp_ms "
+        "FROM history WHERE id = ?",
+        (args.id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        if getattr(args, "json", False):
+            print(json.dumps({"error": f"no entry with id {args.id}"}))
+        else:
+            print(f"No entry with id {args.id}")
+        sys.exit(1)
+
+    id_, source, session_id, project, prompt, ts_ms = row
+    dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000))
+    resume = _resume_cmd(source, session_id, project)
+
+    if getattr(args, "json", False):
+        session_count = None
+        tags = []
+        if session_id:
+            session_count = conn.execute(
+                "SELECT COUNT(*) FROM history WHERE source = ? AND session_id = ?", (source, session_id)
+            ).fetchone()[0]
+            tags = _session_tags(conn, source, session_id)
+        conn.close()
+        out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
+        out["resume_cmd"] = resume
+        out["session_count"] = session_count
+        out["tags"] = tags
+        print(json.dumps(out))
+        return
+
+    print(f"  ID:        {id_}")
+    print(f"  Source:    {source}")
+    print(f"  Session:   {session_id or '(none)'}")
+    print(f"  Project:   {project or '(none)'}")
+    print(f"  Time:      {dt}")
+    print(f"  Prompt:")
+    print()
+    print(prompt)
+
+    print()
+    if session_id:
+        session_count = conn.execute(
+            "SELECT COUNT(*) FROM history WHERE source = ? AND session_id = ?", (source, session_id)
+        ).fetchone()[0]
+        print(f"  Session has {session_count} entries: ai-hist session {session_id}")
+        tags = _session_tags(conn, source, session_id)
+        if tags:
+            print("  Tags:    " + ", ".join(t["display_name"] for t in tags))
+        if resume:
+            print(f"  Resume:  {resume}")
+    print(f"  Context: ai-hist context {id_}")
+    conn.close()
+
+
+def cmd_context(args):
+    """Show entries around a given ID: same session + nearby in time."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT id, source, session_id, project, timestamp_ms "
+        "FROM history WHERE id = ?",
+        (args.id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        print(f"No entry with id {args.id}")
+        sys.exit(1)
+    id_, source, session_id, project, ts_ms = row
+
+    # Same session
+    if session_id:
+        session_rows = conn.execute(
+            "SELECT id, source, project, prompt, timestamp_ms "
+            "FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
+            (session_id,),
+        ).fetchall()
+        if session_rows:
+            print(f"  === Session {session_id} ({len(session_rows)} entries) ===\n")
+            for r in session_rows:
+                marker = " >>>" if r[0] == id_ else "    "
+                print(f"{marker}{fmt_row(*r)}")
+            print()
+
+    # Nearby in time (±5 min), excluding same session
+    window_ms = args.window * 60 * 1000
+    nearby_sql = (
+        "SELECT id, source, project, prompt, timestamp_ms "
+        "FROM history WHERE timestamp_ms BETWEEN ? AND ? "
+        "AND (session_id IS NULL OR session_id != ?) "
+        "ORDER BY timestamp_ms ASC"
+    )
+    nearby_rows = conn.execute(
+        nearby_sql, (ts_ms - window_ms, ts_ms + window_ms, session_id or "")
+    ).fetchall()
+    if nearby_rows:
+        print(f"  === Nearby ({args.window}min window, other sessions) ===\n")
+        for r in nearby_rows:
+            print(f"    {fmt_row(*r)}")
+
+    conn.close()
+
+
+def cmd_session(args):
+    """Show all prompts in a given session."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    sql = (
+        "SELECT id, source, session_id, project, prompt, timestamp_ms "
+        "FROM history h WHERE h.session_id = ?"
+    )
+    params = [args.session_id]
+    if getattr(args, "source", None):
+        sql += " AND h.source = ?"
+        params.append(args.source)
+    if getattr(args, "tag", None):
+        sql += f" AND {_tag_filter_clause('h')}"
+        params.append(_normalize_tag_name(args.tag))
+    sql += " ORDER BY h.timestamp_ms ASC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    if not rows:
+        if getattr(args, "json", False):
+            print(json.dumps([]))
+        else:
+            print(f"No entries for session {args.session_id}")
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps([_row_to_dict(*r) for r in rows]))
+        return
+
+    print(f"  Session {args.session_id} ({len(rows)} entries):\n")
+    for r in rows:
+        id_, source, session_id, project, prompt, ts_ms = r
+        print(fmt_row(id_, source, project, prompt, ts_ms, verbose=args.full))
+
+
+def cmd_stats(args=None):
+    """Show summary statistics."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    tag = _normalize_tag_name(args.tag) if args and getattr(args, "tag", None) else None
+    where = ""
+    params = []
+    if tag:
+        where = f" WHERE {_tag_filter_clause('h')}"
+        params.append(tag)
+
+    total = conn.execute(f"SELECT COUNT(*) FROM history h{where}", params).fetchone()[0]
+    by_source = {
+        source: count
+        for source, count in conn.execute(
+            f"SELECT source, COUNT(*) FROM history h{where} GROUP BY source ORDER BY source",
+            params,
+        )
+    }
+    top_projects = [
+        {"project": p, "count": c}
+        for p, c in conn.execute(
+            "SELECT project, COUNT(*) as c FROM history "
+            f"h WHERE project IS NOT NULL {'AND ' + _tag_filter_clause('h') if tag else ''} "
+            "GROUP BY project ORDER BY c DESC LIMIT 10",
+            params,
+        )
+    ]
+    r = conn.execute(f"SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history h{where}", params).fetchone()
+    conn.close()
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "total": total,
+            "by_source": by_source,
+            "top_projects": top_projects,
+            "first_timestamp_ms": r[0],
+            "last_timestamp_ms": r[1],
+            "tag": tag,
+        }))
+        return
+
+    print(f"\nTotal entries: {total:,}")
+    if tag:
+        print(f"Tag filter: {tag}")
+    print("\nBy source:")
+    for source, count in by_source.items():
+        print(f"  {source}: {count:,}")
+    if r[0]:
+        print(f"\nDate range:")
+        print(f"  {time.strftime('%Y-%m-%d', time.localtime(r[0] / 1000))} to "
+              f"{time.strftime('%Y-%m-%d', time.localtime(r[1] / 1000))}")
+    print("\nTop 10 projects:")
+    for item in top_projects:
+        print(f"  {item['count']:>6,}  {item['project']}")
+
+
+def cmd_pack(args):
+    """Generate a token-budget-aware evidence bundle for LLM handoff.
+
+    Searches the same way as `search` and formats results as a numbered list
+    with resume commands — ready to paste into an LLM context window.
+    Use --tokens to truncate each prompt to approximately N tokens (4 chars/token).
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
+
+    sql = (
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? "
+    )
+    params = [query]
+    if args.source:
+        sql += "AND h.source = ? "
+        params.append(args.source)
+    if args.project:
+        sql += "AND h.project LIKE ? "
+        params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql += f"AND {_tag_filter_clause('h')} "
+        params.append(_normalize_tag_name(args.tag))
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        if getattr(args, "json", False):
+            print(json.dumps({"query": " ".join(args.query), "entries": []}))
+        else:
+            print("No results.")
+        sys.exit(1)
+
+    chars_budget = args.tokens * 4 if args.tokens else None
+    query_str = " ".join(args.query)
+    now_ms = int(time.time() * 1000)
+
+    if getattr(args, "json", False):
+        entries = []
+        for r in rows:
+            id_, source, session_id, project, prompt, ts_ms = r
+            text = prompt[:chars_budget] if chars_budget and len(prompt) > chars_budget else prompt
+            entries.append({
+                "id": id_,
+                "source": source,
+                "session_id": session_id,
+                "project": project,
+                "prompt": text,
+                "timestamp_ms": ts_ms,
+                "resume_cmd": _resume_cmd(source, session_id, project),
+            })
+        print(json.dumps({
+            "query": query_str,
+            "generated_ms": now_ms,
+            "token_budget": args.tokens,
+            "entries": entries,
+        }))
+        return
+
+    dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(now_ms / 1000))
+    print(f'=== ai-hist pack: "{query_str}" | {dt} | {len(rows)} entries ===\n')
+    for i, r in enumerate(rows, 1):
+        id_, source, session_id, project, prompt, ts_ms = r
+        entry_dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000))
+        proj = f"  {project}" if project else ""
+        if chars_budget and len(prompt) > chars_budget:
+            text = prompt[:chars_budget].replace("\n", " ") + "..."
+        else:
+            text = prompt.replace("\n", " ")
+        print(f"[{i}/{len(rows)}] #{id_}  {entry_dt}  {source}{proj}")
+        print(f"      {text}")
+        if session_id:
+            cmd = _resume_cmd(source, session_id, project)
+            sid_short = session_id[:16] + "..." if len(session_id) > 16 else session_id
+            if cmd:
+                print(f"      Resume: {cmd}")
+            else:
+                print(f"      Session: {sid_short}")
+        print()
+
+
+def cmd_resume(args):
+    """Find the best session matching a query and print its resume command.
+
+    Exits 0 and prints the command on success; exits 1 if no matching session
+    is found. Ideal for shell aliases:
+        alias rai='$(ai-hist resume)'
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    query = _build_fts_query(args.query, getattr(args, "fts", False))
+
+    sql = (
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? AND h.session_id IS NOT NULL AND h.session_id != '' "
+        "ORDER BY h.timestamp_ms DESC LIMIT 1"
+    )
+    row = conn.execute(sql, [query]).fetchone()
+    conn.close()
+
+    if not row:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": "no session found", "query": " ".join(args.query)}))
+        else:
+            print("No session found.", file=sys.stderr)
+        sys.exit(1)
+
+    id_, source, session_id, project, prompt, ts_ms = row
+    cmd = _resume_cmd(source, session_id, project)
+
+    if getattr(args, "json", False):
+        out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
+        out["resume_cmd"] = cmd
+        print(json.dumps(out))
+        return
+
+    if cmd:
+        print(cmd)
+    else:
+        print(f"No resume command available for source '{source}'", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_tag(args):
+    """Tag one or more source-specific sessions."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    try:
+        tag_id = _ensure_tag(conn, args.tag_name, getattr(args, "color", None))
+    except ValueError as e:
+        conn.close()
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    matches = _matching_sessions(conn, args.session_id, getattr(args, "source", None))
+    if not matches:
+        conn.close()
+        print(f"No session found for {args.session_id}", file=sys.stderr)
+        sys.exit(1)
+
+    now_ms = int(time.time() * 1000)
+    changed = 0
+    for source, session_id, project, count, last_ms in matches:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO session_tags (source, session_id, tag_id, created_ms) "
+            "VALUES (?, ?, ?, ?)",
+            (source, session_id, tag_id, now_ms),
+        )
+        changed += cur.rowcount
+    conn.commit()
+
+    if getattr(args, "json", False):
+        out = {
+            "session_id": args.session_id,
+            "tag": _normalize_tag_name(args.tag_name),
+            "matched_sessions": [
+                {"source": s, "session_id": sid, "project": p, "entry_count": c, "last_activity_ms": lm}
+                for s, sid, p, c, lm in matches
+            ],
+            "created_assignments": changed,
+        }
+        conn.close()
+        print(json.dumps(out))
+        return
+
+    conn.close()
+    label = "session" if len(matches) == 1 else "sessions"
+    print(f"Tagged {len(matches)} {label} with '{args.tag_name.strip()}' ({changed} new assignment(s)).")
+
+
+def cmd_untag(args):
+    """Remove a tag from one or more source-specific sessions."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    normalized = _normalize_tag_name(args.tag_name)
+    matches = _matching_sessions(conn, args.session_id, getattr(args, "source", None))
+    removed = 0
+    for source, session_id, *_ in matches:
+        cur = conn.execute(
+            "DELETE FROM session_tags "
+            "WHERE source = ? AND session_id = ? "
+            "AND tag_id IN (SELECT id FROM tags WHERE name = ?)",
+            (source, session_id, normalized),
+        )
+        removed += cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if not matches:
+        print(f"No session found for {args.session_id}", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "json", False):
+        print(json.dumps({"session_id": args.session_id, "tag": normalized, "removed_assignments": removed}))
+        return
+    print(f"Removed tag '{normalized}' from {removed} session assignment(s).")
+
+
+def cmd_tags(args):
+    """List tags and tagged sessions."""
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    params = []
+    where = ""
+    if getattr(args, "tag", None):
+        where = "WHERE t.name = ?"
+        params.append(_normalize_tag_name(args.tag))
+    rows = conn.execute(
+        "SELECT t.name, t.display_name, t.color, COUNT(st.id) AS sessions, "
+        "MIN(st.created_ms), MAX(st.created_ms) "
+        "FROM tags t LEFT JOIN session_tags st ON st.tag_id = t.id "
+        f"{where} "
+        "GROUP BY t.id, t.name, t.display_name, t.color "
+        "ORDER BY t.name",
+        params,
+    ).fetchall()
+
+    if getattr(args, "json", False):
+        out = []
+        for name, display_name, color, sessions, first_ms, last_ms in rows:
+            item = {
+                "name": name,
+                "display_name": display_name,
+                "color": color,
+                "session_count": sessions,
+                "first_tagged_ms": first_ms,
+                "last_tagged_ms": last_ms,
+            }
+            if getattr(args, "sessions", False):
+                item["sessions"] = [
+                    {"source": s, "session_id": sid, "project": p, "entry_count": c, "last_activity_ms": lm}
+                    for s, sid, p, c, lm in conn.execute(
+                        "SELECT st.source, st.session_id, MIN(h.project), COUNT(h.id), MAX(h.timestamp_ms) "
+                        "FROM session_tags st "
+                        "JOIN tags t ON t.id = st.tag_id "
+                        "LEFT JOIN history h ON h.source = st.source AND h.session_id = st.session_id "
+                        "WHERE t.name = ? "
+                        "GROUP BY st.source, st.session_id "
+                        "ORDER BY MAX(h.timestamp_ms) DESC",
+                        (name,),
+                    )
+                ]
+            out.append(item)
+        conn.close()
+        print(json.dumps(out))
+        return
+
+    if not rows:
+        conn.close()
+        print("No tags.")
+        return
+    for name, display_name, color, sessions, first_ms, last_ms in rows:
+        color_text = f" [{color}]" if color else ""
+        print(f"  {display_name}{color_text}  {sessions} session(s)")
+        if getattr(args, "sessions", False):
+            for s, sid, p, c, lm in conn.execute(
+                "SELECT st.source, st.session_id, MIN(h.project), COUNT(h.id), MAX(h.timestamp_ms) "
+                "FROM session_tags st "
+                "JOIN tags t ON t.id = st.tag_id "
+                "LEFT JOIN history h ON h.source = st.source AND h.session_id = st.session_id "
+                "WHERE t.name = ? "
+                "GROUP BY st.source, st.session_id "
+                "ORDER BY MAX(h.timestamp_ms) DESC",
+                (name,),
+            ):
+                project = f" [{p}]" if p else ""
+                print(f"    {s}:{sid}{project} ({c} entries)")
+    conn.close()
+
+
+def cmd_watch(args):
+    """Continuous sync loop (for launchd/cron)."""
+    interval = args.interval
+    print(f"Watching every {interval}s (Ctrl-C to stop)...")
+    while True:
+        try:
+            cmd_sync()
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+# --- Export / Import ---------------------------------------------------------
+
+_EXPORT_FIELDS = ["source", "session_id", "project", "prompt", "prompt_hash", "timestamp_ms"]
+
+
+def _parse_date_to_ms(date_str):
+    try:
+        t = time.strptime(date_str, "%Y-%m-%d")
+        return int(time.mktime(t)) * 1000
+    except ValueError:
+        print(f"Invalid date '{date_str}'. Use YYYY-MM-DD.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _open_file(path, mode="rt"):
+    """Open a file, transparently handling .gz compression."""
+    if path.endswith(".gz"):
+        return gzip.open(path, mode, encoding="utf-8")
+    return open(path, mode, encoding="utf-8")
+
+
+def _query_export_rows(conn, args):
+    sql = (
+        "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms "
+        "FROM history WHERE 1=1"
+    )
+    params = []
+    if getattr(args, "source", None):
+        sql += " AND source = ?"
+        params.append(args.source)
+    if getattr(args, "project", None):
+        sql += " AND project LIKE ?"
+        params.append(f"%{args.project}%")
+    if getattr(args, "since", None):
+        sql += " AND timestamp_ms >= ?"
+        params.append(_parse_date_to_ms(args.since))
+    sql += " ORDER BY timestamp_ms ASC"
+    return conn.execute(sql, params).fetchall()
+
+
+def cmd_export(args):
+    """Export history to a portable JSONL or SQLite file.
+
+    JSONL is the default — one JSON object per line, gzip-friendly, easy to
+    inspect. SQLite exports a self-contained DB file that can be directly used
+    as $AI_HIST_DB on another machine.
+
+    Examples:
+        ai-hist export                          # JSONL to stdout
+        ai-hist export history.jsonl            # JSONL to file
+        ai-hist export history.jsonl.gz         # gzip-compressed JSONL
+        ai-hist export backup.db --format sqlite
+        ai-hist export --source claude --since 2025-01-01 recent.jsonl
+    """
+    if not DB_PATH.exists():
+        print(f"No database found at {DB_PATH}. Run `ai-hist sync` first.", file=sys.stderr)
+        sys.exit(1)
+
+    fmt = getattr(args, "format", "jsonl") or "jsonl"
+    output = getattr(args, "output", None)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    rows = _query_export_rows(conn, args)
+    conn.close()
+
+    if not rows:
+        print("No entries matched the export filters.", file=sys.stderr)
+        sys.exit(1)
+
+    if fmt == "sqlite":
+        dest = output or "ai-hist-export.db"
+        if Path(dest).resolve() == DB_PATH.resolve():
+            print("Refusing to export SQLite over the active AI_HIST_DB.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            Path(dest).unlink()
+        except FileNotFoundError:
+            pass
+        dst = sqlite3.connect(dest)
+        init_db(dst)
+        inserted = 0
+        for row in rows:
+            cur = dst.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        dst.commit()
+        dst.close()
+        print(f"Exported {inserted:,} entries to {dest}")
+        return
+
+    # JSONL (default) — stdout or file
+    def write_jsonl(f):
+        for row in rows:
+            f.write(json.dumps(dict(zip(_EXPORT_FIELDS, row))) + "\n")
+
+    if output:
+        with _open_file(output, "wt") as f:
+            write_jsonl(f)
+        print(f"Exported {len(rows):,} entries to {output}", file=sys.stderr)
+    else:
+        write_jsonl(sys.stdout)
+
+
+def _load_rows_from_sqlite(path):
+    """Load rows from an exported SQLite DB, tolerating missing prompt_hash."""
+    try:
+        src = sqlite3.connect(path)
+        cols = {r[1] for r in src.execute("PRAGMA table_info(history)").fetchall()}
+        if "prompt_hash" in cols:
+            sql = "SELECT source, session_id, project, prompt, prompt_hash, timestamp_ms FROM history"
+            fields = _EXPORT_FIELDS
+        else:
+            sql = "SELECT source, session_id, project, prompt, timestamp_ms FROM history"
+            fields = ["source", "session_id", "project", "prompt", "timestamp_ms"]
+        rows = [dict(zip(fields, r)) for r in src.execute(sql).fetchall()]
+        src.close()
+        return rows
+    except sqlite3.Error as e:
+        print(f"Error reading SQLite file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _load_rows_from_jsonl(path):
+    """Load rows from a JSONL (optionally gzip-compressed) export file."""
+    rows = []
+    try:
+        with _open_file(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except (OSError, EOFError) as e:
+        print(f"Error reading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    return rows
+
+
+def cmd_import(args):
+    """Import history from a JSONL or SQLite export file.
+
+    Entries that already exist (same source + timestamp + prompt) are silently
+    skipped, so it is safe to import the same file multiple times or merge
+    overlapping exports from different machines.
+
+    Examples:
+        ai-hist import colleague.jsonl
+        ai-hist import colleague.jsonl.gz
+        ai-hist import colleague.db
+        ai-hist import colleague.jsonl --dry-run
+    """
+    path = args.file
+    dry_run = getattr(args, "dry_run", False)
+
+    if path.endswith(".db") or path.endswith(".sqlite"):
+        rows = _load_rows_from_sqlite(path)
+    else:
+        rows = _load_rows_from_jsonl(path)
+
+    if not rows:
+        print("No entries found in file.")
+        return
+
+    total = len(rows)
+
+    if dry_run:
+        print(f"[dry-run] {total:,} entries in {path} — none written.")
+        print()
+        for row in rows[:5]:
+            source = row.get("source", "?")
+            project = row.get("project") or ""
+            prompt = row.get("prompt", "")[:80].replace("\n", " ")
+            ts_ms = row.get("timestamp_ms", 0)
+            dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000)) if ts_ms else "?"
+            proj = f" [{project}]" if project else ""
+            print(f"  {dt}  ({source}){proj}  {prompt}")
+        if total > 5:
+            print(f"  ... and {total - 5:,} more")
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+
+    inserted = 0
+    errors = 0
+    for row in rows:
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("source", ""),
+                    row.get("session_id"),
+                    row.get("project"),
+                    prompt,
+                    row.get("prompt_hash") or _prompt_hash(prompt),
+                    row.get("timestamp_ms", 0),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error:
+            errors += 1
+
+    conn.commit()
+    conn.close()
+
+    skipped = total - inserted - errors
+    parts = [f"+{inserted:,} new entries"]
+    if skipped:
+        parts.append(f"{skipped:,} already existed")
+    if errors:
+        parts.append(f"{errors} errors")
+    print(f"Imported from {path}: {', '.join(parts)}")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+# --- CLI ---------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="ai-hist", description="Sync & search AI CLI history in SQLite.")
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("sync", help="Import new entries from history files")
+
+    s = sub.add_parser("search", help="Full-text search prompts")
+    s.add_argument("query", nargs="+", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
+    s.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
+    s.add_argument("--project", help="Filter by project path (substring match)")
+    s.add_argument("--tag", help="Filter by session tag")
+    s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    s.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    s.add_argument("--json", action="store_true", help="Output as JSON array")
+
+    r = sub.add_parser("recent", help="Show most recent entries")
+    r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
+    r.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
+    r.add_argument("--project", help="Filter by project path (substring match)")
+    r.add_argument("--tag", help="Filter by session tag")
+    r.add_argument("--json", action="store_true", help="Output as JSON array")
+
+    sh = sub.add_parser("show", help="Show full details for an entry by ID")
+    sh.add_argument("id", type=int, help="Entry ID (shown as #NNN in search/recent)")
+    sh.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    se = sub.add_parser("session", help="Show all prompts in a session")
+    se.add_argument("session_id", help="Session ID")
+    se.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    se.add_argument("--tag", help="Only show the session if it has this tag")
+    se.add_argument("--full", action="store_true", help="Show full prompt text (no truncation)")
+    se.add_argument("--json", action="store_true", help="Output as JSON array")
+
+    cx = sub.add_parser("context", help="Show entries around an ID (same session + nearby)")
+    cx.add_argument("id", type=int, help="Entry ID to get context for")
+    cx.add_argument("--window", type=int, default=5, help="Time window in minutes (default: 5)")
+
+    st = sub.add_parser("stats", help="Show summary statistics")
+    st.add_argument("--tag", help="Filter stats to sessions with this tag")
+    st.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    pk = sub.add_parser("pack", help="Evidence bundle for LLM handoff (search + resume commands)")
+    pk.add_argument("query", nargs="+", help="Search terms")
+    pk.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
+    pk.add_argument("--project", help="Filter by project path (substring match)")
+    pk.add_argument("--tag", help="Filter by session tag")
+    pk.add_argument("--limit", type=int, default=10, help="Max entries (default: 10)")
+    pk.add_argument("--tokens", type=int, default=0, help="Truncate each prompt to ~N tokens (4 chars/token)")
+    pk.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    pk.add_argument("--json", action="store_true", help="Output as JSON")
+
+    rv = sub.add_parser("resume", help="Find best matching session and print its resume command")
+    rv.add_argument("query", nargs="+", help="Search terms to find the session")
+    rv.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
+    rv.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    w = sub.add_parser("watch", help="Continuous sync loop")
+    w.add_argument("--interval", type=int, default=60, help="Seconds between syncs (default: 60)")
+
+    exp = sub.add_parser("export", help="Export history to a portable JSONL or SQLite file")
+    exp.add_argument("output", nargs="?", help="Output file (default: stdout). Use .gz for compression.")
+    exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
+    exp.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
+    exp.add_argument("--project", help="Filter by project path (substring)")
+    exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
+
+    imp = sub.add_parser("import", help="Import history from an exported JSONL or SQLite file")
+    imp.add_argument("file", help="File to import (.jsonl, .jsonl.gz, or .db)")
+    imp.add_argument("--dry-run", action="store_true", help="Preview what would be imported without writing")
+
+    tg = sub.add_parser("tag", help="Tag a session for logical grouping")
+    tg.add_argument("session_id", help="Session ID to tag")
+    tg.add_argument("tag_name", help="Tag name")
+    tg.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    tg.add_argument("--color", help="Optional display color")
+    tg.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    ut = sub.add_parser("untag", help="Remove a tag from a session")
+    ut.add_argument("session_id", help="Session ID to untag")
+    ut.add_argument("tag_name", help="Tag name")
+    ut.add_argument("--source", choices=SOURCE_CHOICES, help="Disambiguate sessions with the same ID")
+    ut.add_argument("--json", action="store_true", help="Output as JSON object")
+
+    tl = sub.add_parser("tags", help="List tags")
+    tl.add_argument("--tag", help="Show one tag")
+    tl.add_argument("--sessions", action="store_true", help="Include tagged sessions")
+    tl.add_argument("--json", action="store_true", help="Output as JSON array")
+
+    args = p.parse_args()
+    cmds = {
+        "sync": cmd_sync, "search": cmd_search, "recent": cmd_recent,
+        "show": cmd_show, "session": cmd_session, "context": cmd_context,
+        "stats": cmd_stats, "pack": cmd_pack, "resume": cmd_resume,
+        "watch": cmd_watch,
+        "export": cmd_export, "import": cmd_import,
+        "tag": cmd_tag, "untag": cmd_untag, "tags": cmd_tags,
+    }
+
+    if args.command in cmds:
+        cmds[args.command](args)
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

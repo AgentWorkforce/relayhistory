@@ -5,7 +5,8 @@
  * requirements — works in Electron, Node, and browser contexts without
  * needing electron-rebuild. The SDK reads the same file the Python CLI
  * maintains (default `~/.local/share/ai-hist/ai-history.db`, or
- * `$AI_HIST_DB`); the Python tool stays the canonical sync engine.
+ * `$AI_HIST_DB`); during the Rust cutover, full sync still routes through the
+ * legacy Python fallback.
  *
  * Trade-off vs better-sqlite3: sql.js loads the whole DB file into
  * memory. Fine for the ai-hist scale (tens of thousands of rows, MBs

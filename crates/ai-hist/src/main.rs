@@ -1,9 +1,12 @@
 use ai_hist_core::{
     default_db_path, export_json, import_json, list_tags, open_db, recent, resume_command, search,
     session, stats, sync_opencode_db, tag_session, untag_session, HistoryEntry, QueryFilter,
+    SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
+use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -24,6 +27,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Search {
+        #[arg(required = true)]
         query: Vec<String>,
         #[arg(long)]
         source: Option<String>,
@@ -88,6 +92,7 @@ enum Command {
         json: bool,
     },
     Resume {
+        #[arg(required = true)]
         query: Vec<String>,
         #[arg(long)]
         fts: bool,
@@ -121,6 +126,7 @@ fn main() -> Result<()> {
             fts,
             json,
         } => {
+            validate_source(source.as_deref())?;
             let rows = search(
                 &conn,
                 &query,
@@ -133,6 +139,14 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
             )?;
+            if rows.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No results.");
+                }
+                std::process::exit(1);
+            }
             print_entries(rows, json)
         }
         Command::Recent {
@@ -142,6 +156,7 @@ fn main() -> Result<()> {
             tag,
             json,
         } => {
+            validate_source(source.as_deref())?;
             let rows = recent(
                 &conn,
                 &QueryFilter {
@@ -160,8 +175,17 @@ fn main() -> Result<()> {
             tag,
             json,
         } => {
+            validate_source(source.as_deref())?;
             let rows = session(&conn, &session_id, source.as_deref(), tag.as_deref())?;
-            print_entries(rows, json)
+            if rows.is_empty() {
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No entries for session {session_id}");
+                }
+                anyhow::bail!("no entries for session {session_id}");
+            }
+            print_session_entries(&session_id, rows, json)
         }
         Command::Stats { tag, json } => {
             let s = stats(&conn, tag.as_deref())?;
@@ -187,6 +211,7 @@ fn main() -> Result<()> {
             color,
             json,
         } => {
+            validate_source(source.as_deref())?;
             let sessions = tag_session(
                 &conn,
                 &session_id,
@@ -209,6 +234,7 @@ fn main() -> Result<()> {
             source,
             json,
         } => {
+            validate_source(source.as_deref())?;
             let removed = untag_session(&conn, &session_id, &tag_name, source.as_deref())?;
             if json {
                 println!("{}", serde_json::json!({ "removed_assignments": removed }));
@@ -301,23 +327,65 @@ fn main() -> Result<()> {
 
 fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string(&rows)?);
+        println!("{}", serde_json::to_string(&entry_outputs(&rows))?);
         return Ok(());
     }
     for row in rows {
-        println!(
-            "  #{:<5} {} ({}){}  {}",
-            row.id,
-            row.timestamp_ms,
-            row.source,
-            row.project
-                .as_ref()
-                .map(|p| format!(" [{p}]"))
-                .unwrap_or_default(),
-            row.prompt.replace('\n', " ")
-        );
+        println!("{}", fmt_row(&row, false));
     }
     Ok(())
+}
+
+fn print_session_entries(session_id: &str, rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&entry_outputs(&rows))?);
+        return Ok(());
+    }
+    println!("  Session {session_id} ({} entries):\n", rows.len());
+    for row in rows {
+        println!("{}", fmt_row(&row, false));
+    }
+    Ok(())
+}
+
+fn entry_outputs(rows: &[HistoryEntry]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "source": row.source,
+                "session_id": row.session_id,
+                "project": row.project,
+                "prompt": row.prompt,
+                "timestamp_ms": row.timestamp_ms,
+            })
+        })
+        .collect()
+}
+
+fn fmt_row(row: &HistoryEntry, verbose: bool) -> String {
+    let dt = Local
+        .timestamp_millis_opt(row.timestamp_ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00".to_string());
+    let project = row
+        .project
+        .as_ref()
+        .map(|p| format!(" [{p}]"))
+        .unwrap_or_default();
+    let prompt = if verbose {
+        row.prompt.clone()
+    } else if row.prompt.chars().count() > 120 {
+        let truncated: String = row.prompt.chars().take(120).collect();
+        format!("{}...", truncated.replace('\n', " "))
+    } else {
+        row.prompt.replace('\n', " ")
+    };
+    format!(
+        "  #{:<5} {}  ({}){}  {}",
+        row.id, dt, row.source, project, prompt
+    )
 }
 
 fn default_opencode_db_path() -> PathBuf {
@@ -330,4 +398,15 @@ fn default_opencode_db_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."));
             home.join(".local/share/opencode/opencode.db")
         })
+}
+
+fn validate_source(source: Option<&str>) -> Result<()> {
+    if let Some(source) = source {
+        anyhow::ensure!(
+            SOURCE_CHOICES.contains(&source),
+            "invalid source '{source}' (choose from {})",
+            SOURCE_CHOICES.join(", ")
+        );
+    }
+    Ok(())
 }
