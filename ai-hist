@@ -30,6 +30,8 @@ SOURCES = {
     "codex": Path.home() / ".codex" / "history.jsonl",
 }
 
+CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
 CODEX_SESSIONS_DIRS = [
     Path.home() / ".codex" / "sessions",
     Path.home() / ".codex" / "archived_sessions",
@@ -54,6 +56,21 @@ CREATE TABLE IF NOT EXISTS history (
     timestamp_ms INTEGER NOT NULL,
     UNIQUE(source, timestamp_ms, prompt)
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    git_branch TEXT,
+    first_activity_ms INTEGER,
+    last_activity_ms INTEGER,
+    last_assistant_text TEXT,
+    raw_path TEXT,
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
+CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch);
+CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     prompt, project, content='history', content_rowid='id'
 );
@@ -199,7 +216,6 @@ def _row_to_dict(id_, source, session_id, project, prompt, ts_ms):
         "timestamp_ms": ts_ms,
     }
 
-
 def _normalize_tag_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
@@ -259,6 +275,197 @@ def _matching_sessions(conn: sqlite3.Connection, session_id: str, source=None) -
     return conn.execute(sql, params).fetchall()
 
 
+# --- Session helpers ---------------------------------------------------------
+
+def _upsert_session(conn, session_id, source, cwd, git_branch, ts_ms,
+                    last_assistant_text=None, raw_path=None):
+    """Insert or update a row in the sessions table."""
+    conn.execute(
+        """
+        INSERT INTO sessions
+          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms,
+           last_assistant_text, raw_path, parser_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(session_id, source) DO UPDATE SET
+          cwd                = COALESCE(excluded.cwd, sessions.cwd),
+          git_branch         = COALESCE(excluded.git_branch, sessions.git_branch),
+          first_activity_ms  = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms),
+                                   excluded.first_activity_ms),
+          last_activity_ms   = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms),
+                                   excluded.last_activity_ms),
+          last_assistant_text= COALESCE(excluded.last_assistant_text, sessions.last_assistant_text),
+          raw_path           = COALESCE(excluded.raw_path, sessions.raw_path),
+          parser_version     = excluded.parser_version
+        """,
+        (session_id, source, cwd, git_branch, ts_ms, ts_ms,
+         last_assistant_text, raw_path),
+    )
+
+
+def _scan_claude_session_file(path: Path) -> dict | None:
+    """
+    Extract session metadata from a Claude per-session JSONL file.
+
+    Reads the first 20 lines for sessionId/gitBranch/cwd/first-timestamp,
+    then tails the last 64 KB for the most recent assistant turn.
+    Returns a dict or None if the file can't be identified as a session.
+    """
+    MAX_TAIL = 65536
+    session_id = git_branch = cwd = None
+    first_ts = last_ts = None
+    last_assistant_text = None
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if session_id is None:
+                    session_id = obj.get("sessionId")
+                if git_branch is None:
+                    git_branch = obj.get("gitBranch")
+                if cwd is None:
+                    cwd = obj.get("cwd")
+                if first_ts is None:
+                    raw_ts = obj.get("timestamp")
+                    if isinstance(raw_ts, str):
+                        first_ts = _iso_to_ms(raw_ts)
+                    elif isinstance(raw_ts, (int, float)):
+                        first_ts = int(raw_ts)
+    except OSError:
+        return None
+
+    if not session_id:
+        return None
+
+    # Tail the file for last timestamp, last assistant text, and latest branch.
+    # Going bottom-to-top means the first gitBranch we find is the most recent one,
+    # which handles sessions that switched branches mid-way.
+    tail_branch = None
+    try:
+        file_size = path.stat().st_size
+        tail_offset = max(0, file_size - MAX_TAIL)
+        with open(path, "rb") as fb:
+            fb.seek(tail_offset)
+            tail_bytes = fb.read()
+        tail_text = tail_bytes.decode("utf-8", errors="replace")
+        for line in reversed(tail_text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if last_ts is None:
+                raw_ts = obj.get("timestamp")
+                if isinstance(raw_ts, str):
+                    last_ts = _iso_to_ms(raw_ts)
+                elif isinstance(raw_ts, (int, float)):
+                    last_ts = int(raw_ts)
+            if tail_branch is None and obj.get("gitBranch"):
+                tail_branch = obj["gitBranch"]
+            if last_assistant_text is None and obj.get("type") == "assistant":
+                msg = obj.get("message") or {}
+                content = msg.get("content")
+                if isinstance(content, str):
+                    last_assistant_text = content[:4096]
+                elif isinstance(content, list):
+                    parts = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            parts.append(str(c.get("text", "")))
+                    if parts:
+                        last_assistant_text = "\n".join(parts)[:4096]
+            if last_ts is not None and tail_branch is not None and last_assistant_text is not None:
+                break
+    except OSError:
+        pass
+    # Prefer the latest-seen branch (from tail) over the initial branch (from head).
+    if tail_branch:
+        git_branch = tail_branch
+
+    return {
+        "session_id": session_id,
+        "git_branch": git_branch,
+        "cwd": cwd,
+        "first_ts": first_ts or 0,
+        "last_ts": last_ts or first_ts or 0,
+        "last_assistant_text": last_assistant_text,
+        "raw_path": str(path),
+    }
+
+
+def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
+    """
+    Walk ~/.claude/projects/**/<session-id>.jsonl and populate the sessions table.
+    Uses per-file mtime to skip unchanged files incrementally.
+    """
+    if not CLAUDE_PROJECTS_ROOT.exists():
+        return
+
+    session_state = state.get("claude_sessions", {})
+    upserted = 0
+    scanned = 0
+    errors = 0
+
+    for project_dir in CLAUDE_PROJECTS_ROOT.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl_path in project_dir.glob("*.jsonl"):
+            key = str(jsonl_path)
+            try:
+                st = jsonl_path.stat()
+                mtime = f"{st.st_mtime_ns}:{st.st_size}"
+            except OSError:
+                errors += 1
+                continue
+            if session_state.get(key) == mtime:
+                continue
+            scanned += 1
+            meta = _scan_claude_session_file(jsonl_path)
+            session_state[key] = mtime
+            if not meta:
+                continue
+            try:
+                _upsert_session(
+                    conn,
+                    meta["session_id"],
+                    "claude",
+                    meta["cwd"],
+                    meta["git_branch"],
+                    meta["first_ts"],
+                    last_assistant_text=meta["last_assistant_text"],
+                    raw_path=meta["raw_path"],
+                )
+                # Update last_activity_ms separately (max of file mtime vs parsed ts)
+                conn.execute(
+                    "UPDATE sessions SET last_activity_ms = MAX(last_activity_ms, ?) "
+                    "WHERE session_id = ? AND source = 'claude'",
+                    (meta["last_ts"], meta["session_id"]),
+                )
+                upserted += 1
+            except sqlite3.Error:
+                errors += 1
+
+    conn.commit()
+    state["claude_sessions"] = session_state
+    if scanned:
+        suffix = f" ({errors} errors)" if errors else ""
+        print(f"  [claude-sessions] scanned {scanned} files, {upserted} sessions updated{suffix}")
+
+
 # --- Parsers -----------------------------------------------------------------
 
 def parse_claude(line: str):
@@ -274,6 +481,7 @@ def parse_claude(line: str):
         "prompt": display,
         "prompt_hash": _prompt_hash(display),
         "timestamp_ms": obj.get("timestamp", 0),
+        "git_branch": obj.get("gitBranch"),
     }
 
 
@@ -290,6 +498,7 @@ def parse_codex(line: str):
         "prompt": text,
         "prompt_hash": _prompt_hash(text),
         "timestamp_ms": int(obj.get("ts", 0) * 1000),
+        "git_branch": None,
     }
 
 
@@ -306,7 +515,7 @@ PARSERS = {
 # session_id → cwd map at sync time and use it to populate `project`.
 
 def _read_codex_session_meta(path: Path):
-    """Read a codex rollout file's first line; return (session_id, cwd) or None."""
+    """Read a codex rollout file's first line; return (session_id, cwd, git_branch) or None."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             first = f.readline()
@@ -326,11 +535,13 @@ def _read_codex_session_meta(path: Path):
     cwd = payload.get("cwd")
     if not session_id or not cwd:
         return None
-    return session_id, cwd
+    git = payload.get("git") or {}
+    branch = git.get("branch") if isinstance(git, dict) else None
+    return session_id, cwd, branch
 
 
-def build_codex_session_map(state: dict) -> dict:
-    """Walk codex rollout dirs; cache and return {session_id: cwd}.
+def build_codex_session_map(state: dict) -> tuple:
+    """Walk codex rollout dirs; cache and return ({session_id: cwd}, {session_id: branch}).
 
     Rollout files are write-once after the session_meta header — we key the
     rollout cache by path and skip any file whose mtime hasn't changed since
@@ -338,6 +549,7 @@ def build_codex_session_map(state: dict) -> dict:
     """
     seen = state.get("codex_rollouts", {})
     cwds = state.get("codex_session_cwds", {})
+    branches = state.get("codex_session_branches", {})
     scanned = 0
     for root in CODEX_SESSIONS_DIRS:
         if not root.exists():
@@ -354,35 +566,83 @@ def build_codex_session_map(state: dict) -> dict:
             seen[key] = mtime
             scanned += 1
             if meta:
-                sid, cwd = meta
+                sid, cwd, branch = meta
                 cwds[sid] = cwd
+                if branch:
+                    branches[sid] = branch
     state["codex_rollouts"] = seen
     state["codex_session_cwds"] = cwds
+    state["codex_session_branches"] = branches
     if scanned:
         print(f"  [codex] scanned {scanned:,} new rollout files; {len(cwds):,} sessions mapped")
-    return cwds
+    return cwds, branches
 
 
-def _backfill_codex_projects(conn: sqlite3.Connection, cwds: dict) -> int:
-    """Set project for codex rows with NULL project whose session_id is mapped."""
-    if not cwds:
+def _backfill_codex_projects(conn: sqlite3.Connection, cwds: dict, branches: dict) -> int:
+    """Set project/git_branch for codex rows whose session_id is mapped and keep
+    the sessions table in sync.
+
+    Only sessions that still need work are touched — those with a NULL
+    project/branch on some row, not yet recorded in `sessions`, or with newer
+    history activity than `sessions.last_activity_ms`. Fully-synced sessions are
+    skipped, so repeat syncs stay cheap regardless of total history size. The
+    per-session MIN/MAX timestamps come from the same aggregate query.
+    """
+    if not cwds and not branches:
         return 0
-    sids = conn.execute(
-        "SELECT DISTINCT session_id FROM history "
-        "WHERE source='codex' AND project IS NULL AND session_id IS NOT NULL"
+    rows = conn.execute(
+        """
+        SELECT h.session_id,
+               MIN(h.timestamp_ms), MAX(h.timestamp_ms),
+               SUM(CASE WHEN h.project IS NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN h.git_branch IS NULL THEN 1 ELSE 0 END)
+        FROM history h
+        LEFT JOIN sessions s
+          ON s.session_id = h.session_id AND s.source = 'codex'
+        WHERE h.source = 'codex' AND h.session_id IS NOT NULL
+        GROUP BY h.session_id
+        HAVING SUM(CASE WHEN h.project IS NULL THEN 1 ELSE 0 END) > 0
+            OR SUM(CASE WHEN h.git_branch IS NULL THEN 1 ELSE 0 END) > 0
+            OR MAX(s.session_id) IS NULL
+            OR MAX(h.timestamp_ms) > COALESCE(MAX(s.last_activity_ms), -1)
+        """
     ).fetchall()
     updated = 0
-    for (sid,) in sids:
+    dirty = False
+    for sid, first_ts, last_ts, null_proj, null_branch in rows:
         cwd = cwds.get(sid)
-        if not cwd:
+        branch = branches.get(sid)
+        if not cwd and not branch:
             continue
-        cur = conn.execute(
-            "UPDATE history SET project = ? "
-            "WHERE source='codex' AND project IS NULL AND session_id = ?",
-            (cwd, sid),
-        )
-        updated += cur.rowcount
-    if updated:
+        # Only write columns that are actually missing, so rowcount reflects
+        # genuine changes rather than COALESCE no-ops.
+        sets = []
+        params = []
+        if cwd and null_proj:
+            sets.append("project = COALESCE(project, ?)")
+            params.append(cwd)
+        if branch and null_branch:
+            sets.append("git_branch = COALESCE(git_branch, ?)")
+            params.append(branch)
+        if sets:
+            params.append(sid)
+            cur = conn.execute(
+                f"UPDATE history SET {', '.join(sets)} WHERE source='codex' AND session_id = ?",
+                params,
+            )
+            updated += cur.rowcount
+            dirty = True
+        if cwd:
+            # Use real timestamps from history so sessions table sorts correctly.
+            _upsert_session(conn, sid, "codex", cwd, branch, first_ts or 0)
+            if last_ts:
+                conn.execute(
+                    "UPDATE sessions SET last_activity_ms = MAX(COALESCE(last_activity_ms, 0), ?) "
+                    "WHERE session_id = ? AND source = 'codex'",
+                    (last_ts, sid),
+                )
+            dirty = True
+    if dirty:
         conn.commit()
     return updated
 
@@ -394,7 +654,7 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
         print(f"  [codex] not found: {path} (skipped)")
         return
 
-    cwds = build_codex_session_map(state)
+    cwds, branches = build_codex_session_map(state)
 
     file_size = path.stat().st_size
     offset = state.get("codex", 0)
@@ -417,13 +677,15 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
                 if row is None:
                     continue
                 sid = row.get("session_id")
-                if sid and not row.get("project"):
-                    row["project"] = cwds.get(sid)
+                if sid:
+                    if not row.get("project"):
+                        row["project"] = cwds.get(sid)
+                    row["git_branch"] = branches.get(sid)
                 try:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
-                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
                         row,
                     )
                     if cur.rowcount > 0:
@@ -433,14 +695,14 @@ def sync_codex(conn: sqlite3.Connection, state: dict):
         conn.commit()
         state["codex"] = file_size
 
-    backfilled = _backfill_codex_projects(conn, cwds)
+    backfilled = _backfill_codex_projects(conn, cwds, branches)
 
     if offset >= file_size and not backfilled:
         print("  [codex] up to date")
         return
     parts = [f"+{inserted:,} rows"] if inserted or offset < file_size else []
     if backfilled:
-        parts.append(f"backfilled {backfilled:,} project values")
+        parts.append(f"backfilled {backfilled:,} project/branch values")
     if errors:
         parts.append(f"{errors} errors")
     print(f"  [codex] " + ", ".join(parts))
@@ -1039,12 +1301,15 @@ def sync_trajectories(conn: sqlite3.Connection, state: dict):
 def init_db(conn: sqlite3.Connection):
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
-    # Migration: add prompt_hash column to existing DBs that predate it.
-    try:
-        conn.execute("ALTER TABLE history ADD COLUMN prompt_hash TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    for migration in (
+        "ALTER TABLE history ADD COLUMN prompt_hash TEXT",
+        "ALTER TABLE history ADD COLUMN git_branch TEXT",
+    ):
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.execute("CREATE INDEX IF NOT EXISTS idx_history_hash ON history(prompt_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_timestamp ON trajectories(timestamp_ms DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trajectories_project ON trajectories(project_id)")
@@ -1120,8 +1385,8 @@ def cmd_sync(args=None):
                 try:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO history "
-                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms) "
-                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms)",
+                        "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                        "VALUES (:source, :session_id, :project, :prompt, :prompt_hash, :timestamp_ms, :git_branch)",
                         row,
                     )
                     if cur.rowcount > 0:
@@ -1132,6 +1397,9 @@ def cmd_sync(args=None):
         conn.commit()
         state[name] = file_size
         print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    # Sync Claude per-session JSONL files for gitBranch + last assistant text
+    sync_claude_sessions(conn, state)
 
     # Sync Codex history with cwd enrichment from rollout files
     sync_codex(conn, state)

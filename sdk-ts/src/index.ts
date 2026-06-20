@@ -39,6 +39,35 @@ export interface HistoryEntry {
   project: string | null;
   prompt: string;
   timestampMs: number;
+  gitBranch: string | null;
+}
+
+export interface SessionMeta {
+  sessionId: string;
+  source: Source;
+  cwd: string | null;
+  gitBranch: string | null;
+  firstActivityMs: number | null;
+  lastActivityMs: number | null;
+  lastAssistantText: string | null;
+  rawPath: string | null;
+}
+
+export interface HandoffCandidate {
+  sessionId: string;
+  source: Source;
+  cwd: string | null;
+  gitBranch: string | null;
+  firstActivityMs: number | null;
+  lastActivityMs: number | null;
+  promptCount: number;
+  goal: string;
+  lastState: string;
+  lastAssistantText: string | null;
+  filesTouched: string[];
+  resumeCommand: string | null;
+  warmStartCommand: string;
+  confidence: number;
 }
 
 export interface Tag {
@@ -118,6 +147,17 @@ export interface TrajectorySearchOptions {
   project?: string;
 }
 
+export interface GetHandoffOptions {
+  /** Substring match against session cwd. */
+  repo?: string;
+  /** Substring match against git_branch. */
+  branch?: string;
+  /** Filter to a specific CLI source. */
+  source?: 'claude' | 'codex';
+  /** Max candidates to return. Default 3. */
+  limit?: number;
+}
+
 /** Resolve the SQLite path the Python CLI writes to. */
 export function defaultDbPath(): string {
   const fromEnv = process.env.AI_HIST_DB;
@@ -137,6 +177,24 @@ function getSqlJs(): Promise<SqlJsStatic> {
     _sqlPromise = initSqlJs();
   }
   return _sqlPromise;
+}
+
+function ensureSessionsSchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    cwd TEXT,
+    git_branch TEXT,
+    first_activity_ms INTEGER,
+    last_activity_ms INTEGER,
+    last_assistant_text TEXT,
+    raw_path TEXT,
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, source)
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(git_branch)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)');
 }
 
 function ensureTrajectorySchema(db: Database): void {
@@ -228,6 +286,9 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     const db = new SQL.Database(fileBuffer);
     ensureTrajectorySchema(db);
     ensureTagSchema(db);
+    ensureSessionsSchema(db);
+    // Add git_branch to history if missing (pre-handoff DBs lack this column).
+    try { db.run('ALTER TABLE history ADD COLUMN git_branch TEXT'); } catch { /* already exists */ }
     // The Python CLI's schema doesn't create `idx_history_session` or
     // `idx_history_timestamp`. Without them, listSessions degrades to
     // an O(sessions × rows) full table scan and freezes the WASM
@@ -260,12 +321,14 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     project TEXT,
     prompt TEXT NOT NULL,
     timestamp_ms INTEGER NOT NULL,
+    git_branch TEXT,
     UNIQUE(source, timestamp_ms, prompt)
   )`);
   db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
   db.run('CREATE INDEX idx_history_session ON history (session_id)');
   ensureTrajectorySchema(db);
   ensureTagSchema(db);
+  ensureSessionsSchema(db);
 
   // scanLocalSources is async with yields between sources so the event
   // loop stays responsive while we scan many MB of JSONL.
@@ -274,7 +337,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   const trajectories = await scanLocalTrajectories();
 
   const insert = db.prepare(
-    'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms) VALUES (?, ?, ?, ?, ?)',
+    'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms, git_branch) VALUES (?, ?, ?, ?, ?, ?)',
   );
   const insertTrajectory = db.prepare(
     `INSERT OR REPLACE INTO trajectories
@@ -286,10 +349,10 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
   try {
     db.exec('BEGIN');
     for (const row of rows) {
-      insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs]);
+      insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs, row.gitBranch]);
     }
     for (const row of openCodeRows) {
-      insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs]);
+      insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs, null]);
     }
     for (const trajectory of trajectories) {
       insertTrajectory.run([
@@ -315,6 +378,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
         trajectory.projectId,
         trajectory.searchText,
         trajectory.timestampMs,
+        null,
       ]);
     }
     db.exec('COMMIT');
@@ -414,6 +478,18 @@ interface RawHistoryRow {
   project: string | null;
   prompt: string;
   timestamp_ms: number;
+  git_branch: string | null;
+}
+
+interface RawSessionRow {
+  session_id: string;
+  source: string;
+  cwd: string | null;
+  git_branch: string | null;
+  first_activity_ms: number | null;
+  last_activity_ms: number | null;
+  last_assistant_text: string | null;
+  raw_path: string | null;
 }
 
 interface RawTrajectoryRow {
@@ -442,6 +518,7 @@ function rowToEntry(row: RawHistoryRow): HistoryEntry {
     project: row.project,
     prompt: row.prompt,
     timestampMs: row.timestamp_ms,
+    gitBranch: row.git_branch ?? null,
   };
 }
 
@@ -805,7 +882,7 @@ export class AiHist {
     const { sql, params } = buildFilters(opts, this._projectScope);
     return runQuery<RawHistoryRow>(
       this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms
+      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history
        WHERE 1=1${sql}
        ORDER BY timestamp_ms DESC
@@ -897,7 +974,7 @@ export class AiHist {
     appendTagFilter(clauses, params, opts.tag, 'history');
     return runQuery<RawHistoryRow>(
       this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms
+      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history
        WHERE ${clauses.join(' AND ')}
        ORDER BY timestamp_ms ASC`,
@@ -937,7 +1014,7 @@ export class AiHist {
     }
     return runQuery<RawHistoryRow>(
       this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms
+      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history
        WHERE ${clauses.join(' AND ')}
        ORDER BY timestamp_ms DESC
@@ -992,7 +1069,7 @@ export class AiHist {
     appendProjectFilter(clauses, params, undefined, this._projectScope);
     const rows = runQuery<RawHistoryRow>(
       this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms
+      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history WHERE ${clauses.join(' AND ')}`,
       params,
     );
@@ -1009,12 +1086,127 @@ export class AiHist {
     appendProjectFilter(clauses, params, undefined, this._projectScope);
     return runQuery<RawHistoryRow>(
       this.db,
-      `SELECT id, source, session_id, project, prompt, timestamp_ms
+      `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history
        WHERE ${clauses.join(' AND ')}
        ORDER BY timestamp_ms ASC`,
       params,
     ).map(rowToEntry);
+  }
+
+  /**
+   * Find sessions matching the given repo/branch/source and return ranked
+   * handoff candidates with a warm-start command for the target CLI.
+   *
+   * Queries the `sessions` table (populated by `ai-hist sync`) for objective
+   * metadata, then joins the last N user prompts from `history` to generate
+   * a brief on demand — no pre-computed summaries.
+   */
+  getHandoff(opts: GetHandoffOptions = {}): HandoffCandidate[] {
+    const limit = opts.limit ?? 3;
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (this._projectScope) {
+      const escaped = this._projectScope.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
+      clauses.push("cwd LIKE ? ESCAPE '|'");
+      params.push(`${escaped}%`);
+    }
+    if (opts.source) {
+      clauses.push('source = ?');
+      params.push(opts.source);
+    }
+    if (opts.repo) {
+      const escaped = opts.repo.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
+      clauses.push("cwd LIKE ? ESCAPE '|'");
+      params.push(`%${escaped}%`);
+    }
+    if (opts.branch) {
+      const escaped = opts.branch.replace(/\|/g, '||').replace(/%/g, '|%').replace(/_/g, '|_');
+      clauses.push("git_branch LIKE ? ESCAPE '|'");
+      params.push(`%${escaped}%`);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    // Over-fetch sessions because many (old or sub-agent) sessions have no
+    // matching `history` prompts and get skipped below. Fetching exactly
+    // `limit` could starve the result to empty even when good candidates exist
+    // just past the cutoff. We stop scanning once we've collected `limit`.
+    const fetchCount = Math.min(Math.max(limit * 5, limit), 100);
+    const sessionRows = runQuery<RawSessionRow>(
+      this.db,
+      `SELECT session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms,
+              last_assistant_text, raw_path
+       FROM sessions
+       ${where}
+       ORDER BY last_activity_ms DESC
+       LIMIT ?`,
+      [...params, fetchCount],
+    );
+
+    const candidates: HandoffCandidate[] = [];
+    for (const session of sessionRows) {
+      if (candidates.length >= limit) break;
+      // Filter by both session_id AND source to prevent cross-source prompt mixing
+      // when two CLIs happen to use the same session ID (rare but possible).
+      const prompts = runQuery<RawHistoryRow>(
+        this.db,
+        `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
+         FROM history
+         WHERE session_id = ? AND source = ?
+         ORDER BY timestamp_ms ASC`,
+        [session.session_id, session.source],
+      ).map(rowToEntry);
+      if (prompts.length === 0) continue;
+
+      const filesTouched = extractFilePaths(prompts.map((p) => p.prompt).join('\n'));
+      // The first prompt is often injected boilerplate (system-reminder /
+      // command wrappers), especially for relay-driven sessions. Prefer the
+      // first prompt that looks like a real user instruction for the goal.
+      const goalPrompt = prompts.find((p) => !isBoilerplatePrompt(p.prompt)) ?? prompts[0];
+      const goal = goalPrompt.prompt.slice(0, 300).replace(/\n/g, ' ');
+      const lastState = prompts[prompts.length - 1].prompt.slice(0, 300).replace(/\n/g, ' ');
+
+      const resume = resumeCommand({
+        source: session.source as Source,
+        sessionId: session.session_id,
+        project: session.cwd,
+      });
+
+      const targetSource = session.source === 'claude' ? 'codex' : 'claude';
+      const warmStart = buildWarmStartCommand(
+        targetSource,
+        goal,
+        filesTouched,
+        lastState,
+        session.last_assistant_text ?? null,
+        session.cwd,
+      );
+
+      let confidence = Math.min(0.6, 0.2 + prompts.length * 0.02);
+      if (opts.branch && session.git_branch?.includes(opts.branch)) confidence += 0.25;
+      if (opts.repo && session.cwd?.includes(opts.repo)) confidence += 0.15;
+      confidence = Math.min(1.0, confidence);
+
+      candidates.push({
+        sessionId: session.session_id,
+        source: session.source as Source,
+        cwd: session.cwd,
+        gitBranch: session.git_branch,
+        firstActivityMs: session.first_activity_ms,
+        lastActivityMs: session.last_activity_ms,
+        promptCount: prompts.length,
+        goal,
+        lastState,
+        lastAssistantText: session.last_assistant_text ?? null,
+        filesTouched,
+        resumeCommand: resume,
+        warmStartCommand: warmStart,
+        confidence,
+      });
+    }
+
+    return candidates.sort((a, b) => b.confidence - a.confidence);
   }
 
   /** Counts + date range, mirroring `ai-hist stats`. */
@@ -1055,6 +1247,62 @@ export class AiHist {
       lastTimestampMs: range?.mx ?? null,
     };
   }
+}
+
+/**
+ * Heuristic: does a prompt look like injected boilerplate rather than a real
+ * user instruction? Relay/agent sessions often open with a system-reminder or
+ * command wrapper that makes a poor "goal" summary.
+ */
+function isBoilerplatePrompt(prompt: string): boolean {
+  const t = prompt.trimStart();
+  return (
+    t.startsWith('<system-reminder') ||
+    t.startsWith('<command-') ||
+    t.startsWith('Caveat:') ||
+    t.startsWith('[Request interrupted')
+  );
+}
+
+/**
+ * Extract file paths with recognizable extensions from a block of text.
+ * Heuristic — used to populate filesTouched in HandoffCandidate.
+ */
+function extractFilePaths(text: string): string[] {
+  const exts = 'ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|java|cs|cpp|cc|c|h|json|yaml|yml|toml|md|sh|sql|css|scss|html|svelte|vue';
+  const regex = new RegExp(
+    `(?:^|[\\s,\`'"(])([~./][\\w./-]*\\.(?:${exts})|-?[\\w/-]+\\.(?:${exts}))\\b`,
+    'gm',
+  );
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(text)) !== null) {
+    const p = m[1].trim();
+    if (p.length > 2 && p.length < 200) seen.add(p);
+  }
+  return Array.from(seen).slice(0, 20);
+}
+
+/**
+ * Build a warm-start command for the target CLI, injecting context from a
+ * prior session so the new agent can pick up mid-task.
+ */
+function buildWarmStartCommand(
+  targetSource: string,
+  goal: string,
+  files: string[],
+  lastState: string,
+  lastAssistant: string | null,
+  cwd: string | null,
+): string {
+  const filesLine = files.length > 0 ? ` Files touched: ${files.slice(0, 10).join(', ')}.` : '';
+  const assistantLine = lastAssistant
+    ? ` Last assistant state: ${lastAssistant.replace(/\n/g, ' ').slice(0, 200)}`
+    : '';
+  const context =
+    `Picking up from previous session. Goal: ${goal}.${filesLine} Last user prompt: ${lastState}.${assistantLine}`;
+  const cdPart = cwd ? `cd ${shellQuote(cwd)} && ` : '';
+  return `${cdPart}${targetSource} ${shellQuote(context)}`;
 }
 
 /**

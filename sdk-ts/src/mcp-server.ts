@@ -13,7 +13,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry } from "./index.js";
+import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry, type HandoffCandidate } from "./index.js";
 
 // ---------------------------------------------------------------------------
 // Lazy singleton — opens on first tool call and reuses across all calls.
@@ -162,6 +162,13 @@ and Agent Relay — all searchable in a single index.
 
 - **why_for_task** — Return the best matching trajectory's decisions and
   retrospective for a task query.
+
+- **get_handoff** — Find sessions for a repo/branch and generate a warm-start
+  handoff brief so you can continue work in a different CLI. Use this when you
+  need to switch from Claude Code to Codex (or vice versa) because one is down
+  or quota-exhausted. Ask: "where did codex leave off on branch feat/auth in
+  /my-repo?" and this tool returns ranked candidates with resume commands and
+  a ready-to-paste warm-start command for the target CLI.
 
 ## Tips
 
@@ -650,6 +657,95 @@ server.tool(
           },
         ],
       };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "get_handoff",
+  "Find active sessions for a repo/branch and generate a warm-start handoff brief " +
+    "so you can continue work in a different CLI (e.g. pick up a Claude session in Codex " +
+    "or vice versa). Returns ranked candidate sessions with: the original goal, files " +
+    "touched (extracted from prompts), last user prompt, last assistant state, the resume " +
+    "command for the original CLI, and a ready-to-paste warm-start command for the target CLI. " +
+    "Use this when switching between Claude Code and Codex mid-task due to quota or outage.",
+  {
+    repo: z
+      .string()
+      .optional()
+      .describe(
+        "Project directory path to filter by (substring match against session cwd). " +
+          'Example: "/my-app", "work/api". Omit to search across all projects.',
+      ),
+    branch: z
+      .string()
+      .optional()
+      .describe(
+        "Git branch name to filter by (substring match). " +
+          'Example: "feat/auth", "main". Requires ai-hist sync to have captured gitBranch.',
+      ),
+    source: z
+      .enum(["claude", "codex"])
+      .optional()
+      .describe(
+        "Filter to sessions from a specific CLI. Omit to search both Claude Code and Codex.",
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .optional()
+      .default(3)
+      .describe("Maximum number of handoff candidates to return. Default: 3."),
+  },
+  READ_ONLY,
+  async ({ repo, branch, source, limit }) => {
+    try {
+      const hist = await getHist();
+      const candidates = hist.getHandoff({ repo, branch, source, limit });
+      if (candidates.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "No sessions found matching the given filters. " +
+                "Run `ai-hist sync` to populate session metadata, then try again.",
+            },
+          ],
+        };
+      }
+      const lines: string[] = [`Found ${candidates.length} handoff candidate(s):\n`];
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        let dt = "unknown";
+        if (c.lastActivityMs != null && Number.isFinite(c.lastActivityMs)) {
+          dt = new Date(c.lastActivityMs).toISOString().slice(0, 16).replace("T", " ");
+        }
+        lines.push(
+          `[${i + 1}] ${c.source.toUpperCase()} session  confidence: ${(c.confidence * 100).toFixed(0)}%`,
+        );
+        lines.push(`  session_id : ${c.sessionId}`);
+        lines.push(`  cwd        : ${c.cwd ?? "(unknown)"}`);
+        lines.push(`  branch     : ${c.gitBranch ?? "(unknown)"}`);
+        lines.push(`  last seen  : ${dt}  (${c.promptCount} prompts)`);
+        lines.push(`  goal       : ${c.goal.slice(0, 150)}`);
+        lines.push(`  last state : ${c.lastState.slice(0, 150)}`);
+        if (c.filesTouched.length > 0) {
+          lines.push(`  files      : ${c.filesTouched.slice(0, 8).join(", ")}`);
+        }
+        if (c.lastAssistantText) {
+          lines.push(`  assistant  : ${c.lastAssistantText.slice(0, 200).replace(/\n/g, " ")}`);
+        }
+        if (c.resumeCommand) {
+          lines.push(`  resume     : ${c.resumeCommand}`);
+        }
+        lines.push(`  warm-start : ${c.warmStartCommand}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
     }

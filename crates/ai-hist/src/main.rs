@@ -325,6 +325,7 @@ fn default_opencode_db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             home.join(".local/share/opencode/opencode.db")

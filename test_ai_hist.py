@@ -49,6 +49,13 @@ def tmp_env(tmp_path, monkeypatch):
     monkeypatch.setattr(ai_hist, "TRAJECTORY_ROOT", str(trajectory_root))
     monkeypatch.setattr(ai_hist, "DEFAULT_TRAJECTORY_SEARCH_ROOT", tmp_path / "Projects")
 
+    # Isolate Claude per-session JSONL scanning from real ~/.claude/projects.
+    claude_projects_root = tmp_path / "claude_projects"
+    monkeypatch.setattr(ai_hist, "CLAUDE_PROJECTS_ROOT", claude_projects_root)
+
+    # Isolate Codex rollout dirs from real ~/.codex/sessions.
+    monkeypatch.setattr(ai_hist, "CODEX_SESSIONS_DIRS", [])
+
     return SimpleNamespace(
         db_path=db_path,
         state_path=state_path,
@@ -56,6 +63,7 @@ def tmp_env(tmp_path, monkeypatch):
         codex_hist=codex_hist,
         cursor_root=cursor_root,
         trajectory_root=trajectory_root,
+        claude_projects_root=claude_projects_root,
         tmp_path=tmp_path,
     )
 
@@ -124,7 +132,13 @@ class TestParseClaude:
             "prompt": "hello world",
             "prompt_hash": ai_hist._prompt_hash("hello world"),
             "timestamp_ms": 1700000000000,
+            "git_branch": None,
         }
+
+    def test_git_branch_captured(self):
+        line = json.dumps({"display": "hi", "timestamp": 1, "gitBranch": "feat/x"})
+        result = ai_hist.parse_claude(line)
+        assert result["git_branch"] == "feat/x"
 
     def test_empty_display_returns_none(self):
         line = json.dumps({"display": "", "timestamp": 123})
@@ -157,6 +171,7 @@ class TestParseCodex:
             "prompt": "fix the bug",
             "prompt_hash": ai_hist._prompt_hash("fix the bug"),
             "timestamp_ms": 1700000000000,
+            "git_branch": None,
         }
 
     def test_empty_text_returns_none(self):
@@ -2124,3 +2139,242 @@ class TestCmdImport:
         assert row[1] == "sess-rt"
         assert row[2] == "/proj"
         assert row[3] == "roundtrip test"
+
+
+# ---------------------------------------------------------------------------
+# Session helpers and Claude session scanning
+# ---------------------------------------------------------------------------
+
+def make_claude_session_jsonl(project_dir: Path, session_id: str, git_branch: str,
+                               cwd: str, prompts: list, last_assistant: str | None = None) -> Path:
+    """Create a fake Claude per-session JSONL file."""
+    project_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = project_dir / f"{session_id}.jsonl"
+    lines = []
+    # First line: a typical attachment entry that carries session metadata.
+    lines.append(json.dumps({
+        "type": "attachment",
+        "sessionId": session_id,
+        "gitBranch": git_branch,
+        "cwd": cwd,
+        "timestamp": "2024-01-01T00:00:00.000Z",
+    }))
+    for i, prompt in enumerate(prompts):
+        lines.append(json.dumps({
+            "type": "user",
+            "sessionId": session_id,
+            "gitBranch": git_branch,
+            "cwd": cwd,
+            "timestamp": f"2024-01-01T00:0{i}:01.000Z",
+            "message": {"role": "user", "content": prompt},
+        }))
+    if last_assistant:
+        lines.append(json.dumps({
+            "type": "assistant",
+            "sessionId": session_id,
+            "gitBranch": git_branch,
+            "cwd": cwd,
+            "timestamp": "2024-01-01T01:00:00.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": last_assistant}]},
+        }))
+    jsonl.write_text("\n".join(lines) + "\n")
+    return jsonl
+
+
+class TestUpsertSession:
+    def test_insert(self, tmp_path):
+        db = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db))
+        ai_hist.init_db(conn)
+        ai_hist._upsert_session(conn, "sid1", "claude", "/proj", "main", 1000)
+        conn.commit()
+        row = conn.execute(
+            "SELECT session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms "
+            "FROM sessions WHERE session_id='sid1'"
+        ).fetchone()
+        conn.close()
+        assert row == ("sid1", "claude", "/proj", "main", 1000, 1000)
+
+    def test_upsert_preserves_existing_cwd(self, tmp_path):
+        db = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db))
+        ai_hist.init_db(conn)
+        ai_hist._upsert_session(conn, "sid1", "claude", "/proj", "main", 1000)
+        # Second upsert with NULL cwd should keep existing.
+        ai_hist._upsert_session(conn, "sid1", "claude", None, None, 2000)
+        conn.commit()
+        row = conn.execute("SELECT cwd, git_branch FROM sessions WHERE session_id='sid1'").fetchone()
+        conn.close()
+        assert row == ("/proj", "main")
+
+    def test_upsert_updates_last_activity_ms(self, tmp_path):
+        db = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db))
+        ai_hist.init_db(conn)
+        ai_hist._upsert_session(conn, "sid1", "claude", "/proj", "main", 1000)
+        ai_hist._upsert_session(conn, "sid1", "claude", "/proj", "main", 5000)
+        conn.commit()
+        row = conn.execute(
+            "SELECT first_activity_ms, last_activity_ms FROM sessions WHERE session_id='sid1'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == 1000  # first stays
+        assert row[1] == 5000  # last updated
+
+    def test_upsert_last_assistant_text(self, tmp_path):
+        db = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db))
+        ai_hist.init_db(conn)
+        ai_hist._upsert_session(conn, "sid1", "claude", "/proj", "main", 1000,
+                                 last_assistant_text="done!")
+        conn.commit()
+        row = conn.execute("SELECT last_assistant_text FROM sessions WHERE session_id='sid1'").fetchone()
+        conn.close()
+        assert row[0] == "done!"
+
+
+class TestScanClaudeSessionFile:
+    def test_basic_metadata(self, tmp_path):
+        proj_dir = tmp_path / "proj"
+        jsonl = make_claude_session_jsonl(proj_dir, "sess-abc", "feat/auth", "/app", ["fix bug"])
+        meta = ai_hist._scan_claude_session_file(jsonl)
+        assert meta is not None
+        assert meta["session_id"] == "sess-abc"
+        assert meta["git_branch"] == "feat/auth"
+        assert meta["cwd"] == "/app"
+        assert meta["raw_path"] == str(jsonl)
+
+    def test_last_assistant_text(self, tmp_path):
+        proj_dir = tmp_path / "proj"
+        jsonl = make_claude_session_jsonl(proj_dir, "sess-abc", "main", "/app",
+                                          ["do X"], last_assistant="Done, I updated auth.ts")
+        meta = ai_hist._scan_claude_session_file(jsonl)
+        assert meta is not None
+        assert "auth.ts" in meta["last_assistant_text"]
+
+    def test_no_session_id_returns_none(self, tmp_path):
+        f = tmp_path / "unknown.jsonl"
+        f.write_text(json.dumps({"type": "mode", "mode": "normal"}) + "\n")
+        assert ai_hist._scan_claude_session_file(f) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert ai_hist._scan_claude_session_file(tmp_path / "missing.jsonl") is None
+
+
+class TestSyncClaudeSessions:
+    def test_populates_sessions_table(self, tmp_env, capsys):
+        proj_dir = tmp_env.claude_projects_root / "proj"
+        make_claude_session_jsonl(proj_dir, "sess-1", "main", "/app", ["do work"])
+        ai_hist.cmd_sync()
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        row = conn.execute(
+            "SELECT session_id, source, cwd, git_branch FROM sessions WHERE session_id='sess-1'"
+        ).fetchone()
+        conn.close()
+        assert row == ("sess-1", "claude", "/app", "main")
+
+    def test_incremental_scan_skips_unchanged_files(self, tmp_env, capsys):
+        proj_dir = tmp_env.claude_projects_root / "proj"
+        make_claude_session_jsonl(proj_dir, "sess-1", "main", "/app", ["do work"])
+        ai_hist.cmd_sync()
+        capsys.readouterr()
+        ai_hist.cmd_sync()
+        captured = capsys.readouterr()
+        # Second sync should report no new files scanned.
+        assert "scanned 1" not in captured.out
+
+    def test_last_assistant_text_stored(self, tmp_env):
+        proj_dir = tmp_env.claude_projects_root / "proj"
+        make_claude_session_jsonl(proj_dir, "sess-2", "feat/x", "/app",
+                                  ["do Y"], last_assistant="Updated src/auth.ts")
+        ai_hist.cmd_sync()
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        row = conn.execute(
+            "SELECT last_assistant_text FROM sessions WHERE session_id='sess-2'"
+        ).fetchone()
+        conn.close()
+        assert row[0] is not None
+        assert "auth.ts" in row[0]
+
+
+class TestReadCodexSessionMetaBranch:
+    def test_returns_branch(self, tmp_path):
+        rollout = tmp_path / "rollout-1.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": "codex-sess-1",
+                "cwd": "/my/project",
+                "git": {"branch": "feat/payments"},
+            },
+        }) + "\n")
+        result = ai_hist._read_codex_session_meta(rollout)
+        assert result == ("codex-sess-1", "/my/project", "feat/payments")
+
+    def test_no_git_returns_none_branch(self, tmp_path):
+        rollout = tmp_path / "rollout-2.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": "codex-sess-2", "cwd": "/proj"},
+        }) + "\n")
+        result = ai_hist._read_codex_session_meta(rollout)
+        assert result == ("codex-sess-2", "/proj", None)
+
+    def test_non_session_meta_returns_none(self, tmp_path):
+        rollout = tmp_path / "rollout-3.jsonl"
+        rollout.write_text(json.dumps({"type": "other", "payload": {}}) + "\n")
+        assert ai_hist._read_codex_session_meta(rollout) is None
+
+
+class TestBackfillCodexProjects:
+    def _seed(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        ai_hist.init_db(conn)
+        for i, ts in enumerate((1000, 2000)):
+            conn.execute(
+                "INSERT INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                "VALUES ('codex', 'cx1', NULL, ?, ?, ?, NULL)",
+                (f"p{i}", ai_hist._prompt_hash(f"p{i}"), ts),
+            )
+        conn.commit()
+        return conn
+
+    def test_backfills_columns_and_session(self, tmp_path):
+        conn = self._seed(tmp_path)
+        updated = ai_hist._backfill_codex_projects(conn, {"cx1": "/proj"}, {"cx1": "main"})
+        assert updated == 2  # both rows had NULL project/branch
+        proj, branch = conn.execute(
+            "SELECT project, git_branch FROM history WHERE session_id='cx1' LIMIT 1"
+        ).fetchone()
+        assert (proj, branch) == ("/proj", "main")
+        srow = conn.execute(
+            "SELECT cwd, git_branch, first_activity_ms, last_activity_ms "
+            "FROM sessions WHERE session_id='cx1' AND source='codex'"
+        ).fetchone()
+        conn.close()
+        assert srow == ("/proj", "main", 1000, 2000)
+
+    def test_repeat_call_is_cheap_noop(self, tmp_path):
+        conn = self._seed(tmp_path)
+        ai_hist._backfill_codex_projects(conn, {"cx1": "/proj"}, {"cx1": "main"})
+        # Nothing changed since last sync: no history rows re-written.
+        updated = ai_hist._backfill_codex_projects(conn, {"cx1": "/proj"}, {"cx1": "main"})
+        conn.close()
+        assert updated == 0
+
+    def test_new_activity_bumps_last_activity(self, tmp_path):
+        conn = self._seed(tmp_path)
+        ai_hist._backfill_codex_projects(conn, {"cx1": "/proj"}, {"cx1": "main"})
+        # A newer codex row arrives (already enriched at insert time).
+        conn.execute(
+            "INSERT INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+            "VALUES ('codex', 'cx1', '/proj', 'p2', ?, 9000, 'main')",
+            (ai_hist._prompt_hash("p2"),),
+        )
+        conn.commit()
+        ai_hist._backfill_codex_projects(conn, {"cx1": "/proj"}, {"cx1": "main"})
+        last = conn.execute(
+            "SELECT last_activity_ms FROM sessions WHERE session_id='cx1' AND source='codex'"
+        ).fetchone()[0]
+        conn.close()
+        assert last == 9000

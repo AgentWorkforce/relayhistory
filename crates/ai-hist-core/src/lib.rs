@@ -18,9 +18,12 @@ pub const SOURCE_CHOICES: &[&str] = &[
 pub struct HistoryEntry {
     pub id: i64,
     pub source: String,
+    #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
     pub project: Option<String>,
     pub prompt: String,
+    #[serde(default)]
     pub prompt_hash: Option<String>,
     pub timestamp_ms: i64,
 }
@@ -134,6 +137,7 @@ pub fn default_db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             home.join(".local/share/ai-hist/ai-history.db")
@@ -595,9 +599,10 @@ pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
 }
 
 pub fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
     {
         value.to_string()
     } else {
@@ -609,15 +614,15 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     if !opencode_db.exists() {
         return Ok(0);
     }
-    let tmp = tempfile::NamedTempFile::new()?;
+    let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
     let src_live = Connection::open_with_flags(
         opencode_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-    src_live.backup(DatabaseName::Main, tmp.path(), None)?;
-    let src = Connection::open(tmp.path())?;
+    src_live.backup(DatabaseName::Main, &tmp, None)?;
+    let src = Connection::open(&tmp)?;
     let mut stmt = src.prepare(
         "SELECT s.id, s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = p.session_id WHERE json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY p.time_created ASC",
     )?;
@@ -740,6 +745,18 @@ mod tests {
             untag_session(&conn, "s1", "release", Some("claude")).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn deserializes_legacy_history_entries_and_quotes_empty_args() {
+        let entry: HistoryEntry = serde_json::from_str(
+            r#"{"id":1,"source":"codex","prompt":"legacy export","timestamp_ms":42}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.session_id, None);
+        assert_eq!(entry.project, None);
+        assert_eq!(entry.prompt_hash, None);
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
