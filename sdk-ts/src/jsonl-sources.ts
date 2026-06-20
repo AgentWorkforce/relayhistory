@@ -27,6 +27,7 @@ export interface RawRow {
   project: string | null;
   prompt: string;
   timestampMs: number;
+  gitBranch: string | null;
 }
 
 const CLAUDE_HISTORY = join(homedir(), '.claude', 'history.jsonl');
@@ -83,6 +84,7 @@ function parseClaudeLine(line: string): RawRow | null {
     project: asString(obj.project),
     prompt: display,
     timestampMs: asNumber(obj.timestamp) ?? 0,
+    gitBranch: asString(obj.gitBranch),
   };
 }
 
@@ -101,6 +103,7 @@ function parseCodexLine(line: string): RawRow | null {
     prompt: text,
     // Python stores Codex's seconds-since-epoch as ms.
     timestampMs: Math.trunc(ts * 1000),
+    gitBranch: null,
   };
 }
 
@@ -204,6 +207,7 @@ async function scanCursor(): Promise<RawRow[]> {
           project: projectPath,
           prompt: text,
           timestampMs: tsMs,
+          gitBranch: null,
         });
       }
     }
