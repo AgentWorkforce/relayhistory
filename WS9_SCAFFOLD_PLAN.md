@@ -74,11 +74,17 @@ _The sections below describe the cloud-sync lens to add to the existing client._
 >   (monotonic `history.id` / `trajectories.rowid`), maps via convergence, applies the
 >   incognito session-exclusion (skipped rows still advance the cursor), caps per-source by
 >   `limit`. Pure sync rusqlite — no network. `SyncCursor` is JSON-persistable.
-> - ⏳ **Increment 2b — HTTP/auth/network (binding layer) — GATED on local `wrangler dev`**
->   (now that relayhistory-cloud's `/v1/admin/mint` + `/v1/cli/login` + `/v1/ingest` are
->   code-ready; needs a non-prod Neon `.dev.vars` + `wrangler dev` running): HTTP POST client,
->   `rth_at_`/`rth_rt_` token storage/refresh (token via `/v1/admin/mint` for local), single
->   cursor-store persistence + server-confirmed advancement, the `sync` CLI command.
+> - ✅ **Increment 2b — client transport DONE & green** in `crates/ai-hist/src/cloud.rs`
+>   (5 tests; 29 total in-crate, clippy clean): `ureq` HTTP `Ingestor` (behind a trait so the
+>   push orchestration is unit-tested without a server), `rth_at_`/`rth_rt_` token storage
+>   (`0600`), `SyncCursor` persistence + server-confirmed advance, deterministic retry-safe
+>   `batch_id`, stable `machine_id`. CLI: `ai-hist login` (`/v1/cli/login`), `ai-hist admin-mint`
+>   (dev `/v1/admin/mint`), `ai-hist push` (incremental, idempotent, `--incognito`, `--json`).
+>   Network I/O lives here, not in the WASM-bound core.
+> - **User docs:** `docs/cloud-sync.md` (human quickstart + automation/agent section).
+> - ⏳ **Live client→cloud round-trip** — only remaining step: `ai-hist push` against a
+>   `wrangler dev` relayhistory-cloud + non-prod Neon. Gated solely on the operational Neon
+>   `.dev.vars` — no client code left.
 > - **Deferred:** `taskRef` population + full chapter-stream (`trajevent:*`) — both need ai-hist to
 >   persist `task.source` / re-parse via `path` (WS-6 timeframe).
 
