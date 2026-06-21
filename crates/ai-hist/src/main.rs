@@ -578,6 +578,8 @@ fn main() -> Result<()> {
 }
 
 /// Best-effort `git remote get-url origin` for project scoping (None if not a repo).
+/// Credentials in the URL (`https://user:token@host/…`) are stripped before egress — this
+/// field is generated client-side, downstream of the hook's scrub belt, so it self-guards.
 fn detect_git_remote() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
@@ -587,7 +589,24 @@ fn detect_git_remote() -> Option<String> {
         return None;
     }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!url.is_empty()).then_some(url)
+    (!url.is_empty()).then(|| strip_url_credentials(&url))
+}
+
+/// Remove any `userinfo@` (user/password/token) between `scheme://` and the host so a
+/// credential-embedded remote never ships to the server. Non-`://` forms (scp-style
+/// `git@host:org/repo`) carry no secret and are returned unchanged.
+fn strip_url_credentials(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = scheme_end + 3;
+        let rest = &url[after..];
+        if let Some(at) = rest.find('@') {
+            let host_start = rest.find('/').unwrap_or(rest.len());
+            if at < host_start {
+                return format!("{}{}", &url[..after], &rest[at + 1..]);
+            }
+        }
+    }
+    url.to_string()
 }
 
 fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
@@ -2568,4 +2587,39 @@ fn home_dir() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_url_credentials;
+
+    #[test]
+    fn strips_embedded_token_from_https_remote() {
+        // C3: gh-cli/CI token helper form must never egress the token.
+        assert_eq!(
+            strip_url_credentials("https://x-access-token:ghp_secret123@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://user:pass@gitlab.com/org/repo.git"),
+            "https://gitlab.com/org/repo.git"
+        );
+        assert_eq!(
+            strip_url_credentials("ssh://git@github.com/org/repo.git"),
+            "ssh://github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn leaves_clean_remotes_unchanged() {
+        // Plain https, and scp-style (no scheme) — no secret, untouched.
+        assert_eq!(
+            strip_url_credentials("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            strip_url_credentials("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+    }
 }
