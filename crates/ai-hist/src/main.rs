@@ -202,6 +202,40 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Pair (Agent Relay Loop, WS-6) — in-session warnings from your team's history.
+    Pair {
+        #[command(subcommand)]
+        action: PairAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PairAction {
+    /// Ask relayhistory-cloud for advisory warnings before an action (POST /v1/pair/check).
+    Check {
+        /// Files in scope / about to be touched (paths only — never contents).
+        #[arg(long)]
+        file: Vec<String>,
+        /// Current task summary.
+        #[arg(long)]
+        task: Option<String>,
+        /// Pending tool/action (e.g. Edit).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Tool target (e.g. the file being edited).
+        #[arg(long)]
+        target: Option<String>,
+        /// Short, caller-provided prompt summary (never the full prompt body).
+        #[arg(long)]
+        recent_prompt: Option<String>,
+        /// Canonical project id (else inferred server-side from repo/cwd).
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -505,7 +539,55 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Pair { action } => match action {
+            PairAction::Check {
+                file,
+                task,
+                tool,
+                target,
+                recent_prompt,
+                project_id,
+                limit,
+                json,
+            } => {
+                let auth = cloud::load_auth()?.context(
+                    "not authenticated — run `ai-hist login` or `ai-hist admin-mint` first",
+                )?;
+                let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+                let ctx = cloud::PairContext {
+                    project_id,
+                    repo_path: cwd.clone(),
+                    cwd,
+                    git_remote: detect_git_remote(),
+                    task,
+                    files: file,
+                    tool,
+                    target,
+                    recent_prompt,
+                };
+                let resp = cloud::pair_check(&auth, &ctx, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string(&resp)?);
+                } else {
+                    print!("{}", cloud::format_pair_warnings(&resp));
+                }
+                Ok(())
+            }
+        },
     }
+}
+
+/// Best-effort `git remote get-url origin` for project scoping (None if not a repo).
+fn detect_git_remote() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
