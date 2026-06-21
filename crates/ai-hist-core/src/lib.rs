@@ -5,6 +5,11 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
+pub mod convergence;
+/// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
+pub mod outbox;
+
 pub const SOURCE_CHOICES: &[&str] = &[
     "claude",
     "codex",
