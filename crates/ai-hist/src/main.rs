@@ -3,6 +3,7 @@ use ai_hist_core::{
     prompt_hash, recent, resume_command, search, session, sync_opencode_db, untag_session,
     HistoryEntry, QueryFilter, SOURCE_CHOICES,
 };
+use ai_hist_core::convergence::MachineIdentity;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
@@ -11,11 +12,13 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+mod cloud;
 
 #[derive(Parser)]
 #[command(
@@ -163,6 +166,41 @@ enum Command {
         file: PathBuf,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Authenticate to relayhistory-cloud (Agent Relay Loop) via a RelayAuth token.
+    Login {
+        #[arg(long)]
+        base_url: String,
+        /// RelayAuth/Agent Relay token (device-flow JWT).
+        #[arg(long)]
+        token: String,
+        #[arg(long, default_value = "ai-hist-cli")]
+        label: String,
+    },
+    /// Dev-only: mint a local `rth_at_` token via /v1/admin/mint (needs ADMIN_MINT_SECRET).
+    AdminMint {
+        #[arg(long)]
+        base_url: String,
+        #[arg(long, env = "ADMIN_MINT_SECRET")]
+        admin_secret: String,
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, default_value = "cli-user")]
+        user: String,
+        #[arg(long, default_value = "local-dev")]
+        label: String,
+    },
+    /// Push new local history + trajectory events to relayhistory-cloud.
+    Push {
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        /// Session ids (or trajectory ids) to exclude from the sync (incognito).
+        #[arg(long)]
+        incognito: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -389,6 +427,84 @@ fn main() -> Result<()> {
             )
         }
         Command::Import { file, dry_run } => import_history(&conn, &file, dry_run),
+        Command::Login {
+            base_url,
+            token,
+            label,
+        } => {
+            let auth = cloud::login(&base_url, &token, &label)?;
+            cloud::save_auth(&auth)?;
+            println!("Logged in to {} (token stored).", auth.base_url);
+            Ok(())
+        }
+        Command::AdminMint {
+            base_url,
+            admin_secret,
+            org,
+            workspace,
+            user,
+            label,
+        } => {
+            let auth = cloud::admin_mint(
+                &base_url,
+                &admin_secret,
+                &org,
+                workspace.as_deref(),
+                &user,
+                &label,
+            )?;
+            cloud::save_auth(&auth)?;
+            println!("Minted local token for org {org} (stored).");
+            Ok(())
+        }
+        Command::Push {
+            limit,
+            incognito,
+            json,
+        } => {
+            let auth = cloud::load_auth()?
+                .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
+            let machine = MachineIdentity {
+                id: cloud::machine_id()?,
+                hostname: std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()),
+                os: Some(std::env::consts::OS.to_string()),
+                cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                ..Default::default()
+            };
+            let cursor = cloud::load_cursor()?;
+            let incognito_set: HashSet<String> = incognito.into_iter().collect();
+            let report = cloud::push(
+                &conn,
+                &cloud::UreqIngestor,
+                &auth,
+                &machine,
+                &cursor,
+                limit,
+                &incognito_set,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "sent": report.sent,
+                        "accepted": report.accepted,
+                        "batchId": report.batch_id,
+                        "cursor": report.cursor,
+                    })
+                );
+            } else if report.sent == 0 {
+                println!("Nothing new to push.");
+            } else {
+                println!(
+                    "Pushed {} record(s), {} accepted (cursor → history #{}, trajectory rowid {}).",
+                    report.sent,
+                    report.accepted,
+                    report.cursor.history_id,
+                    report.cursor.trajectory_rowid
+                );
+            }
+            Ok(())
+        }
     }
 }
 
