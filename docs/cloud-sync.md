@@ -1,148 +1,152 @@
 # Cloud Sync — push your local history to Agent Relay Loop
 
 `ai-hist` captures your AI-agent history **locally** (Claude Code, Codex, Cursor, Agent
-Relay, Trajectories) into a SQLite database. **Cloud sync** is the optional next step: push
-that history to your team's **Agent Relay Loop** service (`relayhistory-cloud`) so it feeds
-the shared Capture → Learn → Plan → Pair loop.
+Relay, Trajectories) into a SQLite database. **Cloud sync** pushes that history to your
+team's **Agent Relay Loop** service (`relayhistory-cloud`) so it feeds the shared
+Capture → Learn → Plan → Pair loop.
 
-> **Status:** the `login` / `admin-mint` / `push` commands below are built and tested. They
-> require a running `relayhistory-cloud` endpoint — either your team's deployed service or a
-> local `wrangler dev` instance. Pair (in-session warnings) is a later phase.
+This is the single source of truth for cloud-sync usage (dev + prod, end-to-end).
+
+- **Dev API:** `https://relayhistory-api-dev.agent-workforce.workers.dev`
+- **Prod API:** `https://history.agentrelay.com`
+
+> Pair (in-session warnings) is a later phase. What's shipped is Capture → push → store.
 
 ---
 
 ## What gets sent (and what doesn't)
 
-`ai-hist push` maps your local rows into the team's normalized **convergence event**
-contract and POSTs them to `/v1/ingest`. Two lenses are sent today:
+`ai-hist push` maps your local rows into the normalized **convergence event** contract and
+POSTs them to `/v1/ingest`. Two lenses are sent:
 
 - **History (prompts):** your prompts across tools → `kind: "prompt"`, `lens: "history"`.
-- **Trajectories (reasoning):** the *distilled* `decisions` + `retrospective` from each run
-  (not the full turn-by-turn transcript) → `decision` / `finding` / `reflection` events,
-  `lens: "trajectories"`.
+- **Trajectories (reasoning):** the *distilled* `decisions` + `retrospective` per run (not
+  the full transcript) → `decision` / `finding` / `reflection` events, `lens: "trajectories"`.
 
 Privacy model (default **Team/Growth** tier — vendor-readable):
 - Cost/usage data is **not** sent by this client — that's `burn`'s job.
-- The CLI does a **defense-in-depth preflight**: home-directory paths are normalized
-  (`/Users/<you>/…` → `/Users/~/…`) before anything leaves your machine.
-- The **server** is the compliance boundary: it scrubs secrets/PII, drops raw payloads,
-  and minimizes records before storage. Readable content is retained (scrubbed) so the team
-  can search and learn from it.
-- **Incognito** lets you exclude any session from sync entirely (see below).
-- End-to-end-encrypted / self-hosted custody is the separate **Enterprise** tier.
+- Client preflight normalizes home-dir paths (`/Users/<you>/…` → `/Users/~/…`) before send.
+- The **server** is the compliance boundary: scrubs secrets/PII, drops raw payloads,
+  minimizes records before storage. Scrubbed readable content is retained for Learn/Plan.
+- **Incognito** excludes any session from sync.
+- E2E / self-host custody is the separate **Enterprise** tier.
 
 ---
 
-## Quickstart (humans)
+## Step 0 — Build & install the CLI (required first)
 
-### 1. Authenticate
-
-**Real use** — log in with your Agent Relay token (the service mints a local
-`rth_at_`/`rth_rt_` session, stored `0600` under `~/.agentworkforce/relayhistory/`):
-
-```bash
-ai-hist login --base-url https://history.agentrelay.com --token "<your-agent-relay-token>"
-```
-
-**Local dev** — against a `wrangler dev` instance, mint a token directly (no browser flow;
-needs the server's `ADMIN_MINT_SECRET`):
+The cloud commands (`login` / `admin-mint` / `push`) are in the **Rust** binary. The
+`~/.local/bin/ai-hist` you may already have is the **Python** CLI and does **not** include
+them — rebuild from `main`:
 
 ```bash
-ai-hist admin-mint \
-  --base-url http://localhost:8787 \
-  --admin-secret "$ADMIN_MINT_SECRET" \
-  --org org-a --workspace workspace-a --user me
+cd <relayhistory repo>            # e.g. ~/Projects/AgentWorkforce/ai-hist
+git checkout main && git pull --ff-only origin main
+cargo build --release -p ai-hist-cli
+cp target/release/ai-hist ~/.local/bin/ai-hist
+ai-hist --help                    # should list: login, admin-mint, push
 ```
 
-### 2. Push
-
-```bash
-ai-hist push                 # send everything new since the last push
-ai-hist push --limit 200     # cap rows scanned per source
-ai-hist push --json          # machine-readable result
-```
-
-Output:
-
-```
-Pushed 6 record(s), 6 accepted (cursor → history #4821, trajectory rowid 37).
-```
-
-`push` is **incremental and idempotent**: it tracks a per-source cursor
-(`~/.agentworkforce/relayhistory/cursor.json`) and only sends rows past it. The cursor
-advances **only after the server accepts the batch**, and each batch carries a deterministic
-id, so a retry after a network blip never double-writes.
-
-### 3. Incognito (exclude sessions)
-
-```bash
-ai-hist push --incognito <session-id> --incognito <trajectory-id>
-```
-
-Excluded sessions are skipped *and* the cursor still advances past them — they are never
-sent, now or on a later push.
+Both CLIs read the **same** local DB (`~/.local/share/ai-hist/ai-history.db`), so your
+existing captured history is what `push` sends. If you have nothing captured yet, run
+`ai-hist sync` first. (If `push` ever says `Nothing new to push.`, run `ai-hist sync`.)
 
 ---
 
-## Automation (agents / CI / continuous sync)
+## DEV — usable right now (no RelayAuth token needed)
 
-`push` is safe to run on a timer — the cursor makes repeated runs cheap and idempotent.
-
-**macOS launchd** (every 5 min):
+Dev allows `admin-mint` (it's fail-closed only in prod). Two commands:
 
 ```bash
-# in your LaunchAgent ProgramArguments, after `ai-hist sync` (local import):
-/usr/bin/env ai-hist push --json >> /tmp/ai-hist-push.log 2>&1
+# load the dev admin secret from the secure local file (never echo it)
+set -a; source ~/.agentworkforce/secrets/relayhistory-cloud-dev-github-secrets.env; set +a
+
+RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" \
+  ai-hist admin-mint \
+    --base-url https://relayhistory-api-dev.agent-workforce.workers.dev \
+    --admin-secret "$RELAYHISTORY_DEV_ADMIN_MINT_SECRET" \
+    --org org-a --workspace workspace-a --user "$USER"
+
+RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" \
+  ai-hist push --json
 ```
 
-**Linux cron:**
+(Against a *local* `wrangler dev` instead of the deployed dev Worker, use
+`--base-url http://localhost:8787`.)
+
+---
+
+## PROD — once you issue a RelayAuth token
+
+Prod returns **404** on `admin-mint` by design, so prod uses the RelayAuth login path:
+
+```bash
+# 1. issue a RelayAuth access JWT for audience "relayhistory" (your RelayAuth infra).
+#    NOTE: the param is expiresIn (seconds, integer) — not ttl.
+ACCESS_TOKEN=$(curl -sS -X POST https://api.relayauth.dev/v1/tokens \
+  -H "x-api-key: $RELAYAUTH_API_KEY" -H "content-type: application/json" \
+  -d '{"identityId":"<id>","workspaceId":"<ws>","audience":["relayhistory"],"expiresIn":3600}' \
+  | jq -r .accessToken)
+
+# 2. login + push
+RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
+  ai-hist login --base-url https://history.agentrelay.com --token "$ACCESS_TOKEN"
+
+RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
+  ai-hist push --json
+```
+
+RelayAuth JWT must be RS256, issuer `https://relayauth.dev`, audience `relayhistory`, with
+mappable user/org/workspace claims.
+
+---
+
+## Push semantics & key behaviors
+
+`ai-hist push` output (example): `{"sent":N,"accepted":N,"batchId":"b_…","cursor":{…}}`
+
+- **Auth + base_url are stored** in `$RELAYHISTORY_HOME/auth.json` (mode `0600`) by
+  `login`/`admin-mint`. Authenticate once per target, then just `ai-hist push` — **`push`
+  takes no `--base-url`** (it uses stored context).
+- **Use a separate `RELAYHISTORY_HOME` for dev vs prod** (as above): `auth.json` holds one
+  base_url + token + the cursor, so a shared home would make dev/prod overwrite each other's
+  auth and resume state.
+- **Incremental + idempotent:** the cursor only sends new rows; re-running `push` (or a
+  cron) is safe — duplicates dedupe server-side on the event PK + batch id. The cursor
+  advances only after the server accepts the batch.
+- **Exclude sessions:** `ai-hist push --incognito <sessionId> --incognito <trajectoryId>`.
+- To switch targets, re-run `login`/`admin-mint` against the other `--base-url` (or just use
+  the per-target `RELAYHISTORY_HOME`).
+
+### Automation (cron / launchd)
 
 ```cron
-*/5 * * * * ai-hist sync && ai-hist push --json >> /tmp/ai-hist-push.log 2>&1
+*/5 * * * * RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist sync && \
+            RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist push --json >> /tmp/ai-hist-push.log 2>&1
 ```
 
-Notes for automated callers:
-- `--json` emits `{ "sent", "accepted", "batchId", "cursor" }` — parse `sent`/`accepted`.
-- Exit code is non-zero on transport/auth failure; the cursor is **not** advanced on failure,
-  so the next run retries the same batch safely.
-- Token storage and cursor are per-machine under `~/.agentworkforce/relayhistory/`
-  (override the home with `RELAYHISTORY_HOME`).
-- The CLI sends source-native data; the server owns normalization (confidence scaling,
-  `Task:` content enrichment, scrub). Don't pre-transform on the client.
-
----
-
-## Local end-to-end (against `wrangler dev`)
-
-To exercise the full client→cloud path locally:
-
-1. Stand up `relayhistory-cloud` on `wrangler dev` with a **dedicated non-prod Neon branch**
-   in `.dev.vars` (see `relayhistory-cloud/docs/deployment-flow.md`).
-2. `ai-hist admin-mint --base-url http://localhost:8787 --admin-secret <secret> --org org-a`
-3. `ai-hist push --json`
-4. Verify the rows landed (the server-side quickstart shows the `SELECT … FROM
-   convergence_events` checks).
+`push` exits non-zero on transport/auth failure (cursor not advanced → safe retry next run).
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause / fix |
+| Message | Fix |
 |---|---|
-| `not authenticated …` | Run `ai-hist login` or `ai-hist admin-mint` first. |
-| `ingest failed: HTTP 401` | Token expired/invalid — re-auth. |
-| `ingest failed: HTTP 404` on admin-mint | The server fails admin-mint closed in production — it's dev-only. Use `login` against a deployed service. |
-| `Nothing new to push.` | Cursor is already current; capture new sessions (or `ai-hist sync`) first. |
-| Connection refused (localhost) | `wrangler dev` isn't running, or wrong `--base-url` port. |
+| `ai-hist: command not found` / no `login`/`push` | rebuild from `main` (Step 0) — old binary is Python |
+| `not authenticated …` | run `login` (prod) or `admin-mint` (dev) first |
+| `Nothing new to push.` | `ai-hist sync` first, then push |
+| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — prod is login-only |
+| `HTTP 401` | token expired/invalid — re-auth |
+| connection refused | wrong `--base-url`, or (local) `wrangler dev` not running |
 
 ---
 
-## How it works (internals)
+## Internals
 
-- Mapping: `ai-hist-core::convergence` turns local rows into the WS-1 `ConvergenceEnvelope`.
-- Batching/cursor: `ai-hist-core::outbox::build_outbox_batch` selects rows past the cursor.
-- Transport/auth: `ai-hist` (binary) `cloud` module — `ureq` HTTP, `rth_at_` bearer,
+- Mapping: `ai-hist-core::convergence` → WS-1 `ConvergenceEnvelope`.
+- Batching/cursor: `ai-hist-core::outbox::build_outbox_batch`.
+- Transport/auth: the `ai-hist` binary `cloud` module — `ureq` HTTP, `rth_at_` bearer,
   `SyncCursor` persistence. Network I/O lives here, not in the WASM-bound core.
-- The convergence contract is defined in
-  `relayhistory-cloud/docs/decisions/2026-06-21-normalized-agent-event-schema.md`; the
-  trajectory-lens mapping reference is `trajectories/docs/convergence-integration.md`.
+- Convergence contract: `relayhistory-cloud/docs/decisions/2026-06-21-normalized-agent-event-schema.md`;
+  trajectory-lens mapping: `trajectories/docs/convergence-integration.md`.
