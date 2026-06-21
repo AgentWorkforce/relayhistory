@@ -2611,6 +2611,25 @@ mod tests {
     }
 
     #[test]
+    fn strips_token_without_user_prefix() {
+        // gh-cli `x-access-token` can also appear without a `user:` prefix — keyed on `@`.
+        assert_eq!(
+            strip_url_credentials("https://ghp_secret123@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_at_in_path_or_ref() {
+        // The subtle case: an `@` in the path/ref must not be treated as userinfo
+        // (guarded by `at < host_start`).
+        assert_eq!(
+            strip_url_credentials("https://github.com/org/repo@v2"),
+            "https://github.com/org/repo@v2"
+        );
+    }
+
+    #[test]
     fn leaves_clean_remotes_unchanged() {
         // Plain https, and scp-style (no scheme) — no secret, untouched.
         assert_eq!(
