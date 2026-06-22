@@ -168,13 +168,29 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Authenticate to relayhistory-cloud (Agent Relay Loop) via a RelayAuth token.
+    /// Authenticate to relayhistory-cloud (Agent Relay Loop).
+    ///
+    /// `--cloud` uses Agent Relay Cloud — you never handle a token: it shells to the already-
+    /// authenticated `agent-relay` CLI, which performs the server-to-server exchange and returns
+    /// only the relayhistory session. (Cloud will become the default once the bridge is live.)
+    /// Otherwise pass `--base-url` + `--token` for manual/dev login.
     Login {
+        /// Use Agent Relay Cloud (no token handling).
         #[arg(long)]
-        base_url: String,
-        /// RelayAuth/Agent Relay token (device-flow JWT).
+        cloud: bool,
+        /// Least-privilege ceiling: `read` (Pair-only) or `sync` (Learn/push). Cloud authorizes
+        /// the actual scope it grants. Cloud mode only.
+        #[arg(long, default_value = "sync")]
+        mode: String,
+        /// Optional workspace id for the Cloud session.
         #[arg(long)]
-        token: String,
+        workspace: Option<String>,
+        /// Legacy/manual: relayhistory-cloud base URL (required with `--token`).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
+        #[arg(long)]
+        token: Option<String>,
         #[arg(long, default_value = "ai-hist-cli")]
         label: String,
     },
@@ -507,13 +523,30 @@ fn main() -> Result<()> {
         }
         Command::Import { file, dry_run } => import_history(&conn, &file, dry_run),
         Command::Login {
+            cloud: use_cloud,
+            mode,
+            workspace,
             base_url,
             token,
             label,
         } => {
-            let auth = cloud::login(&base_url, &token, &label)?;
+            // Cloud login is opt-in via --cloud until the Cloud `relayhistory-session` command +
+            // RelayAuth org-claim land end-to-end; legacy --token + --base-url is the current
+            // default so this can ship without a broken-by-default `login`. (Flip to Cloud-default
+            // once the bridge is live.)
+            let auth = if use_cloud {
+                cloud::login_via_cloud(&mode, workspace.as_deref())?
+            } else {
+                let base_url = base_url.context(
+                    "use `--cloud` for Agent Relay Cloud login, or pass `--base-url` + `--token` for manual login",
+                )?;
+                let token =
+                    token.context("`--token` is required for manual login (or use `--cloud`)")?;
+                cloud::login(&base_url, &token, &label)?
+            };
             cloud::save_auth(&auth)?;
-            println!("Logged in to {} (token stored).", auth.base_url);
+            // Never print the session/token — only where it landed.
+            println!("Logged in to {} (session stored).", auth.base_url);
             Ok(())
         }
         Command::AdminMint {
