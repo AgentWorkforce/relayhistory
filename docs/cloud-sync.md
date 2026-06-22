@@ -10,7 +10,7 @@ This is the single source of truth for cloud-sync usage (dev + prod, end-to-end)
 - **Dev API:** `https://relayhistory-api-dev.agent-workforce.workers.dev`
 - **Prod API:** `https://history.agentrelay.com`
 
-> Pair (in-session warnings) is a later phase. What's shipped is Capture → push → store.
+> Pair (in-session warnings) is documented separately in [`docs/pair-hooks.md`](pair-hooks.md).
 
 ---
 

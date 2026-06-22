@@ -343,6 +343,7 @@ test('MCP server exposes history and trajectory tools over stdio', async () => {
       'search_trajectories',
       'why_for_task',
       'get_handoff',
+      'pair_check',
     ]) {
       assert.ok(tools.has(name), `missing MCP tool ${name}`);
     }

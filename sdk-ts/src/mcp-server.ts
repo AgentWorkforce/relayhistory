@@ -14,6 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { resolve } from "node:path";
 import { z } from "zod";
 import { openAiHist, resumeCommand, type AiHist, type TrajectoryEntry, type HandoffCandidate } from "./index.js";
+import { formatPairWarnings, pairCheck } from "./pair-client.js";
 
 // ---------------------------------------------------------------------------
 // Lazy singleton — opens on first tool call and reuses across all calls.
@@ -102,6 +103,7 @@ function fmtTrajectory(t: TrajectoryEntry, maxChars = 500): string {
 
 const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
 const WRITE_LOCAL = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
+const REMOTE_READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "relay", "trajectory", "opencode"]);
 
 // ---------------------------------------------------------------------------
@@ -170,6 +172,10 @@ and Agent Relay — all searchable in a single index.
   /my-repo?" and this tool returns ranked candidates with resume commands and
   a ready-to-paste warm-start command for the target CLI.
 
+- **pair_check** — Ask relayhistory-cloud for advisory in-session warnings before
+  a prompt, plan, or tool action. It sends only minimal current context and returns
+  cited, scrubbed warnings from prior convergence events.
+
 ## Tips
 
 - If a tool returns "database not found", the user should run \`ai-hist sync\` to
@@ -185,6 +191,41 @@ and Agent Relay — all searchable in a single index.
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
+
+server.tool(
+  "pair_check",
+  "Ask relayhistory-cloud Pair for advisory warnings before a prompt, plan, or tool action. " +
+    "This shells to `ai-hist pair check --json`, which calls POST /v1/pair/check using stored " +
+    "relayhistory auth. Send only minimal current context: repo/cwd, " +
+    "task summary, files, pending tool/action, and a short recent prompt summary. The response cites " +
+    "scrubbed convergence-event evidence and never blocks by itself.",
+  {
+    projectId: z.string().optional().describe("Canonical project id if known. Optional; server can infer from path/repo."),
+    repoPath: z.string().optional().describe("Local repository path or normalized repository identity."),
+    cwd: z.string().optional().describe("Current working directory for the session."),
+    gitRemote: z.string().optional().describe("Git remote URL if known, used by the server to infer project identity."),
+    task: z.string().optional().describe("Short current task or prompt summary. Do not send raw transcript."),
+    files: z.array(z.string()).optional().default([]).describe("Files in scope or about to be read/edited."),
+    tool: z.string().optional().describe("Pending tool name, for example Edit, Write, Bash, or apply_patch."),
+    target: z.string().optional().describe("Primary pending target, such as a file path or command target."),
+    action: z.string().optional().describe("Short action label, for example edit, write, read, run-tests, or plan."),
+    recentPrompt: z.string().optional().describe("Short recent prompt summary. Keep it minimal; do not send full transcript."),
+    limit: z.number().int().min(1).max(10).optional().default(5).describe("Maximum warnings to return."),
+  },
+  REMOTE_READ_ONLY,
+  async ({ projectId, repoPath, cwd, gitRemote, task, files, tool, target, action, recentPrompt, limit }) => {
+    try {
+      const result = await pairCheck({
+        context: { projectId, repoPath, cwd, gitRemote, task, files, tool, target, action, recentPrompt },
+        limit,
+      });
+      const text = formatPairWarnings(result) || JSON.stringify({ decision: result.decision ?? "allow", warnings: [] }, null, 2);
+      return { content: [{ type: "text", text }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${String(err)}` }], isError: true };
+    }
+  },
+);
 
 server.tool(
   "search_history",
