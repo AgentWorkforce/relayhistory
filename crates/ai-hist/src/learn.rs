@@ -6,11 +6,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-latest";
+const LLM_TIMEOUT: Duration = Duration::from_secs(300);
 
 const LEARN_SYSTEM_PROMPT: &str = r#"You are a technical analyst distilling AI coding sessions into durable team memory.
 Your job is to produce concise, high-signal guidance that captures:
@@ -506,6 +508,7 @@ fn complete_openai(
     ))
     .set("authorization", &format!("Bearer {}", provider.api_key))
     .set("content-type", "application/json")
+    .timeout(LLM_TIMEOUT)
     .send_json(body)?
     .into_json()?;
     response
@@ -547,6 +550,7 @@ fn complete_anthropic(
     .set("x-api-key", &provider.api_key)
     .set("anthropic-version", "2024-10-22")
     .set("content-type", "application/json")
+    .timeout(LLM_TIMEOUT)
     .send_json(body)?
     .into_json()?;
     let text = response

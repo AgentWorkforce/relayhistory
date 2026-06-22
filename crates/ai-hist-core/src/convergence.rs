@@ -438,11 +438,13 @@ fn map_compacted_trajectory(
         .get("source")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
         .unwrap_or("trajectories");
     let lens = compacted
         .get("lens")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
         .unwrap_or(source);
     let tags = compacted_tags(compacted);
     let is_learn = tags.iter().any(|tag| tag == "learn");
