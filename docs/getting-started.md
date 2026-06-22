@@ -68,10 +68,11 @@ Cloud sync authenticates once per target, then `push` uses the stored context. *
 separate `RELAYHISTORY_HOME` per target** (dev vs prod) so their auth + resume cursors
 don't overwrite each other.
 
-### Dev (team/internal admin mint)
+### Dev / team-internal admin mint
 
-Dev allows `admin-mint` (prod does not). The admin secret comes from a local `0600` file —
-never typed inline:
+Dev allows `admin-mint` for maintainers and internal test environments only. It requires
+an admin secret and is **not** an end-user auth path. The admin secret comes from a local
+`0600` file — never typed inline:
 
 ```bash
 set -a; source ~/.agentworkforce/secrets/relayhistory-cloud-dev-github-secrets.env; set +a
@@ -171,9 +172,9 @@ more actionable nudge. Advisory only: it adds context, it never blocks the actio
 | Symptom | Fix |
 |---|---|
 | `command not found` / no `login`/`pair` | rebuild from `main` (Step 1) |
-| `not authenticated …` | run `login` (prod) or `admin-mint` (dev) first |
+| `not authenticated …` | run Agent Relay Cloud login (prod) or team-internal `admin-mint` (dev) first |
 | `Nothing new to push.` | `ai-hist sync` first, then `push` |
-| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — prod is login-only |
+| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — use Agent Relay Cloud login for prod |
 | `HTTP 401` | token expired/invalid — re-auth |
 | Pair returns nothing | confirm `/v1/pair/check` is deployed on your target + you've `push`ed history |
 
