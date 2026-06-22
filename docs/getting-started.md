@@ -17,7 +17,7 @@ The loop has three stages:
    warnings drawn from your team's prior decisions/findings/reflections.
 
 > **Security note (applies throughout):** never paste a real token, admin secret, or
-> RelayAuth key into a shell, file, or chat. Every example below reads secrets from
+> provider key into a shell, file, or chat. Every example below reads secrets from
 > environment variables or files with mode `0600`. The client only ever sends **paths +
 > short summaries** — never file contents or full prompt bodies.
 
@@ -68,7 +68,7 @@ Cloud sync authenticates once per target, then `push` uses the stored context. *
 separate `RELAYHISTORY_HOME` per target** (dev vs prod) so their auth + resume cursors
 don't overwrite each other.
 
-### Dev (no RelayAuth token needed)
+### Dev (team/internal admin mint)
 
 Dev allows `admin-mint` (prod does not). The admin secret comes from a local `0600` file —
 never typed inline:
@@ -88,27 +88,26 @@ RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" \
 RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" ai-hist push --json
 ```
 
-### Prod (RelayAuth login)
+### Prod (Agent Relay Cloud login)
 
-Prod returns **404** on `admin-mint` by design — it uses the RelayAuth login path:
-
-> **First-time RelayAuth setup:** the steps below assume you already have an `identityId`
-> and `workspaceId`. Creating a **new** identity requires a **`sponsorId`** — `POST
-> /v1/identities` is rejected without one. Request an identity (or a `sponsorId`) from your
-> RelayAuth admin before this step.
+Prod auth is owned by **Agent Relay Cloud**. End users should not mint auth tokens, call
+internal auth services directly, or handle internal API keys. Sign in through Agent Relay
+Cloud, then let the Cloud/relayhistory login handoff populate the `ai-hist` prod session:
 
 ```bash
-# 1. issue a RelayAuth access JWT (audience "relayhistory") — key read from a 0600 file.
-ACCESS_TOKEN=$(curl -sS -X POST https://api.relayauth.dev/v1/tokens \
-  -H "x-api-key: $RELAYAUTH_API_KEY" -H "content-type: application/json" \
-  -d '{"identityId":"<id>","workspaceId":"<ws>","audience":["relayhistory"],"expiresIn":3600}' \
-  | jq -r .accessToken)
+# 1. Sign in to Agent Relay Cloud in the browser / Cloud CLI.
+#    Your org/workspace and relayhistory session are provisioned by Cloud.
+npx agent-relay cloud login
 
+# 2. Push uses the stored prod relayhistory session.
 RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
-  ai-hist login --base-url https://history.agentrelay.com --token "$ACCESS_TOKEN"
-
-RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" ai-hist push --json
+  ai-hist push --json
 ```
+
+If your local build still asks for a manual auth handoff, treat that as a temporary
+Cloud-login gap, not as an instruction to mint anything yourself. Ask your Agent Relay
+Cloud admin to provision the relayhistory session, or wait for the first-class Cloud login
+handoff in the CLI. Internal auth details belong in operator runbooks, not human setup.
 
 `push` is incremental + idempotent: it only sends new rows past the cursor, dedupes
 server-side, and advances the cursor only after the server accepts the batch. Re-run it (or
@@ -127,38 +126,16 @@ Pair shells out to the CLI primitive, which reuses the same stored auth as Step 
 ai-hist pair check --json --task "refactor auth middleware" --file src/auth/middleware.ts
 ```
 
-Wire it into your agent so it fires automatically:
+Install the MCP tool and advisory hooks from the project you want Pair scoped to:
 
-### MCP tool (`pair_check`)
-
-The `ai-hist-mcp` server exposes a `pair_check` tool that shells to `ai-hist pair check
---json`. Add the server to your MCP client config; the agent can then call `pair_check`
-before risky steps. Set `AI_HIST_PAIR_CHECK_BIN=/path/to/ai-hist` if `ai-hist` isn't on
-`PATH`.
-
-### Claude Code / Codex hook (automatic)
-
-Add a `PreToolUse` / `UserPromptSubmit` hook that runs the example script. It returns
-`hookSpecificOutput.additionalContext` only — **advisory, never blocks**:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|Bash",
-        "hooks": [
-          { "type": "command",
-            "command": "node /absolute/path/to/relayhistory/examples/hooks/pair-check-hook.mjs",
-            "timeout": 10 }
-        ]
-      }
-    ]
-  }
-}
+```bash
+npx -y ai-hist-mcp setup
 ```
 
-(Codex uses the same command in `.codex/hooks.json`; run `/hooks` to trust it.)
+The installer writes `.mcp.json`, `.claude/settings.json`, and `.codex/hooks.json`
+idempotently. It scopes Pair to the current project and writes no tokens or secrets to
+config. After it runs, restart your agent session, then ask your agent to use the
+`pair_check` MCP tool before risky edits.
 
 > Full Pair setup (Codex config, MCP details, request/response contract):
 > [`pair-hooks.md`](pair-hooks.md).

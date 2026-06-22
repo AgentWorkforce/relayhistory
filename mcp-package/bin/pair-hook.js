@@ -129,7 +129,7 @@ try {
   }
 } catch (err) {
   if (process.env.PAIR_CHECK_DEBUG) {
-    process.stderr.write(`pair-check-hook skipped: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`pair hook skipped: ${err instanceof Error ? err.message : String(err)}\n`);
   }
   process.exit(0);
 }

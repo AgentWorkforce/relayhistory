@@ -53,7 +53,7 @@ existing captured history is what `push` sends. If you have nothing captured yet
 
 ---
 
-## DEV — usable right now (no RelayAuth token needed)
+## DEV — team/internal admin mint
 
 Dev allows `admin-mint` (it's fail-closed only in prod). Two commands:
 
@@ -76,28 +76,24 @@ RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" \
 
 ---
 
-## PROD — once you issue a RelayAuth token
+## PROD — Agent Relay Cloud login
 
-Prod returns **404** on `admin-mint` by design, so prod uses the RelayAuth login path:
+Prod auth goes through **Agent Relay Cloud**. End users should not mint tokens, call
+internal auth services, or handle internal API keys.
 
 ```bash
-# 1. issue a RelayAuth access JWT for audience "relayhistory" (your RelayAuth infra).
-#    NOTE: the param is expiresIn (seconds, integer) — not ttl.
-ACCESS_TOKEN=$(curl -sS -X POST https://api.relayauth.dev/v1/tokens \
-  -H "x-api-key: $RELAYAUTH_API_KEY" -H "content-type: application/json" \
-  -d '{"identityId":"<id>","workspaceId":"<ws>","audience":["relayhistory"],"expiresIn":3600}' \
-  | jq -r .accessToken)
+# 1. Sign in to Agent Relay Cloud. Cloud provisions the relayhistory session.
+npx agent-relay cloud login
 
-# 2. login + push
-RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
-  ai-hist login --base-url https://history.agentrelay.com --token "$ACCESS_TOKEN"
-
+# 2. Push with the stored prod relayhistory session.
 RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
   ai-hist push --json
 ```
 
-RelayAuth JWT must be RS256, issuer `https://relayauth.dev`, audience `relayhistory`, with
-mappable user/org/workspace claims.
+Current implementation note: older `ai-hist` builds may still expose a manual auth handoff.
+That handoff value is internal Cloud/relayhistory plumbing, not something a user should
+mint manually. If your build still requires it, ask your Agent Relay Cloud admin for the
+Cloud-provisioned handoff or wait for the first-class browser/device login flow.
 
 ---
 
@@ -115,8 +111,8 @@ mappable user/org/workspace claims.
   cron) is safe — duplicates dedupe server-side on the event PK + batch id. The cursor
   advances only after the server accepts the batch.
 - **Exclude sessions:** `ai-hist push --incognito <sessionId> --incognito <trajectoryId>`.
-- To switch targets, re-run `login`/`admin-mint` against the other `--base-url` (or just use
-  the per-target `RELAYHISTORY_HOME`).
+- To switch targets, use the per-target `RELAYHISTORY_HOME`; for prod, re-run Agent Relay
+  Cloud login if the stored session expires.
 
 ### Automation (cron / launchd)
 
@@ -134,10 +130,10 @@ mappable user/org/workspace claims.
 | Message | Fix |
 |---|---|
 | `ai-hist: command not found` / no `login`/`push` | rebuild from `main` (Step 0) — old binary is Python |
-| `not authenticated …` | run `login` (prod) or `admin-mint` (dev) first |
+| `not authenticated …` | run Agent Relay Cloud login (prod) or `admin-mint` (dev) first |
 | `Nothing new to push.` | `ai-hist sync` first, then push |
-| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — prod is login-only |
-| `HTTP 401` | token expired/invalid — re-auth |
+| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — use Agent Relay Cloud login |
+| `HTTP 401` | session expired/invalid — re-auth |
 | connection refused | wrong `--base-url`, or (local) `wrangler dev` not running |
 
 ---
