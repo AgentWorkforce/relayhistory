@@ -259,8 +259,14 @@ mod tests {
         let batch = build_outbox_batch(&conn, &SyncCursor::default(), 100, &none).unwrap();
         // decision + summary + learning = 3 events, all trajectory lens
         assert_eq!(batch.records.len(), 3);
-        assert!(batch.records.iter().all(|r| r.lens.as_deref() == Some("trajectories")));
-        assert!(batch.records.iter().any(|r| r.event_id == "decision:traj-1:0"));
+        assert!(batch
+            .records
+            .iter()
+            .all(|r| r.lens.as_deref() == Some("trajectories")));
+        assert!(batch
+            .records
+            .iter()
+            .any(|r| r.event_id == "decision:traj-1:0"));
         assert!(batch
             .records
             .iter()
