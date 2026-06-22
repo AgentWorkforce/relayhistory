@@ -6,7 +6,9 @@
   "private": false,
   "type": "module",
   "bin": {
-    "ai-hist-mcp": "bin/ai-hist-mcp.js"
+    "ai-hist-mcp": "bin/ai-hist-mcp.js",
+    "ai-hist-pair-setup": "bin/pair-setup.js",
+    "ai-hist-pair-hook": "bin/pair-hook.js"
   },
   "files": [
     "bin",

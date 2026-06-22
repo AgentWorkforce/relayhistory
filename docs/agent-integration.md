@@ -4,7 +4,7 @@
 
 This is the agent-facing counterpart to the human setup guide (`docs/cloud-sync.md`, `docs/pair-hooks.md`). It assumes the CLI is built and authenticated (see `docs/cloud-sync.md`).
 
-> **Secret hygiene (non-negotiable):** every command below reads secrets from env vars (`$ADMIN_MINT_SECRET`, etc.) — **never paste a real `rth_at_*` token, admin-mint secret, or `sponsorId` into a file, prompt, log, or PR.** The server scrubs content at ingest, but don't rely on it for credentials in commands.
+> **Secret hygiene (non-negotiable):** every command below reads secrets from env vars (`$ADMIN_MINT_SECRET`, etc.) — **never paste a real session token, admin-mint secret, or internal auth identifier into a file, prompt, log, or PR.** The server scrubs content at ingest, but don't rely on it for credentials in commands.
 
 ---
 
@@ -108,7 +108,7 @@ Empty result → `{"decision":"allow","warnings":[]}` → the hook no-ops cleanl
 
 ```bash
 # one-time: build + authenticate (see docs/cloud-sync.md)
-ai-hist login --base-url <url> --token "$ACCESS_TOKEN"      # prod (RelayAuth JWT)
+npx agent-relay cloud login                                # prod; hides auth/token plumbing
 ai-hist admin-mint --base-url <dev-url> --org <org> --user "$USER"   # dev only; reads $ADMIN_MINT_SECRET from env (never pass via --flag → argv/ps exposure)
 
 # every session

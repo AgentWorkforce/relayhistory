@@ -23,8 +23,37 @@ Set `AI_HIST_PAIR_CHECK_BIN=/path/to/ai-hist` if `ai-hist` is not on `PATH`.
 
 ## MCP Tool
 
-The `ai-hist-mcp` server exposes `pair_check`. It shells to `ai-hist pair check --json`
-and returns formatted warnings:
+Install the `pair_check` MCP tool and advisory hooks with one command from the project you
+want Pair scoped to:
+
+```bash
+npx -y ai-hist-mcp setup
+```
+
+The installer:
+
+- writes `.mcp.json` with an `ai-hist` MCP server;
+- writes Claude Code and Codex advisory hook config when requested;
+- scopes the MCP server to the current project path;
+- is safe to re-run (entries are merged, not duplicated);
+- writes no tokens or secrets to MCP/hook config.
+
+Options:
+
+```bash
+npx -y ai-hist-mcp setup --agents claude       # only Claude Code hooks
+npx -y ai-hist-mcp setup --agents codex        # only Codex hooks
+npx -y ai-hist-mcp setup --mcp-only            # only .mcp.json
+npx -y ai-hist-mcp setup --hooks-only          # only hooks
+npx -y ai-hist-mcp setup --project /path/to/repo
+npx -y ai-hist-mcp setup --dry-run
+```
+
+After install, restart your agent session, ask your client to list MCP tools (`/mcp` in
+Claude Code/Codex), and confirm `pair_check` is available.
+
+The `ai-hist-mcp` server shells to `ai-hist pair check --json` and returns formatted
+warnings:
 
 ```json
 {
@@ -43,11 +72,14 @@ and returns formatted warnings:
 `projectId` is optional. Local hooks should send `cwd` or `repoPath` when no canonical
 project id is known.
 
-## Claude Code Hooks
+## Advanced: Claude Code Hooks
 
 The example command hook supports `UserPromptSubmit` and `PreToolUse`. It returns
 `hookSpecificOutput.additionalContext` only, so Pair warnings are advisory and do not
 approve, deny, or block tool calls.
+
+The setup command above is the recommended path. The JSON below is only for auditing what
+the installer writes or for unusual client setups.
 
 `.claude/settings.json`:
 
@@ -59,7 +91,7 @@ approve, deny, or block tool calls.
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/ai-hist/examples/hooks/pair-check-hook.mjs",
+            "command": "npx -y ai-hist-mcp hook",
             "timeout": 10
           }
         ]
@@ -71,7 +103,7 @@ approve, deny, or block tool calls.
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/ai-hist/examples/hooks/pair-check-hook.mjs",
+            "command": "npx -y ai-hist-mcp hook",
             "timeout": 10
           }
         ]
@@ -81,7 +113,7 @@ approve, deny, or block tool calls.
 }
 ```
 
-## Codex Hooks
+## Advanced: Codex Hooks
 
 Codex discovers hooks in `.codex/hooks.json` or inline config. The same command works for
 Codex `UserPromptSubmit` and `PreToolUse`; Codex adds the returned
@@ -97,7 +129,7 @@ Codex `UserPromptSubmit` and `PreToolUse`; Codex adds the returned
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/ai-hist/examples/hooks/pair-check-hook.mjs",
+            "command": "npx -y ai-hist-mcp hook",
             "timeout": 10,
             "statusMessage": "Checking Pair warnings"
           }
@@ -110,7 +142,7 @@ Codex `UserPromptSubmit` and `PreToolUse`; Codex adds the returned
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/ai-hist/examples/hooks/pair-check-hook.mjs",
+            "command": "npx -y ai-hist-mcp hook",
             "timeout": 10,
             "statusMessage": "Checking Pair warnings"
           }
