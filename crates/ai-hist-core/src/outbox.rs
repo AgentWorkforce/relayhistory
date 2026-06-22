@@ -52,6 +52,11 @@ pub fn build_outbox_batch(
     incognito: &HashSet<String>,
 ) -> Result<OutboxBatch> {
     let limit = limit.max(1) as i64;
+    // The server caps an ingest batch at 1000 records. A single trajectory row — especially
+    // a compacted roll-up — expands to many convergence events (decisions + findings +
+    // reflections), so the batch must be bounded on EMITTED records, not rows scanned, or a
+    // handful of roll-ups blows past the cap and the push 400s.
+    const MAX_RECORDS: usize = 900;
     let mut records = Vec::new();
     let mut next = cursor.clone();
 
@@ -74,6 +79,11 @@ pub fn build_outbox_batch(
         })?;
         for row in rows {
             let entry = row?;
+            // Stop before consuming this row if the batch is full, so the cursor does not
+            // advance past an un-emitted row (the next batch resumes from here).
+            if records.len() >= MAX_RECORDS {
+                break;
+            }
             next.history_id = next.history_id.max(entry.id);
             // incognito: skip rows whose session is suppressed (still advances cursor)
             if let Some(sid) = &entry.session_id {
@@ -108,11 +118,11 @@ pub fn build_outbox_batch(
         })?;
         for row in raw {
             let t = row?;
-            next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
             if incognito.contains(&t.id) {
+                next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
                 continue;
             }
-            records.extend(map_trajectory(&TrajectoryRow {
+            let mapped = map_trajectory(&TrajectoryRow {
                 id: &t.id,
                 persona_id: t.persona_id.as_deref(),
                 project_id: t.project_id.as_deref(),
@@ -123,7 +133,15 @@ pub fn build_outbox_batch(
                 decisions_json: &t.decisions_json,
                 retrospective_json: &t.retrospective_json,
                 timestamp_ms: t.timestamp_ms,
-            }));
+            });
+            // A compacted roll-up expands to many events. If adding this row would exceed the
+            // batch cap and we already have records, defer it to the next batch — leave the
+            // cursor before it so nothing is skipped. (A lone row under the cap always fits.)
+            if !records.is_empty() && records.len() + mapped.len() > MAX_RECORDS {
+                break;
+            }
+            next.trajectory_rowid = next.trajectory_rowid.max(t.rowid);
+            records.extend(mapped);
         }
     }
 

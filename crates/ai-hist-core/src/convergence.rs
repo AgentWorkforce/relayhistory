@@ -219,7 +219,11 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
         .map(str::to_string);
     // Structured task fields sent top-level (typed server fields). The server folds
     // `Task: <taskTitle>` into `content` at ingest — the client must NOT pre-fold it.
-    let owned = |s: Option<&str>| s.map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
+    let owned = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+    };
     let task_title = owned(row.task_title);
     let task_description = owned(row.task_description);
     let task_status = owned(row.status);
@@ -228,6 +232,22 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
     let task_ref_json = row
         .task_ref
         .map(|tr| json!({ "system": tr.system, "id": tr.id }));
+
+    if let Ok(compacted) = serde_json::from_str::<Value>(row.retrospective_json) {
+        if is_compacted_rollup(&compacted) {
+            return map_compacted_trajectory(
+                traj_id,
+                &ts,
+                actor.as_deref(),
+                project_id.as_deref(),
+                task_title.as_deref(),
+                task_description.as_deref(),
+                task_status.as_deref(),
+                task_ref_json.as_ref(),
+                &compacted,
+            );
+        }
+    }
 
     let mut out = Vec::new();
 
@@ -349,6 +369,235 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
     out
 }
 
+fn is_compacted_rollup(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("compacted")
+        && v.get("sourceTrajectories")
+            .and_then(Value::as_array)
+            .is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compacted_event(
+    traj_id: &str,
+    ts: &str,
+    actor: Option<&str>,
+    project_id: Option<&str>,
+    task_title: Option<&str>,
+    task_description: Option<&str>,
+    task_status: Option<&str>,
+    task_ref: Option<&Value>,
+    kind: &str,
+    event_id: String,
+    content: String,
+    record: Option<Value>,
+) -> Option<ConvergenceEnvelope> {
+    let content = normalize_home_path(content.trim());
+    if content.is_empty() {
+        return None;
+    }
+    Some(ConvergenceEnvelope {
+        v: 1,
+        kind: kind.to_string(),
+        source: "trajectories".to_string(),
+        lens: Some("trajectories".to_string()),
+        session_id: traj_id.to_string(),
+        event_id,
+        ts: ts.to_string(),
+        event_type: kind.to_string(),
+        content,
+        significance: None,
+        confidence: None,
+        tags: vec!["compacted".to_string()],
+        actor_name: actor.map(str::to_string),
+        project_id: project_id.map(str::to_string),
+        task_title: task_title.map(str::to_string),
+        task_description: task_description.map(str::to_string),
+        task_status: task_status.map(str::to_string),
+        task_ref: task_ref.cloned(),
+        record,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_compacted_trajectory(
+    traj_id: &str,
+    ts: &str,
+    actor: Option<&str>,
+    project_id: Option<&str>,
+    task_title: Option<&str>,
+    task_description: Option<&str>,
+    task_status: Option<&str>,
+    task_ref: Option<&Value>,
+    compacted: &Value,
+) -> Vec<ConvergenceEnvelope> {
+    let mut out = Vec::new();
+    let mut push = |kind: &str, event_id: String, content: String, record: Option<Value>| {
+        if let Some(event) = compacted_event(
+            traj_id,
+            ts,
+            actor,
+            project_id,
+            task_title,
+            task_description,
+            task_status,
+            task_ref,
+            kind,
+            event_id,
+            content,
+            record,
+        ) {
+            out.push(event);
+        }
+    };
+
+    if let Some(decisions) = compacted.get("decisions").and_then(Value::as_array) {
+        for (i, decision) in decisions.iter().enumerate() {
+            push(
+                "decision",
+                format!("decision:{traj_id}:{i}"),
+                compacted_decision_content(decision),
+                compacted_decision_record(decision),
+            );
+        }
+    }
+
+    for (i, lesson) in compacted_object_array(compacted, "lessons")
+        .into_iter()
+        .enumerate()
+    {
+        push(
+            KIND_REFLECTION,
+            format!("{KIND_REFLECTION}:{traj_id}:lesson:{i}"),
+            labeled_fields(
+                &lesson,
+                &[
+                    ("Context", "context"),
+                    ("Lesson", "lesson"),
+                    ("Recommendation", "recommendation"),
+                ],
+            ),
+            None,
+        );
+    }
+
+    for (i, text) in string_array(compacted, "keyFindings")
+        .into_iter()
+        .enumerate()
+    {
+        push(
+            KIND_FINDING,
+            format!("{KIND_FINDING}:{traj_id}:keyfinding:{i}"),
+            text,
+            None,
+        );
+    }
+
+    for (i, text) in string_array(compacted, "keyLearnings")
+        .into_iter()
+        .enumerate()
+    {
+        push(
+            KIND_FINDING,
+            format!("{KIND_FINDING}:{traj_id}:learning:{i}"),
+            text,
+            None,
+        );
+    }
+
+    for (i, convention) in compacted_object_array(compacted, "conventions")
+        .into_iter()
+        .enumerate()
+    {
+        push(
+            KIND_REFLECTION,
+            format!("{KIND_REFLECTION}:{traj_id}:convention:{i}"),
+            labeled_fields(
+                &convention,
+                &[
+                    ("Pattern", "pattern"),
+                    ("Rationale", "rationale"),
+                    ("Scope", "scope"),
+                ],
+            ),
+            None,
+        );
+    }
+
+    if let Some(narrative) = string_field(compacted, "narrative") {
+        push(
+            KIND_REFLECTION,
+            format!("{KIND_REFLECTION}:{traj_id}:summary"),
+            narrative,
+            None,
+        );
+    }
+
+    for (i, text) in string_array(compacted, "openQuestions")
+        .into_iter()
+        .enumerate()
+    {
+        push(
+            KIND_FINDING,
+            format!("{KIND_FINDING}:{traj_id}:openquestion:{i}"),
+            text,
+            None,
+        );
+    }
+
+    out
+}
+
+fn compacted_object_array(v: &Value, key: &str) -> Vec<Value> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.is_object())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn compacted_decision_content(d: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(q) = string_field(d, "question") {
+        parts.push(format!("Question: {q}"));
+    }
+    if let Some(c) = string_field(d, "chosen") {
+        parts.push(format!("Chose: {c}"));
+    }
+    if let Some(r) = string_field(d, "reasoning") {
+        parts.push(format!("Because: {r}"));
+    }
+    if let Some(impact) = string_field(d, "impact") {
+        parts.push(format!("Impact: {impact}"));
+    }
+    normalize_home_path(parts.join("\n").trim())
+}
+
+fn compacted_decision_record(d: &Value) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    for key in ["chosen", "impact"] {
+        if let Some(value) = string_field(d, key) {
+            map.insert(key.to_string(), json!(normalize_home_path(&value)));
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
+fn labeled_fields(v: &Value, fields: &[(&str, &str)]) -> String {
+    fields
+        .iter()
+        .filter_map(|(label, key)| string_field(v, key).map(|value| format!("{label}: {value}")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// (6) Build a decision's readable embedding text from question/chosen/reasoning/alternatives.
 fn decision_content(d: &Value) -> String {
     let mut parts = Vec::new();
@@ -463,10 +712,7 @@ pub fn normalize_home_path(s: &str) -> String {
             let plen = prefix.len();
             let after = i + plen;
             // username runs until the next '/' or end
-            let end = s[after..]
-                .find('/')
-                .map(|o| after + o)
-                .unwrap_or(s.len());
+            let end = s[after..].find('/').map(|o| after + o).unwrap_or(s.len());
             if end > after {
                 out.push_str(&s[i..after]); // keep "/Users/" original case
                 out.push('~');
@@ -477,10 +723,7 @@ pub fn normalize_home_path(s: &str) -> String {
         // Windows: C:\Users\<name>\
         if lower[i..].starts_with("\\users\\") {
             let after = i + "\\users\\".len();
-            let end = s[after..]
-                .find('\\')
-                .map(|o| after + o)
-                .unwrap_or(s.len());
+            let end = s[after..].find('\\').map(|o| after + o).unwrap_or(s.len());
             if end > after {
                 out.push_str(&s[i..after]);
                 out.push('~');
@@ -541,8 +784,14 @@ mod tests {
     fn iso_conversion_matches_known_epochs() {
         assert_eq!(epoch_ms_to_iso(0), "1970-01-01T00:00:00.000Z");
         // 2026-06-21T10:00:00.000Z = 1_782_036_000_000 ms
-        assert_eq!(epoch_ms_to_iso(1_782_036_000_000), "2026-06-21T10:00:00.000Z");
-        assert_eq!(epoch_ms_to_iso(1_782_036_000_123), "2026-06-21T10:00:00.123Z");
+        assert_eq!(
+            epoch_ms_to_iso(1_782_036_000_000),
+            "2026-06-21T10:00:00.000Z"
+        );
+        assert_eq!(
+            epoch_ms_to_iso(1_782_036_000_123),
+            "2026-06-21T10:00:00.123Z"
+        );
     }
 
     #[test]
@@ -551,10 +800,7 @@ mod tests {
             normalize_home_path("/Users/khaliqgant/Projects/burn/file.ts"),
             "/Users/~/Projects/burn/file.ts"
         );
-        assert_eq!(
-            normalize_home_path("/home/alice/repo"),
-            "/home/~/repo"
-        );
+        assert_eq!(normalize_home_path("/home/alice/repo"), "/home/~/repo");
         assert_eq!(
             normalize_home_path(r"C:\Users\alice\repo\file.ts"),
             r"C:\Users\~\repo\file.ts"
@@ -565,7 +811,10 @@ mod tests {
             "see /Users/~/a and /home/~/b"
         );
         // no home path → unchanged
-        assert_eq!(normalize_home_path("github.com/org/repo"), "github.com/org/repo");
+        assert_eq!(
+            normalize_home_path("github.com/org/repo"),
+            "github.com/org/repo"
+        );
     }
 
     fn traj(decisions: &str, retro: &str) -> Vec<ConvergenceEnvelope> {
@@ -636,7 +885,9 @@ mod tests {
         });
         // C: trajectory rows use canonical plural source + non-PK lens facet
         assert!(events.iter().all(|e| e.source == "trajectories"));
-        assert!(events.iter().all(|e| e.lens.as_deref() == Some("trajectories")));
+        assert!(events
+            .iter()
+            .all(|e| e.lens.as_deref() == Some("trajectories")));
         // B: structured task fields sent top-level; content is NOT pre-prefixed
         // (the server folds `Task: <title>` at ingest — client must not double it).
         assert!(events.iter().all(|e| !e.content.starts_with("Task:")));
@@ -714,8 +965,91 @@ mod tests {
     }
 
     #[test]
+    fn maps_compacted_rollup_acceptance_fixture() {
+        let compacted = r#"{
+            "id":"compact_fixture",
+            "type":"compacted",
+            "version":1,
+            "sourceTrajectories":["traj_a","traj_b"],
+            "compactedAt":"2026-06-21T10:00:00.000Z",
+            "decisions":[
+                {"question":"Which store?","chosen":"Neon","reasoning":"Needs pgvector","impact":"Pair can rank prior work"},
+                {"question":"How to auth?","chosen":"Server-derived org","reasoning":"Avoid client tenancy claims","impact":"Tenant boundary is enforceable"}
+            ],
+            "lessons":[
+                {"context":"Deploys","lesson":"Secrets can appear in run notes","recommendation":"Scrub ghp_FAKE0000000000000000000000000000abcd before surfacing snippets"},
+                {"context":"Pair ranking","lesson":"Suggestions are actionable","recommendation":"Surface recommendations ahead of comparable findings"}
+            ],
+            "keyFindings":["Kind belongs in the primary key","Prompt events should not warn"],
+            "keyLearnings":["Use ts_rank_cd normalization"],
+            "conventions":[
+                {"pattern":"Use server-derived tenancy","rationale":"Files are untrusted input","scope":"all cloud sync"}
+            ],
+            "narrative":"Compacted roll-up captured durable Pair guidance.",
+            "openQuestions":["Should chapter streams become v1.2?"],
+            "decisionGroups":[{"category":"storage","decisions":[0]}]
+        }"#;
+        let events = map_trajectory(&TrajectoryRow {
+            id: "compact_fixture",
+            persona_id: None,
+            project_id: Some("relayhistory"),
+            task_title: None,
+            task_description: None,
+            status: None,
+            task_ref: None,
+            decisions_json: "[]",
+            retrospective_json: compacted,
+            timestamp_ms: 1_782_036_000_000,
+        });
+
+        let got: Vec<(&str, &str)> = events
+            .iter()
+            .map(|e| (e.event_id.as_str(), e.kind.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("decision:compact_fixture:0", "decision"),
+                ("decision:compact_fixture:1", "decision"),
+                ("reflection:compact_fixture:lesson:0", "reflection"),
+                ("reflection:compact_fixture:lesson:1", "reflection"),
+                ("finding:compact_fixture:keyfinding:0", "finding"),
+                ("finding:compact_fixture:keyfinding:1", "finding"),
+                ("finding:compact_fixture:learning:0", "finding"),
+                ("reflection:compact_fixture:convention:0", "reflection"),
+                ("reflection:compact_fixture:summary", "reflection"),
+                ("finding:compact_fixture:openquestion:0", "finding"),
+            ]
+        );
+        assert!(events.iter().all(|e| e.source == "trajectories"));
+        assert!(events
+            .iter()
+            .all(|e| e.lens.as_deref() == Some("trajectories")));
+        assert!(events.iter().all(|e| e.tags == vec!["compacted"]));
+        assert!(events.iter().all(|e| e.confidence.is_none()));
+        assert!(events
+            .iter()
+            .all(|e| e.project_id.as_deref() == Some("relayhistory")));
+        assert!(events.iter().all(|e| e.task_title.is_none()));
+        assert!(events.iter().all(|e| e.record.as_ref().map_or(true, |r| {
+            r.get("sourceTrajectories").is_none() && r.get("raw").is_none()
+        })));
+        assert!(events[0]
+            .content
+            .contains("Impact: Pair can rank prior work"));
+        assert!(events[2].content.contains("Recommendation: Scrub ghp_FAKE"));
+        assert!(events[7]
+            .content
+            .contains("Pattern: Use server-derived tenancy"));
+        assert!(!events.iter().any(|e| e.event_id.contains("decisionGroups")));
+    }
+
+    #[test]
     fn empty_arrays_emit_zero_events() {
-        let events = traj("[]", r#"{"learnings":[],"suggestions":[],"confidence":1.0}"#);
+        let events = traj(
+            "[]",
+            r#"{"learnings":[],"suggestions":[],"confidence":1.0}"#,
+        );
         assert!(events.is_empty());
     }
 

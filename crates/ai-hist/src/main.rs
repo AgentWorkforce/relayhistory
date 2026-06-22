@@ -1,9 +1,9 @@
+use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, parse_cursor_text,
     prompt_hash, recent, resume_command, search, session, sync_opencode_db, untag_session,
     HistoryEntry, QueryFilter, SOURCE_CHOICES,
 };
-use ai_hist_core::convergence::MachineIdentity;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
@@ -553,7 +553,9 @@ fn main() -> Result<()> {
                 let auth = cloud::load_auth()?.context(
                     "not authenticated — run `ai-hist login` or `ai-hist admin-mint` first",
                 )?;
-                let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string());
                 let ctx = cloud::PairContext {
                     project_id,
                     repo_path: cwd.clone(),
@@ -2135,24 +2137,9 @@ fn trajectory_files() -> Result<Vec<PathBuf>> {
         if !root.exists() {
             continue;
         }
-        let search_root = if root.file_name().and_then(|s| s.to_str()) == Some("compacted") {
-            root.parent().unwrap_or(&root).to_path_buf()
-        } else {
-            root
-        };
-        let mut compacted = Vec::new();
-        collect_named_dirs(&search_root, "compacted", &mut compacted)?;
-        for dir in compacted {
-            for entry in fs::read_dir(dir)? {
-                let path = entry?.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && path.file_name().and_then(|s| s.to_str()) != Some("index.json")
-                    && path.file_name().and_then(|s| s.to_str()) != Some(".sync-state.json")
-                {
-                    files.push(path);
-                }
-            }
-        }
+        // Recursively collect every trajectory JSON under the `.trajectories` root.
+        // The parser decides whether each file is a per-run trajectory or compacted roll-up.
+        collect_trajectory_json(&root, &mut files)?;
     }
     files.sort();
     files.dedup();
@@ -2175,6 +2162,28 @@ fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result
     Ok(())
 }
 
+/// Recursively collect trajectory JSON under a `.trajectories` root: `completed/<month>/`
+/// individual runs, `compacted/` roll-ups, `active/`. Skips index/state/trace sidecars;
+/// `parse_trajectory_file` decides per-file what's mappable.
+fn collect_trajectory_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_trajectory_json(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name != "index.json" && name != ".sync-state.json" && !name.ends_with(".trace.json")
+            {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_trajectory_file(path: &Path) -> Result<Option<TrajectoryRow>> {
     let obj: Value = match serde_json::from_str(&fs::read_to_string(path)?) {
         Ok(value) => value,
@@ -2190,17 +2199,11 @@ fn parse_trajectory_file(path: &Path) -> Result<Option<TrajectoryRow>> {
     else {
         return Ok(None);
     };
-    if map.get("type").and_then(Value::as_str) == Some("compacted")
+    let is_compacted = map.get("type").and_then(Value::as_str) == Some("compacted")
         && map
             .get("sourceTrajectories")
             .and_then(Value::as_array)
-            .is_some()
-        && !["task", "retrospective", "personaId", "projectId"]
-            .iter()
-            .any(|key| map.contains_key(*key))
-    {
-        return Ok(None);
-    }
+            .is_some();
     let task = map.get("task").and_then(Value::as_object);
     let retrospective = map.get("retrospective").and_then(Value::as_object);
     let decisions = map
@@ -2252,7 +2255,11 @@ fn parse_trajectory_file(path: &Path) -> Result<Option<TrajectoryRow>> {
             .and_then(Value::as_str)
             .map(str::to_string),
         decisions_json: serde_json::to_string(&decisions)?,
-        retrospective_json: serde_json::to_string(retrospective.unwrap_or(&Map::new()))?,
+        retrospective_json: if is_compacted {
+            serde_json::to_string(map)?
+        } else {
+            serde_json::to_string(retrospective.unwrap_or(&Map::new()))?
+        },
         search_text,
         path: path.to_string_lossy().to_string(),
         updated_ms,
@@ -2293,6 +2300,27 @@ fn trajectory_search_text(map: &Map<String, Value>) -> String {
         if let Some(items) = retro.get("learnings").and_then(Value::as_array) {
             for item in items {
                 push_text(&mut parts, Some(item));
+            }
+        }
+    }
+    if map.get("type").and_then(Value::as_str) == Some("compacted") {
+        push_text(&mut parts, map.get("narrative"));
+        for key in ["keyFindings", "keyLearnings", "openQuestions"] {
+            if let Some(items) = map.get(key).and_then(Value::as_array) {
+                for item in items {
+                    push_text(&mut parts, Some(item));
+                }
+            }
+        }
+        for key in ["lessons", "conventions"] {
+            if let Some(items) = map.get(key).and_then(Value::as_array) {
+                for item in items {
+                    if let Some(item) = item.as_object() {
+                        for value in item.values() {
+                            push_text(&mut parts, Some(value));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2591,7 +2619,8 @@ fn home_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_url_credentials;
+    use super::{parse_trajectory_file, strip_url_credentials};
+    use std::fs;
 
     #[test]
     fn strips_embedded_token_from_https_remote() {
@@ -2640,5 +2669,34 @@ mod tests {
             strip_url_credentials("git@github.com:org/repo.git"),
             "git@github.com:org/repo.git"
         );
+    }
+
+    #[test]
+    fn parses_compacted_rollup_instead_of_skipping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact_fixture.json");
+        fs::write(
+            &path,
+            r#"{
+                "id":"compact_fixture",
+                "type":"compacted",
+                "version":1,
+                "sourceTrajectories":["traj_a"],
+                "compactedAt":"2026-06-21T10:00:00.000Z",
+                "decisions":[{"question":"Which DB?","chosen":"Neon","reasoning":"pgvector","impact":"rank Pair warnings"}],
+                "lessons":[{"context":"Deploy","lesson":"Scrub snippets","recommendation":"Redact ghp_FAKE0000000000000000000000000000abcd"}],
+                "keyFindings":["kind in PK"],
+                "narrative":"Compacted roll-up captured durable guidance."
+            }"#,
+        )
+        .unwrap();
+
+        let row = parse_trajectory_file(&path).unwrap().unwrap();
+        assert_eq!(row.id, "compact_fixture");
+        assert_eq!(row.version, Some(1));
+        assert!(row.retrospective_json.contains(r#""type":"compacted""#));
+        assert!(row.search_text.contains("kind in PK"));
+        assert!(row.search_text.contains("Redact ghp_FAKE"));
+        assert_eq!(row.timestamp_ms, 1_782_036_000_000);
     }
 }
