@@ -53,9 +53,10 @@ existing captured history is what `push` sends. If you have nothing captured yet
 
 ---
 
-## DEV — team/internal admin mint
+## DEV — team-internal admin mint
 
-Dev allows `admin-mint` (it's fail-closed only in prod). Two commands:
+Dev allows `admin-mint` for maintainers and internal test environments only. It requires
+an admin secret and is **not** an end-user auth path. Two commands:
 
 ```bash
 # load the dev admin secret from the secure local file (never echo it)
@@ -130,9 +131,9 @@ Cloud-provisioned handoff or wait for the first-class browser/device login flow.
 | Message | Fix |
 |---|---|
 | `ai-hist: command not found` / no `login`/`push` | rebuild from `main` (Step 0) — old binary is Python |
-| `not authenticated …` | run Agent Relay Cloud login (prod) or `admin-mint` (dev) first |
+| `not authenticated …` | run Agent Relay Cloud login (prod) or team-internal `admin-mint` (dev) first |
 | `Nothing new to push.` | `ai-hist sync` first, then push |
-| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — use Agent Relay Cloud login |
+| `HTTP 404 admin mint disabled` | you hit prod with `admin-mint` — use Agent Relay Cloud login for prod |
 | `HTTP 401` | session expired/invalid — re-auth |
 | connection refused | wrong `--base-url`, or (local) `wrangler dev` not running |
 

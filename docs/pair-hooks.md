@@ -12,7 +12,9 @@ Pair hook and MCP wrappers shell out to the Rust CLI primitive:
 ai-hist pair check --json --task "refactor auth middleware" --file src/auth/middleware.ts
 ```
 
-That primitive owns relayhistory-cloud auth and reads the same auth file as cloud sync:
+That primitive owns relayhistory-cloud auth and reads the same auth file as cloud sync.
+For production users, auth should come from Agent Relay Cloud login; `admin-mint` is
+dev/team-internal only and requires an admin secret:
 
 ```bash
 RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" ai-hist admin-mint ...
