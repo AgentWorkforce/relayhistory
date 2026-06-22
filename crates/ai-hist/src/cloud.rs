@@ -281,6 +281,118 @@ fn map_http_err(e: ureq::Error) -> anyhow::Error {
     }
 }
 
+// ----- WS-6 Pair: in-session warning check (client of POST /v1/pair/check) -----
+
+/// Minimal current-session context sent to `/v1/pair/check`. **Never** file contents or
+/// full prompt bodies — only paths + caller-provided summaries (egress-minimal).
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct PairContext {
+    #[serde(rename = "projectId", skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(rename = "repoPath", skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(rename = "gitRemote", skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(rename = "recentPrompt", skip_serializing_if = "Option::is_none")]
+    pub recent_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PairRequest<'a> {
+    context: &'a PairContext,
+    limit: usize,
+}
+
+/// One cited convergence event backing a warning (full composite identity; eventId isn't
+/// unique alone). `snippet` is server-scrubbed + length-capped — never the raw `record`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairEvidence {
+    #[serde(rename = "machineId", default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(rename = "sessionId", default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(rename = "eventId", default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub ts: Option<String>,
+    #[serde(default)]
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairWarning {
+    pub text: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub lens: Option<String>,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub evidence: Vec<PairEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairResponse {
+    /// `"warn"` iff warnings present; `"allow"` otherwise. v1 is advisory — never blocks.
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<PairWarning>,
+    #[serde(rename = "correlationId", default)]
+    pub correlation_id: Option<String>,
+}
+
+/// `POST /v1/pair/check` with the stored `rth_at_` bearer. Returns ranked advisory warnings.
+pub fn pair_check(auth: &StoredAuth, context: &PairContext, limit: usize) -> Result<PairResponse> {
+    let url = format!("{}/v1/pair/check", auth.base_url.trim_end_matches('/'));
+    let req = PairRequest { context, limit };
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {}", auth.access_token))
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(req)?);
+    match resp {
+        Ok(r) => Ok(r.into_json::<PairResponse>()?),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            anyhow::bail!("pair check failed: HTTP {code}: {body}")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Human-readable rendering of Pair warnings (the non-`--json` output).
+pub fn format_pair_warnings(resp: &PairResponse) -> String {
+    if resp.warnings.is_empty() {
+        return "No Pair warnings for this context.".to_string();
+    }
+    let mut out = format!("⚠️  {} Pair warning(s) [advisory]:\n", resp.warnings.len());
+    for (i, w) in resp.warnings.iter().enumerate() {
+        let kind = w.kind.as_deref().unwrap_or("?");
+        let score = w.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
+        out.push_str(&format!("{}. [{kind}{score}] {}\n", i + 1, w.text));
+        if let Some(ev) = w.evidence.first() {
+            let id = ev.event_id.as_deref().unwrap_or("?");
+            out.push_str(&format!("   ↳ {id}\n"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +558,69 @@ mod tests {
             assert_eq!(a, b);
             assert!(a.starts_with("m_"));
         });
+    }
+
+    #[test]
+    fn pair_request_serializes_camelcase_and_omits_empties() {
+        let ctx = PairContext {
+            project_id: Some("proj-auth-svc".into()),
+            repo_path: Some("/Users/~/Projects/x".into()),
+            cwd: None,
+            git_remote: None,
+            task: Some("refactor auth middleware".into()),
+            files: vec!["src/auth/mw.ts".into()],
+            tool: Some("Edit".into()),
+            target: None,
+            recent_prompt: None,
+        };
+        let v = serde_json::to_value(PairRequest {
+            context: &ctx,
+            limit: 5,
+        })
+        .unwrap();
+        let c = &v["context"];
+        assert_eq!(c["projectId"], "proj-auth-svc");
+        assert_eq!(c["repoPath"], "/Users/~/Projects/x");
+        assert_eq!(c["task"], "refactor auth middleware");
+        assert_eq!(c["files"][0], "src/auth/mw.ts");
+        assert_eq!(c["tool"], "Edit");
+        assert_eq!(v["limit"], 5);
+        // None/empty fields must be absent on the wire, not null.
+        assert!(c.get("cwd").is_none());
+        assert!(c.get("gitRemote").is_none());
+        assert!(c.get("target").is_none());
+        assert!(c.get("recentPrompt").is_none());
+    }
+
+    #[test]
+    fn pair_response_parses_warn_with_evidence() {
+        let resp: PairResponse = serde_json::from_str(
+            r#"{"decision":"warn","correlationId":"c_1","warnings":[
+                {"text":"prior auth refactor broke token refresh","kind":"reflection",
+                 "lens":"trajectories","score":0.87,
+                 "evidence":[{"machineId":"m_x","source":"trajectories","sessionId":"s1",
+                   "kind":"reflection","eventId":"reflection:tA:suggestion:0","ts":"2026-06-01T00:00:00Z",
+                   "snippet":"update permissions when editing mw"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.decision.as_deref(), Some("warn"));
+        assert_eq!(resp.warnings.len(), 1);
+        let w = &resp.warnings[0];
+        assert_eq!(w.evidence[0].event_id.as_deref(), Some("reflection:tA:suggestion:0"));
+        let rendered = format_pair_warnings(&resp);
+        assert!(rendered.contains("Pair warning(s)"));
+        assert!(rendered.contains("reflection:tA:suggestion:0"));
+    }
+
+    #[test]
+    fn pair_response_parses_empty_allow_and_renders_noop() {
+        let resp: PairResponse =
+            serde_json::from_str(r#"{"decision":"allow","warnings":[]}"#).unwrap();
+        assert_eq!(resp.decision.as_deref(), Some("allow"));
+        assert!(resp.warnings.is_empty());
+        assert_eq!(
+            format_pair_warnings(&resp),
+            "No Pair warnings for this context."
+        );
     }
 }
