@@ -386,6 +386,9 @@ fn compacted_event(
     task_description: Option<&str>,
     task_status: Option<&str>,
     task_ref: Option<&Value>,
+    source: &str,
+    lens: &str,
+    tags: &[String],
     kind: &str,
     event_id: String,
     content: String,
@@ -398,8 +401,8 @@ fn compacted_event(
     Some(ConvergenceEnvelope {
         v: 1,
         kind: kind.to_string(),
-        source: "trajectories".to_string(),
-        lens: Some("trajectories".to_string()),
+        source: source.to_string(),
+        lens: Some(lens.to_string()),
         session_id: traj_id.to_string(),
         event_id,
         ts: ts.to_string(),
@@ -407,7 +410,7 @@ fn compacted_event(
         content,
         significance: None,
         confidence: None,
-        tags: vec!["compacted".to_string()],
+        tags: tags.to_vec(),
         actor_name: actor.map(str::to_string),
         project_id: project_id.map(str::to_string),
         task_title: task_title.map(str::to_string),
@@ -431,6 +434,18 @@ fn map_compacted_trajectory(
     compacted: &Value,
 ) -> Vec<ConvergenceEnvelope> {
     let mut out = Vec::new();
+    let source = compacted
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("trajectories");
+    let lens = compacted
+        .get("lens")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(source);
+    let tags = compacted_tags(compacted);
+    let is_learn = tags.iter().any(|tag| tag == "learn");
     let mut push = |kind: &str, event_id: String, content: String, record: Option<Value>| {
         if let Some(event) = compacted_event(
             traj_id,
@@ -441,6 +456,9 @@ fn map_compacted_trajectory(
             task_description,
             task_status,
             task_ref,
+            source,
+            lens,
+            &tags,
             kind,
             event_id,
             content,
@@ -523,13 +541,15 @@ fn map_compacted_trajectory(
         );
     }
 
-    if let Some(narrative) = string_field(compacted, "narrative") {
-        push(
-            KIND_REFLECTION,
-            format!("{KIND_REFLECTION}:{traj_id}:summary"),
-            narrative,
-            None,
-        );
+    if !is_learn {
+        if let Some(narrative) = string_field(compacted, "narrative") {
+            push(
+                KIND_REFLECTION,
+                format!("{KIND_REFLECTION}:{traj_id}:summary"),
+                narrative,
+                None,
+            );
+        }
     }
 
     for (i, text) in string_array(compacted, "openQuestions")
@@ -545,6 +565,27 @@ fn map_compacted_trajectory(
     }
 
     out
+}
+
+fn compacted_tags(compacted: &Value) -> Vec<String> {
+    let tags = compacted
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if tags.is_empty() {
+        vec!["compacted".to_string()]
+    } else {
+        tags
+    }
 }
 
 fn compacted_object_array(v: &Value, key: &str) -> Vec<Value> {
@@ -856,7 +897,7 @@ mod tests {
         assert_eq!(events[2].kind, "finding"); // learning
         assert_eq!(events[4].kind, "reflection"); // suggestion
         assert_eq!(events[5].kind, "finding"); // challenge
-        // learning[0] and suggestion[0] do NOT collide (the bug we fixed)
+                                               // learning[0] and suggestion[0] do NOT collide (the bug we fixed)
         assert_ne!(ids[2], ids[4]);
         // summary/approach carry retro confidence; individual items emit null (not dropped)
         assert_eq!(events[0].confidence, Some(0.8));

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod cloud;
+mod learn;
 
 #[derive(Parser)]
 #[command(
@@ -207,6 +208,11 @@ enum Command {
         #[command(subcommand)]
         action: PairAction,
     },
+    /// Learn (Agent Relay Loop) — distill ordinary session history into Pair signal.
+    Learn {
+        #[command(subcommand)]
+        action: LearnAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +239,45 @@ enum PairAction {
         project_id: Option<String>,
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LearnAction {
+    /// Distill local session history into decision/finding/reflection events.
+    Distill {
+        /// Only distill sessions from this source (claude, codex, cursor, relay, opencode).
+        #[arg(long)]
+        source: Option<String>,
+        /// Distill one session id.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Maximum sessions to distill.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Maximum transcript characters sent to the local/opt-in distiller per session.
+        #[arg(long, default_value_t = 24_000)]
+        max_chars: usize,
+        /// Approximate output-token budget for the distiller.
+        #[arg(long, default_value_t = 2_000)]
+        max_output_tokens: usize,
+        /// Provider: auto, openai, or anthropic.
+        #[arg(long, default_value = "auto")]
+        provider: String,
+        /// Model override.
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider base URL override. Use a local endpoint by default, e.g. Ollama.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Explicit opt-in for cloud LLM distillation over pre-scrub full transcripts.
+        #[arg(long)]
+        allow_cloud_llm: bool,
+        /// Run distillation and report output without writing local trajectory rows.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -572,6 +617,69 @@ fn main() -> Result<()> {
                     println!("{}", serde_json::to_string(&resp)?);
                 } else {
                     print!("{}", cloud::format_pair_warnings(&resp));
+                }
+                Ok(())
+            }
+        },
+        Command::Learn { action } => match action {
+            LearnAction::Distill {
+                source,
+                session_id,
+                limit,
+                max_chars,
+                max_output_tokens,
+                provider,
+                model,
+                base_url,
+                allow_cloud_llm,
+                dry_run,
+                json,
+            } => {
+                validate_source(source.as_deref())?;
+                let provider = learn::provider_from_str(&provider)?;
+                let report = learn::distill_sessions(
+                    &conn,
+                    &learn::LearnDistillOptions {
+                        source,
+                        session_id,
+                        limit,
+                        max_chars,
+                        max_output_tokens,
+                        provider,
+                        model,
+                        base_url,
+                        allow_cloud_llm,
+                        dry_run,
+                    },
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "scanned": report.scanned,
+                            "distilled": report.distilled,
+                            "skipped": report.skipped,
+                            "rows": report.rows.iter().map(|row| serde_json::json!({
+                                "id": row.id,
+                                "source": row.source,
+                                "sessionId": row.session_id,
+                                "eventsEstimate": row.events_estimate,
+                                "dryRun": row.dry_run,
+                            })).collect::<Vec<_>>(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "Learn-distilled {} session(s) ({} scanned, {} skipped).",
+                        report.distilled, report.scanned, report.skipped
+                    );
+                    for row in report.rows {
+                        let action = if row.dry_run { "would write" } else { "wrote" };
+                        println!(
+                            "  {action} {} from {}:{} ({} event(s) estimated)",
+                            row.id, row.source, row.session_id, row.events_estimate
+                        );
+                    }
                 }
                 Ok(())
             }

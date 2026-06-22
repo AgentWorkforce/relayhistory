@@ -114,7 +114,10 @@ pub fn machine_id() -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let id = format!("m_{}", ai_hist_core::prompt_hash(&format!("{host}:{nanos}")));
+    let id = format!(
+        "m_{}",
+        ai_hist_core::prompt_hash(&format!("{host}:{nanos}"))
+    );
     write_private(&path, &id)?;
     Ok(id)
 }
@@ -241,7 +244,10 @@ pub fn admin_mint(
     Ok(StoredAuth {
         base_url: base_url.trim_end_matches('/').to_string(),
         access_token: field(&v, "accessToken")?,
-        refresh_token: v.get("refreshToken").and_then(|x| x.as_str()).map(String::from),
+        refresh_token: v
+            .get("refreshToken")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         org_id: Some(org_id.to_string()),
         workspace_id: workspace_id.map(String::from),
     })
@@ -258,9 +264,15 @@ pub fn login(base_url: &str, agent_relay_token: &str, label: &str) -> Result<Sto
     Ok(StoredAuth {
         base_url: base_url.trim_end_matches('/').to_string(),
         access_token: field(&v, "accessToken")?,
-        refresh_token: v.get("refreshToken").and_then(|x| x.as_str()).map(String::from),
+        refresh_token: v
+            .get("refreshToken")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         org_id: v.get("orgId").and_then(|x| x.as_str()).map(String::from),
-        workspace_id: v.get("workspaceId").and_then(|x| x.as_str()).map(String::from),
+        workspace_id: v
+            .get("workspaceId")
+            .and_then(|x| x.as_str())
+            .map(String::from),
     })
 }
 
@@ -606,7 +618,10 @@ mod tests {
         assert_eq!(resp.decision.as_deref(), Some("warn"));
         assert_eq!(resp.warnings.len(), 1);
         let w = &resp.warnings[0];
-        assert_eq!(w.evidence[0].event_id.as_deref(), Some("reflection:tA:suggestion:0"));
+        assert_eq!(
+            w.evidence[0].event_id.as_deref(),
+            Some("reflection:tA:suggestion:0")
+        );
         let rendered = format_pair_warnings(&resp);
         assert!(rendered.contains("Pair warning(s)"));
         assert!(rendered.contains("reflection:tA:suggestion:0"));
