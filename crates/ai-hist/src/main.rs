@@ -168,13 +168,28 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Authenticate to relayhistory-cloud (Agent Relay Loop) via a RelayAuth token.
+    /// Authenticate to relayhistory-cloud (Agent Relay Loop).
+    ///
+    /// Default (no flags) uses Agent Relay Cloud — you never handle a token. It shells to the
+    /// already-authenticated `agent-relay` CLI, which performs the server-to-server exchange and
+    /// returns only the relayhistory session. Legacy `--token` mode is for manual/dev use.
     Login {
+        /// Use Agent Relay Cloud (implied when no `--token` is given).
         #[arg(long)]
-        base_url: String,
-        /// RelayAuth/Agent Relay token (device-flow JWT).
+        cloud: bool,
+        /// Least-privilege ceiling: `read` (Pair-only) or `sync` (Learn/push). Cloud authorizes
+        /// the actual scope it grants. Cloud mode only.
+        #[arg(long, default_value = "sync")]
+        mode: String,
+        /// Optional workspace id for the Cloud session.
         #[arg(long)]
-        token: String,
+        workspace: Option<String>,
+        /// Legacy/manual: relayhistory-cloud base URL (required with `--token`).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
+        #[arg(long)]
+        token: Option<String>,
         #[arg(long, default_value = "ai-hist-cli")]
         label: String,
     },
@@ -507,13 +522,25 @@ fn main() -> Result<()> {
         }
         Command::Import { file, dry_run } => import_history(&conn, &file, dry_run),
         Command::Login {
+            cloud: use_cloud,
+            mode,
+            workspace,
             base_url,
             token,
             label,
         } => {
-            let auth = cloud::login(&base_url, &token, &label)?;
+            // Cloud is the default; legacy token mode only when a token is explicitly given.
+            let auth = if use_cloud || token.is_none() {
+                cloud::login_via_cloud(&mode, workspace.as_deref())?
+            } else {
+                let base_url = base_url.context(
+                    "--base-url is required with --token (legacy mode); omit both for Cloud login",
+                )?;
+                cloud::login(&base_url, &token.unwrap(), &label)?
+            };
             cloud::save_auth(&auth)?;
-            println!("Logged in to {} (token stored).", auth.base_url);
+            // Never print the session/token — only where it landed.
+            println!("Logged in to {} (session stored).", auth.base_url);
             Ok(())
         }
         Command::AdminMint {
