@@ -1,6 +1,6 @@
 {
   "name": "ai-hist-mcp",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Thin npx wrapper for the ai-hist stdio MCP server.",
   "license": "MIT",
   "private": false,
@@ -24,7 +24,7 @@
     "access": "public"
   },
   "dependencies": {
-    "ai-hist": "0.3.5"
+    "ai-hist": "0.3.6"
   },
   "engines": {
     "node": ">=18"
