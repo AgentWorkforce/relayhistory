@@ -108,6 +108,17 @@ def test_search_json_routes_to_rust_with_python_compatible_shape(tmp_path):
     }
 
 
+def test_search_tag_without_query_routes_to_rust(tmp_path):
+    env, _db = seed_via_wrapper(tmp_path)
+    tag = run_cli(["tag", "claude-dispatch", "relayfile-migration", "--source", "claude"], env)
+    assert tag.returncode == 0, tag.stderr
+    result = run_cli(["search", "--tag", "relayfile-migration", "--json"], env)
+    assert result.returncode == 0, result.stderr
+    assert "deprecated Python fallback" not in result.stderr
+    rows = json.loads(result.stdout)
+    assert [row["session_id"] for row in rows] == ["claude-dispatch"]
+
+
 def test_session_full_routes_to_rust(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
     result = run_cli(["session", "claude-dispatch", "--full"], env)

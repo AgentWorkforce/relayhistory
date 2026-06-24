@@ -30,7 +30,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export type Source = 'claude' | 'codex' | 'cursor' | 'relay' | 'trajectory' | 'opencode';
+export type Source = 'claude' | 'codex' | 'cursor' | 'grok' | 'relay' | 'trajectory' | 'opencode';
 
 export interface HistoryEntry {
   id: number;
@@ -251,7 +251,7 @@ export interface OpenOptions {
   projectScope?: string;
   /**
    * What to do when the SQLite DB is missing:
-   *   - `'jsonl'` (default): scan local Claude/Codex/Cursor history files
+   *   - `'jsonl'` (default): scan local Claude/Codex/Cursor/Grok history files
    *     directly into an in-memory SQLite — works without the Python
    *     `ai-hist sync` tool installed.
    *   - `'error'`: throw with an install hint (legacy 0.1.x behavior).
@@ -309,7 +309,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     );
   }
 
-  // Fallback: scan local source files (Claude/Codex/Cursor) directly.
+  // Fallback: scan local source files (Claude/Codex/Cursor/Grok) directly.
   // No Python dependency; uses the same parsers documented in the Python
   // CLI's source. Yields control to the event loop between sources so a
   // large local history doesn't freeze the host.
@@ -386,7 +386,7 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     insert.free();
     insertTrajectory.free();
   }
-  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}, ${trajectoryRootDescription()}`;
+  const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}, ${LOCAL_SOURCE_PATHS.grokSessionsRoot}, ${trajectoryRootDescription()}`;
   return new AiHist(db, { kind: 'jsonl', path: scannedPaths }, { projectScope: opts.projectScope });
 }
 
@@ -990,18 +990,19 @@ export class AiHist {
    * future consumer needs phrase/boolean queries.
    *
    * The query is matched literally — `%` and `_` are escaped so users can
-   * search for them. Empty queries return an empty array.
+   * search for them. Empty queries return recent entries matching the filters.
    */
   search(query: string, opts: SearchOptions = {}): HistoryEntry[] {
     const trimmed = query.trim();
-    if (!trimmed) return [];
     const limit = opts.limit ?? 50;
-    const escaped = trimmed.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const pattern = `%${escaped}%`;
-    const clauses: string[] = [
-      `(LOWER(prompt) LIKE LOWER(?) ESCAPE '\\' OR LOWER(COALESCE(project, '')) LIKE LOWER(?) ESCAPE '\\')`,
-    ];
-    const params: unknown[] = [pattern, pattern];
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (trimmed) {
+      const escaped = trimmed.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+      const pattern = `%${escaped}%`;
+      clauses.push(`(LOWER(prompt) LIKE LOWER(?) ESCAPE '\\' OR LOWER(COALESCE(project, '')) LIKE LOWER(?) ESCAPE '\\')`);
+      params.push(pattern, pattern);
+    }
     if (opts.source) {
       clauses.push('source = ?');
       params.push(opts.source);
@@ -1016,7 +1017,7 @@ export class AiHist {
       this.db,
       `SELECT id, source, session_id, project, prompt, timestamp_ms, git_branch
        FROM history
-       WHERE ${clauses.join(' AND ')}
+       WHERE ${clauses.length > 0 ? clauses.join(' AND ') : '1=1'}
        ORDER BY timestamp_ms DESC
        LIMIT ?`,
       [...params, limit],

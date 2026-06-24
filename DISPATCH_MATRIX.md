@@ -17,8 +17,8 @@ Escape hatches:
 
 | Surface | Default route | Parity evidence |
 | --- | --- | --- |
-| `sync` | Rust | Full-source sync covers Claude, Codex, Cursor, OpenCode, Agent Relay when configured, and trajectories. Local E2E verifies Claude/Codex/Cursor/OpenCode/trajectory ingestion, `.sync-state.json`, WAL-safe OpenCode reads, and shared DB compatibility. |
-| `search QUERY [--source --project --tag --limit --fts --json]` | Rust | Wrapper tests cover JSON shape, source validation, no-result exit status, tag/project/source filters, and FTS behavior through the shared Rust core. |
+| `sync` | Rust | Full-source sync covers Claude, Codex, Cursor, Grok, OpenCode, Agent Relay when configured, and trajectories. Local E2E verifies Claude/Codex/Cursor/Grok/OpenCode/trajectory ingestion, `.sync-state.json`, WAL-safe OpenCode reads, and shared DB compatibility. |
+| `search [QUERY] [--source --project --tag --limit --fts --json]` | Rust | Wrapper tests cover JSON shape, source validation, no-result exit status, tag/project/source filters, filter-only search, and FTS behavior through the shared Rust core. |
 | `recent [n] [--source --project --tag --json]` | Rust | Uses the same row JSON fields and timestamp formatting contract as the legacy CLI. |
 | `show ID [--json]` | Rust | Includes full prompt, tags, session count, resume command, and context hint. |
 | `session SESSION_ID [--source --tag --full --json]` | Rust | `--full` and JSON output are Rust-default; missing sessions exit non-zero. |

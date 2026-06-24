@@ -74,6 +74,10 @@ test('SDK tags sessions, filters reads by tag, and persists SQLite writes', asyn
       hist.search('prompt', { tag: 'release work', limit: 10 }).map((entry) => entry.prompt),
       ['scoped root prompt'],
     );
+    assert.deepEqual(
+      hist.search('', { tag: 'release work', limit: 10 }).map((entry) => entry.prompt),
+      ['scoped root prompt'],
+    );
     assert.equal(hist.listTags({ includeSessions: true })[0].sessions?.[0].sessionId, 'shared');
   } finally {
     hist.close();

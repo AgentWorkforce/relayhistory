@@ -10,6 +10,7 @@ export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20" "$TRAJECTORY_ROOT/planner/compacted"
+mkdir -p "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e"
 mkdir -p "$HOME/.cursor/projects/tmp-e2e-cursor/agent-transcripts/cursor-e2e"
 
 rust_ai_hist() {
@@ -30,6 +31,15 @@ JSONL
 
 cat > "$HOME/.codex/sessions/2026/06/20/rollout-codex-e2e.jsonl" <<'JSONL'
 {"type":"session_meta","payload":{"id":"codex-e2e","cwd":"/tmp/e2e/codex","git":{"branch":"main"}}}
+JSONL
+
+cat > "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e/summary.json" <<'JSON'
+{"info":{"id":"grok-e2e","cwd":"/tmp/e2e/grok"},"created_at":"2026-06-20T10:02:00.000Z","updated_at":"2026-06-20T10:03:00.000Z","head_branch":"main"}
+JSON
+cat > "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e/chat_history.jsonl" <<'JSONL'
+{"type":"user","content":[{"type":"text","text":"e2e grok release tagging prompt"}]}
+{"type":"user","synthetic_reason":"system_reminder","content":[{"type":"text","text":"do not import this synthetic prompt"}]}
+{"type":"assistant","content":[{"type":"text","text":"grok assistant summary"}]}
 JSONL
 
 cat > "$HOME/.claude/projects/e2e-project/claude-e2e.jsonl" <<'JSONL'
@@ -87,9 +97,11 @@ PY
 "$ROOT/ai-hist" sync
 "$ROOT/ai-hist" tag claude-e2e release-e2e --source claude
 "$ROOT/ai-hist" tag opencode-e2e release-e2e --source opencode
+"$ROOT/ai-hist" tag grok-e2e release-e2e --source grok
 "$ROOT/ai-hist" tag cursor-e2e release-e2e --source cursor
 "$ROOT/ai-hist" tag trajectory-e2e release-e2e --source trajectory
 "$ROOT/ai-hist" search release --tag release-e2e --json
+"$ROOT/ai-hist" search --tag release-e2e >/dev/null
 "$ROOT/ai-hist" session claude-e2e --full >/dev/null
 "$ROOT/ai-hist" show 1 --json >/dev/null
 "$ROOT/ai-hist" context 1 >/dev/null
@@ -101,7 +113,7 @@ python3 - <<'PY'
 import os, sqlite3
 conn = sqlite3.connect(os.environ["AI_HIST_DB"])
 sources = {row[0] for row in conn.execute("SELECT DISTINCT source FROM history")}
-expected = {"claude", "codex", "cursor", "opencode", "trajectory"}
+expected = {"claude", "codex", "cursor", "grok", "opencode", "trajectory"}
 missing = expected - sources
 if missing:
     raise SystemExit(f"missing sources from Rust sync: {sorted(missing)}")
@@ -111,6 +123,12 @@ if codex_project != "/tmp/e2e/codex":
 claude_session = conn.execute("SELECT cwd, git_branch, last_assistant_text FROM sessions WHERE source='claude' AND session_id='claude-e2e'").fetchone()
 if not claude_session or claude_session[0] != "/tmp/e2e/project" or claude_session[1] != "main" or "assistant summary" not in (claude_session[2] or ""):
     raise SystemExit(f"claude session metadata missing: {claude_session!r}")
+grok_session = conn.execute("SELECT cwd, git_branch, last_assistant_text FROM sessions WHERE source='grok' AND session_id='grok-e2e'").fetchone()
+if not grok_session or grok_session[0] != "/tmp/e2e/grok" or grok_session[1] != "main" or "grok assistant summary" not in (grok_session[2] or ""):
+    raise SystemExit(f"grok session metadata missing: {grok_session!r}")
+synthetic = conn.execute("SELECT COUNT(*) FROM history WHERE source='grok' AND prompt LIKE '%synthetic prompt%'").fetchone()[0]
+if synthetic:
+    raise SystemExit("grok synthetic prompt was imported")
 conn.close()
 PY
 

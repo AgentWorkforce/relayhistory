@@ -37,7 +37,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Search {
-        #[arg(required = true)]
         query: Vec<String>,
         #[arg(long)]
         source: Option<String>,
@@ -264,7 +263,7 @@ enum PairAction {
 enum LearnAction {
     /// Distill local session history into decision/finding/reflection events.
     Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, relay, opencode).
+        /// Only distill sessions from this source (claude, codex, cursor, grok, relay, opencode).
         #[arg(long)]
         source: Option<String>,
         /// Distill one session id.
@@ -1333,6 +1332,7 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects"))?;
     total_inserted += sync_codex(conn, &mut state, &home)?;
     total_inserted += sync_cursor(conn, &mut state, &home.join(".cursor/projects"))?;
+    total_inserted += sync_grok(conn, &mut state, &home.join(".grok/sessions"))?;
     total_inserted += sync_trajectories(conn, &mut state)?;
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
@@ -2162,6 +2162,239 @@ fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {
 
 fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
+}
+
+fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    if !root.exists() {
+        println!("  [grok] not found: {} (skipped)", root.display());
+        return Ok(0);
+    }
+    let mut grok_state = state
+        .get("grok_sessions")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut inserted = 0;
+    let mut scanned = 0;
+    let mut sessions = 0;
+    let mut errors = 0;
+    for chat in collect_matching_files(root, "chat_history", "jsonl")? {
+        let key = chat.to_string_lossy().to_string();
+        let stamp = grok_session_stamp(&chat)?;
+        if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
+            continue;
+        }
+        scanned += 1;
+        match scan_grok_session_file(&chat) {
+            Ok(Some(session)) => {
+                let raw_path = chat.to_string_lossy().to_string();
+                upsert_session(
+                    conn,
+                    &session.session_id,
+                    "grok",
+                    session.cwd.as_deref(),
+                    session.git_branch.as_deref(),
+                    session.first_ts,
+                    session.last_ts,
+                    session.last_assistant_text.as_deref(),
+                    Some(&raw_path),
+                )?;
+                for (idx, prompt) in session.prompts.iter().enumerate() {
+                    inserted += insert_history(
+                        conn,
+                        &HistoryEntry {
+                            id: 0,
+                            source: "grok".into(),
+                            session_id: Some(session.session_id.clone()),
+                            project: session.cwd.clone(),
+                            prompt_hash: Some(prompt_hash(prompt)),
+                            prompt: prompt.clone(),
+                            timestamp_ms: session.first_ts + idx as i64,
+                        },
+                    )?;
+                }
+                sessions += 1;
+                grok_state.insert(key, json!(stamp));
+            }
+            Ok(None) => {
+                grok_state.insert(key, json!(stamp));
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    state.insert("grok_sessions".to_string(), Value::Object(grok_state));
+    if scanned > 0 {
+        let suffix = if errors > 0 {
+            format!(" ({errors} errors)")
+        } else {
+            String::new()
+        };
+        println!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
+    }
+    Ok(inserted)
+}
+
+fn grok_session_stamp(chat: &Path) -> Result<String> {
+    let mut stamp = file_stamp(chat)?;
+    let summary = chat.with_file_name("summary.json");
+    if summary.exists() {
+        stamp.push('|');
+        stamp.push_str(&file_stamp(&summary)?);
+    }
+    Ok(stamp)
+}
+
+struct GrokSession {
+    session_id: String,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    first_ts: i64,
+    last_ts: i64,
+    last_assistant_text: Option<String>,
+    prompts: Vec<String>,
+}
+
+fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
+    let summary = read_grok_summary(&chat.with_file_name("summary.json"));
+    let fallback_session = chat
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let session_id = summary
+        .as_ref()
+        .and_then(|s| s.pointer("/info/id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback_session)
+        .to_string();
+    let cwd = summary
+        .as_ref()
+        .and_then(|s| s.pointer("/info/cwd").or_else(|| s.get("git_root_dir")))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| grok_project_from_path(chat));
+    let git_branch = summary
+        .as_ref()
+        .and_then(|s| s.get("head_branch"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let created_ms = summary
+        .as_ref()
+        .and_then(|s| s.get("created_at").and_then(Value::as_str))
+        .and_then(parse_iso_ms)
+        .or_else(|| file_modified_ms(chat))
+        .unwrap_or(0);
+    let updated_ms = summary
+        .as_ref()
+        .and_then(|s| s.get("updated_at").and_then(Value::as_str))
+        .and_then(parse_iso_ms)
+        .unwrap_or(created_ms);
+
+    let mut prompts = Vec::new();
+    let mut last_assistant_text = None;
+    let contents = fs::read_to_string(chat)
+        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(text) = grok_chat_text(&value, "user") {
+            prompts.push(text);
+        }
+        if let Some(text) = grok_chat_text(&value, "assistant") {
+            last_assistant_text = Some(text.chars().take(4096).collect());
+        }
+    }
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    let last_ts = if prompts.is_empty() {
+        updated_ms
+    } else {
+        created_ms + prompts.len() as i64 - 1
+    };
+    Ok(Some(GrokSession {
+        session_id,
+        cwd,
+        git_branch,
+        first_ts: created_ms,
+        last_ts,
+        last_assistant_text,
+        prompts,
+    }))
+}
+
+fn read_grok_summary(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+fn grok_project_from_path(chat: &Path) -> Option<String> {
+    let project_dir = chat.parent()?.parent()?.file_name()?.to_str()?;
+    percent_decode_path(project_dir)
+}
+
+fn percent_decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(hex) = bytes
+                .get(i + 1..i + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok().filter(|s| !s.is_empty())
+}
+
+fn file_modified_ms(path: &Path) -> Option<i64> {
+    path.metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some(role) {
+        return None;
+    }
+    if role == "user" && value.get("synthetic_reason").is_some() {
+        return None;
+    }
+    let content = value.get("content")?;
+    let mut parts = Vec::new();
+    if let Some(text) = content.as_str() {
+        parts.push(text);
+    } else if let Some(items) = content.as_array() {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    parts.push(text);
+                }
+            }
+        }
+    } else if let Some(text) = content.get("text").and_then(Value::as_str) {
+        parts.push(text);
+    }
+    let text = parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn sync_trajectories(conn: &Connection, state: &mut Map<String, Value>) -> Result<usize> {

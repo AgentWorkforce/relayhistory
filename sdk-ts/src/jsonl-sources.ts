@@ -13,13 +13,13 @@
 
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-export type Source = 'claude' | 'codex' | 'cursor';
+export type Source = 'claude' | 'codex' | 'cursor' | 'grok';
 
 export interface RawRow {
   source: Source;
@@ -33,11 +33,12 @@ export interface RawRow {
 const CLAUDE_HISTORY = join(homedir(), '.claude', 'history.jsonl');
 const CODEX_HISTORY = join(homedir(), '.codex', 'history.jsonl');
 const CURSOR_ROOT = join(homedir(), '.cursor', 'projects');
+const GROK_SESSIONS_ROOT = join(homedir(), '.grok', 'sessions');
 
-async function safeStat(path: string): Promise<{ size: number; mtimeMs: number } | null> {
+async function safeStat(path: string): Promise<{ isDirectory: boolean; isFile: boolean; size: number; mtimeMs: number } | null> {
   try {
     const s = await stat(path);
-    return { size: s.size, mtimeMs: s.mtimeMs };
+    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: s.mtimeMs };
   } catch {
     return null;
   }
@@ -158,6 +159,22 @@ async function readDirSafe(path: string): Promise<string[]> {
   }
 }
 
+async function collectMatchingFiles(root: string, filename: string, out: string[] = []): Promise<string[]> {
+  const rootStat = await safeStat(root);
+  if (!rootStat) return out;
+  for (const name of await readDirSafe(root)) {
+    const full = join(root, name);
+    const child = await safeStat(full);
+    if (!child) continue;
+    if (name === filename && child.isFile) {
+      out.push(full);
+    } else if (child.isDirectory) {
+      await collectMatchingFiles(full, filename, out);
+    }
+  }
+  return out;
+}
+
 async function scanClaude(): Promise<RawRow[]> {
   const lines = await readLines(CLAUDE_HISTORY);
   const rows: RawRow[] = [];
@@ -218,6 +235,94 @@ async function scanCursor(): Promise<RawRow[]> {
   return rows;
 }
 
+function parseIsoMs(value: unknown, fallbackMs: number): number {
+  if (typeof value !== 'string' || value.length === 0) return fallbackMs;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : fallbackMs;
+}
+
+function grokText(obj: Record<string, unknown>, role: 'user' | 'assistant'): string | null {
+  if (obj.type !== role) return null;
+  if (role === 'user' && obj.synthetic_reason) return null;
+  const content = obj.content;
+  const parts: string[] = [];
+  if (typeof content === 'string') {
+    parts.push(content);
+  } else if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!item || typeof item !== 'object') continue;
+      const record = item as Record<string, unknown>;
+      if (record.type === 'text' && typeof record.text === 'string') parts.push(record.text);
+    }
+  } else if (content && typeof content === 'object') {
+    const record = content as Record<string, unknown>;
+    if (typeof record.text === 'string') parts.push(record.text);
+  }
+  const text = parts.map((part) => part.trim()).filter(Boolean).join('\n');
+  return text || null;
+}
+
+function grokProjectFromPath(chatPath: string): string | null {
+  const encodedProject = basename(dirname(dirname(chatPath)));
+  try {
+    const decoded = decodeURIComponent(encodedProject);
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readGrokSummary(chatPath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = JSON.parse(await readFile(join(dirname(chatPath), 'summary.json'), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function nestedString(obj: Record<string, unknown> | null, path: string[]): string | null {
+  let current: unknown = obj;
+  for (const part of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return asString(current);
+}
+
+async function scanGrok(): Promise<RawRow[]> {
+  const root = await safeStat(GROK_SESSIONS_ROOT);
+  if (!root) return [];
+  const rows: RawRow[] = [];
+  for (const chatPath of await collectMatchingFiles(GROK_SESSIONS_ROOT, 'chat_history.jsonl')) {
+    const summary = await readGrokSummary(chatPath);
+    const fileStat = await safeStat(chatPath);
+    const fallbackMs = Math.trunc(fileStat?.mtimeMs ?? 0);
+    const sessionId = nestedString(summary, ['info', 'id']) ?? basename(dirname(chatPath));
+    const project = nestedString(summary, ['info', 'cwd']) ?? asString(summary?.git_root_dir) ?? grokProjectFromPath(chatPath);
+    const gitBranch = asString(summary?.head_branch);
+    const baseMs = parseIsoMs(summary?.created_at, fallbackMs);
+    let idx = 0;
+    for (const line of await readLines(chatPath)) {
+      const obj = readJsonRecord(line);
+      if (!obj) continue;
+      const prompt = grokText(obj, 'user');
+      if (!prompt) continue;
+      rows.push({
+        source: 'grok',
+        sessionId,
+        project,
+        prompt,
+        timestampMs: baseMs + idx,
+        gitBranch,
+      });
+      idx += 1;
+    }
+    await yieldToEventLoop();
+  }
+  return rows;
+}
+
 /**
  * Scan all available local source files. Async + yields between sources
  * so a host event loop (e.g. Electron's main process) stays responsive.
@@ -230,11 +335,14 @@ export async function scanLocalSources(): Promise<RawRow[]> {
   const codexRows = await scanCodex();
   await yieldToEventLoop();
   const cursorRows = await scanCursor();
-  return [...claudeRows, ...codexRows, ...cursorRows];
+  await yieldToEventLoop();
+  const grokRows = await scanGrok();
+  return [...claudeRows, ...codexRows, ...cursorRows, ...grokRows];
 }
 
 export const LOCAL_SOURCE_PATHS = {
   claude: CLAUDE_HISTORY,
   codex: CODEX_HISTORY,
   cursorRoot: CURSOR_ROOT,
+  grokSessionsRoot: GROK_SESSIONS_ROOT,
 };

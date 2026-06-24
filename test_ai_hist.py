@@ -44,6 +44,8 @@ def tmp_env(tmp_path, monkeypatch):
     # Point cursor at an empty tmp dir so it never reads real ~/.cursor.
     cursor_root = tmp_path / "cursor_projects"
     monkeypatch.setattr(ai_hist, "CURSOR_ROOT", cursor_root)
+    grok_sessions_root = tmp_path / "grok_sessions"
+    monkeypatch.setattr(ai_hist, "GROK_SESSIONS_ROOT", grok_sessions_root)
     monkeypatch.setattr(ai_hist, "OPENCODE_DB", tmp_path / "missing-opencode.db")
     trajectory_root = tmp_path / ".trajectories"
     monkeypatch.setattr(ai_hist, "TRAJECTORY_ROOT", str(trajectory_root))
@@ -62,6 +64,7 @@ def tmp_env(tmp_path, monkeypatch):
         claude_hist=claude_hist,
         codex_hist=codex_hist,
         cursor_root=cursor_root,
+        grok_sessions_root=grok_sessions_root,
         trajectory_root=trajectory_root,
         claude_projects_root=claude_projects_root,
         tmp_path=tmp_path,
@@ -88,6 +91,36 @@ def make_cursor_session(cursor_root: Path, project: str, session_id: str, prompt
         }))
     jsonl.write_text("\n".join(lines) + "\n")
     return jsonl
+
+
+def make_grok_session(grok_root: Path, project: str, session_id: str, prompts: list,
+                      synthetic_prompt: str = "synthetic reminder") -> Path:
+    """Create a fake Grok per-session chat_history.jsonl. Returns the session dir."""
+    session_dir = grok_root / project / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "summary.json").write_text(json.dumps({
+        "info": {"id": session_id, "cwd": "/tmp/grok/project"},
+        "created_at": "2026-06-20T10:02:00.000Z",
+        "updated_at": "2026-06-20T10:03:00.000Z",
+        "head_branch": "main",
+    }))
+    lines = []
+    for prompt in prompts:
+        lines.append(json.dumps({
+            "type": "user",
+            "content": [{"type": "text", "text": prompt}],
+        }))
+    lines.append(json.dumps({
+        "type": "user",
+        "synthetic_reason": "system_reminder",
+        "content": [{"type": "text", "text": synthetic_prompt}],
+    }))
+    lines.append(json.dumps({
+        "type": "assistant",
+        "content": [{"type": "text", "text": "grok assistant state"}],
+    }))
+    (session_dir / "chat_history.jsonl").write_text("\n".join(lines) + "\n")
+    return session_dir
 
 
 def make_claude_entry(display, timestamp=1700000000000, project="/proj", session_id="s1"):
@@ -615,6 +648,11 @@ class TestTags:
         assert "Tagged 1 session" in captured.out
 
         ai_hist.cmd_search(SimpleNamespace(query=["auth"], source=None, project=None, tag="release", limit=20, fts=False, json=False))
+        captured = capsys.readouterr()
+        assert "taggable auth prompt" in captured.out
+        assert "other auth prompt" not in captured.out
+
+        ai_hist.cmd_search(SimpleNamespace(query=[], source=None, project=None, tag="release", limit=20, fts=False, json=False))
         captured = capsys.readouterr()
         assert "taggable auth prompt" in captured.out
         assert "other auth prompt" not in captured.out
@@ -1156,11 +1194,14 @@ class TestIsoToMs:
         ms = ai_hist._iso_to_ms("2026-03-07T20:13:00+00:00")
         assert ms > 0
 
+    def test_iso_z_is_utc(self):
+        assert ai_hist._iso_to_ms("1970-01-01T00:00:01Z") == 1000
+
     def test_iso_invalid(self):
-        assert ai_hist._iso_to_ms("not a date") == 0
+        assert ai_hist._iso_to_ms("not a date") is None
 
     def test_iso_empty(self):
-        assert ai_hist._iso_to_ms("") == 0
+        assert ai_hist._iso_to_ms("") is None
 
 
 class TestRelayMsgToRow:
@@ -1622,6 +1663,30 @@ class TestDecodeCursorProject:
         assert ai_hist._decode_cursor_project(
             "Users-khaliq-Projects-AgentWorkforce"
         ) == "/Users/khaliq/Projects/AgentWorkforce"
+
+
+class TestSyncGrok:
+    def test_imports_prompts_and_session_metadata(self, tmp_env, capsys):
+        make_grok_session(
+            tmp_env.grok_sessions_root,
+            "%2Ftmp%2Fgrok%2Fproject",
+            "grok-sess-1",
+            ["grok migration prompt"],
+            synthetic_prompt="synthetic should not import",
+        )
+        ai_hist.cmd_sync()
+        conn = sqlite3.connect(str(tmp_env.db_path))
+        prompts = conn.execute(
+            "SELECT prompt FROM history WHERE source='grok' ORDER BY timestamp_ms"
+        ).fetchall()
+        session = conn.execute(
+            "SELECT cwd, git_branch, last_assistant_text FROM sessions WHERE source='grok' AND session_id='grok-sess-1'"
+        ).fetchone()
+        conn.close()
+        assert prompts == [("grok migration prompt",)]
+        assert session[0] == "/tmp/grok/project"
+        assert session[1] == "main"
+        assert "grok assistant state" in session[2]
 
 
 class TestSyncTrajectories:
