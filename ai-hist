@@ -33,6 +33,11 @@ RUST_COMMANDS = {
     "untag",
     "tags",
     "sync",
+    "login",
+    "admin-mint",
+    "push",
+    "pair",
+    "learn",
 }
 
 PYTHON_COMMANDS = set()
@@ -112,6 +117,11 @@ Rust-default commands:
   tag            Tag a session
   untag          Remove a tag from a session
   tags           List tags and tagged sessions
+  login          Authenticate through Agent Relay Cloud
+  admin-mint     Dev-only local relayhistory token mint
+  push           Push new local history to relayhistory-cloud
+  pair           Ask relayhistory-cloud for in-session warnings
+  learn          Distill history into Pair signal
 
 Python fallback commands:
   (none in auto mode; use the explicit escape hatches for legacy compatibility)

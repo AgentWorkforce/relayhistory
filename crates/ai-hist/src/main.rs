@@ -24,8 +24,9 @@ mod learn;
 #[derive(Parser)]
 #[command(
     name = "ai-hist",
+    bin_name = "ai-hist",
     version,
-    about = "Rust ai-hist CLI, parallel to the Python CLI"
+    about = "Sync, search, tag, and relay AI coding agent history"
 )]
 struct Cli {
     #[arg(long)]
@@ -36,6 +37,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Search prompts and sessions.
     Search {
         query: Vec<String>,
         #[arg(long)]
@@ -51,6 +53,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show recent history entries.
     Recent {
         #[arg(default_value_t = 20)]
         n: i64,
@@ -63,6 +66,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show all entries for a session.
     Session {
         session_id: String,
         #[arg(long)]
@@ -74,22 +78,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show one history entry by id.
     Show {
         id: i64,
         #[arg(long)]
         json: bool,
     },
+    /// Show neighboring entries around an id.
     Context {
         id: i64,
         #[arg(long, default_value_t = 5)]
         window: i64,
     },
+    /// Show local history statistics.
     Stats {
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
         json: bool,
     },
+    /// Add a tag to a session.
     Tag {
         session_id: String,
         tag_name: String,
@@ -100,6 +108,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Remove a tag from a session.
     Untag {
         session_id: String,
         tag_name: String,
@@ -108,6 +117,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List tags, optionally with tagged sessions.
     Tags {
         #[arg(long)]
         tag: Option<String>,
@@ -116,6 +126,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a resume command for the best matching session.
     Resume {
         #[arg(required = true)]
         query: Vec<String>,
@@ -124,15 +135,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Import history from an opencode SQLite database.
     SyncOpencode {
         #[arg(long)]
         opencode_db: Option<PathBuf>,
     },
+    /// Sync local agent history into the relayhistory database.
     Sync,
+    /// Repeatedly sync local agent history.
     Watch {
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
+    /// Build a compact context pack from matching history.
     Pack {
         #[arg(required = true)]
         query: Vec<String>,
@@ -151,6 +166,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export local history.
     Export {
         output: Option<PathBuf>,
         #[arg(long, default_value = "jsonl")]
@@ -162,6 +178,7 @@ enum Command {
         #[arg(long)]
         since: Option<String>,
     },
+    /// Import exported history.
     Import {
         file: PathBuf,
         #[arg(long)]
@@ -169,22 +186,21 @@ enum Command {
     },
     /// Authenticate to relayhistory-cloud (Agent Relay Loop).
     ///
-    /// `--cloud` uses Agent Relay Cloud — you never handle a token: it shells to the already-
-    /// authenticated `agent-relay` CLI, which performs the server-to-server exchange and returns
-    /// only the relayhistory session. (Cloud will become the default once the bridge is live.)
-    /// Otherwise pass `--base-url` + `--token` for manual/dev login.
+    /// Defaults to Agent Relay Cloud auth, matching relayfile/workforce. The CLI reads the
+    /// canonical `agent-relay` session and exchanges it for a relayhistory session. Pass
+    /// `--base-url` + `--token` only for manual/dev login.
     Login {
-        /// Use Agent Relay Cloud (no token handling).
+        /// Use Agent Relay Cloud auth. This is now the default and is kept for compatibility.
         #[arg(long)]
         cloud: bool,
         /// Least-privilege ceiling: `read` (Pair-only) or `sync` (Learn/push). Cloud authorizes
         /// the actual scope it grants. Cloud mode only.
         #[arg(long, default_value = "sync")]
         mode: String,
-        /// Optional workspace id for the Cloud session.
+        /// Optional Agent Relay workspace name/id to switch before reading the Cloud session.
         #[arg(long)]
         workspace: Option<String>,
-        /// Legacy/manual: relayhistory-cloud base URL (required with `--token`).
+        /// relayhistory-cloud base URL. Defaults to https://history.agentrelay.com for Cloud login.
         #[arg(long)]
         base_url: Option<String>,
         /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
@@ -522,26 +538,20 @@ fn main() -> Result<()> {
         }
         Command::Import { file, dry_run } => import_history(&conn, &file, dry_run),
         Command::Login {
-            cloud: use_cloud,
+            cloud: _use_cloud,
             mode,
             workspace,
             base_url,
             token,
             label,
         } => {
-            // Cloud login is opt-in via --cloud until the Cloud `relayhistory-session` command +
-            // RelayAuth org-claim land end-to-end; legacy --token + --base-url is the current
-            // default so this can ship without a broken-by-default `login`. (Flip to Cloud-default
-            // once the bridge is live.)
-            let auth = if use_cloud {
-                cloud::login_via_cloud(&mode, workspace.as_deref())?
-            } else {
-                let base_url = base_url.context(
-                    "use `--cloud` for Agent Relay Cloud login, or pass `--base-url` + `--token` for manual login",
-                )?;
-                let token =
-                    token.context("`--token` is required for manual login (or use `--cloud`)")?;
+            let auth = if let Some(token) = token {
+                let base_url =
+                    base_url.context("`--base-url` is required with manual `--token` login")?;
                 cloud::login(&base_url, &token, &label)?
+            } else {
+                let base_url = base_url.unwrap_or_else(cloud::default_base_url);
+                cloud::login_via_cloud(&base_url, &mode, workspace.as_deref(), &label)?
             };
             cloud::save_auth(&auth)?;
             // Never print the session/token — only where it landed.

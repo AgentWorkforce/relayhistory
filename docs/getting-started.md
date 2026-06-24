@@ -93,22 +93,22 @@ RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-dev" ai-hist push --json
 
 Prod auth is owned by **Agent Relay Cloud**. End users should not mint auth tokens, call
 internal auth services directly, or handle internal API keys. Sign in through Agent Relay
-Cloud, then let the Cloud/relayhistory login handoff populate the `ai-hist` prod session:
+Cloud, then let `ai-hist login` populate the relayhistory prod session from the same
+canonical Agent Relay auth:
 
 ```bash
-# 1. Sign in to Agent Relay Cloud in the browser / Cloud CLI.
-#    Your org/workspace and relayhistory session are provisioned by Cloud.
-npx agent-relay cloud login
+export RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod"
+
+# 1. Sign in to Agent Relay Cloud and exchange that session for relayhistory auth.
+ai-hist login
 
 # 2. Push uses the stored prod relayhistory session.
-RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
-  ai-hist push --json
+ai-hist push --json
 ```
 
-If your local build still asks for a manual auth handoff, treat that as a temporary
-Cloud-login gap, not as an instruction to mint anything yourself. Ask your Agent Relay
-Cloud admin to provision the relayhistory session, or wait for the first-class Cloud login
-handoff in the CLI. Internal auth details belong in operator runbooks, not human setup.
+If you are not already signed in to Agent Relay Cloud, `ai-hist login` will start
+`agent-relay cloud login`. Internal auth details belong in operator runbooks, not human
+setup.
 
 `push` is incremental + idempotent: it only sends new rows past the cursor, dedupes
 server-side, and advances the cursor only after the server accepts the batch. Re-run it (or
