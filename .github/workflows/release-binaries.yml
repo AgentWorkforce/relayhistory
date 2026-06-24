@@ -1,13 +1,10 @@
 name: Build ai-hist release binaries
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach binaries to, for example v0.3.5'
+        description: 'Release tag to attach binaries to, for example sdk-ts-v0.3.5'
         required: true
         type: string
 
