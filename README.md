@@ -19,14 +19,22 @@ Make sure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
 ```
 
-The installer owns the Rust build and installs deterministic launchers for
-`ai-hist`, `ai-hist-python`, and `ai-hist-rust`. It requires `cargo` and
-`python3`; if Rust is missing, install it from <https://rustup.rs/> and rerun
-the script.
+The installer installs deterministic launchers for `ai-hist`, `ai-hist-python`,
+and `ai-hist-rust`. For normal installs it downloads a prebuilt Rust binary from
+GitHub Releases, so users do not need a local Rust toolchain.
 
-Normal use does not require manually running Cargo commands. The install script
-builds the Rust binary, places it under the ai-hist install directory, and
-writes launchers that point the wrapper at that exact binary.
+If no prebuilt binary is available for your platform, the installer falls back
+to building from source. That fallback requires `cargo` and `python3`; install
+Rust from <https://rustup.rs/> if you intentionally use the source path.
+
+Installer controls:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | AI_HIST_INSTALL_METHOD=binary sh
+curl -fsSL https://raw.githubusercontent.com/AgentWorkforce/relayhistory/main/install.sh | AI_HIST_VERSION=0.3.5 sh
+AI_HIST_INSTALL_METHOD=source sh install.sh   # from a local checkout
+AI_HIST_SOURCE_REF=my-branch sh install.sh    # override source fallback ref
+```
 
 Escape hatches:
 
