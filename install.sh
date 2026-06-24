@@ -84,11 +84,20 @@ release_download_url() {
     return 0
   fi
 
-  case "$VERSION" in
-    v*) tag="$VERSION" ;;
-    *) tag="v$VERSION" ;;
-  esac
-  echo "https://github.com/$REPO_SLUG/releases/download/$tag/$asset"
+  echo "https://github.com/$REPO_SLUG/releases/download/$(version_tag)/$asset"
+}
+
+version_tag() {
+  if [ "$VERSION" != "latest" ]; then
+    case "$VERSION" in
+      sdk-ts-v*) echo "$VERSION" ;;
+      v*) echo "sdk-ts-$VERSION" ;;
+      *) echo "sdk-ts-v$VERSION" ;;
+    esac
+    return 0
+  fi
+
+  echo "$REF"
 }
 
 raw_ref() {
@@ -97,15 +106,7 @@ raw_ref() {
     return 0
   fi
 
-  if [ "$VERSION" != "latest" ]; then
-    case "$VERSION" in
-      v*) echo "$VERSION" ;;
-      *) echo "v$VERSION" ;;
-    esac
-    return 0
-  fi
-
-  echo "$REF"
+  version_tag
 }
 
 source_ref() {

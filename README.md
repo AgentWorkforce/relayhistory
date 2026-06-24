@@ -36,6 +36,9 @@ AI_HIST_INSTALL_METHOD=source sh install.sh   # from a local checkout
 AI_HIST_SOURCE_REF=my-branch sh install.sh    # override source fallback ref
 ```
 
+The publish workflow creates the npm packages, the `sdk-ts-v<version>` GitHub
+Release, and the prebuilt Rust assets consumed by the installer.
+
 Escape hatches:
 
 ```bash
