@@ -79,7 +79,16 @@ def seed_via_wrapper(tmp_path):
 
 
 def ensure_rust_binary():
-    built = ROOT / "target" / "debug" / "ai-hist"
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    target_dir = Path(json.loads(metadata.stdout)["target_directory"])
+    built = target_dir / "debug" / ("ai-hist.exe" if os.name == "nt" else "ai-hist")
     if not built.exists():
         subprocess.run(["cargo", "build", "-q", "-p", "ai-hist-cli"], cwd=ROOT, check=True)
     return built

@@ -93,8 +93,11 @@ ai-hist push --json
 ```
 
 `ai-hist login` uses the same canonical Agent Relay Cloud login as relayfile/workforce. If
-you are not already signed in, it will start `agent-relay cloud login`; for dev/local
-targets, pass `--base-url` or set `RELAYHISTORY_BASE_URL`.
+you are not already signed in, it will start `agent-relay cloud login`. Cloud login
+defaults to prod; for dev/local targets use `admin-mint` or explicit manual `--token`
+login. To test Cloud exchange against a trusted non-prod endpoint, set
+`RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1` with `--base-url` or
+`RELAYHISTORY_BASE_URL`.
 
 ---
 

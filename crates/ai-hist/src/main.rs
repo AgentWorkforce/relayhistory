@@ -197,10 +197,11 @@ enum Command {
         /// the actual scope it grants. Cloud mode only.
         #[arg(long, default_value = "sync")]
         mode: String,
-        /// Optional Agent Relay workspace name/id to switch before reading the Cloud session.
+        /// Reserved for future non-mutating workspace-scoped Cloud sessions.
         #[arg(long)]
         workspace: Option<String>,
-        /// relayhistory-cloud base URL. Defaults to https://history.agentrelay.com for Cloud login.
+        /// relayhistory-cloud base URL. Cloud login defaults to https://history.agentrelay.com;
+        /// non-default Cloud exchanges require RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1.
         #[arg(long)]
         base_url: Option<String>,
         /// Legacy/manual: RelayAuth/Agent Relay token (device-flow JWT). Prefer Cloud login.
@@ -548,7 +549,7 @@ fn main() -> Result<()> {
             let auth = if let Some(token) = token {
                 let base_url =
                     base_url.context("`--base-url` is required with manual `--token` login")?;
-                cloud::login(&base_url, &token, &label)?
+                cloud::login(&base_url, &token, &label, None)?
             } else {
                 let base_url = base_url.unwrap_or_else(cloud::default_base_url);
                 cloud::login_via_cloud(&base_url, &mode, workspace.as_deref(), &label)?
