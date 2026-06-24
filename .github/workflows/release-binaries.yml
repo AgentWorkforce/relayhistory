@@ -1,0 +1,120 @@
+name: Build ai-hist release binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach binaries to, for example v0.3.5'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: ai-hist-darwin-arm64
+            binary: ai-hist
+            run_binary: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: ai-hist-darwin-x64
+            binary: ai-hist
+            run_binary: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: ai-hist-linux-x64
+            binary: ai-hist
+            run_binary: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: ai-hist-linux-arm64
+            binary: ai-hist
+            run_binary: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ai-hist-${{ matrix.target }}
+          cache-bin: false
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            RUSTFLAGS="-C target-feature=+crt-static" cross build --release --target "${{ matrix.target }}" -p ai-hist-cli
+          else
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target "${{ matrix.target }}" -p ai-hist-cli
+          fi
+          strip "target/${{ matrix.target }}/release/${{ matrix.binary }}" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
+          chmod 755 "${{ matrix.asset }}"
+
+      - name: Verify binary
+        if: matrix.run_binary
+        run: "./${{ matrix.asset }} --version"
+
+      - name: Inspect binary
+        if: ${{ !matrix.run_binary }}
+        run: file "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  release:
+    name: Attach binaries to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ai-hist ${{ steps.tag.outputs.tag }}
+          files: artifacts/*
+          make_latest: true
