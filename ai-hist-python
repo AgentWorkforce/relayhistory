@@ -17,6 +17,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 # --- Configuration -----------------------------------------------------------
@@ -38,10 +39,11 @@ CODEX_SESSIONS_DIRS = [
 ]
 
 CURSOR_ROOT = Path.home() / ".cursor" / "projects"
+GROK_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 OPENCODE_DB = Path(os.environ.get("OPENCODE_DB", str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")))
 TRAJECTORY_ROOT = os.environ.get("TRAJECTORY_ROOT", "")
 DEFAULT_TRAJECTORY_SEARCH_ROOT = Path.home() / "Projects"
-SOURCE_CHOICES = ["claude", "codex", "cursor", "relay", "trajectory", "opencode"]
+SOURCE_CHOICES = ["claude", "codex", "cursor", "grok", "relay", "trajectory", "opencode"]
 
 # --- Schema ------------------------------------------------------------------
 
@@ -167,6 +169,11 @@ def _resume_cmd(source, session_id, project):
         return f"codex resume {_shell_quote(session_id)}"
     if source == "cursor":
         cmd = f"cursor-agent --resume={_shell_quote(session_id)}"
+        if project:
+            return f"cd {_shell_quote(project)} && {cmd}"
+        return cmd
+    if source == "grok":
+        cmd = f"grok resume {_shell_quote(session_id)}"
         if project:
             return f"cd {_shell_quote(project)} && {cmd}"
         return cmd
@@ -812,6 +819,115 @@ def sync_cursor(conn: sqlite3.Connection, state: dict):
         print(f"  [cursor] +{inserted:,} rows from {files_seen} files{suffix}")
 
 
+def _grok_chat_text(obj: dict, role: str):
+    if obj.get("type") != role:
+        return None
+    if role == "user" and obj.get("synthetic_reason"):
+        return None
+    content = obj.get("content")
+    parts = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+    elif isinstance(content, dict) and isinstance(content.get("text"), str):
+        parts.append(content["text"])
+    text = "\n".join(p.strip() for p in parts if p.strip())
+    return text or None
+
+
+def _grok_project_from_path(chat_path: Path):
+    try:
+        return urllib.parse.unquote(chat_path.parent.parent.name)
+    except Exception:
+        return None
+
+
+def sync_grok(conn: sqlite3.Connection, state: dict):
+    """Sync user prompts from ~/.grok/sessions/**/chat_history.jsonl."""
+    if not GROK_SESSIONS_ROOT.exists():
+        print(f"  [grok] not found: {GROK_SESSIONS_ROOT} (skipped)")
+        return
+
+    grok_state = state.get("grok_sessions", {})
+    inserted = scanned = sessions = errors = 0
+    for chat_path in sorted(GROK_SESSIONS_ROOT.rglob("chat_history.jsonl")):
+        key = str(chat_path)
+        try:
+            chat_stat = chat_path.stat()
+            stamp = f"{chat_stat.st_mtime_ns}:{chat_stat.st_size}"
+            summary_path = chat_path.with_name("summary.json")
+            if summary_path.exists():
+                summary_stat = summary_path.stat()
+                stamp += f"|{summary_stat.st_mtime_ns}:{summary_stat.st_size}"
+        except OSError:
+            errors += 1
+            continue
+        if grok_state.get(key) == stamp:
+            continue
+        scanned += 1
+        grok_state[key] = stamp
+
+        summary = {}
+        try:
+            summary_path = chat_path.with_name("summary.json")
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+
+        info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
+        session_id = info.get("id") or chat_path.parent.name
+        cwd = info.get("cwd") or summary.get("git_root_dir") or _grok_project_from_path(chat_path)
+        git_branch = summary.get("head_branch")
+        created_ms = _iso_to_ms(summary.get("created_at")) if summary.get("created_at") else int(chat_stat.st_mtime * 1000)
+        updated_ms = _iso_to_ms(summary.get("updated_at")) if summary.get("updated_at") else created_ms
+        prompts = []
+        last_assistant_text = None
+        try:
+            with open(chat_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    prompt = _grok_chat_text(obj, "user")
+                    if prompt:
+                        prompts.append(prompt)
+                    assistant_text = _grok_chat_text(obj, "assistant")
+                    if assistant_text:
+                        last_assistant_text = assistant_text[:4096]
+        except OSError:
+            errors += 1
+            continue
+
+        _upsert_session(conn, session_id, "grok", cwd, git_branch, created_ms, last_assistant_text, str(chat_path))
+        conn.execute(
+            "UPDATE sessions SET last_activity_ms = MAX(last_activity_ms, ?) WHERE session_id = ? AND source = 'grok'",
+            (updated_ms if not prompts else created_ms + len(prompts) - 1, session_id),
+        )
+        for idx, prompt in enumerate(prompts):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO history "
+                "(source, session_id, project, prompt, prompt_hash, timestamp_ms, git_branch) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("grok", session_id, cwd, prompt, _prompt_hash(prompt), created_ms + idx, git_branch),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        sessions += 1
+
+    conn.commit()
+    state["grok_sessions"] = grok_state
+    if scanned:
+        suffix = f" ({errors} errors)" if errors else ""
+        print(f"  [grok] +{inserted:,} rows from {sessions} sessions{suffix}")
+
+
 def _opencode_part_text(data: str) -> str:
     try:
         obj = json.loads(data)
@@ -1407,6 +1523,9 @@ def cmd_sync(args=None):
     # Sync Cursor agent transcripts (auto-discovered, no config needed)
     sync_cursor(conn, state)
 
+    # Sync Grok per-session chat histories (auto-discovered, no config needed)
+    sync_grok(conn, state)
+
     # Sync OpenCode SQLite history (auto-discovered, no config needed)
     sync_opencode(conn, state)
 
@@ -1426,14 +1545,17 @@ def cmd_search(args):
     """Full-text search across prompts."""
     conn = sqlite3.connect(str(DB_PATH))
     init_db(conn)
-    query = _build_fts_query(args.query, getattr(args, "fts", False))
-
-    sql = (
-        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
-        "FROM history_fts f JOIN history h ON f.rowid = h.id "
-        "WHERE history_fts MATCH ? "
-    )
-    params = [query]
+    if args.query:
+        query = _build_fts_query(args.query, getattr(args, "fts", False))
+        sql = (
+            "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
+            "FROM history_fts f JOIN history h ON f.rowid = h.id "
+            "WHERE history_fts MATCH ? "
+        )
+        params = [query]
+    else:
+        sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1 "
+        params = []
     if args.source:
         sql += "AND h.source = ? "
         params.append(args.source)
@@ -2227,7 +2349,7 @@ def main():
     sub.add_parser("sync", help="Import new entries from history files")
 
     s = sub.add_parser("search", help="Full-text search prompts")
-    s.add_argument("query", nargs="+", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
+    s.add_argument("query", nargs="*", help="Search terms (FTS5: AND/OR/NOT auto-detected; use --fts for raw)")
     s.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--tag", help="Filter by session tag")

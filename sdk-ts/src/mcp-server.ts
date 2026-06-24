@@ -2,7 +2,7 @@
 /**
  * ai-hist MCP server — exposes AI coding agent history as MCP tools.
  *
- * Covers Claude Code, Codex, Cursor, and Agent Relay in a single index.
+ * Covers Claude Code, Codex, Cursor, Grok, and Agent Relay in a single index.
  * Uses the ai-hist SQLite database when present ($AI_HIST_DB or the
  * default ~/.local/share/ai-hist/ai-history.db), falling back to
  * scanning local JSONL source files directly so the server works without
@@ -104,7 +104,7 @@ function fmtTrajectory(t: TrajectoryEntry, maxChars = 500): string {
 const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
 const WRITE_LOCAL = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const REMOTE_READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
-const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "relay", "trajectory", "opencode"]);
+const SOURCE_SCHEMA = z.enum(["claude", "codex", "cursor", "grok", "relay", "trajectory", "opencode"]);
 
 // ---------------------------------------------------------------------------
 // Server
@@ -130,7 +130,7 @@ server.prompt(
           type: "text" as const,
           text: `You are connected to the ai-hist MCP server, which gives you access to a
 unified history of AI coding agent sessions across Claude Code, Codex, Cursor,
-and Agent Relay — all searchable in a single index.
+Grok, OpenCode, Agent Relay, and trajectories — all searchable in a single index.
 
 ## Available tools
 
@@ -230,7 +230,7 @@ server.tool(
 server.tool(
   "search_history",
   "Search your AI coding agent history using full-text search across all prompts " +
-    "from Claude Code, Codex, Cursor, and Agent Relay. Returns matching entries with " +
+    "from Claude Code, Codex, Cursor, Grok, and Agent Relay. Returns matching entries with " +
     "source, project path, session ID, and timestamp ordered by most recent first. " +
     "Supports FTS5 boolean operators (AND, OR, NOT), leading - to exclude a term, and " +
     "trailing * for prefix matching. Use get_session with a returned session_id to read " +

@@ -9,8 +9,8 @@ Code / Codex so your agents get advisory nudges from your team's own past work.
 
 The loop has three stages:
 
-1. **Capture** — `ai-hist` records your AI history (Claude Code, Codex, Cursor, Agent Relay,
-   Trajectories) into a local SQLite DB.
+1. **Capture** — `ai-hist` records your AI history (Claude Code, Codex, Cursor, Grok,
+   Agent Relay, Trajectories) into a local SQLite DB.
 2. **Cloud sync** — `ai-hist push` maps that history into normalized **convergence events**
    and POSTs them to your team's relayhistory-cloud service (`/v1/ingest`).
 3. **Pair** — before a risky action, a hook/MCP tool asks `/v1/pair/check` for advisory

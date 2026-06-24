@@ -1,8 +1,8 @@
 # ai-hist (TypeScript SDK and MCP server)
 
-TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, and Agent Relay.
+TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, Grok, and Agent Relay.
 
-The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file that `ai-hist sync` writes, or falls back to scanning local Claude/Codex/Cursor JSONL files and compacted trajectory JSON when the database is missing.
+The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file that `ai-hist sync` writes, or falls back to scanning local Claude/Codex/Cursor/Grok JSONL files and compacted trajectory JSON when the database is missing.
 
 ## Install
 

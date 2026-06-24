@@ -14,6 +14,7 @@ pub const SOURCE_CHOICES: &[&str] = &[
     "claude",
     "codex",
     "cursor",
+    "grok",
     "relay",
     "trajectory",
     "opencode",
@@ -406,6 +407,9 @@ pub fn search(
     raw_fts: bool,
     filter: &QueryFilter,
 ) -> Result<Vec<HistoryEntry>> {
+    if terms.is_empty() {
+        return recent(conn, filter);
+    }
     let query = build_fts_query(terms, raw_fts);
     let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?".to_string();
     let mut params_vec = vec![query];
@@ -633,6 +637,10 @@ pub fn resume_command(entry: &HistoryEntry) -> Option<String> {
                 )
             },
         )),
+        "grok" => Some(entry.project.as_ref().map_or_else(
+            || format!("grok resume {}", shell_quote(sid)),
+            |p| format!("cd {} && grok resume {}", shell_quote(p), shell_quote(sid)),
+        )),
         _ => None,
     }
 }
@@ -784,6 +792,39 @@ mod tests {
             untag_session(&conn, "s1", "release", Some("claude")).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn empty_search_returns_recent_filtered_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "grok".into(),
+                session_id: Some("g1".into()),
+                project: Some("/p".into()),
+                prompt: "relayfile migration".into(),
+                prompt_hash: Some(prompt_hash("relayfile migration")),
+                timestamp_ms: 2,
+            },
+        )
+        .unwrap();
+        tag_session(&conn, "g1", "Relayfile Migration", Some("grok"), None).unwrap();
+        let rows = search(
+            &conn,
+            &[],
+            false,
+            &QueryFilter {
+                tag: Some("relayfile migration".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "grok");
     }
 
     #[test]

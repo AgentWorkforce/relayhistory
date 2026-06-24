@@ -1,7 +1,7 @@
 # Cloud Sync — push your local history to Agent Relay Loop
 
-`ai-hist` captures your AI-agent history **locally** (Claude Code, Codex, Cursor, Agent
-Relay, Trajectories) into a SQLite database. **Cloud sync** pushes that history to your
+`ai-hist` captures your AI-agent history **locally** (Claude Code, Codex, Cursor, Grok,
+Agent Relay, Trajectories) into a SQLite database. **Cloud sync** pushes that history to your
 team's **Agent Relay Loop** service (`relayhistory-cloud`) so it feeds the shared
 Capture → Learn → Plan → Pair loop.
 

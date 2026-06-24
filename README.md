@@ -1,6 +1,6 @@
 # ai-hist
 
-Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
+Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), Grok, [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
 `ai-hist` is now a Rust-default CLI. The public `ai-hist` command dispatches
 the user-facing command surface through Rust, while the legacy Python CLI
@@ -50,6 +50,7 @@ ai-hist search "refactor" --source claude --limit 10
 ai-hist search "deploy" --source relay
 ai-hist search "retry policy" --source trajectory
 ai-hist search "deploy" --project relay
+ai-hist search --tag relayfile-migration
 
 # Recent prompts
 ai-hist recent                             # last 20
@@ -112,11 +113,12 @@ ai-hist supports these sources:
 | Claude Code | Local JSONL (`~/.claude/history.jsonl`) | `display`, `timestamp`, `project`, `sessionId` |
 | Codex CLI | Local JSONL (`~/.codex/history.jsonl`) | `text`, `ts`, `session_id` |
 | Cursor | Per-session JSONL (`~/.cursor/projects/<encoded-path>/agent-transcripts/<uuid>/<uuid>.jsonl`) | `role`, `message.content[].text` (user prompts wrapped in `<user_query>...`) |
+| Grok | Per-session JSONL (`~/.grok/sessions/<encoded-path>/<session-id>/chat_history.jsonl`) plus `summary.json` | `type`, `content[].text`, `info.cwd`, `head_branch` |
 | [Agent Relay](https://github.com/AgentWorkforce/relay) | API (`https://api.relaycast.dev/v1`) | `sender`, `content`, `channel`, `timestamp` |
 | Trajectories | Compacted per-run JSON (`$TRAJECTORY_ROOT/**/compacted/*.json`) | `personaId`, `projectId`, `task`, `decisions`, `retrospective` |
 | OpenCode | Local SQLite (`$OPENCODE_DB` or `~/.local/share/opencode/opencode.db`) | user text parts joined to sessions |
 
-**Claude Code, Codex & Cursor** are synced from local JSONL files incrementally (byte-offset tracking in `.sync-state.json`). Cursor lines have no per-line timestamp, so the file mtime at sync time is used.
+**Claude Code, Codex, Cursor & Grok** are synced from local JSONL files incrementally. Grok user prompts are read from `chat_history.jsonl`; synthetic reminders are skipped and session metadata comes from `summary.json`.
 
 **Agent Relay** is synced via the [Relaycast API](https://github.com/AgentWorkforce/relaycast), pulling workspace messages with cursor-based pagination. Configure with:
 
@@ -251,7 +253,7 @@ ai-hist watch --interval 30  # syncs every 30s
 ```sql
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'relay', 'trajectory', or 'opencode'
+    source TEXT NOT NULL,          -- 'claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', or 'opencode'
     session_id TEXT,
     project TEXT,
     prompt TEXT NOT NULL,
