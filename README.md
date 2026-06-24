@@ -44,7 +44,6 @@ Escape hatches:
 ```bash
 AI_HIST_CLI=rust ai-hist search deploy
 AI_HIST_CLI=python ai-hist sync   # explicit legacy compatibility path
-AI_HIST_RUST_BIN=/absolute/path/to/ai-hist-rust-bin ai-hist search deploy
 ai-hist-rust search deploy
 ai-hist-python sync
 ```
@@ -223,11 +222,6 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
         <string>${HOME}/.local/bin/ai-hist</string>
         <string>sync</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>AI_HIST_RUST_BIN</key>
-        <string>${HOME}/.local/share/ai-hist/ai-hist-rust-bin</string>
-    </dict>
     <key>StartInterval</key>
     <integer>60</integer>
     <key>RunAtLoad</key>

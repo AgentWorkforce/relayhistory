@@ -78,6 +78,22 @@ def seed_via_wrapper(tmp_path):
     return env, db
 
 
+def ensure_rust_binary():
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    target_dir = Path(json.loads(metadata.stdout)["target_directory"])
+    built = target_dir / "debug" / ("ai-hist.exe" if os.name == "nt" else "ai-hist")
+    if not built.exists():
+        subprocess.run(["cargo", "build", "-q", "-p", "ai-hist-cli"], cwd=ROOT, check=True)
+    return built
+
+
 def test_sync_routes_to_rust_and_preserves_db(tmp_path):
     env, db = seed_via_wrapper(tmp_path)
     conn = sqlite3.connect(db)
@@ -175,9 +191,7 @@ def test_escape_hatches_force_python_or_rust(tmp_path):
 
 def test_explicit_rust_binary_escape_hatch(tmp_path):
     env, _db = seed_via_wrapper(tmp_path)
-    built = ROOT / "target" / "debug" / "ai-hist"
-    if not built.exists():
-        subprocess.run(["cargo", "build", "-q", "-p", "ai-hist-cli"], cwd=ROOT, check=True)
+    built = ensure_rust_binary()
     result = run_cli(
         ["search", "dispatch", "--json"],
         env | {"AI_HIST_RUST_BIN": str(built)},
@@ -195,7 +209,70 @@ def test_top_level_help_lists_rust_and_fallback_commands(tmp_path):
     assert "search" in result.stdout
     assert "sync" in result.stdout
     assert "show" in result.stdout
+    assert "login" in result.stdout
+    assert "pair" in result.stdout
+    assert "learn" in result.stdout
     assert "DISPATCH_MATRIX.md" in result.stdout
+
+
+def test_rust_binary_help_uses_public_name_and_describes_commands(tmp_path):
+    env, _db, _home = isolated_env(tmp_path)
+    built = ensure_rust_binary()
+    result = subprocess.run(
+        [str(built), "--help"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Usage: ai-hist [OPTIONS] <COMMAND>" in result.stdout
+    assert "ai-hist-rust-bin" not in result.stdout
+    assert "Search prompts and sessions" in result.stdout
+    assert "Authenticate to relayhistory-cloud" in result.stdout
+
+
+def test_all_rust_command_help_forms_work(tmp_path):
+    env, _db, _home = isolated_env(tmp_path)
+    built = ensure_rust_binary()
+    commands = [
+        ["search"],
+        ["recent"],
+        ["session"],
+        ["show"],
+        ["context"],
+        ["stats"],
+        ["tag"],
+        ["untag"],
+        ["tags"],
+        ["resume"],
+        ["sync-opencode"],
+        ["sync"],
+        ["watch"],
+        ["pack"],
+        ["export"],
+        ["import"],
+        ["login"],
+        ["admin-mint"],
+        ["push"],
+        ["pair"],
+        ["pair", "check"],
+        ["learn"],
+        ["learn", "distill"],
+    ]
+    for command in commands:
+        result = subprocess.run(
+            [str(built), *command, "--help"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (command, result.stderr)
+        assert "ai-hist-rust-bin" not in result.stdout
+        assert "Usage: ai-hist" in result.stdout
 
 
 def test_rust_default_validates_source_choices(tmp_path):

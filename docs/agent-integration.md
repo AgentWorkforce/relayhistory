@@ -108,7 +108,7 @@ Empty result → `{"decision":"allow","warnings":[]}` → the hook no-ops cleanl
 
 ```bash
 # one-time: build + authenticate (see docs/cloud-sync.md)
-npx agent-relay cloud login                                # prod; hides auth/token plumbing
+ai-hist login                                             # prod; uses canonical Agent Relay Cloud auth
 ai-hist admin-mint --base-url <dev-url> --org <org> --user "$USER"   # dev only; reads $ADMIN_MINT_SECRET from env (never pass via --flag → argv/ps exposure)
 
 # every session

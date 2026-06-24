@@ -21,6 +21,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
+
 /// Locally stored service-local session (never the RelayAuth JWT). Written `0600`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAuth {
@@ -46,6 +48,23 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".agentworkforce/relayhistory")
+}
+
+pub fn default_base_url() -> String {
+    ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find_map(|value| normalize_base_url(&value))
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+}
+
+fn normalize_base_url(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn auth_path() -> PathBuf {
@@ -254,11 +273,20 @@ pub fn admin_mint(
 }
 
 /// `POST /v1/cli/login` (RelayAuth JWT → `rth_at_`/`rth_rt_`) — the real-use bootstrap.
-pub fn login(base_url: &str, agent_relay_token: &str, label: &str) -> Result<StoredAuth> {
+pub fn login(
+    base_url: &str,
+    agent_relay_token: &str,
+    label: &str,
+    mode: Option<&str>,
+) -> Result<StoredAuth> {
     let url = format!("{}/v1/cli/login", base_url.trim_end_matches('/'));
+    let mut body = serde_json::json!({ "agentRelayToken": agent_relay_token, "label": label });
+    if let Some(mode) = mode {
+        body["mode"] = serde_json::json!(mode);
+    }
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
-        .send_json(serde_json::json!({ "agentRelayToken": agent_relay_token, "label": label }))
+        .send_json(body)
         .map_err(map_http_err)?;
     let v: serde_json::Value = resp.into_json()?;
     Ok(StoredAuth {
@@ -276,64 +304,122 @@ pub fn login(base_url: &str, agent_relay_token: &str, label: &str) -> Result<Sto
     })
 }
 
-/// The relayhistory session JSON returned by `agent-relay cloud relayhistory-session --json`.
-/// Only the final session is parsed — no upstream Cloud/RelayAuth token is present in this shape.
-#[derive(serde::Deserialize)]
-struct CloudSessionResponse {
-    #[serde(rename = "baseUrl")]
-    base_url: String,
+/// The canonical Agent Relay Cloud session returned by `agent-relay cloud session --json`.
+/// This is the same credential source used by relayfile/workforce. It is captured only long
+/// enough to exchange it for a service-local relayhistory session.
+#[derive(Debug, serde::Deserialize)]
+struct AgentRelayCloudSession {
+    #[serde(rename = "apiUrl")]
+    _api_url: Option<String>,
     #[serde(rename = "accessToken")]
     access_token: String,
-    #[serde(rename = "refreshToken")]
-    refresh_token: Option<String>,
-    #[serde(rename = "orgId")]
-    org_id: Option<String>,
-    #[serde(rename = "workspaceId")]
-    workspace_id: Option<String>,
 }
 
-/// Cloud-bridge login: shell to the already-authenticated Agent Relay Cloud CLI, which performs
-/// the **server-to-server** exchange (Cloud mints a short-lived `aud=relayhistory` assertion and
-/// calls `/v1/cli/login` itself) and returns ONLY the final `rth_*` session. The client never
-/// handles a Cloud or RelayAuth token — it consumes the session JSON on stdout and stores it 0600.
-/// `mode` is a least-privilege *ceiling request* (`read` | `sync`); Cloud authorizes the actual
-/// scope it signs. The relayhistory target is **server-configured by Cloud**, never client-supplied
-/// — a client-chosen URL would let Cloud send a signed `aud=relayhistory` assertion to an arbitrary
-/// host (SSRF / token exfil). The returned `baseUrl` tells the client where the session belongs.
-pub fn login_via_cloud(mode: &str, workspace: Option<&str>) -> Result<StoredAuth> {
-    if mode != "read" && mode != "sync" {
-        anyhow::bail!("invalid --mode '{mode}' (expected `read` or `sync`)");
-    }
-    // Allow overriding the binary for tests / non-standard installs; default to PATH lookup.
-    let bin = std::env::var("AGENT_RELAY_BIN").unwrap_or_else(|_| "agent-relay".to_string());
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["cloud", "relayhistory-session", "--json", "--mode", mode]);
-    if let Some(ws) = workspace {
-        cmd.args(["--workspace", ws]);
-    }
-    let output = cmd.output().with_context(|| {
-        format!("failed to run `{bin} cloud relayhistory-session` — is the Agent Relay CLI installed and logged in? (`agent-relay login`)")
-    })?;
+fn env_agent_relay_session() -> Option<AgentRelayCloudSession> {
+    std::env::var("CLOUD_API_ACCESS_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .map(|access_token| AgentRelayCloudSession {
+            _api_url: std::env::var("CLOUD_API_URL").ok(),
+            access_token,
+        })
+}
+
+fn agent_relay_bin() -> String {
+    std::env::var("AGENT_RELAY_BIN").unwrap_or_else(|_| "agent-relay".to_string())
+}
+
+fn read_agent_relay_session(bin: &str) -> Result<AgentRelayCloudSession> {
+    let output = std::process::Command::new(bin)
+        .args(["cloud", "session", "--json"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run `{bin} cloud session --json` — install Agent Relay and run `agent-relay login`"
+            )
+        })?;
     if !output.status.success() {
-        // Surface stderr (user-facing auth prompts/errors) but NEVER stdout — stdout may carry a
-        // partial/!-redacted session.
+        // Surface stderr (user-facing auth prompts/errors) but NEVER stdout — stdout contains the
+        // bearer token when this command succeeds or partially succeeds.
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "Agent Relay Cloud login failed ({}). {}",
+            "Agent Relay Cloud session lookup failed ({}). {}",
             output.status,
             stderr.trim()
         );
     }
-    let session: CloudSessionResponse = serde_json::from_slice(&output.stdout).context(
-        "parsing relayhistory session JSON from `agent-relay cloud relayhistory-session`",
-    )?;
-    Ok(StoredAuth {
-        base_url: session.base_url.trim_end_matches('/').to_string(),
-        access_token: session.access_token,
-        refresh_token: session.refresh_token,
-        org_id: session.org_id,
-        workspace_id: session.workspace_id,
-    })
+    serde_json::from_slice(&output.stdout)
+        .context("parsing Agent Relay Cloud session JSON from `agent-relay cloud session --json`")
+}
+
+fn ensure_agent_relay_session(
+    bin: &str,
+    workspace: Option<&str>,
+) -> Result<AgentRelayCloudSession> {
+    if let Some(ws) = workspace {
+        anyhow::bail!(
+            "`--workspace {ws}` is not supported for Cloud login yet because `agent-relay cloud session` has no non-mutating workspace-scoped mode; switch the active workspace with Agent Relay first, then rerun without `--workspace`"
+        );
+    }
+
+    if let Some(session) = env_agent_relay_session() {
+        return Ok(session);
+    }
+
+    match read_agent_relay_session(bin) {
+        Ok(session) => Ok(session),
+        Err(first_error) => {
+            eprintln!("Agent Relay Cloud login required; starting `agent-relay cloud login`.");
+            let status = std::process::Command::new(bin)
+                .args(["cloud", "login"])
+                .status()
+                .with_context(|| {
+                    format!(
+                        "failed to run `{bin} cloud login` — install Agent Relay and run `agent-relay login`"
+                    )
+                })?;
+            if !status.success() {
+                anyhow::bail!(
+                    "Agent Relay Cloud login failed ({status}). Previous session lookup error: {first_error}"
+                );
+            }
+            read_agent_relay_session(bin)
+        }
+    }
+}
+
+/// Cloud login: use the canonical Agent Relay Cloud session, then exchange that bearer for a
+/// service-local `rth_*` relayhistory session via `/v1/cli/login`.
+pub fn login_via_cloud(
+    base_url: &str,
+    mode: &str,
+    workspace: Option<&str>,
+    label: &str,
+) -> Result<StoredAuth> {
+    if mode != "read" && mode != "sync" {
+        anyhow::bail!("invalid --mode '{mode}' (expected `read` or `sync`)");
+    }
+    validate_cloud_exchange_base_url(base_url)?;
+    let bin = agent_relay_bin();
+    let session = ensure_agent_relay_session(&bin, workspace)?;
+    login(base_url, &session.access_token, label, Some(mode))
+}
+
+fn validate_cloud_exchange_base_url(base_url: &str) -> Result<()> {
+    let normalized = normalize_base_url(base_url).context("relayhistory base URL is empty")?;
+    if normalized == DEFAULT_BASE_URL {
+        return Ok(());
+    }
+    let allowed = std::env::var("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if allowed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send the Agent Relay Cloud bearer to non-default relayhistory URL `{normalized}`; use manual `--token` login or set RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1 for a trusted dev endpoint"
+    )
 }
 
 fn field(v: &serde_json::Value, key: &str) -> Result<String> {
@@ -513,13 +599,40 @@ mod tests {
     // runner can't clobber it across tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("RELAYHISTORY_HOME", dir.path());
-        let out = f();
-        std::env::remove_var("RELAYHISTORY_HOME");
-        out
+        let _relayhistory_home = EnvVarGuard::set("RELAYHISTORY_HOME", dir.path());
+        f()
     }
 
     #[test]
@@ -709,19 +822,78 @@ mod tests {
         (dir, path)
     }
 
+    fn one_shot_login_server(
+        expected_agent_relay_token: &'static str,
+        expected_mode: Option<&'static str>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).unwrap();
+            assert!(first_line.starts_with("POST /v1/cli/login "));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["agentRelayToken"], expected_agent_relay_token);
+            if let Some(mode) = expected_mode {
+                assert_eq!(payload["mode"], mode);
+            } else {
+                assert!(payload.get("mode").is_none());
+            }
+            let response_body = r#"{"accessToken":"rth_at_abc","refreshToken":"rth_rt_def","orgId":"org_dev","workspaceId":"ws_dev","tokenType":"Bearer"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[cfg(unix)]
     #[test]
-    fn login_via_cloud_parses_and_maps_session() {
+    fn login_via_cloud_exchanges_agent_relay_session() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The fake Cloud CLI emits ONLY the final relayhistory session JSON on stdout.
+        let (base_url, server) = one_shot_login_server("relay_at_abc", Some("sync"));
         let (_dir, bin) = fake_agent_relay(
-            r#"echo '{"baseUrl":"https://history.agentrelay.com/","accessToken":"rth_at_abc","refreshToken":"rth_rt_def","orgId":"org_dev","workspaceId":"ws_dev","tokenType":"Bearer"}'"#,
+            r#"if [ "$1 $2 $3" = "cloud session --json" ]; then
+  echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
+  exit 0
+fi
+echo "unexpected args: $*" 1>&2
+exit 42"#,
         );
-        std::env::set_var("AGENT_RELAY_BIN", &bin);
-        let auth = login_via_cloud("sync", None).unwrap();
-        std::env::remove_var("AGENT_RELAY_BIN");
+        let _agent_relay_bin = EnvVarGuard::set("AGENT_RELAY_BIN", bin.as_os_str());
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let _allow_dev_base_url =
+            EnvVarGuard::set("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL", "1");
+        let auth = login_via_cloud(&base_url, "sync", None, "test-label").unwrap();
+        server.join().unwrap();
 
-        assert_eq!(auth.base_url, "https://history.agentrelay.com"); // trailing slash trimmed
+        assert_eq!(auth.base_url, base_url);
         assert_eq!(auth.access_token, "rth_at_abc");
         assert_eq!(auth.refresh_token.as_deref(), Some("rth_rt_def"));
         assert_eq!(auth.org_id.as_deref(), Some("org_dev"));
@@ -730,15 +902,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn login_via_cloud_surfaces_stderr_never_stdout_on_failure() {
+    fn cloud_session_failure_surfaces_stderr_never_stdout() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Failing exit: stdout carries a (would-be) secret; stderr carries the user-facing reason.
         let (_dir, bin) = fake_agent_relay(
             "echo 'rth_at_LEAKED_TOKEN_SHOULD_NOT_SURFACE'; echo 'not logged in: run agent-relay login' 1>&2; exit 1",
         );
-        std::env::set_var("AGENT_RELAY_BIN", &bin);
-        let err = login_via_cloud("sync", None).unwrap_err().to_string();
-        std::env::remove_var("AGENT_RELAY_BIN");
+        let err = read_agent_relay_session(bin.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
 
         assert!(
             err.contains("not logged in"),
@@ -753,7 +925,49 @@ mod tests {
 
     #[test]
     fn login_via_cloud_rejects_invalid_mode() {
-        let err = login_via_cloud("admin", None).unwrap_err().to_string();
+        let err = login_via_cloud("https://history.agentrelay.com", "admin", None, "test")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid --mode"), "{err}");
+    }
+
+    #[test]
+    fn login_via_cloud_rejects_workspace_without_mutating_global_agent_relay_state() {
+        let err = login_via_cloud(
+            "https://history.agentrelay.com",
+            "sync",
+            Some("workspace-a"),
+            "test",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not supported for Cloud login"), "{err}");
+        assert!(err.contains("non-mutating"), "{err}");
+    }
+
+    #[test]
+    fn login_via_cloud_rejects_non_default_base_url_without_explicit_dev_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _allow = EnvVarGuard::remove("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL");
+        let err = login_via_cloud("http://localhost:8787", "sync", None, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to send"), "{err}");
+    }
+
+    #[test]
+    fn default_base_url_honors_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _relayhistory_base_url =
+            EnvVarGuard::set("RELAYHISTORY_BASE_URL", "http://localhost:8787/");
+        assert_eq!(default_base_url(), "http://localhost:8787");
+    }
+
+    #[test]
+    fn default_base_url_falls_through_empty_primary_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _relayhistory_base_url = EnvVarGuard::set("RELAYHISTORY_BASE_URL", "///");
+        let _ai_hist_base_url = EnvVarGuard::set("AI_HIST_BASE_URL", "http://localhost:8787/");
+        assert_eq!(default_base_url(), "http://localhost:8787");
     }
 }

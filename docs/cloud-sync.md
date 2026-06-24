@@ -83,18 +83,21 @@ Prod auth goes through **Agent Relay Cloud**. End users should not mint tokens, 
 internal auth services, or handle internal API keys.
 
 ```bash
-# 1. Sign in to Agent Relay Cloud. Cloud provisions the relayhistory session.
-npx agent-relay cloud login
+export RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod"
+
+# 1. Sign in to Agent Relay Cloud and exchange that session for relayhistory auth.
+ai-hist login
 
 # 2. Push with the stored prod relayhistory session.
-RELAYHISTORY_HOME="$HOME/.agentworkforce/relayhistory-prod" \
-  ai-hist push --json
+ai-hist push --json
 ```
 
-Current implementation note: older `ai-hist` builds may still expose a manual auth handoff.
-That handoff value is internal Cloud/relayhistory plumbing, not something a user should
-mint manually. If your build still requires it, ask your Agent Relay Cloud admin for the
-Cloud-provisioned handoff or wait for the first-class browser/device login flow.
+`ai-hist login` uses the same canonical Agent Relay Cloud login as relayfile/workforce. If
+you are not already signed in, it will start `agent-relay cloud login`. Cloud login
+defaults to prod; for dev/local targets use `admin-mint` or explicit manual `--token`
+login. To test Cloud exchange against a trusted non-prod endpoint, set
+`RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1` with `--base-url` or
+`RELAYHISTORY_BASE_URL`.
 
 ---
 
