@@ -7,10 +7,12 @@ Zero dependencies — Python standard library only.
 """
 
 import argparse
+import datetime
 import gzip
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -19,6 +21,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from pathlib import Path
+from typing import Optional
 
 # --- Configuration -----------------------------------------------------------
 
@@ -868,7 +871,6 @@ def sync_grok(conn: sqlite3.Connection, state: dict):
         if grok_state.get(key) == stamp:
             continue
         scanned += 1
-        grok_state[key] = stamp
 
         summary = {}
         try:
@@ -882,8 +884,8 @@ def sync_grok(conn: sqlite3.Connection, state: dict):
         session_id = info.get("id") or chat_path.parent.name
         cwd = info.get("cwd") or summary.get("git_root_dir") or _grok_project_from_path(chat_path)
         git_branch = summary.get("head_branch")
-        created_ms = _iso_to_ms(summary.get("created_at")) if summary.get("created_at") else int(chat_stat.st_mtime * 1000)
-        updated_ms = _iso_to_ms(summary.get("updated_at")) if summary.get("updated_at") else created_ms
+        created_ms = _iso_to_ms(summary.get("created_at")) or int(chat_stat.st_mtime * 1000)
+        updated_ms = _iso_to_ms(summary.get("updated_at")) or created_ms
         prompts = []
         last_assistant_text = None
         try:
@@ -920,6 +922,7 @@ def sync_grok(conn: sqlite3.Connection, state: dict):
             if cur.rowcount > 0:
                 inserted += 1
         sessions += 1
+        grok_state[key] = stamp
 
     conn.commit()
     state["grok_sessions"] = grok_state
@@ -1148,7 +1151,7 @@ def _relay_msg_to_row(msg: dict, channel: str):
         return None
     sender = msg.get("from_name") or msg.get("from_id") or ""
     created_at = msg.get("created_at", "")
-    ts_ms = _iso_to_ms(created_at) if created_at else 0
+    ts_ms = _iso_to_ms(created_at) or 0
     prompt = f"[{sender}] {text}" if sender else text
     return {
         "source": "relay",
@@ -1160,19 +1163,31 @@ def _relay_msg_to_row(msg: dict, channel: str):
     }
 
 
-def _iso_to_ms(iso_str: str) -> int:
+def _iso_to_ms(iso_str) -> Optional[int]:
     """Parse ISO 8601 datetime string to milliseconds since epoch."""
-    iso_str = iso_str.rstrip("Z").split("+")[0]
-    frac = 0
-    if "." in iso_str:
-        base, frac_str = iso_str.rsplit(".", 1)
-        frac = int(frac_str.ljust(3, "0")[:3])
-        iso_str = base
+    if not isinstance(iso_str, str) or not iso_str:
+        return None
+    normalized = f"{iso_str[:-1]}+00:00" if iso_str.endswith("Z") else iso_str
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?([+-]\d{2}:?\d{2})?",
+        normalized,
+    )
+    if not match:
+        return None
+    base, frac, offset = match.groups()
     try:
-        t = time.strptime(iso_str, "%Y-%m-%dT%H:%M:%S")
+        dt = datetime.datetime.strptime(base, "%Y-%m-%dT%H:%M:%S")
     except ValueError:
-        return 0
-    return int(time.mktime(t)) * 1000 + frac
+        return None
+    if frac:
+        dt = dt.replace(microsecond=int(frac.ljust(6, "0")[:6]))
+    if offset:
+        sign = 1 if offset[0] == "+" else -1
+        hours = int(offset[1:3])
+        minutes = int(offset[-2:])
+        tz = datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
+        dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp() * 1000)
 
 
 # --- Trajectories ------------------------------------------------------------

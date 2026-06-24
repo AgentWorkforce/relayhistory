@@ -114,6 +114,7 @@ def test_search_tag_without_query_routes_to_rust(tmp_path):
     assert tag.returncode == 0, tag.stderr
     result = run_cli(["search", "--tag", "relayfile-migration", "--json"], env)
     assert result.returncode == 0, result.stderr
+    assert "deprecated Python fallback" not in result.stderr
     rows = json.loads(result.stdout)
     assert [row["session_id"] for row in rows] == ["claude-dispatch"]
 

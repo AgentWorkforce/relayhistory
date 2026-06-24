@@ -2185,7 +2185,6 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             continue;
         }
         scanned += 1;
-        grok_state.insert(key, json!(stamp));
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
@@ -2215,8 +2214,11 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                     )?;
                 }
                 sessions += 1;
+                grok_state.insert(key, json!(stamp));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                grok_state.insert(key, json!(stamp));
+            }
             Err(_) => errors += 1,
         }
     }
@@ -2293,7 +2295,9 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
 
     let mut prompts = Vec::new();
     let mut last_assistant_text = None;
-    for line in fs::read_to_string(chat).unwrap_or_default().lines() {
+    let contents = fs::read_to_string(chat)
+        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
+    for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -2338,7 +2342,11 @@ fn percent_decode_path(raw: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+            if let Some(hex) = bytes
+                .get(i + 1..i + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
                 out.push(hex);
                 i += 3;
                 continue;

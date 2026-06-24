@@ -2,7 +2,7 @@
 /**
  * ai-hist MCP server — exposes AI coding agent history as MCP tools.
  *
- * Covers Claude Code, Codex, Cursor, Grok, and Agent Relay in a single index.
+ * Covers Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay, and trajectories in a single index.
  * Uses the ai-hist SQLite database when present ($AI_HIST_DB or the
  * default ~/.local/share/ai-hist/ai-history.db), falling back to
  * scanning local JSONL source files directly so the server works without
@@ -230,7 +230,7 @@ server.tool(
 server.tool(
   "search_history",
   "Search your AI coding agent history using full-text search across all prompts " +
-    "from Claude Code, Codex, Cursor, Grok, and Agent Relay. Returns matching entries with " +
+    "from Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay, and trajectories. Returns matching entries with " +
     "source, project path, session ID, and timestamp ordered by most recent first. " +
     "Supports FTS5 boolean operators (AND, OR, NOT), leading - to exclude a term, and " +
     "trailing * for prefix matching. Use get_session with a returned session_id to read " +

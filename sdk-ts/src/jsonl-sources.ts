@@ -35,10 +35,10 @@ const CODEX_HISTORY = join(homedir(), '.codex', 'history.jsonl');
 const CURSOR_ROOT = join(homedir(), '.cursor', 'projects');
 const GROK_SESSIONS_ROOT = join(homedir(), '.grok', 'sessions');
 
-async function safeStat(path: string): Promise<{ size: number; mtimeMs: number } | null> {
+async function safeStat(path: string): Promise<{ isDirectory: boolean; isFile: boolean; size: number; mtimeMs: number } | null> {
   try {
     const s = await stat(path);
-    return { size: s.size, mtimeMs: s.mtimeMs };
+    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: s.mtimeMs };
   } catch {
     return null;
   }
@@ -166,9 +166,9 @@ async function collectMatchingFiles(root: string, filename: string, out: string[
     const full = join(root, name);
     const child = await safeStat(full);
     if (!child) continue;
-    if (name === filename) {
+    if (name === filename && child.isFile) {
       out.push(full);
-    } else {
+    } else if (child.isDirectory) {
       await collectMatchingFiles(full, filename, out);
     }
   }

@@ -1194,11 +1194,14 @@ class TestIsoToMs:
         ms = ai_hist._iso_to_ms("2026-03-07T20:13:00+00:00")
         assert ms > 0
 
+    def test_iso_z_is_utc(self):
+        assert ai_hist._iso_to_ms("1970-01-01T00:00:01Z") == 1000
+
     def test_iso_invalid(self):
-        assert ai_hist._iso_to_ms("not a date") == 0
+        assert ai_hist._iso_to_ms("not a date") is None
 
     def test_iso_empty(self):
-        assert ai_hist._iso_to_ms("") == 0
+        assert ai_hist._iso_to_ms("") is None
 
 
 class TestRelayMsgToRow:
