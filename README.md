@@ -209,8 +209,13 @@ npx -y ai-hist-mcp --project /path/to/project
 
 Create a launchd plist to sync every 60 seconds:
 
+The unquoted heredoc (`<< EOF`) expands `$HOME` to an absolute path as the
+file is written — launchd does **not** expand `${HOME}` in `ProgramArguments`,
+so the path must be literal. Point it directly at the `ai-hist` wrapper; do not
+prefix it with `python3` (the wrapper dispatches to the Rust binary itself).
+
 ```bash
-cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -219,7 +224,7 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
     <string>com.ai-hist.sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${HOME}/.local/bin/ai-hist</string>
+        <string>$HOME/.local/bin/ai-hist</string>
         <string>sync</string>
     </array>
     <key>StartInterval</key>
@@ -234,10 +239,15 @@ cat > ~/Library/LaunchAgents/com.ai-hist.sync.plist << 'EOF'
 </plist>
 EOF
 
+# Reload (idempotent — unload any previous version first)
+launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist 2>/dev/null
 launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 ```
 
-> Replace `${HOME}/.local/bin/ai-hist` with the wrapper path you installed if needed.
+> Replace `$HOME/.local/bin/ai-hist` with the wrapper path you installed if
+> needed, then confirm the job is healthy with
+> `launchctl list | grep ai-hist` (the middle "last exit status" column should
+> be `0`, not `1`).
 
 ### Linux (cron)
 
