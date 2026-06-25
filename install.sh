@@ -290,6 +290,17 @@ else
   install_from_source
 fi
 
+# Register the background sync service so history stays fresh automatically.
+# Opt out with AI_HIST_NO_AUTOSYNC=1 (e.g. CI, or to manage scheduling yourself).
+if [ "${AI_HIST_NO_AUTOSYNC:-0}" = "1" ]; then
+  info "skipping auto-sync service install (AI_HIST_NO_AUTOSYNC=1)"
+elif "$BIN_DIR/ai-hist" sync --install-service; then
+  info "background sync service installed; history will sync automatically"
+else
+  warn "could not install the background sync service automatically"
+  warn "run '$BIN_DIR/ai-hist sync --install-service' yourself, or see the README"
+fi
+
 cat <<EOF
 ai-hist installed.
 

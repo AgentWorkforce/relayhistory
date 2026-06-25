@@ -141,7 +141,19 @@ enum Command {
         opencode_db: Option<PathBuf>,
     },
     /// Sync local agent history into the relayhistory database.
-    Sync,
+    Sync {
+        /// Install a background service (launchd on macOS, cron on Linux) that
+        /// runs `sync` on an interval so the database stays fresh automatically.
+        #[arg(long)]
+        install_service: bool,
+        /// Remove the background sync service installed by --install-service.
+        #[arg(long, conflicts_with = "install_service")]
+        uninstall_service: bool,
+        /// Seconds between syncs for the installed service (macOS only; cron
+        /// runs at 1-minute granularity).
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
     /// Repeatedly sync local agent history.
     Watch {
         #[arg(long, default_value_t = 60)]
@@ -518,7 +530,19 @@ fn main() -> Result<()> {
             println!("  [opencode] +{inserted} rows");
             Ok(())
         }
-        Command::Sync => sync_basic(&conn, &db_path),
+        Command::Sync {
+            install_service,
+            uninstall_service,
+            interval,
+        } => {
+            if install_service {
+                install_sync_service(interval)
+            } else if uninstall_service {
+                uninstall_sync_service()
+            } else {
+                sync_basic(&conn, &db_path)
+            }
+        }
         Command::Watch { interval } => watch_loop(&db_path, interval),
         Command::Export {
             output,
@@ -1371,6 +1395,174 @@ fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
             Err(err) => eprintln!("Error: {err}"),
         }
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+const SYNC_SERVICE_LABEL: &str = "com.ai-hist.sync";
+const CRON_MARKER: &str = "# ai-hist sync (managed)";
+
+fn launchd_plist_path() -> PathBuf {
+    home_dir().join("Library/LaunchAgents/com.ai-hist.sync.plist")
+}
+
+/// Resolve the absolute path of the running ai-hist binary so the service
+/// invokes it directly — never through a shell wrapper or `python3`, which is
+/// what historically broke the launchd job.
+fn service_binary() -> Result<PathBuf> {
+    std::env::current_exe().context("could not resolve the ai-hist binary path for the service")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn install_sync_service(interval: u64) -> Result<()> {
+    let bin = service_binary()?;
+    let bin = bin.to_string_lossy();
+    if cfg!(target_os = "macos") {
+        install_launchd_service(&bin, interval)
+    } else if cfg!(target_os = "linux") {
+        install_cron_service(&bin, interval)
+    } else {
+        anyhow::bail!(
+            "Automatic sync service install is only supported on macOS and Linux. \
+             Run `ai-hist watch` to keep syncing in the foreground instead."
+        )
+    }
+}
+
+fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
+    let plist_path = launchd_plist_path();
+    if let Some(dir) = plist_path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>sync</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{interval}</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/ai-hist-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ai-hist-sync.err</string>
+</dict>
+</plist>
+"#,
+        label = SYNC_SERVICE_LABEL,
+        bin = xml_escape(bin),
+        interval = interval,
+    );
+    fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
+
+    // Reload idempotently: unload any previous version (ignoring errors), then load.
+    let _ = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg(&plist_path)
+        .status();
+    let status = std::process::Command::new("launchctl")
+        .arg("load")
+        .arg(&plist_path)
+        .status()
+        .context("running launchctl load")?;
+    if !status.success() {
+        anyhow::bail!("launchctl load failed for {}", plist_path.display());
+    }
+
+    println!("Installed launchd sync service ({SYNC_SERVICE_LABEL}); syncing every {interval}s.");
+    println!("  plist: {}", plist_path.display());
+    println!("  check: launchctl list | grep ai-hist   (middle column 0 = healthy)");
+    println!("  remove: ai-hist sync --uninstall-service");
+    Ok(())
+}
+
+fn read_crontab() -> String {
+    match std::process::Command::new("crontab").arg("-l").output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        // No crontab yet (or `crontab -l` errors on an empty table) — start fresh.
+        _ => String::new(),
+    }
+}
+
+fn write_crontab(contents: &str) -> Result<()> {
+    let mut child = std::process::Command::new("crontab")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("running `crontab -` (is cron installed?)")?;
+    child
+        .stdin
+        .take()
+        .context("failed to open crontab stdin")?
+        .write_all(contents.as_bytes())?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("crontab update failed");
+    }
+    Ok(())
+}
+
+fn install_cron_service(bin: &str, interval: u64) -> Result<()> {
+    if interval != 60 {
+        eprintln!(
+            "Note: cron runs at 1-minute granularity; ignoring --interval={interval} and \
+             scheduling every minute."
+        );
+    }
+    let line = format!("* * * * * {bin} sync >> /tmp/ai-hist-sync.log 2>&1 {CRON_MARKER}");
+    // Drop any previously managed line, then append the current one.
+    let mut lines: Vec<String> = read_crontab()
+        .lines()
+        .filter(|l| !l.contains(CRON_MARKER))
+        .map(str::to_string)
+        .collect();
+    lines.push(line);
+    write_crontab(&format!("{}\n", lines.join("\n")))?;
+
+    println!("Installed cron sync job; syncing every minute.");
+    println!("  view:   crontab -l");
+    println!("  remove: ai-hist sync --uninstall-service");
+    Ok(())
+}
+
+fn uninstall_sync_service() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist_path = launchd_plist_path();
+        let _ = std::process::Command::new("launchctl")
+            .arg("unload")
+            .arg(&plist_path)
+            .status();
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)
+                .with_context(|| format!("removing {}", plist_path.display()))?;
+            println!("Removed launchd sync service.");
+        } else {
+            println!("No launchd sync service installed.");
+        }
+        Ok(())
+    } else if cfg!(target_os = "linux") {
+        let kept: Vec<String> = read_crontab()
+            .lines()
+            .filter(|l| !l.contains(CRON_MARKER))
+            .map(str::to_string)
+            .collect();
+        write_crontab(&format!("{}\n", kept.join("\n")))?;
+        println!("Removed cron sync job.");
+        Ok(())
+    } else {
+        anyhow::bail!("No managed sync service exists on this platform.")
     }
 }
 
@@ -3004,8 +3196,18 @@ fn home_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_trajectory_file, strip_url_credentials};
+    use super::{parse_trajectory_file, strip_url_credentials, xml_escape};
     use std::fs;
+
+    #[test]
+    fn xml_escape_protects_plist_path() {
+        // A binary path with shell/XML metacharacters must not break the plist.
+        assert_eq!(
+            xml_escape("/home/a&b/<bin>/ai-hist"),
+            "/home/a&amp;b/&lt;bin&gt;/ai-hist"
+        );
+        assert_eq!(xml_escape("/usr/local/bin/ai-hist"), "/usr/local/bin/ai-hist");
+    }
 
     #[test]
     fn strips_embedded_token_from_https_remote() {

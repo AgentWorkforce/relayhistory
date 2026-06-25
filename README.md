@@ -205,9 +205,33 @@ npx -y ai-hist-mcp --project .
 npx -y ai-hist-mcp --project /path/to/project
 ```
 
-## Continuous sync (macOS)
+## Continuous sync
 
-Create a launchd plist to sync every 60 seconds:
+The installer sets up a background sync service automatically, so history stays
+fresh without any manual step. To opt out at install time, set
+`AI_HIST_NO_AUTOSYNC=1`.
+
+To manage it yourself at any time:
+
+```bash
+ai-hist sync --install-service    # launchd on macOS, cron on Linux
+ai-hist sync --uninstall-service  # remove it
+ai-hist sync                      # run a one-off sync now
+```
+
+`--install-service` points the scheduler directly at the resolved `ai-hist`
+binary (no shell wrapper, no `python3`) and reloads idempotently, so it can't
+fall into the stale-interpreter trap the hand-written plist below historically
+hit. On macOS, pass `--interval <seconds>` to change the cadence (default 60;
+cron runs at 1-minute granularity). Verify health with:
+
+```bash
+launchctl list | grep ai-hist   # middle "last exit status" column should be 0
+```
+
+### Manual setup (macOS)
+
+If you prefer to write the launchd plist by hand, sync every 60 seconds with:
 
 The unquoted heredoc (`<< EOF`) expands `$HOME` to an absolute path as the
 file is written — launchd does **not** expand `${HOME}` in `ProgramArguments`,
@@ -249,7 +273,7 @@ launchctl load ~/Library/LaunchAgents/com.ai-hist.sync.plist
 > `launchctl list | grep ai-hist` (the middle "last exit status" column should
 > be `0`, not `1`).
 
-### Linux (cron)
+### Manual setup (Linux, cron)
 
 ```bash
 # Sync every minute
