@@ -46,6 +46,12 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        #[arg(long, default_value = "all")]
+        role: String,
+        #[arg(long)]
+        agent: bool,
+        #[arg(long)]
+        human: bool,
         #[arg(long, default_value_t = 20)]
         limit: i64,
         #[arg(long)]
@@ -338,12 +344,16 @@ fn main() -> Result<()> {
             source,
             project,
             tag,
+            role,
+            agent,
+            human,
             limit,
             fts,
             json,
         } => {
             validate_source(source.as_deref())?;
-            let rows = search(
+            let role = resolve_search_role(&role, agent, human)?;
+            let rows = search_all(
                 &conn,
                 &query,
                 fts,
@@ -354,6 +364,7 @@ fn main() -> Result<()> {
                     limit,
                     ..Default::default()
                 },
+                role,
             )?;
             if rows.is_empty() {
                 if json {
@@ -363,7 +374,7 @@ fn main() -> Result<()> {
                 }
                 std::process::exit(1);
             }
-            print_entries(rows, json)
+            print_search_rows(rows, json)
         }
         Command::Recent {
             n,
@@ -795,6 +806,102 @@ fn print_entries(rows: Vec<HistoryEntry>, json: bool) -> Result<()> {
         println!("{}", fmt_row(&row, false));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchRole {
+    All,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+struct SearchRow {
+    id: i64,
+    source: String,
+    session_id: Option<String>,
+    project: Option<String>,
+    text: String,
+    timestamp_ms: i64,
+    role: String,
+    kind: String,
+    match_source: String,
+}
+
+fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole> {
+    anyhow::ensure!(
+        !(agent && human),
+        "ai-hist search: --agent and --human are mutually exclusive"
+    );
+    if agent {
+        return Ok(SearchRole::Assistant);
+    }
+    if human {
+        return Ok(SearchRole::User);
+    }
+    match raw {
+        "all" => Ok(SearchRole::All),
+        "user" => Ok(SearchRole::User),
+        "assistant" => Ok(SearchRole::Assistant),
+        other => anyhow::bail!(
+            "ai-hist search: --role must be one of user, assistant, all (got {other})"
+        ),
+    }
+}
+
+fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
+    if as_json {
+        let out = rows
+            .iter()
+            .map(|row| {
+                let mut value = json!({
+                    "id": row.id,
+                    "source": row.source,
+                    "session_id": row.session_id,
+                    "project": row.project,
+                    "prompt": row.text,
+                    "timestamp_ms": row.timestamp_ms,
+                });
+                if row.match_source != "history" {
+                    value["role"] = json!(row.role);
+                    value["kind"] = json!(row.kind);
+                    value["match_source"] = json!(row.match_source);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    for row in rows {
+        println!("{}", fmt_search_row(&row));
+    }
+    Ok(())
+}
+
+fn fmt_search_row(row: &SearchRow) -> String {
+    let dt = Local
+        .timestamp_millis_opt(row.timestamp_ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00".to_string());
+    let project = row
+        .project
+        .as_ref()
+        .map(|p| format!(" [{p}]"))
+        .unwrap_or_default();
+    let label = if row.match_source == "history" {
+        row.source.clone()
+    } else {
+        format!("{}:{}:{}", row.source, row.role, row.kind)
+    };
+    let text = if row.text.chars().count() > 120 {
+        let truncated: String = row.text.chars().take(120).collect();
+        format!("{}...", truncated.replace('\n', " "))
+    } else {
+        row.text.replace('\n', " ")
+    };
+    format!("  #{:<5} {}  ({}){}  {}", row.id, dt, label, project, text)
 }
 
 fn print_session_entries(
@@ -1595,6 +1702,153 @@ fn query_entries(conn: &Connection, sql: &str, params_: &[&String]) -> Result<Ve
     Ok(rows)
 }
 
+fn search_all(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    role: SearchRole,
+) -> Result<Vec<SearchRow>> {
+    let mut rows = Vec::new();
+    if !matches!(role, SearchRole::Assistant) {
+        rows.extend(search_history_rows(conn, terms, raw_fts, filter)?);
+    }
+    rows.extend(search_event_rows(conn, terms, raw_fts, filter, role)?);
+    rows.sort_by(|a, b| {
+        b.timestamp_ms
+            .cmp(&a.timestamp_ms)
+            .then_with(|| b.id.cmp(&a.id))
+            .then_with(|| a.match_source.cmp(&b.match_source))
+    });
+    rows.truncate(filter.limit.max(1) as usize);
+    Ok(rows)
+}
+
+fn search_history_rows(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+) -> Result<Vec<SearchRow>> {
+    let mut params_vec = Vec::new();
+    let mut sql = if terms.is_empty() {
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms \
+         FROM history h WHERE 1=1"
+            .to_string()
+    } else {
+        params_vec.push(ai_hist_core::build_fts_query(terms, raw_fts));
+        "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms \
+         FROM history_fts f JOIN history h ON f.rowid = h.id WHERE history_fts MATCH ?"
+            .to_string()
+    };
+    append_history_search_filters(&mut sql, &mut params_vec, filter, "h");
+    sql.push_str(" ORDER BY h.timestamp_ms DESC LIMIT ?");
+    params_vec.push(filter.limit.max(1).to_string());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok(SearchRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                session_id: row.get(2)?,
+                project: row.get(3)?,
+                text: row.get(4)?,
+                timestamp_ms: row.get(5)?,
+                role: "user".to_string(),
+                kind: "history".to_string(),
+                match_source: "history".to_string(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn search_event_rows(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    role: SearchRole,
+) -> Result<Vec<SearchRow>> {
+    let mut params_vec = Vec::new();
+    let mut sql = if terms.is_empty() {
+        "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
+         FROM session_events e WHERE 1=1"
+            .to_string()
+    } else {
+        params_vec.push(ai_hist_core::build_fts_query(terms, raw_fts));
+        "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind \
+         FROM session_events_fts f JOIN session_events e ON f.rowid = e.id WHERE session_events_fts MATCH ?"
+            .to_string()
+    };
+    append_event_search_filters(&mut sql, &mut params_vec, filter, "e", role);
+    sql.push_str(" ORDER BY e.ts_ms DESC LIMIT ?");
+    params_vec.push(filter.limit.max(1).to_string());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok(SearchRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                session_id: row.get(2)?,
+                project: row.get(3)?,
+                text: row.get(4)?,
+                timestamp_ms: row.get(5)?,
+                role: row.get(6)?,
+                kind: row.get(7)?,
+                match_source: "session_event".to_string(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn append_history_search_filters(
+    sql: &mut String,
+    params: &mut Vec<String>,
+    filter: &QueryFilter,
+    alias: &str,
+) {
+    if let Some(source) = &filter.source {
+        sql.push_str(&format!(" AND {alias}.source = ?"));
+        params.push(source.clone());
+    }
+    if let Some(project) = &filter.project {
+        sql.push_str(&format!(" AND {alias}.project LIKE ?"));
+        params.push(format!("%{project}%"));
+    }
+    if let Some(tag) = &filter.tag {
+        sql.push_str(&format!(" AND {}", tag_filter_clause(alias)));
+        params.push(normalize_tag_name(tag));
+    }
+}
+
+fn append_event_search_filters(
+    sql: &mut String,
+    params: &mut Vec<String>,
+    filter: &QueryFilter,
+    alias: &str,
+    role: SearchRole,
+) {
+    if let Some(source) = &filter.source {
+        sql.push_str(&format!(" AND {alias}.source = ?"));
+        params.push(source.clone());
+    }
+    if let Some(project) = &filter.project {
+        sql.push_str(&format!(" AND {alias}.project LIKE ?"));
+        params.push(format!("%{project}%"));
+    }
+    if let Some(tag) = &filter.tag {
+        sql.push_str(&format!(" AND {}", tag_filter_clause(alias)));
+        params.push(normalize_tag_name(tag));
+    }
+    match role {
+        SearchRole::All => {}
+        SearchRole::User => sql.push_str(&format!(" AND {alias}.role = 'user'")),
+        SearchRole::Assistant => sql.push_str(&format!(" AND {alias}.role = 'assistant'")),
+    }
+}
+
 fn query_pairs(
     conn: &Connection,
     sql: &str,
@@ -2081,7 +2335,9 @@ fn sync_claude_session_metadata(
     for path in collect_matching_files(root, "", "jsonl")? {
         let key = path.to_string_lossy().to_string();
         let stamp = file_stamp(&path)?;
-        if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
+        if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
+            && claude_transcript_events_exist(conn, &path)?
+        {
             continue;
         }
         scanned += 1;
@@ -2098,6 +2354,7 @@ fn sync_claude_session_metadata(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
+            ingest_claude_transcript(conn, &path)?;
             upserted += 1;
         }
     }
@@ -2106,6 +2363,22 @@ fn sync_claude_session_metadata(
         println!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
     Ok(())
+}
+
+fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
+        )",
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 struct ClaudeSessionMeta {
@@ -2177,6 +2450,485 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         last_ts: last_ts.unwrap_or(first),
         last_assistant_text,
     }))
+}
+
+fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    for (line_index, line) in text.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let session_id = match obj.get("sessionId").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let cwd = obj.get("cwd").and_then(Value::as_str);
+        let project = cwd;
+        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+            .unwrap_or(0);
+        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
+        let message = obj.get("message").and_then(Value::as_object);
+        let fallback_uid = format!(
+            "{}:{}",
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("session"),
+            line_index
+        );
+        let message_uuid = obj
+            .get("uuid")
+            .and_then(Value::as_str)
+            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
+            .unwrap_or(&fallback_uid);
+        let message_role = message
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+        let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
+        let token_json = message
+            .and_then(|m| m.get("usage"))
+            .and_then(|v| serde_json::to_string(v).ok());
+        let Some(content) = message.and_then(|m| m.get("content")) else {
+            continue;
+        };
+        if let Some(s) = content.as_str() {
+            if !s.trim().is_empty() {
+                let role = if message_role == "assistant" {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                insert_session_event(
+                    conn,
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    role,
+                    "text",
+                    Some(s),
+                    model,
+                    token_json.as_deref(),
+                    &format!("{message_uuid}:0"),
+                )?;
+            }
+            continue;
+        }
+        let Some(blocks) = content.as_array() else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            let event_uid = format!("{message_uuid}:{block_index}");
+            match block_type {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            let role = if message_role == "assistant" {
+                                "assistant"
+                            } else {
+                                "user"
+                            };
+                            insert_session_event(
+                                conn,
+                                session_id,
+                                project,
+                                cwd,
+                                git_branch,
+                                message_uuid,
+                                parent_id,
+                                ts_ms,
+                                role,
+                                "text",
+                                Some(text),
+                                model,
+                                token_json.as_deref(),
+                                &event_uid,
+                            )?;
+                        }
+                    }
+                }
+                "thinking" => {
+                    let text = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str);
+                    if text.is_some_and(|s| !s.trim().is_empty()) {
+                        insert_session_event(
+                            conn,
+                            session_id,
+                            project,
+                            cwd,
+                            git_branch,
+                            message_uuid,
+                            parent_id,
+                            ts_ms,
+                            "assistant",
+                            "thinking",
+                            text,
+                            model,
+                            token_json.as_deref(),
+                            &event_uid,
+                        )?;
+                    }
+                }
+                "tool_use" => {
+                    let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let args = block.get("input").unwrap_or(&Value::Null);
+                    let target = pick_tool_target(name, args);
+                    let event_text = format_tool_event_text(name, target.as_deref(), args);
+                    insert_session_event(
+                        conn,
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_uuid,
+                        parent_id,
+                        ts_ms,
+                        "assistant",
+                        "tool_use",
+                        Some(&event_text),
+                        model,
+                        token_json.as_deref(),
+                        &event_uid,
+                    )?;
+                    if !tool_use_id.is_empty() && !name.is_empty() {
+                        let args_json =
+                            serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
+                        insert_tool_call(
+                            conn,
+                            session_id,
+                            message_uuid,
+                            tool_use_id,
+                            name,
+                            target.as_deref(),
+                            &args_json,
+                            None,
+                            ts_ms,
+                        )?;
+                        if is_file_edit_tool(name) {
+                            if let Some(file_path) = target.as_deref() {
+                                upsert_file_edit_from_call(
+                                    conn,
+                                    session_id,
+                                    message_uuid,
+                                    tool_use_id,
+                                    file_path,
+                                    name,
+                                    ts_ms,
+                                    git_branch,
+                                    cwd,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                "tool_result" => {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .or_else(|| block.get("toolUseId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let content = block.get("content").unwrap_or(&Value::Null);
+                    let text = materialize_tool_result_text(content);
+                    insert_session_event(
+                        conn,
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_uuid,
+                        parent_id,
+                        ts_ms,
+                        "tool_result",
+                        "tool_result",
+                        text.as_deref(),
+                        model,
+                        token_json.as_deref(),
+                        &event_uid,
+                    )?;
+                    let is_error = block.get("is_error").and_then(Value::as_bool);
+                    if !tool_use_id.is_empty() {
+                        if let Some(err) = is_error {
+                            conn.execute(
+                                "UPDATE tool_calls SET is_error = ? WHERE source = 'claude' AND session_id = ? AND tool_use_id = ?",
+                                params![if err { 1 } else { 0 }, session_id, tool_use_id],
+                            )?;
+                        }
+                        if let Some(result) = find_tool_use_result(block) {
+                            update_file_edit_from_tool_result(
+                                conn,
+                                session_id,
+                                message_uuid,
+                                tool_use_id,
+                                result,
+                                ts_ms,
+                                git_branch,
+                                cwd,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_session_event(
+    conn: &Connection,
+    session_id: &str,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    message_id: &str,
+    parent_id: Option<&str>,
+    ts_ms: i64,
+    role: &str,
+    kind: &str,
+    text: Option<&str>,
+    model: Option<&str>,
+    token_json: Option<&str>,
+    event_uid: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_events \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
+         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
+         project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
+         parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
+         model=excluded.model, token_json=excluded.token_json",
+        params![
+            session_id,
+            project,
+            cwd,
+            git_branch,
+            message_id,
+            parent_id,
+            ts_ms,
+            role,
+            kind,
+            text,
+            model,
+            token_json,
+            event_uid,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_tool_call(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+    tool_use_id: &str,
+    name: &str,
+    target: Option<&str>,
+    args_json: &str,
+    is_error: Option<bool>,
+    ts_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO tool_calls \
+         (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms) \
+         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
+         message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
+         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms",
+        params![
+            session_id,
+            message_id,
+            tool_use_id,
+            name,
+            target,
+            args_json,
+            is_error.map(|v| if v { 1 } else { 0 }),
+            ts_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_file_edit_from_call(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+    tool_use_id: &str,
+    file_path: &str,
+    tool_name: &str,
+    ts_ms: i64,
+    git_branch: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO file_edits \
+         (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
+         VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
+         message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
+         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd)",
+        params![
+            session_id,
+            message_id,
+            tool_use_id,
+            file_path,
+            tool_name,
+            ts_ms,
+            git_branch,
+            cwd,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_file_edit_from_tool_result(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+    tool_use_id: &str,
+    result: &Value,
+    ts_ms: i64,
+    git_branch: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<()> {
+    let structured_patch = result
+        .get("structuredPatch")
+        .or_else(|| result.get("structured_patch"));
+    let patch_json = structured_patch.and_then(|v| serde_json::to_string(v).ok());
+    let (lines_added, lines_removed) = structured_patch.map(count_patch_lines).unwrap_or((0, 0));
+    let user_modified = result
+        .get("userModified")
+        .or_else(|| result.get("user_modified"))
+        .and_then(Value::as_bool);
+    let file_path = result
+        .get("filePath")
+        .or_else(|| result.get("file_path"))
+        .or_else(|| result.get("path"))
+        .and_then(Value::as_str);
+    conn.execute(
+        "UPDATE file_edits SET \
+         message_id = COALESCE(message_id, ?), \
+         file_path = COALESCE(?, file_path), \
+         lines_added = ?, lines_removed = ?, structured_patch_json = COALESCE(?, structured_patch_json), \
+         user_modified = COALESCE(?, user_modified), ts_ms = COALESCE(ts_ms, ?), \
+         git_branch = COALESCE(?, git_branch), cwd = COALESCE(?, cwd) \
+         WHERE source = 'claude' AND session_id = ? AND tool_use_id = ?",
+        params![
+            message_id,
+            file_path,
+            lines_added,
+            lines_removed,
+            patch_json,
+            user_modified.map(|v| if v { 1 } else { 0 }),
+            ts_ms,
+            git_branch,
+            cwd,
+            session_id,
+            tool_use_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn pick_tool_target(name: &str, input: &Value) -> Option<String> {
+    let obj = input.as_object()?;
+    let get = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
+    match name {
+        "Read" | "Edit" | "Write" | "NotebookEdit" => get("file_path")
+            .or_else(|| get("path"))
+            .or_else(|| get("notebook_path")),
+        "Bash" => get("command"),
+        "Grep" | "Glob" => get("pattern"),
+        _ => get("file_path")
+            .or_else(|| get("path"))
+            .or_else(|| get("url"))
+            .or_else(|| get("command")),
+    }
+}
+
+fn format_tool_event_text(name: &str, target: Option<&str>, args: &Value) -> String {
+    match target {
+        Some(target) if !target.is_empty() => format!("{name} {target}"),
+        _ => format!("{name} {}", serde_json::to_string(args).unwrap_or_default()),
+    }
+}
+
+fn is_file_edit_tool(name: &str) -> bool {
+    matches!(name, "Edit" | "Write" | "NotebookEdit")
+}
+
+fn materialize_tool_result_text(content: &Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        return (!s.trim().is_empty()).then(|| s.to_string());
+    }
+    if content.is_null() {
+        return None;
+    }
+    serde_json::to_string(content).ok()
+}
+
+fn find_tool_use_result(block: &Value) -> Option<&Value> {
+    block
+        .get("toolUseResult")
+        .or_else(|| block.get("tool_use_result"))
+        .or_else(|| block.get("content").and_then(|c| c.get("toolUseResult")))
+        .or_else(|| block.get("content").and_then(|c| c.get("tool_use_result")))
+}
+
+fn count_patch_lines(value: &Value) -> (i64, i64) {
+    match value {
+        Value::String(s) => count_patch_text(s),
+        Value::Array(items) => items
+            .iter()
+            .map(count_patch_lines)
+            .fold((0, 0), |acc, next| (acc.0 + next.0, acc.1 + next.1)),
+        Value::Object(map) => {
+            for key in ["patch", "diff", "text", "content", "structuredPatch"] {
+                if let Some(v) = map.get(key) {
+                    let count = count_patch_lines(v);
+                    if count != (0, 0) {
+                        return count;
+                    }
+                }
+            }
+            (0, 0)
+        }
+        _ => (0, 0),
+    }
+}
+
+fn count_patch_text(text: &str) -> (i64, i64) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in text.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3196,7 +3948,13 @@ fn home_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_trajectory_file, strip_url_credentials, xml_escape};
+    use super::{
+        file_stamp, ingest_claude_transcript, parse_trajectory_file, search_all,
+        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole,
+    };
+    use ai_hist_core::{init_db, QueryFilter};
+    use rusqlite::Connection;
+    use serde_json::{json, Map, Value};
     use std::fs;
 
     #[test]
@@ -3285,5 +4043,108 @@ mod tests {
         assert!(row.search_text.contains("kind in PK"));
         assert!(row.search_text.contains("Redact ghp_FAKE"));
         assert_eq!(row.timestamp_ms, 1_782_036_000_000);
+    }
+
+    #[test]
+    fn ingests_claude_transcript_events_tools_edits_and_searches_agent_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-rich.jsonl");
+        write_rich_claude_transcript(&path);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        let tool_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .unwrap();
+        let edit = conn
+            .query_row(
+                "SELECT file_path, lines_added, lines_removed, user_modified, git_branch, cwd FROM file_edits",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(event_count, 4);
+        assert_eq!(tool_count, 1);
+        assert_eq!(
+            edit,
+            (
+                "/tmp/proj/auth.ts".to_string(),
+                1,
+                1,
+                1,
+                "feat/rich".to_string(),
+                "/tmp/proj".to_string()
+            )
+        );
+
+        let rows = search_all(
+            &conn,
+            &["update".to_string()],
+            false,
+            &QueryFilter {
+                limit: 10,
+                ..Default::default()
+            },
+            SearchRole::Assistant,
+        )
+        .unwrap();
+        assert!(rows.iter().any(|row| {
+            row.match_source == "session_event"
+                && row.role == "assistant"
+                && row.text.contains("I will update auth.ts")
+        }));
+    }
+
+    #[test]
+    fn sync_backfills_transcript_events_when_existing_stamp_has_no_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-rich.jsonl");
+        write_rich_claude_transcript(&path);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut claude_sessions = Map::new();
+        claude_sessions.insert(
+            path.to_string_lossy().to_string(),
+            json!(file_stamp(&path).unwrap()),
+        );
+        let mut state = Map::new();
+        state.insert(
+            "claude_sessions".to_string(),
+            Value::Object(claude_sessions),
+        );
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 4);
+    }
+
+    fn write_rich_claude_transcript(path: &std::path::Path) {
+        fs::write(
+            path,
+            r#"{"type":"user","uuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:00.000Z","message":{"role":"user","content":"please update auth"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:01.000Z","message":{"role":"assistant","model":"claude-test","usage":{"input_tokens":11,"output_tokens":22},"content":[{"type":"text","text":"I will update auth.ts"},{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/tmp/proj/auth.ts","old_string":"old","new_string":"new"}}]}}
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}"#,
+        )
+        .unwrap();
     }
 }

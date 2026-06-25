@@ -86,6 +86,57 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     prompt, project, content='history', content_rowid='id'
 );
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    project TEXT,
+    cwd TEXT,
+    git_branch TEXT,
+    message_id TEXT,
+    parent_id TEXT,
+    ts_ms INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool_result')),
+    kind TEXT NOT NULL CHECK(kind IN ('text', 'thinking', 'tool_use', 'tool_result')),
+    text TEXT,
+    model TEXT,
+    token_json TEXT,
+    event_uid TEXT NOT NULL,
+    UNIQUE(source, session_id, event_uid)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+    text, role, project, content='session_events', content_rowid='id'
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT,
+    tool_use_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    target TEXT,
+    args_json TEXT,
+    is_error INTEGER,
+    ts_ms INTEGER,
+    UNIQUE(source, session_id, tool_use_id)
+);
+CREATE TABLE IF NOT EXISTS file_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT,
+    tool_use_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    lines_added INTEGER,
+    lines_removed INTEGER,
+    structured_patch_json TEXT,
+    user_modified INTEGER,
+    ts_ms INTEGER,
+    git_branch TEXT,
+    cwd TEXT,
+    UNIQUE(source, session_id, tool_use_id)
+);
 CREATE TABLE IF NOT EXISTS trajectories (
     id TEXT PRIMARY KEY,
     version INTEGER,
@@ -136,6 +187,20 @@ END;
 CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
+    INSERT INTO session_events_fts(rowid, text, role, project)
+    VALUES (new.id, new.text, new.role, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
+    VALUES('delete', old.id, old.text, old.role, old.project);
+    INSERT INTO session_events_fts(rowid, text, role, project)
+    VALUES (new.id, new.text, new.role, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
+    VALUES('delete', old.id, old.text, old.role, old.project);
 END;
 "#;
 
@@ -215,6 +280,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_ts ON session_events(ts_ms DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_role ON session_events(role)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_session ON file_edits(source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
         [],
     )?;
     Ok(())

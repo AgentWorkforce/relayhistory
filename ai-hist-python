@@ -79,6 +79,57 @@ CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_activity_ms DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     prompt, project, content='history', content_rowid='id'
 );
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    project TEXT,
+    cwd TEXT,
+    git_branch TEXT,
+    message_id TEXT,
+    parent_id TEXT,
+    ts_ms INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool_result')),
+    kind TEXT NOT NULL CHECK(kind IN ('text', 'thinking', 'tool_use', 'tool_result')),
+    text TEXT,
+    model TEXT,
+    token_json TEXT,
+    event_uid TEXT NOT NULL,
+    UNIQUE(source, session_id, event_uid)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+    text, role, project, content='session_events', content_rowid='id'
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT,
+    tool_use_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    target TEXT,
+    args_json TEXT,
+    is_error INTEGER,
+    ts_ms INTEGER,
+    UNIQUE(source, session_id, tool_use_id)
+);
+CREATE TABLE IF NOT EXISTS file_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT,
+    tool_use_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    lines_added INTEGER,
+    lines_removed INTEGER,
+    structured_patch_json TEXT,
+    user_modified INTEGER,
+    ts_ms INTEGER,
+    git_branch TEXT,
+    cwd TEXT,
+    UNIQUE(source, session_id, tool_use_id)
+);
 CREATE TABLE IF NOT EXISTS trajectories (
     id TEXT PRIMARY KEY,
     version INTEGER,
@@ -129,6 +180,20 @@ END;
 CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
+    INSERT INTO session_events_fts(rowid, text, role, project)
+    VALUES (new.id, new.text, new.role, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
+    VALUES('delete', old.id, old.text, old.role, old.project);
+    INSERT INTO session_events_fts(rowid, text, role, project)
+    VALUES (new.id, new.text, new.role, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
+    VALUES('delete', old.id, old.text, old.role, old.project);
 END;
 CREATE TRIGGER IF NOT EXISTS trajectories_ai AFTER INSERT ON trajectories BEGIN
     INSERT INTO trajectory_fts(rowid, search_text, task_title, task_description, persona_id, project_id)
@@ -417,6 +482,213 @@ def _scan_claude_session_file(path: Path):
     }
 
 
+def _sync_claude_transcript_events(conn: sqlite3.Connection, path: Path):
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for line_index, line in enumerate(lines):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        session_id = obj.get("sessionId")
+        if not session_id:
+            continue
+        cwd = obj.get("cwd")
+        git_branch = obj.get("gitBranch")
+        ts_ms = _coerce_ts_ms(obj.get("timestamp"))
+        parent_id = obj.get("parentUuid")
+        message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        message_id = obj.get("uuid") or message.get("id") or f"{path.stem}:{line_index}"
+        role = message.get("role") or obj.get("type") or ""
+        model = message.get("model")
+        token_json = json.dumps(message.get("usage"), separators=(",", ":")) if message.get("usage") is not None else None
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                _insert_session_event(conn, session_id, cwd, cwd, git_branch, message_id, parent_id, ts_ms,
+                                      "assistant" if role == "assistant" else "user", "text", content, model, token_json,
+                                      f"{message_id}:0")
+            continue
+        if not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            event_uid = f"{message_id}:{block_index}"
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    _insert_session_event(conn, session_id, cwd, cwd, git_branch, message_id, parent_id, ts_ms,
+                                          "assistant" if role == "assistant" else "user", "text", text, model, token_json,
+                                          event_uid)
+            elif block_type == "thinking":
+                text = block.get("thinking") or block.get("text")
+                if isinstance(text, str) and text.strip():
+                    _insert_session_event(conn, session_id, cwd, cwd, git_branch, message_id, parent_id, ts_ms,
+                                          "assistant", "thinking", text, model, token_json, event_uid)
+            elif block_type == "tool_use":
+                tool_use_id = block.get("id") or ""
+                name = block.get("name") or ""
+                args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                target = _tool_target(name, args)
+                text = f"{name} {target}" if target else f"{name} {json.dumps(args, separators=(',', ':'))}"
+                _insert_session_event(conn, session_id, cwd, cwd, git_branch, message_id, parent_id, ts_ms,
+                                      "assistant", "tool_use", text, model, token_json, event_uid)
+                if tool_use_id and name:
+                    conn.execute(
+                        """
+                        INSERT INTO tool_calls
+                          (source, session_id, message_id, tool_use_id, name, target, args_json, ts_ms)
+                        VALUES ('claude', ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET
+                          message_id=excluded.message_id, name=excluded.name, target=excluded.target,
+                          args_json=excluded.args_json, ts_ms=excluded.ts_ms
+                        """,
+                        (session_id, message_id, tool_use_id, name, target, json.dumps(args, separators=(",", ":")), ts_ms),
+                    )
+                    if name in {"Edit", "Write", "NotebookEdit"} and target:
+                        conn.execute(
+                            """
+                            INSERT INTO file_edits
+                              (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd)
+                            VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET
+                              message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name,
+                              ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch),
+                              cwd=COALESCE(excluded.cwd, file_edits.cwd)
+                            """,
+                            (session_id, message_id, tool_use_id, target, name, ts_ms, git_branch, cwd),
+                        )
+            elif block_type == "tool_result":
+                tool_use_id = block.get("tool_use_id") or block.get("toolUseId") or ""
+                result_text = _tool_result_text(block.get("content"))
+                _insert_session_event(conn, session_id, cwd, cwd, git_branch, message_id, parent_id, ts_ms,
+                                      "tool_result", "tool_result", result_text, model, token_json, event_uid)
+                if tool_use_id:
+                    if isinstance(block.get("is_error"), bool):
+                        conn.execute(
+                            "UPDATE tool_calls SET is_error = ? WHERE source = 'claude' AND session_id = ? AND tool_use_id = ?",
+                            (1 if block["is_error"] else 0, session_id, tool_use_id),
+                        )
+                    result = _find_tool_use_result(block)
+                    if isinstance(result, dict):
+                        patch = result.get("structuredPatch") or result.get("structured_patch")
+                        added, removed = _count_patch_lines(patch)
+                        user_modified = result.get("userModified")
+                        if user_modified is None:
+                            user_modified = result.get("user_modified")
+                        file_path = result.get("filePath") or result.get("file_path") or result.get("path")
+                        conn.execute(
+                            """
+                            UPDATE file_edits SET
+                              message_id=COALESCE(message_id, ?), file_path=COALESCE(?, file_path),
+                              lines_added=?, lines_removed=?, structured_patch_json=COALESCE(?, structured_patch_json),
+                              user_modified=COALESCE(?, user_modified), ts_ms=COALESCE(ts_ms, ?),
+                              git_branch=COALESCE(?, git_branch), cwd=COALESCE(?, cwd)
+                            WHERE source='claude' AND session_id=? AND tool_use_id=?
+                            """,
+                            (
+                                message_id,
+                                file_path,
+                                added,
+                                removed,
+                                json.dumps(patch, separators=(",", ":")) if patch is not None else None,
+                                1 if user_modified is True else (0 if user_modified is False else None),
+                                ts_ms,
+                                git_branch,
+                                cwd,
+                                session_id,
+                                tool_use_id,
+                            ),
+                        )
+
+
+def _insert_session_event(conn, session_id, project, cwd, git_branch, message_id, parent_id,
+                          ts_ms, role, kind, text, model, token_json, event_uid):
+    conn.execute(
+        """
+        INSERT INTO session_events
+          (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid)
+        VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source, session_id, event_uid) DO UPDATE SET
+          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id,
+          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text,
+          model=excluded.model, token_json=excluded.token_json
+        """,
+        (session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid),
+    )
+
+
+def _coerce_ts_ms(value):
+    if isinstance(value, str):
+        return _iso_to_ms(value) or 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _tool_target(name, args):
+    if not isinstance(args, dict):
+        return None
+    if name in {"Read", "Edit", "Write", "NotebookEdit"}:
+        return args.get("file_path") or args.get("path") or args.get("notebook_path")
+    if name == "Bash":
+        return args.get("command")
+    if name in {"Grep", "Glob"}:
+        return args.get("pattern")
+    return args.get("file_path") or args.get("path") or args.get("url") or args.get("command")
+
+
+def _tool_result_text(content):
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if content is None:
+        return None
+    return json.dumps(content, separators=(",", ":"))
+
+
+def _find_tool_use_result(block):
+    for key in ("toolUseResult", "tool_use_result"):
+        if key in block:
+            return block[key]
+    content = block.get("content")
+    if isinstance(content, dict):
+        return content.get("toolUseResult") or content.get("tool_use_result")
+    return None
+
+
+def _count_patch_lines(value):
+    if isinstance(value, str):
+        added = removed = 0
+        for line in value.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        return added, removed
+    if isinstance(value, list):
+        added = removed = 0
+        for item in value:
+            a, r = _count_patch_lines(item)
+            added += a
+            removed += r
+        return added, removed
+    if isinstance(value, dict):
+        for key in ("patch", "diff", "text", "content", "structuredPatch"):
+            if key in value:
+                counts = _count_patch_lines(value[key])
+                if counts != (0, 0):
+                    return counts
+    return 0, 0
+
+
 def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
     """
     Walk ~/.claude/projects/**/<session-id>.jsonl and populate the sessions table.
@@ -441,7 +713,7 @@ def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
             except OSError:
                 errors += 1
                 continue
-            if session_state.get(key) == mtime:
+            if session_state.get(key) == mtime and _claude_transcript_events_exist(conn, jsonl_path):
                 continue
             scanned += 1
             meta = _scan_claude_session_file(jsonl_path)
@@ -465,6 +737,7 @@ def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
                     "WHERE session_id = ? AND source = 'claude'",
                     (meta["last_ts"], meta["session_id"]),
                 )
+                _sync_claude_transcript_events(conn, jsonl_path)
                 upserted += 1
             except sqlite3.Error:
                 errors += 1
@@ -474,6 +747,22 @@ def sync_claude_sessions(conn: sqlite3.Connection, state: dict):
     if scanned:
         suffix = f" ({errors} errors)" if errors else ""
         print(f"  [claude-sessions] scanned {scanned} files, {upserted} sessions updated{suffix}")
+
+
+def _claude_transcript_events_exist(conn: sqlite3.Connection, path: Path):
+    row = conn.execute(
+        """
+        SELECT EXISTS(
+          SELECT 1
+          FROM sessions s
+          JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+          WHERE s.source = 'claude' AND s.raw_path = ?
+          LIMIT 1
+        )
+        """,
+        (str(path),),
+    ).fetchone()
+    return bool(row and row[0])
 
 
 # --- Parsers -----------------------------------------------------------------
@@ -1447,6 +1736,12 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(source, session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_events_ts ON session_events(ts_ms DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_events_role ON session_events(role)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_edits_session ON file_edits(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)")
 
 
 def load_state() -> dict:
@@ -1557,33 +1852,56 @@ def cmd_sync(args=None):
 
 
 def cmd_search(args):
-    """Full-text search across prompts."""
+    """Full-text search across prompts and transcript events."""
     conn = sqlite3.connect(str(DB_PATH))
     init_db(conn)
+    role = _resolve_search_role(args)
+    rows = []
+    if role != "assistant":
+        if args.query:
+            query = _build_fts_query(args.query, getattr(args, "fts", False))
+            sql = (
+                "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, "
+                "'user' AS role, 'history' AS kind, 'history' AS match_source "
+                "FROM history_fts f JOIN history h ON f.rowid = h.id "
+                "WHERE history_fts MATCH ? "
+            )
+            params = [query]
+        else:
+            sql = (
+                "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, "
+                "'user' AS role, 'history' AS kind, 'history' AS match_source "
+                "FROM history h WHERE 1=1 "
+            )
+            params = []
+        _append_history_search_filters(sql_parts := [sql], params, args, "h")
+        sql = sql_parts[0] + "ORDER BY h.timestamp_ms DESC LIMIT ?"
+        params.append(args.limit)
+        rows.extend(conn.execute(sql, params).fetchall())
+
     if args.query:
         query = _build_fts_query(args.query, getattr(args, "fts", False))
         sql = (
-            "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms "
-            "FROM history_fts f JOIN history h ON f.rowid = h.id "
-            "WHERE history_fts MATCH ? "
+            "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, "
+            "e.role, e.kind, 'session_event' AS match_source "
+            "FROM session_events_fts f JOIN session_events e ON f.rowid = e.id "
+            "WHERE session_events_fts MATCH ? "
         )
         params = [query]
     else:
-        sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1 "
+        sql = (
+            "SELECT e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, "
+            "e.role, e.kind, 'session_event' AS match_source "
+            "FROM session_events e WHERE 1=1 "
+        )
         params = []
-    if args.source:
-        sql += "AND h.source = ? "
-        params.append(args.source)
-    if args.project:
-        sql += "AND h.project LIKE ? "
-        params.append(f"%{args.project}%")
-    if getattr(args, "tag", None):
-        sql += f"AND {_tag_filter_clause('h')} "
-        params.append(_normalize_tag_name(args.tag))
-    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    _append_event_search_filters(sql_parts := [sql], params, args, "e", role)
+    sql = sql_parts[0] + "ORDER BY e.ts_ms DESC LIMIT ?"
     params.append(args.limit)
+    rows.extend(conn.execute(sql, params).fetchall())
+    rows.sort(key=lambda r: (r[5], r[0]), reverse=True)
+    rows = rows[: max(1, args.limit)]
 
-    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     if not rows:
@@ -1594,12 +1912,62 @@ def cmd_search(args):
         sys.exit(1)
 
     if getattr(args, "json", False):
-        print(json.dumps([_row_to_dict(*r) for r in rows]))
+        print(json.dumps([_search_row_to_dict(r) for r in rows]))
         return
 
     for r in rows:
-        id_, source, session_id, project, prompt, ts_ms = r
-        print(fmt_row(id_, source, project, prompt, ts_ms))
+        id_, source, session_id, project, prompt, ts_ms, row_role, kind, match_source = r
+        label = source if match_source == "history" else f"{source}:{row_role}:{kind}"
+        print(fmt_row(id_, label, project, prompt, ts_ms))
+
+
+def _resolve_search_role(args):
+    if getattr(args, "agent", False) and getattr(args, "human", False):
+        raise SystemExit("ai-hist search: --agent and --human are mutually exclusive")
+    if getattr(args, "agent", False):
+        return "assistant"
+    if getattr(args, "human", False):
+        return "user"
+    role = getattr(args, "role", "all")
+    if role not in {"all", "user", "assistant"}:
+        raise SystemExit("ai-hist search: --role must be one of user, assistant, all")
+    return role
+
+
+def _append_history_search_filters(sql_parts, params, args, alias):
+    if getattr(args, "source", None):
+        sql_parts[0] += f"AND {alias}.source = ? "
+        params.append(args.source)
+    if getattr(args, "project", None):
+        sql_parts[0] += f"AND {alias}.project LIKE ? "
+        params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql_parts[0] += f"AND {_tag_filter_clause(alias)} "
+        params.append(_normalize_tag_name(args.tag))
+
+
+def _append_event_search_filters(sql_parts, params, args, alias, role):
+    if getattr(args, "source", None):
+        sql_parts[0] += f"AND {alias}.source = ? "
+        params.append(args.source)
+    if getattr(args, "project", None):
+        sql_parts[0] += f"AND {alias}.project LIKE ? "
+        params.append(f"%{args.project}%")
+    if getattr(args, "tag", None):
+        sql_parts[0] += f"AND {_tag_filter_clause(alias)} "
+        params.append(_normalize_tag_name(args.tag))
+    if role == "user":
+        sql_parts[0] += f"AND {alias}.role = 'user' "
+    elif role == "assistant":
+        sql_parts[0] += f"AND {alias}.role = 'assistant' "
+
+
+def _search_row_to_dict(row):
+    id_, source, session_id, project, prompt, ts_ms, role, kind, match_source = row
+    out = _row_to_dict(id_, source, session_id, project, prompt, ts_ms)
+    if match_source != "history":
+        out.update({"role": role, "kind": kind, "match_source": match_source})
+    return out
 
 
 def cmd_recent(args):
@@ -2368,6 +2736,9 @@ def main():
     s.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     s.add_argument("--project", help="Filter by project path (substring match)")
     s.add_argument("--tag", help="Filter by session tag")
+    s.add_argument("--role", choices=["user", "assistant", "all"], default="all", help="Filter transcript matches by role")
+    s.add_argument("--agent", action="store_true", help="Alias for --role assistant")
+    s.add_argument("--human", action="store_true", help="Alias for --role user")
     s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
     s.add_argument("--fts", action="store_true", help="Pass query through as raw FTS5 expression")
     s.add_argument("--json", action="store_true", help="Output as JSON array")
