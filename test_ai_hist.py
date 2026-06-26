@@ -1117,46 +1117,6 @@ class TestMain:
             with patch("sys.argv", ["ai-hist", "watch"]):
                 ai_hist.main()
 
-    def test_import_watch_dispatches(self, tmp_env):
-        def mock_watch(args):
-            assert args.interval == 30
-
-        with patch.object(ai_hist, "cmd_watch", mock_watch):
-            with patch("sys.argv", ["ai-hist", "import", "--watch", "--interval", "30"]):
-                ai_hist.main()
-
-    def test_setup_git_command_dispatches(self, tmp_env):
-        def mock_setup_git(args):
-            assert args.repo == "/repo"
-            assert not args.uninstall
-
-        with patch.object(ai_hist, "cmd_setup_git", mock_setup_git):
-            with patch("sys.argv", ["ai-hist", "setup", "git", "--repo", "/repo"]):
-                ai_hist.main()
-
-    def test_link_commit_command_dispatches(self, tmp_env):
-        def mock_link_commit(args):
-            assert args.repo == "/repo"
-            assert args.commit == "abc123"
-            assert args.match_method == "manual"
-
-        with patch.object(ai_hist, "cmd_link_commit", mock_link_commit):
-            with patch(
-                "sys.argv",
-                [
-                    "ai-hist",
-                    "link",
-                    "commit",
-                    "--repo",
-                    "/repo",
-                    "--commit",
-                    "abc123",
-                    "--match-method",
-                    "manual",
-                ],
-            ):
-                ai_hist.main()
-
     def test_recent_with_source_and_project(self, tmp_env, capsys):
         seed_db(tmp_env, claude_lines=[make_claude_entry("filtered", 1700000001000, "/proj/x")])
         capsys.readouterr()
@@ -2110,50 +2070,6 @@ END;
         rows = [json.loads(l) for l in captured.out.strip().splitlines() if l]
         assert len(rows) == 1
         assert rows[0]["prompt"] == "new entry"
-
-    def test_export_commit_links_jsonl(self, tmp_env, capsys):
-        conn = sqlite3.connect(str(tmp_env.db_path))
-        ai_hist.init_db(conn)
-        conn.execute(
-            "INSERT INTO session_commit_links "
-            "(source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "claude",
-                "s1",
-                "/repo",
-                "feat/x",
-                "abc123",
-                "refs/notes/ai-hist",
-                "git_note",
-                0.95,
-                json.dumps(["src/main.rs"]),
-                json.dumps([{"path": "src/main.rs", "additions": 2, "deletions": 1}]),
-                json.dumps({"candidate": {"branch_match": True}}),
-                1700000000000,
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        args = SimpleNamespace(
-            output="commit-links",
-            format="jsonl",
-            source=None,
-            project=None,
-            repo=None,
-            since=None,
-            jsonl=True,
-        )
-        ai_hist.cmd_export(args)
-        row = json.loads(capsys.readouterr().out.strip())
-        assert row["source"] == "claude"
-        assert row["session_id"] == "s1"
-        assert row["commit_sha"] == "abc123"
-        assert row["match_method"] == "git_note"
-        assert row["confidence"] == 0.95
-        assert row["files_json"] == ["src/main.rs"]
-        assert row["evidence_json"]["candidate"]["branch_match"] is True
 
     def test_export_no_db(self, tmp_env, capsys):
         # Remove the DB

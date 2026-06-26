@@ -200,19 +200,19 @@ def test_explicit_rust_binary_escape_hatch(tmp_path):
     assert len(json.loads(result.stdout)) == 2
 
 
-def test_top_level_help_lists_rust_and_fallback_commands(tmp_path):
+def test_top_level_help_lists_rust_commands(tmp_path):
     env, _db, _home = isolated_env(tmp_path)
     result = run_cli(["--help"], env)
     assert result.returncode == 0
     assert "Rust-default commands:" in result.stdout
-    assert "Python fallback commands:" in result.stdout
     assert "search" in result.stdout
     assert "sync" in result.stdout
     assert "show" in result.stdout
     assert "login" in result.stdout
     assert "pair" in result.stdout
     assert "learn" in result.stdout
-    assert "DISPATCH_MATRIX.md" in result.stdout
+    assert "DISPATCH_MATRIX.md" not in result.stdout
+    assert "Python fallback" not in result.stdout
 
 
 def test_rust_binary_help_uses_public_name_and_describes_commands(tmp_path):
