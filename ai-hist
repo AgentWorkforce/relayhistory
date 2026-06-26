@@ -114,6 +114,8 @@ Rust-default commands:
   watch          Continuous sync loop
   export         Export JSONL/gzip/SQLite with filters
   import         Import JSONL/gzip/SQLite with dry-run support
+  setup          Install local integrations (for example git hooks)
+  link           Link sessions to commits and other artifacts
   tag            Tag a session
   untag          Remove a tag from a session
   tags           List tags and tagged sessions

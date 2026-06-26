@@ -27,8 +27,10 @@ Escape hatches:
 | `pack QUERY [--source --project --tag --limit --tokens --fts --json]` | Rust | Builds a search evidence bundle with resume commands and optional prompt truncation. |
 | `resume QUERY [--fts --json]` | Rust | Text and JSON output include the legacy-compatible `resume_cmd` field. |
 | `watch [--interval N]` | Rust | Runs the Rust sync loop repeatedly using the same sync implementation as `sync`. |
-| `export [output] [--format jsonl/sqlite --source --project --since]` | Rust | Supports JSONL, `.gz`, SQLite export, filters, stdout, and active DB overwrite protection. |
-| `import FILE [--dry-run]` | Rust | Supports JSONL, `.jsonl.gz`, SQLite import, dry-run preview, dedupe, and legacy rows without `prompt_hash` or `id`. |
+| `export [output] [--format jsonl/sqlite --source --project --since]` | Rust | Supports JSONL, `.gz`, SQLite export, filters, stdout, active DB overwrite protection, and `export commit-links --jsonl` for Reflex-ready session→commit edges. |
+| `import [FILE] [--dry-run --watch --interval N]` | Rust | Supports JSONL, `.jsonl.gz`, SQLite import, dry-run preview, dedupe, legacy rows without `prompt_hash` or `id`, and `import --watch` as a live-capture alias. |
+| `setup git [--repo --uninstall]` | Rust | Installs/removes a no-network managed `post-commit` hook that runs `link commit` and writes `refs/notes/ai-hist`. |
+| `link commit [--repo --commit --match-method --no-note --json --quiet]` | Rust | Links the most recent matching session to a commit with `match_method`, `confidence`, changed files, numstat, and evidence JSON. |
 | `tag SESSION TAG [--source --color --json]` | Rust | JSON includes matched sessions and created assignment count. |
 | `untag SESSION TAG [--source --json]` | Rust | JSON includes removed assignment count. |
 | `tags [--tag --sessions --json]` | Rust | Lists tag metadata and optional tagged sessions. |

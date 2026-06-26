@@ -217,6 +217,7 @@ To manage it yourself at any time:
 ai-hist sync --install-service    # launchd on macOS, cron on Linux
 ai-hist sync --uninstall-service  # remove it
 ai-hist sync                      # run a one-off sync now
+ai-hist import --watch            # foreground alias for continuous live capture
 ```
 
 `--install-service` points the scheduler directly at the resolved `ai-hist`
@@ -285,6 +286,53 @@ echo "* * * * * ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | cront
 ```bash
 ai-hist watch              # syncs every 60s
 ai-hist watch --interval 30  # syncs every 30s
+ai-hist import --watch --interval 30
+```
+
+## Session → commit links
+
+`ai-hist` can record local, no-network links between captured agent sessions
+and git commits. The rows are raw evidence for downstream outcome attribution:
+they contain match method, confidence, changed files, numstat, and evidence
+JSON. They do **not** score work quality.
+
+Install the hook in a repo:
+
+```bash
+ai-hist setup git --repo /path/to/repo
+```
+
+After each commit, the managed `post-commit` hook runs `ai-hist link commit`,
+writes a local `refs/notes/ai-hist` note, and stores a row in
+`session_commit_links`. To link manually:
+
+```bash
+ai-hist link commit --repo /path/to/repo --commit HEAD --json
+```
+
+Export links for Reflex or another consumer:
+
+```bash
+ai-hist export commit-links --jsonl --since 2026-06-01
+```
+
+Each JSONL row includes:
+
+```json
+{
+  "source": "claude",
+  "session_id": "session-id",
+  "repo": "/path/to/repo",
+  "branch": "feature-branch",
+  "commit_sha": "abc123...",
+  "note_ref": "refs/notes/ai-hist",
+  "match_method": "git_note",
+  "confidence": 0.95,
+  "files_json": ["src/file.rs"],
+  "numstat_json": [{"path": "src/file.rs", "additions": 10, "deletions": 2}],
+  "evidence_json": {"candidate": {"branch_match": true}},
+  "created_at_ms": 1780000000000
+}
 ```
 
 ## Schema

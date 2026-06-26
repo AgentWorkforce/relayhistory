@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -130,6 +131,22 @@ CREATE TABLE IF NOT EXISTS file_edits (
     cwd TEXT,
     UNIQUE(source, session_id, tool_use_id)
 );
+CREATE TABLE IF NOT EXISTS session_commit_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    branch TEXT,
+    commit_sha TEXT NOT NULL,
+    note_ref TEXT,
+    match_method TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    files_json TEXT,
+    numstat_json TEXT,
+    evidence_json TEXT,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE(source, session_id, commit_sha, match_method)
+);
 CREATE TABLE IF NOT EXISTS trajectories (
     id TEXT PRIMARY KEY,
     version INTEGER,
@@ -223,6 +240,16 @@ def _shell_quote(value):
     if re.match(r'^[A-Za-z0-9_./-]+$', value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _strip_url_credentials(url):
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
 
 
 def _resume_cmd(source, session_id, project):
@@ -1742,6 +1769,9 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(source, session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_edits_session ON file_edits(source, session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_commit_links_session ON session_commit_links(source, session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_commit_links_commit ON session_commit_links(commit_sha)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)")
 
 
 def load_state() -> dict:
@@ -2491,6 +2521,255 @@ def cmd_watch(args):
         time.sleep(interval)
 
 
+GIT_HOOK_MARKER_BEGIN = "# ai-hist session commit link (managed begin)"
+GIT_HOOK_MARKER_END = "# ai-hist session commit link (managed end)"
+AI_HIST_NOTE_REF = "ai-hist"
+
+
+def _git(repo, *args):
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def _git_root(repo):
+    return Path(_git(repo, "rev-parse", "--show-toplevel"))
+
+
+def _git_branch(repo):
+    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    return None if branch == "HEAD" else branch
+
+
+def _git_commit_files(repo, commit):
+    out = _git(repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _git_commit_numstat(repo, commit):
+    out = _git(repo, "diff-tree", "--root", "--numstat", "--no-commit-id", "-r", commit)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            rows.append({
+                "path": parts[2],
+                "additions": int(parts[0]) if parts[0].isdigit() else None,
+                "deletions": int(parts[1]) if parts[1].isdigit() else None,
+            })
+    return rows
+
+
+def _session_file_overlap(conn, source, session_id, files):
+    if not files:
+        return 0
+    rows = conn.execute(
+        "SELECT DISTINCT file_path FROM file_edits WHERE source = ? AND session_id = ?",
+        (source, session_id),
+    ).fetchall()
+    session_files = [r[0] for r in rows]
+    return sum(
+        1 for f in files
+        if any(sf == f or sf.endswith(f) or f.endswith(sf) for sf in session_files)
+    )
+
+
+def _find_session_for_commit(conn, repo_root, branch, commit_ms, files):
+    repo = str(repo_root)
+    try:
+        repo_canonical = repo_root.resolve()
+    except OSError:
+        repo_canonical = repo_root
+    min_ms = commit_ms - 36 * 60 * 60 * 1000
+    max_ms = commit_ms + 6 * 60 * 60 * 1000
+    rows = conn.execute(
+        "SELECT source, session_id, cwd, git_branch, first_activity_ms, last_activity_ms "
+        "FROM sessions WHERE session_id IS NOT NULL "
+        "AND COALESCE(last_activity_ms, first_activity_ms, 0) BETWEEN ? AND ?",
+        (min_ms, max_ms),
+    ).fetchall()
+    best = None
+    for source, session_id, cwd, git_branch, first_ms, last_ms in rows:
+        cwd_match = bool(cwd and _cwd_matches_repo(cwd, repo, repo_canonical))
+        branch_match = bool(branch and git_branch and branch == git_branch)
+        if not cwd_match and not branch_match:
+            continue
+        last = last_ms or first_ms or commit_ms
+        first = first_ms or last
+        if commit_ms < first:
+            distance = first - commit_ms
+        elif commit_ms > last:
+            distance = commit_ms - last
+        else:
+            distance = 0
+        overlap = _session_file_overlap(conn, source, session_id, files)
+        confidence = 0.45
+        if cwd_match:
+            confidence += 0.20
+        if branch_match:
+            confidence += 0.20
+        if distance == 0:
+            confidence += 0.10
+        elif distance <= 2 * 60 * 60 * 1000:
+            confidence += 0.05
+        if overlap:
+            confidence += 0.05
+        confidence = min(confidence, 0.98)
+        evidence = {
+            "cwd": cwd,
+            "git_branch": git_branch,
+            "first_activity_ms": first_ms,
+            "last_activity_ms": last_ms,
+            "cwd_match": cwd_match,
+            "branch_match": branch_match,
+            "time_distance_ms": distance,
+            "file_overlap": overlap,
+        }
+        candidate = (confidence, source, session_id, evidence)
+        if best is None or confidence > best[0]:
+            best = candidate
+    return best
+
+
+def _cwd_matches_repo(cwd, repo, repo_canonical):
+    if cwd == repo or cwd.startswith(repo + "/"):
+        return True
+    try:
+        cwd_canonical = Path(cwd).resolve()
+        return cwd_canonical == repo_canonical or repo_canonical in cwd_canonical.parents
+    except OSError:
+        return False
+
+
+def cmd_setup_git(args):
+    root = _git_root(Path(args.repo))
+    hook_path = root / ".git" / "hooks" / "post-commit"
+    if args.uninstall:
+        if not hook_path.exists():
+            print("No ai-hist post-commit hook installed.")
+            return
+        text = hook_path.read_text()
+        if GIT_HOOK_MARKER_BEGIN not in text:
+            print(f"{hook_path} is not managed by ai-hist; refusing to remove it.", file=sys.stderr)
+            sys.exit(1)
+        hook_path.unlink()
+        print(f"Removed ai-hist post-commit hook: {hook_path}")
+        return
+    existing = hook_path.read_text() if hook_path.exists() else ""
+    if existing.strip() and GIT_HOOK_MARKER_BEGIN not in existing:
+        print(f"{hook_path} already exists and is not managed by ai-hist.", file=sys.stderr)
+        sys.exit(1)
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    script = (
+        "#!/bin/sh\n"
+        f"{GIT_HOOK_MARKER_BEGIN}\n"
+        f"AI_HIST_DB={_shell_quote(str(DB_PATH))} {_shell_quote(sys.argv[0])} "
+        f"link commit --repo {_shell_quote(str(root))} --commit HEAD "
+        "--match-method git_note --quiet >/dev/null 2>>/tmp/ai-hist-git-link.err || true\n"
+        f"{GIT_HOOK_MARKER_END}\n"
+    )
+    hook_path.write_text(script)
+    hook_path.chmod(hook_path.stat().st_mode | 0o755)
+    print("Installed ai-hist post-commit hook.")
+    print(f"  repo: {root}")
+    print(f"  hook: {hook_path}")
+    print(f"  notes: refs/notes/{AI_HIST_NOTE_REF}")
+
+
+def cmd_link_commit(args):
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    root = _git_root(Path(args.repo))
+    commit_sha = _git(root, "rev-parse", args.commit)
+    commit_ms = int(_git(root, "show", "-s", "--format=%ct", commit_sha)) * 1000
+    try:
+        branch = _git_branch(root)
+    except Exception:
+        branch = None
+    try:
+        remote = _strip_url_credentials(_git(root, "remote", "get-url", "origin"))
+    except Exception:
+        remote = None
+    files = _git_commit_files(root, commit_sha)
+    numstat = _git_commit_numstat(root, commit_sha)
+    candidate = _find_session_for_commit(conn, root, branch, commit_ms, files)
+    if candidate is None:
+        if args.json:
+            print(json.dumps({"linked": False, "repo": str(root), "commit_sha": commit_sha, "reason": "no matching session"}))
+        elif not args.quiet:
+            print(f"No matching session found for {commit_sha} in {root}")
+        conn.close()
+        return
+    confidence, source, session_id, candidate_evidence = candidate
+    created_at_ms = int(time.time() * 1000)
+    note_ref = f"refs/notes/{AI_HIST_NOTE_REF}" if not args.no_note else None
+    evidence = {
+        "repo_path": str(root),
+        "repo_remote": remote,
+        "branch": branch,
+        "commit_time_ms": commit_ms,
+        "candidate": candidate_evidence,
+        "files": files,
+        "numstat": numstat,
+    }
+    if not args.no_note:
+        note = {
+            "schema": "ai-hist.session_commit_link.v1",
+            "source": source,
+            "session_id": session_id,
+            "repo": str(root),
+            "branch": branch,
+            "commit_sha": commit_sha,
+            "match_method": args.match_method,
+            "confidence": confidence,
+            "created_at_ms": created_at_ms,
+        }
+        subprocess.run(
+            ["git", "notes", f"--ref={AI_HIST_NOTE_REF}", "add", "-f", "-m", json.dumps(note), commit_sha],
+            cwd=str(root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    conn.execute(
+        "INSERT INTO session_commit_links "
+        "(source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(source, session_id, commit_sha, match_method) DO UPDATE SET "
+        "repo=excluded.repo, branch=excluded.branch, note_ref=excluded.note_ref, confidence=excluded.confidence, "
+        "files_json=excluded.files_json, numstat_json=excluded.numstat_json, evidence_json=excluded.evidence_json, created_at_ms=excluded.created_at_ms",
+        (source, session_id, str(root), branch, commit_sha, note_ref, args.match_method, confidence,
+         json.dumps(files), json.dumps(numstat), json.dumps(evidence), created_at_ms),
+    )
+    conn.commit()
+    conn.close()
+    out = {
+        "linked": True,
+        "source": source,
+        "session_id": session_id,
+        "repo": str(root),
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "note_ref": note_ref,
+        "match_method": args.match_method,
+        "confidence": confidence,
+        "files": files,
+        "numstat": numstat,
+        "evidence": evidence,
+        "created_at_ms": created_at_ms,
+    }
+    if args.json:
+        print(json.dumps(out))
+    elif not args.quiet:
+        print(f"Linked {source}:{session_id} → {commit_sha} ({args.match_method}, confidence {confidence:.2f})")
+
+
 # --- Export / Import ---------------------------------------------------------
 
 _EXPORT_FIELDS = ["source", "session_id", "project", "prompt", "prompt_hash", "timestamp_ms"]
@@ -2554,6 +2833,45 @@ def cmd_export(args):
 
     conn = sqlite3.connect(str(DB_PATH))
     init_db(conn)
+    if output == "commit-links":
+        if not getattr(args, "jsonl", False):
+            print("commit-link export is JSONL-only; pass `ai-hist export commit-links --jsonl`", file=sys.stderr)
+            sys.exit(1)
+        sql = (
+            "SELECT source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, "
+            "files_json, numstat_json, evidence_json, created_at_ms "
+            "FROM session_commit_links WHERE 1=1"
+        )
+        params = []
+        if getattr(args, "source", None):
+            sql += " AND source = ?"
+            params.append(args.source)
+        repo = getattr(args, "repo", None) or getattr(args, "project", None)
+        if repo:
+            sql += " AND repo LIKE ?"
+            params.append(f"%{repo}%")
+        if getattr(args, "since", None):
+            sql += " AND created_at_ms >= ?"
+            params.append(_parse_date_to_ms(args.since))
+        sql += " ORDER BY created_at_ms ASC, id ASC"
+        for row in conn.execute(sql, params):
+            source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms = row
+            print(json.dumps({
+                "source": source,
+                "session_id": session_id,
+                "repo": repo,
+                "branch": branch,
+                "commit_sha": commit_sha,
+                "note_ref": note_ref,
+                "match_method": match_method,
+                "confidence": confidence,
+                "files_json": json.loads(files_json) if files_json else None,
+                "numstat_json": json.loads(numstat_json) if numstat_json else None,
+                "evidence_json": json.loads(evidence_json) if evidence_json else None,
+                "created_at_ms": created_at_ms,
+            }))
+        conn.close()
+        return
     rows = _query_export_rows(conn, args)
     conn.close()
 
@@ -2651,7 +2969,17 @@ def cmd_import(args):
         ai-hist import colleague.db
         ai-hist import colleague.jsonl --dry-run
     """
+    if getattr(args, "watch", False):
+        if args.file:
+            print("`ai-hist import --watch` does not accept an import file.", file=sys.stderr)
+            sys.exit(1)
+        cmd_watch(args)
+        return
+
     path = args.file
+    if not path:
+        print("`ai-hist import` requires FILE unless --watch is set.", file=sys.stderr)
+        sys.exit(1)
     dry_run = getattr(args, "dry_run", False)
 
     if path.endswith(".db") or path.endswith(".sqlite"):
@@ -2792,11 +3120,31 @@ def main():
     exp.add_argument("--format", choices=["jsonl", "sqlite"], default="jsonl", help="Output format (default: jsonl)")
     exp.add_argument("--source", choices=SOURCE_CHOICES, help="Filter by source")
     exp.add_argument("--project", help="Filter by project path (substring)")
+    exp.add_argument("--repo", help="Filter commit-link export by repo path substring")
     exp.add_argument("--since", metavar="YYYY-MM-DD", help="Only entries on or after this date")
+    exp.add_argument("--jsonl", action="store_true", help="Required for `export commit-links`")
 
     imp = sub.add_parser("import", help="Import history from an exported JSONL or SQLite file")
-    imp.add_argument("file", help="File to import (.jsonl, .jsonl.gz, or .db)")
+    imp.add_argument("file", nargs="?", help="File to import (.jsonl, .jsonl.gz, or .db)")
     imp.add_argument("--dry-run", action="store_true", help="Preview what would be imported without writing")
+    imp.add_argument("--watch", action="store_true", help="Continuously sync local history, equivalent to watch")
+    imp.add_argument("--interval", type=int, default=60, help="Seconds between watch syncs (default: 60)")
+
+    setup = sub.add_parser("setup", help="Install local integrations")
+    setup_sub = setup.add_subparsers(dest="setup_command")
+    setup_git = setup_sub.add_parser("git", help="Install a no-network post-commit link hook")
+    setup_git.add_argument("--repo", default=".", help="Git repo to install into")
+    setup_git.add_argument("--uninstall", action="store_true", help="Remove the managed hook")
+
+    link = sub.add_parser("link", help="Link sessions to external artifacts")
+    link_sub = link.add_subparsers(dest="link_command")
+    link_commit = link_sub.add_parser("commit", help="Link the most recent matching session to a git commit")
+    link_commit.add_argument("--repo", default=".", help="Git repo containing the commit")
+    link_commit.add_argument("--commit", default="HEAD", help="Commit-ish to link")
+    link_commit.add_argument("--match-method", default="git_note", help="Evidence/match method label")
+    link_commit.add_argument("--no-note", action="store_true", help="Do not write refs/notes/ai-hist")
+    link_commit.add_argument("--json", action="store_true", help="Output the link row as JSON")
+    link_commit.add_argument("--quiet", action="store_true", help="Suppress text output")
 
     tg = sub.add_parser("tag", help="Tag a session for logical grouping")
     tg.add_argument("session_id", help="Session ID to tag")
@@ -2823,6 +3171,8 @@ def main():
         "stats": cmd_stats, "pack": cmd_pack, "resume": cmd_resume,
         "watch": cmd_watch,
         "export": cmd_export, "import": cmd_import,
+        "setup": lambda a: cmd_setup_git(a) if a.setup_command == "git" else setup.print_help(),
+        "link": lambda a: cmd_link_commit(a) if a.link_command == "commit" else link.print_help(),
         "tag": cmd_tag, "untag": cmd_untag, "tags": cmd_tags,
     }
 

@@ -137,6 +137,22 @@ CREATE TABLE IF NOT EXISTS file_edits (
     cwd TEXT,
     UNIQUE(source, session_id, tool_use_id)
 );
+CREATE TABLE IF NOT EXISTS session_commit_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    branch TEXT,
+    commit_sha TEXT NOT NULL,
+    note_ref TEXT,
+    match_method TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    files_json TEXT,
+    numstat_json TEXT,
+    evidence_json TEXT,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE(source, session_id, commit_sha, match_method)
+);
 CREATE TABLE IF NOT EXISTS trajectories (
     id TEXT PRIMARY KEY,
     version INTEGER,
@@ -304,6 +320,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_commit_links_session ON session_commit_links(source, session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_commit_links_commit ON session_commit_links(commit_sha)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
     Ok(())

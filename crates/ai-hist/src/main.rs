@@ -194,13 +194,32 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
         since: Option<String>,
+        #[arg(long)]
+        jsonl: bool,
     },
     /// Import exported history.
     Import {
-        file: PathBuf,
+        file: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
+        /// Continuously sync local agent history, equivalent to `watch`.
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
+    /// Install local integrations such as git hooks.
+    Setup {
+        #[command(subcommand)]
+        action: SetupAction,
+    },
+    /// Link sessions to external artifacts such as git commits.
+    Link {
+        #[command(subcommand)]
+        action: LinkAction,
     },
     /// Authenticate to relayhistory-cloud (Agent Relay Loop).
     ///
@@ -330,6 +349,36 @@ enum LearnAction {
         dry_run: bool,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Install a no-network post-commit hook that records session→commit links.
+    Git {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        uninstall: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LinkAction {
+    /// Link the most recent matching session to a git commit and optional git note.
+    Commit {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value = "HEAD")]
+        commit: String,
+        #[arg(long, default_value = "git_note")]
+        match_method: String,
+        #[arg(long)]
+        no_note: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -560,19 +609,69 @@ fn main() -> Result<()> {
             format,
             source,
             project,
+            repo,
             since,
+            jsonl,
         } => {
             validate_source(source.as_deref())?;
-            export_history(
-                &conn,
-                output.as_deref(),
-                &format,
-                source.as_deref(),
-                project.as_deref(),
-                since.as_deref(),
-            )
+            if output.as_deref() == Some(Path::new("commit-links")) {
+                export_commit_links(
+                    &conn,
+                    source.as_deref(),
+                    repo.as_deref().or(project.as_deref()),
+                    since.as_deref(),
+                    jsonl,
+                )
+            } else {
+                export_history(
+                    &conn,
+                    output.as_deref(),
+                    &format,
+                    source.as_deref(),
+                    project.as_deref(),
+                    since.as_deref(),
+                )
+            }
         }
-        Command::Import { file, dry_run } => import_history(&conn, &file, dry_run),
+        Command::Import {
+            file,
+            dry_run,
+            watch,
+            interval,
+        } => {
+            if watch {
+                anyhow::ensure!(
+                    file.is_none(),
+                    "`ai-hist import --watch` does not accept an import file"
+                );
+                watch_loop(&db_path, interval)
+            } else {
+                let file = file.context("`ai-hist import` requires FILE unless --watch is set")?;
+                import_history(&conn, &file, dry_run)
+            }
+        }
+        Command::Setup { action } => match action {
+            SetupAction::Git { repo, uninstall } => setup_git_hook(&db_path, &repo, uninstall),
+        },
+        Command::Link { action } => match action {
+            LinkAction::Commit {
+                repo,
+                commit,
+                match_method,
+                no_note,
+                json,
+                quiet,
+            } => link_git_commit(
+                &conn,
+                &db_path,
+                &repo,
+                &commit,
+                &match_method,
+                !no_note,
+                json,
+                quiet,
+            ),
+        },
         Command::Login {
             cloud: _use_cloud,
             mode,
@@ -1671,6 +1770,487 @@ fn uninstall_sync_service() -> Result<()> {
     } else {
         anyhow::bail!("No managed sync service exists on this platform.")
     }
+}
+
+const GIT_HOOK_MARKER_BEGIN: &str = "# ai-hist session commit link (managed begin)";
+const GIT_HOOK_MARKER_END: &str = "# ai-hist session commit link (managed end)";
+const AI_HIST_NOTE_REF: &str = "ai-hist";
+
+#[derive(Debug, Clone)]
+struct SessionCandidate {
+    source: String,
+    session_id: String,
+    confidence: f64,
+    evidence: Value,
+}
+
+fn setup_git_hook(db_path: &Path, repo: &Path, uninstall: bool) -> Result<()> {
+    let root = git_repo_root(repo)?;
+    let hooks_dir = root.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir).with_context(|| format!("creating {}", hooks_dir.display()))?;
+    let hook_path = hooks_dir.join("post-commit");
+    if uninstall {
+        uninstall_git_hook(&hook_path)?;
+        return Ok(());
+    }
+    let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+    anyhow::ensure!(
+        existing.trim().is_empty() || existing.contains(GIT_HOOK_MARKER_BEGIN),
+        "{} already exists and is not managed by ai-hist; install manually or remove it first",
+        hook_path.display()
+    );
+    let bin = service_binary()?;
+    let block = format!(
+        r#"#!/bin/sh
+{begin}
+AI_HIST_DB={db} {bin} link commit --repo {repo} --commit HEAD --match-method git_note --quiet >/dev/null 2>>/tmp/ai-hist-git-link.err || true
+{end}
+"#,
+        begin = GIT_HOOK_MARKER_BEGIN,
+        end = GIT_HOOK_MARKER_END,
+        db = sh_single_quote(&db_path.display().to_string()),
+        bin = sh_single_quote(&bin.display().to_string()),
+        repo = sh_single_quote(&root.display().to_string()),
+    );
+    fs::write(&hook_path, block).with_context(|| format!("writing {}", hook_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+    println!("Installed ai-hist post-commit hook.");
+    println!("  repo: {}", root.display());
+    println!("  hook: {}", hook_path.display());
+    println!("  rows: session_commit_links");
+    println!("  notes: refs/notes/{AI_HIST_NOTE_REF}");
+    Ok(())
+}
+
+fn uninstall_git_hook(hook_path: &Path) -> Result<()> {
+    if !hook_path.exists() {
+        println!("No ai-hist post-commit hook installed.");
+        return Ok(());
+    }
+    let existing = fs::read_to_string(hook_path)?;
+    anyhow::ensure!(
+        existing.contains(GIT_HOOK_MARKER_BEGIN),
+        "{} is not managed by ai-hist; refusing to remove it",
+        hook_path.display()
+    );
+    fs::remove_file(hook_path)?;
+    println!("Removed ai-hist post-commit hook: {}", hook_path.display());
+    Ok(())
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn link_git_commit(
+    conn: &Connection,
+    _db_path: &Path,
+    repo: &Path,
+    commit: &str,
+    match_method: &str,
+    write_note: bool,
+    as_json: bool,
+    quiet: bool,
+) -> Result<()> {
+    let root = git_repo_root(repo)?;
+    let commit_sha = git_stdout(&root, &["rev-parse", commit])?;
+    let commit_sha = commit_sha.trim();
+    let commit_ms = git_commit_time_ms(&root, commit_sha)?;
+    let branch = git_branch(&root).ok();
+    let repo_remote = git_remote(&root).ok();
+    let files = git_commit_files(&root, commit_sha)?;
+    let numstat = git_commit_numstat(&root, commit_sha)?;
+    let candidate = find_session_for_commit(conn, &root, branch.as_deref(), commit_ms, &files)?;
+    let Some(candidate) = candidate else {
+        if as_json {
+            println!(
+                "{}",
+                json!({
+                    "linked": false,
+                    "repo": root,
+                    "commit_sha": commit_sha,
+                    "reason": "no matching session"
+                })
+            );
+        } else if !quiet {
+            println!(
+                "No matching session found for {commit_sha} in {}",
+                root.display()
+            );
+        }
+        return Ok(());
+    };
+    let files_json = serde_json::to_string(&files)?;
+    let numstat_json = serde_json::to_string(&numstat)?;
+    let created_at_ms = chrono::Utc::now().timestamp_millis();
+    let note_ref = write_note.then_some(format!("refs/notes/{AI_HIST_NOTE_REF}"));
+    let evidence = json!({
+        "repo_path": root,
+        "repo_remote": repo_remote,
+        "branch": branch,
+        "commit_time_ms": commit_ms,
+        "candidate": candidate.evidence,
+        "files": files,
+        "numstat": numstat,
+    });
+    if write_note {
+        let note = json!({
+            "schema": "ai-hist.session_commit_link.v1",
+            "source": candidate.source,
+            "session_id": candidate.session_id,
+            "repo": root,
+            "branch": branch,
+            "commit_sha": commit_sha,
+            "match_method": match_method,
+            "confidence": candidate.confidence,
+            "created_at_ms": created_at_ms,
+        });
+        let note_string = serde_json::to_string(&note)?;
+        let _ = git_status(
+            &root,
+            &[
+                "notes",
+                &format!("--ref={AI_HIST_NOTE_REF}"),
+                "add",
+                "-f",
+                "-m",
+                &note_string,
+                commit_sha,
+            ],
+        );
+    }
+    conn.execute(
+        "INSERT INTO session_commit_links \
+         (source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, commit_sha, match_method) DO UPDATE SET \
+           repo=excluded.repo, branch=excluded.branch, note_ref=excluded.note_ref, confidence=excluded.confidence, \
+           files_json=excluded.files_json, numstat_json=excluded.numstat_json, evidence_json=excluded.evidence_json, created_at_ms=excluded.created_at_ms",
+        params![
+            candidate.source,
+            candidate.session_id,
+            root.display().to_string(),
+            branch,
+            commit_sha,
+            note_ref,
+            match_method,
+            candidate.confidence,
+            files_json,
+            numstat_json,
+            serde_json::to_string(&evidence)?,
+            created_at_ms,
+        ],
+    )?;
+    let out = json!({
+        "linked": true,
+        "source": candidate.source,
+        "session_id": candidate.session_id,
+        "repo": root,
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "note_ref": note_ref,
+        "match_method": match_method,
+        "confidence": candidate.confidence,
+        "files": files,
+        "numstat": numstat,
+        "evidence": evidence,
+        "created_at_ms": created_at_ms,
+    });
+    if as_json {
+        println!("{}", serde_json::to_string(&out)?);
+    } else if !quiet {
+        println!(
+            "Linked {}:{} → {} ({match_method}, confidence {:.2})",
+            out["source"].as_str().unwrap_or(""),
+            out["session_id"].as_str().unwrap_or(""),
+            commit_sha,
+            out["confidence"].as_f64().unwrap_or(0.0)
+        );
+    }
+    Ok(())
+}
+
+fn find_session_for_commit(
+    conn: &Connection,
+    repo_root: &Path,
+    branch: Option<&str>,
+    commit_ms: i64,
+    files: &[String],
+) -> Result<Option<SessionCandidate>> {
+    let repo = repo_root.display().to_string();
+    let repo_canonical = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let min_ms = commit_ms - 36 * 60 * 60 * 1000;
+    let max_ms = commit_ms + 6 * 60 * 60 * 1000;
+    let mut stmt = conn.prepare(
+        "SELECT source, session_id, cwd, git_branch, first_activity_ms, last_activity_ms \
+         FROM sessions \
+         WHERE session_id IS NOT NULL \
+           AND COALESCE(last_activity_ms, first_activity_ms, 0) BETWEEN ? AND ?",
+    )?;
+    let rows = stmt
+        .query_map(params![min_ms, max_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut best: Option<SessionCandidate> = None;
+    for (source, session_id, cwd, git_branch, first_activity_ms, last_activity_ms) in rows {
+        let cwd_match = cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd_matches_repo(cwd, &repo, &repo_canonical));
+        let branch_match = match (branch, git_branch.as_deref()) {
+            (Some(branch), Some(session_branch)) => branch == session_branch,
+            _ => false,
+        };
+        if !cwd_match && !branch_match {
+            continue;
+        }
+        let last = last_activity_ms.or(first_activity_ms).unwrap_or(commit_ms);
+        let first = first_activity_ms.unwrap_or(last);
+        let time_distance_ms = if commit_ms < first {
+            first - commit_ms
+        } else if commit_ms > last {
+            commit_ms - last
+        } else {
+            0
+        };
+        let file_overlap = session_file_overlap(conn, &source, &session_id, files)?;
+        let mut confidence: f64 = 0.45;
+        if cwd_match {
+            confidence += 0.20;
+        }
+        if branch_match {
+            confidence += 0.20;
+        }
+        if time_distance_ms == 0 {
+            confidence += 0.10;
+        } else if time_distance_ms <= 2 * 60 * 60 * 1000 {
+            confidence += 0.05;
+        }
+        if file_overlap > 0 {
+            confidence += 0.05;
+        }
+        confidence = confidence.min(0.98);
+        let evidence = json!({
+            "cwd": cwd,
+            "git_branch": git_branch,
+            "first_activity_ms": first_activity_ms,
+            "last_activity_ms": last_activity_ms,
+            "cwd_match": cwd_match,
+            "branch_match": branch_match,
+            "time_distance_ms": time_distance_ms,
+            "file_overlap": file_overlap,
+        });
+        let candidate = SessionCandidate {
+            source,
+            session_id,
+            confidence,
+            evidence,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.confidence > current.confidence)
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn cwd_matches_repo(cwd: &str, repo: &str, repo_canonical: &Path) -> bool {
+    if cwd == repo || cwd.starts_with(&(repo.to_string() + "/")) {
+        return true;
+    }
+    let cwd_path = PathBuf::from(cwd);
+    if let Ok(cwd_canonical) = fs::canonicalize(&cwd_path) {
+        return cwd_canonical == repo_canonical || cwd_canonical.starts_with(repo_canonical);
+    }
+    false
+}
+
+fn session_file_overlap(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    files: &[String],
+) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT file_path FROM file_edits WHERE source = ? AND session_id = ?")?;
+    let session_files = stmt
+        .query_map(params![source, session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut overlap = 0;
+    for file in files {
+        if session_files.iter().any(|session_file| {
+            session_file == file || session_file.ends_with(file) || file.ends_with(session_file)
+        }) {
+            overlap += 1;
+        }
+    }
+    Ok(overlap)
+}
+
+fn export_commit_links(
+    conn: &Connection,
+    source: Option<&str>,
+    repo: Option<&str>,
+    since: Option<&str>,
+    jsonl: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        jsonl,
+        "commit-link export is JSONL-only; pass `ai-hist export commit-links --jsonl`"
+    );
+    let since_ms = since.map(parse_date_ms).transpose()?;
+    let mut sql = "SELECT source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms FROM session_commit_links WHERE 1=1".to_string();
+    let mut params_vec = Vec::new();
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        params_vec.push(source.to_string());
+    }
+    if let Some(repo) = repo {
+        sql.push_str(" AND repo LIKE ?");
+        params_vec.push(format!("%{repo}%"));
+    }
+    if let Some(since_ms) = since_ms {
+        sql.push_str(" AND created_at_ms >= ?");
+        params_vec.push(since_ms.to_string());
+    }
+    sql.push_str(" ORDER BY created_at_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        let files_json: Option<String> = row.get(8)?;
+        let numstat_json: Option<String> = row.get(9)?;
+        let evidence_json: Option<String> = row.get(10)?;
+        Ok(json!({
+            "source": row.get::<_, String>(0)?,
+            "session_id": row.get::<_, String>(1)?,
+            "repo": row.get::<_, String>(2)?,
+            "branch": row.get::<_, Option<String>>(3)?,
+            "commit_sha": row.get::<_, String>(4)?,
+            "note_ref": row.get::<_, Option<String>>(5)?,
+            "match_method": row.get::<_, String>(6)?,
+            "confidence": row.get::<_, f64>(7)?,
+            "files_json": files_json.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            "numstat_json": numstat_json.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            "evidence_json": evidence_json.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+            "created_at_ms": row.get::<_, i64>(11)?,
+        }))
+    })?;
+    for row in rows {
+        println!("{}", serde_json::to_string(&row?)?);
+    }
+    Ok(())
+}
+
+fn git_repo_root(repo: &Path) -> Result<PathBuf> {
+    let out = git_stdout(repo, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(out.trim()))
+}
+
+fn git_branch(repo: &Path) -> Result<String> {
+    let out = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = out.trim();
+    anyhow::ensure!(branch != "HEAD" && !branch.is_empty(), "detached HEAD");
+    Ok(branch.to_string())
+}
+
+fn git_remote(repo: &Path) -> Result<String> {
+    let out = git_stdout(repo, &["remote", "get-url", "origin"])?;
+    Ok(strip_url_credentials(out.trim()))
+}
+
+fn git_commit_time_ms(repo: &Path, commit: &str) -> Result<i64> {
+    let out = git_stdout(repo, &["show", "-s", "--format=%ct", commit])?;
+    Ok(out.trim().parse::<i64>()? * 1000)
+}
+
+fn git_commit_files(repo: &Path, commit: &str) -> Result<Vec<String>> {
+    let out = git_stdout(
+        repo,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            commit,
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn git_commit_numstat(repo: &Path, commit: &str) -> Result<Vec<Value>> {
+    let out = git_stdout(
+        repo,
+        &[
+            "diff-tree",
+            "--root",
+            "--numstat",
+            "--no-commit-id",
+            "-r",
+            commit,
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let additions = parts.next()?;
+            let deletions = parts.next()?;
+            let path = parts.next()?;
+            Some(json!({
+                "path": path,
+                "additions": additions.parse::<i64>().ok(),
+                "deletions": deletions.parse::<i64>().ok(),
+            }))
+        })
+        .collect())
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn git_status(repo: &Path, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    anyhow::ensure!(status.success(), "git {} failed", args.join(" "));
+    Ok(())
 }
 
 fn get_entry(conn: &Connection, id: i64) -> Result<HistoryEntry> {
@@ -3949,8 +4529,9 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_stamp, ingest_claude_transcript, parse_trajectory_file, search_all,
-        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole,
+        file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript, link_git_commit,
+        parse_trajectory_file, search_all, strip_url_credentials, sync_claude_session_metadata,
+        xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
@@ -3964,7 +4545,10 @@ mod tests {
             xml_escape("/home/a&b/<bin>/ai-hist"),
             "/home/a&amp;b/&lt;bin&gt;/ai-hist"
         );
-        assert_eq!(xml_escape("/usr/local/bin/ai-hist"), "/usr/local/bin/ai-hist");
+        assert_eq!(
+            xml_escape("/usr/local/bin/ai-hist"),
+            "/usr/local/bin/ai-hist"
+        );
     }
 
     #[test]
@@ -4136,6 +4720,85 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(event_count, 4);
+    }
+
+    #[test]
+    fn links_git_commit_to_recent_session_with_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        run_git_for_test(&repo, &["init"]);
+        run_git_for_test(&repo, &["config", "user.email", "test@example.com"]);
+        run_git_for_test(&repo, &["config", "user.name", "ai-hist test"]);
+        run_git_for_test(&repo, &["checkout", "-b", "feat/link-test"]);
+        fs::write(repo.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        run_git_for_test(&repo, &["add", "src/lib.rs"]);
+        run_git_for_test(&repo, &["commit", "-m", "demo"]);
+        let commit = git_stdout(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let commit = commit.trim();
+        let commit_ms = git_commit_time_ms(&repo, commit).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, parser_version) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            rusqlite::params![
+                "s-link",
+                "claude",
+                repo.display().to_string(),
+                "feat/link-test",
+                commit_ms - 60_000,
+                commit_ms + 60_000
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name) VALUES (?, ?, ?, ?, ?)",
+            rusqlite::params!["claude", "s-link", "toolu_1", "src/lib.rs", "Edit"],
+        )
+        .unwrap();
+
+        link_git_commit(
+            &conn,
+            tmp.path(),
+            &repo,
+            commit,
+            "manual",
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let (session_id, commit_sha, match_method, confidence, evidence): (
+            String,
+            String,
+            String,
+            f64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT session_id, commit_sha, match_method, confidence, evidence_json FROM session_commit_links",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(session_id, "s-link");
+        assert_eq!(commit_sha, commit);
+        assert_eq!(match_method, "manual");
+        assert!(confidence >= 0.90);
+        let evidence: Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(evidence["candidate"]["branch_match"], true);
+        assert_eq!(evidence["candidate"]["file_overlap"], 1);
+    }
+
+    fn run_git_for_test(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {} failed", args.join(" "));
     }
 
     fn write_rich_claude_transcript(path: &std::path::Path) {
