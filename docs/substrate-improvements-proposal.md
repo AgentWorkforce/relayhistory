@@ -27,8 +27,9 @@ our moat's prerequisite.** Do the substrate extremely well; let Reflex score.
    hooks (`SessionStart`/`PostToolUse`/`Stop`/`PreCompact`). *Why:* agentmemory
    flags that Claude JSONL gets **cleaned up** — raw transcripts can vanish. If the
    evidence disappears, the entire ledger/outcome thesis collapses. **This is the
-   single most urgent item.** Hooks also capture tool *errors* inline (lower latency
-   than after-the-fact sync). *Effort: M.*
+   single most urgent item.** Status: the Rust `import --watch` live-capture alias
+   is landing in PR #36; lifecycle hook adapters remain follow-up work. Hooks also
+   capture tool *errors* inline (lower latency than after-the-fact sync). *Effort: M.*
 2. **Governance primitives** — `redact` / `delete` / `export` with audit, + **secret
    redaction at ingest** (we store full transcripts + diffs). *Why:* required before
    relayhistory is a shared/team substrate, and for the cloud data-trust posture.
@@ -41,10 +42,13 @@ our moat's prerequisite.** Do the substrate extremely well; let Reflex score.
    relayhistory from an archive into a live, queryable substrate + a distribution
    surface (`connect <agent>` one-liners). *Effort: M–L.*
 4. **session → commit → PR linkage** — `ai-hist setup git` (thin, no-network
-   `post-commit` → `refs/notes/ai-hist` + `session_commit_links` table), with the
-   branch/commit/time-overlap fallback. *Why:* the **bridge to outcome** — Reflex
-   can't attribute anything without it. (Borrow Traces' git-notes; this was "edit #2".)
-   *Effort: M.*
+   `post-commit` → optional `refs/notes/ai-hist` + `session_commit_links` table),
+   plus `ai-hist link commit` and `ai-hist export commit-links --jsonl`. Status:
+   the deterministic hook/link/export path is landing in PR #36; broader PR and
+   outcome joins remain follow-up work. `match_method` and `confidence` are linkage
+   metadata only, not scoring or attribution. *Why:* the **bridge to outcome** —
+   Reflex can't attribute anything without it. (Borrow Traces' git-notes; this was
+   "edit #2".) *Effort: M.*
 5. **Provenance-preserving recall-pack** — `ai-hist recall "<query>" --budget N
    --with-source-ids --json` → top sessions/files/PRs + intent snippets + **raw-evidence
    pointers + match confidence**, token-budgeted. *Why:* the genuinely good part of
@@ -72,7 +76,8 @@ our moat's prerequisite.** Do the substrate extremely well; let Reflex score.
 - Don't make relayhistory the auto-injection brain (that's a layer above / Reflex).
 - Don't let LLM-summarized memory become the source of truth — raw events stay canonical.
 - Don't bury raw evidence under summaries; don't require an always-on server for the local path.
-- Keep storage standard/inspectable (SQLite/FTS) — agentmemory's iii-KV lock-in is a differentiator *against* them.
+- Keep storage standard/inspectable (SQLite/FTS) — agentmemory's proprietary
+  native KV engine lock-in is a differentiator *against* them.
 
 ## Recommended first move
 **P0.1 (live capture / import-before-cleanup) + P1.4 (session→commit→PR linkage).**

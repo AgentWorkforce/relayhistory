@@ -47,7 +47,7 @@ def test_install_script_installs_working_launchers_from_source(tmp_path):
     )
     assert help_result.returncode == 0
     assert "Rust-default commands:" in help_result.stdout
-    assert "Python fallback commands:" in help_result.stdout
+    assert "Python fallback" not in help_result.stdout
     assert "sync" in help_result.stdout
 
     home = tmp_path / "home"

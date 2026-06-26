@@ -644,6 +644,10 @@ fn main() -> Result<()> {
                     file.is_none(),
                     "`ai-hist import --watch` does not accept an import file"
                 );
+                anyhow::ensure!(
+                    !dry_run,
+                    "`ai-hist import --watch` cannot be combined with --dry-run"
+                );
                 watch_loop(&db_path, interval)
             } else {
                 let file = file.context("`ai-hist import` requires FILE unless --watch is set")?;
@@ -1786,12 +1790,13 @@ struct SessionCandidate {
 
 fn setup_git_hook(db_path: &Path, repo: &Path, uninstall: bool) -> Result<()> {
     let root = git_repo_root(repo)?;
-    let hooks_dir = root.join(".git/hooks");
-    fs::create_dir_all(&hooks_dir).with_context(|| format!("creating {}", hooks_dir.display()))?;
-    let hook_path = hooks_dir.join("post-commit");
+    let hook_path = git_path(&root, "hooks/post-commit")?;
     if uninstall {
         uninstall_git_hook(&hook_path)?;
         return Ok(());
+    }
+    if let Some(parent) = hook_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let existing = fs::read_to_string(&hook_path).unwrap_or_default();
     anyhow::ensure!(
@@ -1889,7 +1894,7 @@ fn link_git_commit(
     let files_json = serde_json::to_string(&files)?;
     let numstat_json = serde_json::to_string(&numstat)?;
     let created_at_ms = chrono::Utc::now().timestamp_millis();
-    let note_ref = write_note.then_some(format!("refs/notes/{AI_HIST_NOTE_REF}"));
+    let mut note_ref = None;
     let evidence = json!({
         "repo_path": root,
         "repo_remote": repo_remote,
@@ -1912,7 +1917,7 @@ fn link_git_commit(
             "created_at_ms": created_at_ms,
         });
         let note_string = serde_json::to_string(&note)?;
-        let _ = git_status(
+        let note_status = git_status(
             &root,
             &[
                 "notes",
@@ -1924,6 +1929,11 @@ fn link_git_commit(
                 commit_sha,
             ],
         );
+        match note_status {
+            Ok(()) => note_ref = Some(format!("refs/notes/{AI_HIST_NOTE_REF}")),
+            Err(err) if !quiet => eprintln!("ai-hist: could not write git note: {err}"),
+            Err(_) => {}
+        }
     }
     conn.execute(
         "INSERT INTO session_commit_links \
@@ -2096,13 +2106,29 @@ fn session_file_overlap(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut overlap = 0;
     for file in files {
-        if session_files.iter().any(|session_file| {
-            session_file == file || session_file.ends_with(file) || file.ends_with(session_file)
-        }) {
+        if session_files
+            .iter()
+            .any(|session_file| paths_overlap(session_file, file))
+        {
             overlap += 1;
         }
     }
     Ok(overlap)
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    fn normalize(path: &str) -> String {
+        path.replace('\\', "/").trim_matches('/').to_string()
+    }
+    fn matches_suffix(path: &str, suffix: &str) -> bool {
+        path == suffix || path.ends_with(&format!("/{suffix}"))
+    }
+    let a = normalize(a);
+    let b = normalize(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    matches_suffix(&a, &b) || matches_suffix(&b, &a)
 }
 
 fn export_commit_links(
@@ -2161,6 +2187,16 @@ fn export_commit_links(
 fn git_repo_root(repo: &Path) -> Result<PathBuf> {
     let out = git_stdout(repo, &["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(out.trim()))
+}
+
+fn git_path(repo: &Path, path: &str) -> Result<PathBuf> {
+    let out = git_stdout(repo, &["rev-parse", "--git-path", path])?;
+    let resolved = PathBuf::from(out.trim());
+    if resolved.is_absolute() {
+        Ok(resolved)
+    } else {
+        Ok(repo.join(resolved))
+    }
 }
 
 fn git_branch(repo: &Path) -> Result<String> {
@@ -4530,8 +4566,8 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::{
         file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript, link_git_commit,
-        parse_trajectory_file, search_all, strip_url_credentials, sync_claude_session_metadata,
-        xml_escape, SearchRole,
+        parse_trajectory_file, paths_overlap, search_all, strip_url_credentials,
+        sync_claude_session_metadata, xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
@@ -4790,6 +4826,15 @@ mod tests {
         let evidence: Value = serde_json::from_str(&evidence).unwrap();
         assert_eq!(evidence["candidate"]["branch_match"], true);
         assert_eq!(evidence["candidate"]["file_overlap"], 1);
+    }
+
+    #[test]
+    fn path_overlap_requires_separator_boundary() {
+        assert!(paths_overlap("/repo/src/main.rs", "src/main.rs"));
+        assert!(paths_overlap("/repo/src/main.rs", "main.rs"));
+        assert!(paths_overlap("src/main.rs", "/repo/src/main.rs"));
+        assert!(!paths_overlap("src/remain.rs", "main.rs"));
+        assert!(!paths_overlap("src/main.rs.bak", "main.rs"));
     }
 
     fn run_git_for_test(repo: &std::path::Path, args: &[&str]) {

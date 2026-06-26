@@ -292,8 +292,10 @@ ai-hist setup git --repo /path/to/repo
 ```
 
 After each commit, the managed `post-commit` hook runs `ai-hist link commit`,
-writes a local `refs/notes/ai-hist` note, and stores a row in
-`session_commit_links`. To link manually:
+stores a row in `session_commit_links`, and may write a local
+`refs/notes/ai-hist` note when Git accepts the note write. `note_ref` is
+nullable so link rows remain valid when notes are disabled or cannot be written.
+To link manually:
 
 ```bash
 ai-hist link commit --repo /path/to/repo --commit HEAD --json
