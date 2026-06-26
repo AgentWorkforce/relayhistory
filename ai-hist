@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-Rust-first ai-hist dispatcher.
-
-The Rust CLI is the default for user-facing commands covered by the cutover
-tests. Python remains available as an explicit legacy escape hatch.
-"""
+"""Rust-first ai-hist dispatcher."""
 
 import os
 import subprocess
@@ -96,7 +91,7 @@ def is_top_level_help(argv):
 
 def print_wrapper_help():
     print(
-        """ai-hist: Rust-first AI history CLI with legacy Python fallback
+        """ai-hist: Rust-first AI history CLI
 
 Usage:
   ai-hist [COMMAND] [OPTIONS]
@@ -114,6 +109,8 @@ Rust-default commands:
   watch          Continuous sync loop
   export         Export JSONL/gzip/SQLite with filters
   import         Import JSONL/gzip/SQLite with dry-run support
+  setup          Install local integrations (for example git hooks)
+  link           Link sessions to commits and other artifacts
   tag            Tag a session
   untag          Remove a tag from a session
   tags           List tags and tagged sessions
@@ -123,16 +120,9 @@ Rust-default commands:
   pair           Ask relayhistory-cloud for in-session warnings
   learn          Distill history into Pair signal
 
-Python fallback commands:
-  (none in auto mode; use the explicit escape hatches for legacy compatibility)
-
-Escape hatches:
-  AI_HIST_CLI=auto|rust|python
+Rust binary override:
   AI_HIST_RUST_BIN=/path/to/ai-hist
-  ai-hist-rust
-  ai-hist-python
-
-See DISPATCH_MATRIX.md for the tested cutover routing table."""
+  ai-hist-rust"""
     )
 
 

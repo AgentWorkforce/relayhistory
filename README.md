@@ -2,10 +2,8 @@
 
 Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor](https://cursor.com), Grok, [Agent Relay](https://github.com/AgentWorkforce/relay), and compacted persona trajectory history into a local SQLite database with full-text search.
 
-`ai-hist` is now a Rust-default CLI. The public `ai-hist` command dispatches
-the user-facing command surface through Rust, while the legacy Python CLI
-remains available only as an explicit compatibility escape hatch. See
-[DISPATCH_MATRIX.md](DISPATCH_MATRIX.md) for the tested parity table.
+`ai-hist` is a Rust CLI. New commands and integrations should land in the Rust
+SDK/CLI surfaces.
 
 ## Install
 
@@ -19,13 +17,13 @@ Make sure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"  # add to .zshrc / .bashrc
 ```
 
-The installer installs deterministic launchers for `ai-hist`, `ai-hist-python`,
-and `ai-hist-rust`. For normal installs it downloads a prebuilt Rust binary from
-GitHub Releases, so users do not need a local Rust toolchain.
+The installer installs deterministic launchers for `ai-hist` and `ai-hist-rust`.
+For normal installs it downloads a prebuilt Rust binary from GitHub Releases, so
+users do not need a local Rust toolchain.
 
 If no prebuilt binary is available for your platform, the installer falls back
-to building from source. That fallback requires `cargo` and `python3`; install
-Rust from <https://rustup.rs/> if you intentionally use the source path.
+to building from source. That fallback requires `cargo`; install Rust from
+<https://rustup.rs/> if you intentionally use the source path.
 
 Installer controls:
 
@@ -38,15 +36,6 @@ AI_HIST_SOURCE_REF=my-branch sh install.sh    # override source fallback ref
 
 The publish workflow creates the npm packages, the `sdk-ts-v<version>` GitHub
 Release, and the prebuilt Rust assets consumed by the installer.
-
-Escape hatches:
-
-```bash
-AI_HIST_CLI=rust ai-hist search deploy
-AI_HIST_CLI=python ai-hist sync   # explicit legacy compatibility path
-ai-hist-rust search deploy
-ai-hist-python sync
-```
 
 ## Usage
 
@@ -217,6 +206,7 @@ To manage it yourself at any time:
 ai-hist sync --install-service    # launchd on macOS, cron on Linux
 ai-hist sync --uninstall-service  # remove it
 ai-hist sync                      # run a one-off sync now
+ai-hist import --watch            # foreground alias for continuous live capture
 ```
 
 `--install-service` points the scheduler directly at the resolved `ai-hist`
@@ -285,6 +275,55 @@ echo "* * * * * ~/.local/bin/ai-hist sync >> /tmp/ai-hist-sync.log 2>&1" | cront
 ```bash
 ai-hist watch              # syncs every 60s
 ai-hist watch --interval 30  # syncs every 30s
+ai-hist import --watch --interval 30
+```
+
+## Session → commit links
+
+`ai-hist` can record local, no-network links between captured agent sessions
+and git commits. The rows are raw evidence for downstream outcome attribution:
+they contain match method, confidence, changed files, numstat, and evidence
+JSON. They do **not** score work quality.
+
+Install the hook in a repo:
+
+```bash
+ai-hist setup git --repo /path/to/repo
+```
+
+After each commit, the managed `post-commit` hook runs `ai-hist link commit`,
+stores a row in `session_commit_links`, and may write a local
+`refs/notes/ai-hist` note when Git accepts the note write. `note_ref` is
+nullable so link rows remain valid when notes are disabled or cannot be written.
+To link manually:
+
+```bash
+ai-hist link commit --repo /path/to/repo --commit HEAD --json
+```
+
+Export links for Reflex or another consumer:
+
+```bash
+ai-hist export commit-links --jsonl --since 2026-06-01
+```
+
+Each JSONL row includes:
+
+```json
+{
+  "source": "claude",
+  "session_id": "session-id",
+  "repo": "/path/to/repo",
+  "branch": "feature-branch",
+  "commit_sha": "abc123...",
+  "note_ref": "refs/notes/ai-hist",
+  "match_method": "git_note",
+  "confidence": 0.95,
+  "files_json": ["src/file.rs"],
+  "numstat_json": [{"path": "src/file.rs", "additions": 10, "deletions": 2}],
+  "evidence_json": {"candidate": {"branch_match": true}},
+  "created_at_ms": 1780000000000
+}
 ```
 
 ## Schema
