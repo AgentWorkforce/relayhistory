@@ -15,6 +15,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./cloud": {
+      "types": "./dist/cloud-client.d.ts",
+      "default": "./dist/cloud-client.js"
+    },
     "./mcp-server": {
       "types": "./dist/mcp-server.d.ts",
       "default": "./dist/mcp-server.js"
