@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-27
+
+### Added
+
+- **Add cloud-client module with loginCloud and loadStoredRelayhistoryAuth**
+
 ## [0.3.5] - 2026-06-24
 
 ### Added
