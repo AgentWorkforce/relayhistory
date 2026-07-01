@@ -5,6 +5,33 @@ Sync and search your [Claude Code](https://docs.anthropic.com/en/docs/claude-cod
 `ai-hist` is a Rust CLI. New commands and integrations should land in the Rust
 SDK/CLI surfaces.
 
+## Why ai-hist
+
+Coding agents start every session from zero — they can't see the decisions you
+made yesterday, the approach that already failed, or the reasoning behind the
+architecture they're editing. Local transcript search recovers *what* you typed.
+ai-hist also captures *why*.
+
+- **HOW + WHY, not just HOW.** Most history tools index raw prompts and
+  transcripts (the *how*). ai-hist indexes those **and** distilled
+  **trajectories** — the `decisions` (question → chosen → reasoning →
+  alternatives) and `retrospectives` (learnings, confidence) behind each run.
+  Ask `why_for_task` and get the reasoning, not just the keystrokes.
+- **Local-first, team-optional.** Everything lands in local SQLite with FTS5 —
+  no keys, no network required. When you want it, opt into **cloud sync** to
+  feed a shared team memory with server-side secret/PII scrubbing and a
+  self-host Enterprise tier.
+- **It talks back.** Pushed history powers **Pair**: before a risky action, your
+  agent queries the store and gets *cited warnings drawn from your team's own
+  prior work* — so nobody repeats a mistake that's already in the record.
+- **Built for agents.** A stdio **MCP server** (`npx -y ai-hist-mcp`) exposes
+  `search_history`, `get_context`, `search_trajectories`, and `why_for_task` so
+  the agent can pull its own context mid-session, scoped to one project.
+
+If you only want fast local grep over your own agent history, ai-hist does that
+in one command. The trajectory + Pair loop is there when you're ready for team
+memory that prevents repeat mistakes.
+
 ## Install
 
 ```bash
