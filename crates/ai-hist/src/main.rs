@@ -738,6 +738,17 @@ fn main() -> Result<()> {
             interval,
         } => {
             if install_service {
+                // `--incognito` is a per-run privacy filter; the scheduled job
+                // runs a plain `push`, so silently dropping it would give a
+                // false sense that it applies. Reject the combo. (`--limit` is
+                // only a batch-size knob and is harmless to ignore here.)
+                if !incognito.is_empty() {
+                    anyhow::bail!(
+                        "--incognito is a per-run privacy filter and is NOT applied to the scheduled \
+                         push service. Run `ai-hist push --incognito ...` for a one-off push, or omit \
+                         it when installing the service."
+                    );
+                }
                 return install_managed_service(&PUSH_SERVICE, interval);
             }
             if uninstall_service {
@@ -1689,9 +1700,37 @@ fn install_managed_service(spec: &ServiceSpec, interval: u64) -> Result<()> {
     } else {
         anyhow::bail!(
             "Automatic {} service install is only supported on macOS and Linux. \
-             Run `ai-hist watch` to keep syncing in the foreground instead.",
-            spec.human
+             Schedule `ai-hist {}` yourself (e.g. via your platform's task scheduler) instead.",
+            spec.human,
+            spec.subcommand
         )
+    }
+}
+
+/// Single-quote a path for a crontab line so spaces / shell metacharacters in
+/// the binary path don't break the scheduled command.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Translate a desired interval (seconds) into a cron schedule expression plus a
+/// human cadence. cron's finest granularity is one minute, so sub-minute or
+/// non-whole-minute intervals collapse to every minute.
+fn cron_schedule(interval: u64) -> (String, String) {
+    if interval < 60 || !interval.is_multiple_of(60) {
+        return ("* * * * *".to_string(), "every minute".to_string());
+    }
+    let minutes = interval / 60;
+    if minutes == 1 {
+        ("* * * * *".to_string(), "every minute".to_string())
+    } else if minutes < 60 {
+        (format!("*/{minutes} * * * *"), format!("every {minutes} minutes"))
+    } else if minutes.is_multiple_of(60) && minutes / 60 < 24 {
+        let hours = minutes / 60;
+        (format!("0 */{hours} * * *"), format!("every {hours} hour(s)"))
+    } else {
+        // Odd multi-hour cadence — fall back to hourly rather than mis-schedule.
+        ("0 * * * *".to_string(), "every hour".to_string())
     }
 }
 
@@ -1785,16 +1824,22 @@ fn write_crontab(contents: &str) -> Result<()> {
 }
 
 fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
-    if interval != 60 {
+    let (schedule, cadence) = cron_schedule(interval);
+    if interval >= 60 && !interval.is_multiple_of(60) {
         eprintln!(
-            "Note: cron runs at 1-minute granularity; ignoring --interval={interval} and \
-             scheduling every minute."
+            "Note: cron runs at 1-minute granularity; rounding --interval={interval}s to {cadence}."
+        );
+    } else if interval < 60 && interval != 60 {
+        eprintln!(
+            "Note: cron runs at 1-minute granularity; scheduling --interval={interval}s as {cadence}."
         );
     }
     let marker = cron_marker(spec);
     let line = format!(
-        "* * * * * {bin} {} >> /tmp/{}.log 2>&1 {marker}",
-        spec.subcommand, spec.log_stem
+        "{schedule} {} {} >> /tmp/{}.log 2>&1 {marker}",
+        shell_single_quote(bin),
+        spec.subcommand,
+        spec.log_stem
     );
     // Drop any previously managed line, then append the current one.
     let mut lines: Vec<String> = read_crontab()
@@ -1805,12 +1850,9 @@ fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<
     lines.push(line);
     write_crontab(&format!("{}\n", lines.join("\n")))?;
 
-    println!("Installed cron {} job; running every minute.", spec.human);
+    println!("Installed cron {} job; running {cadence}.", spec.human);
     println!("  view:   crontab -l");
-    println!(
-        "  remove: ai-hist {} --uninstall-service",
-        spec.subcommand
-    );
+    println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
     Ok(())
 }
 
@@ -4633,14 +4675,31 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript, link_git_commit,
-        parse_trajectory_file, paths_overlap, search_all, strip_url_credentials,
-        sync_claude_session_metadata, xml_escape, SearchRole,
+        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
+        link_git_commit, parse_trajectory_file, paths_overlap, search_all, shell_single_quote,
+        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
+
+    #[test]
+    fn cron_schedule_maps_intervals_to_step_expressions() {
+        assert_eq!(cron_schedule(60).0, "* * * * *");
+        assert_eq!(cron_schedule(300).0, "*/5 * * * *"); // push default
+        assert_eq!(cron_schedule(120).0, "*/2 * * * *");
+        assert_eq!(cron_schedule(3600).0, "0 */1 * * *");
+        // Sub-minute and non-whole-minute intervals collapse to every minute.
+        assert_eq!(cron_schedule(30).0, "* * * * *");
+        assert_eq!(cron_schedule(90).0, "* * * * *");
+    }
+
+    #[test]
+    fn shell_single_quote_survives_spaces_and_quotes() {
+        assert_eq!(shell_single_quote("/opt/ai hist/bin"), "'/opt/ai hist/bin'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
 
     #[test]
     fn xml_escape_protects_plist_path() {

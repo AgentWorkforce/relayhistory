@@ -66,3 +66,8 @@ test('pushToCloud treats empty stdout as a zero-record push', async () => {
   const report = await pushToCloud({ binPath: '/bin/echo', spawnFn });
   assert.deepEqual(report, { sent: 0, accepted: 0, batchId: null, cursor: undefined });
 });
+
+test('pushToCloud rejects when the binary prints malformed JSON', async () => {
+  const { spawnFn } = fakeSpawn({ code: 0, stdout: '{ truncated' });
+  await assert.rejects(pushToCloud({ binPath: '/bin/echo', spawnFn }), /could not parse ai-hist push output/);
+});

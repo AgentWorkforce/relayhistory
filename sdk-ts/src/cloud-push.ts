@@ -46,15 +46,19 @@ function isExecutable(path: string): boolean {
 }
 
 /**
- * Resolve the ai-hist binary: explicit override → `$AI_HIST_RUST_BIN` → the
- * install.sh location → the `ai-hist` wrapper on `PATH`. Returns `null` only if
- * an explicit/known path was given but isn't executable; otherwise falls back
- * to `'ai-hist'` and lets spawn surface ENOENT (handled as a no-op).
+ * Resolve the ai-hist binary. An explicit override is **authoritative** — it is
+ * returned verbatim without falling through to discovery, so the caller always
+ * runs the binary it asked for (a bad path surfaces later as ENOENT → a no-op
+ * push, never a silent switch to a different binary). With no override:
+ * `$AI_HIST_RUST_BIN` → the install.sh location → the `ai-hist` wrapper on
+ * `PATH`. Always returns a string.
  */
 export function resolveAiHistBinary(explicit?: string): string {
-  const known = [explicit, process.env[AI_HIST_RUST_BIN_ENV], join(homedir(), '.local', 'share', 'ai-hist', 'ai-hist-rust-bin')].filter(
-    (c): c is string => typeof c === 'string' && c.length > 0
-  );
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  const known = [
+    process.env[AI_HIST_RUST_BIN_ENV],
+    join(homedir(), '.local', 'share', 'ai-hist', 'ai-hist-rust-bin'),
+  ].filter((c): c is string => typeof c === 'string' && c.length > 0);
   for (const candidate of known) {
     if (isExecutable(candidate)) return candidate;
   }

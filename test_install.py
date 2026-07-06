@@ -219,9 +219,9 @@ def test_install_script_autosync_opt_out_leaves_launchd_untouched(tmp_path):
     bin_dir = tmp_path / "bin"
     install_dir = tmp_path / "share" / "ai-hist"
     sandbox_home = tmp_path / "home"
-    fake_tools = tmp_path / "fake-tools"
-    fake_tools.mkdir()
 
+    # Binary mode installs a prebuilt binary (no cargo), so no fake toolchain on
+    # PATH is needed here — the inherited PATH covers install.sh's own tools.
     fake_binary = tmp_path / "ai-hist-darwin-arm64"
     fake_binary.write_text(
         "#!/bin/sh\n"
@@ -239,7 +239,6 @@ def test_install_script_autosync_opt_out_leaves_launchd_untouched(tmp_path):
             "AI_HIST_BIN_DIR": str(bin_dir),
             "AI_HIST_INSTALL_DIR": str(install_dir),
             "AI_HIST_WRAPPER_SOURCE_DIR": str(ROOT),
-            "PATH": f"{fake_tools}:{os.environ.get('PATH', '')}",
             "AI_HIST_NO_AUTOSYNC": "1",
             "HOME": str(sandbox_home),
         }

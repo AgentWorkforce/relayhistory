@@ -253,10 +253,14 @@ a separate step (`push`), which has its own background service using the same
 launchd/cron plumbing:
 
 ```bash
-ai-hist push --install-service      # schedule automatic cloud push (default: every 300s)
+ai-hist push --install-service      # schedule automatic cloud push (macOS: every 300s)
 ai-hist push --uninstall-service    # remove it
 ai-hist push                        # push new history now
 ```
+
+On macOS the launchd job honors `--interval` (default 300s). On Linux the job is
+a cron entry: whole-minute intervals become a step schedule (300s → `*/5`), and
+sub-minute intervals run every minute (cron's finest granularity).
 
 Running both services keeps local capture and cloud upload going end-to-end.
 The push job authenticates with the `rth_at_` token written by `ai-hist login`.
