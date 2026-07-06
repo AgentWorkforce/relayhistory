@@ -18,6 +18,12 @@ def test_install_script_installs_working_launchers_from_source(tmp_path):
             "AI_HIST_BIN_DIR": str(bin_dir),
             "AI_HIST_INSTALL_DIR": str(install_dir),
             "AI_HIST_BUILD_PROFILE": "debug",
+            # Never let the installer's auto-sync step touch the developer's real
+            # launchd session: it would overwrite ~/Library/LaunchAgents with a
+            # plist pointing at this throwaway tmp binary. Sandbox HOME too as
+            # defense in depth.
+            "AI_HIST_NO_AUTOSYNC": "1",
+            "HOME": str(tmp_path / "install-home"),
         }
     )
 
@@ -150,6 +156,10 @@ def test_install_script_binary_mode_does_not_require_cargo(tmp_path):
             "AI_HIST_INSTALL_DIR": str(install_dir),
             "AI_HIST_WRAPPER_SOURCE_DIR": str(ROOT),
             "PATH": f"{fake_tools}:{os.environ.get('PATH', '')}",
+            # See note above: keep the installer's auto-sync out of the real
+            # launchd session during tests.
+            "AI_HIST_NO_AUTOSYNC": "1",
+            "HOME": str(tmp_path / "install-home"),
         }
     )
 
@@ -195,3 +205,55 @@ def test_install_script_binary_mode_does_not_require_cargo(tmp_path):
     )
     assert rust_result.returncode == 0, rust_result.stderr
     assert rust_result.stdout.strip() == "[]"
+
+
+def test_install_script_autosync_opt_out_leaves_launchd_untouched(tmp_path):
+    """AI_HIST_NO_AUTOSYNC=1 must skip the launchd/cron install entirely.
+
+    Regression guard: the installer's auto-sync step resolves the launchd plist
+    against $HOME, so an un-sandboxed install (as the test suite once did) would
+    clobber the real ~/Library/LaunchAgents job with a pointer to a throwaway
+    binary. The opt-out must write no plist at all.
+    """
+    bin_dir = tmp_path / "bin"
+    install_dir = tmp_path / "share" / "ai-hist"
+    sandbox_home = tmp_path / "home"
+    fake_tools = tmp_path / "fake-tools"
+    fake_tools.mkdir()
+
+    fake_binary = tmp_path / "ai-hist-darwin-arm64"
+    fake_binary.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then echo 'ai-hist 9.9.9'; exit 0; fi\n"
+        "if [ \"$1\" = \"recent\" ]; then echo '[]'; exit 0; fi\n"
+        "echo \"fake ai-hist: $*\"\n"
+    )
+    fake_binary.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AI_HIST_INSTALL_METHOD": "binary",
+            "AI_HIST_BINARY_URL": fake_binary.as_uri(),
+            "AI_HIST_BIN_DIR": str(bin_dir),
+            "AI_HIST_INSTALL_DIR": str(install_dir),
+            "AI_HIST_WRAPPER_SOURCE_DIR": str(ROOT),
+            "PATH": f"{fake_tools}:{os.environ.get('PATH', '')}",
+            "AI_HIST_NO_AUTOSYNC": "1",
+            "HOME": str(sandbox_home),
+        }
+    )
+
+    result = subprocess.run(
+        ["sh", str(ROOT / "install.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "skipping auto-sync" in (result.stdout + result.stderr)
+    assert not sandbox_home.joinpath(
+        "Library", "LaunchAgents", "com.ai-hist.sync.plist"
+    ).exists()

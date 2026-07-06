@@ -246,6 +246,23 @@ cron runs at 1-minute granularity). Verify health with:
 launchctl list | grep ai-hist   # middle "last exit status" column should be 0
 ```
 
+### Continuous cloud push
+
+`sync` keeps the **local** database fresh. Uploading it to relayhistory-cloud is
+a separate step (`push`), which has its own background service using the same
+launchd/cron plumbing:
+
+```bash
+ai-hist push --install-service      # schedule automatic cloud push (default: every 300s)
+ai-hist push --uninstall-service    # remove it
+ai-hist push                        # push new history now
+```
+
+Enabling Reflex — `agent-relay reflex on` — installs both the `sync` and `push`
+services for you, so local capture and cloud upload run end-to-end automatically;
+`agent-relay reflex off` removes the push service again. The push job authenticates
+with the `rth_at_` token written by `ai-hist login` / `reflex on`.
+
 ### Manual setup (macOS)
 
 If you prefer to write the launchd plist by hand, sync every 60 seconds with:

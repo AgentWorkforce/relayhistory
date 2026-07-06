@@ -271,6 +271,18 @@ enum Command {
         incognito: Vec<String>,
         #[arg(long)]
         json: bool,
+        /// Install a background service (launchd on macOS, cron on Linux) that
+        /// runs `push` on an interval so new history reaches the cloud
+        /// automatically. Enabling Reflex (`agent-relay reflex on`) does this.
+        #[arg(long)]
+        install_service: bool,
+        /// Remove the background push service installed by --install-service.
+        #[arg(long, conflicts_with = "install_service")]
+        uninstall_service: bool,
+        /// Seconds between pushes for the installed service (macOS only; cron
+        /// runs at 1-minute granularity).
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
     },
     /// Pair (Agent Relay Loop, WS-6) — in-session warnings from your team's history.
     Pair {
@@ -596,9 +608,9 @@ fn main() -> Result<()> {
             interval,
         } => {
             if install_service {
-                install_sync_service(interval)
+                install_managed_service(&SYNC_SERVICE, interval)
             } else if uninstall_service {
-                uninstall_sync_service()
+                uninstall_managed_service(&SYNC_SERVICE)
             } else {
                 sync_basic(&conn, &db_path)
             }
@@ -721,7 +733,16 @@ fn main() -> Result<()> {
             limit,
             incognito,
             json,
+            install_service,
+            uninstall_service,
+            interval,
         } => {
+            if install_service {
+                return install_managed_service(&PUSH_SERVICE, interval);
+            }
+            if uninstall_service {
+                return uninstall_managed_service(&PUSH_SERVICE);
+            }
             let auth = cloud::load_auth()?
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let machine = MachineIdentity {
@@ -1608,11 +1629,41 @@ fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
     }
 }
 
-const SYNC_SERVICE_LABEL: &str = "com.ai-hist.sync";
-const CRON_MARKER: &str = "# ai-hist sync (managed)";
+/// A background service managed by ai-hist. Both the local `sync` job and the
+/// cloud `push` job share the same launchd/cron plumbing; only these fields
+/// differ.
+struct ServiceSpec {
+    /// launchd label and plist basename stem, e.g. "com.ai-hist.sync".
+    label: &'static str,
+    /// ai-hist subcommand the service runs, e.g. "sync" or "push".
+    subcommand: &'static str,
+    /// `/tmp/<log_stem>.log` and `.err` capture the service's output.
+    log_stem: &'static str,
+    /// Human-facing noun for messages, e.g. "sync" or "cloud push".
+    human: &'static str,
+}
 
-fn launchd_plist_path() -> PathBuf {
-    home_dir().join("Library/LaunchAgents/com.ai-hist.sync.plist")
+const SYNC_SERVICE: ServiceSpec = ServiceSpec {
+    label: "com.ai-hist.sync",
+    subcommand: "sync",
+    log_stem: "ai-hist-sync",
+    human: "sync",
+};
+
+const PUSH_SERVICE: ServiceSpec = ServiceSpec {
+    label: "com.ai-hist.push",
+    subcommand: "push",
+    log_stem: "ai-hist-push",
+    human: "cloud push",
+};
+
+/// The comment marker that identifies this service's managed crontab line.
+fn cron_marker(spec: &ServiceSpec) -> String {
+    format!("# ai-hist {} (managed)", spec.subcommand)
+}
+
+fn launchd_plist_path(spec: &ServiceSpec) -> PathBuf {
+    home_dir().join(format!("Library/LaunchAgents/{}.plist", spec.label))
 }
 
 /// Resolve the absolute path of the running ai-hist binary so the service
@@ -1628,23 +1679,24 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn install_sync_service(interval: u64) -> Result<()> {
+fn install_managed_service(spec: &ServiceSpec, interval: u64) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
     if cfg!(target_os = "macos") {
-        install_launchd_service(&bin, interval)
+        install_launchd_service(spec, &bin, interval)
     } else if cfg!(target_os = "linux") {
-        install_cron_service(&bin, interval)
+        install_cron_service(spec, &bin, interval)
     } else {
         anyhow::bail!(
-            "Automatic sync service install is only supported on macOS and Linux. \
-             Run `ai-hist watch` to keep syncing in the foreground instead."
+            "Automatic {} service install is only supported on macOS and Linux. \
+             Run `ai-hist watch` to keep syncing in the foreground instead.",
+            spec.human
         )
     }
 }
 
-fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
-    let plist_path = launchd_plist_path();
+fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
+    let plist_path = launchd_plist_path(spec);
     if let Some(dir) = plist_path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -1658,22 +1710,24 @@ fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
     <key>ProgramArguments</key>
     <array>
         <string>{bin}</string>
-        <string>sync</string>
+        <string>{subcommand}</string>
     </array>
     <key>StartInterval</key>
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/ai-hist-sync.log</string>
+    <string>/tmp/{log_stem}.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/ai-hist-sync.err</string>
+    <string>/tmp/{log_stem}.err</string>
 </dict>
 </plist>
 "#,
-        label = SYNC_SERVICE_LABEL,
+        label = spec.label,
         bin = xml_escape(bin),
+        subcommand = spec.subcommand,
         interval = interval,
+        log_stem = spec.log_stem,
     );
     fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
 
@@ -1691,10 +1745,16 @@ fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
         anyhow::bail!("launchctl load failed for {}", plist_path.display());
     }
 
-    println!("Installed launchd sync service ({SYNC_SERVICE_LABEL}); syncing every {interval}s.");
+    println!(
+        "Installed launchd {} service ({}); running every {interval}s.",
+        spec.human, spec.label
+    );
     println!("  plist: {}", plist_path.display());
     println!("  check: launchctl list | grep ai-hist   (middle column 0 = healthy)");
-    println!("  remove: ai-hist sync --uninstall-service");
+    println!(
+        "  remove: ai-hist {} --uninstall-service",
+        spec.subcommand
+    );
     Ok(())
 }
 
@@ -1724,32 +1784,39 @@ fn write_crontab(contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_cron_service(bin: &str, interval: u64) -> Result<()> {
+fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
     if interval != 60 {
         eprintln!(
             "Note: cron runs at 1-minute granularity; ignoring --interval={interval} and \
              scheduling every minute."
         );
     }
-    let line = format!("* * * * * {bin} sync >> /tmp/ai-hist-sync.log 2>&1 {CRON_MARKER}");
+    let marker = cron_marker(spec);
+    let line = format!(
+        "* * * * * {bin} {} >> /tmp/{}.log 2>&1 {marker}",
+        spec.subcommand, spec.log_stem
+    );
     // Drop any previously managed line, then append the current one.
     let mut lines: Vec<String> = read_crontab()
         .lines()
-        .filter(|l| !l.contains(CRON_MARKER))
+        .filter(|l| !l.contains(&marker))
         .map(str::to_string)
         .collect();
     lines.push(line);
     write_crontab(&format!("{}\n", lines.join("\n")))?;
 
-    println!("Installed cron sync job; syncing every minute.");
+    println!("Installed cron {} job; running every minute.", spec.human);
     println!("  view:   crontab -l");
-    println!("  remove: ai-hist sync --uninstall-service");
+    println!(
+        "  remove: ai-hist {} --uninstall-service",
+        spec.subcommand
+    );
     Ok(())
 }
 
-fn uninstall_sync_service() -> Result<()> {
+fn uninstall_managed_service(spec: &ServiceSpec) -> Result<()> {
     if cfg!(target_os = "macos") {
-        let plist_path = launchd_plist_path();
+        let plist_path = launchd_plist_path(spec);
         let _ = std::process::Command::new("launchctl")
             .arg("unload")
             .arg(&plist_path)
@@ -1757,22 +1824,23 @@ fn uninstall_sync_service() -> Result<()> {
         if plist_path.exists() {
             fs::remove_file(&plist_path)
                 .with_context(|| format!("removing {}", plist_path.display()))?;
-            println!("Removed launchd sync service.");
+            println!("Removed launchd {} service.", spec.human);
         } else {
-            println!("No launchd sync service installed.");
+            println!("No launchd {} service installed.", spec.human);
         }
         Ok(())
     } else if cfg!(target_os = "linux") {
+        let marker = cron_marker(spec);
         let kept: Vec<String> = read_crontab()
             .lines()
-            .filter(|l| !l.contains(CRON_MARKER))
+            .filter(|l| !l.contains(&marker))
             .map(str::to_string)
             .collect();
         write_crontab(&format!("{}\n", kept.join("\n")))?;
-        println!("Removed cron sync job.");
+        println!("Removed cron {} job.", spec.human);
         Ok(())
     } else {
-        anyhow::bail!("No managed sync service exists on this platform.")
+        anyhow::bail!("No managed {} service exists on this platform.", spec.human)
     }
 }
 
