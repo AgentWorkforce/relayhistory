@@ -258,10 +258,8 @@ ai-hist push --uninstall-service    # remove it
 ai-hist push                        # push new history now
 ```
 
-Enabling Reflex — `agent-relay reflex on` — installs both the `sync` and `push`
-services for you, so local capture and cloud upload run end-to-end automatically;
-`agent-relay reflex off` removes the push service again. The push job authenticates
-with the `rth_at_` token written by `ai-hist login` / `reflex on`.
+Running both services keeps local capture and cloud upload going end-to-end.
+The push job authenticates with the `rth_at_` token written by `ai-hist login`.
 
 ### Manual setup (macOS)
 

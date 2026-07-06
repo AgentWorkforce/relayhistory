@@ -273,7 +273,7 @@ enum Command {
         json: bool,
         /// Install a background service (launchd on macOS, cron on Linux) that
         /// runs `push` on an interval so new history reaches the cloud
-        /// automatically. Enabling Reflex (`agent-relay reflex on`) does this.
+        /// automatically.
         #[arg(long)]
         install_service: bool,
         /// Remove the background push service installed by --install-service.
