@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **In-process cloud push (`ai-hist/cloud` → `pushToCloud`)** — a wire-compatible
-  TypeScript port of the Rust `ai-hist push`: reads new local history/trajectory
-  rows and POSTs them to relayhistory-cloud `/v1/ingest`. Enables hosts (e.g. the
-  Agent Relay runtime) to sync in-process without shelling out to the CLI. Also
-  exports the primitives `buildOutboxBatch`, `promptHash`, `batchId`, `machineId`,
-  `loadCursor`/`saveCursor`, and `normalizeHomePath`.
+- **In-process cloud push (`ai-hist/cloud` → `pushToCloud`)** — a thin wrapper
+  that drives the real `ai-hist push --json` Rust binary and parses its result,
+  rather than re-implementing the push pipeline in TypeScript. The binary stays
+  the single source of truth for batching/cursor/dedup; the SDK just gives hosts
+  (e.g. the Agent Relay runtime) an ergonomic surface to sync in-process without
+  shelling out to a CLI by hand. Binary discovery: `$AI_HIST_RUST_BIN` → the
+  install.sh location → `ai-hist` on `PATH`. Also exports `resolveAiHistBinary`.
 
 ## [0.3.7] - 2026-06-27
 

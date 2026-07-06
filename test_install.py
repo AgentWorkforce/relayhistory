@@ -20,10 +20,11 @@ def test_install_script_installs_working_launchers_from_source(tmp_path):
             "AI_HIST_BUILD_PROFILE": "debug",
             # Never let the installer's auto-sync step touch the developer's real
             # launchd session: it would overwrite ~/Library/LaunchAgents with a
-            # plist pointing at this throwaway tmp binary. Sandbox HOME too as
-            # defense in depth.
+            # plist pointing at this throwaway tmp binary. AI_HIST_NO_AUTOSYNC
+            # skips the launchctl step entirely, which is the real fix. We do NOT
+            # override HOME here: this path runs `cargo build`, and an empty HOME
+            # blinds rustup (it resolves the toolchain via ~/.rustup / ~/.cargo).
             "AI_HIST_NO_AUTOSYNC": "1",
-            "HOME": str(tmp_path / "install-home"),
         }
     )
 
