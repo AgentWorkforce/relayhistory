@@ -2,6 +2,25 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 
+// Re-export the in-process cloud push so `ai-hist/cloud` exposes auth + push.
+export {
+  pushToCloud,
+  buildOutboxBatch,
+  promptHash,
+  batchId,
+  machineId,
+  buildMachineIdentity,
+  loadCursor,
+  saveCursor,
+  normalizeHomePath,
+  type SyncCursor,
+  type MachineIdentity,
+  type ConvergenceEnvelope,
+  type PushReport,
+  type PushOptions,
+  type OutboxBatch,
+} from './cloud-push.js';
+
 export interface RelayhistoryAuth {
   baseUrl: string;
   accessToken: string;
