@@ -14,6 +14,10 @@ name: Publish ai-hist-native (napi)
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Version to publish (e.g. 0.4.1). Blank = use package.json.'
+        required: false
+        type: string
       dry_run:
         description: 'Dry run (build only, no publish)'
         required: true
@@ -71,8 +75,7 @@ jobs:
         with:
           key: ai-hist-napi-${{ matrix.target }}
 
-      # napi's --cross-compile shells out to `cargo zigbuild`, which needs both
-      # the zig toolchain and the cargo-zigbuild subcommand. Pin a released zig
+      # napi's `--zig` uses zig as the cross linker/compiler. Pin a released zig
       # version so setup-zig fetches a stable release URL (an unpinned run hits
       # the master `builds` URL, which 404s).
       - name: Setup zig
@@ -81,12 +84,6 @@ jobs:
         with:
           version: 0.13.0
 
-      - name: Install cargo-zigbuild
-        if: matrix.cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-
       - name: Install deps
         run: npm ci
 
@@ -94,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
-            npx napi build --platform --release --target "${{ matrix.target }}" --cross-compile
+            npx napi build --platform --release --target "${{ matrix.target }}" --zig
           else
             npx napi build --platform --release --target "${{ matrix.target }}"
           fi
@@ -123,6 +120,14 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: Install deps
         run: npm ci
+      - name: Set version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VERSION" ]; then
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: crates/ai-hist-napi/artifacts
