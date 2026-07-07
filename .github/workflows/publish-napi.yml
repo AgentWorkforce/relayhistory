@@ -71,11 +71,21 @@ jobs:
         with:
           key: ai-hist-napi-${{ matrix.target }}
 
-      # zig backs napi's --cross-compile (cargo-zigbuild) for the non-native
-      # Linux targets.
+      # napi's --cross-compile shells out to `cargo zigbuild`, which needs both
+      # the zig toolchain and the cargo-zigbuild subcommand. Pin a released zig
+      # version so setup-zig fetches a stable release URL (an unpinned run hits
+      # the master `builds` URL, which 404s).
       - name: Setup zig
         if: matrix.cross
         uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Install deps
         run: npm ci
