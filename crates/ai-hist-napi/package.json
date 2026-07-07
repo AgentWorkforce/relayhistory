@@ -1,0 +1,35 @@
+{
+  "name": "ai-hist-native",
+  "version": "0.4.0",
+  "description": "Native (napi) binding for ai-hist — in-process sync + cloud push.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentWorkforce/relayhistory.git",
+    "directory": "crates/ai-hist-napi"
+  },
+  "napi": {
+    "name": "ai-hist-native",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
+      ]
+    }
+  },
+  "files": ["index.js", "index.d.ts"],
+  "engines": { "node": ">= 18" },
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}

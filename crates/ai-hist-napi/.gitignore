@@ -1,0 +1,5 @@
+# Built per-platform in CI, never committed
+*.node
+node_modules
+# napi-rs generates the per-platform package dirs at publish time
+npm/

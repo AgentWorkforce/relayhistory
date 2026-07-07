@@ -2,6 +2,7 @@
 members = [
     "crates/ai-hist-core",
     "crates/ai-hist",
+    "crates/ai-hist-napi",
 ]
 resolver = "2"
 
