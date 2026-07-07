@@ -1719,8 +1719,17 @@ fn shell_single_quote(s: &str) -> String {
 /// more — a scheduled cloud push should never fire more often than the user
 /// asked. Intervals of a day or longer collapse to a daily run (the coarsest
 /// simple cron cadence).
+/// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
+/// cron field uniform — a non-divisor step (e.g. `*/45`) fires a short interval
+/// at the field's rollover (`:00, :45, :00` → a 15-minute gap).
+fn round_up_to_divisor(n: u64, base: u64) -> u64 {
+    (n..=base).find(|d| base.is_multiple_of(*d)).unwrap_or(base)
+}
+
 /// Returns `(cron expression, human cadence, effective period in seconds)`. The
-/// effective period lets callers detect when the interval was rounded.
+/// effective period lets callers detect when the interval was rounded. cron
+/// can't match every interval exactly; we always round toward a *coarser*,
+/// uniform cadence so a scheduled push never fires more often than requested.
 fn cron_schedule(interval: u64) -> (String, String, u64) {
     // Sub-two-minute intervals can only be "every minute".
     if interval < 120 {
@@ -1728,24 +1737,29 @@ fn cron_schedule(interval: u64) -> (String, String, u64) {
     }
     let minutes = interval / 60; // floor; >= 2 here
     if minutes < 60 {
-        return (
-            format!("*/{minutes} * * * *"),
-            format!("every {minutes} minutes"),
-            minutes * 60,
-        );
+        // Uniform minute steps require a divisor of 60; round up to the next one.
+        let step = round_up_to_divisor(minutes, 60);
+        if step < 60 {
+            return (
+                format!("*/{step} * * * *"),
+                format!("every {step} minutes"),
+                step * 60,
+            );
+        }
+        return ("0 * * * *".to_string(), "every hour".to_string(), 3600);
     }
-    // Round up to whole hours so we don't over-run (e.g. 90 min -> every 2h).
-    let hours = if minutes.is_multiple_of(60) {
-        minutes / 60
-    } else {
-        minutes / 60 + 1
-    };
+    // Round up to whole hours (e.g. 90 min -> 2h), then to a uniform hour step.
+    let hours = minutes.div_ceil(60);
     if hours < 24 {
-        return (
-            format!("0 */{hours} * * *"),
-            format!("every {hours} hour(s)"),
-            hours * 3600,
-        );
+        let step = round_up_to_divisor(hours, 24);
+        if step < 24 {
+            return (
+                format!("0 */{step} * * *"),
+                format!("every {step} hour(s)"),
+                step * 3600,
+            );
+        }
+        return ("0 0 * * *".to_string(), "once a day".to_string(), 86_400);
     }
     // A day or longer: run once daily at midnight.
     ("0 0 * * *".to_string(), "once a day".to_string(), 86_400)
@@ -4713,9 +4727,14 @@ mod tests {
         assert_eq!(cron_schedule(5400).0, "0 */2 * * *"); // 90 min -> every 2h, not hourly
         assert_eq!(cron_schedule(86_400).0, "0 0 * * *"); // 1 day -> daily, not hourly
         assert_eq!(cron_schedule(90_000).0, "0 0 * * *"); // 25h -> daily
+        // Non-divisor steps round up to a uniform divisor (no short boundary gap).
+        assert_eq!(cron_schedule(420).0, "*/10 * * * *"); // 7 min -> */10 (not */7)
+        assert_eq!(cron_schedule(2700).0, "0 * * * *"); // 45 min -> hourly (60 is next divisor)
+        assert_eq!(cron_schedule(25_200).0, "0 */8 * * *"); // 7h -> */8 (uniform), not */7
         // The effective period flags whether the interval was matched exactly.
         assert_eq!(cron_schedule(300).2, 300);
         assert_eq!(cron_schedule(5400).2, 7200);
+        assert_eq!(cron_schedule(420).2, 600);
     }
 
     #[test]
