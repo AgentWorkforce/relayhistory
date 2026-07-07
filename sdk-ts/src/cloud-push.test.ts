@@ -50,6 +50,12 @@ test('pushToCloud returns null when the binary is not installed (ENOENT)', async
   assert.equal(report, null);
 });
 
+test('pushToCloud returns null when the binary is not executable (EACCES)', async () => {
+  const { spawnFn } = fakeSpawn({ errorCode: 'EACCES' });
+  const report = await pushToCloud({ binPath: '/some/dir', spawnFn });
+  assert.equal(report, null);
+});
+
 test('pushToCloud returns null when not authenticated', async () => {
   const { spawnFn } = fakeSpawn({ code: 1, stderr: 'error: not authenticated — run `ai-hist login`' });
   const report = await pushToCloud({ binPath: '/bin/echo', spawnFn });

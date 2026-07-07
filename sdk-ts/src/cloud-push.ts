@@ -48,10 +48,10 @@ function isExecutable(path: string): boolean {
 /**
  * Resolve the ai-hist binary. An explicit override is **authoritative** — it is
  * returned verbatim without falling through to discovery, so the caller always
- * runs the binary it asked for (a bad path surfaces later as ENOENT → a no-op
- * push, never a silent switch to a different binary). With no override:
- * `$AI_HIST_RUST_BIN` → the install.sh location → the `ai-hist` wrapper on
- * `PATH`. Always returns a string.
+ * runs the binary it asked for (an unusable path surfaces later in `pushToCloud`
+ * as a no-op push, never a silent switch to a different binary). With no
+ * override: `$AI_HIST_RUST_BIN` → the install.sh location → the `ai-hist`
+ * wrapper on `PATH`. Always returns a string.
  */
 export function resolveAiHistBinary(explicit?: string): string {
   if (typeof explicit === 'string' && explicit.length > 0) return explicit;
@@ -98,8 +98,10 @@ export function pushToCloud(opts: PushOptions = {}): Promise<PushReport | null> 
     });
 
     child.on('error', (err: NodeJS.ErrnoException) => {
-      // Binary not on PATH / not installed → treat as "nothing to do".
-      if (err.code === 'ENOENT') {
+      // Binary unavailable — missing (ENOENT), not executable (EACCES/EPERM), or
+      // a directory (ENOTDIR/EISDIR). All mean "nothing to sync", the same
+      // no-op contract a background loop relies on.
+      if (['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'EISDIR'].includes(err.code ?? '')) {
         resolve(null);
         return;
       }

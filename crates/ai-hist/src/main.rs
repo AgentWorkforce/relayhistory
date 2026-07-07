@@ -1714,24 +1714,41 @@ fn shell_single_quote(s: &str) -> String {
 }
 
 /// Translate a desired interval (seconds) into a cron schedule expression plus a
-/// human cadence. cron's finest granularity is one minute, so sub-minute or
-/// non-whole-minute intervals collapse to every minute.
-fn cron_schedule(interval: u64) -> (String, String) {
-    if interval < 60 || !interval.is_multiple_of(60) {
-        return ("* * * * *".to_string(), "every minute".to_string());
+/// human cadence. cron's finest granularity is one minute. When an interval
+/// isn't exactly expressible we round toward a *less* frequent cadence, never
+/// more — a scheduled cloud push should never fire more often than the user
+/// asked. Intervals of a day or longer collapse to a daily run (the coarsest
+/// simple cron cadence).
+/// Returns `(cron expression, human cadence, effective period in seconds)`. The
+/// effective period lets callers detect when the interval was rounded.
+fn cron_schedule(interval: u64) -> (String, String, u64) {
+    // Sub-two-minute intervals can only be "every minute".
+    if interval < 120 {
+        return ("* * * * *".to_string(), "every minute".to_string(), 60);
     }
-    let minutes = interval / 60;
-    if minutes == 1 {
-        ("* * * * *".to_string(), "every minute".to_string())
-    } else if minutes < 60 {
-        (format!("*/{minutes} * * * *"), format!("every {minutes} minutes"))
-    } else if minutes.is_multiple_of(60) && minutes / 60 < 24 {
-        let hours = minutes / 60;
-        (format!("0 */{hours} * * *"), format!("every {hours} hour(s)"))
+    let minutes = interval / 60; // floor; >= 2 here
+    if minutes < 60 {
+        return (
+            format!("*/{minutes} * * * *"),
+            format!("every {minutes} minutes"),
+            minutes * 60,
+        );
+    }
+    // Round up to whole hours so we don't over-run (e.g. 90 min -> every 2h).
+    let hours = if minutes.is_multiple_of(60) {
+        minutes / 60
     } else {
-        // Odd multi-hour cadence — fall back to hourly rather than mis-schedule.
-        ("0 * * * *".to_string(), "every hour".to_string())
+        minutes / 60 + 1
+    };
+    if hours < 24 {
+        return (
+            format!("0 */{hours} * * *"),
+            format!("every {hours} hour(s)"),
+            hours * 3600,
+        );
     }
+    // A day or longer: run once daily at midnight.
+    ("0 0 * * *".to_string(), "once a day".to_string(), 86_400)
 }
 
 fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
@@ -1824,14 +1841,13 @@ fn write_crontab(contents: &str) -> Result<()> {
 }
 
 fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
-    let (schedule, cadence) = cron_schedule(interval);
-    if interval >= 60 && !interval.is_multiple_of(60) {
+    let (schedule, cadence, effective) = cron_schedule(interval);
+    // cron can't match every interval exactly; the confirmation below states the
+    // cadence actually scheduled. Only note a mismatch when it isn't exact, so a
+    // plain `--interval=300` install doesn't imply the user picked an odd value.
+    if effective != interval {
         eprintln!(
-            "Note: cron runs at 1-minute granularity; rounding --interval={interval}s to {cadence}."
-        );
-    } else if interval < 60 && interval != 60 {
-        eprintln!(
-            "Note: cron runs at 1-minute granularity; scheduling --interval={interval}s as {cadence}."
+            "Note: cron runs at 1-minute granularity; --interval={interval}s scheduled as {cadence}."
         );
     }
     let marker = cron_marker(spec);
@@ -4690,9 +4706,16 @@ mod tests {
         assert_eq!(cron_schedule(300).0, "*/5 * * * *"); // push default
         assert_eq!(cron_schedule(120).0, "*/2 * * * *");
         assert_eq!(cron_schedule(3600).0, "0 */1 * * *");
-        // Sub-minute and non-whole-minute intervals collapse to every minute.
+        // Sub-two-minute intervals collapse to every minute.
         assert_eq!(cron_schedule(30).0, "* * * * *");
         assert_eq!(cron_schedule(90).0, "* * * * *");
+        // Never run MORE often than requested: round toward a coarser cadence.
+        assert_eq!(cron_schedule(5400).0, "0 */2 * * *"); // 90 min -> every 2h, not hourly
+        assert_eq!(cron_schedule(86_400).0, "0 0 * * *"); // 1 day -> daily, not hourly
+        assert_eq!(cron_schedule(90_000).0, "0 0 * * *"); // 25h -> daily
+        // The effective period flags whether the interval was matched exactly.
+        assert_eq!(cron_schedule(300).2, 300);
+        assert_eq!(cron_schedule(5400).2, 7200);
     }
 
     #[test]
