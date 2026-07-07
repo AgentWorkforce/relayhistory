@@ -135,6 +135,11 @@ jobs:
         # `-t .` is the target directory (creates ./npm/<platform>/); artifacts
         # then routes each downloaded .node into the matching platform dir.
         run: npx napi create-npm-dir -t . && npx napi artifacts --dir artifacts
+      # npm >= 11.5 is required for the OIDC trusted-publisher flow (the runner's
+      # bundled npm 10.x can't mint OIDC tokens, so publish fails unauthenticated).
+      - name: Upgrade npm for OIDC
+        if: ${{ !inputs.dry_run }}
+        run: npm install -g npm@latest
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -142,10 +147,14 @@ jobs:
           NPM_CONFIG_PROVENANCE: 'true'
         run: |
           set -euo pipefail
+          # --skip-gh-release: we ship npm packages only (a GitHub release needs
+          # contents:write + a token this job doesn't have).
           if [ "$DRY_RUN" = "true" ]; then
             echo "Dry run — skipping publish. Prepared packages:"
-            npx napi prepublish -t npm --dry-run || true
+            npx napi prepublish -t npm --dry-run --skip-gh-release || true
           else
-            # Publishes the per-platform packages then the main package.
-            npx napi prepublish -t npm
+            # Tokenless OIDC: requires each package name to be registered as a
+            # trusted publisher on npmjs (repo + this workflow). Publishes the
+            # per-platform packages then the main package.
+            npx napi prepublish -t npm --skip-gh-release
           fi
