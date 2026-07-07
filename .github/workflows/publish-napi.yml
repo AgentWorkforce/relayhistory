@@ -153,8 +153,11 @@ jobs:
             echo "Dry run — skipping publish. Prepared packages:"
             npx napi prepublish -t npm --dry-run --skip-gh-release || true
           else
-            # Tokenless OIDC: requires each package name to be registered as a
-            # trusted publisher on npmjs (repo + this workflow). Publishes the
-            # per-platform packages then the main package.
+            # Tokenless OIDC: each package name must be a trusted publisher on
+            # npmjs (repo + this workflow). `prepublish` publishes the six
+            # per-platform packages AND writes the main package's
+            # optionalDependencies — but it does NOT publish the main package,
+            # so we publish it explicitly afterward (from the crate root).
             npx napi prepublish -t npm --skip-gh-release
+            npm publish --access public
           fi
