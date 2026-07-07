@@ -132,16 +132,20 @@ jobs:
         with:
           path: crates/ai-hist-napi/artifacts
       - name: Assemble per-platform packages
-        run: npx napi create-npm-dirs && npx napi artifacts --dir artifacts
+        # `-t .` is the target directory (creates ./npm/<platform>/); artifacts
+        # then routes each downloaded .node into the matching platform dir.
+        run: npx napi create-npm-dir -t . && npx napi artifacts --dir artifacts
       - name: Publish
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          # npm reads this for OIDC provenance (napi prepublish has no flag for it).
+          NPM_CONFIG_PROVENANCE: 'true'
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
             echo "Dry run — skipping publish. Prepared packages:"
             npx napi prepublish -t npm --dry-run || true
           else
-            # Publishes the per-platform packages then the main package (OIDC provenance).
-            npx napi prepublish -t npm --provenance
+            # Publishes the per-platform packages then the main package.
+            npx napi prepublish -t npm
           fi
