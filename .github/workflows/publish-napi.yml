@@ -1,0 +1,132 @@
+name: Publish ai-hist-native (napi)
+
+# Builds the `ai-hist-native` napi addon for each platform and publishes it —
+# the main `ai-hist-native` package (JS loader) plus one
+# `ai-hist-native-<platform>-<arch>` package per target carrying the `.node`.
+# agent-relay depends on `ai-hist-native` (optional) and calls `syncAndPush()`
+# in-process. See docs/reflex-zero-setup.md.
+#
+# Linux is built for BOTH glibc (gnu) and musl so the loader resolves on Ubuntu
+# etc. (gnu) and Alpine (musl). Cross targets use zig via napi --cross-compile.
+# NOTE: napi cross-compilation can need tuning per runner image; validate a dry
+# run before the first real publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build only, no publish)'
+        required: true
+        default: true
+        type: boolean
+
+# Least privilege: the build matrix needs neither repo writes nor OIDC.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: crates/ai-hist-napi
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ai-hist-napi-${{ matrix.target }}
+
+      # zig backs napi's --cross-compile (cargo-zigbuild) for the non-native
+      # Linux targets.
+      - name: Setup zig
+        if: matrix.cross
+        uses: mlugg/setup-zig@v1
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build addon
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            npx napi build --platform --release --target "${{ matrix.target }}" --cross-compile
+          else
+            npx napi build --platform --release --target "${{ matrix.target }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}
+          path: crates/ai-hist-napi/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    # Only the publish job mints OIDC tokens (npm provenance).
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install deps
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/ai-hist-napi/artifacts
+      - name: Assemble per-platform packages
+        run: npx napi create-npm-dirs && npx napi artifacts --dir artifacts
+      - name: Publish
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — skipping publish. Prepared packages:"
+            npx napi prepublish -t npm --dry-run || true
+          else
+            # Publishes the per-platform packages then the main package (OIDC provenance).
+            npx napi prepublish -t npm --provenance
+          fi
