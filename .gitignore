@@ -8,3 +8,7 @@ __pycache__/
 .claude/
 target/
 .tmp/
+
+# Prebuilt binaries are injected into bin-packages at publish time, never committed
+bin-packages/*/bin/ai-hist
+bin-packages/*/bin/ai-hist.exe
