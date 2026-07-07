@@ -246,6 +246,25 @@ cron runs at 1-minute granularity). Verify health with:
 launchctl list | grep ai-hist   # middle "last exit status" column should be 0
 ```
 
+### Continuous cloud push
+
+`sync` keeps the **local** database fresh. Uploading it to relayhistory-cloud is
+a separate step (`push`), which has its own background service using the same
+launchd/cron plumbing:
+
+```bash
+ai-hist push --install-service      # schedule automatic cloud push (macOS: every 300s)
+ai-hist push --uninstall-service    # remove it
+ai-hist push                        # push new history now
+```
+
+On macOS the launchd job honors `--interval` (default 300s). On Linux the job is
+a cron entry: whole-minute intervals become a step schedule (300s → `*/5`), and
+sub-minute intervals run every minute (cron's finest granularity).
+
+Running both services keeps local capture and cloud upload going end-to-end.
+The push job authenticates with the `rth_at_` token written by `ai-hist login`.
+
 ### Manual setup (macOS)
 
 If you prefer to write the launchd plist by hand, sync every 60 seconds with:

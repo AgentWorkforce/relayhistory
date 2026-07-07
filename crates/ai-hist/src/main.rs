@@ -271,6 +271,18 @@ enum Command {
         incognito: Vec<String>,
         #[arg(long)]
         json: bool,
+        /// Install a background service (launchd on macOS, cron on Linux) that
+        /// runs `push` on an interval so new history reaches the cloud
+        /// automatically.
+        #[arg(long)]
+        install_service: bool,
+        /// Remove the background push service installed by --install-service.
+        #[arg(long, conflicts_with = "install_service")]
+        uninstall_service: bool,
+        /// Seconds between pushes for the installed service (macOS only; cron
+        /// runs at 1-minute granularity).
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
     },
     /// Pair (Agent Relay Loop, WS-6) — in-session warnings from your team's history.
     Pair {
@@ -596,9 +608,9 @@ fn main() -> Result<()> {
             interval,
         } => {
             if install_service {
-                install_sync_service(interval)
+                install_managed_service(&SYNC_SERVICE, interval)
             } else if uninstall_service {
-                uninstall_sync_service()
+                uninstall_managed_service(&SYNC_SERVICE)
             } else {
                 sync_basic(&conn, &db_path)
             }
@@ -721,7 +733,27 @@ fn main() -> Result<()> {
             limit,
             incognito,
             json,
+            install_service,
+            uninstall_service,
+            interval,
         } => {
+            if install_service {
+                // `--incognito` is a per-run privacy filter; the scheduled job
+                // runs a plain `push`, so silently dropping it would give a
+                // false sense that it applies. Reject the combo. (`--limit` is
+                // only a batch-size knob and is harmless to ignore here.)
+                if !incognito.is_empty() {
+                    anyhow::bail!(
+                        "--incognito is a per-run privacy filter and is NOT applied to the scheduled \
+                         push service. Run `ai-hist push --incognito ...` for a one-off push, or omit \
+                         it when installing the service."
+                    );
+                }
+                return install_managed_service(&PUSH_SERVICE, interval);
+            }
+            if uninstall_service {
+                return uninstall_managed_service(&PUSH_SERVICE);
+            }
             let auth = cloud::load_auth()?
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let machine = MachineIdentity {
@@ -1608,11 +1640,41 @@ fn watch_loop(db_path: &Path, interval: u64) -> Result<()> {
     }
 }
 
-const SYNC_SERVICE_LABEL: &str = "com.ai-hist.sync";
-const CRON_MARKER: &str = "# ai-hist sync (managed)";
+/// A background service managed by ai-hist. Both the local `sync` job and the
+/// cloud `push` job share the same launchd/cron plumbing; only these fields
+/// differ.
+struct ServiceSpec {
+    /// launchd label and plist basename stem, e.g. "com.ai-hist.sync".
+    label: &'static str,
+    /// ai-hist subcommand the service runs, e.g. "sync" or "push".
+    subcommand: &'static str,
+    /// `/tmp/<log_stem>.log` and `.err` capture the service's output.
+    log_stem: &'static str,
+    /// Human-facing noun for messages, e.g. "sync" or "cloud push".
+    human: &'static str,
+}
 
-fn launchd_plist_path() -> PathBuf {
-    home_dir().join("Library/LaunchAgents/com.ai-hist.sync.plist")
+const SYNC_SERVICE: ServiceSpec = ServiceSpec {
+    label: "com.ai-hist.sync",
+    subcommand: "sync",
+    log_stem: "ai-hist-sync",
+    human: "sync",
+};
+
+const PUSH_SERVICE: ServiceSpec = ServiceSpec {
+    label: "com.ai-hist.push",
+    subcommand: "push",
+    log_stem: "ai-hist-push",
+    human: "cloud push",
+};
+
+/// The comment marker that identifies this service's managed crontab line.
+fn cron_marker(spec: &ServiceSpec) -> String {
+    format!("# ai-hist {} (managed)", spec.subcommand)
+}
+
+fn launchd_plist_path(spec: &ServiceSpec) -> PathBuf {
+    home_dir().join(format!("Library/LaunchAgents/{}.plist", spec.label))
 }
 
 /// Resolve the absolute path of the running ai-hist binary so the service
@@ -1628,23 +1690,83 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn install_sync_service(interval: u64) -> Result<()> {
+fn install_managed_service(spec: &ServiceSpec, interval: u64) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
     if cfg!(target_os = "macos") {
-        install_launchd_service(&bin, interval)
+        install_launchd_service(spec, &bin, interval)
     } else if cfg!(target_os = "linux") {
-        install_cron_service(&bin, interval)
+        install_cron_service(spec, &bin, interval)
     } else {
         anyhow::bail!(
-            "Automatic sync service install is only supported on macOS and Linux. \
-             Run `ai-hist watch` to keep syncing in the foreground instead."
+            "Automatic {} service install is only supported on macOS and Linux. \
+             Schedule `ai-hist {}` yourself (e.g. via your platform's task scheduler) instead.",
+            spec.human,
+            spec.subcommand
         )
     }
 }
 
-fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
-    let plist_path = launchd_plist_path();
+/// Single-quote a path for a crontab line so spaces / shell metacharacters in
+/// the binary path don't break the scheduled command.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Translate a desired interval (seconds) into a cron schedule expression plus a
+/// human cadence. cron's finest granularity is one minute. When an interval
+/// isn't exactly expressible we round toward a *less* frequent cadence, never
+/// more — a scheduled cloud push should never fire more often than the user
+/// asked. Intervals of a day or longer collapse to a daily run (the coarsest
+/// simple cron cadence).
+/// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
+/// cron field uniform — a non-divisor step (e.g. `*/45`) fires a short interval
+/// at the field's rollover (`:00, :45, :00` → a 15-minute gap).
+fn round_up_to_divisor(n: u64, base: u64) -> u64 {
+    (n..=base).find(|d| base.is_multiple_of(*d)).unwrap_or(base)
+}
+
+/// Returns `(cron expression, human cadence, effective period in seconds)`. The
+/// effective period lets callers detect when the interval was rounded. cron
+/// can't match every interval exactly; we always round toward a *coarser*,
+/// uniform cadence so a scheduled push never fires more often than requested.
+fn cron_schedule(interval: u64) -> (String, String, u64) {
+    // Sub-two-minute intervals can only be "every minute".
+    if interval < 120 {
+        return ("* * * * *".to_string(), "every minute".to_string(), 60);
+    }
+    let minutes = interval / 60; // floor; >= 2 here
+    if minutes < 60 {
+        // Uniform minute steps require a divisor of 60; round up to the next one.
+        let step = round_up_to_divisor(minutes, 60);
+        if step < 60 {
+            return (
+                format!("*/{step} * * * *"),
+                format!("every {step} minutes"),
+                step * 60,
+            );
+        }
+        return ("0 * * * *".to_string(), "every hour".to_string(), 3600);
+    }
+    // Round up to whole hours (e.g. 90 min -> 2h), then to a uniform hour step.
+    let hours = minutes.div_ceil(60);
+    if hours < 24 {
+        let step = round_up_to_divisor(hours, 24);
+        if step < 24 {
+            return (
+                format!("0 */{step} * * *"),
+                format!("every {step} hour(s)"),
+                step * 3600,
+            );
+        }
+        return ("0 0 * * *".to_string(), "once a day".to_string(), 86_400);
+    }
+    // A day or longer: run once daily at midnight.
+    ("0 0 * * *".to_string(), "once a day".to_string(), 86_400)
+}
+
+fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
+    let plist_path = launchd_plist_path(spec);
     if let Some(dir) = plist_path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -1658,22 +1780,24 @@ fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
     <key>ProgramArguments</key>
     <array>
         <string>{bin}</string>
-        <string>sync</string>
+        <string>{subcommand}</string>
     </array>
     <key>StartInterval</key>
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/ai-hist-sync.log</string>
+    <string>/tmp/{log_stem}.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/ai-hist-sync.err</string>
+    <string>/tmp/{log_stem}.err</string>
 </dict>
 </plist>
 "#,
-        label = SYNC_SERVICE_LABEL,
+        label = spec.label,
         bin = xml_escape(bin),
+        subcommand = spec.subcommand,
         interval = interval,
+        log_stem = spec.log_stem,
     );
     fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
 
@@ -1691,10 +1815,16 @@ fn install_launchd_service(bin: &str, interval: u64) -> Result<()> {
         anyhow::bail!("launchctl load failed for {}", plist_path.display());
     }
 
-    println!("Installed launchd sync service ({SYNC_SERVICE_LABEL}); syncing every {interval}s.");
+    println!(
+        "Installed launchd {} service ({}); running every {interval}s.",
+        spec.human, spec.label
+    );
     println!("  plist: {}", plist_path.display());
     println!("  check: launchctl list | grep ai-hist   (middle column 0 = healthy)");
-    println!("  remove: ai-hist sync --uninstall-service");
+    println!(
+        "  remove: ai-hist {} --uninstall-service",
+        spec.subcommand
+    );
     Ok(())
 }
 
@@ -1724,32 +1854,41 @@ fn write_crontab(contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_cron_service(bin: &str, interval: u64) -> Result<()> {
-    if interval != 60 {
+fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
+    let (schedule, cadence, effective) = cron_schedule(interval);
+    // cron can't match every interval exactly; the confirmation below states the
+    // cadence actually scheduled. Only note a mismatch when it isn't exact, so a
+    // plain `--interval=300` install doesn't imply the user picked an odd value.
+    if effective != interval {
         eprintln!(
-            "Note: cron runs at 1-minute granularity; ignoring --interval={interval} and \
-             scheduling every minute."
+            "Note: cron runs at 1-minute granularity; --interval={interval}s scheduled as {cadence}."
         );
     }
-    let line = format!("* * * * * {bin} sync >> /tmp/ai-hist-sync.log 2>&1 {CRON_MARKER}");
+    let marker = cron_marker(spec);
+    let line = format!(
+        "{schedule} {} {} >> /tmp/{}.log 2>&1 {marker}",
+        shell_single_quote(bin),
+        spec.subcommand,
+        spec.log_stem
+    );
     // Drop any previously managed line, then append the current one.
     let mut lines: Vec<String> = read_crontab()
         .lines()
-        .filter(|l| !l.contains(CRON_MARKER))
+        .filter(|l| !l.contains(&marker))
         .map(str::to_string)
         .collect();
     lines.push(line);
     write_crontab(&format!("{}\n", lines.join("\n")))?;
 
-    println!("Installed cron sync job; syncing every minute.");
+    println!("Installed cron {} job; running {cadence}.", spec.human);
     println!("  view:   crontab -l");
-    println!("  remove: ai-hist sync --uninstall-service");
+    println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
     Ok(())
 }
 
-fn uninstall_sync_service() -> Result<()> {
+fn uninstall_managed_service(spec: &ServiceSpec) -> Result<()> {
     if cfg!(target_os = "macos") {
-        let plist_path = launchd_plist_path();
+        let plist_path = launchd_plist_path(spec);
         let _ = std::process::Command::new("launchctl")
             .arg("unload")
             .arg(&plist_path)
@@ -1757,22 +1896,23 @@ fn uninstall_sync_service() -> Result<()> {
         if plist_path.exists() {
             fs::remove_file(&plist_path)
                 .with_context(|| format!("removing {}", plist_path.display()))?;
-            println!("Removed launchd sync service.");
+            println!("Removed launchd {} service.", spec.human);
         } else {
-            println!("No launchd sync service installed.");
+            println!("No launchd {} service installed.", spec.human);
         }
         Ok(())
     } else if cfg!(target_os = "linux") {
+        let marker = cron_marker(spec);
         let kept: Vec<String> = read_crontab()
             .lines()
-            .filter(|l| !l.contains(CRON_MARKER))
+            .filter(|l| !l.contains(&marker))
             .map(str::to_string)
             .collect();
         write_crontab(&format!("{}\n", kept.join("\n")))?;
-        println!("Removed cron sync job.");
+        println!("Removed cron {} job.", spec.human);
         Ok(())
     } else {
-        anyhow::bail!("No managed sync service exists on this platform.")
+        anyhow::bail!("No managed {} service exists on this platform.", spec.human)
     }
 }
 
@@ -4565,14 +4705,43 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript, link_git_commit,
-        parse_trajectory_file, paths_overlap, search_all, strip_url_credentials,
-        sync_claude_session_metadata, xml_escape, SearchRole,
+        cron_schedule, file_stamp, git_commit_time_ms, git_stdout, ingest_claude_transcript,
+        link_git_commit, parse_trajectory_file, paths_overlap, search_all, shell_single_quote,
+        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
+
+    #[test]
+    fn cron_schedule_maps_intervals_to_step_expressions() {
+        assert_eq!(cron_schedule(60).0, "* * * * *");
+        assert_eq!(cron_schedule(300).0, "*/5 * * * *"); // push default
+        assert_eq!(cron_schedule(120).0, "*/2 * * * *");
+        assert_eq!(cron_schedule(3600).0, "0 */1 * * *");
+        // Sub-two-minute intervals collapse to every minute.
+        assert_eq!(cron_schedule(30).0, "* * * * *");
+        assert_eq!(cron_schedule(90).0, "* * * * *");
+        // Never run MORE often than requested: round toward a coarser cadence.
+        assert_eq!(cron_schedule(5400).0, "0 */2 * * *"); // 90 min -> every 2h, not hourly
+        assert_eq!(cron_schedule(86_400).0, "0 0 * * *"); // 1 day -> daily, not hourly
+        assert_eq!(cron_schedule(90_000).0, "0 0 * * *"); // 25h -> daily
+        // Non-divisor steps round up to a uniform divisor (no short boundary gap).
+        assert_eq!(cron_schedule(420).0, "*/10 * * * *"); // 7 min -> */10 (not */7)
+        assert_eq!(cron_schedule(2700).0, "0 * * * *"); // 45 min -> hourly (60 is next divisor)
+        assert_eq!(cron_schedule(25_200).0, "0 */8 * * *"); // 7h -> */8 (uniform), not */7
+        // The effective period flags whether the interval was matched exactly.
+        assert_eq!(cron_schedule(300).2, 300);
+        assert_eq!(cron_schedule(5400).2, 7200);
+        assert_eq!(cron_schedule(420).2, 600);
+    }
+
+    #[test]
+    fn shell_single_quote_survives_spaces_and_quotes() {
+        assert_eq!(shell_single_quote("/opt/ai hist/bin"), "'/opt/ai hist/bin'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
 
     #[test]
     fn xml_escape_protects_plist_path() {

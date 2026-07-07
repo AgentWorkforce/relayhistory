@@ -1,7 +1,7 @@
 {
   "name": "ai-hist",
-  "version": "0.3.7",
-  "description": "TypeScript SDK and MCP server for AI coding agent session history — Claude Code, Codex, Cursor, Grok, and Agent Relay in one searchable index. Works with or without ai-hist sync via automatic JSONL fallback.",
+  "version": "0.4.0",
+  "description": "TypeScript SDK and MCP server for AI coding agent session history \u2014 Claude Code, Codex, Cursor, Grok, and Agent Relay in one searchable index. Works with or without ai-hist sync via automatic JSONL fallback.",
   "license": "MIT",
   "private": false,
   "type": "module",
