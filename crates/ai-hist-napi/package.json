@@ -1,6 +1,6 @@
 {
   "name": "ai-hist-native",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Native (napi) binding for ai-hist \u2014 in-process sync + cloud push.",
   "main": "index.js",
   "types": "index.d.ts",
