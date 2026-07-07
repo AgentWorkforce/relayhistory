@@ -56,7 +56,7 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
 
    ```json
    "optionalDependencies": {
-     "ai-hist-native": "0.4.0"
+     "ai-hist-native": "0.4.1"
    }
    ```
 

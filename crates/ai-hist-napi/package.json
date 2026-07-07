@@ -1,7 +1,7 @@
 {
   "name": "ai-hist-native",
-  "version": "0.4.0",
-  "description": "Native (napi) binding for ai-hist — in-process sync + cloud push.",
+  "version": "0.4.1",
+  "description": "Native (napi) binding for ai-hist \u2014 in-process sync + cloud push.",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
@@ -24,9 +24,16 @@
       ]
     }
   },
-  "files": ["index.js", "index.d.ts"],
-  "engines": { "node": ">= 18" },
-  "publishConfig": { "access": "public" },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform"
