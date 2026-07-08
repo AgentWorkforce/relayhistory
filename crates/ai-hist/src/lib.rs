@@ -3047,7 +3047,7 @@ fn build_codex_session_maps(
         }
     }
     if scanned > 0 {
-        println!(
+        sync_note!(
             "  [codex] scanned {scanned} new rollout files; {} sessions mapped",
             cwds.len()
         );
