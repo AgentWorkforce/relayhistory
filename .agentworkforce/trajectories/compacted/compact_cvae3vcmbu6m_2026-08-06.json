@@ -1,0 +1,48 @@
+{
+  "id": "compact_cvae3vcmbu6m",
+  "version": 1,
+  "type": "compacted",
+  "compactedAt": "2026-08-06T20:11:56.883Z",
+  "sourceTrajectories": [
+    "traj_z0lzp7qfha1u"
+  ],
+  "dateRange": {
+    "start": "2026-08-06T19:43:23.197Z",
+    "end": "2026-08-06T20:11:34.376Z"
+  },
+  "summary": {
+    "totalDecisions": 2,
+    "totalEvents": 3,
+    "uniqueAgents": [
+      "default"
+    ]
+  },
+  "decisionGroups": [
+    {
+      "category": "api",
+      "decisions": [
+        {
+          "question": "SQLite contention did not cause the 13:00:19 agent freeze",
+          "chosen": "SQLite contention did not cause the 13:00:19 agent freeze",
+          "reasoning": "The Relay integration runs sync on a N-API blocking worker; SQLite busy waits cannot SIGSTOP a process or block the Node inbox event loop. External suspension can freeze an in-flight SQLite transaction, so the only supported causal direction is process stop to wedged database. The available-lock holder snapshot and historical sync-writer-count-zero evidence further rule out current lock ownership as the fleet-wide cause.",
+          "fromTrajectory": "traj_z0lzp7qfha1u"
+        }
+      ]
+    },
+    {
+      "category": "database",
+      "decisions": [
+        {
+          "question": "The 13:00:19 cohort timestamp was inventory reconciliation, not a mass process stop",
+          "chosen": "The 13:00:19 cohort timestamp was inventory reconciliation, not a mass process stop",
+          "reasoning": "The relay incident lane established that agents.lastSeen was rewritten for all 25 inventory rows by one inventory.sync frame after reconnect. No OS T-state PIDs were captured at that time, PID 23630 had active TLS traffic, and direct probes advanced formerly static lanes. This independently confirms that historical stopped SQLite holders are causally separate.",
+          "fromTrajectory": "traj_z0lzp7qfha1u"
+        }
+      ]
+    }
+  ],
+  "keyLearnings": [],
+  "keyFindings": [],
+  "filesAffected": [],
+  "commits": []
+}

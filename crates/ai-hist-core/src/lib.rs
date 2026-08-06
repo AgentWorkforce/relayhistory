@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
 pub mod convergence;
@@ -237,15 +237,40 @@ pub fn default_db_path() -> PathBuf {
         })
 }
 
-/// How long a writer waits for a competing writer before giving up.
+/// Maximum number of times SQLite asks us to retry a contended lock.
 ///
-/// Raised from rusqlite's 5s default. The database is shared by several
-/// long-lived writers (the sync agent, the MCP server, relay brokers) and WAL
-/// admits one at a time, so a lock can be held longer than 5s -- a large WAL
-/// being recovered or checkpointed is enough. Sync then dies mid-run with
-/// "database is locked" and, being long-running, is the process most likely to
-/// be waiting when that happens.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// A busy handler is preferable to one flat timeout for normal writer overlap:
+/// exponential delays stop hammering the lock and per-process/time jitter keeps
+/// two scheduled syncs from waking and colliding in lockstep. The callback is
+/// never useful for a permanently suspended holder, so the sequence stays
+/// bounded and returns `SQLITE_BUSY` after roughly five seconds at worst.
+const BUSY_RETRY_ATTEMPTS: i32 = 10;
+const BUSY_RETRY_BASE_MS: u64 = 10;
+const BUSY_RETRY_CAP_MS: u64 = 500;
+
+fn busy_retry_handler(prior_attempts: i32) -> bool {
+    if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
+        return false;
+    }
+
+    let shift = (prior_attempts as u32).min(6);
+    let backoff_ms = BUSY_RETRY_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(BUSY_RETRY_CAP_MS);
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
+    let jitter_ms = seed % (backoff_ms + 1);
+    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
+    true
+}
+
+fn configure_busy_retry(conn: &Connection) -> Result<()> {
+    conn.busy_handler(Some(busy_retry_handler))?;
+    Ok(())
+}
 
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -253,7 +278,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(path)?;
     // Before init_db: creating the schema takes a write lock too.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    configure_busy_retry(&conn)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -319,7 +344,7 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("opening {} read-only", path.display()))?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    configure_busy_retry(&conn)?;
     Ok(conn)
 }
 
@@ -1023,25 +1048,15 @@ mod tests {
     }
 
     #[test]
-    fn open_db_waits_longer_than_the_rusqlite_default_for_a_busy_writer() {
+    fn open_db_retries_a_transient_busy_writer() {
         let dir = std::env::temp_dir().join(format!("ai-hist-busy-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("busy.db");
         let conn = open_db(&path).unwrap();
 
-        // rusqlite already waits 5s by default; this database is contended by
-        // several long-lived writers and a lock can outlast that, so sync needs
-        // a longer grace period than the default gives it.
-        let configured: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(configured, BUSY_TIMEOUT.as_millis() as i64);
-        assert!(
-            configured > 5_000,
-            "expected a longer wait than rusqlite's 5s default, got {configured}ms"
-        );
-
-        // The waiting is real: a competing writer blocks rather than erroring.
+        // A competing writer is retried rather than failing immediately. The
+        // releaser runs after several backoff steps, exercising the handler
+        // rather than succeeding on the first lock attempt.
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
@@ -1054,6 +1069,12 @@ mod tests {
         releaser.join().unwrap();
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn busy_retry_sequence_is_bounded() {
+        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS));
+        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS + 1));
     }
 
     #[test]
