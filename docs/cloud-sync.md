@@ -105,24 +105,24 @@ login. To test Cloud exchange against a trusted non-prod endpoint, set
 
 `ai-hist push` output (example): `{"sent":N,"accepted":N,"batchId":"b_…","cursor":{…}}`
 
-- **Auth + base_url are stored** in `$RELAYHISTORY_HOME/auth.json` (mode `0600`) by
-  `login`/`admin-mint`. Authenticate once per target, then just `ai-hist push` — **`push`
-  takes no `--base-url`** (it uses stored context).
-- **Use a separate `RELAYHISTORY_HOME` for dev vs prod** (as above): `auth.json` holds one
-  base_url + token + the cursor, so a shared home would make dev/prod overwrite each other's
-  auth and resume state.
+- **Auth + cursor are stage-scoped.** `login`/`admin-mint` store each target's session and
+  watermark independently under `$RELAYHISTORY_HOME/stages/` (mode `0600`). A second login
+  cannot overwrite the first target's cursor.
+- **Select deliberately when needed.** With one configured target, `ai-hist push` uses it.
+  With more than one, use `ai-hist push --base-url <origin>`; the CLI refuses to guess. A
+  service installed with `ai-hist push --install-service` pins that selected origin so later
+  foreground logins cannot redirect it.
 - **Incremental + idempotent:** the cursor only sends new rows; re-running `push` (or a
   cron) is safe — duplicates dedupe server-side on the event PK + batch id. The cursor
   advances only after the server accepts the batch.
 - **Exclude sessions:** `ai-hist push --incognito <sessionId> --incognito <trajectoryId>`.
-- To switch targets, use the per-target `RELAYHISTORY_HOME`; for prod, re-run Agent Relay
-  Cloud login if the stored session expires.
+- To switch targets, pass the corresponding `--base-url`; for prod, re-run Agent Relay Cloud
+  login if that stored session expires.
 
 ### Automation (cron / launchd)
 
 ```cron
-*/5 * * * * RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist sync && \
-            RELAYHISTORY_HOME=$HOME/.agentworkforce/relayhistory-prod ai-hist push --json >> /tmp/ai-hist-push.log 2>&1
+*/5 * * * * ai-hist sync && ai-hist push --base-url https://history.agentrelay.com --json >> /tmp/ai-hist-push.log 2>&1
 ```
 
 `push` exits non-zero on transport/auth failure (cursor not advanced → safe retry next run).

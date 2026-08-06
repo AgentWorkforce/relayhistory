@@ -3,8 +3,8 @@
 //!
 //! This is the **binding layer** — it does the network I/O the WASM-bound `ai-hist-core`
 //! deliberately avoids. It wires `ai_hist_core::outbox::build_outbox_batch` (pure batch
-//! building) to `POST /v1/ingest` with `rth_at_` bearer auth, persists the single cursor
-//! store, and advances it to the server-confirmed watermark.
+//! building) to `POST /v1/ingest` with `rth_at_` bearer auth, persists a cursor per Cloud
+//! stage, and advances only that stage's server-confirmed watermark.
 //!
 //! Token bootstrap: `/v1/cli/login` (RelayAuth JWT → `rth_at_`/`rth_rt_`) for real use, or
 //! `/v1/admin/mint` (dev-only, `ADMIN_MINT_SECRET`) for local `wrangler dev` iteration.
@@ -120,11 +120,28 @@ fn authority_is_loopback(rest: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn auth_path() -> PathBuf {
+fn legacy_auth_path() -> PathBuf {
     config_dir().join("auth.json")
 }
-fn cursor_path() -> PathBuf {
+
+fn legacy_cursor_path() -> PathBuf {
     config_dir().join("cursor.json")
+}
+
+fn stage_key(base_url: &str) -> String {
+    ai_hist_core::prompt_hash(base_url.trim().trim_end_matches('/'))
+}
+
+fn stage_dir() -> PathBuf {
+    config_dir().join("stages")
+}
+
+fn auth_path(base_url: &str) -> PathBuf {
+    stage_dir().join(format!("{}.auth.json", stage_key(base_url)))
+}
+
+fn cursor_path(base_url: &str) -> PathBuf {
+    stage_dir().join(format!("{}.cursor.json", stage_key(base_url)))
 }
 fn machine_path() -> PathBuf {
     config_dir().join("machine-id")
@@ -144,32 +161,134 @@ fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load_auth() -> Result<Option<StoredAuth>> {
-    let path = auth_path();
-    if !path.exists() {
-        return Ok(None);
+fn read_auth(path: &std::path::Path) -> Result<StoredAuth> {
+    let body = fs::read_to_string(path)?;
+    serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn staged_auths() -> Result<Vec<StoredAuth>> {
+    let dir = stage_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
     }
-    let body = fs::read_to_string(&path)?;
-    Ok(Some(
-        serde_json::from_str(&body).context("parsing stored auth.json")?,
-    ))
+    let mut auths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".auth.json"))
+        {
+            auths.push(read_auth(&path)?);
+        }
+    }
+    Ok(auths)
 }
 
+fn same_stage(left: &str, right: &str) -> bool {
+    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+}
+
+/// Load one stored session. A caller that knows its destination must pass it explicitly.
+/// Without a destination, only a single configured stage is accepted; choosing the last
+/// successful login was the old behavior and could silently divert a scheduled push.
+pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
+    if let Some(base_url) = base_url {
+        let path = auth_path(base_url);
+        if path.exists() {
+            let auth = read_auth(&path)?;
+            anyhow::ensure!(
+                same_stage(&auth.base_url, base_url),
+                "stored session stage does not match the requested --base-url"
+            );
+            return Ok(Some(auth));
+        }
+        let legacy = legacy_auth_path();
+        if !legacy.exists() {
+            return Ok(None);
+        }
+        let auth = read_auth(&legacy)?;
+        return Ok(same_stage(&auth.base_url, base_url).then_some(auth));
+    }
+
+    let auths = staged_auths()?;
+    match auths.len() {
+        0 => {
+            let path = legacy_auth_path();
+            if path.exists() {
+                Ok(Some(read_auth(&path)?))
+            } else {
+                Ok(None)
+            }
+        }
+        1 => Ok(auths.into_iter().next()),
+        count => anyhow::bail!(
+            "{count} relayhistory stages are configured; pass --base-url to select one. \
+             Refusing to guess, because a global cloud session can skip records in another stage."
+        ),
+    }
+}
+
+/// Store a session only under its base URL. If upgrading from the old one-file layout, preserve
+/// that old stage and cursor before adding the new one; overwriting it is exactly what caused
+/// cross-stage cursor corruption.
 pub fn save_auth(auth: &StoredAuth) -> Result<()> {
-    write_private(&auth_path(), &serde_json::to_string_pretty(auth)?)
+    migrate_legacy_stage()?;
+    write_private(
+        &auth_path(&auth.base_url),
+        &serde_json::to_string_pretty(auth)?,
+    )
 }
 
-pub fn load_cursor() -> Result<SyncCursor> {
-    let path = cursor_path();
-    if !path.exists() {
+fn migrate_legacy_stage() -> Result<()> {
+    let legacy_auth = legacy_auth_path();
+    if !legacy_auth.exists() {
+        return Ok(());
+    }
+    let auth = read_auth(&legacy_auth)?;
+    let staged_auth_path = auth_path(&auth.base_url);
+    if !staged_auth_path.exists() {
+        write_private(&staged_auth_path, &serde_json::to_string_pretty(&auth)?)?;
+    }
+
+    let legacy_cursor = legacy_cursor_path();
+    if legacy_cursor.exists() {
+        let staged_cursor = cursor_path(&auth.base_url);
+        if !staged_cursor.exists() {
+            let body = fs::read_to_string(&legacy_cursor)?;
+            write_private(&staged_cursor, &body)?;
+        }
+    }
+
+    fs::remove_file(legacy_auth)?;
+    if legacy_cursor.exists() {
+        fs::remove_file(legacy_cursor)?;
+    }
+    Ok(())
+}
+
+pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
+    let path = cursor_path(base_url);
+    if path.exists() {
+        let body = fs::read_to_string(&path)?;
+        return serde_json::from_str(&body).context("parsing stage-scoped cursor.json");
+    }
+
+    // Compatibility for an existing single-stage install. The next successful push writes the
+    // scoped path; a subsequent login migrates it eagerly with the corresponding auth session.
+    let legacy = legacy_cursor_path();
+    if !legacy.exists() {
         return Ok(SyncCursor::default());
     }
-    let body = fs::read_to_string(&path)?;
-    serde_json::from_str(&body).context("parsing cursor.json")
+    let body = fs::read_to_string(&legacy)?;
+    serde_json::from_str(&body).context("parsing legacy cursor.json")
 }
 
-pub fn save_cursor(cursor: &SyncCursor) -> Result<()> {
-    write_private(&cursor_path(), &serde_json::to_string_pretty(cursor)?)
+pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
+    write_private(
+        &cursor_path(base_url),
+        &serde_json::to_string_pretty(cursor)?,
+    )
 }
 
 /// Stable per-machine id (the WS-1 `machineId` sub-tenant), generated once and persisted.
@@ -281,7 +400,7 @@ pub fn push(
     };
     let resp = client.ingest(auth, &req).context("POST /v1/ingest")?;
     // advance the cursor only after the server accepts the batch (durable outbox)
-    save_cursor(&batch.cursor)?;
+    save_cursor(&auth.base_url, &batch.cursor)?;
     Ok(PushReport {
         sent: req.records.len(),
         accepted: resp.accepted,
@@ -1124,7 +1243,7 @@ mod tests {
             assert!(sent.batch_id.starts_with("b_"));
             assert_eq!(sent.records.len(), 2);
             // cursor persisted to disk and reloads to the advanced value
-            assert_eq!(load_cursor().unwrap().history_id, 2);
+            assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 2);
         });
     }
 
@@ -1177,13 +1296,55 @@ mod tests {
                 workspace_id: None,
             };
             save_auth(&auth).unwrap();
-            assert_eq!(load_auth().unwrap().unwrap(), auth);
+            assert_eq!(load_auth(Some(&auth.base_url)).unwrap().unwrap(), auth);
             let c = SyncCursor {
                 history_id: 9,
                 trajectory_rowid: 4,
             };
-            save_cursor(&c).unwrap();
-            assert_eq!(load_cursor().unwrap(), c);
+            save_cursor(&auth.base_url, &c).unwrap();
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), c);
+        });
+    }
+
+    /// A login to a second stage must preserve both the original stage's bearer session and
+    /// its outbox watermark. The previous single auth.json/cursor.json layout overwrote both.
+    #[test]
+    fn auth_and_cursor_are_scoped_to_the_cloud_stage() {
+        with_temp_home(|| {
+            let prod = StoredAuth {
+                base_url: "https://history.agentrelay.com".into(),
+                access_token: "test-prod-access".into(),
+                ..Default::default()
+            };
+            let dev = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-dev-access".into(),
+                ..Default::default()
+            };
+            let prod_cursor = SyncCursor {
+                history_id: 101,
+                trajectory_rowid: 7,
+            };
+            let dev_cursor = SyncCursor {
+                history_id: 9,
+                trajectory_rowid: 2,
+            };
+
+            save_auth(&prod).unwrap();
+            save_cursor(&prod.base_url, &prod_cursor).unwrap();
+            save_auth(&dev).unwrap();
+            save_cursor(&dev.base_url, &dev_cursor).unwrap();
+
+            assert_eq!(load_auth(Some(&prod.base_url)).unwrap(), Some(prod));
+            assert_eq!(
+                load_cursor("https://history.agentrelay.com").unwrap(),
+                prod_cursor
+            );
+            assert_eq!(load_auth(Some(&dev.base_url)).unwrap(), Some(dev));
+            assert_eq!(load_cursor("http://localhost:8787").unwrap(), dev_cursor);
+
+            let err = load_auth(None).unwrap_err().to_string();
+            assert!(err.contains("pass --base-url"), "{err}");
         });
     }
 

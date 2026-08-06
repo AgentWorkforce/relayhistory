@@ -22,8 +22,8 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
   on a worker thread so the event loop isn't blocked.
 - **Single source of truth:** the Rust `ai_hist_cli` library does the sync +
   push. The CLI binary and the addon call the same code.
-- **Auth:** the `rth_at_` token written by `reflex on`
-  (`~/.agentworkforce/relayhistory/auth.json`). `syncAndPush()` returns
+- **Auth:** the `rth_at_` token written by `reflex on` (in the stage-scoped
+  `~/.agentworkforce/relayhistory/stages/` store). `syncAndPush()` returns
   `authenticated: false` (a no-op) until the user is logged in.
 
 ## The packages

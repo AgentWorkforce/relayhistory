@@ -58,7 +58,10 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
     let conn = open_db(&db_path)?;
     sync_basic(&conn, &db_path)?;
 
-    let auth = match cloud::load_auth()? {
+    // The in-process runtime has no CLI argument channel. Keep it pinned to the normal Cloud
+    // origin rather than following whichever stage happened to be logged into most recently.
+    let default_base_url = cloud::default_base_url();
+    let auth = match cloud::load_auth(Some(&default_base_url))? {
         Some(auth) => auth,
         None => {
             return Ok(SyncPushOutcome {
@@ -75,7 +78,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
         cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
-    let cursor = cloud::load_cursor()?;
+    let cursor = cloud::load_cursor(&auth.base_url)?;
     let report = cloud::push(
         &conn,
         &cloud::UreqIngestor,
@@ -344,6 +347,9 @@ enum Command {
     },
     /// Push new local history + trajectory events to relayhistory-cloud.
     Push {
+        /// Select the cloud stage. Required when this machine has sessions for multiple stages.
+        #[arg(long)]
+        base_url: Option<String>,
         #[arg(long, default_value_t = 500)]
         limit: usize,
         /// Session ids (or trajectory ids) to exclude from the sync (incognito).
@@ -370,6 +376,9 @@ enum Command {
     /// stops pushing keeps its row and shows up as STALE or MISSING rather than
     /// disappearing quietly.
     Coverage {
+        /// Select the cloud stage. Required when this machine has sessions for multiple stages.
+        #[arg(long)]
+        base_url: Option<String>,
         /// Seconds without a push before a machine counts as stale (server default: 900,
         /// three times the 300s push service interval).
         #[arg(long)]
@@ -402,6 +411,9 @@ enum Command {
 enum PairAction {
     /// Ask relayhistory-cloud for advisory warnings before an action (POST /v1/pair/check).
     Check {
+        /// Select the cloud stage. Required when this machine has sessions for multiple stages.
+        #[arg(long)]
+        base_url: Option<String>,
         /// Files in scope / about to be touched (paths only — never contents).
         #[arg(long)]
         file: Vec<String>,
@@ -768,7 +780,7 @@ pub fn run() -> Result<()> {
             interval,
         } => {
             if install_service {
-                install_managed_service(&SYNC_SERVICE, interval)
+                install_managed_service(&SYNC_SERVICE, interval, &[])
             } else if uninstall_service {
                 uninstall_managed_service(&SYNC_SERVICE)
             } else {
@@ -890,6 +902,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Command::Push {
+            base_url,
             limit,
             incognito,
             json,
@@ -909,12 +922,17 @@ pub fn run() -> Result<()> {
                          it when installing the service."
                     );
                 }
-                return install_managed_service(&PUSH_SERVICE, interval);
+                let auth = cloud::load_auth(base_url.as_deref())?.context(
+                    "not authenticated for the selected stage — run `ai-hist login` or \
+                     `ai-hist admin-mint` first",
+                )?;
+                let service_args = vec!["--base-url".to_string(), auth.base_url];
+                return install_managed_service(&PUSH_SERVICE, interval, &service_args);
             }
             if uninstall_service {
                 return uninstall_managed_service(&PUSH_SERVICE);
             }
-            let auth = cloud::load_auth()?
+            let auth = cloud::load_auth(base_url.as_deref())?
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let machine = MachineIdentity {
                 id: cloud::machine_id()?,
@@ -923,7 +941,7 @@ pub fn run() -> Result<()> {
                 cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 ..Default::default()
             };
-            let cursor = cloud::load_cursor()?;
+            let cursor = cloud::load_cursor(&auth.base_url)?;
             let incognito_set: HashSet<String> = incognito.into_iter().collect();
             let report = cloud::push(
                 &conn,
@@ -958,13 +976,14 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Command::Coverage {
+            base_url,
             stale_after,
             missing_after,
             window_hours,
             fail_on_stale,
             json,
         } => {
-            let auth = cloud::load_auth()?
+            let auth = cloud::load_auth(base_url.as_deref())?
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let resp = cloud::fleet_coverage(
                 &auth,
@@ -988,6 +1007,7 @@ pub fn run() -> Result<()> {
         }
         Command::Pair { action } => match action {
             PairAction::Check {
+                base_url,
                 file,
                 task,
                 tool,
@@ -997,7 +1017,7 @@ pub fn run() -> Result<()> {
                 limit,
                 json,
             } => {
-                let auth = cloud::load_auth()?.context(
+                let auth = cloud::load_auth(base_url.as_deref())?.context(
                     "not authenticated — run `ai-hist login` or `ai-hist admin-mint` first",
                 )?;
                 let cwd = std::env::current_dir()
@@ -2147,13 +2167,20 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn install_managed_service(spec: &ServiceSpec, interval: u64) -> Result<()> {
+fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(spec.subcommand.to_string());
+    command.extend(args.iter().cloned());
+    command
+}
+
+fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
     if cfg!(target_os = "macos") {
-        install_launchd_service(spec, &bin, interval)
+        install_launchd_service(spec, &bin, interval, args)
     } else if cfg!(target_os = "linux") {
-        install_cron_service(spec, &bin, interval)
+        install_cron_service(spec, &bin, interval, args)
     } else {
         anyhow::bail!(
             "Automatic {} service install is only supported on macOS and Linux. \
@@ -2222,11 +2249,21 @@ fn cron_schedule(interval: u64) -> (String, String, u64) {
     ("0 0 * * *".to_string(), "once a day".to_string(), 86_400)
 }
 
-fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
+fn install_launchd_service(
+    spec: &ServiceSpec,
+    bin: &str,
+    interval: u64,
+    args: &[String],
+) -> Result<()> {
     let plist_path = launchd_plist_path(spec);
     if let Some(dir) = plist_path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    let command_args = service_command_args(spec, args)
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2237,7 +2274,7 @@ fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Resu
     <key>ProgramArguments</key>
     <array>
         <string>{bin}</string>
-        <string>{subcommand}</string>
+{command_args}
     </array>
     <key>StartInterval</key>
     <integer>{interval}</integer>
@@ -2252,7 +2289,7 @@ fn install_launchd_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Resu
 "#,
         label = spec.label,
         bin = xml_escape(bin),
-        subcommand = spec.subcommand,
+        command_args = command_args,
         interval = interval,
         log_stem = spec.log_stem,
     );
@@ -2308,7 +2345,12 @@ fn write_crontab(contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<()> {
+fn install_cron_service(
+    spec: &ServiceSpec,
+    bin: &str,
+    interval: u64,
+    args: &[String],
+) -> Result<()> {
     let (schedule, cadence, effective) = cron_schedule(interval);
     // cron can't match every interval exactly; the confirmation below states the
     // cadence actually scheduled. Only note a mismatch when it isn't exact, so a
@@ -2319,10 +2361,16 @@ fn install_cron_service(spec: &ServiceSpec, bin: &str, interval: u64) -> Result<
         );
     }
     let marker = cron_marker(spec);
+    let command = std::iter::once(shell_single_quote(bin))
+        .chain(
+            service_command_args(spec, args)
+                .iter()
+                .map(|arg| shell_single_quote(arg)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
     let line = format!(
-        "{schedule} {} {} >> /tmp/{}.log 2>&1 {marker}",
-        shell_single_quote(bin),
-        spec.subcommand,
+        "{schedule} {command} >> /tmp/{}.log 2>&1 {marker}",
         spec.log_stem
     );
     // Drop any previously managed line, then append the current one.
@@ -5310,8 +5358,8 @@ mod tests {
     use super::{
         checkpoint_sync_state, cron_schedule, file_stamp, git_commit_time_ms, git_stdout,
         ingest_claude_transcript, link_git_commit, load_sync_state, parse_trajectory_file,
-        paths_overlap, save_sync_state, search_all, shell_single_quote, strip_url_credentials,
-        sync_claude_session_metadata, xml_escape, SearchRole,
+        paths_overlap, save_sync_state, search_all, service_command_args, shell_single_quote,
+        strip_url_credentials, sync_claude_session_metadata, xml_escape, SearchRole, PUSH_SERVICE,
     };
     use ai_hist_core::{init_db, QueryFilter};
     use rusqlite::Connection;
@@ -5339,6 +5387,22 @@ mod tests {
         assert_eq!(cron_schedule(300).2, 300);
         assert_eq!(cron_schedule(5400).2, 7200);
         assert_eq!(cron_schedule(420).2, 600);
+    }
+
+    #[test]
+    fn push_service_command_pins_the_selected_cloud_stage() {
+        let args = vec![
+            "--base-url".to_string(),
+            "https://history.agentrelay.com".to_string(),
+        ];
+        assert_eq!(
+            service_command_args(&PUSH_SERVICE, &args),
+            vec![
+                "push".to_string(),
+                "--base-url".to_string(),
+                "https://history.agentrelay.com".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -5455,6 +5519,7 @@ mod tests {
         // Opening writably would park a scheduled `coverage --fail-on-stale` behind the 60s
         // sync service's write lock, for a query that reads nothing local.
         assert!(super::is_read_only(&super::Command::Coverage {
+            base_url: None,
             stale_after: None,
             missing_after: None,
             window_hours: None,
