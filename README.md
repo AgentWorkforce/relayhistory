@@ -254,6 +254,7 @@ launchd/cron plumbing:
 
 ```bash
 ai-hist push --install-service      # schedule automatic cloud push (macOS: every 300s)
+ai-hist push --install-service --limit 50  # persist a smaller batch for a heavy machine
 ai-hist push --uninstall-service    # remove it
 ai-hist push                        # push new history now
 ```
@@ -263,6 +264,9 @@ a cron entry: whole-minute intervals become a step schedule (300s → `*/5`), an
 sub-minute intervals run every minute (cron's finest granularity).
 
 Running both services keeps local capture and cloud upload going end-to-end.
+When the Cloud worker rejects a batch for resource limits, `push` halves the batch and retries
+from the unchanged cursor down to a safe floor. If even that floor is rejected, it exits with a
+clear error that the cursor was not advanced; this is distinct from `Nothing new to push.`
 The push job authenticates with the `rth_at_` token written by `ai-hist login`.
 Because that token goes on the wire, an `https://` endpoint is required; plain
 `http://` is accepted only for loopback (`http://127.0.0.1:8787`, the `wrangler
