@@ -913,8 +913,9 @@ pub fn run() -> Result<()> {
             if install_service {
                 // `--incognito` is a per-run privacy filter; the scheduled job
                 // runs a plain `push`, so silently dropping it would give a
-                // false sense that it applies. Reject the combo. (`--limit` is
-                // only a batch-size knob and is harmless to ignore here.)
+                // false sense that it applies. Reject the combo. `--limit`, on
+                // the other hand, is part of the reliability configuration and
+                // is recorded in the service command.
                 if !incognito.is_empty() {
                     anyhow::bail!(
                         "--incognito is a per-run privacy filter and is NOT applied to the scheduled \
@@ -926,7 +927,12 @@ pub fn run() -> Result<()> {
                     "not authenticated for the selected stage — run `ai-hist login` or \
                      `ai-hist admin-mint` first",
                 )?;
-                let service_args = vec!["--base-url".to_string(), auth.base_url];
+                let service_args = vec![
+                    "--base-url".to_string(),
+                    auth.base_url,
+                    "--limit".to_string(),
+                    limit.to_string(),
+                ];
                 return install_managed_service(&PUSH_SERVICE, interval, &service_args);
             }
             if uninstall_service {
@@ -960,17 +966,21 @@ pub fn run() -> Result<()> {
                         "accepted": report.accepted,
                         "batchId": report.batch_id,
                         "cursor": report.cursor,
+                        "batchLimit": report.batch_limit,
+                        "attempts": report.attempts,
                     })
                 );
             } else if report.sent == 0 {
                 println!("Nothing new to push.");
             } else {
                 println!(
-                    "Pushed {} record(s), {} accepted (cursor → history #{}, trajectory rowid {}).",
+                    "Pushed {} record(s), {} accepted (cursor → history #{}, trajectory rowid {}; batch limit {}, {} attempt(s)).",
                     report.sent,
                     report.accepted,
                     report.cursor.history_id,
-                    report.cursor.trajectory_rowid
+                    report.cursor.trajectory_rowid,
+                    report.batch_limit,
+                    report.attempts,
                 );
             }
             Ok(())
@@ -5394,6 +5404,8 @@ mod tests {
         let args = vec![
             "--base-url".to_string(),
             "https://history.agentrelay.com".to_string(),
+            "--limit".to_string(),
+            "50".to_string(),
         ];
         assert_eq!(
             service_command_args(&PUSH_SERVICE, &args),
@@ -5401,6 +5413,8 @@ mod tests {
                 "push".to_string(),
                 "--base-url".to_string(),
                 "https://history.agentrelay.com".to_string(),
+                "--limit".to_string(),
+                "50".to_string(),
             ]
         );
     }

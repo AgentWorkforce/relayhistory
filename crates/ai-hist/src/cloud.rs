@@ -366,6 +366,10 @@ pub struct PushReport {
     pub accepted: u64,
     pub cursor: SyncCursor,
     pub batch_id: Option<String>,
+    /// The per-source scan limit that produced the accepted batch.
+    pub batch_limit: usize,
+    /// Number of ingest attempts in this push run, including any smaller retry.
+    pub attempts: usize,
 }
 
 /// Build the next outbox batch and push it. On success, persists the advanced cursor.
@@ -379,13 +383,59 @@ pub fn push(
     limit: usize,
     incognito: &HashSet<String>,
 ) -> Result<PushReport> {
-    let batch = build_outbox_batch(conn, cursor, limit, incognito)?;
+    const MIN_RECOVERABLE_BATCH_LIMIT: usize = 10;
+    let mut batch_limit = limit.max(1);
+    let mut attempts = 1;
+
+    loop {
+        match push_once(
+            conn,
+            client,
+            auth,
+            machine,
+            cursor,
+            batch_limit,
+            incognito,
+            attempts,
+        ) {
+            Ok(report) => return Ok(report),
+            Err(err)
+                if is_worker_capacity_error(&err) && batch_limit > MIN_RECOVERABLE_BATCH_LIMIT =>
+            {
+                let next_limit = (batch_limit / 2).max(MIN_RECOVERABLE_BATCH_LIMIT);
+                batch_limit = next_limit;
+                attempts += 1;
+            }
+            Err(err) if is_worker_capacity_error(&err) => {
+                return Err(err.context(format!(
+                    "cloud ingest still exceeded its resource limit at batch limit {batch_limit} \
+                     after {attempts} attempt(s); cursor was not advanced"
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn push_once(
+    conn: &Connection,
+    client: &dyn Ingestor,
+    auth: &StoredAuth,
+    machine: &MachineIdentity,
+    cursor: &SyncCursor,
+    batch_limit: usize,
+    incognito: &HashSet<String>,
+    attempts: usize,
+) -> Result<PushReport> {
+    let batch = build_outbox_batch(conn, cursor, batch_limit, incognito)?;
     if batch.records.is_empty() {
         return Ok(PushReport {
             sent: 0,
             accepted: 0,
             cursor: cursor.clone(),
             batch_id: None,
+            batch_limit,
+            attempts: 0,
         });
     }
     let bid = batch_id(&machine.id, cursor, &batch.cursor, batch.records.len());
@@ -406,6 +456,21 @@ pub fn push(
         accepted: resp.accepted,
         cursor: batch.cursor,
         batch_id: Some(bid),
+        batch_limit,
+        attempts,
+    })
+}
+
+/// Cloudflare's worker overload currently arrives as an HTML 503, while a future structured
+/// response may retain the text without that status. Treat either signal as safe to retry with
+/// the exact same starting cursor and a smaller batch; no cursor is persisted before success.
+fn is_worker_capacity_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("HTTP 503")
+            || message
+                .to_ascii_lowercase()
+                .contains("worker exceeded resource limits")
     })
 }
 
@@ -1166,6 +1231,30 @@ mod tests {
         }
     }
 
+    /// Simulates the Worker rejecting a request whose encoded records are too large. It records
+    /// every attempt so the test verifies we retry from the same cursor at a smaller limit.
+    struct CapacityLimitedIngestor {
+        max_records: usize,
+        attempted_record_counts: RefCell<Vec<usize>>,
+    }
+
+    impl Ingestor for CapacityLimitedIngestor {
+        fn ingest(&self, _auth: &StoredAuth, req: &IngestRequest) -> Result<IngestResponse> {
+            self.attempted_record_counts
+                .borrow_mut()
+                .push(req.records.len());
+            if req.records.len() > self.max_records {
+                anyhow::bail!("ingest failed: HTTP 503: Worker exceeded resource limits");
+            }
+            Ok(IngestResponse {
+                batch_id: req.batch_id.clone(),
+                received: req.records.len() as u64,
+                accepted: req.records.len() as u64,
+                cursors: None,
+            })
+        }
+    }
+
     // RELAYHISTORY_HOME is process-global; serialize env-home tests so cargo's parallel
     // runner can't clobber it across tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1244,6 +1333,79 @@ mod tests {
             assert_eq!(sent.records.len(), 2);
             // cursor persisted to disk and reloads to the advanced value
             assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 2);
+        });
+    }
+
+    #[test]
+    fn push_halves_a_worker_rejected_batch_and_makes_progress() {
+        with_temp_home(|| {
+            let conn = mem();
+            for id in 1..=32 {
+                add(&conn, &format!("entry {id}"), id);
+            }
+            let client = CapacityLimitedIngestor {
+                max_records: 10,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let report = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                32,
+                &HashSet::new(),
+            )
+            .unwrap();
+
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![32, 16, 10]);
+            assert_eq!(report.batch_limit, 10);
+            assert_eq!(report.attempts, 3);
+            assert_eq!(report.cursor.history_id, 10);
+            assert_eq!(load_cursor(&auth.base_url).unwrap().history_id, 10);
+        });
+    }
+
+    #[test]
+    fn worker_rejection_at_the_minimum_limit_is_loud_and_keeps_the_cursor() {
+        with_temp_home(|| {
+            let conn = mem();
+            add(&conn, "too large even alone", 1);
+            let client = CapacityLimitedIngestor {
+                max_records: 0,
+                attempted_record_counts: RefCell::new(Vec::new()),
+            };
+            let auth = StoredAuth {
+                base_url: "http://localhost:8787".into(),
+                access_token: "test-access-token".into(),
+                ..Default::default()
+            };
+            let err = push(
+                &conn,
+                &client,
+                &auth,
+                &MachineIdentity {
+                    id: "m1".into(),
+                    ..Default::default()
+                },
+                &SyncCursor::default(),
+                1,
+                &HashSet::new(),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("cursor was not advanced"), "{err}");
+            assert_eq!(*client.attempted_record_counts.borrow(), vec![1]);
+            assert_eq!(load_cursor(&auth.base_url).unwrap(), SyncCursor::default());
         });
     }
 
