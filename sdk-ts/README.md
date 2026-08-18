@@ -2,7 +2,7 @@
 
 TypeScript reader for the [ai-hist](../README.md) history database, plus an MCP server for searching local AI coding-agent history from Claude Code, Codex, Cursor, Grok, and Agent Relay.
 
-The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file that `ai-hist sync` writes, or falls back to scanning local Claude/Codex/Cursor/Grok JSONL files and compacted trajectory JSON when the database is missing.
+The SDK uses `sql.js`, so it has no native build step. It reads the same SQLite file that `ai-hist sync` writes, or falls back to scanning local Claude/Codex/Cursor/Grok JSONL files and compacted trajectory JSON when the database is missing. The first fallback scan is persisted separately at `~/.local/share/ai-hist/jsonl-fallback-cache.db`; later opens re-read only new or changed source files. Override that cache path with `AI_HIST_JSONL_CACHE_DB`.
 
 ## Install
 
@@ -98,6 +98,7 @@ All list-style methods accept `{ source?, project?, limit?, beforeMs? }`. `befor
 ```ts
 resumeCommand(entry): string | null           // shell command per source; null for relay
 defaultDbPath(): string                       // resolve env / OS default
+defaultJsonlCacheDbPath(): string             // resolve fallback-cache env / OS default
 ```
 
 ## Trajectories

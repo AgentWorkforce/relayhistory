@@ -30,6 +30,17 @@ export interface RawRow {
   gitBranch: string | null;
 }
 
+export interface FileFingerprint {
+  mtimeMs: number;
+  size: number;
+}
+
+export interface ScannedSourceFile extends FileFingerprint {
+  path: string;
+  /** Undefined when the manifest fingerprint matched and the file was not read. */
+  rows?: RawRow[];
+}
+
 const CLAUDE_HISTORY = join(homedir(), '.claude', 'history.jsonl');
 const CODEX_HISTORY = join(homedir(), '.codex', 'history.jsonl');
 const CURSOR_ROOT = join(homedir(), '.cursor', 'projects');
@@ -38,13 +49,21 @@ const GROK_SESSIONS_ROOT = join(homedir(), '.grok', 'sessions');
 async function safeStat(path: string): Promise<{ isDirectory: boolean; isFile: boolean; size: number; mtimeMs: number } | null> {
   try {
     const s = await stat(path);
-    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: s.mtimeMs };
+    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: Math.trunc(s.mtimeMs) };
   } catch {
     return null;
   }
 }
 
+let jsonlReadObserver: ((path: string) => void) | undefined;
+
+/** @internal Test/diagnostic hook for verifying incremental scans. */
+export function setJsonlReadObserver(observer?: (path: string) => void): void {
+  jsonlReadObserver = observer;
+}
+
 async function readLines(path: string): Promise<string[]> {
+  jsonlReadObserver?.(path);
   try {
     const content = await readFile(path, 'utf8');
     return content.split('\n');
@@ -175,30 +194,47 @@ async function collectMatchingFiles(root: string, filename: string, out: string[
   return out;
 }
 
-async function scanClaude(): Promise<RawRow[]> {
-  const lines = await readLines(CLAUDE_HISTORY);
+function unchanged(
+  path: string,
+  fileStat: FileFingerprint,
+  ingestedFiles: ReadonlyMap<string, FileFingerprint>,
+): boolean {
+  const previous = ingestedFiles.get(path);
+  return previous?.mtimeMs === fileStat.mtimeMs && previous.size === fileStat.size;
+}
+
+async function scanClaude(ingestedFiles: ReadonlyMap<string, FileFingerprint>): Promise<ScannedSourceFile[]> {
+  const fileStat = await safeStat(CLAUDE_HISTORY);
+  if (!fileStat?.isFile) return [];
+  if (unchanged(CLAUDE_HISTORY, fileStat, ingestedFiles)) {
+    return [{ path: CLAUDE_HISTORY, mtimeMs: fileStat.mtimeMs, size: fileStat.size }];
+  }
   const rows: RawRow[] = [];
-  for (const line of lines) {
+  for (const line of await readLines(CLAUDE_HISTORY)) {
     const row = parseClaudeLine(line);
     if (row) rows.push(row);
   }
-  return rows;
+  return [{ path: CLAUDE_HISTORY, mtimeMs: fileStat.mtimeMs, size: fileStat.size, rows }];
 }
 
-async function scanCodex(): Promise<RawRow[]> {
-  const lines = await readLines(CODEX_HISTORY);
+async function scanCodex(ingestedFiles: ReadonlyMap<string, FileFingerprint>): Promise<ScannedSourceFile[]> {
+  const fileStat = await safeStat(CODEX_HISTORY);
+  if (!fileStat?.isFile) return [];
+  if (unchanged(CODEX_HISTORY, fileStat, ingestedFiles)) {
+    return [{ path: CODEX_HISTORY, mtimeMs: fileStat.mtimeMs, size: fileStat.size }];
+  }
   const rows: RawRow[] = [];
-  for (const line of lines) {
+  for (const line of await readLines(CODEX_HISTORY)) {
     const row = parseCodexLine(line);
     if (row) rows.push(row);
   }
-  return rows;
+  return [{ path: CODEX_HISTORY, mtimeMs: fileStat.mtimeMs, size: fileStat.size, rows }];
 }
 
-async function scanCursor(): Promise<RawRow[]> {
+async function scanCursor(ingestedFiles: ReadonlyMap<string, FileFingerprint>): Promise<ScannedSourceFile[]> {
   const root = await safeStat(CURSOR_ROOT);
   if (!root) return [];
-  const rows: RawRow[] = [];
+  const files: ScannedSourceFile[] = [];
   const projectDirs = await readDirSafe(CURSOR_ROOT);
   for (const projectDirName of projectDirs) {
     const projectDir = join(CURSOR_ROOT, projectDirName);
@@ -213,8 +249,13 @@ async function scanCursor(): Promise<RawRow[]> {
       const sessionId = sessionDirName;
       const jsonl = join(sessionDir, `${sessionId}.jsonl`);
       const fileStat = await safeStat(jsonl);
-      if (!fileStat) continue;
+      if (!fileStat?.isFile) continue;
+      if (unchanged(jsonl, fileStat, ingestedFiles)) {
+        files.push({ path: jsonl, mtimeMs: fileStat.mtimeMs, size: fileStat.size });
+        continue;
+      }
       const tsMs = Math.trunc(fileStat.mtimeMs);
+      const rows: RawRow[] = [];
       for (const line of await readLines(jsonl)) {
         const text = parseCursorLine(line);
         if (!text) continue;
@@ -227,12 +268,13 @@ async function scanCursor(): Promise<RawRow[]> {
           gitBranch: null,
         });
       }
+      files.push({ path: jsonl, mtimeMs: fileStat.mtimeMs, size: fileStat.size, rows });
     }
     // Yield between project dirs so very large cursor histories don't
     // hold the event loop for seconds at a time.
     await yieldToEventLoop();
   }
-  return rows;
+  return files;
 }
 
 function parseIsoMs(value: unknown, fallbackMs: number): number {
@@ -290,18 +332,24 @@ function nestedString(obj: Record<string, unknown> | null, path: string[]): stri
   return asString(current);
 }
 
-async function scanGrok(): Promise<RawRow[]> {
+async function scanGrok(ingestedFiles: ReadonlyMap<string, FileFingerprint>): Promise<ScannedSourceFile[]> {
   const root = await safeStat(GROK_SESSIONS_ROOT);
   if (!root) return [];
-  const rows: RawRow[] = [];
+  const files: ScannedSourceFile[] = [];
   for (const chatPath of await collectMatchingFiles(GROK_SESSIONS_ROOT, 'chat_history.jsonl')) {
-    const summary = await readGrokSummary(chatPath);
     const fileStat = await safeStat(chatPath);
-    const fallbackMs = Math.trunc(fileStat?.mtimeMs ?? 0);
+    if (!fileStat?.isFile) continue;
+    if (unchanged(chatPath, fileStat, ingestedFiles)) {
+      files.push({ path: chatPath, mtimeMs: fileStat.mtimeMs, size: fileStat.size });
+      continue;
+    }
+    const summary = await readGrokSummary(chatPath);
+    const fallbackMs = Math.trunc(fileStat.mtimeMs);
     const sessionId = nestedString(summary, ['info', 'id']) ?? basename(dirname(chatPath));
     const project = nestedString(summary, ['info', 'cwd']) ?? asString(summary?.git_root_dir) ?? grokProjectFromPath(chatPath);
     const gitBranch = asString(summary?.head_branch);
     const baseMs = parseIsoMs(summary?.created_at, fallbackMs);
+    const rows: RawRow[] = [];
     let idx = 0;
     for (const line of await readLines(chatPath)) {
       const obj = readJsonRecord(line);
@@ -318,9 +366,10 @@ async function scanGrok(): Promise<RawRow[]> {
       });
       idx += 1;
     }
+    files.push({ path: chatPath, mtimeMs: fileStat.mtimeMs, size: fileStat.size, rows });
     await yieldToEventLoop();
   }
-  return rows;
+  return files;
 }
 
 /**
@@ -329,15 +378,21 @@ async function scanGrok(): Promise<RawRow[]> {
  * Silently skips sources whose paths don't exist — that's the common
  * case for users who only have one CLI.
  */
+export async function scanLocalSourceFiles(
+  ingestedFiles: ReadonlyMap<string, FileFingerprint> = new Map(),
+): Promise<ScannedSourceFile[]> {
+  const files = await Promise.all([
+    scanClaude(ingestedFiles),
+    scanCodex(ingestedFiles),
+    scanCursor(ingestedFiles),
+    scanGrok(ingestedFiles),
+  ]);
+  return files.flat();
+}
+
 export async function scanLocalSources(): Promise<RawRow[]> {
-  const claudeRows = await scanClaude();
-  await yieldToEventLoop();
-  const codexRows = await scanCodex();
-  await yieldToEventLoop();
-  const cursorRows = await scanCursor();
-  await yieldToEventLoop();
-  const grokRows = await scanGrok();
-  return [...claudeRows, ...codexRows, ...cursorRows, ...grokRows];
+  const files = await scanLocalSourceFiles();
+  return files.flatMap((file) => file.rows ?? []);
 }
 
 export const LOCAL_SOURCE_PATHS = {

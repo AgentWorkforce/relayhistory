@@ -158,8 +158,10 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
 
   const previousRoot = process.env.TRAJECTORY_ROOT;
   const previousDb = process.env.AI_HIST_DB;
+  const previousCacheDb = process.env.AI_HIST_JSONL_CACHE_DB;
   process.env.TRAJECTORY_ROOT = root;
   process.env.AI_HIST_DB = join(root, 'missing.db');
+  process.env.AI_HIST_JSONL_CACHE_DB = join(root, 'fallback-cache.db');
   const hist = await openAiHist({ dbPath: join(root, 'missing.db') });
   try {
     const results = hist.searchTrajectories('exponential backoff', { limit: 5 });
@@ -174,6 +176,8 @@ test('SDK fallback ingests compacted per-run trajectories from TRAJECTORY_ROOT',
     else process.env.TRAJECTORY_ROOT = previousRoot;
     if (previousDb === undefined) delete process.env.AI_HIST_DB;
     else process.env.AI_HIST_DB = previousDb;
+    if (previousCacheDb === undefined) delete process.env.AI_HIST_JSONL_CACHE_DB;
+    else process.env.AI_HIST_JSONL_CACHE_DB = previousCacheDb;
   }
 });
 
@@ -212,9 +216,11 @@ time.sleep(60)
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
 
   const previousDb = process.env.AI_HIST_DB;
+  const previousCacheDb = process.env.AI_HIST_JSONL_CACHE_DB;
   const previousOpenCode = process.env.OPENCODE_DB;
   const previousTrajectory = process.env.TRAJECTORY_ROOT;
   process.env.AI_HIST_DB = join(root, 'missing-ai-hist.db');
+  process.env.AI_HIST_JSONL_CACHE_DB = join(root, 'fallback-cache.db');
   process.env.OPENCODE_DB = dbPath;
   process.env.TRAJECTORY_ROOT = join(root, 'missing-trajectories');
   try {
@@ -232,6 +238,8 @@ time.sleep(60)
     child.kill();
     if (previousDb === undefined) delete process.env.AI_HIST_DB;
     else process.env.AI_HIST_DB = previousDb;
+    if (previousCacheDb === undefined) delete process.env.AI_HIST_JSONL_CACHE_DB;
+    else process.env.AI_HIST_JSONL_CACHE_DB = previousCacheDb;
     if (previousOpenCode === undefined) delete process.env.OPENCODE_DB;
     else process.env.OPENCODE_DB = previousOpenCode;
     if (previousTrajectory === undefined) delete process.env.TRAJECTORY_ROOT;

@@ -1,6 +1,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import type { FileFingerprint } from './jsonl-sources.js';
 
 export interface TrajectoryDecision {
   question: string;
@@ -36,6 +37,12 @@ export interface RawTrajectory {
   timestampMs: number;
 }
 
+export interface ScannedTrajectoryFile extends FileFingerprint {
+  path: string;
+  /** Undefined when the manifest fingerprint matched and the file was not read. */
+  trajectory?: RawTrajectory | null;
+}
+
 export const DEFAULT_TRAJECTORY_SEARCH_ROOT = join(homedir(), 'Projects');
 
 function yieldToEventLoop(): Promise<void> {
@@ -45,7 +52,7 @@ function yieldToEventLoop(): Promise<void> {
 async function safeStat(path: string): Promise<{ isDirectory: boolean; isFile: boolean; size: number; mtimeMs: number } | null> {
   try {
     const s = await stat(path);
-    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: s.mtimeMs };
+    return { isDirectory: s.isDirectory(), isFile: s.isFile(), size: s.size, mtimeMs: Math.trunc(s.mtimeMs) };
   } catch {
     return null;
   }
@@ -220,18 +227,37 @@ export async function readTrajectoryFile(path: string): Promise<RawTrajectory | 
   return { ...trajectory, searchText: buildSearchText(trajectory) };
 }
 
-export async function scanLocalTrajectories(): Promise<RawTrajectory[]> {
+export async function scanLocalTrajectoryFiles(
+  ingestedFiles: ReadonlyMap<string, FileFingerprint> = new Map(),
+): Promise<ScannedTrajectoryFile[]> {
   const roots = await trajectoryRoots();
   const seen = new Set<string>();
-  const trajectories: RawTrajectory[] = [];
+  const files: ScannedTrajectoryFile[] = [];
   for (const root of roots) {
     for (const file of await compactedJsonFiles(root)) {
       if (seen.has(file)) continue;
       seen.add(file);
+      const fileStat = await safeStat(file);
+      if (!fileStat?.isFile) continue;
+      const previous = ingestedFiles.get(file);
+      if (previous?.mtimeMs === fileStat.mtimeMs && previous.size === fileStat.size) {
+        files.push({ path: file, mtimeMs: fileStat.mtimeMs, size: fileStat.size });
+        continue;
+      }
       const trajectory = await readTrajectoryFile(file);
-      if (trajectory) trajectories.push(trajectory);
+      files.push({
+        path: file,
+        mtimeMs: fileStat.mtimeMs,
+        size: fileStat.size,
+        trajectory,
+      });
     }
     await yieldToEventLoop();
   }
-  return trajectories;
+  return files;
+}
+
+export async function scanLocalTrajectories(): Promise<RawTrajectory[]> {
+  const files = await scanLocalTrajectoryFiles();
+  return files.flatMap((file) => file.trajectory ? [file.trajectory] : []);
 }

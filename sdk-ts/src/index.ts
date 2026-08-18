@@ -13,16 +13,21 @@
  */
 
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
-import { scanLocalSources, LOCAL_SOURCE_PATHS } from './jsonl-sources.js';
 import {
-  scanLocalTrajectories,
+  scanLocalSourceFiles,
+  LOCAL_SOURCE_PATHS,
+  type FileFingerprint,
+} from './jsonl-sources.js';
+import {
+  scanLocalTrajectoryFiles,
   trajectoryRootDescription,
   type TrajectoryDecision,
   type TrajectoryRetrospective,
@@ -165,6 +170,13 @@ export function defaultDbPath(): string {
   return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
 }
 
+/** Resolve the standalone JSONL fallback cache path. */
+export function defaultJsonlCacheDbPath(): string {
+  const fromEnv = process.env.AI_HIST_JSONL_CACHE_DB;
+  if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
+  return join(homedir(), '.local', 'share', 'ai-hist', 'jsonl-fallback-cache.db');
+}
+
 function defaultOpenCodeDbPath(): string {
   return process.env.OPENCODE_DB && process.env.OPENCODE_DB.trim().length > 0
     ? process.env.OPENCODE_DB
@@ -241,6 +253,100 @@ function ensureTagSchema(db: Database): void {
   db.run('CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag_id)');
 }
 
+const JSONL_FALLBACK_CACHE_SCHEMA_VERSION = 1;
+
+function ensureJsonlCacheSchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT,
+    project TEXT,
+    prompt TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    git_branch TEXT,
+    ingest_path TEXT NOT NULL,
+    UNIQUE(source, timestamp_ms, prompt, ingest_path)
+  )`);
+  db.run('CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history (timestamp_ms DESC)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_history_session ON history (session_id)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_history_ingest_path ON history (ingest_path)');
+  db.run(`CREATE TABLE IF NOT EXISTS ingested_files (
+    path TEXT PRIMARY KEY,
+    mtime_ms INTEGER NOT NULL,
+    size INTEGER NOT NULL
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS cache_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`);
+  db.run(
+    `INSERT OR IGNORE INTO cache_metadata (key, value) VALUES ('schema_version', ?)`,
+    [String(JSONL_FALLBACK_CACHE_SCHEMA_VERSION)],
+  );
+  ensureTrajectorySchema(db);
+  ensureTagSchema(db);
+  ensureSessionsSchema(db);
+}
+
+function jsonlCacheVersion(db: Database): number | null {
+  try {
+    const row = runQuery<{ value: string }>(
+      db,
+      `SELECT value FROM cache_metadata WHERE key = 'schema_version'`,
+      [],
+    )[0];
+    if (!row) return null;
+    const version = Number(row.value);
+    return Number.isInteger(version) ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+async function openJsonlCache(
+  SQL: SqlJsStatic,
+  cachePath: string,
+): Promise<{ db: Database; rebuilt: boolean }> {
+  if (await pathExists(cachePath)) {
+    let cachedDb: Database | undefined;
+    try {
+      cachedDb = new SQL.Database(await readFile(cachePath));
+      if (jsonlCacheVersion(cachedDb) === JSONL_FALLBACK_CACHE_SCHEMA_VERSION) {
+        ensureJsonlCacheSchema(cachedDb);
+        return { db: cachedDb, rebuilt: false };
+      }
+    } catch {
+      // A corrupt or incompatible cache is disposable and rebuilt below.
+    }
+    cachedDb?.close();
+  }
+
+  const db = new SQL.Database();
+  ensureJsonlCacheSchema(db);
+  return { db, rebuilt: true };
+}
+
+function readIngestedFiles(db: Database): Map<string, FileFingerprint> {
+  const rows = runQuery<{ path: string; mtime_ms: number; size: number }>(
+    db,
+    'SELECT path, mtime_ms, size FROM ingested_files',
+    [],
+  );
+  return new Map(rows.map((row) => [row.path, { mtimeMs: row.mtime_ms, size: row.size }]));
+}
+
+async function persistJsonlCacheAtomically(db: Database, cachePath: string): Promise<void> {
+  const cacheDir = dirname(cachePath);
+  await mkdir(cacheDir, { recursive: true });
+  const tempPath = join(cacheDir, `.${basename(cachePath)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, Buffer.from(db.export()), { flag: 'wx' });
+    await rename(tempPath, cachePath);
+  } finally {
+    await rm(tempPath, { force: true });
+  }
+}
+
 export interface OpenOptions {
   /** Override the SQLite path (default: `$AI_HIST_DB` or `~/.local/share/ai-hist/ai-history.db`). */
   dbPath?: string;
@@ -252,8 +358,9 @@ export interface OpenOptions {
   /**
    * What to do when the SQLite DB is missing:
    *   - `'jsonl'` (default): scan local Claude/Codex/Cursor/Grok history files
-   *     directly into an in-memory SQLite — works without the Python
-   *     `ai-hist sync` tool installed.
+   *     into a standalone incremental cache — works without the Python
+   *     `ai-hist sync` tool installed. The cache path is controlled by
+   *     `$AI_HIST_JSONL_CACHE_DB`.
    *   - `'error'`: throw with an install hint (legacy 0.1.x behavior).
    */
   fallback?: 'jsonl' | 'error';
@@ -309,35 +416,34 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
     );
   }
 
-  // Fallback: scan local source files (Claude/Codex/Cursor/Grok) directly.
-  // No Python dependency; uses the same parsers documented in the Python
-  // CLI's source. Yields control to the event loop between sources so a
-  // large local history doesn't freeze the host.
-  const db = new SQL.Database();
-  db.run(`CREATE TABLE history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    session_id TEXT,
-    project TEXT,
-    prompt TEXT NOT NULL,
-    timestamp_ms INTEGER NOT NULL,
-    git_branch TEXT,
-    UNIQUE(source, timestamp_ms, prompt)
-  )`);
-  db.run('CREATE INDEX idx_history_timestamp ON history (timestamp_ms DESC)');
-  db.run('CREATE INDEX idx_history_session ON history (session_id)');
-  ensureTrajectorySchema(db);
-  ensureTagSchema(db);
-  ensureSessionsSchema(db);
+  // Fallback cache is intentionally separate from the real CLI database.
+  // The fast path above always wins when the CLI-written database exists.
+  const cachePath = defaultJsonlCacheDbPath();
+  if (resolve(cachePath) === resolve(dbPath)) {
+    throw new Error('AI_HIST_JSONL_CACHE_DB must resolve to a different path than the ai-hist sync database');
+  }
+  const { db, rebuilt: cacheRebuilt } = await openJsonlCache(SQL, cachePath);
+  const ingestedFiles = readIngestedFiles(db);
 
-  // scanLocalSources is async with yields between sources so the event
-  // loop stays responsive while we scan many MB of JSONL.
-  const rows = await scanLocalSources();
-  const openCodeRows = await scanOpenCode(SQL);
-  const trajectories = await scanLocalTrajectories();
+  // The four JSONL providers scan concurrently; each scanner only reads
+  // files whose mtime or size differs from the persisted manifest.
+  const [sourceFiles, openCodeFile, trajectoryFiles] = await Promise.all([
+    scanLocalSourceFiles(ingestedFiles),
+    scanOpenCodeFile(SQL, ingestedFiles),
+    scanLocalTrajectoryFiles(ingestedFiles),
+  ]);
+  const currentPaths = new Set([
+    ...sourceFiles.map((file) => file.path),
+    ...(openCodeFile ? [openCodeFile.path] : []),
+    ...trajectoryFiles.map((file) => file.path),
+  ]);
+  const removedPaths = [...ingestedFiles.keys()].filter((path) => !currentPaths.has(path));
+  let cacheDirty = cacheRebuilt || removedPaths.length > 0;
 
   const insert = db.prepare(
-    'INSERT OR IGNORE INTO history (source, session_id, project, prompt, timestamp_ms, git_branch) VALUES (?, ?, ?, ?, ?, ?)',
+    `INSERT OR IGNORE INTO history
+     (source, session_id, project, prompt, timestamp_ms, git_branch, ingest_path)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertTrajectory = db.prepare(
     `INSERT OR REPLACE INTO trajectories
@@ -346,45 +452,104 @@ export async function openAiHist(opts: OpenOptions = {}): Promise<AiHist> {
       path, updated_ms, timestamp_ms)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
+  const upsertFile = db.prepare(
+    `INSERT INTO ingested_files (path, mtime_ms, size) VALUES (?, ?, ?)
+     ON CONFLICT(path) DO UPDATE SET mtime_ms = excluded.mtime_ms, size = excluded.size`,
+  );
+  let inTransaction = false;
   try {
     db.exec('BEGIN');
-    for (const row of rows) {
-      insert.run([row.source, row.sessionId, row.project, row.prompt, row.timestampMs, row.gitBranch]);
+    inTransaction = true;
+
+    for (const removedPath of removedPaths) {
+      db.run('DELETE FROM history WHERE ingest_path = ?', [removedPath]);
+      db.run('DELETE FROM trajectories WHERE path = ?', [removedPath]);
+      db.run('DELETE FROM ingested_files WHERE path = ?', [removedPath]);
     }
-    for (const row of openCodeRows) {
-      insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs, null]);
+
+    for (const file of sourceFiles) {
+      if (file.rows === undefined) continue;
+      cacheDirty = true;
+      db.run('DELETE FROM history WHERE ingest_path = ?', [file.path]);
+      for (const row of file.rows) {
+        insert.run([
+          row.source,
+          row.sessionId,
+          row.project,
+          row.prompt,
+          row.timestampMs,
+          row.gitBranch,
+          file.path,
+        ]);
+      }
+      upsertFile.run([file.path, file.mtimeMs, file.size]);
     }
-    for (const trajectory of trajectories) {
-      insertTrajectory.run([
-        trajectory.id,
-        trajectory.version,
-        trajectory.personaId,
-        trajectory.projectId,
-        trajectory.task.title,
-        trajectory.task.description,
-        trajectory.status,
-        trajectory.startedAt,
-        trajectory.completedAt,
-        JSON.stringify(trajectory.decisions),
-        JSON.stringify(trajectory.retrospective),
-        trajectory.searchText,
-        trajectory.path,
-        trajectory.updatedMs,
-        trajectory.timestampMs,
-      ]);
-      insert.run([
-        'trajectory',
-        trajectory.id,
-        trajectory.projectId,
-        trajectory.searchText,
-        trajectory.timestampMs,
-        null,
-      ]);
+
+    if (openCodeFile?.rows !== undefined) {
+      cacheDirty = true;
+      db.run('DELETE FROM history WHERE ingest_path = ?', [openCodeFile.path]);
+      for (const row of openCodeFile.rows) {
+        insert.run(['opencode', row.sessionId, row.project, row.prompt, row.timestampMs, null, openCodeFile.path]);
+      }
+      upsertFile.run([openCodeFile.path, openCodeFile.mtimeMs, openCodeFile.size]);
+    }
+
+    for (const file of trajectoryFiles) {
+      if (file.trajectory === undefined) continue;
+      cacheDirty = true;
+      db.run('DELETE FROM history WHERE ingest_path = ?', [file.path]);
+      db.run('DELETE FROM trajectories WHERE path = ?', [file.path]);
+      const trajectory = file.trajectory;
+      if (trajectory) {
+        insertTrajectory.run([
+          trajectory.id,
+          trajectory.version,
+          trajectory.personaId,
+          trajectory.projectId,
+          trajectory.task.title,
+          trajectory.task.description,
+          trajectory.status,
+          trajectory.startedAt,
+          trajectory.completedAt,
+          JSON.stringify(trajectory.decisions),
+          JSON.stringify(trajectory.retrospective),
+          trajectory.searchText,
+          trajectory.path,
+          trajectory.updatedMs,
+          trajectory.timestampMs,
+        ]);
+        insert.run([
+          'trajectory',
+          trajectory.id,
+          trajectory.projectId,
+          trajectory.searchText,
+          trajectory.timestampMs,
+          null,
+          file.path,
+        ]);
+      }
+      upsertFile.run([file.path, file.mtimeMs, file.size]);
     }
     db.exec('COMMIT');
+    inTransaction = false;
+  } catch (error) {
+    if (inTransaction) {
+      try { db.exec('ROLLBACK'); } catch { /* preserve the original error */ }
+    }
+    throw error;
   } finally {
     insert.free();
     insertTrajectory.free();
+    upsertFile.free();
+  }
+
+  if (cacheDirty) {
+    try {
+      await persistJsonlCacheAtomically(db, cachePath);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
   }
   const scannedPaths = `${LOCAL_SOURCE_PATHS.claude}, ${LOCAL_SOURCE_PATHS.codex}, ${LOCAL_SOURCE_PATHS.cursorRoot}, ${LOCAL_SOURCE_PATHS.grokSessionsRoot}, ${trajectoryRootDescription()}`;
   return new AiHist(db, { kind: 'jsonl', path: scannedPaths }, { projectScope: opts.projectScope });
@@ -425,6 +590,47 @@ type ScannedOpenCodeRow = {
   prompt: string;
   timestampMs: number;
 };
+
+type ScannedOpenCodeFile = FileFingerprint & {
+  path: string;
+  /** Undefined when the manifest fingerprint matched and the DB was not read. */
+  rows?: ScannedOpenCodeRow[];
+};
+
+async function sqliteFingerprint(dbPath: string): Promise<FileFingerprint | null> {
+  try {
+    const dbStat = await stat(dbPath);
+    if (!dbStat.isFile()) return null;
+    let mtimeMs = Math.trunc(dbStat.mtimeMs);
+    let size = dbStat.size;
+    try {
+      const walStat = await stat(`${dbPath}-wal`);
+      if (walStat.isFile()) {
+        mtimeMs = Math.max(mtimeMs, Math.trunc(walStat.mtimeMs));
+        size += walStat.size;
+      }
+    } catch {
+      // No WAL is the common case.
+    }
+    return { mtimeMs, size };
+  } catch {
+    return null;
+  }
+}
+
+async function scanOpenCodeFile(
+  SQL: SqlJsStatic,
+  ingestedFiles: ReadonlyMap<string, FileFingerprint>,
+): Promise<ScannedOpenCodeFile | null> {
+  const dbPath = defaultOpenCodeDbPath();
+  const fingerprint = await sqliteFingerprint(dbPath);
+  if (!fingerprint) return null;
+  const previous = ingestedFiles.get(dbPath);
+  if (previous?.mtimeMs === fingerprint.mtimeMs && previous.size === fingerprint.size) {
+    return { path: dbPath, ...fingerprint };
+  }
+  return { path: dbPath, ...fingerprint, rows: await scanOpenCode(SQL) };
+}
 
 async function scanOpenCode(SQL: SqlJsStatic): Promise<ScannedOpenCodeRow[]> {
   const dbPath = defaultOpenCodeDbPath();
