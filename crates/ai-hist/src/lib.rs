@@ -12,10 +12,11 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rusqlite::{params, Connection, ErrorCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -3715,8 +3716,9 @@ fn checkpoint_sync_state(path: &Path, state: &Map<String, Value>) {
 /// of the whole state map. Writing that copy wholesale lets a slow run replace
 /// a fast run's newer cursors with its own stale ones, so the next run rescans
 /// work that was already finished: exactly the loop checkpointing exists to
-/// prevent. Merging per key keeps sources this run did not touch, and cursors
-/// are monotonic byte offsets so a smaller one is always staler and is dropped.
+/// prevent. Merging per key keeps sources this run did not touch. File cursors
+/// advance monotonically only within one generation; a newer generation must
+/// replace the old cursor even when it starts at a smaller offset.
 ///
 /// Returns `None` when disk already reflects everything here, so a steady-state
 /// run that finds every source up to date does not rewrite the file per source.
@@ -3724,23 +3726,53 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
     let mut merged = load_sync_state(path)?;
     let mut changed = false;
     for (key, value) in ours {
-        match (merged.get(key), value.as_u64()) {
-            // A cursor that has not advanced past what is on disk is stale.
-            (Some(existing), Some(ours_offset))
-                if existing
-                    .as_u64()
-                    .is_some_and(|on_disk| on_disk >= ours_offset) =>
-            {
-                continue
-            }
-            // Unchanged non-cursor entries (per-file maps) need no rewrite.
-            (Some(existing), None) if existing == value => continue,
-            _ => {}
+        let next = match merged.get(key) {
+            Some(existing) if key == "cursor" => merge_file_cursor_map(existing, value),
+            Some(existing) => merge_sync_value(existing, value),
+            None => value.clone(),
+        };
+        if merged.get(key) == Some(&next) {
+            continue;
         }
-        merged.insert(key.clone(), value.clone());
+        merged.insert(key.clone(), next);
         changed = true;
     }
     Ok(if changed { Some(merged) } else { None })
+}
+
+fn merge_sync_value(on_disk: &Value, ours: &Value) -> Value {
+    match (FileCursor::decode(on_disk), FileCursor::decode(ours)) {
+        (Some(DecodedFileCursor::Typed(on_disk)), Some(DecodedFileCursor::Typed(ours))) => {
+            FileCursor::merge(on_disk, ours).to_value()
+        }
+        // Once a cursor carries a generation, a concurrent legacy writer cannot
+        // safely replace it: its numeric offset may belong to the previous file.
+        (Some(DecodedFileCursor::Typed(on_disk)), Some(DecodedFileCursor::Legacy(_))) => {
+            on_disk.to_value()
+        }
+        (Some(DecodedFileCursor::Legacy(_)), Some(DecodedFileCursor::Typed(ours))) => {
+            ours.to_value()
+        }
+        (Some(DecodedFileCursor::Legacy(on_disk)), Some(DecodedFileCursor::Legacy(ours))) => {
+            json!(on_disk.max(ours))
+        }
+        _ if on_disk == ours => on_disk.clone(),
+        _ => ours.clone(),
+    }
+}
+
+fn merge_file_cursor_map(on_disk: &Value, ours: &Value) -> Value {
+    let (Some(on_disk), Some(ours)) = (on_disk.as_object(), ours.as_object()) else {
+        return merge_sync_value(on_disk, ours);
+    };
+    let mut merged = on_disk.clone();
+    for (path, cursor) in ours {
+        let next = merged
+            .get(path)
+            .map_or_else(|| cursor.clone(), |saved| merge_sync_value(saved, cursor));
+        merged.insert(path.clone(), next);
+    }
+    Value::Object(merged)
 }
 
 const STALE_SYNC_STATE_TMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -3858,6 +3890,201 @@ fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
 /// minutes and starve everyone else.
 const JSONL_CHUNK_LINES: usize = 2_000;
 
+/// A byte cursor is valid only for the file generation that produced it.
+/// `observed_at_ns` orders overlapping writers across rotations, while the
+/// identity and start metadata let writers recognize the same generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileGeneration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inode: Option<u64>,
+    started_mtime_ns: u64,
+    started_size: u64,
+    observed_at_ns: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct FileCursor {
+    /// Bytes through the last newline whose database work has committed.
+    offset: u64,
+    generation: FileGeneration,
+    /// Latest mtime seen for this generation, used to catch backwards rewrites.
+    observed_mtime_ns: u64,
+}
+
+enum DecodedFileCursor {
+    Legacy(u64),
+    Typed(FileCursor),
+}
+
+impl FileCursor {
+    fn decode(value: &Value) -> Option<DecodedFileCursor> {
+        if let Some(offset) = value.as_u64() {
+            return Some(DecodedFileCursor::Legacy(offset));
+        }
+        serde_json::from_value(value.clone())
+            .ok()
+            .map(DecodedFileCursor::Typed)
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("file cursor serialization cannot fail")
+    }
+
+    fn same_generation(&self, other: &Self) -> bool {
+        self.generation.device == other.generation.device
+            && self.generation.inode == other.generation.inode
+            && self.generation.started_mtime_ns == other.generation.started_mtime_ns
+            && self.generation.started_size == other.generation.started_size
+    }
+
+    fn generation_order(&self) -> (u64, u64, Option<u64>, Option<u64>, u64) {
+        (
+            self.generation.observed_at_ns,
+            self.generation.started_mtime_ns,
+            self.generation.device,
+            self.generation.inode,
+            self.generation.started_size,
+        )
+    }
+
+    fn merge(on_disk: Self, ours: Self) -> Self {
+        if on_disk.same_generation(&ours) {
+            let (mut winner, other) = if on_disk.offset >= ours.offset {
+                (on_disk, ours)
+            } else {
+                (ours, on_disk)
+            };
+            winner.observed_mtime_ns = winner.observed_mtime_ns.max(other.observed_mtime_ns);
+            winner
+        } else if ours.generation_order() > on_disk.generation_order() {
+            ours
+        } else {
+            on_disk
+        }
+    }
+}
+
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(metadata.dev()), Some(metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn metadata_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+struct CompleteJsonlReader {
+    reader: BufReader<fs::File>,
+    cursor: FileCursor,
+    position: u64,
+}
+
+impl CompleteJsonlReader {
+    fn open(path: &Path, saved: Option<&Value>) -> Result<Self> {
+        let file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let size = metadata.len();
+        let mtime_ns = metadata_mtime_ns(&metadata);
+        let (device, inode) = metadata_identity(&metadata);
+        let decoded = saved.and_then(FileCursor::decode);
+
+        let (offset, generation) = match decoded {
+            Some(DecodedFileCursor::Typed(saved)) => {
+                let identity_changed = saved.generation.device.is_some()
+                    && device.is_some()
+                    && (saved.generation.device, saved.generation.inode) != (device, inode);
+                let replaced =
+                    identity_changed || size < saved.offset || mtime_ns < saved.observed_mtime_ns;
+                if replaced {
+                    (
+                        0,
+                        FileGeneration {
+                            device,
+                            inode,
+                            started_mtime_ns: mtime_ns,
+                            started_size: size,
+                            observed_at_ns: now_ns(),
+                        },
+                    )
+                } else {
+                    (saved.offset, saved.generation)
+                }
+            }
+            Some(DecodedFileCursor::Legacy(saved)) if saved <= size => (
+                saved,
+                FileGeneration {
+                    device,
+                    inode,
+                    started_mtime_ns: mtime_ns,
+                    started_size: size,
+                    observed_at_ns: now_ns(),
+                },
+            ),
+            _ => (
+                0,
+                FileGeneration {
+                    device,
+                    inode,
+                    started_mtime_ns: mtime_ns,
+                    started_size: size,
+                    observed_at_ns: now_ns(),
+                },
+            ),
+        };
+
+        let mut reader = BufReader::new(file);
+        reader.seek(std::io::SeekFrom::Start(offset))?;
+        Ok(Self {
+            reader,
+            cursor: FileCursor {
+                offset,
+                generation,
+                observed_mtime_ns: mtime_ns,
+            },
+            position: offset,
+        })
+    }
+
+    /// Returns only newline-terminated records. A partial final buffer remains
+    /// uncommitted and will be read again after the writer completes it.
+    fn next_line(&mut self, line: &mut String) -> Result<Option<u64>> {
+        line.clear();
+        let read = self.reader.read_line(line)?;
+        if read == 0 || !line.ends_with('\n') {
+            return Ok(None);
+        }
+        self.position += read as u64;
+        Ok(Some(self.position))
+    }
+
+    fn committed_cursor(&self, offset: u64) -> Result<FileCursor> {
+        let mut cursor = self.cursor.clone();
+        cursor.offset = offset;
+        cursor.observed_mtime_ns = metadata_mtime_ns(&self.reader.get_ref().metadata()?);
+        Ok(cursor)
+    }
+}
+
 fn sync_jsonl_incremental(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -3870,16 +4097,15 @@ fn sync_jsonl_incremental(
         sync_note!("  [{name}] not found: {} (skipped)", path.display());
         return Ok(0);
     }
-    let size = path.metadata()?.len();
-    let offset = state.get(name).and_then(Value::as_u64).unwrap_or(0);
-    if offset >= size {
+    let mut source = CompleteJsonlReader::open(path, state.get(name))?;
+    let offset = source.position;
+    let size = source.reader.get_ref().metadata()?.len();
+    let opened_cursor = source.committed_cursor(offset)?.to_value();
+    if offset >= size && state.get(name) == Some(&opened_cursor) {
         sync_note!("  [{name}] up to date");
         return Ok(0);
     }
     sync_note!("  [{name}] syncing {} new bytes...", size - offset);
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    reader.seek_relative(offset as i64)?;
     let mut inserted = 0;
     let mut errors = 0;
     // Byte position of the last line handed to the database, tracked as we read
@@ -3892,12 +4118,10 @@ fn sync_jsonl_incremental(
             let mut pending = 0usize;
             let mut line = String::new();
             loop {
-                line.clear();
-                let read = reader.read_line(&mut line)?;
-                if read == 0 {
+                let Some(position) = source.next_line(&mut line)? else {
                     break;
-                }
-                consumed += read as u64;
+                };
+                consumed = position;
                 if !line.trim().is_empty() {
                     match parser(&line) {
                         Ok(Some(entry)) => inserted += insert_history(conn, &entry)?,
@@ -3908,14 +4132,20 @@ fn sync_jsonl_incremental(
                 pending += 1;
                 if pending >= JSONL_CHUNK_LINES {
                     conn.execute_batch("COMMIT")?;
-                    state.insert(name.to_string(), json!(consumed));
+                    state.insert(
+                        name.to_string(),
+                        source.committed_cursor(consumed)?.to_value(),
+                    );
                     checkpoint(state);
                     conn.execute_batch("BEGIN")?;
                     pending = 0;
                 }
             }
             conn.execute_batch("COMMIT")?;
-            state.insert(name.to_string(), json!(consumed));
+            state.insert(
+                name.to_string(),
+                source.committed_cursor(consumed)?.to_value(),
+            );
             Ok(())
         };
         run()
@@ -3943,17 +4173,17 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
         sync_note!("  [codex] not found: {} (skipped)", path.display());
         return Ok(0);
     }
-    let size = path.metadata()?.len();
-    let offset = state.get("codex").and_then(Value::as_u64).unwrap_or(0);
+    let mut source = CompleteJsonlReader::open(&path, state.get("codex"))?;
+    let offset = source.position;
+    let size = source.reader.get_ref().metadata()?.len();
     let mut inserted = 0;
     let mut errors = 0;
+    let mut consumed = offset;
     if offset < size {
         sync_note!("  [codex] syncing {} new bytes...", size - offset);
-        let file = fs::File::open(&path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek_relative(offset as i64)?;
-        for line in reader.lines() {
-            let line = line?;
+        let mut line = String::new();
+        while let Some(position) = source.next_line(&mut line)? {
+            consumed = position;
             if line.trim().is_empty() {
                 continue;
             }
@@ -3970,14 +4200,19 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
                 Err(_) => errors += 1,
             }
         }
-        state.insert("codex".to_string(), json!(size));
     }
+    // This also upgrades legacy numeric cursors at EOF. The actual committed
+    // position may include complete lines appended after the initial stat.
+    state.insert(
+        "codex".to_string(),
+        source.committed_cursor(consumed)?.to_value(),
+    );
     let backfilled = backfill_codex_metadata(conn, &cwds, &branches)?;
-    if offset >= size && backfilled == 0 {
+    if consumed == offset && backfilled == 0 {
         sync_note!("  [codex] up to date");
     } else {
         let mut parts = Vec::new();
-        if inserted > 0 || offset < size {
+        if inserted > 0 || consumed > offset {
             parts.push(format!("+{inserted} rows"));
         }
         if backfilled > 0 {
@@ -4874,12 +5109,10 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
                 continue;
             }
             files_seen += 1;
-            let size = jsonl.metadata()?.len();
             let key = jsonl.to_string_lossy().to_string();
-            let offset = cursor_state.get(&key).and_then(Value::as_u64).unwrap_or(0);
-            if offset >= size {
-                continue;
-            }
+            let mut source = CompleteJsonlReader::open(&jsonl, cursor_state.get(&key))?;
+            let offset = source.position;
+            let size = source.reader.get_ref().metadata()?.len();
             let ts_ms = jsonl
                 .metadata()
                 .and_then(|m| m.modified())
@@ -4887,31 +5120,32 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let file = fs::File::open(&jsonl)?;
-            let mut reader = BufReader::new(file);
-            reader.seek_relative(offset as i64)?;
-            for line in reader.lines() {
-                let line = line?;
-                match parse_cursor_text(&line) {
-                    Ok(Some(prompt)) => {
-                        inserted += insert_history(
-                            conn,
-                            &HistoryEntry {
-                                id: 0,
-                                source: "cursor".into(),
-                                session_id: Some(session_id.clone()),
-                                project: Some(project_path.clone()),
-                                prompt_hash: Some(prompt_hash(&prompt)),
-                                prompt,
-                                timestamp_ms: ts_ms,
-                            },
-                        )?;
+            let mut consumed = offset;
+            if offset < size {
+                let mut line = String::new();
+                while let Some(position) = source.next_line(&mut line)? {
+                    consumed = position;
+                    match parse_cursor_text(&line) {
+                        Ok(Some(prompt)) => {
+                            inserted += insert_history(
+                                conn,
+                                &HistoryEntry {
+                                    id: 0,
+                                    source: "cursor".into(),
+                                    session_id: Some(session_id.clone()),
+                                    project: Some(project_path.clone()),
+                                    prompt_hash: Some(prompt_hash(&prompt)),
+                                    prompt,
+                                    timestamp_ms: ts_ms,
+                                },
+                            )?;
+                        }
+                        Ok(None) => {}
+                        Err(_) => errors += 1,
                     }
-                    Ok(None) => {}
-                    Err(_) => errors += 1,
                 }
             }
-            cursor_state.insert(key, json!(size));
+            cursor_state.insert(key, source.committed_cursor(consumed)?.to_value());
         }
     }
     state.insert("cursor".to_string(), Value::Object(cursor_state));
@@ -5787,6 +6021,29 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::fs;
+    use std::io::Write as _;
+
+    fn saved_cursor_offset(value: &Value) -> u64 {
+        match super::FileCursor::decode(value).expect("valid file cursor") {
+            super::DecodedFileCursor::Legacy(offset) => offset,
+            super::DecodedFileCursor::Typed(cursor) => cursor.offset,
+        }
+    }
+
+    fn test_file_cursor(offset: u64, inode: u64, generation: u64) -> Value {
+        super::FileCursor {
+            offset,
+            generation: super::FileGeneration {
+                device: Some(1),
+                inode: Some(inode),
+                started_mtime_ns: generation,
+                started_size: 100,
+                observed_at_ns: generation,
+            },
+            observed_mtime_ns: generation,
+        }
+        .to_value()
+    }
 
     #[test]
     fn cron_schedule_maps_intervals_to_step_expressions() {
@@ -6053,6 +6310,43 @@ mod tests {
     }
 
     #[test]
+    fn typed_cursor_merges_are_monotonic_within_a_generation_and_replace_stale_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let transcript = "/cursor/session.jsonl";
+
+        let mut newest = Map::new();
+        newest.insert("claude".into(), test_file_cursor(25, 10, 200));
+        newest.insert(
+            "cursor".into(),
+            json!({transcript: test_file_cursor(30, 10, 200)}),
+        );
+        checkpoint_sync_state(&path, &newest);
+
+        // A stale writer from the prior inode cannot restore its larger offset.
+        let mut stale_generation = Map::new();
+        stale_generation.insert("claude".into(), test_file_cursor(900, 9, 100));
+        stale_generation.insert(
+            "cursor".into(),
+            json!({transcript: test_file_cursor(800, 9, 100)}),
+        );
+        checkpoint_sync_state(&path, &stale_generation);
+
+        // Nor can a slow writer rewind the active generation.
+        let mut slow_same_generation = Map::new();
+        slow_same_generation.insert("claude".into(), test_file_cursor(12, 10, 200));
+        slow_same_generation.insert(
+            "cursor".into(),
+            json!({transcript: test_file_cursor(14, 10, 200)}),
+        );
+        checkpoint_sync_state(&path, &slow_same_generation);
+
+        let saved = load_sync_state(&path).unwrap();
+        assert_eq!(saved_cursor_offset(&saved["claude"]), 25);
+        assert_eq!(saved_cursor_offset(&saved["cursor"][transcript]), 30);
+    }
+
+    #[test]
     fn an_unchanged_source_does_not_rewrite_the_state_file() {
         let dir = std::env::temp_dir().join(format!("ai-hist-norewrite-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -6171,7 +6465,7 @@ mod tests {
             &path,
             super::parse_claude_line,
             &mut |in_progress| {
-                checkpoints.push(in_progress.get("claude").and_then(Value::as_u64).unwrap());
+                checkpoints.push(saved_cursor_offset(&in_progress["claude"]));
             },
         )
         .unwrap();
@@ -6182,10 +6476,7 @@ mod tests {
         assert_eq!(checkpoints.len(), lines / super::JSONL_CHUNK_LINES);
         assert!(checkpoints.windows(2).all(|w| w[0] < w[1]));
         assert!(checkpoints.iter().all(|&at| at < body.len() as u64));
-        assert_eq!(
-            state.get("claude").and_then(Value::as_u64),
-            Some(body.len() as u64)
-        );
+        assert_eq!(saved_cursor_offset(&state["claude"]), body.len() as u64);
 
         // Resuming from a mid-file checkpoint ingests only the remainder, and
         // the offsets line up exactly -- nothing skipped, nothing double-counted.
@@ -6205,6 +6496,271 @@ mod tests {
         assert_eq!(after, lines - super::JSONL_CHUNK_LINES);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generic_jsonl_retries_partial_lines_then_imports_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        fs::write(&path, r#"{"display":"half"#).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(saved_cursor_offset(&state["claude"]), 0);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#" prompt","timestamp":1,"project":"/p","sessionId":"s"}"#)
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn generic_jsonl_skips_complete_malformed_lines_permanently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        fs::write(&path, "{malformed}\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let sync = |state: &mut Map<String, Value>| {
+            super::sync_jsonl_incremental(
+                &conn,
+                state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+
+        assert_eq!(sync(&mut state), 0);
+        assert_eq!(saved_cursor_offset(&state["claude"]), 12);
+        assert_eq!(sync(&mut state), 0);
+        assert_eq!(saved_cursor_offset(&state["claude"]), 12);
+    }
+
+    #[test]
+    fn generic_jsonl_resets_after_truncation_and_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let sync = |state: &mut Map<String, Value>| {
+            super::sync_jsonl_incremental(
+                &conn,
+                state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"display":"a deliberately long original prompt","timestamp":1,"sessionId":"old"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(sync(&mut state), 1);
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"display":"short","timestamp":2,"sessionId":"new"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(sync(&mut state), 1, "same-inode truncation must reset");
+        assert_eq!(sync(&mut state), 0);
+
+        let replacement = dir.path().join("replacement.jsonl");
+        fs::write(
+            &replacement,
+            concat!(
+                r#"{"display":"replacement prompt longer than the prior cursor","timestamp":3,"sessionId":"replacement"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(sync(&mut state), 1, "new inode must reset even when larger");
+        assert_eq!(sync(&mut state), 0);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn generic_jsonl_consumes_complete_data_appended_during_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let initial: String = (0..super::JSONL_CHUNK_LINES)
+            .map(|i| format!(r#"{{"display":"prompt {i}","timestamp":{i}}}"#) + "\n")
+            .collect();
+        fs::write(&path, initial).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        let mut appended = false;
+        let inserted = super::sync_jsonl_incremental(
+            &conn,
+            &mut state,
+            "claude",
+            &path,
+            super::parse_claude_line,
+            &mut |_| {
+                if !appended {
+                    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                    writeln!(file, r#"{{"display":"appended","timestamp":999999}}"#).unwrap();
+                    appended = true;
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted, super::JSONL_CHUNK_LINES + 1);
+        assert_eq!(
+            saved_cursor_offset(&state["claude"]),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn legacy_numeric_cursor_upgrades_after_a_successful_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let first = concat!(r#"{"display":"already imported","timestamp":1}"#, "\n");
+        let second = concat!(r#"{"display":"new record","timestamp":2}"#, "\n");
+        fs::write(&path, format!("{first}{second}")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("claude".into(), json!(first.len() as u64));
+
+        assert_eq!(
+            super::sync_jsonl_incremental(
+                &conn,
+                &mut state,
+                "claude",
+                &path,
+                super::parse_claude_line,
+                &mut |_| {},
+            )
+            .unwrap(),
+            1
+        );
+        assert!(matches!(
+            super::FileCursor::decode(&state["claude"]),
+            Some(super::DecodedFileCursor::Typed(_))
+        ));
+        assert_eq!(
+            saved_cursor_offset(&state["claude"]),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn codex_and_cursor_sources_retry_unterminated_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        let codex = dir.path().join(".codex/history.jsonl");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(&codex, r#"{"text":"codex"#).unwrap();
+        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 0);
+        assert_eq!(saved_cursor_offset(&state["codex"]), 0);
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        file.write_all(br#" prompt","ts":1,"session_id":"c1"}"#)
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 1);
+
+        let cursor_root = dir.path().join(".cursor/projects");
+        let cursor = cursor_root.join("P/agent-transcripts/s1/s1.jsonl");
+        fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        fs::write(&cursor, r#"{"role":"user","message":{"content":"cursor"#).unwrap();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            0
+        );
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            0
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+        file.write_all(br#" prompt"}}"#).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
