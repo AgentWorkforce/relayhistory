@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-20
+
+### Added
+
+- `getSessionEvents(sessionId, { source? })` — the normalized transcript for one
+  session from the `session_events` table: user/assistant text, thinking, tool
+  calls, and tool results in order, with parsed per-event token usage
+  (`tokenUsage`). Returns `[]` on databases that predate the table and in JSONL
+  fallback mode. On large databases prefer streaming from the native CLI
+  (`ai-hist events <session-id> --json`); this SDK loads the whole file into
+  memory.
+- `getToolCalls(sessionId, { source? })` — the session's `tool_calls` rows with
+  typed `isError`.
+- `SessionEvent` and `SessionToolCall` types.
+
 ## [0.4.1] - 2026-07-07
 
 ### Added

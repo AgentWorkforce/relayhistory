@@ -758,6 +758,153 @@ pub fn session(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub message_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub ts_ms: i64,
+    pub role: String,
+    pub kind: String,
+    pub text: Option<String>,
+    pub model: Option<String>,
+    pub token_json: Option<String>,
+    pub event_uid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionToolCall {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub tool_use_id: String,
+    pub name: String,
+    pub target: Option<String>,
+    pub args_json: Option<String>,
+    pub is_error: Option<i64>,
+    pub ts_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionFileEdit {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub tool_use_id: String,
+    pub file_path: String,
+    pub tool_name: Option<String>,
+    pub lines_added: Option<i64>,
+    pub lines_removed: Option<i64>,
+    pub user_modified: Option<i64>,
+    pub ts_ms: Option<i64>,
+}
+
+/// All normalized events for one session, oldest first. Rows sharing a
+/// timestamp keep insertion order via the rowid tiebreaker.
+pub fn session_events(
+    conn: &Connection,
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<Vec<SessionEvent>> {
+    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
+        .to_string();
+    let mut params_vec = vec![session_id.to_string()];
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        params_vec.push(source.to_string());
+    }
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        Ok(SessionEvent {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            project: row.get(3)?,
+            cwd: row.get(4)?,
+            git_branch: row.get(5)?,
+            message_id: row.get(6)?,
+            parent_id: row.get(7)?,
+            ts_ms: row.get(8)?,
+            role: row.get(9)?,
+            kind: row.get(10)?,
+            text: row.get(11)?,
+            model: row.get(12)?,
+            token_json: row.get(13)?,
+            event_uid: row.get(14)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn session_tool_calls(
+    conn: &Connection,
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<Vec<SessionToolCall>> {
+    let mut sql = "SELECT id, source, session_id, message_id, tool_use_id, name, target,                    args_json, is_error, ts_ms                    FROM tool_calls WHERE session_id = ?"
+        .to_string();
+    let mut params_vec = vec![session_id.to_string()];
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        params_vec.push(source.to_string());
+    }
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        Ok(SessionToolCall {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            message_id: row.get(3)?,
+            tool_use_id: row.get(4)?,
+            name: row.get(5)?,
+            target: row.get(6)?,
+            args_json: row.get(7)?,
+            is_error: row.get(8)?,
+            ts_ms: row.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn session_file_edits(
+    conn: &Connection,
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<Vec<SessionFileEdit>> {
+    let mut sql = "SELECT id, source, session_id, tool_use_id, file_path, tool_name,                    lines_added, lines_removed, user_modified, ts_ms                    FROM file_edits WHERE session_id = ?"
+        .to_string();
+    let mut params_vec = vec![session_id.to_string()];
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        params_vec.push(source.to_string());
+    }
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        Ok(SessionFileEdit {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            session_id: row.get(2)?,
+            tool_use_id: row.get(3)?,
+            file_path: row.get(4)?,
+            tool_name: row.get(5)?,
+            lines_added: row.get(6)?,
+            lines_removed: row.get(7)?,
+            user_modified: row.get(8)?,
+            ts_ms: row.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
     let mut where_sql = String::new();
     let mut params_vec = Vec::new();

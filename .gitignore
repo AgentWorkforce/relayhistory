@@ -8,3 +8,4 @@ __pycache__/
 .claude/
 target/
 .tmp/
+.npm-cache/

@@ -85,6 +85,8 @@ hist.projectScope: string | undefined
 hist.recent(opts?): HistoryEntry[]            // newest prompts first
 hist.listSessions(opts?): SessionSummary[]    // grouped by session_id, last activity DESC
 hist.getSession(sessionId): HistoryEntry[]    // all prompts in a session, oldest first
+hist.getSessionEvents(sessionId): SessionEvent[] // full transcript: text, thinking, tool calls/results, token usage
+hist.getToolCalls(sessionId): SessionToolCall[]  // the session's tool invocations
 hist.getEntry(id): HistoryEntry | null
 hist.getInTimeWindow(timestampMs, windowMs): HistoryEntry[]
 hist.search(query, opts?): HistoryEntry[]     // literal substring search, recent matches first

@@ -1,7 +1,6 @@
 //! Native (napi) binding for driving ai-hist in-process — no CLI shell-out.
 //!
-//! Exposes `syncAndPush()` to Node. The Agent Relay runtime calls this from its
-//! Reflex capture loop so history is synced + pushed inside the process.
+//! Exposes local-only `syncLocal()` and cloud-enabled `syncAndPush()` to Node.
 #![deny(clippy::all)]
 
 use napi_derive::napi;
@@ -15,6 +14,15 @@ pub struct SyncPushResult {
     pub authenticated: bool,
     /// `true` when another process owned the history scan; existing rows were still pushed.
     pub sync_skipped: bool,
+}
+
+/// Refresh local history without reading auth or pushing to cloud.
+#[napi]
+pub async fn sync_local() -> napi::Result<()> {
+    napi::tokio::task::spawn_blocking(ai_hist_cli::sync_local)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("worker thread panicked: {e}")))?
+        .map_err(|e| napi::Error::from_reason(format!("{e:#}")))
 }
 
 /// Sync local agent history into the ai-hist DB, then push new records to

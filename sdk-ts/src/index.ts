@@ -97,6 +97,46 @@ export interface SessionSummary {
   promptCount: number;
 }
 
+/**
+ * One normalized transcript event from the `session_events` table: user and
+ * assistant text, thinking, tool calls, and tool results, in order.
+ * `tokenUsage` is the parsed `token_json` blob — Claude's per-message
+ * `usage` shape, or a Codex per-request delta (`input_tokens` inclusive of
+ * `cached_input_tokens`). Claude repeats the same usage on every content
+ * block of a message, so sum per distinct `messageId`, not per row.
+ */
+export interface SessionEvent {
+  id: number;
+  source: Source;
+  sessionId: string;
+  project: string | null;
+  cwd: string | null;
+  gitBranch: string | null;
+  messageId: string | null;
+  parentId: string | null;
+  tsMs: number;
+  role: 'user' | 'assistant' | 'tool_result';
+  kind: 'text' | 'thinking' | 'tool_use' | 'tool_result';
+  text: string | null;
+  model: string | null;
+  tokenUsage: Record<string, unknown> | null;
+  eventUid: string;
+}
+
+/** One tool invocation from the `tool_calls` table. */
+export interface SessionToolCall {
+  id: number;
+  source: Source;
+  sessionId: string;
+  messageId: string | null;
+  toolUseId: string;
+  name: string;
+  target: string | null;
+  argsJson: string | null;
+  isError: boolean | null;
+  tsMs: number | null;
+}
+
 export interface ListOptions {
   source?: Source;
   project?: string;
@@ -642,6 +682,26 @@ function buildFilters(opts: ListOptions, projectScope?: string): { sql: string; 
   };
 }
 
+function tableExists(db: Database, name: string): boolean {
+  return (
+    runQuery<{ c: number }>(
+      db,
+      "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = ?",
+      [name],
+    )[0]?.c > 0
+  );
+}
+
+function parseTokenJson(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 function runQuery<T>(db: Database, sql: string, params: unknown[]): T[] {
   const stmt = db.prepare(sql);
   try {
@@ -980,6 +1040,124 @@ export class AiHist {
        ORDER BY timestamp_ms ASC`,
       params,
     ).map(rowToEntry);
+  }
+
+  /**
+   * All normalized events for a session, oldest first — messages, thinking,
+   * tool calls, and tool results with per-event token usage where the
+   * transcript provides it. Returns `[]` when the database predates the
+   * `session_events` table (or in JSONL fallback mode, which has no events).
+   *
+   * Size caveat: this SDK loads the whole database file into memory, so on
+   * large event-bearing databases prefer streaming from the native CLI
+   * (`ai-hist events <session-id> --json`).
+   */
+  getSessionEvents(sessionId: string, opts: { source?: Source } = {}): SessionEvent[] {
+    if (!tableExists(this.db, 'session_events')) return [];
+    const clauses = ['session_id = ?'];
+    const params: unknown[] = [sessionId];
+    if (opts.source) {
+      clauses.push('source = ?');
+      params.push(opts.source);
+    }
+    appendProjectFilter(clauses, params, undefined, this._projectScope);
+    interface RawEventRow {
+      id: number;
+      source: Source;
+      session_id: string;
+      project: string | null;
+      cwd: string | null;
+      git_branch: string | null;
+      message_id: string | null;
+      parent_id: string | null;
+      ts_ms: number;
+      role: SessionEvent['role'];
+      kind: SessionEvent['kind'];
+      text: string | null;
+      model: string | null;
+      token_json: string | null;
+      event_uid: string;
+    }
+    return runQuery<RawEventRow>(
+      this.db,
+      `SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,
+              ts_ms, role, kind, text, model, token_json, event_uid
+       FROM session_events
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
+      params,
+    ).map((row) => ({
+      id: row.id,
+      source: row.source,
+      sessionId: row.session_id,
+      project: row.project,
+      cwd: row.cwd,
+      gitBranch: row.git_branch,
+      messageId: row.message_id,
+      parentId: row.parent_id,
+      tsMs: row.ts_ms,
+      role: row.role,
+      kind: row.kind,
+      text: row.text,
+      model: row.model,
+      tokenUsage: parseTokenJson(row.token_json),
+      eventUid: row.event_uid,
+    }));
+  }
+
+  /** All tool calls for a session, oldest first; `[]` on pre-events databases. */
+  getToolCalls(sessionId: string, opts: { source?: Source } = {}): SessionToolCall[] {
+    if (!tableExists(this.db, 'tool_calls')) return [];
+    const clauses = ['session_id = ?'];
+    const params: unknown[] = [sessionId];
+    if (opts.source) {
+      clauses.push('source = ?');
+      params.push(opts.source);
+    }
+    // tool_calls has no project column; the configured scope constrains
+    // through the session's events. Without that table the scoped answer is
+    // unknowable — fail closed rather than throw.
+    if (this._projectScope) {
+      if (!tableExists(this.db, 'session_events')) return [];
+      const scope = scopedPathClause('e.project', this._projectScope);
+      clauses.push(
+        `EXISTS (SELECT 1 FROM session_events e
+                 WHERE e.source = tool_calls.source AND e.session_id = tool_calls.session_id
+                   AND ${scope.sql})`,
+      );
+      params.push(...scope.params);
+    }
+    interface RawToolCallRow {
+      id: number;
+      source: Source;
+      session_id: string;
+      message_id: string | null;
+      tool_use_id: string;
+      name: string;
+      target: string | null;
+      args_json: string | null;
+      is_error: number | null;
+      ts_ms: number | null;
+    }
+    return runQuery<RawToolCallRow>(
+      this.db,
+      `SELECT id, source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms
+       FROM tool_calls
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC`,
+      params,
+    ).map((row) => ({
+      id: row.id,
+      source: row.source,
+      sessionId: row.session_id,
+      messageId: row.message_id,
+      toolUseId: row.tool_use_id,
+      name: row.name,
+      target: row.target,
+      argsJson: row.args_json,
+      isError: row.is_error === null ? null : row.is_error !== 0,
+      tsMs: row.ts_ms,
+    }));
   }
 
   /**
