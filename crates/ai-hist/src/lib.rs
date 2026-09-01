@@ -5319,10 +5319,12 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 ///
 /// Replaces the earlier split walks (state keys `codex_rollouts` and
 /// `codex_rollout_user_messages_v2`) with one stamp map. The current
-/// `codex_rollouts_v4` generation repairs the user-message parser change by
-/// re-reading unchanged files once. Its per-file record carries the session id
-/// so a wiped database forces re-ingestion even when the file stamp is unchanged.
-/// (session cwds, session branches, prompts inserted).
+/// `codex_rollouts_v5` generation repairs the user-message parser change
+/// and reclassifies existing `source.subagent` markers by re-reading unchanged
+/// files once. Its per-file record carries the session id and classification so
+/// a wiped database or an older standalone-guardian classification forces the
+/// necessary re-ingestion even when the file stamp is unchanged. (session cwds,
+/// session branches, prompts inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
 /// Reconcile the catalog registration for a locally observed subagent.
@@ -5410,16 +5412,26 @@ fn sync_codex_rollouts(
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
-    let repair_user_messages = !state.contains_key("codex_rollouts_v4");
+    let has_v5 = state.contains_key("codex_rollouts_v5");
+    let has_v4 = state.contains_key("codex_rollouts_v4");
+    // v4 already repaired user-message parsing. Its only stale knowledge is
+    // the source.subagent classification, so a v4->v5 upgrade must not
+    // re-read the complete archive: invalidate only marked subagent entries.
+    let repair_user_messages = !has_v5 && !has_v4;
     let mut seen = state
-        .get("codex_rollouts_v4")
+        .get("codex_rollouts_v5")
+        .or_else(|| state.get("codex_rollouts_v4"))
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    if !has_v5 && has_v4 {
+        seen.retain(|_, record| record.get("subagent").and_then(Value::as_bool) != Some(true));
+    }
     // Superseded stamp maps from the split-walk era; keeping them would carry
     // three path->stamp maps over the same 2K-file tree in .sync-state.json.
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
+    state.remove("codex_rollouts_v4");
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -5578,7 +5590,7 @@ fn sync_codex_rollouts(
         ),
     );
     state.remove("codex_rollouts_v3");
-    state.insert("codex_rollouts_v4".to_string(), Value::Object(seen));
+    state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -10979,7 +10991,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_v4_repair_restores_users_without_duplicating_existing_evidence() {
+    fn codex_v5_repair_restores_users_without_duplicating_existing_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let day = home.join(".codex/sessions/2026/08/31");
@@ -11066,7 +11078,7 @@ mod tests {
             .unwrap();
         assert_eq!(tool_count, 1);
         assert!(state.get("codex_rollouts_v3").is_none());
-        assert!(state.get("codex_rollouts_v4").is_some());
+        assert!(state.get("codex_rollouts_v5").is_some());
 
         super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
@@ -11152,6 +11164,37 @@ mod tests {
         .unwrap();
     }
 
+    fn write_standalone_codex_guardian_rollout(path: &std::path::Path, session_id: &str) {
+        let lines = [
+            json!({
+                "timestamp": "2026-08-01T10:02:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/tmp/proj",
+                    "source": {"subagent": {"other": "guardian"}}
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-01T10:02:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "standalone guardian prompt"}
+            }),
+            json!({
+                "timestamp": "2026-08-01T10:02:02.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "standalone guardian answer"}
+            }),
+        ];
+        let content = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(path, content).unwrap();
+    }
+
     #[test]
     fn unchanged_subagent_state_still_repairs_migrated_local_catalog_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -11193,7 +11236,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v4".into(),
+            "codex_rollouts_v5".into(),
             json!({
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -11364,6 +11407,155 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(edges, vec!["child:grandchild".to_string()]);
+    }
+
+    #[test]
+    fn old_codex_cache_reclassifies_standalone_guardian_before_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        let standalone = day.join("rollout-standalone-guardian.jsonl");
+        let linked = day.join("rollout-linked-guardian.jsonl");
+        write_rich_codex_rollout(&root);
+        write_standalone_codex_guardian_rollout(&standalone, "sess-standalone-guardian");
+        write_codex_subagent_rollout(&linked, "sess-linked-guardian");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Existing events make the old v4 entries eligible for the fast path.
+        for session_id in [
+            "sess-top",
+            "sess-standalone-guardian",
+            "sess-linked-guardian",
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('codex', ?, 2, 'assistant', 'text', 'retained event', ?)",
+                rusqlite::params![session_id, format!("retained-{session_id}")],
+            )
+            .unwrap();
+        }
+        // The normal root has an existing catalog row and should stay on the
+        // stamp fast path during this targeted migration.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-top', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        // The linked child also has stale catalog registration from the old
+        // classifier; the upgrade must remove it rather than promote it.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('sess-linked-guardian', 'codex', '/tmp/proj')",
+            [],
+        )
+        .unwrap();
+        ai_hist_core::mark_session_presence(
+            &conn,
+            "codex",
+            "sess-linked-guardian",
+            super::SessionLocation::Local,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('codex', 'sess-linked-guardian', 'stale child prompt', 1)",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        let standalone_key = standalone.to_string_lossy().to_string();
+        let linked_key = linked.to_string_lossy().to_string();
+        state.insert(
+            "codex_rollouts_v4".into(),
+            json!({
+                (root.to_string_lossy().to_string()): {
+                    "stamp": super::file_stamp(&root).unwrap(),
+                    "session": "sess-top",
+                    "subagent": false
+                },
+                (standalone_key.clone()): {
+                    "stamp": super::file_stamp(&standalone).unwrap(),
+                    "session": "sess-standalone-guardian",
+                    "subagent": true
+                },
+                (linked_key.clone()): {
+                    "stamp": super::file_stamp(&linked).unwrap(),
+                    "session": "sess-linked-guardian",
+                    "subagent": true
+                }
+            }),
+        );
+        state.insert(
+            "codex_session_cwds".into(),
+            json!({
+                "sess-top": "/tmp/proj",
+                "sess-standalone-guardian": "/tmp/proj",
+                "sess-linked-guardian": "/tmp/proj"
+            }),
+        );
+
+        let (_, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(inserted, 1, "standalone guardian prompt is newly indexed");
+        let sessions: Vec<String> = conn
+            .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sessions, vec!["sess-standalone-guardian", "sess-top"]);
+        let standalone_presence: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_presences \
+                 WHERE source='codex' AND session_id='sess-standalone-guardian' AND location='local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(standalone_presence, 1);
+        let linked_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history \
+                 WHERE source='codex' AND session_id='sess-linked-guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_history, 0);
+        let root_history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source='codex' AND session_id='sess-top'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            root_history, 0,
+            "the unchanged root stayed on the fast path"
+        );
+        assert!(state.get("codex_rollouts_v4").is_none());
+        let records = state
+            .get("codex_rollouts_v5")
+            .and_then(Value::as_object)
+            .expect("upgraded rollout cache");
+        assert_eq!(
+            records
+                .get(standalone_key.as_str())
+                .and_then(|record| record.get("subagent")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            records
+                .get(linked_key.as_str())
+                .and_then(|record| record.get("subagent")),
+            Some(&Value::Bool(true))
+        );
     }
 
     #[test]
