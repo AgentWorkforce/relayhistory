@@ -630,6 +630,64 @@ fn codex_subagent_threads_are_not_sessions() {
 }
 
 #[test]
+fn linked_codex_source_marked_subagent_is_not_a_root_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    codex_rollout(
+        home.path(),
+        "codex-linked-guardian",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-linked-guardian","cwd":"/work/api","parent_thread_id":"codex-1","source":{"subagent":{"other":"guardian"}}}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(found.ids(), vec!["codex:codex-1"]);
+    assert_eq!(found.summary.providers["codex"].candidates, 2);
+    assert_eq!(found.summary.discovered, 1);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn standalone_codex_guardian_source_marker_is_a_root_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    let guardian = codex_rollout(
+        home.path(),
+        "codex-guardian",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-guardian","cwd":"/work/api","source":{"subagent":{"other":"guardian"}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-20T11:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"guardian prompt"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-20T11:02:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"guardian answer"}}"#,
+            "\n",
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(found.ids().contains(&"codex:codex-guardian".to_string()));
+    assert_eq!(found.summary.providers["codex"].candidates, 2);
+    assert_eq!(found.summary.discovered, 2);
+    let row = found.row("codex-guardian");
+    assert_eq!(row.cwd.as_deref(), Some("/work/api"));
+    assert_eq!(row.first_prompt.as_deref(), Some("guardian prompt"));
+    assert_eq!(row.raw_path.as_deref(), Some(guardian.to_str().unwrap()));
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[test]
 fn codex_rescan_is_stamp_guarded_and_identity_stable() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();

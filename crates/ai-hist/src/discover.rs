@@ -868,16 +868,10 @@ impl ShallowSessionProvider for CodexProvider {
         else {
             return Ok(None);
         };
-        // Subagent threads are real rollouts but not user sessions; the full
-        // sync excludes them from `sessions` and so does discovery.
-        let is_subagent = payload
-            .and_then(|p| p.get("thread_source"))
-            .and_then(Value::as_str)
-            == Some("subagent")
-            || payload
-                .and_then(|p| p.get("source"))
-                .and_then(Value::as_object)
-                .is_some_and(|s| s.contains_key("subagent"));
+        // Linked subagent threads are real rollouts but not root sessions;
+        // standalone guardian rollouts may carry `source.subagent` without a
+        // parent and are cataloged under their own payload.id.
+        let is_subagent = crate::codex_is_subagent(payload, session_id);
         if is_subagent {
             return Ok(None);
         }

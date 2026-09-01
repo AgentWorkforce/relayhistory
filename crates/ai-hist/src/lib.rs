@@ -5714,14 +5714,39 @@ fn codex_parent_session_id(
     })
 }
 
+/// Codex rollouts marked as subagents are hidden from the root session
+/// catalog.  A `thread_source: subagent` rollout remains a child even when an
+/// older producer omitted its parent fields.  The object form of
+/// `source.subagent` is treated as a child only when an explicit parent is
+/// present, so a standalone guardian remains discoverable under `payload.id`.
+pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bool {
+    let thread_source_is_subagent = payload
+        .and_then(|p| p.get("thread_source"))
+        .and_then(Value::as_str)
+        == Some("subagent");
+    let source_marks_subagent = payload
+        .and_then(|p| p.get("source"))
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent"));
+
+    // `payload.id` is always the rollout's own identity. A `source.subagent`
+    // marker is not by itself evidence of a parent: standalone guardian rollouts
+    // carry that marker while keeping their own identity, so they stay
+    // discoverable under `payload.id`.
+    thread_source_is_subagent
+        || (source_marks_subagent
+            && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some())
+}
+
 /// Read the `session_meta` line that opens every rollout file.
 ///
 /// Sessions key on `payload.id` — the per-thread id. Subagent rollouts can
 /// carry their parent in `parent_thread_id`, a structured thread-spawn source,
 /// or the legacy `session_id`; keying on any of those would collapse every
 /// subagent into its parent. Subagent threads are detected instead
-/// (`thread_source`, or the object form of `payload.source`) and excluded from
-/// session registration.
+/// (`thread_source`, or the object form of `payload.source` *together with* an
+/// explicit parent) and excluded from session registration. A standalone
+/// guardian carries `source.subagent` without a parent and stays discoverable.
 fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
@@ -5737,7 +5762,8 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
         return Ok(None);
     }
-    let payload = value.get("payload").and_then(Value::as_object);
+    let payload_value = value.get("payload");
+    let payload = payload_value.and_then(Value::as_object);
     let Some(session_id) = payload
         .and_then(|p| p.get("id"))
         .and_then(Value::as_str)
@@ -5762,11 +5788,7 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .and_then(|p| p.get("source"))
         .and_then(Value::as_object)
         .and_then(|s| s.get("subagent"));
-    let is_subagent = payload
-        .and_then(|p| p.get("thread_source"))
-        .and_then(Value::as_str)
-        == Some("subagent")
-        || subagent.is_some();
+    let is_subagent = codex_is_subagent(payload_value, session_id);
     let parent_thread_id = is_subagent
         .then(|| codex_parent_thread_id(payload, session_id))
         .flatten();

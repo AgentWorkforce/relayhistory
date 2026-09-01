@@ -2660,6 +2660,58 @@ mod tests {
     }
 
     #[test]
+    fn standalone_codex_guardian_source_marker_hydrates_without_a_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&day).unwrap();
+        let guardian = day.join("rollout-guardian.jsonl");
+        fs::write(
+            &guardian,
+            concat!(
+                "{\"timestamp\":\"2026-05-05T19:13:27Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"guardian\",\"cwd\":\"/work/api\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n",
+                "{\"timestamp\":\"2026-05-05T19:13:28Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"guardian prompt\"}}\n",
+                "{\"timestamp\":\"2026-05-05T19:13:29Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"guardian answer\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "guardian", Some(&guardian));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("codex", "guardian"), dir.path()).unwrap();
+        assert_eq!(first.status, "hydrated");
+        assert_eq!(first.related_session_ids, Vec::<String>::new());
+        assert_eq!(first.evidence.prompts, 1);
+        assert_eq!(first.evidence.events, 2);
+        assert_eq!(first.evidence.tool_calls, 0);
+
+        let conn = open_db(&db).unwrap();
+        let raw_path: String = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source='codex' AND session_id='guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_path, guardian.to_string_lossy());
+        let relationships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE source='codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relationships, 0);
+        let second =
+            hydrate_session_at_with_home(&db, &options("codex", "guardian"), dir.path()).unwrap();
+        assert_eq!(second.status, "unchanged");
+        assert_eq!(second.evidence.prompts, 1);
+        assert_eq!(second.evidence.events, 2);
+    }
+
+    #[test]
     fn thousands_of_unrelated_catalog_rows_do_not_expand_hydration_work() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join(".claude/projects/app/selected.jsonl");
