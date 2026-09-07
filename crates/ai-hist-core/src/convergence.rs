@@ -55,6 +55,17 @@ pub struct IngestResponse {
     pub cursors: Option<Value>,
 }
 
+/// Token categories sent to convergence. Input excludes cache reads; cost is owned by burn.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+}
+
 /// One heterogeneous convergence record in `POST /v1/ingest` `records[]`.
 ///
 /// Tenancy fields (`orgId`/`workspaceId`/`machineId`) are intentionally absent — the
@@ -85,6 +96,8 @@ pub struct ConvergenceEnvelope {
     pub event_type: String,
     /// Scrubbed, readable text — the pgvector embedding input.
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub significance: Option<String>,
     /// Source-native float 0..1. Server owns `toBasisPoints`. Emitted as `null` (not
@@ -287,7 +300,7 @@ const KIND_FINDING: &str = "finding";
 /// even when the row carries no session id. `projectId` is always a slug (or
 /// [`UNKNOWN_PROJECT`]), never `None`.
 pub fn map_history_entry(entry: &HistoryEntry) -> ConvergenceEnvelope {
-    map_history_entry_with(entry, None, Vec::new(), None)
+    map_history_entry_with(entry, None, Vec::new(), None, None)
 }
 
 /// The `taskRef` a prompt belongs to, as `{system:"git", id:"<project>@<branch>"}`.
@@ -314,15 +327,14 @@ pub fn git_task_ref(project_id: &str, branch: Option<&str>) -> Option<serde_json
     }))
 }
 
-/// Like [`map_history_entry`], with a git-remote fallback, `filesTouched` and the branch
-/// the session was on.
-/// Like [`map_history_entry`], with a git-remote fallback, `filesTouched`, and the
-/// branch the session was on.
+/// Like [`map_history_entry`], enriched with the session's repo, files, branch,
+/// and token usage attributed specifically to this prompt.
 pub fn map_history_entry_with(
     entry: &HistoryEntry,
     git_remote: Option<&str>,
     files_touched: Vec<String>,
     git_branch: Option<&str>,
+    usage: Option<TokenUsage>,
 ) -> ConvergenceEnvelope {
     let session_id = entry
         .session_id
@@ -342,6 +354,7 @@ pub fn map_history_entry_with(
         ts: epoch_ms_to_iso(entry.timestamp_ms),
         event_type: "prompt".to_string(),
         content: normalize_home_path(entry.prompt.trim()),
+        usage,
         significance: None,
         confidence: None,
         tags: Vec::new(),
@@ -406,6 +419,7 @@ pub fn map_session_outcome(
         ts: epoch_ms_to_iso(link.created_at_ms),
         event_type: "session_outcome".to_string(),
         content: format!("session linked to commit {sha} via {method}"),
+        usage: None,
         significance: None,
         confidence: Some(link.confidence),
         tags: Vec::new(),
@@ -585,6 +599,7 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
                 ts: ts.clone(),
                 event_type: "decision".to_string(),
                 content, // raw text only — server folds `Task: <title>` at ingest
+                usage: None,
                 significance: None,
                 confidence: number_field(d, "confidence"), // (2) optional → null
                 tags: Vec::new(),
@@ -627,6 +642,7 @@ pub fn map_trajectory(row: &TrajectoryRow<'_>) -> Vec<ConvergenceEnvelope> {
                     ts: ts.clone(),
                     event_type: kind.to_string(),
                     content: item, // raw text only — server folds `Task: <title>` at ingest
+                    usage: None,
                     significance: None,
                     confidence: conf,
                     tags: Vec::new(),
@@ -741,6 +757,7 @@ fn compacted_event(
         ts: ts.to_string(),
         event_type: kind.to_string(),
         content,
+        usage: None,
         significance: None,
         confidence: None,
         tags: tags.to_vec(),
@@ -1798,13 +1815,13 @@ mod tests {
             prompt_hash: Some("h".into()),
             timestamp_ms: 1_700_000_000_000,
         };
-        let env = map_history_entry_with(&entry, None, Vec::new(), Some("fix/scrub"));
+        let env = map_history_entry_with(&entry, None, Vec::new(), Some("fix/scrub"), None);
         let task_ref = env
             .task_ref
             .expect("branch known, so a taskRef is expected");
         assert_eq!(task_ref["id"], "AgentWorkforce/relayhistory@fix/scrub");
 
-        let without = map_history_entry_with(&entry, None, Vec::new(), None);
+        let without = map_history_entry_with(&entry, None, Vec::new(), None, None);
         assert!(without.task_ref.is_none());
     }
 

@@ -14,11 +14,12 @@
 
 use crate::convergence::{
     map_history_entry_with, map_session_outcome, map_trajectory, normalize_home_path,
-    resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TrajectoryRow, UNKNOWN_PROJECT,
+    resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TokenUsage, TrajectoryRow,
+    UNKNOWN_PROJECT,
 };
 use crate::{
-    session_file_edits, session_file_edits_page, HistoryEntry, SessionEvidenceCursor,
-    SessionFileEdit,
+    session_events, session_file_edits, session_file_edits_page, HistoryEntry, SessionEvent,
+    SessionEvidenceCursor, SessionFileEdit,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -77,7 +78,8 @@ impl Default for SyncCursor {
 impl SyncCursor {
     /// Neighborhood-memory capture mapper. Bump when an upgraded client must
     /// re-upsert already-synced rows with newly populated fields.
-    pub const CAPTURE_VERSION: i64 = 1;
+    // Re-upsert existing prompts once: their original envelopes omitted token usage.
+    pub const CAPTURE_VERSION: i64 = 2;
 
     /// Advance watermarks so a stale writer cannot rewind one. History and
     /// commit-link ids are independent maxima. Trajectories use a single keyset
@@ -175,6 +177,7 @@ pub fn build_outbox_batch(
     let mut remotes: HashMap<String, Option<String>> = HashMap::new();
     let mut branches: HashMap<String, Option<String>> = HashMap::new();
     let mut file_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut usage_cache = HashMap::new();
     let mut published_sessions: HashSet<(String, String)> = HashSet::new();
 
     // --- history (prompts) — append-only, watermark on id ---
@@ -217,11 +220,13 @@ pub fn build_outbox_batch(
                 published_sessions.insert((entry.source.clone(), sid.clone()));
             }
             let branch = session_branch_for_entry(conn, &entry, &mut branches);
+            let usage = session_usage_for_entry(conn, &entry, &mut usage_cache)?;
             records.push(map_history_entry_with(
                 &entry,
                 git_remote.as_deref(),
                 files,
                 branch.as_deref(),
+                usage,
             ));
         }
     }
@@ -388,11 +393,13 @@ pub fn build_outbox_batch(
             let git_remote = git_remote_for_entry(conn, &entry, &mut remotes);
             let files = session_files(conn, &mut file_cache, Some(&entry.source), &hit.session_id)?;
             let branch = session_branch_for_entry(conn, &entry, &mut branches);
+            let usage = session_usage_for_entry(conn, &entry, &mut usage_cache)?;
             records.push(map_history_entry_with(
                 &entry,
                 git_remote.as_deref(),
                 files,
                 branch.as_deref(),
+                usage,
             ));
             published_sessions.insert((hit.source, hit.session_id));
         }
@@ -456,6 +463,214 @@ fn latest_history_for_session(
         })
     })?;
     Ok(rows.next().transpose()?)
+}
+
+type PromptKey = (i64, String);
+type UsageCache = HashMap<(String, String), HashMap<PromptKey, TokenUsage>>;
+
+fn session_usage_for_entry(
+    conn: &Connection,
+    entry: &HistoryEntry,
+    cache: &mut UsageCache,
+) -> Result<Option<TokenUsage>> {
+    let Some(sid) = &entry.session_id else {
+        return Ok(None);
+    };
+    let key = (entry.source.clone(), sid.clone());
+    if !cache.contains_key(&key) {
+        let events = session_events(conn, sid, Some(&entry.source))?;
+        cache.insert(key.clone(), attribute_session_usage(&events, &entry.source));
+    }
+    Ok(cache[&key]
+        .get(&(entry.timestamp_ms, entry.prompt.clone()))
+        .cloned())
+}
+
+struct UsageMessage {
+    id: String,
+    parent: Option<String>,
+    ts: i64,
+    role: String,
+    text: String,
+    usage: Option<TokenUsage>,
+}
+
+fn attribute_session_usage(
+    events: &[SessionEvent],
+    source: &str,
+) -> HashMap<PromptKey, TokenUsage> {
+    let mut groups: HashMap<&str, Vec<&SessionEvent>> = HashMap::new();
+    for event in events {
+        if let Some(id) = event.message_id.as_deref().filter(|id| !id.is_empty()) {
+            groups.entry(id).or_default().push(event);
+        }
+    }
+    let messages: HashMap<String, UsageMessage> = groups
+        .into_iter()
+        .filter_map(|(id, rows)| {
+            let first = rows[0];
+            if rows.iter().any(|r| {
+                r.ts_ms != first.ts_ms || r.role != first.role || r.parent_id != first.parent_id
+            }) {
+                return None;
+            }
+            // Claude copies message.usage onto every content block. Counting rows
+            // would multiply one model request by its thinking/text/tool block count.
+            let tokens: Option<Vec<serde_json::Value>> = rows
+                .iter()
+                .filter_map(|r| r.token_json.as_deref())
+                .map(|raw| serde_json::from_str(raw).ok())
+                .collect();
+            let usage = tokens.and_then(|tokens| {
+                let first = tokens.first()?;
+                if tokens.iter().any(|value| value != first) {
+                    return None;
+                }
+                parse_token_usage(first, source)
+            });
+            let text = rows
+                .iter()
+                .filter(|r| r.kind == "text")
+                .filter_map(|r| r.text.as_deref())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some((
+                id.to_string(),
+                UsageMessage {
+                    id: id.to_string(),
+                    parent: first.parent_id.clone(),
+                    ts: first.ts_ms,
+                    role: first.role.clone(),
+                    text,
+                    usage,
+                },
+            ))
+        })
+        .collect();
+    // Keep even unidentifiable user events as boundaries; dropping one would
+    // incorrectly charge its answer to the preceding identifiable prompt.
+    let mut boundaries: Vec<_> = events.iter().filter(|e| e.role == "user").collect();
+    boundaries.sort_by_key(|e| e.ts_ms);
+    // Parsers use zero when time is missing. Such a turn could fall anywhere,
+    // so timestamp-only ownership is unsafe for the session.
+    let timestamps_known = boundaries.iter().all(|e| e.ts_ms > 0);
+    let mut prompt_counts = HashMap::new();
+    for user in messages.values().filter(|m| m.role == "user") {
+        *prompt_counts
+            .entry((user.ts, user.text.clone()))
+            .or_insert(0) += 1;
+    }
+    let mut attributed: HashMap<PromptKey, Option<TokenUsage>> = HashMap::new();
+    for message in messages.values().filter(|m| m.role == "assistant") {
+        let Some(usage) = &message.usage else {
+            continue;
+        };
+        let owner = if message.parent.is_some() {
+            parent_prompt(message, &messages)
+        } else if source == "codex" && message.ts > 0 && timestamps_known {
+            // Codex persists no parent IDs. Only its ordered human-turn stream
+            // establishes ownership: a tie at either boundary is ambiguous, and
+            // an explicit but broken parent link must never fall back to time.
+            let boundary = boundaries.partition_point(|u| u.ts_ms < message.ts);
+            if boundaries
+                .get(boundary)
+                .is_some_and(|u| u.ts_ms == message.ts)
+            {
+                None
+            } else {
+                boundary.checked_sub(1).and_then(|i| {
+                    let user = boundaries[i];
+                    if user.ts_ms <= 0 || (i > 0 && boundaries[i - 1].ts_ms == user.ts_ms) {
+                        return None;
+                    }
+                    messages.get(user.message_id.as_deref()?)
+                })
+            }
+        } else {
+            None
+        };
+        let Some(owner) = owner else { continue };
+        let key = (owner.ts, owner.text.clone());
+        // Identical text and timestamps cannot distinguish two user messages.
+        // Assigning both to a single history row would conceal a bad join.
+        if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
+            continue;
+        }
+        let total = attributed
+            .entry(key)
+            .or_insert_with(|| Some(TokenUsage::default()));
+        *total = total.as_ref().and_then(|total| add_usage(total, usage));
+    }
+    attributed
+        .into_iter()
+        .filter_map(|(key, usage)| usage.map(|u| (key, u)))
+        .collect()
+}
+
+fn parent_prompt<'a>(
+    message: &'a UsageMessage,
+    messages: &'a HashMap<String, UsageMessage>,
+) -> Option<&'a UsageMessage> {
+    let mut current = message;
+    let mut visited = HashSet::new();
+    while visited.insert(current.id.as_str()) {
+        if current.role == "user" {
+            return Some(current);
+        }
+        current = messages.get(current.parent.as_deref()?)?;
+    }
+    // Broken/cyclic ancestry is missing evidence, not permission to charge the
+    // nearest prompt (which could belong to another conversation branch).
+    None
+}
+
+fn parse_token_usage(value: &serde_json::Value, source: &str) -> Option<TokenUsage> {
+    let obj = value.as_object()?;
+    let get = |key: &str| match obj.get(key) {
+        None => Some(0),
+        Some(value) => value.as_u64(),
+    };
+    let (input, cache_read, cache_create) = match source {
+        "codex" => {
+            let cached = get("cached_input_tokens")?;
+            // CodexTokenTotals::to_token_json preserves inclusive input even
+            // after snapshot differencing. Emit exclusive input so cache reads
+            // cannot be counted again when convergence sums token categories.
+            (
+                get("input_tokens")?.checked_sub(cached)?,
+                cached,
+                get("cache_write_input_tokens")?,
+            )
+        }
+        // Claude stores native message.usage: input already excludes cache reads
+        // and writes. Subtracting them here would under-report ordinary input.
+        "claude" => (
+            get("input_tokens")?,
+            get("cache_read_input_tokens")?,
+            get("cache_creation_input_tokens")?,
+        ),
+        _ => return None,
+    };
+    let usage = TokenUsage {
+        input,
+        cache_read,
+        cache_create,
+        output: get("output_tokens")?,
+        reasoning: get("reasoning_output_tokens")?,
+    };
+    (usage != TokenUsage::default()).then_some(usage)
+}
+
+fn add_usage(a: &TokenUsage, b: &TokenUsage) -> Option<TokenUsage> {
+    Some(TokenUsage {
+        input: a.input.checked_add(b.input)?,
+        output: a.output.checked_add(b.output)?,
+        reasoning: a.reasoning.checked_add(b.reasoning)?,
+        cache_read: a.cache_read.checked_add(b.cache_read)?,
+        cache_create: a.cache_create.checked_add(b.cache_create)?,
+    })
 }
 
 /// The git branch a session was working on, cached per `(source, session_id)`.
@@ -674,6 +889,463 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn usage_event(
+        conn: &Connection,
+        source: &str,
+        id: &str,
+        parent: Option<&str>,
+        ts: i64,
+        role: &str,
+        text: &str,
+        tokens: Option<serde_json::Value>,
+    ) {
+        let row: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, message_id, parent_id, ts_ms, role, kind, text, token_json, event_uid) \
+             VALUES (?1, 'usage-session', ?2, ?3, ?4, ?5, 'text', ?6, ?7, ?8)",
+            rusqlite::params![source, id, parent, ts, role, text, tokens.map(|t| t.to_string()), format!("event-{row}")],
+        ).unwrap();
+    }
+
+    fn usage_prompt(conn: &Connection, source: &str, id: &str, ts: i64, prompt: &str) {
+        insert_history(
+            conn,
+            &HistoryEntry {
+                id: 0,
+                source: source.into(),
+                session_id: Some("usage-session".into()),
+                project: None,
+                prompt: prompt.into(),
+                prompt_hash: Some(crate::prompt_hash(prompt)),
+                timestamp_ms: ts,
+            },
+        )
+        .unwrap();
+        usage_event(conn, source, id, None, ts, "user", prompt, None);
+    }
+
+    #[test]
+    fn prompt_usage_sums_session_deltas_once_even_across_batches() {
+        let conn = mem();
+        for (id, ts, prompt) in [
+            ("u1", 100, "first"),
+            ("u2", 300, "second"),
+            ("u3", 500, "third"),
+        ] {
+            usage_prompt(&conn, "codex", id, ts, prompt);
+        }
+        for (id, ts, input, cached, output) in [
+            ("a1", 150, 1000, 400, 120),
+            ("a2", 200, 600, 500, 60),
+            ("a3", 350, 200, 50, 20),
+            ("a4", 550, 400, 100, 40),
+        ] {
+            usage_event(
+                &conn,
+                "codex",
+                id,
+                None,
+                ts,
+                "assistant",
+                "answer",
+                Some(serde_json::json!({
+                    "input_tokens": input, "cached_input_tokens": cached, "output_tokens": output,
+                    "reasoning_output_tokens": 10, "cache_write_input_tokens": 5, "total_tokens": input + output,
+                })),
+            );
+        }
+        let batch =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        let usages: Vec<_> = batch
+            .records
+            .iter()
+            .map(|r| r.usage.as_ref().unwrap())
+            .collect();
+        assert_eq!(
+            usages.iter().map(|u| u.input).collect::<Vec<_>>(),
+            vec![700, 150, 300]
+        );
+        assert_eq!(
+            usages.iter().map(|u| u.output).collect::<Vec<_>>(),
+            vec![180, 20, 40]
+        );
+        assert_eq!(
+            usages.iter().map(|u| u.input + u.cache_read).sum::<u64>(),
+            2200
+        );
+        assert_eq!(usages.iter().map(|u| u.output).sum::<u64>(), 240);
+        assert_eq!(usages.iter().map(|u| u.reasoning).sum::<u64>(), 40);
+        assert_eq!(usages.iter().map(|u| u.cache_create).sum::<u64>(), 20);
+        let wire = serde_json::to_value(&batch.records[0]).unwrap();
+        assert_eq!(
+            wire["usage"],
+            serde_json::json!({"input":700,"output":180,"reasoning":20,"cacheRead":900,"cacheCreate":10})
+        );
+        assert!(!wire.to_string().contains("costUsdMicros"));
+
+        let mut cursor = SyncCursor::default();
+        let mut paged = Vec::new();
+        for _ in 0..3 {
+            let page = build_outbox_batch(&conn, &cursor, 1, &HashSet::new()).unwrap();
+            cursor = page.cursor;
+            paged.extend(page.records);
+        }
+        assert_eq!(paged, batch.records);
+        let old_cursor = SyncCursor {
+            capture_version: 1,
+            ..batch.cursor
+        };
+        let backfill = build_outbox_batch(&conn, &old_cursor, 100, &HashSet::new()).unwrap();
+        assert_eq!(backfill.records, batch.records);
+    }
+
+    #[test]
+    fn claude_usage_follows_parents_and_counts_content_blocks_once() {
+        let conn = mem();
+        usage_prompt(&conn, "claude", "u1", 100, "first\nsecond block");
+        conn.execute(
+            "UPDATE session_events SET text = 'first' WHERE message_id = 'u1'",
+            [],
+        )
+        .unwrap();
+        usage_event(
+            &conn,
+            "claude",
+            "u1",
+            None,
+            100,
+            "user",
+            "second block",
+            None,
+        );
+        usage_prompt(&conn, "claude", "u2", 300, "next prompt");
+        let tokens = serde_json::json!({"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40});
+        for text in ["thinking", "answer", "tool call"] {
+            usage_event(
+                &conn,
+                "claude",
+                "a1",
+                Some("u1"),
+                150,
+                "assistant",
+                text,
+                Some(tokens.clone()),
+            );
+        }
+        usage_event(
+            &conn,
+            "claude",
+            "tool1",
+            Some("a1"),
+            200,
+            "tool_result",
+            "result",
+            None,
+        );
+        usage_event(
+            &conn,
+            "claude",
+            "a2",
+            Some("tool1"),
+            250,
+            "assistant",
+            "continuation",
+            Some(tokens.clone()),
+        );
+        // The branch still answers u1 even though u2 is now the nearest timestamp.
+        usage_event(
+            &conn,
+            "claude",
+            "a3",
+            Some("a2"),
+            350,
+            "assistant",
+            "branch answer",
+            Some(tokens.clone()),
+        );
+        usage_event(
+            &conn,
+            "claude",
+            "a4",
+            Some("u2"),
+            400,
+            "assistant",
+            "next answer",
+            Some(tokens),
+        );
+        let batch =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        assert_eq!(
+            batch.records[0].usage,
+            Some(TokenUsage {
+                input: 30,
+                output: 120,
+                reasoning: 0,
+                cache_read: 60,
+                cache_create: 90
+            })
+        );
+        assert_eq!(batch.records[1].usage.as_ref().unwrap().input, 10);
+        add_file_edit(&conn, "usage-session", "src/main.rs", "Write");
+        let refreshed = build_outbox_batch(&conn, &batch.cursor, 100, &HashSet::new()).unwrap();
+        assert_eq!(refreshed.records.len(), 1);
+        assert_eq!(refreshed.records[0].usage, batch.records[1].usage);
+    }
+
+    #[test]
+    fn ambiguous_or_unlinked_usage_is_omitted() {
+        let conn = mem();
+        usage_prompt(&conn, "codex", "u1", 100, "first");
+        usage_prompt(&conn, "codex", "u2", 300, "second");
+        usage_prompt(&conn, "codex", "u3", 300, "tied");
+        let tokens = Some(serde_json::json!({"input_tokens":100,"output_tokens":10}));
+        for (id, parent, ts) in [
+            ("before", None, 50),
+            ("tie", None, 100),
+            ("broken", Some("missing"), 150),
+            ("after-tie", None, 350),
+        ] {
+            usage_event(
+                &conn,
+                "codex",
+                id,
+                parent,
+                ts,
+                "assistant",
+                "answer",
+                tokens.clone(),
+            );
+        }
+        usage_event(
+            &conn,
+            "codex",
+            "cycle1",
+            Some("cycle2"),
+            200,
+            "assistant",
+            "answer",
+            tokens.clone(),
+        );
+        usage_event(
+            &conn,
+            "codex",
+            "cycle2",
+            Some("cycle1"),
+            250,
+            "assistant",
+            "answer",
+            tokens.clone(),
+        );
+        // Same session ID from another harness cannot donate tokens to Codex.
+        usage_event(
+            &conn,
+            "claude",
+            "other",
+            Some("u1"),
+            200,
+            "assistant",
+            "answer",
+            tokens,
+        );
+        let batch =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        assert_eq!(batch.records.len(), 3);
+        for record in batch.records {
+            assert!(record.usage.is_none());
+            assert!(serde_json::to_value(record).unwrap().get("usage").is_none());
+        }
+    }
+
+    #[test]
+    fn unidentified_user_turn_blocks_timestamp_attribution() {
+        let conn = mem();
+        usage_prompt(&conn, "codex", "u1", 100, "first");
+        usage_event(
+            &conn,
+            "codex",
+            "unknown",
+            None,
+            200,
+            "user",
+            "unidentified",
+            None,
+        );
+        conn.execute(
+            "UPDATE session_events SET message_id = NULL WHERE message_id = 'unknown'",
+            [],
+        )
+        .unwrap();
+        usage_event(
+            &conn,
+            "codex",
+            "a1",
+            None,
+            250,
+            "assistant",
+            "answer",
+            Some(serde_json::json!({"input_tokens":100})),
+        );
+        let batch =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        assert!(batch.records[0].usage.is_none());
+        conn.execute(
+            "UPDATE session_events SET ts_ms = 0 WHERE message_id IS NULL",
+            [],
+        )
+        .unwrap();
+        let undated =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        assert!(undated.records[0].usage.is_none());
+    }
+
+    #[test]
+    fn usage_cache_is_scoped_to_source_and_session() {
+        let conn = mem();
+        usage_prompt(&conn, "codex", "u1", 100, "first");
+        usage_prompt(&conn, "claude", "u1", 100, "first");
+        for (source, input) in [("codex", 100), ("claude", 200)] {
+            usage_event(
+                &conn,
+                source,
+                "a1",
+                Some("u1"),
+                200,
+                "assistant",
+                "answer",
+                Some(serde_json::json!({"input_tokens":input})),
+            );
+        }
+        let mut cache = HashMap::new();
+        let entry = latest_history_for_session(&conn, "codex", "usage-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session_usage_for_entry(&conn, &entry, &mut cache)
+                .unwrap()
+                .unwrap()
+                .input,
+            100
+        );
+        conn.execute("DELETE FROM session_events WHERE source = 'codex'", [])
+            .unwrap();
+        assert_eq!(
+            session_usage_for_entry(&conn, &entry, &mut cache)
+                .unwrap()
+                .unwrap()
+                .input,
+            100
+        );
+        let claude = latest_history_for_session(&conn, "claude", "usage-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session_usage_for_entry(&conn, &claude, &mut cache)
+                .unwrap()
+                .unwrap()
+                .input,
+            200
+        );
+        for unmatched in [
+            HistoryEntry {
+                prompt: " first ".into(),
+                ..entry.clone()
+            },
+            HistoryEntry {
+                timestamp_ms: 101,
+                ..entry.clone()
+            },
+            HistoryEntry {
+                session_id: None,
+                ..entry.clone()
+            },
+        ] {
+            assert!(session_usage_for_entry(&conn, &unmatched, &mut cache)
+                .unwrap()
+                .is_none());
+        }
+        let absent = HistoryEntry {
+            session_id: Some("other-session".into()),
+            ..entry
+        };
+        assert!(session_usage_for_entry(&conn, &absent, &mut cache)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_or_empty_tokens_are_not_reported() {
+        for raw in [
+            "null",
+            "[]",
+            "{}",
+            "{\"total_tokens\":100}",
+            "{\"input_tokens\":0}",
+            "{\"input_tokens\":-1}",
+            "{\"output_tokens\":1.5}",
+            "{\"input_tokens\":\"10\"}",
+            "{\"input_tokens\":10,\"cached_input_tokens\":20}",
+        ] {
+            assert!(
+                parse_token_usage(&serde_json::from_str(raw).unwrap(), "codex").is_none(),
+                "{raw}"
+            );
+        }
+        let conn = mem();
+        usage_prompt(&conn, "claude", "u1", 100, "first");
+        usage_event(
+            &conn,
+            "claude",
+            "a1",
+            Some("u1"),
+            200,
+            "assistant",
+            "answer",
+            Some(serde_json::json!({"input_tokens":10})),
+        );
+        usage_event(
+            &conn,
+            "claude",
+            "a1",
+            Some("u1"),
+            200,
+            "assistant",
+            "conflicting copy",
+            Some(serde_json::json!({"input_tokens":20})),
+        );
+        usage_event(
+            &conn,
+            "claude",
+            "bad",
+            Some("u1"),
+            300,
+            "assistant",
+            "bad JSON",
+            None,
+        );
+        conn.execute(
+            "UPDATE session_events SET token_json = '{' WHERE message_id = 'bad'",
+            [],
+        )
+        .unwrap();
+        let batch =
+            build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
+        assert!(batch.records[0].usage.is_none());
+        assert!(add_usage(
+            &TokenUsage {
+                input: u64::MAX,
+                ..TokenUsage::default()
+            },
+            &TokenUsage {
+                input: 1,
+                ..TokenUsage::default()
+            }
+        )
+        .is_none());
     }
 
     /// A path-valued `project` must NOT suppress the remote lookup.
