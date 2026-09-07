@@ -590,6 +590,48 @@ test('pack defaults to the native command\'s 10-entry limit, not search\'s gener
   }
 });
 
+test('pack truncates by Unicode code point, not UTF-16 code unit, so it never splits a surrogate pair', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-unicode-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  try {
+    await mkdir(codex, { recursive: true });
+    // U+1F600 is a surrogate pair in UTF-16 (2 code units, 1 code point).
+    // A code-unit-based slice at length 3 would cut it in half.
+    const message = '😀😀 emoji-unicode-keyword rest of the message that keeps going';
+    await writeFile(join(codex, 'rollout-codex-1.jsonl'), `${JSON.stringify({
+      timestamp: '2026-09-07T20:00:00.000Z', type: 'session_meta',
+      payload: { id: 'codex-unicode-1', cwd: '/work/demo' },
+    })}\n${JSON.stringify({
+      timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
+      payload: { type: 'user_message', message },
+    })}\n`);
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const json = await run(process.execPath, [
+      cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--json', '--no-warning',
+    ]);
+    const parsed = JSON.parse(json.stdout) as { entries: Array<{ prompt: string }> };
+    // Every character of the truncated prefix must remain a well-formed
+    // code point — no lone (unpaired) surrogate.
+    for (const char of parsed.entries[0]?.prompt ?? '') {
+      const code = char.codePointAt(0) ?? 0;
+      assert.ok(code < 0xD800 || code > 0xDFFF, `lone surrogate in truncated prompt: ${JSON.stringify(parsed.entries[0]?.prompt)}`);
+    }
+    assert.equal(Array.from(parsed.entries[0]?.prompt ?? '').length, 4);
+
+    const human = await run(process.execPath, [
+      cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--no-warning',
+    ]);
+    assert.match(human.stdout, /😀😀 e\.\.\./);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('pack rejects a negative or fractional --tokens instead of silently misinterpreting it', async () => {
   // The generic arg parser reads a leading '-' as "the next flag", not a
   // negative value, so a negative number can only reach our validator via

@@ -413,6 +413,16 @@ function nonNegativeIntFlag(args: Parsed, name: string): number | undefined {
   return Number(value);
 }
 
+// Rust's `.chars().take(limit)` walks Unicode scalar values, not UTF-16 code
+// units — a plain `.slice()`/`.length` here could split a surrogate pair for
+// non-BMP characters (e.g. most emoji). Array.from() iterates by code point,
+// matching that semantics.
+function takeCodePoints(text: string, limit: number): { truncated: boolean; text: string } {
+  const points = Array.from(text);
+  if (points.length <= limit) return { truncated: false, text };
+  return { truncated: true, text: points.slice(0, limit).join('') };
+}
+
 async function runPack(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
   validateFlags(args, 'pack', [
     'all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens',
@@ -438,8 +448,7 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
   const generatedMs = Date.now();
   if (json) {
     const entries = rows.map((entry) => {
-      const prompt = charsBudget && entry.prompt.length > charsBudget
-        ? entry.prompt.slice(0, charsBudget) : entry.prompt;
+      const prompt = charsBudget ? takeCodePoints(entry.prompt, charsBudget).text : entry.prompt;
       return { ...entry, prompt, resumeCmd: resumeCommand(entry) };
     });
     output({ query: queryStr, generatedMs, tokenBudget: tokens, entries }, true);
@@ -449,7 +458,10 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
   rows.forEach((entry: HistoryEntry, index: number) => {
     const project = entry.project ? `  ${entry.project}` : '';
     let text = entry.prompt.replace(/\n/g, ' ');
-    if (charsBudget && text.length > charsBudget) text = `${text.slice(0, charsBudget)}...`;
+    if (charsBudget) {
+      const capped = takeCodePoints(text, charsBudget);
+      if (capped.truncated) text = `${capped.text}...`;
+    }
     process.stdout.write(
       `[${index + 1}/${rows.length}] #${entry.id}  ${formatLocalMinute(entry.timestampMs)}  ${entry.source}${project}\n`,
     );
