@@ -2,8 +2,8 @@ use crate::cloud;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{self, Write};
-use tempfile::NamedTempFile;
 use std::path::Path;
+use tempfile::NamedTempFile;
 
 pub fn run(
     session_id: &str,
