@@ -479,11 +479,13 @@ fn session_usage_for_entry(
     // to prompts that did not produce it. That is the same failure this function is built
     // to avoid — a confident wrong number rather than an honest gap — so blank reads as
     // missing and the row stays unattributed.
+    // Trim TESTS for blankness; it must not change the identity. `session_events` matches
+    // `session_id` exactly, so looking up a trimmed copy of a genuine id like " abc "
+    // would find nothing — or another session — and silently lose or misattribute usage.
     let Some(sid) = entry
         .session_id
         .as_deref()
-        .map(str::trim)
-        .filter(|sid| !sid.is_empty())
+        .filter(|sid| !sid.trim().is_empty())
     else {
         return Ok(None);
     };
@@ -1263,6 +1265,46 @@ mod tests {
         assert!(
             cache.is_empty(),
             "blank identities must never create a cache entry to share"
+        );
+    }
+
+    #[test]
+    fn a_padded_but_real_session_id_keeps_its_identity() {
+        // The blank guard trims to TEST emptiness. If it also trimmed the value used for
+        // lookup, a genuine id stored with surrounding whitespace would query a different
+        // session id than the one its events are filed under, and quietly lose its usage.
+        let conn = mem();
+        let sid = " padded-session ";
+        usage_event(&conn, "codex", "u1", None, 100, "user", "ask", None);
+        usage_event(
+            &conn,
+            "codex",
+            "a1",
+            Some("u1"),
+            150,
+            "assistant",
+            "answer",
+            Some(serde_json::json!({"input_tokens": 42, "output_tokens": 7})),
+        );
+        conn.execute(
+            "UPDATE session_events SET session_id = ?1",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+
+        let entry = HistoryEntry {
+            id: 0,
+            source: "codex".into(),
+            session_id: Some(sid.into()),
+            project: None,
+            prompt: "ask".into(),
+            prompt_hash: Some(crate::prompt_hash("ask")),
+            timestamp_ms: 100,
+        };
+        let usage = session_usage_for_entry(&conn, &entry, &mut HashMap::new()).unwrap();
+        assert!(
+            usage.is_some(),
+            "a padded but non-blank session id must still resolve its own events"
         );
     }
 
