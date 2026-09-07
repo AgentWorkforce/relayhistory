@@ -471,3 +471,202 @@ test('search preserves a multi-word positional query', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function seedCodexSession(root: string, home: string, db: string): Promise<void> {
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  await mkdir(codex, { recursive: true });
+  await writeFile(join(codex, 'rollout-codex-1.jsonl'), `${JSON.stringify({
+    timestamp: '2026-09-07T20:00:00.000Z', type: 'session_meta',
+    payload: { id: 'codex-demo-1', cwd: '/work/demo' },
+  })}\n${JSON.stringify({
+    timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
+    payload: { type: 'user_message', message: 'fix the flaky auth refresh test in refresh.ts' },
+  })}\n`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+  await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+}
+
+test('resume prints the best matching session\'s native resume command', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-resume-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  try {
+    await seedCodexSession(root, home, db);
+    const human = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--no-warning']);
+    assert.equal(human.stdout.trim(), 'cd /work/demo && codex resume codex-demo-1');
+
+    const json = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const parsed = JSON.parse(json.stdout) as Record<string, unknown>;
+    assert.equal(parsed.session_id, 'codex-demo-1');
+    assert.equal(parsed.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+    // A resumable session's JSON never carries the unavailability explanation.
+    assert.equal('resume_unavailable_reason' in parsed, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resume rejects an unknown flag with a documented --db option', async () => {
+  await assert.rejects(
+    run(process.execPath, [cli, 'resume', 'query', '--after', '{}', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'resume does not accept --after')
+      && typeof error === 'object' && error !== null && 'stderr' in error
+      && String(error.stderr).includes('resume QUERY... [--local | --remote | --all] [--db PATH]'),
+  );
+});
+
+test('resume fails loudly when nothing matches', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-resume-empty-'));
+  try {
+    await assert.rejects(
+      run(process.execPath, [cli, 'resume', 'no such session anywhere', '--db', join(root, 'missing.db'), '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stderr' in error && String(error.stderr).includes('No session found'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack formats matching entries with resume commands and respects a token budget', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  try {
+    await seedCodexSession(root, home, db);
+    const human = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--no-warning']);
+    assert.match(human.stdout, /^=== ai-hist pack: "auth refresh" \| .+ \| 1 entries ===/);
+    assert.match(human.stdout, /\[1\/1\] #\d+ {2}.+ {2}codex {2}\/work\/demo/);
+    assert.match(human.stdout, /Resume: cd \/work\/demo && codex resume codex-demo-1/);
+
+    const truncated = await run(process.execPath, [
+      cli, 'pack', 'auth refresh', '--db', db, '--tokens', '2', '--no-warning',
+    ]);
+    assert.match(truncated.stdout, /fix the \.\.\.\n/);
+
+    const json = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const parsed = JSON.parse(json.stdout) as { entries: Array<Record<string, unknown>> };
+    assert.equal(parsed.entries.length, 1);
+    assert.equal(parsed.entries[0]?.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack defaults to the native command\'s 10-entry limit, not search\'s general default', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-limit-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  try {
+    await mkdir(codex, { recursive: true });
+    for (let i = 1; i <= 12; i++) {
+      const metaLine = JSON.stringify({
+        timestamp: `2026-09-07T20:${String(i).padStart(2, '0')}:00.000Z`, type: 'session_meta',
+        payload: { id: `codex-limit-${i}`, cwd: '/work/demo' },
+      });
+      const messageLine = JSON.stringify({
+        timestamp: `2026-09-07T20:${String(i).padStart(2, '0')}:01.000Z`, type: 'event_msg',
+        payload: { type: 'user_message', message: `entry ${i} shared-limit-keyword` },
+      });
+      await writeFile(join(codex, `rollout-codex-${i}.jsonl`), `${metaLine}\n${messageLine}\n`);
+    }
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const defaultLimit = await run(process.execPath, [cli, 'pack', 'shared-limit-keyword', '--db', db, '--json', '--no-warning']);
+    const defaultParsed = JSON.parse(defaultLimit.stdout) as { entries: unknown[] };
+    assert.equal(defaultParsed.entries.length, 10);
+
+    const explicitLimit = await run(process.execPath, [
+      cli, 'pack', 'shared-limit-keyword', '--db', db, '--limit', '3', '--json', '--no-warning',
+    ]);
+    const explicitParsed = JSON.parse(explicitLimit.stdout) as { entries: unknown[] };
+    assert.equal(explicitParsed.entries.length, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack truncates by Unicode code point, not UTF-16 code unit, so it never splits a surrogate pair', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-unicode-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  try {
+    await mkdir(codex, { recursive: true });
+    // U+1F600 is a surrogate pair in UTF-16 (2 code units, 1 code point).
+    // A code-unit-based slice at length 3 would cut it in half.
+    const message = '😀😀 emoji-unicode-keyword rest of the message that keeps going';
+    await writeFile(join(codex, 'rollout-codex-1.jsonl'), `${JSON.stringify({
+      timestamp: '2026-09-07T20:00:00.000Z', type: 'session_meta',
+      payload: { id: 'codex-unicode-1', cwd: '/work/demo' },
+    })}\n${JSON.stringify({
+      timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
+      payload: { type: 'user_message', message },
+    })}\n`);
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const json = await run(process.execPath, [
+      cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--json', '--no-warning',
+    ]);
+    const parsed = JSON.parse(json.stdout) as { entries: Array<{ prompt: string }> };
+    // Every character of the truncated prefix must remain a well-formed
+    // code point — no lone (unpaired) surrogate.
+    for (const char of parsed.entries[0]?.prompt ?? '') {
+      const code = char.codePointAt(0) ?? 0;
+      assert.ok(code < 0xD800 || code > 0xDFFF, `lone surrogate in truncated prompt: ${JSON.stringify(parsed.entries[0]?.prompt)}`);
+    }
+    assert.equal(Array.from(parsed.entries[0]?.prompt ?? '').length, 4);
+
+    const human = await run(process.execPath, [
+      cli, 'pack', 'emoji-unicode-keyword', '--db', db, '--tokens', '1', '--no-warning',
+    ]);
+    assert.match(human.stdout, /😀😀 e\.\.\./);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack rejects a negative or fractional --tokens instead of silently misinterpreting it', async () => {
+  // The generic arg parser reads a leading '-' as "the next flag", not a
+  // negative value, so a negative number can only reach our validator via
+  // the inline `--flag=value` form; the space-separated form is covered by
+  // the pre-existing "--tokens requires a value" usage error instead.
+  for (const args of [['--tokens=-1'], ['--tokens', '0.5']]) {
+    await assert.rejects(
+      run(process.execPath, [cli, 'pack', 'query', ...args, '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null && 'stderr' in error
+        && String(error.stderr).includes('--tokens must be a non-negative integer'),
+      args.join(' '),
+    );
+  }
+});
+
+test('pack reports no results distinctly from a match, and exits non-zero', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-empty-'));
+  try {
+    await assert.rejects(
+      run(process.execPath, [cli, 'pack', 'nothing matches this', '--db', join(root, 'missing.db'), '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stdout' in error && String(error.stdout).includes('No results.'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resume and pack reject flags the other commands accept but these do not', async () => {
+  await assert.rejects(
+    run(process.execPath, [cli, 'resume', 'query', '--project', '/work', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'resume does not accept --project'),
+  );
+  await assert.rejects(
+    run(process.execPath, [cli, 'pack', 'query', '--after-source', 'codex', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'pack does not accept --after-source'),
+  );
+});

@@ -5,9 +5,9 @@ import { readFile } from 'node:fs/promises';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, recent, search, stats, sync,
-  type CatalogCursor, type EvidenceCursor, type SessionFileEditsPage, type SessionRelationship,
-  type SessionScope, type SessionToolCallsPage,
+  listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
+  type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
@@ -17,7 +17,7 @@ type PackageMetadata = { version?: string };
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-related', 'no-warning', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'project', 'source', 'tag',
+  'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -206,6 +206,8 @@ function usage(message?: string): never {
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
+  ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
+  ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
@@ -350,6 +352,131 @@ function outputRelationships(value: Awaited<ReturnType<typeof getSessionRelation
   for (const diagnostic of value.diagnostics) {
     process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
   }
+}
+
+// Mirrors the Rust CLI's `Local.timestamp_millis_opt(ms).format("%Y-%m-%d %H:%M")`:
+// the machine's local timezone, minute precision, zero-padded.
+function formatLocalMinute(epochMs: number): string {
+  const date = new Date(epochMs);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function queryPositionals(subcommand: string | undefined, rest: string[], command: string): string[] {
+  const query = [subcommand, ...rest].filter((value): value is string => value !== undefined);
+  if (query.length === 0) usage(`${command} requires a query`);
+  return query;
+}
+
+async function runResume(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
+  validateFlags(args, 'resume', ['all', 'db', 'fts', 'json', 'local', 'remote']);
+  const query = queryPositionals(subcommand, rest, 'resume');
+  // Matches the Rust CLI: search is capped to the single best match, then that
+  // one row is checked for a usable session id rather than scanning further.
+  const rows = await search(query.join(' '), {
+    dbPath: textFlag(args, 'db'), scope: scopeFlag(args), rawFts: args.flags.has('fts'), limit: 1,
+  });
+  const entry = rows.find((row) => row.sessionId);
+  if (!entry) throw new Error('No session found');
+  const cmd = resumeCommand(entry);
+  // A session with no local presence is only "unavailable", not an error: the
+  // Rust CLI's JSON output always succeeds and explains itself with this
+  // field rather than failing, matching that contract here.
+  const locallyAvailable = entry.locations.length === 0 || entry.locations.includes('local');
+  if (json) {
+    output({
+      ...entry,
+      resumeCmd: cmd,
+      scope: scopeFlag(args),
+      ...(locallyAvailable ? {} : {
+        resumeUnavailableReason: 'session is remote-only; materialize it locally before resuming',
+      }),
+    }, true);
+    return;
+  }
+  if (cmd) {
+    process.stdout.write(`${cmd}\n`);
+    return;
+  }
+  if (!locallyAvailable) {
+    throw new Error(
+      `Session ${entry.sessionId} is remote-only and cannot be resumed locally; materialize it locally first.`,
+    );
+  }
+  throw new Error(`No resume command available for source '${entry.source}'`);
+}
+
+function nonNegativeIntFlag(args: Parsed, name: string): number | undefined {
+  const value = textFlag(args, name);
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(value)) throw new Error(`--${name} must be a non-negative integer`);
+  return Number(value);
+}
+
+// Rust's `.chars().take(limit)` walks Unicode scalar values, not UTF-16 code
+// units — a plain `.slice()`/`.length` here could split a surrogate pair for
+// non-BMP characters (e.g. most emoji). Array.from() iterates by code point,
+// matching that semantics.
+function takeCodePoints(text: string, limit: number): { truncated: boolean; text: string } {
+  const points = Array.from(text);
+  if (points.length <= limit) return { truncated: false, text };
+  return { truncated: true, text: points.slice(0, limit).join('') };
+}
+
+async function runPack(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
+  validateFlags(args, 'pack', [
+    'all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens',
+  ]);
+  const query = queryPositionals(subcommand, rest, 'pack');
+  const queryStr = query.join(' ');
+  const tokens = nonNegativeIntFlag(args, 'tokens') ?? 0;
+  // The native Pack command defaults its own limit to 10, distinct from
+  // search()'s general-purpose default of 20 — match Pack specifically.
+  const rows = await search(queryStr, {
+    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'),
+  });
+  if (rows.length === 0) {
+    if (json) {
+      output({ query: queryStr, entries: [] }, true);
+    } else {
+      process.stdout.write('No results.\n');
+    }
+    process.exitCode = 1;
+    return;
+  }
+  const charsBudget = tokens > 0 ? tokens * 4 : undefined;
+  const generatedMs = Date.now();
+  if (json) {
+    const entries = rows.map((entry) => {
+      const prompt = charsBudget ? takeCodePoints(entry.prompt, charsBudget).text : entry.prompt;
+      return { ...entry, prompt, resumeCmd: resumeCommand(entry) };
+    });
+    output({ query: queryStr, generatedMs, tokenBudget: tokens, entries }, true);
+    return;
+  }
+  process.stdout.write(`=== ai-hist pack: "${queryStr}" | ${formatLocalMinute(generatedMs)} | ${rows.length} entries ===\n\n`);
+  rows.forEach((entry: HistoryEntry, index: number) => {
+    const project = entry.project ? `  ${entry.project}` : '';
+    let text = entry.prompt.replace(/\n/g, ' ');
+    if (charsBudget) {
+      const capped = takeCodePoints(text, charsBudget);
+      if (capped.truncated) text = `${capped.text}...`;
+    }
+    process.stdout.write(
+      `[${index + 1}/${rows.length}] #${entry.id}  ${formatLocalMinute(entry.timestampMs)}  ${entry.source}${project}\n`,
+    );
+    process.stdout.write(`      ${text}\n`);
+    if (entry.sessionId) {
+      const cmd = resumeCommand(entry);
+      if (cmd) {
+        process.stdout.write(`      Resume: ${cmd}\n`);
+      } else {
+        const short = entry.sessionId.length > 16 ? `${entry.sessionId.slice(0, 16)}...` : entry.sessionId;
+        process.stdout.write(`      Session: ${short}\n`);
+      }
+    }
+    process.stdout.write('\n');
+  });
 }
 
 function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boolean): void {
@@ -503,6 +630,14 @@ async function main(): Promise<void> {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
     }), json);
+    return;
+  }
+  if (command === 'resume') {
+    await runResume(args, subcommand, rest, json);
+    return;
+  }
+  if (command === 'pack') {
+    await runPack(args, subcommand, rest, json);
     return;
   }
   if (command === 'stats') {

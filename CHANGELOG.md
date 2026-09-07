@@ -4,6 +4,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+- Add `ai-hist resume <query>` (prints the native resume command for the
+  best-matching session) and `ai-hist pack <query>` (a compact, token-budgeted
+  context block for handing a session to a different agent/tool) to the
+  published npm CLI, matching the existing native Rust CLI's commands.
+
 - Populate `projectId` on every cloud-sync envelope (repo slug from
   `history.project` or the session cwd's git remote, including relative
   forms such as `./repo`; the explicit string `unknown` when neither is
