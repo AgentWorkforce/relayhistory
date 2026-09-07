@@ -1,7 +1,6 @@
 use crate::cloud;
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use tempfile::NamedTempFile;
@@ -56,20 +55,22 @@ pub fn run(
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
-    let tmp = NamedTempFile::new_in(dir)?;
+    let mut tmp = NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temporary transcript in {}", dir.display()))?;
+    // Write through the handle `NamedTempFile` already holds. Converting to a path first
+    // and reopening by name would close a securely-created file and then re-resolve that
+    // name, which on a shared or writable directory is a symlink race: an attacker
+    // swapping a link in between would have us truncate and overwrite an arbitrary file.
+    tmp.write_all(bytes)?;
+    // Flush before replacing: a replacement that lands before the data would leave an
+    // empty file after a crash, which is exactly the loss this guards against.
+    tmp.as_file().sync_all()?;
     let tmp_path = tmp.into_temp_path();
-    {
-        let mut file = fs::File::create(&tmp_path)
-            .with_context(|| format!("creating temporary transcript at {}", tmp_path.display()))?;
-        file.write_all(bytes)?;
-        // Flush before replacing: a replacement that lands before the data would leave an
-        // empty file after a crash, which is exactly the loss this guards against.
-        file.sync_all()?;
-    }
     atomicwrites::replace_atomic(&tmp_path, path)
         .with_context(|| format!("atomically replacing {}", path.display()))?;
-    // Keep the guard from deleting a path it no longer owns after a successful replace.
-    std::mem::forget(tmp_path);
+    // The replace consumed the temporary; keep the guard from trying to unlink a path it
+    // no longer owns.
+    tmp_path.keep()?;
     Ok(())
 }
 
