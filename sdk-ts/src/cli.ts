@@ -206,8 +206,8 @@ function usage(message?: string): never {
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
-  ai-hist resume QUERY... [--local | --remote | --all] [--fts] [--json]
-  ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--fts] [--json]
+  ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
+  ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
@@ -379,20 +379,38 @@ async function runResume(args: Parsed, subcommand: string | undefined, rest: str
   const entry = rows.find((row) => row.sessionId);
   if (!entry) throw new Error('No session found');
   const cmd = resumeCommand(entry);
+  // A session with no local presence is only "unavailable", not an error: the
+  // Rust CLI's JSON output always succeeds and explains itself with this
+  // field rather than failing, matching that contract here.
+  const locallyAvailable = entry.locations.length === 0 || entry.locations.includes('local');
   if (json) {
-    output({ ...entry, resumeCmd: cmd, scope: scopeFlag(args) }, true);
+    output({
+      ...entry,
+      resumeCmd: cmd,
+      scope: scopeFlag(args),
+      ...(locallyAvailable ? {} : {
+        resumeUnavailableReason: 'session is remote-only; materialize it locally before resuming',
+      }),
+    }, true);
     return;
   }
   if (cmd) {
     process.stdout.write(`${cmd}\n`);
     return;
   }
-  if (entry.locations.length > 0 && !entry.locations.includes('local')) {
+  if (!locallyAvailable) {
     throw new Error(
       `Session ${entry.sessionId} is remote-only and cannot be resumed locally; materialize it locally first.`,
     );
   }
   throw new Error(`No resume command available for source '${entry.source}'`);
+}
+
+function nonNegativeIntFlag(args: Parsed, name: string): number | undefined {
+  const value = textFlag(args, name);
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(value)) throw new Error(`--${name} must be a non-negative integer`);
+  return Number(value);
 }
 
 async function runPack(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
@@ -401,8 +419,12 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
   ]);
   const query = queryPositionals(subcommand, rest, 'pack');
   const queryStr = query.join(' ');
-  const tokens = numberFlag(args, 'tokens') ?? 0;
-  const rows = await search(queryStr, { ...common(args), rawFts: args.flags.has('fts') });
+  const tokens = nonNegativeIntFlag(args, 'tokens') ?? 0;
+  // The native Pack command defaults its own limit to 10, distinct from
+  // search()'s general-purpose default of 20 — match Pack specifically.
+  const rows = await search(queryStr, {
+    ...common(args), limit: numberFlag(args, 'limit') ?? 10, rawFts: args.flags.has('fts'),
+  });
   if (rows.length === 0) {
     if (json) {
       output({ query: queryStr, entries: [] }, true);

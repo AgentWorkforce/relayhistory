@@ -500,9 +500,20 @@ test('resume prints the best matching session\'s native resume command', async (
     const parsed = JSON.parse(json.stdout) as Record<string, unknown>;
     assert.equal(parsed.session_id, 'codex-demo-1');
     assert.equal(parsed.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+    // A resumable session's JSON never carries the unavailability explanation.
+    assert.equal('resume_unavailable_reason' in parsed, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('resume rejects an unknown flag with a documented --db option', async () => {
+  await assert.rejects(
+    run(process.execPath, [cli, 'resume', 'query', '--after', '{}', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'resume does not accept --after')
+      && typeof error === 'object' && error !== null && 'stderr' in error
+      && String(error.stderr).includes('resume QUERY... [--local | --remote | --all] [--db PATH]'),
+  );
 });
 
 test('resume fails loudly when nothing matches', async () => {
@@ -540,6 +551,57 @@ test('pack formats matching entries with resume commands and respects a token bu
     assert.equal(parsed.entries[0]?.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack defaults to the native command\'s 10-entry limit, not search\'s general default', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-limit-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  try {
+    await mkdir(codex, { recursive: true });
+    for (let i = 1; i <= 12; i++) {
+      const metaLine = JSON.stringify({
+        timestamp: `2026-09-07T20:${String(i).padStart(2, '0')}:00.000Z`, type: 'session_meta',
+        payload: { id: `codex-limit-${i}`, cwd: '/work/demo' },
+      });
+      const messageLine = JSON.stringify({
+        timestamp: `2026-09-07T20:${String(i).padStart(2, '0')}:01.000Z`, type: 'event_msg',
+        payload: { type: 'user_message', message: `entry ${i} shared-limit-keyword` },
+      });
+      await writeFile(join(codex, `rollout-codex-${i}.jsonl`), `${metaLine}\n${messageLine}\n`);
+    }
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    const defaultLimit = await run(process.execPath, [cli, 'pack', 'shared-limit-keyword', '--db', db, '--json', '--no-warning']);
+    const defaultParsed = JSON.parse(defaultLimit.stdout) as { entries: unknown[] };
+    assert.equal(defaultParsed.entries.length, 10);
+
+    const explicitLimit = await run(process.execPath, [
+      cli, 'pack', 'shared-limit-keyword', '--db', db, '--limit', '3', '--json', '--no-warning',
+    ]);
+    const explicitParsed = JSON.parse(explicitLimit.stdout) as { entries: unknown[] };
+    assert.equal(explicitParsed.entries.length, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack rejects a negative or fractional --tokens instead of silently misinterpreting it', async () => {
+  // The generic arg parser reads a leading '-' as "the next flag", not a
+  // negative value, so a negative number can only reach our validator via
+  // the inline `--flag=value` form; the space-separated form is covered by
+  // the pre-existing "--tokens requires a value" usage error instead.
+  for (const args of [['--tokens=-1'], ['--tokens', '0.5']]) {
+    await assert.rejects(
+      run(process.execPath, [cli, 'pack', 'query', ...args, '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null && 'stderr' in error
+        && String(error.stderr).includes('--tokens must be a non-negative integer'),
+      args.join(' '),
+    );
   }
 });
 
