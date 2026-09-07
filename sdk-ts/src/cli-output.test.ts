@@ -471,3 +471,98 @@ test('search preserves a multi-word positional query', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function seedCodexSession(root: string, home: string, db: string): Promise<void> {
+  const codex = join(home, '.codex', 'sessions', '2026', '09', '07');
+  await mkdir(codex, { recursive: true });
+  await writeFile(join(codex, 'rollout-codex-1.jsonl'), `${JSON.stringify({
+    timestamp: '2026-09-07T20:00:00.000Z', type: 'session_meta',
+    payload: { id: 'codex-demo-1', cwd: '/work/demo' },
+  })}\n${JSON.stringify({
+    timestamp: '2026-09-07T20:00:01.000Z', type: 'event_msg',
+    payload: { type: 'user_message', message: 'fix the flaky auth refresh test in refresh.ts' },
+  })}\n`);
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  await run(process.execPath, [cli, 'sessions', 'discover', '--source', 'codex', '--db', db, '--no-warning'], { env });
+  await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+}
+
+test('resume prints the best matching session\'s native resume command', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-resume-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  try {
+    await seedCodexSession(root, home, db);
+    const human = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--no-warning']);
+    assert.equal(human.stdout.trim(), 'cd /work/demo && codex resume codex-demo-1');
+
+    const json = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const parsed = JSON.parse(json.stdout) as Record<string, unknown>;
+    assert.equal(parsed.session_id, 'codex-demo-1');
+    assert.equal(parsed.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resume fails loudly when nothing matches', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-resume-empty-'));
+  try {
+    await assert.rejects(
+      run(process.execPath, [cli, 'resume', 'no such session anywhere', '--db', join(root, 'missing.db'), '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stderr' in error && String(error.stderr).includes('No session found'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack formats matching entries with resume commands and respects a token budget', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  try {
+    await seedCodexSession(root, home, db);
+    const human = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--no-warning']);
+    assert.match(human.stdout, /^=== ai-hist pack: "auth refresh" \| .+ \| 1 entries ===/);
+    assert.match(human.stdout, /\[1\/1\] #\d+ {2}.+ {2}codex {2}\/work\/demo/);
+    assert.match(human.stdout, /Resume: cd \/work\/demo && codex resume codex-demo-1/);
+
+    const truncated = await run(process.execPath, [
+      cli, 'pack', 'auth refresh', '--db', db, '--tokens', '2', '--no-warning',
+    ]);
+    assert.match(truncated.stdout, /fix the \.\.\.\n/);
+
+    const json = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--json', '--no-warning']);
+    const parsed = JSON.parse(json.stdout) as { entries: Array<Record<string, unknown>> };
+    assert.equal(parsed.entries.length, 1);
+    assert.equal(parsed.entries[0]?.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pack reports no results distinctly from a match, and exits non-zero', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-empty-'));
+  try {
+    await assert.rejects(
+      run(process.execPath, [cli, 'pack', 'nothing matches this', '--db', join(root, 'missing.db'), '--no-warning']),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stdout' in error && String(error.stdout).includes('No results.'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resume and pack reject flags the other commands accept but these do not', async () => {
+  await assert.rejects(
+    run(process.execPath, [cli, 'resume', 'query', '--project', '/work', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'resume does not accept --project'),
+  );
+  await assert.rejects(
+    run(process.execPath, [cli, 'pack', 'query', '--after-source', 'codex', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'pack does not accept --after-source'),
+  );
+});

@@ -32,6 +32,8 @@ ai-hist sessions hydrate codex 01a04f0c-... --json
 ai-hist sessions tree codex 01a04f0c-...
 ai-hist sessions tools codex 01a04f0c-... --limit 50 --json
 ai-hist sessions edits codex 01a04f0c-... --limit 50 --json
+ai-hist resume "the feature I was working on"          # prints the best match's native resume command
+ai-hist pack "the feature I was working on" --tokens 1500  # compact context to hand another agent
 ```
 
 `sessions relationships` and `sessions tree` read the delegation topology a
