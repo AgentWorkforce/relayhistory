@@ -2,6 +2,7 @@ use crate::cloud;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{self, Write};
+use tempfile::NamedTempFile;
 use std::path::Path;
 
 pub fn run(
@@ -20,18 +21,47 @@ pub fn run(
     )?;
     let events = cloud::replay_events(&auth, session_id, limit, max_content)?;
     let body = if json {
-        format!("{}\n", serde_json::to_string(&events)?)
+        // Serialize once and push the newline, rather than `format!`-ing the serialized
+        // string into a second one. A long session's transcript is the largest thing this
+        // command holds; duplicating it wholesale to append a byte is a needless spike.
+        let mut body = serde_json::to_string(&events)?;
+        body.push('\n');
+        body
     } else {
         render(session_id, &events)
     };
     // Finish fetching before touching the destination: an expired token on page two
     // must not overwrite an existing offline transcript with only page one.
     if let Some(path) = out {
-        std::fs::write(path, body)
+        write_atomically(path, body.as_bytes())
             .with_context(|| format!("writing replay to {}", path.display()))?;
     } else {
         io::stdout().lock().write_all(body.as_bytes())?;
     }
+    Ok(())
+}
+
+/// Write via a temporary file in the destination's own directory, then rename over it.
+///
+/// The same reason the fetch completes before the write: an existing transcript must not
+/// be destroyed by a replay that does not finish. `fs::write` truncates first, so a full
+/// disk or an interrupted process leaves a half-written file where a complete one was.
+/// `rename` within a directory is atomic, so the destination only ever holds the old
+/// complete transcript or the new one.
+///
+/// The temp file is a sibling, not in the system temp dir, because `rename` across
+/// filesystems fails — and the destination is frequently on a different mount than /tmp.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut temp = match dir {
+        Some(dir) => NamedTempFile::new_in(dir)?,
+        None => NamedTempFile::new_in(".")?,
+    };
+    temp.write_all(bytes)?;
+    // Flush to disk before the rename: a rename that lands before the data does would
+    // leave an empty file after a crash, which is exactly the loss this guards against.
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

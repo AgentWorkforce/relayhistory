@@ -24,6 +24,11 @@ fn server(pages: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<String>>)
                     Err(error) => panic!("{error}"),
                 }
             };
+            // The listener is non-blocking so `accept` can poll, and on macOS/BSD the
+            // accepted stream INHERITS O_NONBLOCK. `set_read_timeout` does not clear it,
+            // so `read_line` below returned WouldBlock the instant the client had not yet
+            // written — an intermittent panic that looks like a product bug and is not one.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -176,6 +181,19 @@ fn replay_renders_chronology_and_marks_truncation_even_without_content() {
     assert!(text.contains("hello\nworld"));
     assert!(text.contains("Actor: Alice"));
     assert!(text.contains("CONTENT TRUNCATED by server maxContent; this event is incomplete"));
+    // The notice must be tied to the flag, not printed for every event: asserting only the
+    // positive case would pass a regression that marks a complete transcript as truncated,
+    // which is the same lie in the opposite direction.
+    assert_eq!(
+        text.matches("CONTENT TRUNCATED").count(),
+        1,
+        "only the flagged event may carry the truncation notice"
+    );
+    let first = &text[text.find("(first)").unwrap()..text.find("(second)").unwrap()];
+    assert!(
+        !first.contains("CONTENT TRUNCATED"),
+        "an event with contentTruncated=false must not be marked truncated"
+    );
 }
 
 #[test]
