@@ -35,6 +35,7 @@ mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
+mod replay;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env,
@@ -630,6 +631,25 @@ enum Command {
         #[arg(long, default_value = "local-dev")]
         label: String,
     },
+    /// Fetch a cloud session transcript for offline reading (never imports into SQLite).
+    Replay {
+        session_id: String,
+        /// Select the cloud stage. Defaults to RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL, then prod.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Events per request (server default 200, maximum 1000). All pages are fetched.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Cap content per event on the server; truncated events are marked explicitly.
+        #[arg(long)]
+        max_content: Option<usize>,
+        /// Emit the raw event array as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Save the transcript to a file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Push new local history + trajectory events to relayhistory-cloud.
     Push {
         /// Select the cloud stage. Required when this machine has sessions for multiple stages.
@@ -929,6 +949,25 @@ pub fn run() -> Result<()> {
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
     // wait on SQLite before contention is detected.
     match &cli.command {
+        // The common read-only path can create or migrate SQLite. A cloud replay must
+        // also work on a fresh machine without creating a local history store.
+        Command::Replay {
+            session_id,
+            base_url,
+            limit,
+            max_content,
+            json,
+            out,
+        } => {
+            return replay::run(
+                session_id,
+                base_url.as_deref(),
+                *limit,
+                *max_content,
+                *json,
+                out.as_deref(),
+            );
+        }
         Command::Sync {
             scope,
             install_service,
@@ -968,6 +1007,7 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        Command::Replay { .. } => unreachable!("replay is dispatched before opening SQLite"),
         Command::Search {
             scope,
             query,

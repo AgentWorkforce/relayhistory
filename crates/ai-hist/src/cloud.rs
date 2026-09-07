@@ -1137,6 +1137,74 @@ fn map_http_err(e: ureq::Error) -> anyhow::Error {
     }
 }
 
+/// Fetch every page in the server's ascending `(ts, eventId)` order.
+pub fn replay_events(
+    auth: &StoredAuth,
+    session_id: &str,
+    limit: Option<usize>,
+    max_content: Option<usize>,
+) -> Result<Vec<serde_json::Value>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EventPage {
+        // Keep the event payload intact so --json preserves fields added by the server.
+        events: Vec<serde_json::Value>,
+        next_cursor: Option<String>,
+    }
+
+    require_secure_transport(&auth.base_url)?;
+    let url = format!(
+        "{}/v1/sessions/{}/events",
+        normalized_stage(&auth.base_url)?,
+        encode_path_segment(session_id)
+    );
+    let mut events = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let response = send_with_auth_refresh(
+            auth,
+            |current| {
+                let mut request = ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {}", current.access_token))
+                    .query("order", "asc");
+                if let Some(value) = limit {
+                    request = request.query("limit", &value.to_string());
+                }
+                if let Some(value) = max_content {
+                    request = request.query("maxContent", &value.to_string());
+                }
+                if let Some(value) = &cursor {
+                    request = request.query("cursor", value);
+                }
+                request.call().map_err(Box::new)
+            },
+            |error| match error {
+                ureq::Error::Status(401, _) => anyhow::anyhow!(
+                    "HTTP 401: relayhistory session is expired or invalid; run `ai-hist login` for the selected --base-url"
+                ),
+                other => map_http_err(other),
+            },
+        )
+        .context("replay query failed (authentication failures require `ai-hist login` for the selected --base-url)")?;
+        let page: EventPage = response.into_json().context("parsing replay events page")?;
+        events.extend(page.events);
+        match page.next_cursor {
+            None => return Ok(events),
+            Some(next) => {
+                // Preserve the opaque cursor, including its event-id tiebreak. A short
+                // page is not exhaustion, and a repeated cursor must fail instead of
+                // looping forever or saving duplicated events as a complete transcript.
+                anyhow::ensure!(
+                    !next.is_empty() && seen_cursors.insert(next.clone()),
+                    "replay returned an empty or repeated nextCursor; transcript is incomplete"
+                );
+                cursor = Some(next);
+            }
+        }
+    }
+}
+
 // ----- WS-6 Pair: in-session warning check (client of POST /v1/pair/check) -----
 
 /// Minimal current-session context sent to `/v1/pair/check`. **Never** file contents or
