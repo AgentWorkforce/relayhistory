@@ -197,6 +197,49 @@ fn replay_renders_chronology_and_marks_truncation_even_without_content() {
 }
 
 #[test]
+fn replay_over_an_existing_transcript_replaces_it() {
+    // The overwrite path had no coverage: the only test writing a file first exercised the
+    // FAILURE case (expired token leaves it intact). A successful repeat replay to the same
+    // path is the normal way this command is used, and it is the case that breaks when the
+    // replacement primitive cannot overwrite — `rename` does not, on Windows.
+    let home = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![(
+        200,
+        json!({"events": [event("only", "2026-09-06T12:00:00Z", json!("fresh"), false)], "nextCursor": null}),
+    )]);
+    save_auth(home.path(), &base, false);
+    let path = home.path().join("offline.txt");
+    std::fs::write(&path, "stale transcript from an earlier replay").unwrap();
+    let output = replay(
+        home.path(),
+        &base,
+        &["session", "--out", path.to_str().unwrap()],
+    );
+    success(&output);
+    server.join().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("fresh"), "{text}");
+    assert!(
+        !text.contains("stale transcript"),
+        "the previous transcript must be replaced, not appended to: {text}"
+    );
+    // The sibling temp file must not survive a successful replace. Match tempfile's own
+    // ".tmp" prefix rather than "anything unexpected" — the auth fixture legitimately
+    // creates a `stages` directory here, and excluding dotfiles wholesale would have
+    // hidden exactly the leftovers this is looking for.
+    let leftovers: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic write left temporary files behind: {leftovers:?}"
+    );
+}
+
+#[test]
 fn replay_unknown_session_is_an_empty_array_and_json_can_be_saved() {
     let home = tempfile::tempdir().unwrap();
     let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);

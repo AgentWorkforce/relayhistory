@@ -1,6 +1,7 @@
 use crate::cloud;
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use tempfile::NamedTempFile;
@@ -41,27 +42,34 @@ pub fn run(
     Ok(())
 }
 
-/// Write via a temporary file in the destination's own directory, then rename over it.
+/// Write via a temporary file in the destination's own directory, then atomically replace.
 ///
-/// The same reason the fetch completes before the write: an existing transcript must not
-/// be destroyed by a replay that does not finish. `fs::write` truncates first, so a full
-/// disk or an interrupted process leaves a half-written file where a complete one was.
-/// `rename` within a directory is atomic, so the destination only ever holds the old
-/// complete transcript or the new one.
+/// Same reason the fetch completes before the write: an existing transcript must not be
+/// destroyed by a replay that does not finish. `fs::write` truncates first, so a full disk
+/// or an interrupted process leaves a half-written file where a complete one was.
 ///
-/// The temp file is a sibling, not in the system temp dir, because `rename` across
-/// filesystems fails — and the destination is frequently on a different mount than /tmp.
+/// Uses `atomicwrites::replace_atomic` rather than a plain rename, matching
+/// `cloud.rs`'s state writer. `std::fs::rename` replaces an existing file on Unix but NOT
+/// on Windows, so persisting over an existing transcript would fail there — every repeat
+/// replay to the same path, which is the normal case. The temp file is a sibling because
+/// replacement across filesystems fails and the destination is often on another mount.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut temp = match dir {
-        Some(dir) => NamedTempFile::new_in(dir)?,
-        None => NamedTempFile::new_in(".")?,
-    };
-    temp.write_all(bytes)?;
-    // Flush to disk before the rename: a rename that lands before the data does would
-    // leave an empty file after a crash, which is exactly the loss this guards against.
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = parent.unwrap_or_else(|| Path::new("."));
+    let tmp = NamedTempFile::new_in(dir)?;
+    let tmp_path = tmp.into_temp_path();
+    {
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("creating temporary transcript at {}", tmp_path.display()))?;
+        file.write_all(bytes)?;
+        // Flush before replacing: a replacement that lands before the data would leave an
+        // empty file after a crash, which is exactly the loss this guards against.
+        file.sync_all()?;
+    }
+    atomicwrites::replace_atomic(&tmp_path, path)
+        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    // Keep the guard from deleting a path it no longer owns after a successful replace.
+    std::mem::forget(tmp_path);
     Ok(())
 }
 
