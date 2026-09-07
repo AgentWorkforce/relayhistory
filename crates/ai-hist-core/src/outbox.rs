@@ -473,10 +473,21 @@ fn session_usage_for_entry(
     entry: &HistoryEntry,
     cache: &mut UsageCache,
 ) -> Result<Option<TokenUsage>> {
-    let Some(sid) = &entry.session_id else {
+    // A present-but-blank session id is not a session. Treating it as one makes every
+    // malformed row across the store share the cache key `(source, "")`, so
+    // `session_events` returns an unrelated pile of rows and their usage gets attributed
+    // to prompts that did not produce it. That is the same failure this function is built
+    // to avoid — a confident wrong number rather than an honest gap — so blank reads as
+    // missing and the row stays unattributed.
+    let Some(sid) = entry
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty())
+    else {
         return Ok(None);
     };
-    let key = (entry.source.clone(), sid.clone());
+    let key = (entry.source.clone(), sid.to_string());
     if !cache.contains_key(&key) {
         let events = session_events(conn, sid, Some(&entry.source))?;
         cache.insert(key.clone(), attribute_session_usage(&events, &entry.source));
@@ -1201,6 +1212,58 @@ mod tests {
         let undated =
             build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
         assert!(undated.records[0].usage.is_none());
+    }
+
+    #[test]
+    fn blank_session_ids_stay_unattributed_and_do_not_share_a_cache_entry() {
+        // A blank-but-present session id used to reach the cache as `(source, "")`, so
+        // every malformed row in the store collapsed onto one key and could be handed
+        // usage produced by an unrelated prompt.
+        let conn = mem();
+        // Usage really does exist under the blank id, so a regression finds something to
+        // attribute rather than returning None merely because the table was empty.
+        usage_event(
+            &conn,
+            "codex",
+            "blank-user",
+            None,
+            100,
+            "user",
+            "empty",
+            None,
+        );
+        usage_event(
+            &conn,
+            "codex",
+            "blank-answer",
+            Some("blank-user"),
+            150,
+            "assistant",
+            "answer",
+            Some(serde_json::json!({"input_tokens": 999, "output_tokens": 999})),
+        );
+
+        let mut cache = HashMap::new();
+        for (sid, prompt, ts) in [("", "empty", 100i64), ("   ", "spaces", 200)] {
+            let entry = HistoryEntry {
+                id: 0,
+                source: "codex".into(),
+                session_id: Some(sid.into()),
+                project: None,
+                prompt: prompt.into(),
+                prompt_hash: Some(crate::prompt_hash(prompt)),
+                timestamp_ms: ts,
+            };
+            assert_eq!(
+                session_usage_for_entry(&conn, &entry, &mut cache).unwrap(),
+                None,
+                "a blank session id must stay unattributed ({prompt})"
+            );
+        }
+        assert!(
+            cache.is_empty(),
+            "blank identities must never create a cache entry to share"
+        );
     }
 
     #[test]
