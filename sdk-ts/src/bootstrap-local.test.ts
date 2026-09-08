@@ -41,6 +41,12 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
     assert.equal(first.hydratedSessions, 1);
     const found = await run(process.execPath, [cli, 'search', 'bootstrap needle', '--json'], { env });
     assert.equal(JSON.parse(found.stdout)[0].session_id, 'first');
+    const pretty = await run(process.execPath, [cli, 'sessions', 'list', '--pretty'], { env });
+    assert.match(pretty.stdout, /✦ \[claude\].*first.*find the bootstrap needle/);
+    assert.doesNotMatch(pretty.stdout, /\x1b/);
+    await assert.rejects(run(process.execPath, [cli, 'sessions', 'list', '--pretty', '--json'], { env }),
+      (error: unknown) => (error as { code: number; stderr: string }).code === 2
+        && (error as { stderr: string }).stderr.includes('mutually exclusive'));
     await rm(folder, { recursive: true });
     const second = await run(process.execPath, [cli, '--json'], { env });
     assert.equal(JSON.parse(second.stdout).already_indexed, true);

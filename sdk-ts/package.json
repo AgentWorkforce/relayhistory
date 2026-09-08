@@ -63,7 +63,7 @@
     "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/*.test.js ../scripts/hydration-benchmark.test.mjs",
+    "test": "npm run build && node --test dist/*.test.js ../scripts/hydration-benchmark.test.mjs ../scripts/first-search-evidence.test.mjs",
     "test:architecture": "node --test dist/architecture.test.js",
     "benchmark": "npm run build && node ../scripts/benchmark-native.mjs",
     "benchmark:hydration": "npm run build && node ../scripts/benchmark-hydration.mjs",
