@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { enableCloud, installGitHooks, loadStoredRelayhistoryAuth, pushCloud, sync } from './index.js';
+import { createShareableTrace, enableCloud, installGitHooks, loadStoredRelayhistoryAuth, pushCloud, sync } from './index.js';
 
 async function run(bin: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
   const child = spawn(bin, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -38,6 +38,9 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
       res.end(JSON.stringify({ accessToken: acceptToken, refreshToken: 'rth_rt_rotated' }));
     } else if (req.headers.authorization !== `Bearer ${acceptToken}`) {
       res.statusCode = 401; res.end('{}');
+    } else if (req.url === '/v1/sessions/session-a/shares') {
+      assert.equal(data.visibility, 'direct-link');
+      res.end(JSON.stringify({ url: `http://127.0.0.1:${address.port}/s/fixture-share`, visibility: 'direct-link', eventCount: 525 }));
     } else if (req.url?.endsWith('/v1/ingest')) {
       if (rejectIngest) { res.statusCode = 500; res.end('{}'); return; }
       bodies.push(data);
@@ -89,6 +92,12 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     await run('git', ['init', '-q'], process.env, repo);
     await run('git', ['config', 'user.email', 'test@example.com'], process.env, repo);
     await run('git', ['config', 'user.name', 'SDK test'], process.env, repo);
+    const sharedHooks = join(root, 'shared-hooks'); await mkdir(sharedHooks);
+    await writeFile(join(sharedHooks, 'post-commit'), '#!/bin/sh\necho shared\n');
+    await run('git', ['config', 'core.hooksPath', sharedHooks], process.env, repo);
+    await assert.rejects(installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath, prUrl: 'https://github.com/AgentWorkforce/relayhistory/pull/123' }), /external shared core.hooksPath/);
+    assert.equal(await readFile(join(sharedHooks, 'post-commit'), 'utf8'), '#!/bin/sh\necho shared\n');
+    await run('git', ['config', 'core.hooksPath', '.git/hooks'], process.env, repo);
     await writeFile(join(repo, '.git', 'hooks', 'post-commit'), '#!/bin/sh\necho old-hook > old-hook-ran\nexit 0\n', { mode: 0o755 });
     await run('git', ['config', 'ai-hist.pr-url', 'https://github.com/AgentWorkforce/relayhistory/pull/123'], process.env, repo);
     const hook = await installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath });
@@ -102,6 +111,9 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     assert.match(await run('git', ['notes', '--ref=ai-hist', 'show', 'HEAD'], process.env, repo), /ai-hist:claude:session-a/);
     acceptToken = 'rth_at_rotated';
     await pushCloud({ dbPath, baseUrl });
+    const trace = await createShareableTrace('session-a', { visibility: 'direct-link', baseUrl });
+    assert.equal(trace.url, `${baseUrl}/s/fixture-share`);
+    assert.equal(trace.eventCount, 525);
     assert.equal(refreshes, 1);
     assert.equal((await loadStoredRelayhistoryAuth(baseUrl))?.accessToken, acceptToken);
     assert(bodies.flatMap((body) => body.records).some((row) => row.lens === 'github' && row.taskRef?.id === 'AgentWorkforce/relayhistory#123'));
