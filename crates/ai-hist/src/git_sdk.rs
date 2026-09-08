@@ -32,7 +32,9 @@ fn pr_ref(raw: &str) -> Result<String> {
             && url.fragment().is_none()
             && segments.len() == 4
             && segments[2] == "pull"
-            && segments[3].parse::<u64>().is_ok_and(|n| n > 0)
+            && segments[3]
+                .parse::<u64>()
+                .is_ok_and(|n| n > 0 && n.to_string() == segments[3])
             && segments[..2].iter().all(|s| !s.is_empty()
                 && s.chars()
                     .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))),
@@ -72,10 +74,40 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     options.repo = root.display().to_string();
     options.db_path = fs::canonicalize(&options.db_path)?.display().to_string();
     options.source = Some(resolve_source(&options)?);
+    if options.pr_url.is_none() {
+        // Resolve an existing PR once at install time. The post-commit path is
+        // deliberately offline. A repository override also works without gh.
+        options.pr_url = git_stdout(&root, &["config", "--get", "ai-hist.pr-url"])
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if options.pr_url.is_none() {
+            options.pr_url = std::process::Command::new("gh")
+                .current_dir(&root)
+                .env("GH_PROMPT_DISABLED", "1")
+                .args(["pr", "view", "--json", "url", "--jq", ".url"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+        }
+    }
     if let Some(url) = &options.pr_url {
         pr_ref(url)?;
     }
     let hook = git_path(&root, "hooks/post-commit")?;
+    let common = git_stdout(&root, &["rev-parse", "--git-common-dir"])?;
+    let common = root.join(common.trim()).canonicalize()?;
+    let hook_parent = hook.parent().context("missing hook parent")?;
+    let resolved_parent = if hook_parent.exists() {
+        hook_parent.canonicalize()?
+    } else {
+        hook_parent.to_path_buf()
+    };
+    anyhow::ensure!(resolved_parent.starts_with(&common),
+        "Git uses an external shared core.hooksPath; refusing to change another repository's hooks. Configure a repository-local hooks directory first");
     let script = hook.with_file_name("ai-hist-post-commit.mjs");
     fs::create_dir_all(hook.parent().context("missing hook parent")?)?;
     let body = format!(
@@ -110,7 +142,7 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
     }
-    Ok(hook.display().to_string())
+    Ok(json!({"hookPath": hook.display().to_string(), "prUrl": options.pr_url}).to_string())
 }
 
 pub fn link(options: GitLinkOptions) -> Result<String> {

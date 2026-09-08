@@ -36,9 +36,13 @@ console.log(trace.url);
 await cloud.stop();
 ```
 
-Hooks use an explicit, already-indexed session. Pass the existing PR URL; when a
-PR is created later, reinstall the hook with its URL before the next commit.
-They perform no network I/O and preserve the previous post-commit hook in
+Hooks use an explicit, already-indexed session. Installation finds an existing PR
+through `git config ai-hist.pr-url` or `gh pr view`, or you can pass `prUrl` directly.
+The result reports `prUrl: null` when no PR was found. When a PR is created later,
+reinstall the hook before the next commit.
+Installations with an external shared `core.hooksPath` are rejected rather than
+modifying other repositories; configure a repository-local hooks directory first.
+Hooks perform no network I/O and preserve the previous post-commit hook in
 `post-commit.before-ai-hist`. Git notes append session IDs without replacing other
 notes. They are local until you explicitly push `refs/notes/ai-hist`; cloud
 linkage travels through the durable outbox independently.

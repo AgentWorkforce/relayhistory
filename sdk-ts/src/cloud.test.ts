@@ -49,6 +49,12 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const dbPath = join(root, 'history.db');
   try {
+    // The broker can inject a shared hooksPath using command-scope Git config.
+    // Test repositories must not inherit or mutate that shared hook directory.
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'].includes(key)) delete process.env[key];
+    }
+    process.env.GIT_CONFIG_NOSYSTEM = '1';
     process.env.HOME = root;
     process.env.USERPROFILE = root;
     process.env.RELAYHISTORY_HOME = join(root, 'auth');
@@ -84,7 +90,10 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     await run('git', ['config', 'user.email', 'test@example.com'], process.env, repo);
     await run('git', ['config', 'user.name', 'SDK test'], process.env, repo);
     await writeFile(join(repo, '.git', 'hooks', 'post-commit'), '#!/bin/sh\necho old-hook > old-hook-ran\nexit 0\n', { mode: 0o755 });
-    const hook = await installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath, prUrl: 'https://github.com/AgentWorkforce/relayhistory/pull/123' });
+    await run('git', ['config', 'ai-hist.pr-url', 'https://github.com/AgentWorkforce/relayhistory/pull/123'], process.env, repo);
+    const hook = await installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath });
+    assert.equal(hook.prUrl, 'https://github.com/AgentWorkforce/relayhistory/pull/123');
+    assert.match(await readFile(hook.hookPath, 'utf8'), /post-commit.before-ai-hist/);
     assert.equal((await stat(hook.hookPath)).mode & 0o111, 0o111);
     await writeFile(join(repo, 'file.txt'), 'fixture');
     await run('git', ['add', 'file.txt'], process.env, repo);
