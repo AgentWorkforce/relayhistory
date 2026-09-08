@@ -17,11 +17,13 @@ production deployment has been performed.
 - Follow-up hook checks found inherited broker `core.hooksPath` pointing at a
   shared temporary directory. The installer now rejects external shared hook
   paths, and tests use isolated Git configuration. It also resolves an existing
-  PR at install time through repository config or gh. Final rebuilt fixture pending.
+  PR at install time through repository config or gh. The final fixture and full
+  Node 22 SDK suite passed in GitHub CI on head 1b91b25.
 - Server: 4 sharing route tests and 15 existing session-link tests passed, package
   typecheck passed, Wrangler deployment dry-run passed. Sharing tests use real
   PGlite DDL and verify anonymous/private access, owner and tenant isolation,
-  frozen snapshots, escaped HTML, and revocation.
+  frozen snapshots, escaped HTML, and revocation. Full server CI (formatting,
+  typecheck and all tests) passed on f475d7c in run 34232491784.
 - Live dev: the npm command with fresh isolated ai-hist state exchanged an
   existing real Agent Relay Cloud identity and reported sent=1, accepted=1 for
   synthetic session `ws12-cloud-demo-1788873511810`. This was not a fresh browser
@@ -37,14 +39,16 @@ SQLite shared-memory I/O failures. Broad server runs stalled/timed out. These
 runs are not claimed green. Only WS-12's reproducible Rust target cache was
 removed to recover space; the built addon and committed sources were retained.
 
-SST dev plan attempts remained in provider dependency installation. A direct npm
-install of the generated platform dependencies completed, but SST returned to
-its own provider install. No plan, deploy, or migration was applied.
+SST dev plan attempts initially stalled in provider dependency installation. A
+direct npm install of the generated platform dependencies completed. SST then
+failed explicitly: Cloudflare API not initialized; CLOUDFLARE_API_TOKEN (or API
+key plus email) must be configured. No plan, deploy, or migration was applied.
 
 ## Remaining acceptance
 
-1. Build the final addon and SDK, rerun the focused fixture and broader tests on
-   a healthy machine. `node --test sdk-ts/dist/cloud.test.js` exercises the public
+1. Client Node 22 SDK and Windows CI passed. The main verify job found a Clippy
+   item-order warning; the SDK cloud functions have now been moved before the
+   test module. Verify the subsequent CI run. `node --test sdk-ts/dist/cloud.test.js` exercises the public
    SDK and actual npm CLI, including an offline post-commit and native sharing.
 2. Review `sst diff --stage dev`, deploy the cloud companion to dev, and apply
    its additive `0010_trace_shares.sql` to the verified dev Neon branch.
