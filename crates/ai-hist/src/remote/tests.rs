@@ -1626,3 +1626,43 @@ fn cloud_recall_rejects_all_tenancy_query_selectors_before_network() {
         );
     }
 }
+
+#[test]
+fn cloud_preserves_presence_less_local_session_during_full_ingestion_gap() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (base, server) = cloud_http(vec![(200, cloud_listing("grok", "legacy-local"))]);
+    crate::cloud::save_auth(&cloud_auth(&base)).unwrap();
+    let conn = catalog();
+    // State between the canonical full-session INSERT and the local presence
+    // write. Existing cache-only reads classify it as local.
+    conn.execute("INSERT INTO sessions(source, session_id, raw_path, discovery_state) VALUES ('grok', 'legacy-local', '/local/chat.json', 'full')", []).unwrap();
+    assert_eq!(
+        list_session_catalog(&conn, &CatalogListOptions::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    let options = DiscoverOptions {
+        scope: SessionScope::Remote,
+        sources: vec!["grok".into()],
+        ..Default::default()
+    };
+    crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
+        .unwrap();
+    let local = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].raw_path.as_deref(), Some("/local/chat.json"));
+    assert_eq!(local[0].discovery_state, "full");
+    assert_eq!(local[0].locations, ["local", "remote"]);
+    let presences: Vec<(String,String)> = conn.prepare("SELECT location, raw_locator FROM session_presences WHERE source='grok' AND session_id='legacy-local' ORDER BY location").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        presences,
+        vec![
+            ("local".into(), "/local/chat.json".into()),
+            ("remote".into(), "cloud://org-teammates/legacy-local".into())
+        ]
+    );
+    server.join().unwrap();
+    println!("legacy local gap: {presences:?}; canonical raw_path=/local/chat.json; state=full");
+}

@@ -2100,6 +2100,38 @@ fn upsert_shallow_session_in_transaction(
     session: &ShallowSession,
     location: SessionLocation,
 ) -> Result<ShallowSession> {
+    if location == SessionLocation::Remote {
+        // Cache-only local reads classify a preexisting presence-less row as
+        // legacy local. Preserve that classification before adding the first
+        // remote presence, including the gap between a local full-session write
+        // and its separate presence write.
+        let legacy_local = conn
+            .prepare_cached(
+                "SELECT raw_path, source_stamp, discovery_state FROM sessions s \
+             WHERE source = ? AND session_id = ? AND NOT EXISTS ( \
+                 SELECT 1 FROM session_presences p WHERE p.source = s.source \
+                 AND p.session_id = s.session_id)",
+            )?
+            .query_row(params![session.source, session.session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .optional()?;
+        if let Some((raw_path, stamp, state)) = legacy_local {
+            upsert_session_presence(
+                conn,
+                &session.source,
+                &session.session_id,
+                SessionLocation::Local,
+                raw_path.as_deref(),
+                stamp.as_deref(),
+                state.as_deref(),
+            )?;
+        }
+    }
     // The presence lands first: the sessions upsert's RETURNING clause
     // computes `locations` from `session_presences`, so this run's own
     // presence must already be visible when the merged row is read back.
