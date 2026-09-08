@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const evidence = resolve(process.argv[2] ?? join(root, 'tmp', 'first-search'));
-const image = process.env.AI_HIST_TEST_IMAGE ?? 'node:22-bookworm-slim';
+const image = process.env.AI_HIST_TEST_IMAGE ?? 'node:22-trixie-slim';
 const stage = mkdtempSync(join(tmpdir(), 'ai-hist-pack-'));
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', ...options });
