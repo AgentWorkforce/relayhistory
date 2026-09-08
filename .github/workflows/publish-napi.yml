@@ -60,10 +60,18 @@ jobs:
             test_native: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
             test_native: true
+            test_glibc: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
             test_native: true
+            test_glibc: true
+            # Zig 0.13 cannot link the Cortex-A53 flag emitted by Rust 1.98.
+            rust: 1.97.0
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
@@ -114,11 +122,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          # Match the official Node 20/22 glibc baseline, independent of runner OS.
+          if [ -n "${{ matrix.glibc }}" ]; then
+            npx napi build --platform --release --target "${{ matrix.target }}" --zig --zig-abi-suffix "${{ matrix.glibc }}"
+          elif [ "${{ matrix.cross }}" = "true" ]; then
             npx napi build --platform --release --target "${{ matrix.target }}" --zig
           else
             npx napi build --platform --release --target "${{ matrix.target }}"
           fi
+
+      - name: Enforce GNU artifact glibc ceiling
+        if: matrix.test_glibc
+        shell: bash
+        env:
+          GLIBC_FLOOR: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          # Inspect the produced ELF, so compiler/toolchain changes cannot
+          # silently raise the floor even when newer runtime tests pass.
+          readelf --version-info ./*.node > /tmp/addon-versions.txt
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          versions = {tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+(?:\.\d+)?)', Path('/tmp/addon-versions.txt').read_text())}
+          floor = tuple(map(int, os.environ['GLIBC_FLOOR'].split('.')))
+          if not versions or max(versions) > floor:
+              raise SystemExit(f'Invalid glibc requirements: {sorted(versions)}; ceiling={floor}')
+          print(f'Maximum required glibc: {".".join(map(str, max(versions)))}')
+          PY
 
       - name: Execute native contract smoke test
         if: matrix.test_native
@@ -129,6 +160,28 @@ jobs:
         if: matrix.test_musl
         shell: bash
         run: docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work/crates/ai-hist-napi node:22-alpine node ../../scripts/verify-native-contract.mjs ./index.js
+
+      - name: Build CLI for Linux runtime smoke tests
+        if: matrix.test_glibc || matrix.test_musl
+        working-directory: sdk-ts
+        run: npm ci --ignore-scripts && npm run build
+
+      - name: Execute GNU CLI smoke tests on supported Linux runtimes
+        if: matrix.test_glibc
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Bookworm is explicit too: floating Node tags must not silently
+          # move the oldest Debian runtime covered by this gate.
+          for image in node:22-slim node:22 node:22-bookworm-slim ubuntu:22.04 ubuntu:24.04 node:22-trixie-slim; do
+            bash scripts/smoke-linux-native.sh "$image" local
+          done
+
+      - name: Execute musl CLI smoke test
+        if: matrix.test_musl
+        working-directory: .
+        run: bash scripts/smoke-linux-native.sh node:22-alpine local
 
       - uses: actions/upload-artifact@v4
         with:
@@ -383,7 +436,7 @@ jobs:
           npm init -y
           node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
             "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
-          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/empty.db" --json
+          node "$GITHUB_WORKSPACE/scripts/smoke-native-cli.mjs" ./node_modules/ai-hist/dist/cli.js --prove-rejection
           timeout 2 ./node_modules/.bin/ai-hist-mcp </dev/null || test $? -eq 124
 
           NO_OPTIONAL=$(mktemp -d)
@@ -403,6 +456,17 @@ jobs:
               },
             );
           '
+
+      - name: Registry CLI smoke test on older glibc
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for image in node:22-bookworm-slim ubuntu:22.04; do
+            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
+          done
 
       # The branch only advances once every package is published and the
       # registry smoke tests pass, so a failed release never persists its
