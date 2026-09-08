@@ -12,6 +12,11 @@ export interface RelayhistoryAuth {
   refreshToken?: string;
   /** Server-issued RFC 3339 expiry. Absent in sessions stored before it existed. */
   accessTokenExpiresAt?: string;
+  /**
+   * Locally cached org, for provenance only — never sent as an authorization
+   * selector. The native store records it; this SDK's own login does not.
+   */
+  orgId?: string;
 }
 
 export type LoginCloudResult =
@@ -172,11 +177,13 @@ async function readNativeAuth(path: string): Promise<RelayhistoryAuth | null> {
   if (typeof baseUrl !== 'string' || typeof accessToken !== 'string') return null;
   const refreshToken = parsed.refresh_token ?? parsed.refreshToken;
   const expiresAt = parsed.access_token_expires_at ?? parsed.accessTokenExpiresAt;
+  const orgId = parsed.org_id ?? parsed.orgId;
   return {
     baseUrl,
     accessToken,
     ...(typeof refreshToken === 'string' ? { refreshToken } : {}),
     ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
+    ...(typeof orgId === 'string' ? { orgId } : {}),
   };
 }
 
@@ -186,9 +193,9 @@ async function readNativeAuth(path: string): Promise<RelayhistoryAuth | null> {
  * enumerated and each file's own `base_url` identifies it, so this never has
  * to reproduce the engine's stage-key hash.
  */
-async function nativeStoredSessions(): Promise<RelayhistoryAuth[]> {
+async function nativeStoredSessions(): Promise<StoredCandidate[]> {
   const home = nativeCloudHome();
-  const found: RelayhistoryAuth[] = [];
+  const found: StoredCandidate[] = [];
   let entries: string[] = [];
   try {
     entries = (await readdir(join(home, 'stages'))).filter((name) => name.endsWith('.auth.json'));
@@ -197,11 +204,12 @@ async function nativeStoredSessions(): Promise<RelayhistoryAuth[]> {
   }
   for (const entry of entries.sort()) {
     const auth = await readNativeAuth(join(home, 'stages', entry));
-    if (auth) found.push(auth);
+    if (auth) found.push({ auth, origin: 'native' });
   }
   const legacy = await readNativeAuth(join(home, 'auth.json'));
-  if (legacy && !found.some((auth) => normalizeStage(auth.baseUrl) === normalizeStage(legacy.baseUrl))) {
-    found.push(legacy);
+  if (legacy
+    && !found.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(legacy.baseUrl))) {
+    found.push({ auth: legacy, origin: 'native' });
   }
   return found;
 }
@@ -209,13 +217,45 @@ async function nativeStoredSessions(): Promise<RelayhistoryAuth[]> {
 /** Milliseconds of remaining validity below which a session is treated as spent. */
 const EXPIRY_FLOOR_MS = 60_000;
 
-function isExpired(auth: RelayhistoryAuth, now: number): boolean {
-  // A session stored before expiry was recorded carries no claim either way.
-  // Push tolerates those, and the SDK's own store has never written the field,
-  // so absence is not treated as expiry — only a stated, spent expiry is.
-  if (!auth.accessTokenExpiresAt) return false;
-  const expiry = Date.parse(auth.accessTokenExpiresAt);
-  return Number.isFinite(expiry) && expiry < now + EXPIRY_FLOOR_MS;
+/** Which store a candidate came from. The two carry different written contracts. */
+type StoreOrigin = 'native' | 'sdk';
+
+interface StoredCandidate {
+  auth: RelayhistoryAuth;
+  origin: StoreOrigin;
+}
+
+/**
+ * Why a stored session cannot serve a recall read, or `null` when it can.
+ *
+ * For native-store sessions this is `cloud::recall_auth`'s contract, whole: an
+ * `rth_at_` access token, an expiry that is present, parseable and at least
+ * {@link EXPIRY_FLOOR_MS} away, and a non-blank `org_id`. A session failing any
+ * of those is one the engine's own connector already reports as unconfigured,
+ * so answering a thread from it would claim a capability the rest of the
+ * toolchain denies.
+ *
+ * The SDK store is held to the subset it can satisfy. {@link loginCloud} has
+ * never persisted an expiry or an org, so requiring them there would not
+ * enforce a contract — it would retire a login path that works. Teaching
+ * `loginCloud` to store both, then holding one bar everywhere, is the follow-up.
+ */
+function ineligibleReason(candidate: StoredCandidate, now: number): string | null {
+  const { auth, origin } = candidate;
+  if (!auth.accessToken.startsWith('rth_at_')) {
+    return 'the stored relayhistory session has no rth_at_ access token';
+  }
+  const stated = auth.accessTokenExpiresAt;
+  if (origin === 'native' || stated !== undefined) {
+    const expiry = stated === undefined ? Number.NaN : Date.parse(stated);
+    if (!Number.isFinite(expiry) || expiry < now + EXPIRY_FLOOR_MS) {
+      return 'the stored relayhistory access-token expiry is missing, invalid, or less than 60s away';
+    }
+  }
+  if (origin === 'native' && !auth.orgId?.trim()) {
+    return 'the stored cloud session has no orgId for provenance';
+  }
+  return null;
 }
 
 /** Why no usable cloud session was found, phrased for {@link cloudUnconfiguredMessage}. */
@@ -243,8 +283,8 @@ export async function resolveCloudSession(
   const candidates = await nativeStoredSessions();
   const sdkStored = await loadStoredRelayhistoryAuth();
   if (sdkStored
-    && !candidates.some((a) => normalizeStage(a.baseUrl) === normalizeStage(sdkStored.baseUrl))) {
-    candidates.push(sdkStored);
+    && !candidates.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(sdkStored.baseUrl))) {
+    candidates.push({ auth: sdkStored, origin: 'sdk' });
   }
 
   const where = `${nativeCloudHome()} or ${relayhistoryConfigDir()}`;
@@ -252,35 +292,36 @@ export async function resolveCloudSession(
     return { auth: null, detail: `${where}: no stored relayhistory session (run \`ai-hist login\`)` };
   }
 
+  // Selection first, eligibility second — the engine's order, where `load_auth`
+  // picks the stage and `recall_auth` then judges the one it picked.
+  let selected: StoredCandidate;
   if (requestedBaseUrl !== undefined) {
     const wanted = normalizeStage(requestedBaseUrl);
-    const match = candidates.find((auth) => normalizeStage(auth.baseUrl) === wanted);
+    const match = candidates.find((c) => normalizeStage(c.auth.baseUrl) === wanted);
     if (!match) {
       return {
         auth: null,
         detail: `${where}: no stored relayhistory session for ${wanted} `
-          + `(stored: ${candidates.map((a) => normalizeStage(a.baseUrl)).join(', ')})`,
+          + `(stored: ${candidates.map((c) => normalizeStage(c.auth.baseUrl)).join(', ')})`,
       };
     }
-    return isExpired(match, now)
-      ? { auth: null, detail: `${where}: the stored relayhistory session for ${wanted} has expired (run \`ai-hist login\`)` }
-      : { auth: match };
-  }
-
-  if (candidates.length > 1) {
+    selected = match;
+  } else if (candidates.length > 1) {
     return {
       auth: null,
       detail: `${where}: ${candidates.length} relayhistory stages are configured `
-        + `(${candidates.map((a) => normalizeStage(a.baseUrl)).join(', ')}); `
+        + `(${candidates.map((c) => normalizeStage(c.auth.baseUrl)).join(', ')}); `
         + 'set AI_HIST_BASE_URL to select one. Refusing to guess, because a thread read '
         + 'against the wrong stage answers about a different org',
     };
+  } else {
+    selected = candidates[0]!;
   }
 
-  const only = candidates[0]!;
-  return isExpired(only, now)
-    ? { auth: null, detail: `${where}: the stored relayhistory session has expired (run \`ai-hist login\`)` }
-    : { auth: only };
+  const ineligible = ineligibleReason(selected, now);
+  return ineligible
+    ? { auth: null, detail: `${where}: ${ineligible} (run \`ai-hist login\`)` }
+    : { auth: selected.auth };
 }
 
 /**

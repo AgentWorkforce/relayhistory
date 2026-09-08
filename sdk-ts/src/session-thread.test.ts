@@ -331,6 +331,8 @@ async function writeStage(
 }
 
 const HOUR_AHEAD = new Date(Date.now() + 3_600_000).toISOString();
+/** The fields `cloud::recall_auth` requires of a native-store session. */
+const ELIGIBLE = { access_token_expires_at: HOUR_AHEAD, org_id: 'org-example' };
 
 test('a session stored by the native ai-hist login is found', async () => {
   await withStores(async ({ nativeHome }) => {
@@ -338,10 +340,9 @@ test('a session stored by the native ai-hist login is found', async () => {
     await writeStage(nativeHome, 'f482e90bb4722263', {
       base_url: 'https://history.agentrelay.com',
       access_token: 'rth_at_native',
-      access_token_expires_at: HOUR_AHEAD,
       refresh_token: 'rth_rt_native',
-      org_id: null,
       workspace_id: null,
+      ...ELIGIBLE,
     });
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth?.accessToken, 'rth_at_native');
@@ -355,7 +356,7 @@ test('the native store is reached through getSessionThread, not just the resolve
     await writeStage(nativeHome, 'stage', {
       base_url: 'https://history.agentrelay.com',
       access_token: 'rth_at_native',
-      access_token_expires_at: HOUR_AHEAD,
+      ...ELIGIBLE,
     });
     const { impl, calls } = recordingFetch(() => jsonResponse(ENVELOPE));
     // No resolveSession override: this is the production default path.
@@ -394,12 +395,12 @@ test('two stored stages are a refusal to guess, not a coin flip', async () => {
     await writeStage(nativeHome, 'prod', {
       base_url: 'https://history.agentrelay.com',
       access_token: 'rth_at_prod',
-      access_token_expires_at: HOUR_AHEAD,
+      ...ELIGIBLE,
     });
     await writeStage(nativeHome, 'dev', {
       base_url: 'http://127.0.0.1:8787',
       access_token: 'rth_at_dev',
-      access_token_expires_at: HOUR_AHEAD,
+      ...ELIGIBLE,
     });
     const ambiguous = await resolveCloudSession();
     assert.equal(ambiguous.auth, null);
@@ -413,27 +414,85 @@ test('two stored stages are a refusal to guess, not a coin flip', async () => {
   });
 });
 
-test('a spent access token is unconfigured, and a missing expiry is not', async () => {
+test('a native session missing any recall_auth precondition is unconfigured', async () => {
+  // `cloud::recall_auth` requires an rth_at_ token, a present+parseable expiry
+  // at least 60s away, and a non-blank org. A session failing any of them is
+  // one the engine's own connector reports unconfigured, so the tool must not
+  // answer from it — and must say which precondition failed.
+  const cases: [string, Record<string, unknown>, string][] = [
+    ['spent expiry', { ...ELIGIBLE, access_token_expires_at: new Date(Date.now() - 1_000).toISOString() }, 'expiry'],
+    ['unparseable expiry', { ...ELIGIBLE, access_token_expires_at: 'not-a-date' }, 'expiry'],
+    ['missing expiry', { org_id: 'org-example' }, 'expiry'],
+    ['missing org', { access_token_expires_at: HOUR_AHEAD }, 'orgId'],
+    ['blank org', { access_token_expires_at: HOUR_AHEAD, org_id: '   ' }, 'orgId'],
+  ];
+  for (const [label, fields, expected] of cases) {
+    await withStores(async ({ nativeHome }) => {
+      await writeStage(nativeHome, 'stage', {
+        base_url: 'https://history.agentrelay.com',
+        access_token: 'rth_at_native',
+        ...fields,
+      });
+      const resolved = await resolveCloudSession();
+      assert.equal(resolved.auth, null, label);
+      assert.ok(resolved.auth === null && resolved.detail.includes(expected), `${label} names ${expected}`);
+    });
+  }
+
+  // A token that is not an rth_at_ session is rejected in either store.
   await withStores(async ({ nativeHome }) => {
     await writeStage(nativeHome, 'stage', {
       base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_stale',
-      access_token_expires_at: new Date(Date.now() - 1_000).toISOString(),
+      access_token: 'nope_not_a_session',
+      ...ELIGIBLE,
     });
-    const expired = await resolveCloudSession();
-    assert.equal(expired.auth, null);
-    assert.ok(expired.auth === null && expired.detail.includes('expired'));
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth, null);
+    assert.ok(resolved.auth === null && resolved.detail.includes('rth_at_'));
+  });
+});
+
+test('an ineligible native session performs no network call', async () => {
+  await withStores(async ({ nativeHome }) => {
+    // The precondition gate has to run before the transport, exactly like the
+    // no-session case, or an unconfigured connector becomes a 401 instead.
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_native',
+      access_token_expires_at: HOUR_AHEAD,
+    });
+    const { impl, calls } = recordingFetch(() => jsonResponse(ENVELOPE));
+    await assert.rejects(
+      () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
+      (error: unknown) => error instanceof UnsupportedOperationError
+        && error.message.startsWith('no remote provider connectors are configured')
+        && error.message.includes('orgId'),
+    );
+    assert.equal(calls.length, 0);
+  });
+});
+
+test('the SDK store is held only to the contract it can satisfy', async () => {
+  // `loginCloud` has never written an expiry or an org. Requiring them here
+  // would retire a working login path rather than enforce anything.
+  await withStores(async ({ sdkDir }) => {
+    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({
+      baseUrl: 'https://history.agentrelay.com',
+      accessToken: 'rth_at_sdk',
+    }), { mode: 0o600 });
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth?.accessToken, 'rth_at_sdk');
   });
 
-  await withStores(async ({ nativeHome }) => {
-    // Sessions predating the expiry field carry no claim either way, and the
-    // SDK's own store has never written it. Absence must not read as expiry.
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_undated',
-    });
-    const undated = await resolveCloudSession();
-    assert.equal(undated.auth?.accessToken, 'rth_at_undated');
+  // A stated expiry is still honoured there when it is spent.
+  await withStores(async ({ sdkDir }) => {
+    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({
+      baseUrl: 'https://history.agentrelay.com',
+      accessToken: 'rth_at_sdk',
+      accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+    }), { mode: 0o600 });
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth, null);
   });
 });
 
@@ -443,7 +502,7 @@ test('a malformed stage file is skipped rather than failing every read', async (
     await writeStage(nativeHome, 'good', {
       base_url: 'https://history.agentrelay.com',
       access_token: 'rth_at_good',
-      access_token_expires_at: HOUR_AHEAD,
+      ...ELIGIBLE,
     });
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth?.accessToken, 'rth_at_good');
@@ -456,7 +515,7 @@ test('a stage path keeps its case while scheme and host are folded', async () =>
     await writeStage(nativeHome, 'stage', {
       base_url: 'https://History.AgentRelay.COM/Recall',
       access_token: 'rth_at_cased',
-      access_token_expires_at: HOUR_AHEAD,
+      ...ELIGIBLE,
     });
     const { impl, calls } = recordingFetch(() => jsonResponse(ENVELOPE));
     await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });

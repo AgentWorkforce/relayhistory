@@ -51,6 +51,13 @@ read first, then this SDK's own `~/.config/ai-hist/auth.json`. With more than
 one stage stored and no `AI_HIST_BASE_URL` naming one, the tool refuses to
 guess rather than answer about the wrong org.
 
+A native-store session must meet the same bar the engine's `cloud` connector
+applies to recall — an `rth_at_` access token, an expiry at least 60s away, and
+a recorded org for provenance. A session missing any of them is one the
+connector itself reports as unconfigured, so the tool reports it the same way
+and names the missing precondition rather than issuing a request that would
+fail. `ai-hist login` restores all three.
+
 `get_session_relationships` and `get_session_tree` read the delegation topology
 recorded by hydration and sync: who delegated to whom, what evidence
 established the link, whether the child has a stable identity, and whether its
