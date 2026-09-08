@@ -141,6 +141,28 @@ jobs:
         shell: bash
         run: docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work/crates/ai-hist-napi node:22-alpine node ../../scripts/verify-native-contract.mjs ./index.js
 
+      - name: Build CLI for Linux runtime smoke tests
+        if: matrix.test_glibc || matrix.test_musl
+        working-directory: sdk-ts
+        run: npm ci --ignore-scripts && npm run build
+
+      - name: Execute GNU CLI smoke tests on supported Linux runtimes
+        if: matrix.test_glibc
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Bookworm is explicit too: floating Node tags must not silently
+          # move the oldest Debian runtime covered by this gate.
+          for image in node:22-slim node:22 node:22-bookworm-slim ubuntu:22.04 ubuntu:24.04 node:22-trixie-slim; do
+            bash scripts/smoke-linux-native.sh "$image" local
+          done
+
+      - name: Execute musl CLI smoke test
+        if: matrix.test_musl
+        working-directory: .
+        run: bash scripts/smoke-linux-native.sh node:22-alpine local
+
       - uses: actions/upload-artifact@v4
         with:
           name: napi-${{ matrix.target }}
@@ -394,7 +416,7 @@ jobs:
           npm init -y
           node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
             "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
-          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/empty.db" --json
+          node "$GITHUB_WORKSPACE/scripts/smoke-native-cli.mjs" ./node_modules/ai-hist/dist/cli.js --prove-rejection
           timeout 2 ./node_modules/.bin/ai-hist-mcp </dev/null || test $? -eq 124
 
           NO_OPTIONAL=$(mktemp -d)
@@ -414,6 +436,17 @@ jobs:
               },
             );
           '
+
+      - name: Registry CLI smoke test on older glibc
+        if: ${{ !inputs.dry_run }}
+        working-directory: .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for image in node:22-bookworm-slim ubuntu:22.04; do
+            bash scripts/smoke-linux-native.sh "$image" registry "$VERSION"
+          done
 
       # The branch only advances once every package is published and the
       # registry smoke tests pass, so a failed release never persists its
