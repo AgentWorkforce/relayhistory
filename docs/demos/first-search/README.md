@@ -19,3 +19,15 @@ node scripts/verify-first-search.mjs /tmp/first-search
 The script packs the SDK with its release dependency, checks bin resolution and executable shebang, creates fresh containers, saves actual command output as asciinema v2 files, asserts the returned session identity/prompt, and fails when the after run exceeds 30 seconds.
 
 Play [before.cast](before.cast) or [after.cast](after.cast) with `asciinema play FILE`. Timings and command exit statuses are available as [before.json](before.json) and [after.json](after.json). The original cast events are unedited.
+
+## Watch in a browser
+
+[![Recorded first search](after-preview.svg)](https://asciinema.org/a/gBZPWgMLugWCA9Vo)
+
+[Before](https://asciinema.org/a/nrKYyxq4KdHEifdr) · [After](https://asciinema.org/a/gBZPWgMLugWCA9Vo)
+
+These anonymous hosted previews expire seven days after upload unless linked to
+an asciinema account. The original recordings, preview images and measurements
+are committed here permanently and can always be replayed locally.
+
+![Command comparison](preview.svg)

@@ -16,10 +16,11 @@ npx --yes ai-hist@latest sessions list --pretty
 release. Published `0.14.3` still needs `sessions discover` and
 `sessions hydrate SOURCE SESSION_ID` before searching a new index.
 
-[![Before and after: first local search](docs/demos/first-search/preview.svg)](docs/demos/first-search/README.md)
+[![Watch the actual first-search recording](docs/demos/first-search/after-preview.svg)](https://asciinema.org/a/gBZPWgMLugWCA9Vo)
 
-[Before recording](docs/demos/first-search/before.cast) ·
-[After recording](docs/demos/first-search/after.cast) ·
+[Watch before](https://asciinema.org/a/nrKYyxq4KdHEifdr) ·
+[Watch after](https://asciinema.org/a/gBZPWgMLugWCA9Vo) ·
+[Permanent recording files](docs/demos/first-search/README.md) ·
 [Reproduce the clean-container run](docs/demos/first-search/README.md)
 
 **Measured: 5.36 seconds to first search** in a fresh Node 22 / Debian Trixie
