@@ -294,9 +294,7 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
 /// Return an access token with at least 60 seconds of recorded validity remaining.
 /// Unknown legacy expiry is refreshed too: an opaque token cannot prove its own lifetime.
 pub fn access_token(base_url: Option<&str>) -> Result<String> {
-    let explicit_base = base_url
-        .map(|value| normalize_base_url(value).context("invalid relayhistory base URL"))
-        .transpose()?;
+    let explicit_base = base_url.map(normalized_stage).transpose()?;
     let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())

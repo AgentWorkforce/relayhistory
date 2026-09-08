@@ -140,6 +140,20 @@ fn unauthenticated_has_existing_error_and_empty_stdout() {
 }
 
 #[test]
+fn invalid_explicit_base_url_reports_rejected_value_and_expected_format() {
+    let home = tempfile::tempdir().unwrap();
+    let rejected = "not-a-url";
+    let err = failure(
+        &command(home.path())
+            .args(["--base-url", rejected])
+            .output()
+            .unwrap(),
+    );
+    assert!(err.contains(&format!("invalid relayhistory base URL `{rejected}`")));
+    assert!(err.contains("expected an absolute URL without credentials, query, or fragment"));
+}
+
+#[test]
 fn stage_selection_honors_explicit_url_then_environment_and_rejects_ambiguity() {
     let home = tempfile::tempdir().unwrap();
     let dev = "http://localhost:8787";
