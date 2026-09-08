@@ -1790,7 +1790,14 @@ pub struct SessionCatalogPage {
 /// Built in one place so the query-plan test asserts the plan of the statement
 /// that actually runs.
 fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source <> 'trajectory'");
+    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE ");
+    if options.scope == SessionScope::Local {
+        sql.push_str("source <> 'trajectory'");
+    } else {
+        // Local trajectories are derived artifacts; remotely recalled trajectory
+        // sessions are provider evidence and must survive cached remote/all reads.
+        sql.push_str("(source <> 'trajectory' OR EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote'))");
+    }
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     match options.scope {
         SessionScope::Local => sql.push_str(
@@ -2246,7 +2253,7 @@ fn select_providers(
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
             .iter()
-            .find(|entry| entry.source == source)
+            .find(|entry| entry.source == source && options.scope == SessionScope::Local)
         {
             anyhow::bail!(
                 "source '{}' is exempt from session discovery: {}",

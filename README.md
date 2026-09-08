@@ -54,14 +54,27 @@ not separate catalogs: every result comes from the same session ledger. Reads
 only filter that cached ledger. Remote discovery and remote sync run through
 provider connectors: `claude-web` lists your claude.ai/code web sessions using
 the OAuth sign-in the Claude Code CLI stored, and `codex-cloud` lists Codex
-cloud tasks through `codex cloud list --json`. A connector is configured when
-the provider's own CLI is signed in on this machine — see
+cloud tasks through `codex cloud list --json`. The `cloud` connector lists
+teammate sessions from RelayHistory using the stored `rth_at_` session from
+`ai-hist login`, with at least 60 seconds of recorded validity remaining. See
 [docs/remote-connectors.md](docs/remote-connectors.md). With no connector
 configured, remote-only acquisition returns an unsupported-operation error; it
 never silently falls back to local work. `--all` runs the local adapters plus
 every configured connector, and an acquisition summary reports the requested
 `scope` alongside the `locations_run` that actually executed. Each catalog
 row's `locations` array reports where that session was actually observed.
+
+| Remote connector | Source | Stored sign-in |
+|---|---|---|
+| `claude-web` | `claude` | Claude Code OAuth |
+| `codex-cloud` | `codex` | Codex CLI |
+| `cloud` | Upstream provider source; org-wide teammate sessions | RelayHistory `rth_at_` session under `RELAYHISTORY_HOME` (default `~/.agentworkforce/relayhistory`) |
+
+Cloud discovery records `cloud://<orgId>/<sessionId>` on the remote presence.
+An existing local natural key gains a remote presence, so `--all` returns it
+once. Cloud recall shares push's stage selection, credential refresh, and
+HTTPS-or-loopback guard. Discovery populates the cached session catalog;
+automatic cloud event ingestion is separate.
 
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.

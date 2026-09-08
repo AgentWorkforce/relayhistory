@@ -4,21 +4,22 @@ Remote acquisition (`sessions discover --remote`, `sync --remote`, and the
 remote half of `--all`) runs through provider connectors. A connector
 enumerates the sessions a provider keeps on its own service and lands them in
 the shared session ledger as catalog rows with a `remote` presence. There are
-two connectors:
+three connectors:
 
 | Connector | Source | Lists | Interface |
 |---|---|---|---|
 | `claude-web` | `claude` | Claude Code sessions on claude.ai/code | listing plus the CLI's private teleport-evidence interface, with its stored OAuth token |
 | `codex-cloud` | `codex` | Codex cloud tasks | `codex cloud list --json` and `codex cloud diff TASK_ID` |
+| `cloud` | Upstream source (`claude`, `codex`, `cursor`, `grok`, `relay`, `trajectory`, `opencode`) | Teammate sessions in the token’s organization | `GET /v1/sessions`, using the stored RelayHistory `rth_at_` session |
 
 Local and remote stay presences of one session ledger: a session observed
 both by a local file adapter and by a connector is one catalog row whose
 `locations` are `["local", "remote"]`.
 
-## Configuration is the provider CLI's sign-in
+## Configuration
 
-RelayHistory never runs an auth flow of its own. A connector is **configured**
-when the provider's own CLI has been signed in on this machine:
+The provider connectors use their CLI’s stored sign-in. The `cloud` connector
+reuses the RelayHistory session created by `ai-hist login`:
 
 - `claude-web` — `~/.claude/.credentials.json` exists (the claude.ai OAuth
   token the Claude Code CLI stores at sign-in). If your setup keeps
@@ -27,6 +28,33 @@ when the provider's own CLI has been signed in on this machine:
 - `codex-cloud` — `~/.codex/auth.json` exists (written by `codex login`).
   The `codex` binary must be on `PATH` when the connector runs; the CLI
   handles token refresh itself.
+- `cloud` — `cloud::config_dir()` (normally `~/.agentworkforce/relayhistory`,
+  overridden by `RELAYHISTORY_HOME`) resolves a stored `rth_at_` session with
+  `access_token_expires_at` at least 60 seconds in the future. This RFC 3339
+  expiry is persisted from the service's `accessTokenExpiresAt` during login,
+  mint, and refresh. Legacy auth without expiry remains usable for push, but
+  needs a fresh login/refresh before cloud discovery advertises availability.
+  Missing, malformed, expired, or ambiguous credentials report an unconfigured
+  reason; status probes never refresh or perform network requests.
+
+Cloud stage selection and credential loading live only in `cloud.rs`.
+`RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`; without an
+explicit override, a single stored stage is used and multiple stages require
+selection. The normal service URL is `https://history.agentrelay.com`.
+Non-loopback cleartext HTTP is refused, while `http://127.0.0.1:8787` is valid
+for development. Recall requests reuse auth refresh on HTTP 401, refuse
+redirects, and bound each response to 16 MiB and each request to 30 seconds.
+The client never sends an org/workspace selector: tenancy comes from the token.
+
+```bash
+ai-hist login
+ai-hist sessions discover --remote --source cursor
+ai-hist sync --all
+```
+
+Cloud is a connector, **not** a new `--source` value. Its adapters query each
+upstream source independently, preserving source filters and global recency
+ordering. Each source is limited to 100 pages of at most 100 sessions.
 
 Requesting `--remote` acquisition with no connector configured fails loudly
 with the same `no remote provider connectors are configured` error as before
@@ -47,7 +75,7 @@ CLI once refreshes it.
 `codex-cloud` pages through the CLI's listing window: `codex cloud list`
 accepts `--limit` values of 1–20, so the connector requests bounded pages and
 follows the returned `cursor` until the listing (or a requested row cap) is
-exhausted. Both connectors bound one enumeration to 100 pages (10,000 claude
+exhausted. The provider connectors bound one enumeration to 100 pages (10,000 claude
 sessions, 2,000 codex tasks) — bounded work is part of the discovery
 contract; a later run continues from fresher listings.
 
@@ -99,7 +127,9 @@ to fill the gap:
   human-readable identifier the listings offer. Both providers derive it from
   the opening prompt.
 - `raw_path` — the session/task URL (`https://claude.ai/code/<id>`, the
-  ChatGPT task URL).
+  ChatGPT task URL), or `cloud://<orgId>/<sessionId>` for cloud recall.
+  Cloud markers also live on the remote presence, preserving a local locator
+  when the same `(source, session_id)` already exists locally.
 - `repo_url` — for claude-web, the session's `git_repository` source when the
   service records one.
 - Timestamps — `created_at`/`last_event_at` (claude), `updated_at` (codex).
@@ -110,7 +140,9 @@ its available diff is indexed because no transcript export exists.
 
 ## Remote/local identity correlation
 
-Remote and local sessions remain separate rows. A Claude transcript containing
+Different remote and local session IDs remain separate rows. Identical
+`(source, session_id)` keys, including cloud copies of local sessions, have one
+canonical row with both local and remote presences. A Claude transcript containing
 the provider-recorded `remoteSessionId` creates a `materialized_local`
 relationship from the remote ID to the local session ID, but only when that
 exact remote presence already exists. Titles, repositories, prompts, and
@@ -130,6 +162,15 @@ adapters, per presence: the claude stamp tracks `last_event_at`, the codex
 stamp tracks `updated_at` plus task `status` (an applied or failed task whose
 timestamp did not move is still re-read). An unchanged remote session is
 served from the catalog with zero fresh work beyond the listing itself.
+Cloud stamps hash the recall rollup and provenance marker, so a changed summary,
+event count, or timestamp invalidates that presence's cache.
+
+Cloud discovery and sync populate shallow catalog rows. Cached list/search/recent/
+stats APIs retain their existing read semantics; this connector does not ingest
+normalized recall events into the local history tables. `cloud.rs` exposes the
+same authenticated page helper for `GET /v1/events` and
+`GET /v1/sessions/:sessionId/events`, but automatic event ingestion and cloud
+transcript hydration are separate work.
 
 ## Contract stability
 
