@@ -1406,6 +1406,36 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
   });
 }
 
+export interface FormatSessionRowOptions {
+  /** Opt in to ANSI colour. Default false for logs and SDK consumers. */
+  color?: boolean;
+  nowMs?: number;
+  maxPromptLength?: number;
+}
+
+/** Format a catalog session for a terminal without reading providers or the DB. */
+export function formatSessionRow(session: CatalogSession, options: FormatSessionRowOptions = {}): string {
+  const max = options.maxPromptLength ?? 96;
+  if (!Number.isInteger(max) || max < 1 || max > 1000) {
+    throw new InvalidArgumentError('maxPromptLength must be an integer between 1 and 1000', 'INVALID_ARGUMENT');
+  }
+  const clean = (value: string) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim();
+  const icons: Record<CatalogSource, string> = {
+    claude: '✦', codex: '◇', cursor: '▸', grok: '◉', relay: '↔', opencode: '⌘',
+  };
+  const ageMs = session.lastActivityMs === null ? null : Math.max(0, (options.nowMs ?? Date.now()) - session.lastActivityMs);
+  const age = ageMs === null ? 'unknown age' : ageMs < 60_000 ? 'just now'
+    : ageMs < 3_600_000 ? `${Math.floor(ageMs / 60_000)}m ago`
+    : ageMs < 86_400_000 ? `${Math.floor(ageMs / 3_600_000)}h ago`
+    : `${Math.floor(ageMs / 86_400_000)}d ago`;
+  const paint = (text: string, code: number) => options.color ? `\u001b[${code}m${text}\u001b[0m` : text;
+  const prompt = Array.from(clean(session.firstPrompt ?? '(no prompt)'));
+  const preview = prompt.length > max ? `${prompt.slice(0, max).join('')}…` : prompt.join('');
+  const locations = session.locations.length ? ` [${session.locations.join(',')}]` : '';
+  return `${paint(`${icons[session.source]} [${session.source}]`, 36)} ${paint(age, 2)}${locations}  `
+    + `${clean(session.sessionId)}  ${session.cwd ? `${clean(session.cwd)}  ` : ''}${preview}`;
+}
+
 export interface BootstrapLocalOptions {
   dbPath?: string;
   /** Maximum sessions to discover and index on first use. Default 20. */
