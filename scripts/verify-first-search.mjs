@@ -6,6 +6,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveImage } from './first-search-image.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const evidenceRoot = resolve(process.argv[2] ?? join(root, 'tmp', 'first-search'));
@@ -32,7 +33,7 @@ try {
   assert.ok(packed.files.some((file) => file.path === 'dist/cli.js'));
   assert.ok(readFileSync(join(stage, 'dist/cli.js'), 'utf8').startsWith('#!/usr/bin/env node'));
   cpSync(join(root, 'scripts/first-search-container.mjs'), join(stage, 'verify.mjs'));
-  const digest = run('docker', ['image', 'inspect', image, '--format', '{{index .RepoDigests 0}}']).trim();
+  const digest = resolveImage(run, image);
   writeFileSync(join(evidence, 'artifact.json'), JSON.stringify({
     version: pkg.version, integrity: packed.integrity, image: digest,
     revision: run('git', ['rev-parse', 'HEAD'], { cwd: root }).trim(),
