@@ -6,7 +6,7 @@ import {
   bootstrapLocal, discoverSessions, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
-  enableCloud,
+  enableCloud, accessToken, replay,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
   type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
@@ -17,7 +17,7 @@ type PackageMetadata = { version?: string };
 
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
-  'base-url', 'interval', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'base-url', 'interval', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
@@ -211,6 +211,8 @@ function usage(message?: string): never {
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
+  ai-hist token [--base-url URL]
+  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
@@ -533,6 +535,25 @@ async function main(): Promise<void> {
         : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.\n');
       if (result.status === 'partial') process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
     }
+    return;
+  }
+  if (command === 'token') {
+    validateFlags(args, 'token', ['base-url']);
+    rejectSurplusPositionals(args.positional.slice(1), 'token');
+    const token = await accessToken({ baseUrl: textFlag(args, 'base-url') });
+    if (process.stdout.isTTY) process.stderr.write('Warning: this access token is a secret and will remain in terminal scrollback.\n');
+    process.stdout.write(`${token}\n`);
+    return;
+  }
+  if (command === 'replay') {
+    validateFlags(args, 'replay', ['base-url', 'limit', 'max-content', 'json', 'out']);
+    if (!subcommand) usage('replay requires SESSION_ID');
+    rejectSurplusPositionals(rest, 'replay');
+    const result = await replay(subcommand, {
+      baseUrl: textFlag(args, 'base-url'), limit: nonNegativeIntFlag(args, 'limit'),
+      maxContent: nonNegativeIntFlag(args, 'max-content'), json, out: textFlag(args, 'out'),
+    });
+    if (result.transcript !== null) process.stdout.write(result.transcript);
     return;
   }
   if (command === 'enable-cloud') {

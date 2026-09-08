@@ -36,7 +36,7 @@ mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
-mod replay;
+pub mod replay;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env,

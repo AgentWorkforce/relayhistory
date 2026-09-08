@@ -31,7 +31,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 8;
+pub const NATIVE_CONTRACT_VERSION: u32 = 9;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -1576,6 +1576,61 @@ pub struct CloudOptions {
     pub base_url: Option<String>,
     pub relay_access_token: Option<String>,
     pub label: Option<String>,
+}
+
+#[napi]
+pub async fn access_token(base_url: Option<String>) -> napi::Result<String> {
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::access_token(base_url.as_deref())
+    })
+    .await
+    .map_err(worker_error)?
+    // access_token deliberately sanitizes refresh/parser errors. Preserve that
+    // boundary; do not attach the auth state or a server response to this error.
+    .map_err(|error| native_error("CLOUD_TOKEN_FAILED", format!("{error:#}")))
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct ReplayOptions {
+    pub base_url: Option<String>,
+    pub limit: Option<u32>,
+    pub max_content: Option<u32>,
+    pub json: Option<bool>,
+    pub out: Option<String>,
+}
+
+#[napi(object)]
+pub struct ReplayResult {
+    pub event_count: i64,
+    pub transcript: Option<String>,
+    pub output_path: Option<String>,
+}
+
+#[napi]
+pub async fn replay(
+    session_id: String,
+    options: Option<ReplayOptions>,
+) -> napi::Result<ReplayResult> {
+    let options = options.unwrap_or_default();
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::replay::replay(
+            &session_id,
+            options.base_url.as_deref(),
+            options.limit.map(|n| n as usize),
+            options.max_content.map(|n| n as usize),
+            options.json.unwrap_or(false),
+            options.out.as_deref().map(std::path::Path::new),
+        )
+    })
+    .await
+    .map_err(worker_error)?
+    .map(|result| ReplayResult {
+        event_count: result.event_count as i64,
+        transcript: result.transcript,
+        output_path: result.output_path,
+    })
+    .map_err(|error| native_error("CLOUD_REPLAY_FAILED", format!("{error:#}")))
 }
 
 #[napi(object)]

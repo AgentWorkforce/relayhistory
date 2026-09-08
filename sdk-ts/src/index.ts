@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 8;
+export const NATIVE_CONTRACT_VERSION = 9;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
@@ -493,6 +493,8 @@ export interface SyncResult { databasePath: string; scope: SessionScope; complet
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  accessToken(baseUrl?: string): Promise<string>;
+  replay(sessionId: string, options: ReplayOptions): Promise<ReplayResult>;
   createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;
   installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
   linkGitCommit(optionsJson: string): Promise<string>;
@@ -1523,6 +1525,36 @@ function shellQuote(value: string): string {
 export interface RelayhistoryAuth { baseUrl: string; accessToken: string; refreshToken?: string }
 export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
 export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
+/** Return a secret service token with at least 60 seconds of validity. Rust
+ * selects the stage, refreshes if needed and atomically saves rotated tokens. */
+export async function accessToken(options: { baseUrl?: string } = {}): Promise<string> {
+  return nativeCall((native) => native.accessToken(options.baseUrl));
+}
+
+export interface ReplayOptions {
+  baseUrl?: string;
+  /** Page size, not a total cap; Rust fetches every page in server order. */
+  limit?: number;
+  maxContent?: number;
+  /** Return the raw event array serialized as JSON instead of readable text. */
+  json?: boolean;
+  /** Atomically save in Rust after all pages succeed; transcript is then null. */
+  out?: string;
+}
+export interface ReplayResult { eventCount: number; transcript: string | null; outputPath: string | null }
+
+/** Fetch a cloud transcript without opening or importing into the local DB. */
+export async function replay(sessionId: string, options: ReplayOptions = {}): Promise<ReplayResult> {
+  for (const key of ['limit', 'maxContent'] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)) {
+      throw new InvalidArgumentError(`${key} must be an integer between 0 and 4294967295`, 'INVALID_ARGUMENT');
+    }
+  }
+  const result = await nativeCall((native) => native.replay(sessionId, options));
+  return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
+}
+
 export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
 export interface EnableCloudOptions extends CloudOptions {
   /** Keep syncing until stop() is called. Defaults to true. */
