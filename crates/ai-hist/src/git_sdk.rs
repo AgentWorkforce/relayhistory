@@ -84,25 +84,27 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
         serde_json::to_string(&options)?
     );
     fs::write(&script, body)?;
-    let existing = fs::read_to_string(&hook).unwrap_or_else(|_| "#!/bin/sh\n".into());
     let marker = "# ai-hist SDK hook";
-    if !existing.contains(marker) {
-        // Do not reinterpret a non-shell hook by appending shell syntax to it.
+    let backup = hook.with_file_name("post-commit.before-ai-hist");
+    let existing = fs::read_to_string(&hook).unwrap_or_default();
+    if !existing.is_empty() && !existing.contains(marker) {
         anyhow::ensure!(
-            existing.starts_with("#!/bin/sh")
-                || existing.starts_with("#!/bin/bash")
-                || existing.starts_with("#!/usr/bin/env bash"),
-            "post-commit is not a shell hook; refusing to modify it"
+            !backup.exists(),
+            "hook backup already exists; refusing to overwrite it"
         );
-        fs::write(
-            &hook,
-            format!(
-                "{existing}\n{marker}\n{} {} || echo 'ai-hist: commit linkage failed' >&2\n",
-                sh_single_quote(node),
-                sh_single_quote(&script.display().to_string())
-            ),
-        )?;
+        fs::rename(&hook, &backup)?;
     }
+    // Wrap the original instead of appending after a possible `exit 0`. Retain
+    // its interpreter and exit code, and record our link even if it exits early.
+    let previous = if backup.exists() {
+        format!(
+            "{} \"$@\"\nprevious_status=$?\n",
+            sh_single_quote(&backup.display().to_string())
+        )
+    } else {
+        "previous_status=0\n".to_string()
+    };
+    fs::write(&hook, format!("#!/bin/sh\n{marker}\n{previous}{} {} || echo 'ai-hist: commit linkage failed' >&2\nexit \"$previous_status\"\n", sh_single_quote(node), sh_single_quote(&script.display().to_string())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

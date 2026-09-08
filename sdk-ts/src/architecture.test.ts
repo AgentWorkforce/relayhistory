@@ -8,7 +8,7 @@ const sourceDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const repositoryRoot = join(sourceDir, '..', '..');
 
 test('production TypeScript has one native implementation', async () => {
-  const files = ['index.ts', 'cli.ts', 'mcp-server.ts'];
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'cloud-client.ts'];
   const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
   for (const forbidden of ['sql.js', 'node:child_process', 'AI_HIST_RUST_BIN', "fallback: 'jsonl'", 'readFile(dbPath)']) {
     assert.equal(source.includes(forbidden), false, `production source contains ${forbidden}`);
@@ -89,4 +89,11 @@ test('MCP evidence tools require both halves of a session identity', async () =>
     assert.match(registration, /after: EVIDENCE_CURSOR\.optional\(\)/, `${tool} paginates`);
     assert.match(registration, /READ/, `${tool} is a cache-only read`);
   }
+});
+
+
+test('cloud compatibility entrypoint delegates auth and transport to the SDK', async () => {
+  const source = await readFile(join(sourceDir, 'cloud-client.ts'), 'utf8');
+  assert.match(source, /from '\.\/index\.js'/);
+  assert.doesNotMatch(source, /fetch\(|writeFile|readFile|auth\.json|refreshToken:/);
 });
