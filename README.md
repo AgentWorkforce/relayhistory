@@ -3,6 +3,39 @@
 RelayHistory indexes coding-agent sessions from Claude Code, Codex, Cursor,
 Grok, OpenCode, and Agent Relay in a local SQLite database.
 
+Search the coding-agent conversation you remember, without installing a global CLI.
+With Node.js 20+ available, the first invocation prepares your local search index:
+
+```bash
+npx --yes ai-hist@latest
+npx --yes ai-hist@latest search "the feature I was working on"
+npx --yes ai-hist@latest sessions list --pretty
+```
+
+**Release note:** automatic bootstrap and `--pretty` are part of the next npm
+release. Published `0.14.3` still needs `sessions discover` and
+`sessions hydrate SOURCE SESSION_ID` before searching a new index.
+
+[![Before and after: first local search](docs/demos/first-search/preview.svg)](docs/demos/first-search/README.md)
+
+[Before recording](docs/demos/first-search/before.cast) ·
+[After recording](docs/demos/first-search/after.cast) ·
+[Reproduce the clean-container run](docs/demos/first-search/README.md)
+
+**Measured: 5.36 seconds to first search** in a fresh Node 22 / Debian Trixie
+arm64 container, with an empty npm cache and database and one fixture session.
+This includes npm dependency downloads and native indexing; the unreleased SDK
+tarball was mounted locally. Node installation and image pull are excluded.
+The published native addon does not load on Debian Bookworm arm64
+(`GLIBC_2.39` is required); see the recorded evidence above.
+
+Bare `ai-hist` discovers and indexes up to 20 local sessions when there are no
+searchable prompts. Existing indexes are ready immediately. Run `ai-hist sync`
+for a full refresh or `ai-hist --no-bootstrap` for a cache-only invocation.
+No local history yet? Start a coding-agent session and invoke `ai-hist` again.
+
+## Architecture
+
 Its production architecture has one implementation:
 
 ```text
@@ -95,6 +128,7 @@ ai-hist --version --no-warning
 
 ```ts
 import {
+  bootstrapLocal,
   discoverSessions,
   hydrateSession,
   listSessionCatalog,
@@ -105,6 +139,7 @@ import {
   sync,
 } from 'ai-hist';
 
+await bootstrapLocal(); // bounded first-use preparation; skips a searchable index
 await discoverSessions({ limit: 100, scope: 'local' });
 const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
 if (sessions[0]) {

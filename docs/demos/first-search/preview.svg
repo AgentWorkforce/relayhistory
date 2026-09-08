@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="310" viewBox="0 0 1000 310" role="img" aria-label="Actual first-search recordings: before needs discovery and hydration; after prepares the index automatically in 5.36 seconds">
+<rect width="1000" height="310" rx="12" fill="#10151b"/>
+<g font-family="monospace" font-size="16" fill="#d8e2eb">
+<text x="28" y="38" fill="#9aa7b4">BEFORE · npm 0.14.3</text>
+<text x="28" y="73">$ npx --yes ai-hist@0.14.3</text>
+<text x="28" y="101" fill="#ffc078">Usage: ... (exit 2)</text>
+<text x="28" y="137">$ ... sessions discover</text>
+<text x="28" y="173">$ ... sessions hydrate claude ...</text>
+<text x="28" y="209">$ ... search "zero friction needle"</text>
+<text x="28" y="266" fill="#9aa7b4">4 commands · 5.765s</text>
+<path d="M500 26V282" stroke="#33404b"/>
+<text x="528" y="38" fill="#9aa7b4">AFTER · proposed npm tarball</text>
+<text x="528" y="73">$ npx --yes --package=... -- ai-hist</text>
+<text x="528" y="101" fill="#91e7bc">Ready: 1 indexed prompt(s).</text>
+<text x="528" y="137">$ ... search "zero friction needle"</text>
+<text x="528" y="173" fill="#91e7bc">first-search-fixture ✓</text>
+<text x="528" y="237" fill="#9aa7b4">Fresh Node 22 / Linux arm64 container</text>
+<text x="528" y="266" fill="#91e7bc">2 commands · 5.360s</text>
+</g></svg>

@@ -1,0 +1,29 @@
+{
+  "mode": "before",
+  "elapsedMs": 5765,
+  "under30Seconds": true,
+  "node": "v22.23.2",
+  "platform": "linux-arm64",
+  "fixtureSessions": 1,
+  "emptyNpmCache": true,
+  "emptyDatabase": true,
+  "commands": [
+    {
+      "command": "npx --yes ai-hist@0.14.3",
+      "exitCode": 2
+    },
+    {
+      "command": "npx --yes ai-hist@0.14.3 sessions discover",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes ai-hist@0.14.3 sessions hydrate claude first-search-fixture",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes ai-hist@0.14.3 search zero friction needle --json",
+      "exitCode": 0
+    }
+  ],
+  "matchedSession": "first-search-fixture"
+}
