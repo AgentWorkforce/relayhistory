@@ -631,6 +631,13 @@ enum Command {
         #[arg(long, default_value = "local-dev")]
         label: String,
     },
+    /// Print the current access token alone (a secret); refresh it before expiry.
+    Token {
+        /// Select the cloud stage; defaults to RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL, then prod.
+        /// Required when multiple stages are configured and neither environment variable is set.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
     /// Fetch a cloud session transcript for offline reading (never imports into SQLite).
     Replay {
         session_id: String,
@@ -949,6 +956,16 @@ pub fn run() -> Result<()> {
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
     // wait on SQLite before contention is detected.
     match &cli.command {
+        Command::Token { base_url } => {
+            use std::io::IsTerminal;
+            let token = cloud::access_token(base_url.as_deref())?;
+            if std::io::stdout().is_terminal() {
+                eprintln!("Warning: this access token is a secret and will remain in terminal scrollback.");
+            }
+            // Write only after selection, refresh, persistence, and validation all succeed.
+            writeln!(std::io::stdout().lock(), "{token}")?;
+            return Ok(());
+        }
         // The common read-only path can create or migrate SQLite. A cloud replay must
         // also work on a fresh machine without creating a local history store.
         Command::Replay {
@@ -1007,6 +1024,7 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        Command::Token { .. } => unreachable!("token is dispatched before opening SQLite"),
         Command::Replay { .. } => unreachable!("replay is dispatched before opening SQLite"),
         Command::Search {
             scope,

@@ -291,6 +291,70 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     }
 }
 
+/// Return an access token with at least 60 seconds of recorded validity remaining.
+/// Unknown legacy expiry is refreshed too: an opaque token cannot prove its own lifetime.
+pub fn access_token(base_url: Option<&str>) -> Result<String> {
+    let explicit_base = base_url
+        .map(|value| normalize_base_url(value).context("invalid relayhistory base URL"))
+        .transpose()?;
+    let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find_map(|value| normalize_base_url(&value));
+    // Keep push's ambiguity error even though the fallback destination is production.
+    // JSON type errors can quote credential values from a malformed auth file.
+    let load = |base: Option<&str>| {
+        load_auth(base).map_err(|error| {
+            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                anyhow::anyhow!("could not parse stored relayhistory session; run `ai-hist login`")
+            } else {
+                error
+            }
+        })
+    };
+    let selected = explicit_base.or(env_base);
+    if selected.is_none() {
+        load(None)?;
+    }
+    let base = selected.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let mut auth = load(Some(&base))?
+        .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
+    if !token_has_valid_lifetime(&auth) {
+        let _refresh_lock = acquire_refresh_lock(&base)?;
+        auth = load(Some(&base))?
+            .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
+        if !token_has_valid_lifetime(&auth) {
+            // Never expose a server response or parser error here: either can echo secrets.
+            // The shared path retains its HTTPS/loopback guard and atomic rotation storage.
+            auth = refresh_and_save_auth(&auth).map_err(|_| {
+                anyhow::anyhow!("refreshing relayhistory session failed; run `ai-hist login` for the selected --base-url")
+            })?;
+        }
+    }
+    anyhow::ensure!(token_has_valid_lifetime(&auth),
+        "refreshed relayhistory access-token expiry is missing, invalid, or less than 60s away; run `ai-hist login`");
+    anyhow::ensure!(
+        auth.access_token.starts_with("rth_at_")
+            && auth.access_token.len() > "rth_at_".len()
+            && auth
+                .access_token
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic()),
+        "stored relayhistory session has an invalid access token; run `ai-hist login`"
+    );
+    Ok(auth.access_token)
+}
+
+fn token_has_valid_lifetime(auth: &StoredAuth) -> bool {
+    let expiry = auth
+        .access_token_expires_at
+        .as_deref()
+        .and_then(crate::parse_iso_ms);
+    expiry.is_some_and(|expiry| {
+        expiry >= chrono::Utc::now().timestamp_millis().saturating_add(60_000)
+    })
+}
+
 /// Store a session only under its base URL. If upgrading from the old one-file layout, preserve
 /// that old stage and cursor before adding the new one; overwriting it is exactly what caused
 /// cross-stage cursor corruption.
@@ -903,11 +967,17 @@ fn send_with_auth_refresh(
     {
         return Err(map_error(unauthorized));
     }
-    let refreshed = refresh_auth(&current).context("refreshing relayhistory session")?;
+    let refreshed = refresh_and_save_auth(&current)?;
+    send(&refreshed).map_err(|error| map_error(*error))
+}
+
+// Callers hold the stage refresh lock and reload the current pair before entering.
+fn refresh_and_save_auth(auth: &StoredAuth) -> Result<StoredAuth> {
+    let refreshed = refresh_auth(auth).context("refreshing relayhistory session")?;
     // Refresh tokens rotate and invalidate their predecessor. Persist the new pair atomically
     // before retrying so a crash or network failure cannot strand the client on the old token.
     save_auth(&refreshed).context("persisting refreshed relayhistory session")?;
-    send(&refreshed).map_err(|error| map_error(*error))
+    Ok(refreshed)
 }
 
 fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
