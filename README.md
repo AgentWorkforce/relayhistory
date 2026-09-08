@@ -91,6 +91,24 @@ ai-hist --version
 ai-hist --version --no-warning
 ```
 
+### Exporting a cloud access token (Rust CLI)
+
+After `ai-hist login` or `ai-hist admin-mint`, the Rust CLI can print the current
+access token for authenticated API calls:
+
+```bash
+export RTH_TOKEN=$(ai-hist token)
+curl -H "Authorization: Bearer $RTH_TOKEN" https://history.agentrelay.com/v1/sessions
+```
+
+`token` prints only the secret and a newline. It refreshes credentials with less
+than 60 seconds remaining (including missing or invalid expiry) before printing.
+Failures return a non-zero status with empty stdout. A terminal-only warning goes
+to stderr because running this command bare leaves the secret in scrollback.
+Select a stage with `--base-url <url>`, then `RELAYHISTORY_BASE_URL` or
+`AI_HIST_BASE_URL`; the fallback is production. With multiple stored stages and
+no explicit selection, it fails with the same ambiguity error as `push`.
+
 ## TypeScript
 
 ```ts
