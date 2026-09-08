@@ -3,7 +3,7 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  bootstrapLocal, discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  bootstrapLocal, discoverSessions, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
@@ -14,7 +14,7 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
@@ -196,7 +196,7 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json]
-  ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
+  ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
   ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
@@ -536,15 +536,23 @@ async function main(): Promise<void> {
   if (command === 'sessions' && subcommand === 'list') {
     validateFlags(args, 'sessions list', [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
-      'json', 'limit', 'local', 'remote', 'source',
+      'json', 'limit', 'local', 'pretty', 'remote', 'source',
     ]);
     rejectSurplusPositionals(rest, 'sessions list');
     const sources = textFlags(args, 'source');
-    output(await listSessionCatalogPage({
+    if (json && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
+    const page = await listSessionCatalogPage({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
       after: catalogCursorFlag(args),
-    }), json);
+    });
+    if (args.flags.has('pretty')) {
+      const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR === undefined;
+      process.stdout.write(page.sessions.length
+        ? `${page.sessions.map((session) => formatSessionRow(session, { color })).join('\n')}\n`
+        : 'No sessions in the catalog.\n');
+      if (page.nextCursor) process.stdout.write(`more available: --after '${JSON.stringify(page.nextCursor)}'\n`);
+    } else output(page, json);
     return;
   }
   if (command === 'sessions' && subcommand === 'discover') {
