@@ -1,0 +1,5 @@
+{"version":2,"width":110,"height":28,"timestamp":1788883119,"title":"ai-hist after: actual clean-container execution","env":{"TERM":"xterm-256color","SHELL":"/bin/sh"}}
+[0.0015654580000000352,"o","$ npx --yes --package=/artifact/ai-hist-0.14.3.tgz -- ai-hist\r\n"]
+[17.349991258000003,"o","Ready: 1 indexed prompt(s). Search with: ai-hist search \"your query\"\r\n"]
+[17.360017758,"o","$ npx --yes --package=/artifact/ai-hist-0.14.3.tgz -- ai-hist search zero friction needle --json\r\n"]
+[22.925483510000003,"o","[{\"id\":1,\"source\":\"claude\",\"session_id\":\"first-search-fixture\",\"project\":\"/work/demo\",\"prompt\":\"find the zero friction needle\",\"timestamp_ms\":1788861600000,\"locations\":[\"local\"]}]\r\n"]

@@ -1,0 +1,21 @@
+{
+  "mode": "after",
+  "elapsedMs": 22929,
+  "under30Seconds": true,
+  "node": "v22.23.2",
+  "platform": "linux-x64",
+  "fixtureSessions": 1,
+  "emptyNpmCache": true,
+  "emptyDatabase": true,
+  "commands": [
+    {
+      "command": "npx --yes --package=/artifact/ai-hist-0.14.3.tgz -- ai-hist",
+      "exitCode": 0
+    },
+    {
+      "command": "npx --yes --package=/artifact/ai-hist-0.14.3.tgz -- ai-hist search zero friction needle --json",
+      "exitCode": 0
+    }
+  ],
+  "matchedSession": "first-search-fixture"
+}

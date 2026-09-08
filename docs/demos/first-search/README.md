@@ -31,3 +31,13 @@ an asciinema account. The original recordings, preview images and measurements
 are committed here permanently and can always be replayed locally.
 
 ![Command comparison](preview.svg)
+
+## Evidence-isolation review rerun
+
+The updated verifier was rerun on 2026-09-08. It created a fresh `run-t4zLui`
+directory and completed first search in **22.929 seconds** in a fresh Node 22 /
+Trixie **Linux x64** container. The baseline took 35.131 seconds. This is a
+separate runtime/run from the original arm64 measurement above; its artifacts
+are preserved under [review-2026-09-08](review-2026-09-08/after.json), including
+the exact SDK integrity, image digest, commands, and recordings. The same
+Node/image-setup and locally mounted SDK-tarball timing qualifications apply.

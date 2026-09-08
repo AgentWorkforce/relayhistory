@@ -1,0 +1,7 @@
+{
+  "version": "0.14.3",
+  "integrity": "sha512-FZS8QekiO+euj9PJn51joaxOGZsPhuOwnPu4oUNiURJZi/Qxo2buTPBkP2UXRcAFntaY43o2dQmbhkCSxCvb4w==",
+  "image": "node@sha256:7b8a0c89c54499bee567618f96578e1a12a800f062fbdbfd1fb6a443fa6f6284",
+  "revision": "2ca03a8812b38910fde5831e9cae0d5f5e699885",
+  "timingScope": "Fresh container with Node/npm; empty npm cache and DB. Includes npm dependencies download, bootstrap, first search. SDK tarball mounted locally; image pull and Node installation excluded."
+}
