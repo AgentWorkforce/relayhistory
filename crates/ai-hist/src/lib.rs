@@ -7541,6 +7541,9 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
     if !root.exists() {
         return Ok(0);
     }
+    // Checkpoints are published for the whole source, so its writes must roll back
+    // together. Replaying committed prompts after a file's mtime changes can duplicate them.
+    let tx = conn.unchecked_transaction()?;
     let mut cursor_state = state
         .get("cursor")
         .and_then(Value::as_object)
@@ -7591,7 +7594,7 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
                         Ok(Some(prompt)) => {
                             // Failed writes must not publish a checkpoint past missing evidence.
                             inserted += insert_cursor_prompt(
-                                conn,
+                                &tx,
                                 prompt,
                                 &session_id,
                                 &project_path,
@@ -7612,6 +7615,7 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
             }
         }
     }
+    tx.commit()?;
     state.insert("cursor".to_string(), Value::Object(cursor_state));
     if files_seen > 0 {
         let suffix = if errors > 0 {
@@ -9692,15 +9696,34 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            2,
-            "the prompt before the failure is already committed"
+            1,
+            "failed sync must roll back new prompts and preserve the seed"
+        );
+
+        let failed_metadata = fs::metadata(&cursor).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","message":{{"content":"appended before retry"}}}}"#
+        )
+        .unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(failed_metadata.modified().unwrap() + Duration::from_secs(60)),
+        )
+        .unwrap();
+        drop(file);
+        assert_ne!(
+            super::modified_ms_of(&failed_metadata).unwrap(),
+            super::modified_ms_of(&fs::metadata(&cursor).unwrap()).unwrap(),
+            "retry must use a different timestamp in the history uniqueness key"
         );
 
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
             super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
-            2
+            4
         );
         assert_eq!(
             saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
@@ -9721,9 +9744,118 @@ mod tests {
             prompts,
             vec![
                 ("after failure".into(), 1),
+                ("appended before retry".into(), 1),
                 ("before failure".into(), 1),
                 ("rejected".into(), 1),
                 ("seed".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_sync_rolls_back_earlier_files_before_retrying_changed_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        let second = dir.path().join("P/agent-transcripts/s2/s2.jsonl");
+        for (path, prompts) in [
+            (&first, vec!["first file"]),
+            (
+                &second,
+                vec!["second before failure", "rejected", "second after failure"],
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = fs::File::create(path).unwrap();
+            for prompt in prompts {
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"role":"user","message":{"content":prompt}})
+                )
+                .unwrap();
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_cursor_prompt BEFORE INSERT ON history \
+             WHEN NEW.source = 'cursor' AND NEW.prompt = 'rejected' \
+             BEGIN SELECT RAISE(FAIL, 'forced Cursor write failure'); END;",
+        )
+        .unwrap();
+        let mut state = Map::new();
+        let saved = state.clone();
+        let error = super::sync_cursor(&conn, &mut state, dir.path())
+            .expect_err("the later file must fail the entire source");
+        assert!(format!("{error:#}").contains("forced Cursor write failure"));
+        assert_eq!(state, saved, "first failed sync must not publish any state");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "writes from both the earlier file and the failing file must roll back"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_presences", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "session presence writes must roll back with the evidence"
+        );
+
+        for (path, prompt) in [(&first, "first appended"), (&second, "second appended")] {
+            let failed_metadata = fs::metadata(path).unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({"role":"user","message":{"content":prompt}})
+            )
+            .unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(failed_metadata.modified().unwrap() + Duration::from_secs(60)),
+            )
+            .unwrap();
+            drop(file);
+            assert_ne!(
+                super::modified_ms_of(&failed_metadata).unwrap(),
+                super::modified_ms_of(&fs::metadata(path).unwrap()).unwrap()
+            );
+        }
+        conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
+            .unwrap();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            6
+        );
+        for path in [&first, &second] {
+            assert_eq!(
+                saved_cursor_offset(&state["cursor"][path.to_string_lossy().as_ref()]),
+                fs::metadata(path).unwrap().len()
+            );
+        }
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            0
+        );
+        let prompts: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, COUNT(*) FROM history GROUP BY prompt ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                ("first appended".into(), 1),
+                ("first file".into(), 1),
+                ("rejected".into(), 1),
+                ("second after failure".into(), 1),
+                ("second appended".into(), 1),
+                ("second before failure".into(), 1),
             ]
         );
     }
