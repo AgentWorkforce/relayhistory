@@ -60,10 +60,18 @@ jobs:
             test_native: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
             test_native: true
+            test_glibc: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
             test_native: true
+            test_glibc: true
+            # Zig 0.13 cannot link the Cortex-A53 flag emitted by Rust 1.98.
+            rust: 1.97.0
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
@@ -114,7 +122,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          # Match the official Node 20/22 glibc baseline, independent of runner OS.
+          if [ -n "${{ matrix.glibc }}" ]; then
+            npx napi build --platform --release --target "${{ matrix.target }}" --zig --zig-abi-suffix "${{ matrix.glibc }}"
+          elif [ "${{ matrix.cross }}" = "true" ]; then
             npx napi build --platform --release --target "${{ matrix.target }}" --zig
           else
             npx napi build --platform --release --target "${{ matrix.target }}"
