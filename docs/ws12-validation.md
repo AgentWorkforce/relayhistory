@@ -4,6 +4,42 @@ Drafts: https://github.com/AgentWorkforce/relayhistory/pull/117 and
 https://github.com/AgentWorkforce/relayhistory-cloud/pull/43. No merge or
 production deployment has been performed.
 
+## Added scope: npm token and replay
+
+The branch is rebased on published 0.15.0's source (`865a536`). It reuses #111's
+`cloud::access_token` and refactors the existing Rust replay entrypoint into a
+shared result-returning operation. NAPI contract **9** exposes both to the public
+async SDK (`accessToken`, `replay`) and the npm CLI (`token`, `replay`).
+
+Validation on code head `8969793`:
+
+- All 66 SDK tests passed after the rebase, including first-run bootstrap,
+  architecture constraints, the 525-record cloud fixture and both new commands.
+- Existing Rust integration suites passed: 11 token tests and 8 replay tests.
+  Workspace Clippy passed before the rebase; the rebase only brought forward
+  the release metadata and existing bootstrap behavior.
+- Fresh local npm tarballs for the SDK, native loader and Darwin ARM64 addon
+  were installed in an isolated directory. The command suite passed against
+  that installed artifact, including exact token stdout, proactive rotation,
+  redacted refresh/parser failures, explicit/environment stage selection and
+  ambiguity refusal, short-page pagination, opaque cursors, truncation markers,
+  repeated cursor rejection, and preservation of existing output on failure.
+- The same test suite now runs in CI's installed SDK/CLI smoke step against
+  Linux tarballs. Source and built addon agree on native contract 9.
+- Live dev, using the earlier isolated synthetic session's auth: the installed
+  npm `token --base-url https://dev.history.agentrelay.com` exited 0, returned
+  exactly one service-token line and emitted no stderr. The token was captured
+  in memory and was not printed in the validation log.
+- Installed npm `replay ws12-cloud-demo-1788873511810 --base-url
+  https://dev.history.agentrelay.com --limit 1 --json` exited 0 and returned all
+  three events, including exact prompt `prompt:1788873511858:558f0daa0735f957`.
+  It used the Rust pagination path and never imported into SQLite.
+
+These are locally built artifacts, not a new npm publication. Cloud PR #42's
+instructions become usable from the registry after the owner merges/releases
+the client. This lane has not merged or published anything. No additional
+sharing implementation was undertaken for this scope addition.
+
 ## Artifact and CI evidence
 
 - Native source, SDK and built addon agree on contract 8.
