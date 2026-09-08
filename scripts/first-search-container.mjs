@@ -21,9 +21,11 @@ const frames = [{ version: 2, width: 110, height: 28, timestamp: Math.floor(Date
   title: `ai-hist ${mode}: actual clean-container execution`, env: { TERM: 'xterm-256color', SHELL: '/bin/sh' } }];
 const commands = [];
 function execute(args, expected = 0) {
-  const displayed = `npx --yes ${artifact} ${args.join(' ')}`.trim();
+  const invocation = mode === 'before' ? ['--yes', artifact, ...args]
+    : ['--yes', `--package=${artifact}`, '--', 'ai-hist', ...args];
+  const displayed = `npx ${invocation.join(' ')}`;
   frames.push([(performance.now() - start) / 1000, 'o', `$ ${displayed}\r\n`]);
-  const result = spawnSync('npx', ['--yes', artifact, ...args], { env, encoding: 'utf8', timeout: 90_000 });
+  const result = spawnSync('npx', invocation, { env, encoding: 'utf8', timeout: 90_000 });
   commands.push({ command: displayed, exitCode: result.status });
   frames.push([(performance.now() - start) / 1000, 'o', (result.stdout + result.stderr).replace(/\r?\n/g, '\r\n')]);
   assert.equal(result.status, expected, result.stderr);
