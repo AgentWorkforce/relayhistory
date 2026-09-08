@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
@@ -33,6 +33,10 @@ pub struct StoredAuth {
     /// Base URL of the relayhistory-cloud service, e.g. `http://localhost:8787`.
     pub base_url: String,
     pub access_token: String,
+    /// Server-issued expiry (RFC 3339). Legacy sessions without this remain
+    /// usable by push, but cannot advertise recall availability until login/refresh.
+    #[serde(default, alias = "accessTokenExpiresAt")]
+    pub access_token_expires_at: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
     /// Local cache only — never authoritative; the server owns tenancy from the token.
@@ -924,6 +928,10 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
     Ok(StoredAuth {
         base_url: auth.base_url.clone(),
         access_token: field(&payload, "accessToken")?,
+        access_token_expires_at: payload
+            .get("accessTokenExpiresAt")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         refresh_token: Some(field(&payload, "refreshToken")?),
         org_id: auth.org_id.clone(),
         workspace_id: auth.workspace_id.clone(),
@@ -954,6 +962,10 @@ pub fn admin_mint(
     Ok(StoredAuth {
         base_url: base_url.trim_end_matches('/').to_string(),
         access_token: field(&v, "accessToken")?,
+        access_token_expires_at: v
+            .get("accessTokenExpiresAt")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         refresh_token: v
             .get("refreshToken")
             .and_then(|x| x.as_str())
@@ -984,6 +996,10 @@ pub fn login(
     Ok(StoredAuth {
         base_url: base_url.trim_end_matches('/').to_string(),
         access_token: field(&v, "accessToken")?,
+        access_token_expires_at: v
+            .get("accessTokenExpiresAt")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         refresh_token: v
             .get("refreshToken")
             .and_then(|x| x.as_str())
@@ -1135,6 +1151,112 @@ fn map_http_err(e: ureq::Error) -> anyhow::Error {
         }
         other => other.into(),
     }
+}
+
+/// Resolve recall credentials using the same stage selection and storage as push.
+/// This is read-only: status probes must never refresh, log in, or fail hard.
+pub fn recall_auth() -> Result<StoredAuth> {
+    let explicit_stage = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .iter()
+        .any(|key| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| normalize_base_url(&v))
+                .is_some()
+        });
+    let base = explicit_stage.then(default_base_url);
+    let auth = load_auth(base.as_deref())?
+        .context("no stored relayhistory session (run `ai-hist login`)")?;
+    require_secure_transport(&auth.base_url)?;
+    anyhow::ensure!(
+        auth.access_token.starts_with("rth_at_"),
+        "stored relayhistory session has no rth_at_ access token (run `ai-hist login`)"
+    );
+    let expiry = auth
+        .access_token_expires_at
+        .as_deref()
+        .and_then(crate::parse_iso_ms);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    anyhow::ensure!(expiry.is_some_and(|expiry| expiry >= now.saturating_add(60_000)),
+        "stored relayhistory access-token expiry is missing, invalid, or less than 60s away (run `ai-hist login`)");
+    // Recall rollups omit tenancy; the locally cached org is needed only for
+    // provenance markers, never sent to the service as an authorization selector.
+    anyhow::ensure!(
+        auth.org_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty()),
+        "stored cloud session has no orgId for provenance (run `ai-hist login`)"
+    );
+    Ok(auth)
+}
+
+/// Org-scoped recall endpoints. The service derives tenancy from the bearer;
+/// the client never supplies an org/workspace selector.
+pub enum RecallResource<'a> {
+    Sessions,
+    Events,
+    SessionEvents(&'a str),
+}
+
+/// Fetch one bounded recall page with the existing auth refresh and transport guard.
+/// Callers own pagination; opaque cursors are encoded by ureq, never concatenated.
+pub fn recall_page(
+    auth: &StoredAuth,
+    resource: RecallResource<'_>,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value> {
+    require_secure_transport(&auth.base_url)?;
+    anyhow::ensure!(
+        !query
+            .iter()
+            .any(|(key, _)| matches!(*key, "org_id" | "orgId" | "workspace_id" | "workspaceId")),
+        "recall tenancy comes from the token, not query parameters"
+    );
+    let path = match resource {
+        RecallResource::Sessions => "/v1/sessions".to_string(),
+        RecallResource::Events => "/v1/events".to_string(),
+        RecallResource::SessionEvents(id) => {
+            format!("/v1/sessions/{}/events", encode_path_segment(id))
+        }
+    };
+    let url = format!("{}{}", normalized_stage(&auth.base_url)?, path);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let response = send_with_auth_refresh(
+        auth,
+        |current| {
+            let mut request = agent
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(30))
+                .set("Authorization", &format!("Bearer {}", current.access_token));
+            for (key, value) in query {
+                request = request.query(key, value);
+            }
+            request.call().map_err(Box::new)
+        },
+        |error| match error {
+            ureq::Error::Status(code, _) => anyhow::anyhow!("recall request failed: HTTP {code}"),
+            other => other.into(),
+        },
+    )?;
+    anyhow::ensure!(
+        response.status() == 200,
+        "recall request failed: HTTP {}",
+        response.status()
+    );
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_BYTES,
+        "recall page exceeded the 16 MiB response-size limit"
+    );
+    serde_json::from_slice(&bytes).context("recall returned malformed JSON")
 }
 
 /// Fetch every page in the server's ascending `(ts, eventId)` order.
@@ -1691,7 +1813,7 @@ fn humanize_secs(secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ai_hist_core::{init_db, insert_history, HistoryEntry};
     use std::cell::RefCell;
@@ -1805,7 +1927,7 @@ mod tests {
 
     // RELAYHISTORY_HOME is process-global; serialize env-home tests so cargo's parallel
     // runner can't clobber it across tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1848,6 +1970,8 @@ mod tests {
     ) -> (String, std::collections::HashMap<String, String>, String) {
         use std::io::{BufRead, BufReader, Read};
 
+        // Accepted sockets inherit nonblocking mode on macOS.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -2286,6 +2410,7 @@ mod tests {
             let auth = StoredAuth {
                 base_url: "http://localhost:8787".into(),
                 access_token: "rth_at_x".into(),
+                access_token_expires_at: None,
                 refresh_token: Some("rth_rt_y".into()),
                 org_id: Some("org-a".into()),
                 workspace_id: None,
@@ -2312,6 +2437,7 @@ mod tests {
                         save_auth(&StoredAuth {
                             base_url: "http://localhost:8787".into(),
                             access_token: format!("rth_at_{writer}_{revision}"),
+                            access_token_expires_at: None,
                             refresh_token: Some(format!("rth_rt_{writer}_{revision}")),
                             ..Default::default()
                         })
@@ -2412,6 +2538,7 @@ mod tests {
             let auth = StoredAuth {
                 base_url: format!("http://{addr}"),
                 access_token: "rth_at_expired".into(),
+                access_token_expires_at: None,
                 refresh_token: Some("rth_rt_old".into()),
                 org_id: Some("org-a".into()),
                 workspace_id: Some("ws-a".into()),
@@ -2512,6 +2639,7 @@ mod tests {
             let auth = StoredAuth {
                 base_url: format!("http://{addr}"),
                 access_token: "rth_at_expired".into(),
+                access_token_expires_at: None,
                 refresh_token: Some("rth_rt_old".into()),
                 ..Default::default()
             };

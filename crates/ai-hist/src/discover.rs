@@ -1790,7 +1790,14 @@ pub struct SessionCatalogPage {
 /// Built in one place so the query-plan test asserts the plan of the statement
 /// that actually runs.
 fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE source <> 'trajectory'");
+    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE ");
+    if options.scope == SessionScope::Local {
+        sql.push_str("source <> 'trajectory'");
+    } else {
+        // Local trajectories are derived artifacts; remotely recalled trajectory
+        // sessions are provider evidence and must survive cached remote/all reads.
+        sql.push_str("(source <> 'trajectory' OR EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote'))");
+    }
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     match options.scope {
         SessionScope::Local => sql.push_str(
@@ -1850,9 +1857,9 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
 /// List the session catalog straight out of the database.
 ///
 /// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
-/// scan of `history` / `session_events` / `tool_calls`. `trajectory` rows are
-/// excluded defensively — trajectories are derived records, not sessions, and
-/// must never appear in a session list even if something wrote one.
+/// scan of `history` / `session_events` / `tool_calls`. Locally derived
+/// `trajectory` records are excluded. Remote/all scopes can include trajectory
+/// sessions with an explicitly observed remote presence from cloud recall.
 ///
 /// Rows come back in the catalog's total order:
 /// `(last_activity_ms DESC, source ASC, session_id ASC)`, with rows of unknown
@@ -2032,7 +2039,13 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
              ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
-         raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
+         raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
+             SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
+             AND p.session_id = sessions.session_id AND p.location = 'local') \
+             THEN COALESCE((SELECT p.raw_locator FROM session_presences p \
+                 WHERE p.source = sessions.source AND p.session_id = sessions.session_id \
+                 AND p.location = 'local'), sessions.raw_path, excluded.raw_path) \
+             ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
@@ -2087,6 +2100,38 @@ fn upsert_shallow_session_in_transaction(
     session: &ShallowSession,
     location: SessionLocation,
 ) -> Result<ShallowSession> {
+    if location == SessionLocation::Remote {
+        // Cache-only local reads classify a preexisting presence-less row as
+        // legacy local. Preserve that classification before adding the first
+        // remote presence, including the gap between a local full-session write
+        // and its separate presence write.
+        let legacy_local = conn
+            .prepare_cached(
+                "SELECT raw_path, source_stamp, discovery_state FROM sessions s \
+             WHERE source = ? AND session_id = ? AND NOT EXISTS ( \
+                 SELECT 1 FROM session_presences p WHERE p.source = s.source \
+                 AND p.session_id = s.session_id)",
+            )?
+            .query_row(params![session.source, session.session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .optional()?;
+        if let Some((raw_path, stamp, state)) = legacy_local {
+            upsert_session_presence(
+                conn,
+                &session.source,
+                &session.session_id,
+                SessionLocation::Local,
+                raw_path.as_deref(),
+                stamp.as_deref(),
+                state.as_deref(),
+            )?;
+        }
+    }
     // The presence lands first: the sessions upsert's RETURNING clause
     // computes `locations` from `session_presences`, so this run's own
     // presence must already be visible when the merged row is read back.
@@ -2117,6 +2162,12 @@ fn upsert_shallow_session_in_transaction(
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
+            // Remote provenance belongs on its presence; a local transcript
+            // remains the canonical raw path used by local readers and sync.
+            match location {
+                SessionLocation::Local => "local",
+                SessionLocation::Remote => "remote",
+            },
         ],
         row_to_session,
     )?;
@@ -2246,7 +2297,7 @@ fn select_providers(
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
             .iter()
-            .find(|entry| entry.source == source)
+            .find(|entry| entry.source == source && options.scope == SessionScope::Local)
         {
             anyhow::bail!(
                 "source '{}' is exempt from session discovery: {}",

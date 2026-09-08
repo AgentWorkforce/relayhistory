@@ -11868,6 +11868,8 @@ mod tests {
     fn read_request_line(stream: &mut std::net::TcpStream) -> String {
         use std::io::{BufRead, BufReader};
 
+        // Accepted sockets inherit nonblocking mode on macOS.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

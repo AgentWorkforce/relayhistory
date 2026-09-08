@@ -1,4 +1,4 @@
-//! Remote session connectors: claude.ai/code web sessions and Codex cloud tasks.
+//! Remote session connectors: provider surfaces and org-wide RelayHistory recall.
 //!
 //! A remote connector enumerates the sessions a provider keeps on its own
 //! service — Claude Code sessions running on claude.ai/code, Codex cloud
@@ -10,8 +10,8 @@
 //!
 //! # Capability boundary
 //!
-//! A connector is **configured** when the provider's own CLI has been signed
-//! in on this machine — RelayHistory never runs an auth flow of its own:
+//! Provider connectors use their CLI’s sign-in; cloud uses the RelayHistory
+//! session already created by `ai-hist login`. Discovery never starts a login flow:
 //!
 //! * `claude-web` — `~/.claude/.credentials.json` holds the claude.ai OAuth
 //!   token the Claude Code CLI stored at sign-in (override the path with
@@ -19,6 +19,8 @@
 //!   elsewhere, e.g. macOS keychain users who export a token file).
 //! * `codex-cloud` — `~/.codex/auth.json` exists (written by `codex login`),
 //!   and the `codex` CLI is invoked for the actual listing.
+//! * `cloud` — a stored RelayHistory session resolved by [`crate::cloud`],
+//!   with an `rth_at_` access token valid for at least another 60 seconds.
 //!
 //! Requesting `--remote` acquisition with no connector configured fails
 //! loudly, exactly as before connectors existed; `--all` runs whatever is
@@ -30,8 +32,9 @@
 //! invented to fill the gap. The provider's session/task *title* is stored as
 //! `first_prompt` — for both providers the title is derived from the opening
 //! prompt, and it is the only human-readable identifier the listing offers.
-//! Remote rows stay `discovery_state = "shallow"`; full remote transcript
-//! ingestion is a separate capability that has not shipped.
+//! Cloud uses the recall summary or task title and preserves the upstream source.
+//! Discovery rows stay `discovery_state = "shallow"`; transcript hydration is
+//! provider-specific and is not performed by cloud discovery.
 //!
 //! # Contract stability
 //!
@@ -59,10 +62,24 @@ use crate::discover::{
     excerpt, Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider,
 };
 
+/// Org-scoped recall resources, implemented in the shared cloud transport.
+pub use crate::cloud::RecallResource as CloudRecallResource;
+
+/// Read one recall page using the configured RelayHistory session. All token
+/// loading, stage selection, refresh, URL encoding and guards remain in cloud.rs.
+pub fn cloud_recall_page(
+    resource: CloudRecallResource<'_>,
+    query: &[(&str, &str)],
+) -> Result<Value> {
+    crate::cloud::recall_page(&crate::cloud::recall_auth()?, resource, query)
+}
+
 /// Connector name for the claude.ai/code web-session lister.
 pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
 /// Connector name for the Codex cloud task lister.
 pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
+/// Connector name for org-wide RelayHistory recall. This is not a source.
+pub const CLOUD_CONNECTOR: &str = "cloud";
 
 /// Most listing pages one enumeration may fetch, whatever the caller asked.
 const MAX_LIST_PAGES: usize = 100;
@@ -94,9 +111,9 @@ pub(crate) enum RemoteSessionEvidence {
 /// cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConnectorStatus {
-    /// Connector name (`claude-web`, `codex-cloud`).
+    /// Connector name (`claude-web`, `codex-cloud`, `cloud`).
     pub connector: &'static str,
-    /// The `SOURCE_CHOICES` source its sessions land under.
+    /// The upstream source, or `"*"` for a cross-source connector.
     pub source: &'static str,
     /// `true` when the provider CLI's stored sign-in was found.
     pub configured: bool,
@@ -121,6 +138,7 @@ fn codex_auth_path(home: &Path) -> PathBuf {
 pub fn remote_connector_statuses_at(home: &Path) -> Vec<RemoteConnectorStatus> {
     let claude_path = claude_credentials_path(home);
     let codex_path = codex_auth_path(home);
+    let cloud_auth = crate::cloud::recall_auth();
     vec![
         RemoteConnectorStatus {
             connector: CLAUDE_WEB_CONNECTOR,
@@ -148,6 +166,19 @@ pub fn remote_connector_statuses_at(home: &Path) -> Vec<RemoteConnectorStatus> {
                 )
             },
         },
+        RemoteConnectorStatus {
+            connector: CLOUD_CONNECTOR,
+            source: "*",
+            configured: cloud_auth.is_ok(),
+            detail: match cloud_auth {
+                Ok(auth) => format!(
+                    "RelayHistory session at {} ({})",
+                    crate::cloud::config_dir().display(),
+                    auth.base_url
+                ),
+                Err(error) => format!("{}: {error:#}", crate::cloud::config_dir().display()),
+            },
+        },
     ]
 }
 
@@ -167,7 +198,7 @@ pub(crate) fn unconfigured_message(operation: &str, statuses: &[RemoteConnectorS
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "remote session {operation} is not available: no remote provider connectors are configured ({reasons})"
+        "no remote provider connectors are configured: remote session {operation} is not available ({reasons})"
     )
 }
 
@@ -212,7 +243,11 @@ pub fn ensure_remote_connectors_configured_for_at(
     }
     let statuses: Vec<RemoteConnectorStatus> = remote_connector_statuses_at(home)
         .into_iter()
-        .filter(|status| sources.is_empty() || sources.iter().any(|s| s == status.source))
+        .filter(|status| {
+            status.connector == CLOUD_CONNECTOR
+                || sources.is_empty()
+                || sources.iter().any(|s| s == status.source)
+        })
         .collect();
     anyhow::ensure!(
         !statuses.is_empty(),
@@ -250,6 +285,13 @@ pub(crate) fn configured_remote_providers(
             Box::new(ExecCodexCli),
             limit,
         )));
+    }
+    if let Ok(auth) = crate::cloud::recall_auth() {
+        // One adapter per upstream source preserves the engine's source filters,
+        // diagnostics and global recency ordering without inventing a cloud source.
+        for source in SOURCE_CHOICES {
+            providers.push(Box::new(CloudProvider::new(auth.clone(), source, limit)));
+        }
     }
     providers
 }
@@ -1052,6 +1094,172 @@ impl ShallowSessionProvider for CodexCloudProvider {
             if done {
                 break;
             }
+        }
+        *self.fetched.lock().expect("remote connector row cache") = rows;
+        Ok(candidates)
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(take_fetched(&self.fetched, &candidate.locator))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cloud — org-wide recall, preserving the upstream provider's natural key
+// ---------------------------------------------------------------------------
+
+pub(crate) struct CloudProvider {
+    auth: crate::cloud::StoredAuth,
+    source: &'static str,
+    limit: Option<usize>,
+    fetched: FetchedRows,
+}
+
+impl CloudProvider {
+    fn new(auth: crate::cloud::StoredAuth, source: &'static str, limit: Option<usize>) -> Self {
+        Self {
+            auth,
+            source,
+            limit,
+            fetched: FetchedRows::default(),
+        }
+    }
+}
+
+fn map_cloud_session(value: &Value, org_id: &str) -> Result<(Candidate, ShallowSession)> {
+    let source = string_field(value, "source").context("cloud session omitted source")?;
+    let source = *SOURCE_CHOICES
+        .iter()
+        .find(|known| **known == source)
+        .with_context(|| format!("cloud returned unsupported source '{source}'"))?;
+    let id = string_field(value, "sessionId").context("cloud session omitted sessionId")?;
+    let locator = format!("cloud://{}/{}", urlencode(org_id), urlencode(&id));
+    let first_activity_ms = string_field(value, "firstTs")
+        .as_deref()
+        .and_then(crate::parse_iso_ms);
+    let last_activity_ms = string_field(value, "lastTs")
+        .as_deref()
+        .and_then(crate::parse_iso_ms);
+    // Include the full rollup, org and stage-independent locator: title/count changes
+    // invalidate the cache even when lastTs did not move.
+    let stamp = format!(
+        "cloud:{}:{:x}",
+        locator,
+        Sha256::digest(serde_json::to_vec(value)?)
+    );
+    let session = ShallowSession {
+        source: source.into(),
+        session_id: id.clone(),
+        first_prompt: string_field(value, "summary")
+            .or_else(|| string_field(value, "taskTitle"))
+            .map(|s| excerpt(&s)),
+        first_activity_ms,
+        last_activity_ms,
+        models: value
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        raw_path: Some(locator.clone()),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+    Ok((
+        Candidate {
+            source,
+            locator,
+            session_id: Some(id),
+            recency_hint_ms: last_activity_ms,
+            stamp,
+        },
+        session,
+    ))
+}
+
+impl ShallowSessionProvider for CloudProvider {
+    fn source(&self) -> &'static str {
+        self.source
+    }
+    fn location(&self) -> SessionLocation {
+        SessionLocation::Remote
+    }
+
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        if self.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let org_id = self
+            .auth
+            .org_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .context("stored cloud session has no orgId for provenance (run `ai-hist login`)")?;
+        let mut candidates = Vec::new();
+        let mut rows = BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        for _ in 0..MAX_LIST_PAGES {
+            let page_limit = self
+                .limit
+                .map(|limit| limit.saturating_sub(candidates.len()).clamp(1, 100))
+                .unwrap_or(100)
+                .to_string();
+            let mut query = vec![("source", self.source), ("limit", page_limit.as_str())];
+            if let Some(cursor) = cursor.as_deref() {
+                query.push(("cursor", cursor));
+            }
+            let payload = crate::cloud::recall_page(
+                &self.auth,
+                crate::cloud::RecallResource::Sessions,
+                &query,
+            )?;
+            let page = payload
+                .get("sessions")
+                .and_then(Value::as_array)
+                .context("cloud recall response has no sessions array")?;
+            for value in page {
+                let (candidate, session) = map_cloud_session(value, org_id)?;
+                anyhow::ensure!(
+                    candidate.source == self.source,
+                    "cloud recall returned a session outside the requested source"
+                );
+                if rows.insert(candidate.locator.clone(), session).is_none() {
+                    candidates.push(candidate);
+                }
+                if self.limit.is_some_and(|limit| candidates.len() >= limit) {
+                    break;
+                }
+            }
+            cursor = match payload.get("nextCursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+                _ => anyhow::bail!("cloud recall returned an invalid nextCursor"),
+            };
+            if cursor.is_none() || self.limit.is_some_and(|limit| candidates.len() >= limit) {
+                break;
+            }
+            anyhow::ensure!(
+                seen_cursors.insert(cursor.clone().unwrap()),
+                "cloud recall returned a repeated nextCursor"
+            );
+            // Catalog discovery is bounded sampling, not transcript hydration.
+            // Reaching the page cap keeps the fetched rows, like the other
+            // connectors; a malformed/repeated cursor still fails above.
         }
         *self.fetched.lock().expect("remote connector row cache") = rows;
         Ok(candidates)
