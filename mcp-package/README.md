@@ -11,12 +11,13 @@ loads the native addon directly, scans provider files, or invokes a CLI.
 
 Tools: `search_history`, `recent_history`, `list_sessions`,
 `discover_sessions`, `hydrate_session`, `get_session`, `get_session_events`,
-`get_session_relationships`, `get_session_tree`, `get_session_tool_calls`,
-`get_session_file_edits`, `history_stats`, and
+`get_session_relationships`, `get_session_tree`, `get_session_thread`,
+`get_session_tool_calls`, `get_session_file_edits`, `history_stats`, and
 `sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
 `scope` of `local`, `remote`, or `all`; scope defaults to `local`.
-`get_session`, `get_session_events`, `get_session_relationships`, and
-`get_session_tree` address one session by identity and take no `scope`.
+`get_session`, `get_session_events`, `get_session_relationships`,
+`get_session_tree`, and `get_session_thread` address one session by identity
+and take no `scope`.
 `get_session_tool_calls` and `get_session_file_edits` are bounded, cursor-paged
 reads that require both a `source` and a `session_id`, because provider session
 IDs collide.
@@ -30,6 +31,18 @@ sync tools are therefore annotated as open-world writes.
 `hydrate_session` is an idempotent write that fully indexes one previously
 discovered identity and optionally its related provider-native sessions from
 local provider evidence, so it stays annotated as a local, closed-world write.
+
+`get_session_thread` is the *lifecycle* fan-out for one session: the commits it
+shipped plus the pull requests, reviews, incidents, tickets, Slack threads,
+hotfixes and follow-up sessions the cloud has stitched to it. It complements
+`get_session_tree` — that one is the *subagent* fan-out — and an agent may call
+both. It is cloud-only and never cached: a thread exists once the cloud has
+ingested lens events, and it changes as PRs and incidents land, so every call
+fetches. With no stored cloud session it returns `UNSUPPORTED_OPERATION` with
+the same `no remote provider connectors are configured` message the sibling
+connectors use, without making a request. Tenancy is derived from the token
+server-side; there is no org parameter. `kinds` filters `link_kind`, `since`
+bounds link event time, and `cursor` pages through `nextCursor`.
 
 `get_session_relationships` and `get_session_tree` read the delegation topology
 recorded by hydration and sync: who delegated to whom, what evidence

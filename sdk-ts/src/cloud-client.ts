@@ -1,6 +1,10 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import {
+  AuthenticationExpiredError, ConnectorFailureError, InvalidArgumentError, SOURCES,
+  UnsupportedOperationError, isSource,
+} from './index.js';
 
 export interface RelayhistoryAuth {
   baseUrl: string;
@@ -87,4 +91,264 @@ export async function loginCloud(
   }
 
   return { ok: true, auth };
+}
+
+// ---------------------------------------------------------------------------
+// Session thread (SPEC §3.4 / §3.5)
+//
+// `get_session_thread` is the *lifecycle* fan-out for one session — the PRs,
+// reviews, commits, incidents, tickets, Slack threads, hotfixes and follow-up
+// sessions the cloud has stitched to it. It is cloud-only on purpose: a thread
+// exists only once the cloud has ingested lens events, so there is no local
+// fallback and no local cache. Threads change as PRs and incidents land, so
+// every call fetches.
+// ---------------------------------------------------------------------------
+
+/** The operation name the unsupported-operation message is phrased around. */
+const THREAD_OPERATION = 'thread';
+
+/**
+ * Query parameters that select tenancy. Tenancy is derived from the bearer
+ * token server-side; sending one of these would be a client asserting its own
+ * scope. Mirrors the guard in the Rust transport (`cloud::recall_page`).
+ */
+const TENANCY_PARAMS: ReadonlySet<string> = new Set([
+  'org_id', 'orgId', 'workspace_id', 'workspaceId',
+]);
+
+const DEFAULT_CLOUD_BASE_URL = 'https://history.agentrelay.com';
+
+/** Where the stored RelayHistory session lives for this process. */
+function relayhistoryConfigDir(): string {
+  return process.env.AI_HIST_CONFIG_DIR ?? join(homedir(), '.config', 'ai-hist');
+}
+
+/**
+ * A base URL reduced to the identity of its stage, so two spellings of one
+ * stage compare equal. Mirrors `cloud::normalized_stage`.
+ */
+function normalizeStage(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * The unsupported-operation message, in the shape the sibling remote
+ * connectors use.
+ *
+ * The leading phrase `no remote provider connectors are configured` is an
+ * explicit compatibility contract that callers and tests match on — see
+ * `crates/ai-hist/src/remote.rs::unconfigured_message`, whose format this
+ * reproduces for the one connector a thread can be served by (`cloud`).
+ */
+export function cloudUnconfiguredMessage(operation: string, detail: string): string {
+  return `no remote provider connectors are configured: remote session ${operation} is not available (cloud: ${detail})`;
+}
+
+/** Most `link_kind` values the recall route accepts in one `kinds` filter. */
+const MAX_THREAD_KINDS = 50;
+
+/** One lifecycle link, as the recall API returns it. */
+export interface SessionThreadLink {
+  linkKind: string;
+  linkRef: string;
+  linkUrl: string | null;
+  /** ISO 8601, up to six fractional digits. Null for undated links. */
+  linkTs: string | null;
+  metadata: unknown;
+  /** 0..1, converted server-side from stored basis points. */
+  confidence: number | null;
+}
+
+/** One shipped-commit outcome, as the recall API returns it. */
+export interface SessionThreadOutcome {
+  commitSha: string;
+  shippedAt: string | null;
+  reverted: boolean;
+  revertedBySha: string | null;
+  revertedAt: string | null;
+}
+
+/**
+ * The `GET /v1/sessions/:sessionId/thread` envelope. This is a description of
+ * what the recall API returns, not a normalization target: the envelope
+ * reaches the caller exactly as the service sent it, so a field this SDK build
+ * does not know about is passed through rather than dropped.
+ */
+export interface SessionThread {
+  session: {
+    source: string;
+    sessionId: string;
+    orgId: string;
+    workspaceId: string;
+    firstEventAt: string | null;
+    lastEventAt: string | null;
+  } | null;
+  outcomes: SessionThreadOutcome[];
+  links: SessionThreadLink[];
+  nextCursor: string | null;
+}
+
+export interface SessionThreadQuery {
+  /** Upstream source. Validated against this build's source list. */
+  source: string;
+  /** The session id. Carried in the path, never as a query parameter. */
+  sessionId: string;
+  /**
+   * Optional `link_kind` filter, at most {@link MAX_THREAD_KINDS} values. Sent
+   * comma-separated, as the route expects. Not validated against a fixed list:
+   * new lenses add kinds, and the route filters on whatever it is given.
+   */
+  kinds?: readonly string[];
+  /** Optional ISO 8601 lower bound. */
+  since?: string;
+  /** Opaque page cursor from a previous `nextCursor`. */
+  cursor?: string;
+}
+
+export interface SessionThreadOptions {
+  /** Overrides the stored session's base URL. */
+  baseUrl?: string;
+  /**
+   * The connector-status resolver: a stored RelayHistory session means the
+   * `cloud` connector is configured, its absence means it is not. Defaults to
+   * {@link loadStoredRelayhistoryAuth}.
+   */
+  loadAuth?: () => Promise<RelayhistoryAuth | null>;
+  /** HTTP transport. Defaults to the global `fetch`. */
+  fetchImpl?: typeof fetch;
+}
+
+function requireSecureTransport(baseUrl: string): void {
+  if (baseUrl.startsWith('https://')) return;
+  const authority = baseUrl.startsWith('http://') ? baseUrl.slice('http://'.length) : null;
+  const host = authority?.split('/')[0]?.split(':')[0]?.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1') return;
+  throw new ConnectorFailureError(
+    `refusing to send the relayhistory bearer token in cleartext to \`${baseUrl}\` — use an `
+      + 'https:// endpoint. Plain http:// is accepted only for loopback.',
+    'CONNECTOR_FAILURE',
+  );
+}
+
+/**
+ * Fetch one page of a session's lifecycle thread from the recall API.
+ *
+ * Cloud-only. When no RelayHistory session is stored the `cloud` connector is
+ * unconfigured and this throws {@link UnsupportedOperationError} *without
+ * performing a network call* — the same classification the native engine gives
+ * a remote-only request no connector can serve.
+ */
+export async function getSessionThread(
+  query: SessionThreadQuery,
+  opts: SessionThreadOptions = {},
+): Promise<SessionThread> {
+  // A misspelled source is an invalid argument, not an unsupported remote
+  // request — reject it with the engine's own message before classifying
+  // anything, exactly as `ensure_remote_connectors_configured_for_at` does.
+  if (!isSource(query.source)) {
+    throw new InvalidArgumentError(
+      `invalid source '${query.source}' (choose from ${SOURCES.join(', ')})`,
+      'INVALID_ARGUMENT',
+    );
+  }
+  if (typeof query.sessionId !== 'string' || query.sessionId.length === 0) {
+    throw new InvalidArgumentError('session_id must be a non-empty string', 'INVALID_ARGUMENT');
+  }
+  if (query.kinds && query.kinds.length > MAX_THREAD_KINDS) {
+    throw new InvalidArgumentError(
+      `kinds accepts at most ${MAX_THREAD_KINDS} values (got ${query.kinds.length})`,
+      'INVALID_ARGUMENT',
+    );
+  }
+
+  const loadAuth = opts.loadAuth ?? loadStoredRelayhistoryAuth;
+  const auth = await loadAuth();
+  if (!auth) {
+    throw new UnsupportedOperationError(
+      cloudUnconfiguredMessage(
+        THREAD_OPERATION,
+        `${relayhistoryConfigDir()}: no stored relayhistory session (run \`ai-hist login\`)`,
+      ),
+      'UNSUPPORTED_OPERATION',
+    );
+  }
+
+  // A stored session belongs to one stage. Honouring an explicit base URL that
+  // names a different stage would send this stage's bearer token to another
+  // host, which is what `cloud::load_auth`'s `same_stage` check refuses. A
+  // stage the stored session cannot serve is an unconfigured connector, not a
+  // request to attempt.
+  const stored = normalizeStage(auth.baseUrl ?? DEFAULT_CLOUD_BASE_URL);
+  const requested = opts.baseUrl ?? process.env.AI_HIST_BASE_URL;
+  if (requested !== undefined && normalizeStage(requested) !== stored) {
+    throw new UnsupportedOperationError(
+      cloudUnconfiguredMessage(
+        THREAD_OPERATION,
+        `${relayhistoryConfigDir()}: the stored relayhistory session is for ${stored}, not `
+          + `${normalizeStage(requested)} (run \`ai-hist login\`)`,
+      ),
+      'UNSUPPORTED_OPERATION',
+    );
+  }
+  const baseUrl = stored;
+  requireSecureTransport(baseUrl);
+
+  const params = new URLSearchParams();
+  params.set('source', query.source);
+  if (query.kinds?.length) params.set('kinds', query.kinds.join(','));
+  if (query.since) params.set('since', query.since);
+  if (query.cursor) params.set('cursor', query.cursor);
+  for (const key of params.keys()) {
+    // Defence in depth: tenancy comes from the token, never a query parameter.
+    if (TENANCY_PARAMS.has(key)) {
+      throw new InvalidArgumentError(
+        'recall tenancy comes from the token, not query parameters',
+        'INVALID_ARGUMENT',
+      );
+    }
+  }
+
+  const url = `${baseUrl}/v1/sessions/${encodeURIComponent(query.sessionId)}/thread?${params}`;
+  const doFetch = opts.fetchImpl ?? fetch;
+
+  let resp: Response;
+  try {
+    resp = await doFetch(url, {
+      headers: { Authorization: `Bearer ${auth.accessToken}`, Accept: 'application/json' },
+      // A redirect would carry the bearer token to whatever the hop names.
+      redirect: 'error',
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (cause) {
+    throw new ConnectorFailureError(
+      `cloud thread request failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      'CONNECTOR_FAILURE',
+      { cause },
+    );
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    throw new AuthenticationExpiredError(
+      `the stored relayhistory session was rejected (HTTP ${resp.status}); run \`ai-hist login\``,
+      'AUTHENTICATION_EXPIRED',
+    );
+  }
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new ConnectorFailureError(
+      `cloud thread request failed (HTTP ${resp.status}): ${text.slice(0, 200)}`,
+      'CONNECTOR_FAILURE',
+    );
+  }
+
+  try {
+    // Passed through unchanged: the recall API owns this shape.
+    return (await resp.json()) as SessionThread;
+  } catch (cause) {
+    throw new ConnectorFailureError(
+      'cloud thread response was not valid JSON',
+      'CONNECTOR_FAILURE',
+      { cause },
+    );
+  }
 }
