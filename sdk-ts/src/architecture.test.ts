@@ -97,3 +97,11 @@ test('cloud compatibility entrypoint delegates auth and transport to the SDK', a
   assert.match(source, /from '\.\/index\.js'/);
   assert.doesNotMatch(source, /fetch\(|writeFile|readFile|auth\.json|refreshToken:/);
 });
+
+test('token and replay SDK operations delegate to native code', async () => {
+  const source = await readFile(join(sourceDir, 'index.ts'), 'utf8');
+  const cloudCommands = source.slice(source.indexOf('export async function accessToken('), source.indexOf('export interface CloudOptions'));
+  assert.match(cloudCommands, /native\.accessToken\(/);
+  assert.match(cloudCommands, /native\.replay\(/);
+  assert.doesNotMatch(cloudCommands, /fetch\(|readFile|writeFile|auth\.json|nextCursor|refreshToken/);
+});

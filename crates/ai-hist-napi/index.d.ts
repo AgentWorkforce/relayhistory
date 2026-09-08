@@ -436,6 +436,20 @@ export interface CloudOptions {
   relayAccessToken?: string
   label?: string
 }
+export declare function accessToken(baseUrl?: string | undefined | null): Promise<string>
+export interface ReplayOptions {
+  baseUrl?: string
+  limit?: number
+  maxContent?: number
+  json?: boolean
+  out?: string
+}
+export interface ReplayResult {
+  eventCount: number
+  transcript?: string
+  outputPath?: string
+}
+export declare function replay(sessionId: string, options?: ReplayOptions | undefined | null): Promise<ReplayResult>
 export interface CloudAuth {
   baseUrl: string
   accessToken: string
