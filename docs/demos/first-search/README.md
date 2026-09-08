@@ -16,7 +16,7 @@ docker pull node:22-trixie-slim
 node scripts/verify-first-search.mjs /tmp/first-search
 ```
 
-The script packs the SDK with its release dependency, checks bin resolution and executable shebang, creates fresh containers, saves actual command output as asciinema v2 files, asserts the returned session identity/prompt, and fails when the after run exceeds 30 seconds.
+The script prints a fresh `run-*` subdirectory under the supplied output path for every attempt. It packs the SDK with its release dependency, checks bin resolution and executable shebang, creates fresh containers, saves actual command output as asciinema v2 files, asserts the returned session identity/prompt, and fails when the after run exceeds 30 seconds. Previous recordings are preserved separately; a failed attempt cannot inherit a previous run’s successful result files.
 
 Play [before.cast](before.cast) or [after.cast](after.cast) with `asciinema play FILE`. Timings and command exit statuses are available as [before.json](before.json) and [after.json](after.json). The original cast events are unedited.
 
