@@ -8,7 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const evidence = resolve(process.argv[2] ?? join(root, 'tmp', 'first-search'));
+const evidenceRoot = resolve(process.argv[2] ?? join(root, 'tmp', 'first-search'));
 const image = process.env.AI_HIST_TEST_IMAGE ?? 'node:22-trixie-slim';
 const stage = mkdtempSync(join(tmpdir(), 'ai-hist-pack-'));
 function run(command, args, options = {}) {
@@ -17,7 +17,10 @@ function run(command, args, options = {}) {
   return result.stdout;
 }
 try {
-  mkdirSync(evidence, { recursive: true });
+  mkdirSync(evidenceRoot, { recursive: true });
+  // Keep each attempt isolated, including failures and concurrent invocations.
+  const evidence = mkdtempSync(join(evidenceRoot, 'run-'));
+  process.stdout.write(`Evidence directory: ${evidence}\n`);
   const pkg = JSON.parse(readFileSync(join(root, 'sdk-ts/package.json'), 'utf8'));
   assert.equal(pkg.bin['ai-hist'], './dist/cli.js');
   pkg.dependencies['ai-hist-native'] = pkg.version;
