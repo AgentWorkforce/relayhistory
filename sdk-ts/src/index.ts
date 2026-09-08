@@ -1406,6 +1406,63 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
   });
 }
 
+export interface BootstrapLocalOptions {
+  dbPath?: string;
+  /** Maximum sessions to discover and index on first use. Default 20. */
+  limit?: number;
+}
+
+export interface BootstrapLocalResult {
+  status: 'ready' | 'empty' | 'partial';
+  alreadyIndexed: boolean;
+  indexedPrompts: number;
+  hydratedSessions: number;
+  discovery: DiscoverResult | null;
+  diagnostics: Array<{ source: string; sessionId: string; code: string; message: string }>;
+}
+
+/**
+ * Prepare a first local search with the native discovery and hydration APIs.
+ * Existing searchable databases are left alone; use sync() for a full refresh.
+ * Discovery is bounded and related sessions are excluded from first-touch work.
+ */
+export async function bootstrapLocal(options: BootstrapLocalOptions = {}): Promise<BootstrapLocalResult> {
+  const limit = options.limit ?? 20;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    throw new InvalidArgumentError('bootstrap limit must be an integer between 1 and 1000', 'INVALID_ARGUMENT');
+  }
+  const local = { dbPath: options.dbPath, scope: 'local' as const };
+  const existing = await stats(local);
+  if (existing.total > 0) {
+    return { status: 'ready', alreadyIndexed: true, indexedPrompts: existing.total,
+      hydratedSessions: 0, discovery: null, diagnostics: [] };
+  }
+  const discovery = await discoverSessions({ ...local, limit });
+  const diagnostics: BootstrapLocalResult['diagnostics'] = [];
+  let hydratedSessions = 0;
+  for (const session of discovery.sessions.slice(0, limit)) {
+    try {
+      const result = await hydrateSession({ ...local, source: session.source,
+        sessionId: session.sessionId, includeRelated: false });
+      hydratedSessions++;
+      if (result.capability !== 'full') {
+        diagnostics.push({ source: session.source, sessionId: session.sessionId,
+          code: 'CAPABILITY_LIMITED', message: `Provider exposes ${result.capability} evidence` });
+      }
+    } catch (error) {
+      if (!(error instanceof SessionSourceUnavailableError || error instanceof SessionSourceMismatchError
+        || error instanceof HydrationUnsupportedError || error instanceof HydrationFailedError)) throw error;
+      diagnostics.push({ source: session.source, sessionId: session.sessionId,
+        code: error.code, message: error.message });
+    }
+  }
+  const indexed = await stats(local);
+  const partial = diagnostics.length > 0 || discovery.diagnostics.length > 0
+    || discovery.providers.some((provider) => provider.failed);
+  return { status: partial ? 'partial' : indexed.total > 0 ? 'ready' : 'empty',
+    alreadyIndexed: false, indexedPrompts: indexed.total, hydratedSessions, discovery, diagnostics };
+}
+
 export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project' | 'locations'>): string | null {
   if (!entry.sessionId) return null;
   if (entry.locations.length > 0 && !entry.locations.includes('local')) return null;

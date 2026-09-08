@@ -3,7 +3,7 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  bootstrapLocal, discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
@@ -14,7 +14,7 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-related', 'no-warning', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
@@ -195,6 +195,7 @@ function output(value: unknown, json: boolean): void {
 function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
+  ai-hist [--no-bootstrap] [--db PATH] [--json]
   ai-hist sessions list [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
@@ -516,6 +517,22 @@ async function main(): Promise<void> {
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
+  if (command === undefined) {
+    validateFlags(args, 'ai-hist', ['db', 'json', 'no-bootstrap']);
+    if (args.flags.has('no-bootstrap')) {
+      output(await listSessionCatalogPage({ dbPath: textFlag(args, 'db') }), json);
+      return;
+    }
+    const result = await bootstrapLocal({ dbPath: textFlag(args, 'db') });
+    if (json) output(result, true);
+    else {
+      process.stdout.write(result.indexedPrompts > 0
+        ? `Ready: ${result.indexedPrompts} indexed prompt(s). Search with: ai-hist search "your query"\n`
+        : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.\n');
+      if (result.status === 'partial') process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
+    }
+    return;
+  }
   if (command === 'sessions' && subcommand === 'list') {
     validateFlags(args, 'sessions list', [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
