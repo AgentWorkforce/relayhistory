@@ -26,3 +26,12 @@ test('pretty rows handle absent/future dates and untrusted multiline provider te
   assert.match(formatSessionRow({ ...session, firstPrompt: '😀😀😀' }, { maxPromptLength: 2 }), /😀😀…$/);
   assert.throws(() => formatSessionRow(session, { maxPromptLength: 0 }), InvalidArgumentError);
 });
+
+test('pretty rows reject invalid clocks and handle provider rows received at runtime', () => {
+  for (const nowMs of [NaN, Infinity, -Infinity]) {
+    assert.throws(() => formatSessionRow(session, { nowMs }), InvalidArgumentError);
+  }
+  // Remote native catalogs may include trajectory even though local discovery excludes it.
+  const remote = { ...session, source: 'trajectory', locations: ['remote'] } as unknown as CatalogSession;
+  assert.match(formatSessionRow(remote), /↗ \[trajectory\].*\[remote\]/);
+});

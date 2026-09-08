@@ -1415,13 +1415,16 @@ export interface FormatSessionRowOptions {
 
 /** Format a catalog session for a terminal without reading providers or the DB. */
 export function formatSessionRow(session: CatalogSession, options: FormatSessionRowOptions = {}): string {
+  if (options.nowMs !== undefined && !Number.isFinite(options.nowMs)) {
+    throw new InvalidArgumentError('nowMs must be finite', 'INVALID_ARGUMENT');
+  }
   const max = options.maxPromptLength ?? 96;
   if (!Number.isInteger(max) || max < 1 || max > 1000) {
     throw new InvalidArgumentError('maxPromptLength must be an integer between 1 and 1000', 'INVALID_ARGUMENT');
   }
   const clean = (value: string) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim();
-  const icons: Record<CatalogSource, string> = {
-    claude: '✦', codex: '◇', cursor: '▸', grok: '◉', relay: '↔', opencode: '⌘',
+  const icons: Record<Source, string> = {
+    claude: '✦', codex: '◇', cursor: '▸', grok: '◉', relay: '↔', opencode: '⌘', trajectory: '↗',
   };
   const ageMs = session.lastActivityMs === null ? null : Math.max(0, (options.nowMs ?? Date.now()) - session.lastActivityMs);
   const age = ageMs === null ? 'unknown age' : ageMs < 60_000 ? 'just now'
@@ -1432,7 +1435,7 @@ export function formatSessionRow(session: CatalogSession, options: FormatSession
   const prompt = Array.from(clean(session.firstPrompt ?? '(no prompt)'));
   const preview = prompt.length > max ? `${prompt.slice(0, max).join('')}…` : prompt.join('');
   const locations = session.locations.length ? ` [${session.locations.join(',')}]` : '';
-  return `${paint(`${icons[session.source]} [${session.source}]`, 36)} ${paint(age, 2)}${locations}  `
+  return `${paint(`${icons[session.source] ?? '•'} [${clean(session.source)}]`, 36)} ${paint(age, 2)}${locations}  `
     + `${clean(session.sessionId)}  ${session.cwd ? `${clean(session.cwd)}  ` : ''}${preview}`;
 }
 
