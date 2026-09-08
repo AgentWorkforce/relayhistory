@@ -131,6 +131,26 @@ jobs:
             npx napi build --platform --release --target "${{ matrix.target }}"
           fi
 
+      - name: Enforce GNU artifact glibc ceiling
+        if: matrix.test_glibc
+        shell: bash
+        env:
+          GLIBC_FLOOR: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          # Inspect the produced ELF, so compiler/toolchain changes cannot
+          # silently raise the floor even when newer runtime tests pass.
+          readelf --version-info ./*.node > /tmp/addon-versions.txt
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          versions = {tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+(?:\.\d+)?)', Path('/tmp/addon-versions.txt').read_text())}
+          floor = tuple(map(int, os.environ['GLIBC_FLOOR'].split('.')))
+          if not versions or max(versions) > floor:
+              raise SystemExit(f'Invalid glibc requirements: {sorted(versions)}; ceiling={floor}')
+          print(f'Maximum required glibc: {".".join(map(str, max(versions)))}')
+          PY
+
       - name: Execute native contract smoke test
         if: matrix.test_native
         shell: bash
