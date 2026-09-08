@@ -1182,6 +1182,14 @@ pub fn recall_auth() -> Result<StoredAuth> {
         .as_millis() as i64;
     anyhow::ensure!(expiry.is_some_and(|expiry| expiry >= now.saturating_add(60_000)),
         "stored relayhistory access-token expiry is missing, invalid, or less than 60s away (run `ai-hist login`)");
+    // Recall rollups omit tenancy; the locally cached org is needed only for
+    // provenance markers, never sent to the service as an authorization selector.
+    anyhow::ensure!(
+        auth.org_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty()),
+        "stored cloud session has no orgId for provenance (run `ai-hist login`)"
+    );
     Ok(auth)
 }
 

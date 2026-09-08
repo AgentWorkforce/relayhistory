@@ -1857,9 +1857,9 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
 /// List the session catalog straight out of the database.
 ///
 /// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
-/// scan of `history` / `session_events` / `tool_calls`. `trajectory` rows are
-/// excluded defensively — trajectories are derived records, not sessions, and
-/// must never appear in a session list even if something wrote one.
+/// scan of `history` / `session_events` / `tool_calls`. Locally derived
+/// `trajectory` records are excluded. Remote/all scopes can include trajectory
+/// sessions with an explicitly observed remote presence from cloud recall.
 ///
 /// Rows come back in the catalog's total order:
 /// `(last_activity_ms DESC, source ASC, session_id ASC)`, with rows of unknown
@@ -2039,7 +2039,13 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
              ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
-         raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
+         raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
+             SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
+             AND p.session_id = sessions.session_id AND p.location = 'local') \
+             THEN COALESCE((SELECT p.raw_locator FROM session_presences p \
+                 WHERE p.source = sessions.source AND p.session_id = sessions.session_id \
+                 AND p.location = 'local'), sessions.raw_path, excluded.raw_path) \
+             ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
@@ -2124,6 +2130,12 @@ fn upsert_shallow_session_in_transaction(
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
+            // Remote provenance belongs on its presence; a local transcript
+            // remains the canonical raw path used by local readers and sync.
+            match location {
+                SessionLocation::Local => "local",
+                SessionLocation::Remote => "remote",
+            },
         ],
         row_to_session,
     )?;

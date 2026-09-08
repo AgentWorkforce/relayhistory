@@ -35,7 +35,9 @@ reuses the RelayHistory session created by `ai-hist login`:
   mint, and refresh. Legacy auth without expiry remains usable for push, but
   needs a fresh login/refresh before cloud discovery advertises availability.
   Missing, malformed, expired, or ambiguous credentials report an unconfigured
-  reason; status probes never refresh or perform network requests.
+  reason; status probes never refresh or perform network requests. The stored
+  session must also have a non-empty cached `org_id` to construct provenance
+  markers; missing org metadata reports unconfigured before discovery.
 
 Cloud stage selection and credential loading live only in `cloud.rs`.
 `RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`; without an
@@ -54,7 +56,9 @@ ai-hist sync --all
 
 Cloud is a connector, **not** a new `--source` value. Its adapters query each
 upstream source independently, preserving source filters and global recency
-ordering. Each source is limited to 100 pages of at most 100 sessions.
+ordering. Each source is limited to 100 pages of at most 100 sessions. Reaching
+that cap retains the fetched catalog rows; malformed or repeated cursors still
+fail rather than silently accepting an invalid listing.
 
 Requesting `--remote` acquisition with no connector configured fails loudly
 with the same `no remote provider connectors are configured` error as before

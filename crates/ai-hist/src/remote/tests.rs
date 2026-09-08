@@ -1097,7 +1097,9 @@ fn cloud_http(pages: Vec<(u16, Value)>) -> (String, std::thread::JoinHandle<Vec<
             let mut body_bytes = vec![0; content_length];
             reader.read_exact(&mut body_bytes).unwrap();
             assert!(
-                !request.contains("org_id=") && !request.contains("orgId="),
+                !["org_id=", "orgId=", "workspace_id=", "workspaceId="]
+                    .iter()
+                    .any(|selector| request.contains(selector)),
                 "{request}"
             );
             let body = body.to_string();
@@ -1217,6 +1219,26 @@ fn cloud_teleport_adds_second_presence_and_keeps_local_evidence() {
         )
         .unwrap();
     assert_eq!(cwd, "/work/repo");
+    let raw_path: String = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE source='codex' AND session_id='teleport-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_path, "/local/rollout.jsonl");
+    for scope in [SessionScope::Local, SessionScope::Remote, SessionScope::All] {
+        let rows = list_session_catalog(
+            &conn,
+            &CatalogListOptions {
+                scope,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].raw_path.as_deref(), Some("/local/rollout.jsonl"));
+    }
     conn.execute(
         "DELETE FROM sessions WHERE source='codex' AND session_id='teleport-1'",
         [],
@@ -1229,7 +1251,7 @@ fn cloud_teleport_adds_second_presence_and_keeps_local_evidence() {
     );
     server.join().unwrap();
     println!(
-        "teleport session_presences: {presences:?}; canonical deletion cleaned both presences"
+        "teleport session_presences: {presences:?}; canonical raw_path={raw_path}; canonical deletion cleaned both presences"
     );
 }
 
@@ -1525,4 +1547,82 @@ fn cloud_login_preserves_server_expiry_for_connector_availability() {
         Some("2100-01-01T00:00:00Z")
     );
     assert!(server.join().unwrap()[0].starts_with("POST /v1/cli/login "));
+}
+
+#[test]
+fn cloud_page_cap_retains_bounded_catalog_results() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let pages = (0..MAX_LIST_PAGES)
+        .map(|index| {
+            let mut page = cloud_listing("cursor", &format!("bounded-{index}"));
+            page["nextCursor"] = Value::String(format!("next-{}", index + 1));
+            (200, page)
+        })
+        .collect();
+    let (base, server) = cloud_http(pages);
+    crate::cloud::save_auth(&cloud_auth(&base)).unwrap();
+    let conn = catalog();
+    let options = DiscoverOptions {
+        scope: SessionScope::Remote,
+        sources: vec!["cursor".into()],
+        ..Default::default()
+    };
+    let summary =
+        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
+            .unwrap();
+    assert_eq!(summary.discovered, MAX_LIST_PAGES);
+    assert!(summary.diagnostics.is_empty());
+    let rows = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            scope: SessionScope::Remote,
+            limit: Some(200),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rows.len(), MAX_LIST_PAGES);
+    assert_eq!(server.join().unwrap().len(), MAX_LIST_PAGES);
+    println!(
+        "page cap: {} HTTP pages, {} retained remote catalog rows",
+        MAX_LIST_PAGES,
+        rows.len()
+    );
+}
+
+#[test]
+fn cloud_status_requires_cached_org_for_provenance() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    for org_id in [None, Some(""), Some("   ")] {
+        let mut auth = cloud_auth("https://history.agentrelay.com");
+        auth.org_id = org_id.map(String::from);
+        crate::cloud::save_auth(&auth).unwrap();
+        let status = remote_connector_statuses_at(home.path())
+            .into_iter()
+            .find(|s| s.connector == CLOUD_CONNECTOR)
+            .unwrap();
+        assert!(!status.configured);
+        assert!(status.detail.contains("no orgId for provenance"));
+        assert!(configured_remote_providers(home.path(), None).is_empty());
+    }
+}
+
+#[test]
+fn cloud_recall_rejects_all_tenancy_query_selectors_before_network() {
+    let _isolated = without_credentials_override();
+    let auth = cloud_auth("http://127.0.0.1:1");
+    for selector in ["org_id", "orgId", "workspace_id", "workspaceId"] {
+        let error = crate::cloud::recall_page(
+            &auth,
+            crate::cloud::RecallResource::Sessions,
+            &[(selector, "forged")],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("tenancy comes from the token"),
+            "{error}"
+        );
+    }
 }

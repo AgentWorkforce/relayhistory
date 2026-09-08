@@ -1213,7 +1213,7 @@ impl ShallowSessionProvider for CloudProvider {
         let mut rows = BTreeMap::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = std::collections::HashSet::new();
-        for page_index in 0..MAX_LIST_PAGES {
+        for _ in 0..MAX_LIST_PAGES {
             let page_limit = self
                 .limit
                 .map(|limit| limit.saturating_sub(candidates.len()).clamp(1, 100))
@@ -1257,10 +1257,9 @@ impl ShallowSessionProvider for CloudProvider {
                 seen_cursors.insert(cursor.clone().unwrap()),
                 "cloud recall returned a repeated nextCursor"
             );
-            anyhow::ensure!(
-                page_index + 1 < MAX_LIST_PAGES,
-                "cloud recall exceeded the 100-page limit; narrow the request"
-            );
+            // Catalog discovery is bounded sampling, not transcript hydration.
+            // Reaching the page cap keeps the fetched rows, like the other
+            // connectors; a malformed/repeated cursor still fails above.
         }
         *self.fetched.lock().expect("remote connector row cache") = rows;
         Ok(candidates)
