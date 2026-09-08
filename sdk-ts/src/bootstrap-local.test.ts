@@ -4,11 +4,12 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { bootstrapLocal, InvalidArgumentError } from './index.js';
 
 const run = promisify(execFile);
-const cli = new URL('./cli.js', import.meta.url).pathname;
+const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
 const sdk = new URL('./index.js', import.meta.url).href;
 
 test('bootstrap validates its work budget before loading native code', async () => {
