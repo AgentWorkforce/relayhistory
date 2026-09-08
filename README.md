@@ -113,6 +113,13 @@ automatic cloud event ingestion is separate.
 No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
 binary download is used.
 
+### Homebrew
+
+The [ai-hist tap formula](https://github.com/AgentWorkforce/homebrew-ai-hist/pull/1)
+is proposed separately. After it lands, run `brew tap AgentWorkforce/ai-hist`,
+then `brew install ai-hist`. The formula packages the current npm release and
+its native addon; the bootstrap flow above requires the upcoming release.
+
 ### Checking your version
 
 `ai-hist --version` prints the installed npm package version. In an interactive
