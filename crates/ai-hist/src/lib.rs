@@ -23,7 +23,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-mod cloud;
+pub mod cloud;
 mod codex;
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
 /// listing that backs it.

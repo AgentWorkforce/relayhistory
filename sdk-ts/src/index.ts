@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 7;
+export const NATIVE_CONTRACT_VERSION = 8;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
@@ -493,6 +493,10 @@ export interface SyncResult { databasePath: string; scope: SessionScope; complet
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
+  cloudLogin(options: object): Promise<RelayhistoryAuth>;
+  enableCloud(options: object): Promise<CloudPushResult>;
+  pushCloud(options: object): Promise<CloudPushResult>;
   nativeContractVersion(): number;
   nativeBuildProfile?(): string;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
@@ -1511,4 +1515,65 @@ export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' |
 
 function shellQuote(value: string): string {
   return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export interface RelayhistoryAuth { baseUrl: string; accessToken: string; refreshToken?: string }
+export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
+export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
+export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
+export interface EnableCloudOptions extends CloudOptions {
+  /** Keep syncing until stop() is called. Defaults to true. */
+  watch?: boolean;
+  intervalMs?: number;
+  onPush?: (result: CloudPushResult) => void;
+  onError?: (error: unknown) => void;
+}
+export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
+
+/** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
+export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
+  return nativeCall((native) => native.cloudLoadAuth(baseUrl));
+}
+
+export async function loginCloud(relayAccessToken: string, options: { baseUrl?: string; label?: string } = {}): Promise<LoginCloudResult> {
+  try {
+    const auth = await nativeCall((native) => native.cloudLogin({ ...options, relayAccessToken }));
+    return { ok: true, auth };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export async function pushCloud(options: CloudOptions = {}): Promise<CloudPushResult> {
+  return nativeCall((native) => native.pushCloud(options));
+}
+
+/** Device login, service-token exchange and first push run in Rust. The optional
+ * loop is host orchestration only: no token, refresh, stage or cursor logic in JS.
+ * The loop remains in this process; await stop() before shutdown. */
+export async function enableCloud(options: EnableCloudOptions = {}): Promise<CloudHandle> {
+  const intervalMs = options.intervalMs ?? 60_000;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 2_147_483_647) {
+    throw new InvalidArgumentError('intervalMs must be an integer between 1000 and 2147483647', 'INVALID_ARGUMENT');
+  }
+  const first = await nativeCall((native) => native.enableCloud(options));
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: Promise<void> = Promise.resolve();
+  const schedule = () => {
+    if (stopped || options.watch === false) return;
+    timer = setTimeout(() => {
+      pending = (async () => {
+        try {
+          const result = await pushCloud({ dbPath: options.dbPath, baseUrl: first.baseUrl });
+          options.onPush?.(result);
+        } catch (error) {
+          if (options.onError) options.onError(error);
+          else process.stderr.write(`ai-hist cloud push failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        } finally { schedule(); }
+      })();
+    }, intervalMs);
+  };
+  schedule();
+  return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
 }

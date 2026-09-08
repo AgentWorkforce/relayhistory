@@ -6,6 +6,7 @@ import {
   bootstrapLocal, discoverSessions, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  enableCloud,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
   type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
@@ -14,9 +15,9 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'pretty', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
-  'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'base-url', 'interval', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
@@ -196,6 +197,7 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json]
+  ai-hist enable-cloud [--base-url URL] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
@@ -533,6 +535,25 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (command === 'enable-cloud') {
+    validateFlags(args, 'enable-cloud', ['base-url', 'db', 'interval', 'once', 'json']);
+    rejectSurplusPositionals(args.positional.slice(1), 'enable-cloud');
+    const handle = await enableCloud({
+      baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
+      intervalMs: (numberFlag(args, 'interval') ?? 60) * 1000,
+      watch: !args.flags.has('once'),
+      onPush: (result) => output(result, json),
+    });
+    const { stop, ...result } = handle;
+    output(result, json);
+    if (!args.flags.has('once')) {
+      const shutdown = () => { void stop(); };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+    }
+    return;
+  }
+
   if (command === 'sessions' && subcommand === 'list') {
     validateFlags(args, 'sessions list', [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
