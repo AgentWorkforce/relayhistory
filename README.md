@@ -56,7 +56,9 @@ npx -y ai-hist-mcp
 
 Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `get_session_thread`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-`get_session_thread` is the one cloud-backed tool. Given a `source` and a `session_id` it returns the commits that session shipped plus the pull requests, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions linked to it — the *lifecycle* fan-out, complementing `get_session_tree`'s *subagent* fan-out. It fetches on every call and caches nothing, because a thread keeps growing as PRs and incidents land. Tenancy comes from the stored cloud session's token, never from a parameter.
+`get_session_thread` is the one cloud-backed tool. Given a `source` and a `session_id` it returns the commits that session shipped plus the pull requests, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions linked to it — the *lifecycle* fan-out, complementing `get_session_tree`'s *subagent* fan-out. It fetches on every call and caches nothing, because a thread keeps growing as PRs and incidents land. Optional `kinds`, `since`, `limit` and `cursor` narrow and page the links. Tenancy comes from the stored cloud session's token, never from a parameter.
+
+It reads the native `ai-hist login` store first (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory`) and this SDK's `~/.config/ai-hist/auth.json` second. Without a usable cloud session it returns `UNSUPPORTED_OPERATION`, names the missing precondition, and makes no request.
 
 ## Team + Cloud
 

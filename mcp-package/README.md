@@ -42,7 +42,14 @@ fetches. With no stored cloud session it returns `UNSUPPORTED_OPERATION` with
 the same `no remote provider connectors are configured` message the sibling
 connectors use, without making a request. Tenancy is derived from the token
 server-side; there is no org parameter. `kinds` filters `link_kind`, `since`
-bounds link event time, and `cursor` pages through `nextCursor`.
+bounds link event time, and `limit` (1-500, default 100) with `cursor` pages the
+links; outcomes come back whole on every page.
+
+Credentials come from whichever store holds a session: the native `ai-hist
+login` store (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory`) is
+read first, then this SDK's own `~/.config/ai-hist/auth.json`. With more than
+one stage stored and no `AI_HIST_BASE_URL` naming one, the tool refuses to
+guess rather than answer about the wrong org.
 
 `get_session_relationships` and `get_session_tree` read the delegation topology
 recorded by hydration and sync: who delegated to whom, what evidence

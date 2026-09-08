@@ -113,14 +113,15 @@ server.tool('get_session_tree',
 // land, so every call fetches. Tenancy is derived from the token server-side,
 // which is why there is no org parameter to pass.
 server.tool('get_session_thread',
-  'Lifecycle thread for one session from the RelayHistory cloud: shipped commits plus linked PRs, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions. Known link kinds are github_pr, pr_review, commit, sentry_event, incident, zendesk_ticket, slack_thread, hotfix and followup_session. Requires a stored cloud session; complements get_session_tree.', {
+  'Lifecycle thread for one session from the RelayHistory cloud: shipped commits plus linked PRs, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions. Known link kinds are github_pr, pr_review, commit, sentry_event, incident, zendesk_ticket, slack_thread, hotfix and followup_session. Links are paged with limit (1-500, default 100) and cursor; outcomes come back whole on every page. Requires a stored cloud session; complements get_session_tree.', {
   source: SOURCE,
   session_id: z.string().min(1),
   kinds: z.array(z.string().min(1)).max(50).optional(),
   since: z.string().min(1).optional(),
   cursor: z.string().min(1).optional(),
-}, CLOUD_READ, ({ source, session_id, kinds, since, cursor }) => call(() => getSessionThread({
-  source, sessionId: session_id, kinds, since, cursor,
+  limit: z.number().int().min(1).max(500).optional(),
+}, CLOUD_READ, ({ source, session_id, kinds, since, cursor, limit }) => call(() => getSessionThread({
+  source, sessionId: session_id, kinds, since, cursor, limit,
 })));
 
 // Tool calls and file edits are keyed by (source, session_id): a session id

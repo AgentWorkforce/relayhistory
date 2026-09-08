@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
@@ -10,6 +10,8 @@ export interface RelayhistoryAuth {
   baseUrl: string;
   accessToken: string;
   refreshToken?: string;
+  /** Server-issued RFC 3339 expiry. Absent in sessions stored before it existed. */
+  accessTokenExpiresAt?: string;
 }
 
 export type LoginCloudResult =
@@ -126,9 +128,159 @@ function relayhistoryConfigDir(): string {
 /**
  * A base URL reduced to the identity of its stage, so two spellings of one
  * stage compare equal. Mirrors `cloud::normalized_stage`.
+ *
+ * Scheme and host are case-insensitive per RFC 3986 and are lowercased; the
+ * path is not, and is preserved exactly. A stage mounted under a case-sensitive
+ * prefix (`https://host/Recall`) must keep it or the request goes elsewhere.
  */
 function normalizeStage(baseUrl: string): string {
-  return baseUrl.trim().replace(/\/+$/, '').toLowerCase();
+  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    // Not a URL this build can parse: compare it verbatim rather than
+    // inventing an origin for it.
+    return trimmed;
+  }
+  return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname}`
+    .replace(/\/+$/, '');
+}
+
+/**
+ * The store the native `ai-hist login` writes: `RELAYHISTORY_HOME`, else
+ * `~/.agentworkforce/relayhistory`. Sessions live in `stages/<key>.auth.json`
+ * with snake_case fields, plus a legacy single `auth.json` from before stages
+ * existed.
+ */
+function nativeCloudHome(): string {
+  const configured = process.env.RELAYHISTORY_HOME;
+  if (configured) return configured;
+  return join(homedir(), '.agentworkforce', 'relayhistory');
+}
+
+/** Reads one native store file, mapping its snake_case fields. Absent or malformed reads as none. */
+async function readNativeAuth(path: string): Promise<RelayhistoryAuth | null> {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const baseUrl = parsed.base_url ?? parsed.baseUrl;
+  const accessToken = parsed.access_token ?? parsed.accessToken;
+  if (typeof baseUrl !== 'string' || typeof accessToken !== 'string') return null;
+  const refreshToken = parsed.refresh_token ?? parsed.refreshToken;
+  const expiresAt = parsed.access_token_expires_at ?? parsed.accessTokenExpiresAt;
+  return {
+    baseUrl,
+    accessToken,
+    ...(typeof refreshToken === 'string' ? { refreshToken } : {}),
+    ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
+  };
+}
+
+/**
+ * Every session the native store holds, newest layout first. Mirrors
+ * `cloud::staged_auths` plus its legacy fallback: the stage directory is
+ * enumerated and each file's own `base_url` identifies it, so this never has
+ * to reproduce the engine's stage-key hash.
+ */
+async function nativeStoredSessions(): Promise<RelayhistoryAuth[]> {
+  const home = nativeCloudHome();
+  const found: RelayhistoryAuth[] = [];
+  let entries: string[] = [];
+  try {
+    entries = (await readdir(join(home, 'stages'))).filter((name) => name.endsWith('.auth.json'));
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries.sort()) {
+    const auth = await readNativeAuth(join(home, 'stages', entry));
+    if (auth) found.push(auth);
+  }
+  const legacy = await readNativeAuth(join(home, 'auth.json'));
+  if (legacy && !found.some((auth) => normalizeStage(auth.baseUrl) === normalizeStage(legacy.baseUrl))) {
+    found.push(legacy);
+  }
+  return found;
+}
+
+/** Milliseconds of remaining validity below which a session is treated as spent. */
+const EXPIRY_FLOOR_MS = 60_000;
+
+function isExpired(auth: RelayhistoryAuth, now: number): boolean {
+  // A session stored before expiry was recorded carries no claim either way.
+  // Push tolerates those, and the SDK's own store has never written the field,
+  // so absence is not treated as expiry — only a stated, spent expiry is.
+  if (!auth.accessTokenExpiresAt) return false;
+  const expiry = Date.parse(auth.accessTokenExpiresAt);
+  return Number.isFinite(expiry) && expiry < now + EXPIRY_FLOOR_MS;
+}
+
+/** Why no usable cloud session was found, phrased for {@link cloudUnconfiguredMessage}. */
+export type CloudSessionResolution =
+  | { auth: RelayhistoryAuth }
+  | { auth: null; detail: string };
+
+/**
+ * Resolve the cloud session a thread read should use.
+ *
+ * Both stores are consulted, native first: the Rust `ai-hist login` writes
+ * `~/.agentworkforce/relayhistory/stages/*.auth.json`, while this SDK's own
+ * {@link loginCloud} writes `~/.config/ai-hist/auth.json`. Reading only the
+ * latter is what made the documented login flow look unconfigured.
+ *
+ * A caller that names a stage gets that stage or nothing. A caller that does
+ * not, with more than one stage stored, gets a refusal rather than a guess —
+ * the same rule as `cloud::load_auth`, and for the same reason: silently
+ * picking a stage sends a token somewhere the caller did not ask for.
+ */
+export async function resolveCloudSession(
+  requestedBaseUrl?: string,
+  now: number = Date.now(),
+): Promise<CloudSessionResolution> {
+  const candidates = await nativeStoredSessions();
+  const sdkStored = await loadStoredRelayhistoryAuth();
+  if (sdkStored
+    && !candidates.some((a) => normalizeStage(a.baseUrl) === normalizeStage(sdkStored.baseUrl))) {
+    candidates.push(sdkStored);
+  }
+
+  const where = `${nativeCloudHome()} or ${relayhistoryConfigDir()}`;
+  if (candidates.length === 0) {
+    return { auth: null, detail: `${where}: no stored relayhistory session (run \`ai-hist login\`)` };
+  }
+
+  if (requestedBaseUrl !== undefined) {
+    const wanted = normalizeStage(requestedBaseUrl);
+    const match = candidates.find((auth) => normalizeStage(auth.baseUrl) === wanted);
+    if (!match) {
+      return {
+        auth: null,
+        detail: `${where}: no stored relayhistory session for ${wanted} `
+          + `(stored: ${candidates.map((a) => normalizeStage(a.baseUrl)).join(', ')})`,
+      };
+    }
+    return isExpired(match, now)
+      ? { auth: null, detail: `${where}: the stored relayhistory session for ${wanted} has expired (run \`ai-hist login\`)` }
+      : { auth: match };
+  }
+
+  if (candidates.length > 1) {
+    return {
+      auth: null,
+      detail: `${where}: ${candidates.length} relayhistory stages are configured `
+        + `(${candidates.map((a) => normalizeStage(a.baseUrl)).join(', ')}); `
+        + 'set AI_HIST_BASE_URL to select one. Refusing to guess, because a thread read '
+        + 'against the wrong stage answers about a different org',
+    };
+  }
+
+  const only = candidates[0]!;
+  return isExpired(only, now)
+    ? { auth: null, detail: `${where}: the stored relayhistory session has expired (run \`ai-hist login\`)` }
+    : { auth: only };
 }
 
 /**
@@ -146,6 +298,10 @@ export function cloudUnconfiguredMessage(operation: string, detail: string): str
 
 /** Most `link_kind` values the recall route accepts in one `kinds` filter. */
 const MAX_THREAD_KINDS = 50;
+
+/** The `limit` range the recall route accepts before clamping. */
+const MIN_THREAD_LIMIT = 1;
+const MAX_THREAD_LIMIT = 500;
 
 /** One lifecycle link, as the recall API returns it. */
 export interface SessionThreadLink {
@@ -203,17 +359,23 @@ export interface SessionThreadQuery {
   since?: string;
   /** Opaque page cursor from a previous `nextCursor`. */
   cursor?: string;
+  /**
+   * Links per page. The route clamps to {@link MIN_THREAD_LIMIT}..{@link
+   * MAX_THREAD_LIMIT} and defaults to 100. Only links are paged; outcomes come
+   * back whole on every page.
+   */
+  limit?: number;
 }
 
 export interface SessionThreadOptions {
   /** Overrides the stored session's base URL. */
   baseUrl?: string;
   /**
-   * The connector-status resolver: a stored RelayHistory session means the
-   * `cloud` connector is configured, its absence means it is not. Defaults to
-   * {@link loadStoredRelayhistoryAuth}.
+   * The connector-status resolver: a usable stored RelayHistory session means
+   * the `cloud` connector is configured, and anything else carries the reason
+   * it is not. Defaults to {@link resolveCloudSession}.
    */
-  loadAuth?: () => Promise<RelayhistoryAuth | null>;
+  resolveSession?: (requestedBaseUrl?: string) => Promise<CloudSessionResolution>;
   /** HTTP transport. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -221,8 +383,13 @@ export interface SessionThreadOptions {
 function requireSecureTransport(baseUrl: string): void {
   if (baseUrl.startsWith('https://')) return;
   const authority = baseUrl.startsWith('http://') ? baseUrl.slice('http://'.length) : null;
-  const host = authority?.split('/')[0]?.split(':')[0]?.toLowerCase();
-  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1') return;
+  const hostPort = authority?.split('/')[0];
+  // An IPv6 literal is bracketed and full of colons, so the port cannot be
+  // split off before the brackets are removed.
+  const host = hostPort?.startsWith('[')
+    ? hostPort.slice(1, hostPort.indexOf(']')).toLowerCase()
+    : hostPort?.split(':')[0]?.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return;
   throw new ConnectorFailureError(
     `refusing to send the relayhistory bearer token in cleartext to \`${baseUrl}\` — use an `
       + 'https:// endpoint. Plain http:// is accepted only for loopback.',
@@ -260,37 +427,31 @@ export async function getSessionThread(
       'INVALID_ARGUMENT',
     );
   }
-
-  const loadAuth = opts.loadAuth ?? loadStoredRelayhistoryAuth;
-  const auth = await loadAuth();
-  if (!auth) {
-    throw new UnsupportedOperationError(
-      cloudUnconfiguredMessage(
-        THREAD_OPERATION,
-        `${relayhistoryConfigDir()}: no stored relayhistory session (run \`ai-hist login\`)`,
-      ),
-      'UNSUPPORTED_OPERATION',
+  if (query.limit !== undefined
+    && (!Number.isInteger(query.limit)
+      || query.limit < MIN_THREAD_LIMIT || query.limit > MAX_THREAD_LIMIT)) {
+    // Rejected here rather than sent to be clamped, so a caller asking for 5000
+    // learns it is getting 500 instead of silently believing it got 5000.
+    throw new InvalidArgumentError(
+      `limit must be an integer in ${MIN_THREAD_LIMIT}..${MAX_THREAD_LIMIT} (got ${query.limit})`,
+      'INVALID_ARGUMENT',
     );
   }
 
-  // A stored session belongs to one stage. Honouring an explicit base URL that
-  // names a different stage would send this stage's bearer token to another
-  // host, which is what `cloud::load_auth`'s `same_stage` check refuses. A
-  // stage the stored session cannot serve is an unconfigured connector, not a
-  // request to attempt.
-  const stored = normalizeStage(auth.baseUrl ?? DEFAULT_CLOUD_BASE_URL);
-  const requested = opts.baseUrl ?? process.env.AI_HIST_BASE_URL;
-  if (requested !== undefined && normalizeStage(requested) !== stored) {
+  // A stored session belongs to one stage, so naming a stage selects it rather
+  // than redirecting it: sending this stage's bearer token to another host is
+  // what `cloud::load_auth`'s `same_stage` check refuses. A stage no stored
+  // session can serve is an unconfigured connector, not a request to attempt.
+  const resolve = opts.resolveSession ?? resolveCloudSession;
+  const resolved = await resolve(opts.baseUrl ?? process.env.AI_HIST_BASE_URL);
+  if (!resolved.auth) {
     throw new UnsupportedOperationError(
-      cloudUnconfiguredMessage(
-        THREAD_OPERATION,
-        `${relayhistoryConfigDir()}: the stored relayhistory session is for ${stored}, not `
-          + `${normalizeStage(requested)} (run \`ai-hist login\`)`,
-      ),
+      cloudUnconfiguredMessage(THREAD_OPERATION, resolved.detail),
       'UNSUPPORTED_OPERATION',
     );
   }
-  const baseUrl = stored;
+  const auth = resolved.auth;
+  const baseUrl = normalizeStage(auth.baseUrl || DEFAULT_CLOUD_BASE_URL);
   requireSecureTransport(baseUrl);
 
   const params = new URLSearchParams();
@@ -298,6 +459,7 @@ export async function getSessionThread(
   if (query.kinds?.length) params.set('kinds', query.kinds.join(','));
   if (query.since) params.set('since', query.since);
   if (query.cursor) params.set('cursor', query.cursor);
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
   for (const key of params.keys()) {
     // Defence in depth: tenancy comes from the token, never a query parameter.
     if (TENANCY_PARAMS.has(key)) {
