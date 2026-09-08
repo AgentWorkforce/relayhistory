@@ -28,6 +28,7 @@ mod codex;
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
 /// listing that backs it.
 pub mod discover;
+pub mod git_sdk;
 mod hydrate;
 mod learn;
 /// Recording the delegation evidence each provider leaves behind.

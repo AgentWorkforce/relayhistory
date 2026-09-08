@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, syncAndPush } = nativeBinding
+const { nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, syncAndPush, cloudLoadAuth, cloudLogin, enableCloud, pushCloud, installGitHooks, linkGitCommit, createShareableTrace } = nativeBinding
 
 module.exports.nativeContractVersion = nativeContractVersion
 module.exports.nativeBuildProfile = nativeBuildProfile
@@ -331,3 +331,10 @@ module.exports.getSessionChildrenPage = getSessionChildrenPage
 module.exports.sync = sync
 module.exports.syncLocal = syncLocal
 module.exports.syncAndPush = syncAndPush
+module.exports.cloudLoadAuth = cloudLoadAuth
+module.exports.cloudLogin = cloudLogin
+module.exports.enableCloud = enableCloud
+module.exports.pushCloud = pushCloud
+module.exports.installGitHooks = installGitHooks
+module.exports.linkGitCommit = linkGitCommit
+module.exports.createShareableTrace = createShareableTrace

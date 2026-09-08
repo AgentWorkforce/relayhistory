@@ -430,3 +430,27 @@ export interface SyncPushResult {
 }
 /** Cloud capture hook retained for Agent Relay integration. */
 export declare function syncAndPush(): Promise<SyncPushResult>
+export interface CloudOptions {
+  dbPath?: string
+  baseUrl?: string
+  relayAccessToken?: string
+  label?: string
+}
+export interface CloudAuth {
+  baseUrl: string
+  accessToken: string
+  refreshToken?: string
+}
+export interface CloudPushResult {
+  baseUrl: string
+  sent: number
+  accepted: number
+  syncSkipped: boolean
+}
+export declare function cloudLoadAuth(baseUrl?: string | undefined | null): Promise<CloudAuth | null>
+export declare function cloudLogin(options?: CloudOptions | undefined | null): Promise<CloudAuth>
+export declare function enableCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>
+export declare function pushCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>
+export declare function installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>
+export declare function linkGitCommit(optionsJson: string): Promise<string>
+export declare function createShareableTrace(sessionId: string, visibility: string, source?: string | undefined | null, baseUrl?: string | undefined | null): Promise<string>

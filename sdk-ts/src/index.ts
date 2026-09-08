@@ -493,6 +493,9 @@ export interface SyncResult { databasePath: string; scope: SessionScope; complet
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;
+  installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
+  linkGitCommit(optionsJson: string): Promise<string>;
   cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
   cloudLogin(options: object): Promise<RelayhistoryAuth>;
   enableCloud(options: object): Promise<CloudPushResult>;
@@ -1576,4 +1579,23 @@ export async function enableCloud(options: EnableCloudOptions = {}): Promise<Clo
   };
   schedule();
   return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
+}
+
+export interface GitHookOptions { repo: string; sessionId: string; source?: string; dbPath?: string; prUrl?: string }
+/** Install a local post-commit recorder for an explicit session. prUrl identifies
+ * an existing GitHub PR; linkage is uploaded by the next cloud push. */
+export async function installGitHooks(options: GitHookOptions): Promise<{ hookPath: string }> {
+  const hookPath = await nativeCall((native) => native.installGitHooks(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() }), process.execPath, import.meta.url));
+  return { hookPath };
+}
+export async function linkGitCommit(options: GitHookOptions): Promise<{ commitSha: string }> {
+  const commitSha = await nativeCall((native) => native.linkGitCommit(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() })));
+  return { commitSha };
+}
+
+export type TraceVisibility = 'public' | 'private' | 'direct-link';
+export interface ShareableTrace { url: string; visibility: TraceVisibility; eventCount: number }
+/** Share the already-pushed, frozen server snapshot of a session. */
+export async function createShareableTrace(sessionId: string, options: { visibility: TraceVisibility; source?: string; baseUrl?: string }): Promise<ShareableTrace> {
+  return nativeCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
 }

@@ -1587,7 +1587,11 @@ pub struct CloudAuth {
 
 impl From<ai_hist_engine::cloud::StoredAuth> for CloudAuth {
     fn from(auth: ai_hist_engine::cloud::StoredAuth) -> Self {
-        Self { base_url: auth.base_url, access_token: auth.access_token, refresh_token: auth.refresh_token }
+        Self {
+            base_url: auth.base_url,
+            access_token: auth.access_token,
+            refresh_token: auth.refresh_token,
+        }
     }
 }
 
@@ -1601,37 +1605,114 @@ pub struct CloudPushResult {
 
 impl From<ai_hist_engine::cloud::CloudPushOutcome> for CloudPushResult {
     fn from(outcome: ai_hist_engine::cloud::CloudPushOutcome) -> Self {
-        Self { base_url: outcome.base_url, sent: outcome.sent as i64, accepted: outcome.accepted as i64, sync_skipped: outcome.sync_skipped }
+        Self {
+            base_url: outcome.base_url,
+            sent: outcome.sent as i64,
+            accepted: outcome.accepted as i64,
+            sync_skipped: outcome.sync_skipped,
+        }
     }
 }
 
 #[napi]
 pub async fn cloud_load_auth(base_url: Option<String>) -> napi::Result<Option<CloudAuth>> {
-    napi::tokio::task::spawn_blocking(move || ai_hist_engine::cloud::load_sdk_auth(base_url.as_deref()))
-        .await.map_err(worker_error)?.map(|auth| auth.map(Into::into))
-        .map_err(|error| native_error("CLOUD_AUTH_FAILED", format!("{error:#}")))
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::load_sdk_auth(base_url.as_deref())
+    })
+    .await
+    .map_err(worker_error)?
+    .map(|auth| auth.map(Into::into))
+    .map_err(|error| native_error("CLOUD_AUTH_FAILED", format!("{error:#}")))
 }
 
 #[napi]
 pub async fn cloud_login(options: Option<CloudOptions>) -> napi::Result<CloudAuth> {
     let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || ai_hist_engine::cloud::login_for_sdk(options.base_url.as_deref(), options.relay_access_token.as_deref(), options.label.as_deref()))
-        .await.map_err(worker_error)?.map(Into::into)
-        .map_err(|error| native_error("CLOUD_LOGIN_FAILED", format!("{error:#}")))
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::login_for_sdk(
+            options.base_url.as_deref(),
+            options.relay_access_token.as_deref(),
+            options.label.as_deref(),
+        )
+    })
+    .await
+    .map_err(worker_error)?
+    .map(Into::into)
+    .map_err(|error| native_error("CLOUD_LOGIN_FAILED", format!("{error:#}")))
 }
 
 #[napi]
 pub async fn enable_cloud(options: Option<CloudOptions>) -> napi::Result<CloudPushResult> {
     let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || ai_hist_engine::cloud::enable_for_sdk(&db_path(options.db_path), options.base_url.as_deref(), options.relay_access_token.as_deref(), options.label.as_deref()))
-        .await.map_err(worker_error)?.map(Into::into)
-        .map_err(|error| native_error("CLOUD_ENABLE_FAILED", format!("{error:#}")))
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::enable_for_sdk(
+            &db_path(options.db_path),
+            options.base_url.as_deref(),
+            options.relay_access_token.as_deref(),
+            options.label.as_deref(),
+        )
+    })
+    .await
+    .map_err(worker_error)?
+    .map(Into::into)
+    .map_err(|error| native_error("CLOUD_ENABLE_FAILED", format!("{error:#}")))
 }
 
 #[napi]
 pub async fn push_cloud(options: Option<CloudOptions>) -> napi::Result<CloudPushResult> {
     let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || ai_hist_engine::cloud::push_for_sdk(&db_path(options.db_path), options.base_url.as_deref()))
-        .await.map_err(worker_error)?.map(Into::into)
-        .map_err(|error| native_error("CLOUD_PUSH_FAILED", format!("{error:#}")))
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::push_for_sdk(&db_path(options.db_path), options.base_url.as_deref())
+    })
+    .await
+    .map_err(worker_error)?
+    .map(Into::into)
+    .map_err(|error| native_error("CLOUD_PUSH_FAILED", format!("{error:#}")))
+}
+
+#[napi]
+pub async fn install_git_hooks(
+    options_json: String,
+    node: String,
+    sdk_url: String,
+) -> napi::Result<String> {
+    napi::tokio::task::spawn_blocking(move || {
+        let options = serde_json::from_str(&options_json)?;
+        ai_hist_engine::git_sdk::install(options, &node, &sdk_url)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error: anyhow::Error| native_error("GIT_HOOK_FAILED", format!("{error:#}")))
+}
+
+#[napi]
+pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
+    napi::tokio::task::spawn_blocking(move || {
+        let options = serde_json::from_str(&options_json)?;
+        ai_hist_engine::git_sdk::link(options)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error: anyhow::Error| native_error("GIT_LINK_FAILED", format!("{error:#}")))
+}
+
+#[napi]
+pub async fn create_shareable_trace(
+    session_id: String,
+    visibility: String,
+    source: Option<String>,
+    base_url: Option<String>,
+) -> napi::Result<String> {
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::create_share(
+            &session_id,
+            &visibility,
+            source.as_deref(),
+            base_url.as_deref(),
+        )
+        .map(|value| value.to_string())
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error| native_error("CLOUD_SHARE_FAILED", format!("{error:#}")))
 }

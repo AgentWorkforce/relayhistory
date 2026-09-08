@@ -3752,15 +3752,32 @@ exit 0"#,
 /// no credential exists for that destination. Never let a stale SDK token replace
 /// a refreshed Rust token, and retain load_auth's refusal to guess between stages.
 pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
+    let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .iter()
+        .any(|key| {
+            std::env::var(key)
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+        })
+        .then(default_base_url);
+    let base_url = base_url.or(env_base.as_deref());
     if let Some(auth) = load_auth(base_url)? {
         return Ok(Some(auth));
     }
-    let legacy = std::env::var_os("AI_HIST_CONFIG_DIR").map(PathBuf::from)
+    let legacy = std::env::var_os("AI_HIST_CONFIG_DIR")
+        .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_default())
-                .join(".config/ai-hist")
-        }).join("auth.json");
-    if !legacy.exists() { return Ok(None); }
+            PathBuf::from(
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .unwrap_or_default(),
+            )
+            .join(".config/ai-hist")
+        })
+        .join("auth.json");
+    if !legacy.exists() {
+        return Ok(None);
+    }
     let auth = read_auth(&legacy)?;
     if base_url.is_some_and(|base| !same_stage(base, &auth.base_url)) {
         return Ok(None);
@@ -3772,7 +3789,11 @@ pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
 
 /// Exchange a caller-supplied Cloud bearer or run the existing Cloud device login.
 /// Both SDK and CLI persist credentials exclusively through the Rust stage store.
-pub fn login_for_sdk(base_url: Option<&str>, token: Option<&str>, label: Option<&str>) -> Result<StoredAuth> {
+pub fn login_for_sdk(
+    base_url: Option<&str>,
+    token: Option<&str>,
+    label: Option<&str>,
+) -> Result<StoredAuth> {
     let base = base_url.map(str::to_owned).unwrap_or_else(default_base_url);
     let base = normalized_stage(&base)?;
     let label = label.unwrap_or("ai-hist enable-cloud");
@@ -3780,7 +3801,10 @@ pub fn login_for_sdk(base_url: Option<&str>, token: Option<&str>, label: Option<
         Some(token) => login(&base, token, label, Some("sync"))?,
         None => login_via_cloud(&base, "sync", None, label)?,
     };
-    anyhow::ensure!(auth.access_token.starts_with("rth_at_"), "cloud login did not return a service-local access token");
+    anyhow::ensure!(
+        auth.access_token.starts_with("rth_at_"),
+        "cloud login did not return a service-local access token"
+    );
     save_auth(&auth)?;
     Ok(auth)
 }
@@ -3796,25 +3820,47 @@ pub struct CloudPushOutcome {
 /// cursor from local maxima: only push's server-confirmed progress may advance it.
 pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
     let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    crate::SYNC_QUIET.store(true, crate::AtomicOrdering::Relaxed);
     let (conn, sync_skipped) = crate::prepare_sync_and_push_db(db_path)?;
     let machine = MachineIdentity {
-        id: machine_id()?, hostname: machine_hostname(),
+        id: machine_id()?,
+        hostname: machine_hostname(),
         os: Some(std::env::consts::OS.to_string()),
         cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
-    let mut outcome = CloudPushOutcome { base_url: auth.base_url.clone(), sent: 0, accepted: 0, sync_skipped };
+    let mut outcome = CloudPushOutcome {
+        base_url: auth.base_url.clone(),
+        sent: 0,
+        accepted: 0,
+        sync_skipped,
+    };
     loop {
         let cursor = load_cursor(&auth.base_url)?;
-        let report = push(&conn, &UreqIngestor, &auth, &machine, &cursor, 500, &HashSet::new())?;
+        let report = push(
+            &conn,
+            &UreqIngestor,
+            &auth,
+            &machine,
+            &cursor,
+            500,
+            &HashSet::new(),
+        )?;
         outcome.sent += report.sent as u64;
         outcome.accepted += report.accepted;
-        if report.cursor == cursor { break; }
+        if report.cursor == cursor {
+            break;
+        }
     }
     Ok(outcome)
 }
 
-pub fn enable_for_sdk(db_path: &std::path::Path, base_url: Option<&str>, token: Option<&str>, label: Option<&str>) -> Result<CloudPushOutcome> {
+pub fn enable_for_sdk(
+    db_path: &std::path::Path,
+    base_url: Option<&str>,
+    token: Option<&str>,
+    label: Option<&str>,
+) -> Result<CloudPushOutcome> {
     // Explicit tokens request reauthentication; otherwise reuse stage credentials.
     let auth = if token.is_some() {
         login_for_sdk(base_url, token, label)?
@@ -3825,4 +3871,50 @@ pub fn enable_for_sdk(db_path: &std::path::Path, base_url: Option<&str>, token: 
         }
     };
     push_for_sdk(db_path, Some(&auth.base_url))
+}
+
+/// Create a frozen share with the existing refresh-capable transport.
+pub fn create_share(
+    session_id: &str,
+    visibility: &str,
+    source: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(!session_id.trim().is_empty(), "sessionId must not be empty");
+    anyhow::ensure!(
+        ["public", "private", "direct-link"].contains(&visibility),
+        "visibility must be public, private or direct-link"
+    );
+    let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    require_secure_transport(&auth.base_url)?;
+    let url = format!(
+        "{}/v1/sessions/{}/shares",
+        normalized_stage(&auth.base_url)?,
+        encode_path_segment(session_id)
+    );
+    let response = send_with_auth_refresh(
+        &auth,
+        |current| {
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", current.access_token))
+                .timeout(std::time::Duration::from_secs(30))
+                .send_json({
+                    let mut body = serde_json::json!({ "visibility": visibility });
+                    if let Some(source) = source {
+                        body["source"] = serde_json::json!(source);
+                    }
+                    body
+                })
+                .map_err(Box::new)
+        },
+        map_http_err,
+    )?;
+    let value: serde_json::Value = response.into_json()?;
+    let share_url = field(&value, "url")?;
+    let parsed = Url::parse(&share_url)?;
+    anyhow::ensure!(
+        parsed.origin() == Url::parse(&auth.base_url)?.origin() && parsed.path().starts_with("/s/"),
+        "server returned an unexpected share URL"
+    );
+    Ok(value)
 }
