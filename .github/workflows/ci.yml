@@ -93,7 +93,11 @@ jobs:
           echo "$out"
           test "$code" -eq 1
           echo "$out" | grep -q '"status":"unbuilt"'
-          ./node_modules/.bin/ai-hist login --token smoke --base-url http://127.0.0.1:9; test $? -ne 2
+          set +e
+          ./node_modules/.bin/ai-hist login --token smoke --base-url http://127.0.0.1:9
+          login_code=$?
+          set -e
+          test "$login_code" -ne 2
           node --input-type=module -e 'await import("ai-hist")'
           node -e 'require("ai-hist/package.json")'
           AI_HIST_TEST_PACKAGE_DIR="$SMOKE/node_modules/ai-hist" node --test "$GITHUB_WORKSPACE/sdk-ts/dist/cloud-commands.test.js"
