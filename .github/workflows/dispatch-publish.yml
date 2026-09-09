@@ -1,0 +1,35 @@
+name: Dispatch publish
+
+# Lets operators trigger the gated publish workflow by pushing a marker file
+# when local `gh workflow run` is unavailable. Marker files are one-shot and
+# live under .release/dispatch-patch-*.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.release/dispatch-patch-*'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            core.info(`Dispatching publish-napi from ${context.sha}`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'publish-napi.yml',
+              ref: 'main',
+              inputs: {
+                version: 'patch',
+                dry_run: 'false',
+              },
+            });

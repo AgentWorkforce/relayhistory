@@ -1,0 +1,2 @@
+# One-shot publish trigger for 0.15.4 after smoke-native-cli fix (e5c5387).
+# Safe to delete after publish succeeds.
