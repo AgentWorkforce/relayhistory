@@ -1,195 +1,83 @@
 # RelayHistory (`ai-hist`)
 
-RelayHistory indexes coding-agent sessions from Claude Code, Codex, Cursor,
-Grok, OpenCode, and Agent Relay in a local SQLite database.
+**Search, resume, and hand off every coding-agent session — across every harness on your machine.**
 
-Its production architecture has one implementation:
+Local memory for **Claude Code**, **Codex**, **Cursor**, **Grok**, **OpenCode**, and [**Agent Relay**](https://github.com/AgentWorkforce/relay). Your agent sessions are indexed into one local SQLite database. Search them all at once, jump back into a session with its harness's native resume command, and hand a compact context pack to another agent — or to a teammate's agent — to continue the work.
 
-```text
-Rust engine (providers + SQLite + migrations + queries)
-  → Node-API addon
-    → TypeScript SDK
-      → Node CLI / MCP server
+```sh
+ai-hist search "auth rewrite"
+# → matches across every codex/claude/cursor session on this machine
+
+ai-hist resume "auth rewrite"
+# → prints `codex resume 29284179-c09f-44f2-b9ec-16f678dc1832`
+
+ai-hist pack "auth rewrite" --tokens 1500
+# → a token-budgeted context pack, ready to paste into another agent
 ```
 
-TypeScript never opens SQLite, scans provider files, or invokes another
-executable. The native addon is mandatory and operates on the SQLite file in
-place, including WAL-backed databases.
+## Use Cases
 
-## Install
+- **Never search for an old chat session again.** One local index across every harness. `ai-hist search "the thing I was working on"` finds it, whichever CLI you used.
+- **Hand off work between agents without losing context.** `ai-hist pack "the feature"` produces a compact context pack; `ai-hist resume "the feature"` prints the native resume command. Great for switching from Claude to Codex mid-work, or picking up a teammate's session.
+- **Give your agent access to its own memory via MCP.** Wire `ai-hist-mcp` into Claude Code / Cursor / Codex and the agent can query its own past sessions while it's running — search, session events, tool calls, file edits.
 
-Node.js 20 or 22 is required. npm installs the SDK, CLI, MCP server, native
-loader, and matching prebuilt platform package:
+## Get Started
 
-```bash
-npm install ai-hist
-
-# Global CLI
-npm install --global ai-hist
-ai-hist sessions discover --limit 100
-ai-hist sessions list --limit 100
-ai-hist sessions hydrate codex 01a04f0c-... --json
-ai-hist sessions tree codex 01a04f0c-...
-ai-hist sessions tools codex 01a04f0c-... --limit 50 --json
-ai-hist sessions edits codex 01a04f0c-... --limit 50 --json
-ai-hist resume "the feature I was working on"          # prints the best match's native resume command
-ai-hist pack "the feature I was working on" --tokens 1500  # compact context to hand another agent
+```sh
+npm install -g ai-hist
+ai-hist                                      # first run discovers and indexes your recent sessions
+ai-hist search "the thing i was working on"
 ```
 
-`sessions relationships` and `sessions tree` read the delegation topology a
-session recorded: which subagent threads it spawned, what evidence established
-each link, and whether a child's events are addressable on their own.
+The bare `ai-hist` command bootstraps a searchable database on first use: it discovers your most recent local sessions and indexes their evidence, then tells you what it found. It leaves an already-populated database alone. Run `ai-hist sync` any time you want a full re-ingest rather than the bounded first-run pass.
 
-Session-set commands share one mutually exclusive location scope:
+Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows x64 — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
 
-```bash
-ai-hist sessions list --local   # default; identical to omitting a scope flag
-ai-hist sessions list --remote  # cached sessions with a remote presence
-ai-hist sessions list --all     # union of both, with each session returned once
+## Every command
+
+```sh
+ai-hist search "auth rewrite"                        # full-text search across every harness
+ai-hist sessions list                                # your most recent sessions, newest first
+ai-hist resume "auth rewrite"                        # print the native resume command
+ai-hist pack "auth rewrite" --tokens 1500            # compact context to hand another agent
+ai-hist sessions tree <harness> <id>                 # walk the parent/subagent tree
+ai-hist sessions relationships <harness> <id>        # which sessions spawned which
 ```
 
-The same `--local` / `--remote` / `--all` contract applies to discovery,
-search, recent history, statistics, and sync. Local and remote are presences of a session,
-not separate catalogs: every result comes from the same session ledger. Reads
-only filter that cached ledger. Remote discovery and remote sync run through
-provider connectors: `claude-web` lists your claude.ai/code web sessions using
-the OAuth sign-in the Claude Code CLI stored, and `codex-cloud` lists Codex
-cloud tasks through `codex cloud list --json`. The `cloud` connector lists
-teammate sessions from RelayHistory using the stored `rth_at_` session from
-`ai-hist login`, with at least 60 seconds of recorded validity remaining. See
-[docs/remote-connectors.md](docs/remote-connectors.md). With no connector
-configured, remote-only acquisition returns an unsupported-operation error; it
-never silently falls back to local work. `--all` runs the local adapters plus
-every configured connector, and an acquisition summary reports the requested
-`scope` alongside the `locations_run` that actually executed. Each catalog
-row's `locations` array reports where that session was actually observed.
+`<harness>` is the session's source — `claude`, `codex`, `cursor`, `grok`, `opencode`, or `relay` — and is required alongside the ID, because session IDs collide across providers. `ai-hist sessions list` prints both.
 
-| Remote connector | Source | Stored sign-in |
-|---|---|---|
-| `claude-web` | `claude` | Claude Code OAuth |
-| `codex-cloud` | `codex` | Codex CLI |
-| `cloud` | Upstream provider source; org-wide teammate sessions | RelayHistory `rth_at_` session under `RELAYHISTORY_HOME` (default `~/.agentworkforce/relayhistory`) |
-
-Cloud discovery records `cloud://<orgId>/<sessionId>` on the remote presence.
-An existing local natural key gains a remote presence, so `--all` returns it
-once. Cloud recall shares push's stage selection, credential refresh, and
-HTTPS-or-loopback guard. Discovery populates the cached session catalog;
-automatic cloud event ingestion is separate.
-
-No Rust toolchain, C/C++ compiler, standalone CLI, curl installer, or runtime
-binary download is used.
-
-### Checking your version
-
-`ai-hist --version` prints the installed npm package version. In an interactive
-terminal it also checks npm for a newer release, with a three-second timeout and
-silent offline fallback. Suppress the notice with `--no-warning` or
-`RELAYHISTORY_NO_UPDATE_CHECK=1`:
-
-```bash
-ai-hist --version
-ai-hist --version --no-warning
-```
-
-### Exporting a cloud access token (Rust CLI)
-
-After `ai-hist login` or `ai-hist admin-mint`, the Rust CLI can print the current
-access token for authenticated API calls:
-
-```bash
-export RTH_TOKEN=$(ai-hist token)
-curl -H "Authorization: Bearer $RTH_TOKEN" https://history.agentrelay.com/v1/sessions
-```
-
-`token` prints only the secret and a newline. It refreshes credentials with less
-than 60 seconds remaining (including missing or invalid expiry) before printing.
-Failures return a non-zero status with empty stdout. A terminal-only warning goes
-to stderr because running this command bare leaves the secret in scrollback.
-Select a stage with `--base-url <url>`, then `RELAYHISTORY_BASE_URL` or
-`AI_HIST_BASE_URL`; the fallback is production. With multiple stored stages and
-no explicit selection, it fails with the same ambiguity error as `push`.
-
-## TypeScript
-
-```ts
-import {
-  discoverSessions,
-  hydrateSession,
-  listSessionCatalog,
-  getSessionEventsPage,
-  getSessionToolCallsPage,
-  getSessionFileEditsPage,
-  search,
-  sync,
-} from 'ai-hist';
-
-await discoverSessions({ limit: 100, scope: 'local' });
-const sessions = await listSessionCatalog({ limit: 100, scope: 'all' });
-if (sessions[0]) {
-  await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
-}
-const firstEvents = sessions[0]
-  ? await getSessionEventsPage(sessions[0].sessionId, {
-      source: sessions[0].source,
-      limit: 200,
-    })
-  : null;
-const firstTools = sessions[0]
-  ? await getSessionToolCallsPage(sessions[0].source, sessions[0].sessionId, { limit: 200 })
-  : null;
-const firstEdits = sessions[0]
-  ? await getSessionFileEditsPage(sessions[0].source, sessions[0].sessionId, { limit: 200 })
-  : null;
-const matches = await search('migration', { limit: 20, scope: 'all' });
-await sync({ scope: 'local' }); // explicit full ingestion; local is the default
-```
-
-`listSessionCatalog` is cache-only. `discoverSessions` performs bounded shallow
-provider discovery and updates the shared ledger. `hydrateSession` indexes the
-richest evidence a connector safely exposes for one existing catalog identity
-and reports `full`, `partial`, or `shallow_only` capability with evidence
-counts; repeating it is safe as a live session grows. The tool call and file
-edit pages read that hydrated evidence back as structured rows and require both
-a source and a session ID, because provider session IDs collide. `sync` performs
-full global ingestion. Reads never silently turn into discovery, hydration, or
-sync. Hydration includes linked subagent evidence by default; CLI callers can
-pass `--no-related`.
+`ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
 
 ## MCP
 
-```bash
+```sh
 npx -y ai-hist-mcp
 ```
 
-MCP exposes thin adapters for search, recent history, catalog listing,
-discovery, targeted hydration, sessions, paged events, paged tool calls and
-file edits, statistics, and sync.
+Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-## Supported production matrix
+## Team + Cloud
 
-| OS/runtime | Architectures |
-|---|---|
-| macOS 12+ | arm64, x64 |
-| Linux glibc | arm64, x64 |
-| Linux musl | arm64, x64 |
-| Windows 10/11 and Server 2022 | x64 MSVC |
+Every read command takes a location scope — `--local` (the default), `--remote`, or `--all`:
 
-Node-API level 4 is used. CI tests Node.js 20 and 22. Windows arm64, FreeBSD,
-Bun, Deno, browsers, Electron renderer processes, and other unlisted runtimes
-are not supported. Windows arm64 remains follow-up work until it can be built
-and executed reliably in CI.
-
-See [architecture](docs/architecture.md), [getting started](docs/getting-started.md),
-[migration](docs/native-sdk-migration.md), and [release validation](docs/releasing.md).
-
-## Repository development
-
-The `ai-hist-engine` Rust binary target remains an internal development harness while
-provider-ingestion code is being physically separated from command rendering.
-It is not published as a second user runtime. Normal users install with npm.
-
-```bash
-cargo test --workspace
-cd crates/ai-hist-napi && npm ci && npm run build:debug
-cd ../../sdk-ts && npm install && npm test
+```sh
+ai-hist sessions discover --remote     # pull in sessions your providers keep server-side
+ai-hist sync --all                     # ingest local and remote together
+ai-hist search "auth rewrite" --all    # search both at once
 ```
+
+Remote acquisition runs through connectors that reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
+
+A hosted layer for sharing sessions across a team — so every PR threads back to the session that produced it — is in progress at `history.agentrelay.com`; its connector is not yet wired into the npm CLI. Want early access, or to self-host it? Reach out at hello@agentrelay.com.
+
+## Why `ai-hist`
+
+- **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
+- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened.
+- **Local by default.** SQLite on your machine. Nothing leaves it unless you opt in to a remote scope.
+- **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
+- **MCP-native.** Your agent queries its own memory the same way you do.
+
+---
+
+Docs: [getting started](docs/getting-started.md) · [architecture](docs/architecture.md) · [remote connectors](docs/remote-connectors.md) · [migration](docs/native-sdk-migration.md)
