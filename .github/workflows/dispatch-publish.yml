@@ -19,10 +19,18 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/github-script@v7
         with:
           script: |
-            core.info(`Dispatching publish-napi from ${context.sha}`);
+            const fs = require('node:fs');
+            const marker = fs.readdirSync('.release')
+              .filter((name) => name.startsWith('dispatch-patch-'))
+              .sort()
+              .at(-1);
+            const body = marker ? fs.readFileSync(`.release/${marker}`, 'utf8').trim() : '';
+            const customVersion = /^\\d+\\.\\d+\\.\\d+$/.test(body.split(/\r?\n/, 1)[0]) ? body.split(/\r?\n/, 1)[0] : '';
+            core.info(`Dispatching publish-napi from ${context.sha}${customVersion ? ` as ${customVersion}` : ' (patch bump)'}`);
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -30,6 +38,7 @@ jobs:
               ref: 'main',
               inputs: {
                 version: 'patch',
+                custom_version: customVersion,
                 dry_run: 'false',
               },
             });
