@@ -10,8 +10,12 @@ import {
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync,
 } from './index.js';
+import { getSessionThread } from './cloud-client.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
+// A lifecycle thread is served by the cloud recall API and never cached, so it
+// reads nothing locally and reaches the network on every call.
+const CLOUD_READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
@@ -101,6 +105,23 @@ server.tool('get_session_tree',
   max_nodes: z.number().int().min(1).max(10000).optional(),
 }, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
+})));
+
+// `get_session_tree` is the subagent fan-out; `get_session_thread` is the
+// lifecycle fan-out. They are complementary and an agent may call both.
+// The thread is cloud-only and never cached: it changes as PRs and incidents
+// land, so every call fetches. Tenancy is derived from the token server-side,
+// which is why there is no org parameter to pass.
+server.tool('get_session_thread',
+  'Lifecycle thread for one session from the RelayHistory cloud: shipped commits plus linked PRs, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions. Known link kinds are github_pr, pr_review, commit, sentry_event, incident, zendesk_ticket, slack_thread, hotfix and followup_session. Links are paged with limit (1-500, default 100) and cursor; outcomes come back whole on every page. Requires a stored cloud session; complements get_session_tree.', {
+  source: SOURCE,
+  session_id: z.string().min(1),
+  kinds: z.array(z.string().min(1)).max(50).optional(),
+  since: z.string().min(1).optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(500).optional(),
+}, CLOUD_READ, ({ source, session_id, kinds, since, cursor, limit }) => call(() => getSessionThread({
+  source, sessionId: session_id, kinds, since, cursor, limit,
 })));
 
 // Tool calls and file edits are keyed by (source, session_id): a session id
