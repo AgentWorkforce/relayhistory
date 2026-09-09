@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist-napi"
-version = "0.15.2"
+version = "0.15.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
