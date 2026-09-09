@@ -1900,14 +1900,22 @@ fn humanize_secs(secs: u64) -> String {
 /// no credential exists for that destination. Never let a stale SDK token replace
 /// a refreshed Rust token, and retain load_auth's refusal to guess between stages.
 pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
-    let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
-        .iter()
-        .any(|key| {
-            std::env::var(key)
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-        })
-        .then(default_base_url);
+    // A non-empty selector that does not normalize is a mistake, not a request for
+    // production. default_base_url() swallows malformed values and returns the
+    // production origin, so treating "set" as "selected" would silently retarget
+    // the caller's stage — reading, and for enable/push writing, against prod.
+    // Never echo the value: normalize_base_url rejects embedded credentials, so a
+    // rejected value is exactly the kind that may carry them.
+    let env_base = match ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+        .find(|(_, value)| !value.trim().is_empty())
+    {
+        Some((key, value)) => Some(normalize_base_url(&value).with_context(|| {
+            format!("{key} is not a usable base URL; unset it or set a full https:// origin")
+        })?),
+        None => None,
+    };
     let base_url = base_url.or(env_base.as_deref());
     if let Some(auth) = load_auth(base_url)? {
         return Ok(Some(auth));

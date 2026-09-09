@@ -355,3 +355,26 @@ fn unnormalizable_base_url_env_still_refuses_between_stages() {
         "a malformed stage selector must not silently select production: {err}"
     );
 }
+
+// default_base_url() ignores a malformed selector and returns production, so
+// treating "the variable is set" as "production was chosen" would silently
+// retarget the caller's stage. A malformed selector must be reported, and the
+// message must never echo the value: normalize_base_url rejects URLs carrying
+// embedded credentials, so a rejected value is exactly the kind that may hold one.
+#[test]
+fn malformed_base_url_env_is_rejected_without_echoing_the_value() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let secret_shaped = "https://user:hunter2@example.com/path?q=1";
+    let mut cmd = command(home.path());
+    cmd.env("RELAYHISTORY_BASE_URL", secret_shaped);
+    let err = failure(&cmd.output().unwrap());
+    assert!(
+        err.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "a malformed selector must be named, not silently replaced by production: {err}"
+    );
+    assert!(
+        !err.contains("hunter2") && !err.contains(secret_shaped),
+        "the rejected value must never be echoed: {err}"
+    );
+}

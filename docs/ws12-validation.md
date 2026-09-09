@@ -42,7 +42,7 @@ sharing implementation was undertaken for this scope addition.
 
 ## Artifact and CI evidence
 
-- Native source, SDK and built addon agree on contract 8.
+- Native source, SDK and built addon agree on contract 9.
 - Client head e98b4ec passed all required CI jobs in
   https://github.com/AgentWorkforce/relayhistory/actions/runs/34236408938:
   Rust formatting, Clippy and workspace tests; native contract; Node 20 SDK;
@@ -320,3 +320,34 @@ Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
 with 75/75, `scripts` 10/10, contract 9, `index.d.ts` clean. Against the
 repacked and reinstalled artifact both suites pass, including the legacy-store
 case, and `$(ai-hist token)` still captures a real token.
+
+## Root cause: a malformed stage selector silently meant production
+
+The probe fix above cured the symptom in `access_token`. CodeRabbit's security
+review found the cause, which affected every `load_sdk_auth` caller —
+`enableCloud`, `pushCloud`, `loadStoredRelayhistoryAuth` and
+`createShareableTrace` as well as token and replay's destination resolution.
+
+`default_base_url()` ignores a value that does not normalize and returns the
+production origin. `load_sdk_auth` asked only whether the variable was
+*non-empty* before calling it, so a malformed `RELAYHISTORY_BASE_URL` or
+`AI_HIST_BASE_URL` — a typo, a truncated value, a shell-mangled one — silently
+resolved to production: reading against prod, and for enable/push writing
+against it.
+
+`load_sdk_auth` now rejects a non-empty selector that fails to normalize instead
+of falling back. The error names the variable and never echoes the value:
+`normalize_base_url` rejects URLs carrying embedded credentials, so a rejected
+value is exactly the kind that may contain one. The regression test asserts both
+halves — that the variable is named, and that neither the value nor its embedded
+password appears in stderr.
+
+This is the second defect in this file produced by the same root cause, and the
+fifth today from the split auth store overall. The two stores want consolidating
+rather than further call-site patching.
+
+Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 440 passed and 0 failed, `tsc` 0, `npm test` 0
+with 75/75, `scripts` 10/10, contract 9, `index.d.ts` clean. Against the
+repacked and reinstalled artifact both suites pass, `replay` renders and
+paginates, and `$(ai-hist token)` captures a real token.
