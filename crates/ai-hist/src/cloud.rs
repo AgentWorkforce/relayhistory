@@ -31,13 +31,16 @@ const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAuth {
     /// Base URL of the relayhistory-cloud service, e.g. `http://localhost:8787`.
+    #[serde(alias = "baseUrl")]
     pub base_url: String,
+    #[serde(alias = "accessToken")]
     pub access_token: String,
     /// Server-issued expiry (RFC 3339). Legacy sessions without this remain
     /// usable by push, but cannot advertise recall availability until login/refresh.
     #[serde(default, alias = "accessTokenExpiresAt")]
     pub access_token_expires_at: Option<String>,
     #[serde(default)]
+    #[serde(alias = "refreshToken")]
     pub refresh_token: Option<String>,
     /// Local cache only — never authoritative; the server owns tenancy from the token.
     #[serde(default)]
@@ -291,28 +294,88 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     }
 }
 
+/// The stage selected by the environment, if any. A non-empty value that does not
+/// normalize is a mistake rather than a request for production: reject it, because
+/// default_base_url() would silently substitute the production origin. Never echo
+/// the value — normalize_base_url rejects URLs carrying embedded credentials, so a
+/// rejected value is exactly the kind that may hold one.
+///
+/// access_token and load_sdk_auth must share this: when they disagreed about what
+/// counts as a selection, a malformed selector silently meant production.
+fn env_selected_stage() -> Result<Option<String>> {
+    match ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+        .find(|(_, value)| !value.trim().is_empty())
+    {
+        Some((key, value)) => Ok(Some(normalize_base_url(&value).with_context(|| {
+            format!("{key} is not a usable base URL; unset it or set a full https:// origin")
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// Resolve a concrete destination for a caller that needs one up front. An explicit
+/// value wins; otherwise a malformed environment selector is an error rather than a
+/// silent production fallback, and an unset environment takes the default.
+///
+/// Callers that synthesize a destination with default_base_url() and then pass it as
+/// though the user chose it lose that check: default_base_url() swallows a malformed
+/// value and returns production, and load_sdk_auth cannot tell a synthesized origin
+/// from a deliberate one.
+pub fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
+    Ok(resolve_stage(base_url)?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()))
+}
+
+/// The selected stage, preserving the difference between "no selection" and
+/// "production". Callers that must end up somewhere use resolve_base_url; callers
+/// that pass the result to load_auth/load_sdk_auth must use this, because turning
+/// an absent selection into production suppresses the multi-stage refusal — the
+/// caller would silently read production instead of being told to choose.
+pub fn resolve_stage(base_url: Option<&str>) -> Result<Option<String>> {
+    match base_url {
+        Some(explicit) => Ok(Some(explicit.to_string())),
+        None => env_selected_stage(),
+    }
+}
+
+/// Replace parser errors before they surface: a serde_json failure can quote the
+/// credential values it choked on, and this command's output is a secret.
+fn sanitize_auth_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+        anyhow::anyhow!("could not parse stored relayhistory session; run `ai-hist login`")
+    } else {
+        error
+    }
+}
+
 /// Return an access token with at least 60 seconds of recorded validity remaining.
 /// Unknown legacy expiry is refreshed too: an opaque token cannot prove its own lifetime.
 pub fn access_token(base_url: Option<&str>) -> Result<String> {
     let explicit_base = base_url.map(normalized_stage).transpose()?;
-    let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find_map(|value| normalize_base_url(&value));
-    // Keep push's ambiguity error even though the fallback destination is production.
-    // JSON type errors can quote credential values from a malformed auth file.
-    let load = |base: Option<&str>| {
-        load_auth(base).map_err(|error| {
-            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
-                anyhow::anyhow!("could not parse stored relayhistory session; run `ai-hist login`")
-            } else {
-                error
-            }
-        })
+    // An explicit destination wins outright; the environment is not consulted, so
+    // a broken variable cannot block a caller who already chose a stage.
+    let env_base = match explicit_base {
+        Some(_) => None,
+        None => env_selected_stage()?,
     };
+    // Resolve the destination with the SDK loader, not load_auth: npm users
+    // upgrading from the TypeScript client have credentials only in
+    // ~/.config/ai-hist/auth.json. token is one of the two commands this exists
+    // to deliver, so it must migrate that store the same way enableCloud,
+    // pushCloud, loadStoredRelayhistoryAuth and shares do.
+    let load = |base: Option<&str>| load_sdk_auth(base).map_err(sanitize_auth_error);
     let selected = explicit_base.or(env_base);
     if selected.is_none() {
-        load(None)?;
+        // Keep push's ambiguity error even though the fallback destination is
+        // production. This probe must use load_auth: load_sdk_auth counts ANY
+        // non-empty RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL as a stage selection
+        // and falls back to production, whereas a selection here means a value
+        // that actually normalizes. Routing the probe through it would let a
+        // malformed selector skip the multi-stage refusal and print another
+        // stage's credential. Migration is irrelevant to a probe that only asks
+        // whether the destination is ambiguous.
+        load_auth(None).map_err(sanitize_auth_error)?;
     }
     let base = selected.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let mut auth = load(Some(&base))?
@@ -1878,6 +1941,181 @@ fn humanize_secs(secs: u64) -> String {
         5400..=172_799 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86_400),
     }
+}
+
+/// Read the canonical stage store, importing the old TypeScript store only when
+/// no credential exists for that destination. Never let a stale SDK token replace
+/// a refreshed Rust token, and retain load_auth's refusal to guess between stages.
+pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
+    // An explicit destination wins outright, so a malformed variable must not
+    // block a caller who already chose a stage. Only when nothing was passed does
+    // the environment decide, and then a malformed value is an error rather than a
+    // silent fallback to production.
+    let env_base = match base_url {
+        Some(_) => None,
+        None => env_selected_stage()?,
+    };
+    let base_url = base_url.or(env_base.as_deref());
+    if let Some(auth) = load_auth(base_url)? {
+        return Ok(Some(auth));
+    }
+    let legacy = std::env::var_os("AI_HIST_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .unwrap_or_default(),
+            )
+            .join(".config/ai-hist")
+        })
+        .join("auth.json");
+    if !legacy.exists() {
+        return Ok(None);
+    }
+    let auth = read_auth(&legacy)?;
+    if base_url.is_some_and(|base| !same_stage(base, &auth.base_url)) {
+        return Ok(None);
+    }
+    require_secure_transport(&auth.base_url)?;
+    save_auth(&auth)?;
+    Ok(Some(auth))
+}
+
+/// Exchange a caller-supplied Cloud bearer or run the existing Cloud device login.
+/// Both SDK and CLI persist credentials exclusively through the Rust stage store.
+pub fn login_for_sdk(
+    base_url: Option<&str>,
+    token: Option<&str>,
+    label: Option<&str>,
+) -> Result<StoredAuth> {
+    // resolve_base_url, not default_base_url: the latter ignores a malformed
+    // RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL and returns production, so a typo
+    // would authenticate against prod. Login must end up somewhere, so an unset
+    // environment still takes the default — only a malformed one is an error.
+    let base = resolve_base_url(base_url)?;
+    let base = normalized_stage(&base)?;
+    let label = label.unwrap_or("ai-hist enable-cloud");
+    let auth = match token {
+        Some(token) => login(&base, token, label, Some("sync"))?,
+        None => login_via_cloud(&base, "sync", None, label)?,
+    };
+    anyhow::ensure!(
+        auth.access_token.starts_with("rth_at_"),
+        "cloud login did not return a service-local access token"
+    );
+    save_auth(&auth)?;
+    Ok(auth)
+}
+
+pub struct CloudPushOutcome {
+    pub base_url: String,
+    pub sent: u64,
+    pub accepted: u64,
+    pub sync_skipped: bool,
+}
+
+/// Drain the existing outbox at the selected stage. Login never initializes a
+/// cursor from local maxima: only push's server-confirmed progress may advance it.
+pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
+    let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    crate::SYNC_QUIET.store(true, crate::AtomicOrdering::Relaxed);
+    let (conn, sync_skipped) = crate::prepare_sync_and_push_db(db_path)?;
+    let machine = MachineIdentity {
+        id: machine_id()?,
+        hostname: machine_hostname(),
+        os: Some(std::env::consts::OS.to_string()),
+        cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        ..Default::default()
+    };
+    let mut outcome = CloudPushOutcome {
+        base_url: auth.base_url.clone(),
+        sent: 0,
+        accepted: 0,
+        sync_skipped,
+    };
+    loop {
+        let cursor = load_cursor(&auth.base_url)?;
+        let report = push(
+            &conn,
+            &UreqIngestor,
+            &auth,
+            &machine,
+            &cursor,
+            500,
+            &HashSet::new(),
+        )?;
+        outcome.sent += report.sent as u64;
+        outcome.accepted += report.accepted;
+        if report.cursor == cursor {
+            break;
+        }
+    }
+    Ok(outcome)
+}
+
+pub fn enable_for_sdk(
+    db_path: &std::path::Path,
+    base_url: Option<&str>,
+    token: Option<&str>,
+    label: Option<&str>,
+) -> Result<CloudPushOutcome> {
+    // Explicit tokens request reauthentication; otherwise reuse stage credentials.
+    let auth = if token.is_some() {
+        login_for_sdk(base_url, token, label)?
+    } else {
+        match load_sdk_auth(base_url)? {
+            Some(auth) => auth,
+            None => login_for_sdk(base_url, None, label)?,
+        }
+    };
+    push_for_sdk(db_path, Some(&auth.base_url))
+}
+
+/// Create a frozen share with the existing refresh-capable transport.
+pub fn create_share(
+    session_id: &str,
+    visibility: &str,
+    source: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(!session_id.trim().is_empty(), "sessionId must not be empty");
+    anyhow::ensure!(
+        ["public", "private", "direct-link"].contains(&visibility),
+        "visibility must be public, private or direct-link"
+    );
+    let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    require_secure_transport(&auth.base_url)?;
+    let url = format!(
+        "{}/v1/sessions/{}/shares",
+        normalized_stage(&auth.base_url)?,
+        encode_path_segment(session_id)
+    );
+    let response = send_with_auth_refresh(
+        &auth,
+        |current| {
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", current.access_token))
+                .timeout(std::time::Duration::from_secs(30))
+                .send_json({
+                    let mut body = serde_json::json!({ "visibility": visibility });
+                    if let Some(source) = source {
+                        body["source"] = serde_json::json!(source);
+                    }
+                    body
+                })
+                .map_err(Box::new)
+        },
+        map_http_err,
+    )?;
+    let value: serde_json::Value = response.into_json()?;
+    let share_url = field(&value, "url")?;
+    let parsed = Url::parse(&share_url)?;
+    anyhow::ensure!(
+        parsed.origin() == Url::parse(&auth.base_url)?.origin() && parsed.path().starts_with("/s/"),
+        "server returned an unexpected share URL"
+    );
+    Ok(value)
 }
 
 #[cfg(test)]

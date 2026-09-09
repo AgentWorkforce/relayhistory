@@ -66,7 +66,11 @@ for await (const event of sessionEvents(id, { limit: 200 })) consume(event);
 ```
 
 The 1.0 CLI covers `sessions list`, `sessions discover`, `search`, `recent`,
-`session`, `events`, `stats`, and `sync`. Removed legacy cloud/Pair/tag/
+`session`, `events`, `stats`, `sync`, `token`, `replay`, and `enable-cloud`.
+`accessToken()` and `replay()` expose the existing Rust cloud operations through
+NAPI. Token output stays secret-only on stdout; replay pagination, rendering and
+atomic `--out` replacement remain in Rust and never open the local history DB.
+Removed legacy cloud/Pair/tag/
 trajectory convenience commands must migrate to dedicated services or future
 native-backed SDK operations; they are not retained through subprocess or
 JavaScript-SQL fallbacks.

@@ -187,3 +187,34 @@ evidence, and connector/parser failures with dedicated error subclasses.
 
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).
+
+## Cloud opt-in
+
+Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use `--once` to exit after draining. The async SDK exports `enableCloud`, `pushCloud`, `installGitHooks` and `createShareableTrace`; cloud transport and stage-scoped auth stay in Rust. Interactive login requires Agent Relay. See [cloud setup](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/enable-cloud.md).
+
+## Cloud token and replay
+
+The npm CLI uses the same Rust engine as the public async SDK:
+
+```bash
+export RTH_TOKEN=$(ai-hist token)
+ai-hist replay SESSION_ID
+ai-hist replay SESSION_ID --json --out transcript.json
+```
+
+```ts
+import { accessToken, replay } from 'ai-hist';
+
+const token = await accessToken(); // Secret: do not log it.
+const result = await replay('SESSION_ID', { json: true });
+const events = JSON.parse(result.transcript!);
+await replay('SESSION_ID', { json: true, out: 'transcript.json' });
+```
+
+Both APIs accept `baseUrl` (`--base-url` in the CLI) for explicit stage selection.
+Token refresh and persistence run in Rust before returning a token with at least
+60 seconds of recorded validity. Piped `token` stdout contains only the token
+and one newline; failures leave stdout empty. Replay fetches every page in
+server order; `limit` is the page size, and `maxContent` caps each event's content.
+File output replaces its destination atomically only after all pages succeed.
+Neither command opens or imports into the local history database.

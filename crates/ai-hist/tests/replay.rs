@@ -72,6 +72,11 @@ fn save_auth(home: &Path, base: &str, legacy: bool) {
 fn replay(home: &Path, base: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ai-hist"))
         .env("RELAYHISTORY_HOME", home)
+        // replay migrates the legacy TypeScript store under HOME; pin it so the
+        // developer's real ~/.config/ai-hist/auth.json cannot influence results.
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("AI_HIST_CONFIG_DIR", home.join("legacy-sdk"))
         .env("RELAYHISTORY_BASE_URL", base)
         .env_remove("AI_HIST_BASE_URL")
         .arg("--db")
@@ -336,5 +341,67 @@ fn replay_explicit_base_url_overrides_default_and_does_not_open_an_invalid_db() 
     assert_eq!(
         std::fs::read_to_string(home.path().join("must-not-create.db")).unwrap(),
         "not sqlite"
+    );
+}
+
+// replay used to synthesize its destination with default_base_url(), which turns
+// a malformed selector into the production origin, and then passed that on as if
+// the user had chosen it. The result was replay silently hitting production while
+// token rejected the very same selector. Both must reject it.
+#[test]
+fn malformed_base_url_env_is_rejected_instead_of_silently_using_production() {
+    let home = tempfile::tempdir().unwrap();
+    let output = replay(home.path(), "not-a-url", &["some-session"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "a malformed selector must be reported, not replaced by production: {err}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a rejected destination must not print a transcript"
+    );
+}
+
+// An explicit destination still wins over a broken environment, matching token.
+#[test]
+fn explicit_base_url_wins_over_a_malformed_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);
+    save_auth(home.path(), &base, false);
+    let output = replay(home.path(), "not-a-url", &["unknown", "--base-url", &base]);
+    success(&output);
+    server.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No events found."));
+}
+
+// An absent selection must stay absent all the way to load_auth. Turning it into
+// production would hand the loader a value that looks chosen, suppressing the
+// multi-stage refusal, so replay would silently read production while token
+// declines to guess. Both commands must refuse.
+#[test]
+fn multiple_stages_without_a_selector_refuse_to_guess() {
+    let home = tempfile::tempdir().unwrap();
+    save_auth(home.path(), "https://history.agentrelay.com", false);
+    save_auth(home.path(), "http://localhost:8787", false);
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-hist"))
+        .env("RELAYHISTORY_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("AI_HIST_CONFIG_DIR", home.path().join("legacy-sdk"))
+        .env_remove("RELAYHISTORY_BASE_URL")
+        .env_remove("AI_HIST_BASE_URL")
+        .arg("--db")
+        .arg(home.path().join("must-not-create.db"))
+        .arg("replay")
+        .arg("some-session")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("stages are configured; pass --base-url to select one"),
+        "replay must refuse to guess between stages, not default to production: {err}"
     );
 }

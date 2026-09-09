@@ -13,10 +13,40 @@ pub fn run(
     json: bool,
     out: Option<&Path>,
 ) -> Result<()> {
-    let base_url = base_url
-        .map(String::from)
-        .unwrap_or_else(cloud::default_base_url);
-    let auth = cloud::load_auth(Some(&base_url))?.context(
+    let result = replay(session_id, base_url, limit, max_content, json, out)?;
+    if let Some(body) = result.transcript {
+        io::stdout().lock().write_all(body.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// A completed replay. File output stays in Rust so every caller gets the same
+/// fetch-before-write and atomic replacement guarantees. SDK calls never print.
+pub struct ReplayOutput {
+    pub event_count: usize,
+    pub transcript: Option<String>,
+    pub output_path: Option<String>,
+}
+
+pub fn replay(
+    session_id: &str,
+    base_url: Option<&str>,
+    limit: Option<usize>,
+    max_content: Option<usize>,
+    json: bool,
+    out: Option<&Path>,
+) -> Result<ReplayOutput> {
+    anyhow::ensure!(!session_id.trim().is_empty(), "sessionId must not be empty");
+    // resolve_stage, not resolve_base_url: an absent selection must stay absent.
+    // Turning it into production here would hand load_sdk_auth a value that looks
+    // chosen, suppressing the multi-stage refusal, so replay would silently read
+    // production while token declines to guess. A malformed selector is still an
+    // error rather than a silent fallback.
+    let stage = cloud::resolve_stage(base_url)?;
+    // load_sdk_auth, not load_auth: an npm user upgrading from the TypeScript
+    // client keeps credentials in ~/.config/ai-hist/auth.json, and replay must
+    // migrate that store like the rest of the SDK surface.
+    let auth = cloud::load_sdk_auth(stage.as_deref())?.context(
         "not authenticated for the selected stage — run `ai-hist login` or `ai-hist admin-mint` first",
     )?;
     let events = cloud::replay_events(&auth, session_id, limit, max_content)?;
@@ -32,13 +62,18 @@ pub fn run(
     };
     // Finish fetching before touching the destination: an expired token on page two
     // must not overwrite an existing offline transcript with only page one.
-    if let Some(path) = out {
+    let transcript = if let Some(path) = out {
         write_atomically(path, body.as_bytes())
             .with_context(|| format!("writing replay to {}", path.display()))?;
+        None
     } else {
-        io::stdout().lock().write_all(body.as_bytes())?;
-    }
-    Ok(())
+        Some(body)
+    };
+    Ok(ReplayOutput {
+        event_count: events.len(),
+        transcript,
+        output_path: out.map(|path| path.display().to_string()),
+    })
 }
 
 /// Write via a temporary file in the destination's own directory, then atomically replace.

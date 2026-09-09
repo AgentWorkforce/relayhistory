@@ -28,7 +28,15 @@ fn save(home: &Path, base: &str, token: &str, expiry: Option<&str>) -> PathBuf {
 
 fn command(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-hist"));
+    // token migrates the legacy TypeScript store, which lives under HOME rather
+    // than RELAYHISTORY_HOME. Pin both, or these tests read the developer's real
+    // ~/.config/ai-hist/auth.json and pass or fail by machine state. The legacy
+    // dir is deliberately a subpath that stays absent unless a test creates it,
+    // so it cannot collide with the RELAYHISTORY_HOME/auth.json legacy location.
     cmd.env("RELAYHISTORY_HOME", home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("AI_HIST_CONFIG_DIR", home.join("legacy-sdk"))
         .env_remove("RELAYHISTORY_BASE_URL")
         .env_remove("AI_HIST_BASE_URL")
         .env("RUST_LOG", "trace")
@@ -327,4 +335,90 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
     let home = tempfile::tempdir().unwrap();
     save(home.path(), "http://localhost:8787", OLD, Some(FUTURE));
     assert!(failure(&command(home.path()).output().unwrap()).contains("not authenticated"));
+}
+
+// With no selector at all and several stages configured, token must refuse to
+// guess rather than fall back to production. The ambiguity probe stays on
+// load_auth for this reason: load_sdk_auth infers a destination from the
+// environment, which would defeat the refusal.
+#[test]
+fn multiple_stages_without_a_selector_refuse_to_guess() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    save(home.path(), "http://localhost:8787", NEW, Some(FUTURE));
+    let err = failure(&command(home.path()).output().unwrap());
+    assert!(
+        err.contains("stages are configured; pass --base-url to select one"),
+        "an unselected multi-stage setup must not silently select production: {err}"
+    );
+}
+
+// An explicit destination wins outright. A broken environment variable must not
+// block a caller who already chose a stage, or --base-url becomes unusable on any
+// machine with a stale or mistyped selector exported.
+#[test]
+fn explicit_base_url_wins_over_a_malformed_environment() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let mut cmd = command(home.path());
+    cmd.env("RELAYHISTORY_BASE_URL", "not-a-url")
+        .arg("--base-url")
+        .arg(PROD);
+    success(&cmd.output().unwrap(), OLD);
+}
+
+// default_base_url() ignores a malformed selector and returns production, so
+// treating "the variable is set" as "production was chosen" would silently
+// retarget the caller's stage. A malformed selector must be reported, and the
+// message must never echo the value: normalize_base_url rejects URLs carrying
+// embedded credentials, so a rejected value is exactly the kind that may hold one.
+#[test]
+fn malformed_base_url_env_is_rejected_without_echoing_the_value() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let secret_shaped = "https://user:hunter2@example.com/path?q=1";
+    let mut cmd = command(home.path());
+    cmd.env("RELAYHISTORY_BASE_URL", secret_shaped);
+    let err = failure(&cmd.output().unwrap());
+    assert!(
+        err.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "a malformed selector must be named, not silently replaced by production: {err}"
+    );
+    assert!(
+        !err.contains("hunter2") && !err.contains(secret_shaped),
+        "the rejected value must never be echoed: {err}"
+    );
+}
+
+// login_for_sdk resolved a missing destination with default_base_url(), which
+// ignores a malformed selector and returns production — so loginCloud and
+// enableCloud would authenticate against prod where token rejects that selector.
+// The SDK entrypoint is exercised directly; the CLI token path is covered above.
+#[test]
+fn sdk_login_rejects_a_malformed_selector_instead_of_using_production() {
+    let home = tempfile::tempdir().unwrap();
+    let previous: Vec<(String, Option<std::ffi::OsString>)> = [
+        "RELAYHISTORY_HOME",
+        "RELAYHISTORY_BASE_URL",
+        "AI_HIST_BASE_URL",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), std::env::var_os(k)))
+    .collect();
+    std::env::set_var("RELAYHISTORY_HOME", home.path());
+    std::env::set_var("RELAYHISTORY_BASE_URL", "not-a-url");
+    std::env::remove_var("AI_HIST_BASE_URL");
+    let error = ai_hist_engine::cloud::login_for_sdk(None, Some("relay-token"), None)
+        .expect_err("a malformed selector must not authenticate against production");
+    let message = format!("{error:#}");
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(&key, value),
+            None => std::env::remove_var(&key),
+        }
+    }
+    assert!(
+        message.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "the variable must be named: {message}"
+    );
 }

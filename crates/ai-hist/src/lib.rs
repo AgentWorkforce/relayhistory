@@ -23,11 +23,12 @@ use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-mod cloud;
+pub mod cloud;
 mod codex;
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
 /// listing that backs it.
 pub mod discover;
+pub mod git_sdk;
 mod hydrate;
 mod learn;
 /// Recording the delegation evidence each provider leaves behind.
@@ -35,7 +36,7 @@ mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
-mod replay;
+pub mod replay;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env,

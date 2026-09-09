@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 7;
+export const NATIVE_CONTRACT_VERSION = 9;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
@@ -493,6 +493,15 @@ export interface SyncResult { databasePath: string; scope: SessionScope; complet
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  accessToken(baseUrl?: string): Promise<string>;
+  replay(sessionId: string, options: ReplayOptions): Promise<ReplayResult>;
+  createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;
+  installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
+  linkGitCommit(optionsJson: string): Promise<string>;
+  cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
+  cloudLogin(options: object): Promise<RelayhistoryAuth>;
+  enableCloud(options: object): Promise<CloudPushResult>;
+  pushCloud(options: object): Promise<CloudPushResult>;
   nativeContractVersion(): number;
   nativeBuildProfile?(): string;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
@@ -1511,4 +1520,114 @@ export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' |
 
 function shellQuote(value: string): string {
   return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export interface RelayhistoryAuth { baseUrl: string; accessToken: string; refreshToken?: string }
+export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
+export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
+/** Return a secret service token with at least 60 seconds of validity. Rust
+ * selects the stage, refreshes if needed and atomically saves rotated tokens. */
+export async function accessToken(options: { baseUrl?: string } = {}): Promise<string> {
+  return nativeCall((native) => native.accessToken(options.baseUrl));
+}
+
+export interface ReplayOptions {
+  baseUrl?: string;
+  /** Page size, not a total cap; Rust fetches every page in server order. */
+  limit?: number;
+  maxContent?: number;
+  /** Return the raw event array serialized as JSON instead of readable text. */
+  json?: boolean;
+  /** Atomically save in Rust after all pages succeed; transcript is then null. */
+  out?: string;
+}
+export interface ReplayResult { eventCount: number; transcript: string | null; outputPath: string | null }
+
+/** Fetch a cloud transcript without opening or importing into the local DB. */
+export async function replay(sessionId: string, options: ReplayOptions = {}): Promise<ReplayResult> {
+  for (const key of ['limit', 'maxContent'] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)) {
+      throw new InvalidArgumentError(`${key} must be an integer between 0 and 4294967295`, 'INVALID_ARGUMENT');
+    }
+  }
+  const result = await nativeCall((native) => native.replay(sessionId, options));
+  return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
+}
+
+export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
+export interface EnableCloudOptions extends CloudOptions {
+  /** Keep syncing until stop() is called. Defaults to true. */
+  watch?: boolean;
+  intervalMs?: number;
+  onPush?: (result: CloudPushResult) => void;
+  onError?: (error: unknown) => void;
+}
+export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
+
+/** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
+export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
+  return nativeCall((native) => native.cloudLoadAuth(baseUrl));
+}
+
+export async function loginCloud(relayAccessToken: string, options: { baseUrl?: string; label?: string } = {}): Promise<LoginCloudResult> {
+  try {
+    const auth = await nativeCall((native) => native.cloudLogin({ ...options, relayAccessToken }));
+    return { ok: true, auth };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export async function pushCloud(options: CloudOptions = {}): Promise<CloudPushResult> {
+  return nativeCall((native) => native.pushCloud(options));
+}
+
+/** Device login, service-token exchange and first push run in Rust. The optional
+ * loop is host orchestration only: no token, refresh, stage or cursor logic in JS.
+ * The loop remains in this process; await stop() before shutdown. */
+export async function enableCloud(options: EnableCloudOptions = {}): Promise<CloudHandle> {
+  const intervalMs = options.intervalMs ?? 60_000;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 2_147_483_647) {
+    throw new InvalidArgumentError('intervalMs must be an integer between 1000 and 2147483647', 'INVALID_ARGUMENT');
+  }
+  const first = await nativeCall((native) => native.enableCloud(options));
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: Promise<void> = Promise.resolve();
+  const schedule = () => {
+    if (stopped || options.watch === false) return;
+    timer = setTimeout(() => {
+      pending = (async () => {
+        try {
+          const result = await pushCloud({ dbPath: options.dbPath, baseUrl: first.baseUrl });
+          options.onPush?.(result);
+        } catch (error) {
+          if (options.onError) options.onError(error);
+          else process.stderr.write(`ai-hist cloud push failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        } finally { schedule(); }
+      })();
+    }, intervalMs);
+  };
+  schedule();
+  return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
+}
+
+export interface GitHookOptions { repo: string; sessionId: string; source?: string; dbPath?: string; prUrl?: string }
+/** Install a local post-commit recorder for an explicit session. prUrl identifies
+ * an existing GitHub PR; linkage is uploaded by the next cloud push. */
+export async function installGitHooks(options: GitHookOptions): Promise<{ hookPath: string; prUrl: string | null }> {
+  const result = await nativeCall((native) => native.installGitHooks(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() }), process.execPath, import.meta.url));
+  return JSON.parse(result) as { hookPath: string; prUrl: string | null };
+}
+export async function linkGitCommit(options: GitHookOptions): Promise<{ commitSha: string }> {
+  const commitSha = await nativeCall((native) => native.linkGitCommit(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() })));
+  return { commitSha };
+}
+
+export type TraceVisibility = 'public' | 'private' | 'direct-link';
+export interface ShareableTrace { url: string; visibility: TraceVisibility; eventCount: number }
+/** Share the already-pushed, frozen server snapshot of a session. */
+export async function createShareableTrace(sessionId: string, options: { visibility: TraceVisibility; source?: string; baseUrl?: string }): Promise<ShareableTrace> {
+  return nativeCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
 }

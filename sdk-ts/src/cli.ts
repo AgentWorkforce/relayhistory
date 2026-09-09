@@ -6,6 +6,7 @@ import {
   bootstrapLocal, discoverSessions, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  enableCloud, accessToken, replay,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
   type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
@@ -14,9 +15,9 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'pretty', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
-  'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'base-url', 'interval', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
@@ -196,6 +197,7 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json]
+  ai-hist enable-cloud [--base-url URL] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
@@ -209,6 +211,8 @@ function usage(message?: string): never {
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
+  ai-hist token [--base-url URL]
+  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 `);
@@ -533,6 +537,50 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (command === 'token') {
+    validateFlags(args, 'token', ['base-url']);
+    rejectSurplusPositionals(args.positional.slice(1), 'token');
+    const token = await accessToken({ baseUrl: textFlag(args, 'base-url') });
+    if (process.stdout.isTTY) process.stderr.write('Warning: this access token is a secret and will remain in terminal scrollback.\n');
+    process.stdout.write(`${token}\n`);
+    return;
+  }
+  if (command === 'replay') {
+    validateFlags(args, 'replay', ['base-url', 'limit', 'max-content', 'json', 'out']);
+    if (!subcommand) usage('replay requires SESSION_ID');
+    rejectSurplusPositionals(rest, 'replay');
+    const result = await replay(subcommand, {
+      baseUrl: textFlag(args, 'base-url'), limit: nonNegativeIntFlag(args, 'limit'),
+      maxContent: nonNegativeIntFlag(args, 'max-content'), json, out: textFlag(args, 'out'),
+    });
+    if (result.transcript !== null) process.stdout.write(result.transcript);
+    return;
+  }
+  if (command === 'enable-cloud') {
+    validateFlags(args, 'enable-cloud', ['base-url', 'db', 'interval', 'once', 'json']);
+    rejectSurplusPositionals(args.positional.slice(1), 'enable-cloud');
+    // --interval is seconds; validate before converting so the error names the
+    // unit the caller actually typed rather than a millisecond bound.
+    const intervalSeconds = numberFlag(args, 'interval') ?? 60;
+    if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 1 || intervalSeconds > 2_147_483) {
+      usage('--interval must be a whole number of seconds between 1 and 2147483');
+    }
+    const handle = await enableCloud({
+      baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
+      intervalMs: intervalSeconds * 1000,
+      watch: !args.flags.has('once'),
+      onPush: (result) => output(result, json),
+    });
+    const { stop, ...result } = handle;
+    output(result, json);
+    if (!args.flags.has('once')) {
+      const shutdown = () => { void stop(); };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+    }
+    return;
+  }
+
   if (command === 'sessions' && subcommand === 'list') {
     validateFlags(args, 'sessions list', [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',

@@ -319,7 +319,7 @@ pub fn build_outbox_batch(
         })?;
         for row in rows {
             let link = row?;
-            if records.len() >= MAX_RECORDS {
+            if records.len() + 2 > MAX_RECORDS {
                 break;
             }
             next.commit_link_id = next.commit_link_id.max(link.id);
@@ -334,7 +334,7 @@ pub fn build_outbox_batch(
                 link.repo.as_deref(),
                 &mut remotes,
             );
-            records.push(map_session_outcome(
+            let outcome = map_session_outcome(
                 &SessionCommitLink {
                     source: &link.source,
                     session_id: &link.session_id,
@@ -350,7 +350,22 @@ pub fn build_outbox_batch(
                 },
                 &project_id,
                 files,
-            ));
+            );
+            if let Some(task_ref) = link
+                .evidence_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| value.get("github_pr").cloned())
+            {
+                let mut event = outcome.clone();
+                event.kind = "event".into();
+                event.lens = Some("github".into());
+                event.event_type = "github_pr".into();
+                event.event_id = format!("github_pr:{}", outcome.event_id);
+                event.task_ref = Some(task_ref);
+                records.push(event);
+            }
+            records.push(outcome);
         }
     }
 
