@@ -1,6 +1,6 @@
 {
   "name": "ai-hist",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "Native-backed TypeScript SDK, CLI, and MCP server for RelayHistory.",
   "license": "MIT",
   "private": false,
