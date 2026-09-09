@@ -7538,15 +7538,142 @@ fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64>)> {
 }
 
 fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    sync_cursor_with_scan_hook(conn, state, root, &mut |_| {})
+}
+
+struct PreparedCursorTranscript {
+    path: PathBuf,
+    session_id: String,
+    project: String,
+    timestamp_ms: i64,
+    prompts: Vec<String>,
+}
+
+struct PreparedCursorSync {
+    transcripts: Vec<PreparedCursorTranscript>,
+    cursor_state: Map<String, Value>,
+    errors: usize,
+    files_seen: usize,
+}
+
+fn sync_cursor_with_scan_hook(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    before_transcript: &mut dyn FnMut(&Path),
+) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
+    // Finish provider I/O and parsing before taking the destination writer lock.
+    let prepared = prepare_cursor_sync(state, root, before_transcript)
+        .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
+    // Match rollback to the source-wide checkpoint boundary: replaying committed
+    // prompts after a file's mtime changes can duplicate them.
+    let tx = conn.unchecked_transaction()?;
+    let mut inserted = 0;
+    for transcript in prepared.transcripts {
+        for prompt in transcript.prompts {
+            inserted += insert_cursor_prompt(
+                &tx,
+                prompt,
+                &transcript.session_id,
+                &transcript.project,
+                transcript.timestamp_ms,
+            )
+            .with_context(|| format!("insert Cursor prompt from {}", transcript.path.display()))?;
+        }
+    }
+    tx.commit().context("commit Cursor sync")?;
+    state.insert("cursor".to_string(), Value::Object(prepared.cursor_state));
+    if prepared.files_seen > 0 {
+        let suffix = if prepared.errors > 0 {
+            format!(" ({} errors)", prepared.errors)
+        } else {
+            String::new()
+        };
+        sync_note!(
+            "  [cursor] +{inserted} rows from {} files{suffix}",
+            prepared.files_seen
+        );
+    }
+    Ok(inserted)
+}
+
+/// One transcript's worth of prepared work. `checkpoint` is returned rather than
+/// written in place so a transcript that fails midway leaves its saved checkpoint
+/// exactly as it was.
+struct ScannedCursorTranscript {
+    prompts: Vec<String>,
+    timestamp_ms: i64,
+    parse_errors: usize,
+    checkpoint: Option<Value>,
+}
+
+fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
+    let mut source = CompleteJsonlReader::open(jsonl, saved)
+        .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
+    let offset = source.position;
+    let size = source
+        .reader
+        .get_ref()
+        .metadata()
+        .with_context(|| format!("read Cursor transcript metadata {}", jsonl.display()))?
+        .len();
+    let timestamp_ms = jsonl
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut consumed = offset;
+    let mut prompts = Vec::new();
+    let mut parse_errors = 0;
+    if offset < size {
+        let mut line = String::new();
+        while let Some(position) = source
+            .next_line(&mut line)
+            .with_context(|| format!("read Cursor transcript {}", jsonl.display()))?
+        {
+            consumed = position;
+            match parse_cursor_text(&line) {
+                Ok(Some(prompt)) => prompts.push(prompt),
+                Ok(None) => {}
+                Err(_) => parse_errors += 1,
+            }
+        }
+    }
+    let opened_cursor = source.cursor.to_value();
+    let checkpoint = if consumed != offset || saved != Some(&opened_cursor) {
+        Some(
+            source
+                .committed_cursor(consumed, true)
+                .with_context(|| format!("validate Cursor transcript {}", jsonl.display()))?
+                .to_value(),
+        )
+    } else {
+        None
+    };
+    Ok(ScannedCursorTranscript {
+        prompts,
+        timestamp_ms,
+        parse_errors,
+        checkpoint,
+    })
+}
+
+fn prepare_cursor_sync(
+    state: &Map<String, Value>,
+    root: &Path,
+    before_transcript: &mut dyn FnMut(&Path),
+) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
         .get("cursor")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut inserted = 0;
+    let mut transcripts = Vec::new();
     let mut errors = 0;
     let mut files_seen = 0;
     for project_dir in sorted_dirs(root)? {
@@ -7570,45 +7697,43 @@ fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -
             if !jsonl.exists() {
                 continue;
             }
+            before_transcript(&jsonl);
             files_seen += 1;
             let key = jsonl.to_string_lossy().to_string();
-            let mut source = CompleteJsonlReader::open(&jsonl, cursor_state.get(&key))?;
-            let offset = source.position;
-            let size = source.reader.get_ref().metadata()?.len();
-            let ts_ms = jsonl
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let mut consumed = offset;
-            if offset < size {
-                let mut line = String::new();
-                while let Some(position) = source.next_line(&mut line)? {
-                    consumed = position;
-                    match ingest_cursor_line(conn, &line, &session_id, &project_path, ts_ms) {
-                        Ok(count) => inserted += count,
-                        Err(_) => errors += 1,
-                    }
+            // Cursor rewrites and rotates transcripts underneath us, so a file can
+            // vanish or be replaced between enumeration and open. That race is
+            // per-file, not per-source: record it, leave this file's checkpoint
+            // untouched so the next sync retries it from the same offset, and keep
+            // preparing the remaining transcripts.
+            let scan = match scan_cursor_transcript(&jsonl, cursor_state.get(&key)) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
+                    errors += 1;
+                    continue;
                 }
+            };
+            errors += scan.parse_errors;
+            if let Some(checkpoint) = scan.checkpoint {
+                cursor_state.insert(key, checkpoint);
             }
-            let opened_cursor = source.cursor.to_value();
-            if consumed != offset || cursor_state.get(&key) != Some(&opened_cursor) {
-                cursor_state.insert(key, source.committed_cursor(consumed, true)?.to_value());
+            if !scan.prompts.is_empty() {
+                transcripts.push(PreparedCursorTranscript {
+                    path: jsonl,
+                    session_id,
+                    project: project_path.clone(),
+                    timestamp_ms: scan.timestamp_ms,
+                    prompts: scan.prompts,
+                });
             }
         }
     }
-    state.insert("cursor".to_string(), Value::Object(cursor_state));
-    if files_seen > 0 {
-        let suffix = if errors > 0 {
-            format!(" ({errors} errors)")
-        } else {
-            String::new()
-        };
-        sync_note!("  [cursor] +{inserted} rows from {files_seen} files{suffix}");
-    }
-    Ok(inserted)
+    Ok(PreparedCursorSync {
+        transcripts,
+        cursor_state,
+        errors,
+        files_seen,
+    })
 }
 
 fn ingest_cursor_line(
@@ -7621,6 +7746,16 @@ fn ingest_cursor_line(
     let Some(prompt) = parse_cursor_text(line)? else {
         return Ok(0);
     };
+    insert_cursor_prompt(conn, prompt, session_id, project, timestamp_ms)
+}
+
+fn insert_cursor_prompt(
+    conn: &Connection,
+    prompt: String,
+    session_id: &str,
+    project: &str,
+    timestamp_ms: i64,
+) -> Result<usize> {
     insert_history(
         conn,
         &HistoryEntry {
@@ -9619,6 +9754,427 @@ mod tests {
             saved_cursor_offset(&state["claude"]),
             fs::metadata(&path).unwrap().len()
         );
+    }
+
+    #[test]
+    fn cursor_sync_allows_another_writer_while_preparing_later_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        let second = dir.path().join("P/agent-transcripts/s2/s2.jsonl");
+        for (path, prompt) in [(&first, "first pending prompt"), (&second, "second prompt")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("{}\n", json!({"role":"user","message":{"content":prompt}})),
+            )
+            .unwrap();
+        }
+        let db = dir.path().join("history.db");
+        let conn = Connection::open(&db).unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE writer_probe (value INTEGER);")
+            .unwrap();
+        let competitor = Connection::open(&db).unwrap();
+        competitor.busy_timeout(Duration::ZERO).unwrap();
+        let mut visited = Vec::new();
+        let mut competing_write = None;
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+                visited.push(path.to_path_buf());
+                if path == second {
+                    competing_write =
+                        Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+                }
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(visited, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            competing_write
+                .expect("the later transcript must be reached")
+                .unwrap(),
+            1,
+            "preparation must leave the destination available to another writer"
+        );
+        for path in [&first, &second] {
+            assert_eq!(
+                saved_cursor_offset(&state["cursor"][path.to_string_lossy().as_ref()]),
+                fs::metadata(path).unwrap().len()
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn cursor_sync_recovers_when_a_transcript_vanishes_during_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        let second = dir.path().join("P/agent-transcripts/s2/s2.jsonl");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(
+            &first,
+            concat!(r#"{"role":"user","message":{"content":"seed"}}"#, "\n"),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            1
+        );
+        let saved = state.clone();
+        let seed_timestamp: i64 = conn
+            .query_row("SELECT timestamp_ms FROM history", [], |row| row.get(0))
+            .unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&first).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","message":{{"content":"pending prompt"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(
+            &second,
+            concat!(
+                r#"{"role":"user","message":{"content":"later prompt"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut visited = Vec::new();
+        let inserted =
+            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+                visited.push(path.to_path_buf());
+                if path == second {
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1,
+                        "the earlier transcript must still be pending during preparation"
+                    );
+                    // The hook runs after the existence check, forcing open to fail.
+                    fs::remove_file(path).unwrap();
+                }
+            })
+            .expect("one vanished transcript must not abort the whole Cursor source");
+        assert_eq!(visited, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            inserted, 1,
+            "the surviving transcript must still be ingested"
+        );
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, timestamp_ms FROM history ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["seed", "pending prompt"],
+            "the readable transcript must be ingested despite its neighbour vanishing"
+        );
+        assert_eq!(rows[0].1, seed_timestamp);
+        // The surviving file advances; the vanished file keeps whatever checkpoint it
+        // had, so the next sync retries it from the same offset.
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][first.to_string_lossy().as_ref()]),
+            fs::metadata(&first).unwrap().len(),
+            "the readable transcript's checkpoint must advance"
+        );
+        assert_eq!(
+            state["cursor"].get(second.to_string_lossy().as_ref()),
+            saved["cursor"].get(second.to_string_lossy().as_ref()),
+            "the vanished transcript's checkpoint must be left untouched"
+        );
+    }
+
+    #[test]
+    fn cursor_sync_preserves_checkpoint_after_failed_write_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        let seed = concat!(r#"{"role":"user","message":{"content":"seed"}}"#, "\n");
+        fs::write(&cursor, seed).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            1
+        );
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            seed.len() as u64
+        );
+        let saved = state.clone();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+        for prompt in ["before failure", "rejected", "after failure"] {
+            writeln!(
+                file,
+                "{}",
+                json!({"role":"user","message":{"content":prompt}})
+            )
+            .unwrap();
+        }
+        drop(file);
+        conn.execute_batch(
+            "CREATE TRIGGER reject_cursor_prompt BEFORE INSERT ON history \
+             WHEN NEW.source = 'cursor' AND NEW.prompt = 'rejected' \
+             BEGIN SELECT RAISE(FAIL, 'forced Cursor write failure'); END;",
+        )
+        .unwrap();
+
+        let error = super::sync_cursor(&conn, &mut state, dir.path())
+            .expect_err("a failed database write must fail Cursor sync");
+        assert!(format!("{error:#}").contains("forced Cursor write failure"));
+        assert_eq!(
+            state, saved,
+            "failed sync must preserve the entire checkpoint"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "failed sync must roll back new prompts and preserve the seed"
+        );
+
+        let failed_metadata = fs::metadata(&cursor).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","message":{{"content":"appended before retry"}}}}"#
+        )
+        .unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(failed_metadata.modified().unwrap() + Duration::from_secs(60)),
+        )
+        .unwrap();
+        drop(file);
+        assert_ne!(
+            super::modified_ms_of(&failed_metadata).unwrap(),
+            super::modified_ms_of(&fs::metadata(&cursor).unwrap()).unwrap(),
+            "retry must use a different timestamp in the history uniqueness key"
+        );
+
+        conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
+            .unwrap();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            4
+        );
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            fs::metadata(&cursor).unwrap().len()
+        );
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            0
+        );
+        let prompts: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, COUNT(*) FROM history GROUP BY prompt ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                ("after failure".into(), 1),
+                ("appended before retry".into(), 1),
+                ("before failure".into(), 1),
+                ("rejected".into(), 1),
+                ("seed".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_sync_rolls_back_earlier_files_before_retrying_changed_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        let second = dir.path().join("P/agent-transcripts/s2/s2.jsonl");
+        for (path, prompts) in [
+            (&first, vec!["first file"]),
+            (
+                &second,
+                vec!["second before failure", "rejected", "second after failure"],
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = fs::File::create(path).unwrap();
+            for prompt in prompts {
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"role":"user","message":{"content":prompt}})
+                )
+                .unwrap();
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_cursor_prompt BEFORE INSERT ON history \
+             WHEN NEW.source = 'cursor' AND NEW.prompt = 'rejected' \
+             BEGIN SELECT RAISE(FAIL, 'forced Cursor write failure'); END;",
+        )
+        .unwrap();
+        let mut state = Map::new();
+        let saved = state.clone();
+        let error = super::sync_cursor(&conn, &mut state, dir.path())
+            .expect_err("the later file must fail the entire source");
+        assert!(format!("{error:#}").contains("forced Cursor write failure"));
+        assert_eq!(state, saved, "first failed sync must not publish any state");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "writes from both the earlier file and the failing file must roll back"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_presences", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "session presence writes must roll back with the evidence"
+        );
+
+        for (path, prompt) in [(&first, "first appended"), (&second, "second appended")] {
+            let failed_metadata = fs::metadata(path).unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({"role":"user","message":{"content":prompt}})
+            )
+            .unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(failed_metadata.modified().unwrap() + Duration::from_secs(60)),
+            )
+            .unwrap();
+            drop(file);
+            assert_ne!(
+                super::modified_ms_of(&failed_metadata).unwrap(),
+                super::modified_ms_of(&fs::metadata(path).unwrap()).unwrap()
+            );
+        }
+        conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
+            .unwrap();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            6
+        );
+        for path in [&first, &second] {
+            assert_eq!(
+                saved_cursor_offset(&state["cursor"][path.to_string_lossy().as_ref()]),
+                fs::metadata(path).unwrap().len()
+            );
+        }
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            0
+        );
+        let prompts: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, COUNT(*) FROM history GROUP BY prompt ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                ("first appended".into(), 1),
+                ("first file".into(), 1),
+                ("rejected".into(), 1),
+                ("second after failure".into(), 1),
+                ("second appended".into(), 1),
+                ("second before failure".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_sync_consumes_malformed_and_non_user_rows_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
+        fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        fs::write(
+            &cursor,
+            concat!(
+                r#"{"role":"user","message":{"content":"first"}}"#,
+                "\n",
+                "{malformed JSON}\n",
+                r#"{"role":"assistant","message":{"content":"assistant response"}}"#,
+                "\n",
+                r#"{"role":"system","message":{"content":"system message"}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":"second"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            2
+        );
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            fs::metadata(&cursor).unwrap().len()
+        );
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            0
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","message":{{"content":"continued"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            1
+        );
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            fs::metadata(&cursor).unwrap().len()
+        );
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            0
+        );
+        let prompts: Vec<String> = conn
+            .prepare("SELECT prompt FROM history ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["continued", "first", "second"]);
     }
 
     #[test]
