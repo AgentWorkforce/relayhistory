@@ -4656,6 +4656,25 @@ impl Drop for SyncStateLock {
 ///
 /// Returns `None` when disk already reflects everything here, so a steady-state
 /// run that finds every source up to date does not rewrite the file per source.
+/// State keys earlier versions wrote and no longer maintain.
+///
+/// [`merged_sync_state`] folds this run's keys into what is already on disk and
+/// deliberately never walks the on-disk keys: a run legitimately omits every
+/// source it did not touch, so absence cannot mean "delete". That makes an
+/// in-memory `state.remove(...)` invisible to disk — the retired map is reloaded
+/// and rewritten forever, and the cleanup those migrations intend never
+/// completes. Retirements therefore have to be declared here, where the merge
+/// can act on them, rather than inferred from a key's absence.
+///
+/// Adding a key here is a one-way migration: it is dropped from every state file
+/// it is found in. Only list keys no supported version still reads.
+const RETIRED_SYNC_STATE_KEYS: &[&str] = &[
+    "codex_rollouts",
+    "codex_rollout_user_messages_v2",
+    "codex_rollouts_v3",
+    "codex_rollouts_v4",
+];
+
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
     let mut changed = false;
@@ -4670,6 +4689,13 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
         }
         merged.insert(key.clone(), next);
         changed = true;
+    }
+    // Runs concurrent with this one may still be writing a retired key, so sweep
+    // after the fold rather than before it.
+    for key in RETIRED_SYNC_STATE_KEYS {
+        if merged.remove(*key).is_some() {
+            changed = true;
+        }
     }
     Ok(if changed { Some(merged) } else { None })
 }
@@ -8968,6 +8994,55 @@ mod tests {
         );
     }
 
+    /// The v4->v5 migration drops `codex_rollouts_v4` from the in-memory map, but
+    /// the merge only folds in the keys a run *has*, so on its own that deletion
+    /// never reaches disk: the retired map is reloaded and rewritten forever.
+    #[test]
+    fn retired_state_keys_are_deleted_from_disk_not_just_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert(
+            "codex_rollouts_v4".into(),
+            json!({"a.jsonl": {"stamp": "1:1"}}),
+        );
+        on_disk.insert("codex_rollouts".into(), json!({"legacy.jsonl": "1:1"}));
+        on_disk.insert(
+            "codex_rollout_user_messages_v2".into(),
+            json!({"u.jsonl": "1:1"}),
+        );
+        on_disk.insert("codex_rollouts_v3".into(), json!({"v3.jsonl": "1:1"}));
+        on_disk.insert("claude".into(), json!({"keep.jsonl": 7}));
+        save_sync_state(&path, &on_disk).unwrap();
+
+        // What a post-migration run holds: v5 written, the retired keys removed.
+        let mut ours = Map::new();
+        ours.insert(
+            "codex_rollouts_v5".into(),
+            json!({"a.jsonl": {"stamp": "2:2"}}),
+        );
+        checkpoint_sync_state(&path, &ours);
+
+        let saved = load_sync_state(&path).unwrap();
+        for retired in super::RETIRED_SYNC_STATE_KEYS {
+            assert!(
+                !saved.contains_key(*retired),
+                "{retired} must not survive the migration on disk"
+            );
+        }
+        assert_eq!(
+            saved["codex_rollouts_v5"],
+            json!({"a.jsonl": {"stamp": "2:2"}})
+        );
+        // A source this run never touched must still be preserved -- absence from
+        // `ours` is not a deletion, which is why retirement has to be declared.
+        assert_eq!(saved["claude"], json!({"keep.jsonl": 7}));
+
+        // Idempotent: with nothing retired left on disk, a steady-state run that
+        // changes nothing must not rewrite the file.
+        assert!(super::merged_sync_state(&path, &ours).unwrap().is_none());
+    }
+
     #[test]
     fn an_unchanged_source_does_not_rewrite_the_state_file() {
         let dir = std::env::temp_dir().join(format!("ai-hist-norewrite-{}", std::process::id()));
@@ -10700,8 +10775,16 @@ mod tests {
         }
     }
 
+    /// A `source.subagent` marker with no parent metadata is a standalone
+    /// guardian: it keeps its own identity and stays discoverable as a root.
+    ///
+    /// This inverts the `is_subagent` assertion that ac0b64a
+    /// ("fix: resolve Codex subagent parent IDs") left here, which is the exact
+    /// classification this PR exists to change. That commit's own concern — that
+    /// a marker-only rollout resolves *no* parent — is asserted unchanged below,
+    /// and the linked-child case it protected is covered by the sibling test.
     #[test]
-    fn codex_marker_only_guardian_remains_an_unlinked_subagent() {
+    fn codex_marker_only_guardian_is_a_standalone_root() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout-guardian.jsonl");
         fs::write(
@@ -10714,8 +10797,43 @@ mod tests {
         .unwrap();
 
         let meta = codex_meta(&path);
-        assert!(meta.is_subagent);
+        assert!(
+            !meta.is_subagent,
+            "a marker-only guardian must stay discoverable under its own payload.id"
+        );
         assert_eq!(meta.parent_session_id, None);
+        assert_eq!(meta.parent_thread_id, None);
+        assert_eq!(meta.subagent_label.as_deref(), Some("guardian"));
+    }
+
+    /// The same marker *with* an explicit parent stays a child, including when
+    /// the parent is only reachable through the structured thread-spawn source
+    /// that ac0b64a taught the resolver to read.
+    #[test]
+    fn codex_marker_guardian_with_a_parent_stays_a_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, payload) in [
+            (
+                "explicit",
+                r#"{"id":"guardian","cwd":"/tmp/proj","parent_thread_id":"root","source":{"subagent":{"other":"guardian"}}}"#,
+            ),
+            (
+                "thread-spawn",
+                r#"{"id":"guardian","cwd":"/tmp/proj","source":{"subagent":{"other":"guardian","thread_spawn":{"parent_thread_id":"root"}}}}"#,
+            ),
+        ] {
+            let path = dir.path().join(format!("rollout-{name}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"timestamp\":\"2026-08-31T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{payload}}}\n"
+                ),
+            )
+            .unwrap();
+            let meta = codex_meta(&path);
+            assert!(meta.is_subagent, "{name} guardian must remain a child");
+            assert_eq!(meta.parent_session_id.as_deref(), Some("root"), "{name}");
+        }
     }
 
     fn response_user(ts: &str, text: &str) -> String {
