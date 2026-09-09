@@ -221,7 +221,23 @@ jobs:
           else
             # The registry determines the next version. A successful release
             # persists that version back to the checked-in manifests below.
-            CURRENT_VERSION=$(npm view ai-hist version)
+            # Use the highest published semver across the public packages so a
+            # partial release (native only) cannot collide on the next patch.
+            CURRENT_VERSION=$(node -e '
+              const { execSync } = require("node:child_process");
+              const versions = ["ai-hist", "ai-hist-native"].map((pkg) =>
+                execSync(`npm view ${pkg} version`, { encoding: "utf8" }).trim(),
+              );
+              const key = (version) => version.split(".").map(Number);
+              versions.sort((left, right) => {
+                const [a, b] = [key(left), key(right)];
+                for (let index = 0; index < 3; index += 1) {
+                  if (a[index] !== b[index]) return a[index] - b[index];
+                }
+                return 0;
+              });
+              process.stdout.write(versions.at(-1));
+            ')
             VERSION=$(node -e '
               const [current, bump] = process.argv.slice(1);
               const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(current);
