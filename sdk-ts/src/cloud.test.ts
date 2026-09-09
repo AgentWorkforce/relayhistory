@@ -142,7 +142,7 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
 
 // Regression cover for the three hook-install guards. Each one protects a case
 // where installing would silently damage state the caller expected preserved.
-test('hook install refuses linked worktrees, escaping hooksPath, and preserves opaque hooks', { timeout: 60_000 }, async () => {
+test('hook install: worktree and escape refusals, repo-local hooks accepted, opaque hooks preserved', { timeout: 60_000 }, async () => {
   const saved = { ...process.env };
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-hook-guards-'));
   try {
@@ -184,6 +184,14 @@ test('hook install refuses linked worktrees, escaping hooksPath, and preserves o
       installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath }),
       /external shared core.hooksPath/);
     await assert.rejects(stat(outside), 'the escaping hooks directory must not be created');
+
+    // A repository-local hooks directory such as husky's lives in the work tree
+    // rather than under .git. It belongs to this repo, so it must be accepted.
+    await run('git', ['config', 'core.hooksPath', '.husky'], process.env, repo);
+    const husky = await installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath });
+    // macOS resolves TMPDIR through /private, so compare the repo-relative tail.
+    assert.match(husky.hookPath, /[/\\]repo[/\\]\.husky[/\\]post-commit$/);
+    assert.match(await readFile(husky.hookPath, 'utf8'), /ai-hist SDK hook/);
 
     // A compiled or otherwise non-UTF-8 hook is still the user's hook: it must
     // be backed up, not silently overwritten because decoding failed.

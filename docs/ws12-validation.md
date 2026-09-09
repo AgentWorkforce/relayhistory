@@ -162,3 +162,79 @@ installed `./node_modules/.bin/ai-hist`:
   empty string — was reproduced as a shell command substitution against a
   fixture cloud using the installed binary. It captured a 27-character token
   identical to the one the fixture issued, with a non-zero length.
+
+## Review round: four independent reviewers converged on the hook-install path
+
+Rebased again onto `6e6acac` (#118's README rewrite). The README conflict was
+resolved in main's favour: #118's landing copy is kept, and the cloud entrypoint
+is reintroduced lower down described accurately, since `enable-cloud`
+authenticates and syncs but does not install Git hooks.
+
+Six review threads landed on the PR. Four of them — from CodeRabbit and
+cursor — pointed at `crates/ai-hist/src/git_sdk.rs`. That convergence was
+correct; all four described real defects in hook installation.
+
+**P1, installing fixed hooks from a linked worktree.** Confirmed against real
+Git rather than by reading: in a linked worktree
+`git rev-parse --git-path hooks/post-commit` resolves to the *main* worktree's
+shared `.git/hooks/post-commit`, so the existing containment check passed and
+installation proceeded. The written hook embeds one fixed `sessionId` and `repo`,
+so every other worktree's commits would have fired it and been attributed to the
+wrong session — corrupting exactly the linkage the feature exists to record. Now
+refused by comparing `--git-dir` with `--git-common-dir`, and scoped so it only
+fires for hooks that are actually shared.
+
+**P2, resolving a nonexistent hooks path.** `core.hooksPath` containing `..`
+satisfied the containment check lexically while `create_dir_all` resolved
+outside the repository. The nearest existing ancestor is now canonicalized and
+the remaining components applied before comparison.
+
+**P2, preserving existing hooks.** A compiled or non-UTF-8 `post-commit` made
+`read_to_string` fail; `unwrap_or_default` turned that into an empty string, so
+no backup was taken and the hook was overwritten, contrary to the stated
+preservation contract. Only a missing file now counts as nothing to preserve.
+
+**cursor, repo-local hooks rejected.** The guard treated any `core.hooksPath`
+outside the common dir as external, so legitimate repository-local directories
+such as husky's `.husky` were refused — while the error told the user to
+configure exactly such a directory. Hook directories inside the work tree are
+now accepted; only paths belonging to neither the common dir nor the work tree
+are refused. This also makes the worktree guard meaningful rather than dead:
+work-tree-local hooks are per-worktree and stay allowed.
+
+The two CodeRabbit minors are fixed as well: `--interval` is validated in the
+seconds the caller typed rather than reporting a millisecond bound, and the
+`enable-cloud` copy no longer claims one command threads sessions to PRs. A
+nitpick about `URL.pathname` not decoding percent-encoding was taken too, so a
+checkout path containing a space resolves `cli.js`.
+
+A regression test covers all four hook behaviours. It is not vacuous: it first
+failed for an unrelated reason, which proved the guarded code path was reached,
+then passed on the specific assertions once the fixture seeded a session.
+
+### Re-verified after the fixes
+
+`cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 438 passed, `tsc --noEmit` 0, `npm test` 0 with
+74/74, `scripts/*.test.mjs` 0 with 10/10, native contract 9 agreeing across all
+three sources, `index.d.ts` diff clean.
+
+The artifact was repacked and reinstalled, and both commands were run from the
+installed binary:
+
+```
+$ ai-hist replay sess-117
+Session sess-117 — 2 event(s), oldest first
+
+[2026-09-09T10:00:00Z] claude / prompt (e1)
+rebase 117 onto current main
+
+[2026-09-09T10:00:05Z] claude / response (e2)
+rebased; two union conflicts in cli.ts
+
+$ ai-hist replay sess-117 --json --out transcript.json
+(stdout empty; file holds 2 events e1, e2; pagination exercised)
+```
+
+`$(ai-hist token)` again captured a 27-character token rather than an empty
+string, and `cloud-commands.test.js` passed against the installed package.

@@ -127,19 +127,27 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     // Resolve before comparing: an unresolved `..` can satisfy the lexical
     // containment check while `create_dir_all` lands outside the repository.
     let resolved_parent = resolve_against_existing(hook_parent)?;
-    anyhow::ensure!(resolved_parent.starts_with(&common),
+    // Repository-local hook directories are legitimate: husky and friends live
+    // in the work tree, not under .git. Only a directory belonging to neither
+    // this repository's common dir nor its work tree is another repo's business.
+    let worktree = root.canonicalize()?;
+    let shared_hooks = resolved_parent.starts_with(&common);
+    anyhow::ensure!(shared_hooks || resolved_parent.starts_with(&worktree),
         "Git uses an external shared core.hooksPath; refusing to change another repository's hooks. Configure a repository-local hooks directory first");
-    // Linked worktrees share the common dir's hooks, but this hook embeds one
-    // fixed sessionId and repo. Installing from a worktree would attribute every
-    // other worktree's commits to this session, so refuse instead of corrupting
-    // the linkage we exist to record.
-    let git_dir = git_stdout(&root, &["rev-parse", "--git-dir"])?;
-    let git_dir = root.join(git_dir.trim()).canonicalize()?;
-    anyhow::ensure!(
-        git_dir == common,
-        "this is a linked Git worktree and its hooks are shared with the main worktree; \
-         install from the main worktree instead"
-    );
+    // Hooks under the common dir are shared by every linked worktree, but this
+    // hook embeds one fixed sessionId and repo. Installing from a worktree would
+    // attribute every other worktree's commits to this session, so refuse rather
+    // than corrupt the linkage we exist to record. A work-tree-local hooks
+    // directory is per-worktree and stays allowed.
+    if shared_hooks {
+        let git_dir = git_stdout(&root, &["rev-parse", "--git-dir"])?;
+        let git_dir = root.join(git_dir.trim()).canonicalize()?;
+        anyhow::ensure!(
+            git_dir == common,
+            "this is a linked Git worktree and its hooks are shared with the main worktree; \
+             install from the main worktree, or set a worktree-local core.hooksPath first"
+        );
+    }
     let script = hook.with_file_name("ai-hist-post-commit.mjs");
     fs::create_dir_all(hook.parent().context("missing hook parent")?)?;
     let body = format!(
