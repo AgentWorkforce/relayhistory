@@ -407,3 +407,42 @@ tests, where this PR began with 11 and 8. `tsc` 0, `npm test` 0 with 75/75,
 `scripts` 10/10, contract 9, `index.d.ts` clean. Against the repacked and
 reinstalled artifact both suites pass, `replay` renders and paginates, and
 `$(ai-hist token)` captures a real token.
+
+## Rebase onto #112, and the cloud-client deduplication deferred
+
+`#112` (`bc1e9a5`, get_session_thread MCP tool) landed while CI ran, and it
+touched `sdk-ts/src/cloud-client.ts` — the file this branch had reduced to a
+three-line re-export. `#112` added `getSessionThread` there together with its own
+stage resolution, rotation and recall HTTP client.
+
+Taking this branch's side of that conflict would have silently deleted a feature
+that merged the same day. Main's file is kept intact instead, and this branch's
+deduplication of `cloud-client.ts` is dropped. Nothing in the token/replay
+delivery depends on it: the napi bridge, the legacy-store migration and the
+shared destination rule are all unaffected, and `#112`'s tests pass alongside
+them (the TypeScript suite is now 110 tests, up from 75).
+
+The cost is honest debt rather than a hidden regression. `loginCloud` and
+`loadStoredRelayhistoryAuth` now exist twice in the package: the Rust-backed
+versions in `index.ts` and the TypeScript ones in `cloud-client.ts`, the latter
+still writing `~/.config/ai-hist/auth.json` directly. That is the split auth
+store in its most literal form — two credential implementations in one package —
+and it is the same root cause behind the defects recorded above.
+
+The architecture test was rewritten rather than deleted. Asserting that
+`cloud-client.ts` delegates everything to the SDK is no longer true, so it now
+asserts the narrower thing this change did establish: `enableCloud`, `pushCloud`,
+`accessToken`, `replay` and `createShareableTrace` have exactly one
+implementation and `cloud-client.ts` must not add a second. The remaining
+duplication is named in a comment there so the next reader finds it.
+
+Consolidating `getSessionThread` onto the Rust auth store is the follow-up. It
+was deliberately not attempted here: this PR had blocked the cloud client all
+day, and porting a recall client's auth under time pressure is how the defects
+above were produced in the first place.
+
+Re-verified on the rebased head: `cargo fmt --check` 0, `clippy -D warnings` 0
+with zero warnings, `cargo test --workspace` 0 with 443 passed and 0 failed,
+`tsc` 0, `npm test` 0 with 110/110, `scripts` 10/10, contract 9, `index.d.ts`
+clean. Against the repacked and reinstalled artifact both suites pass, `replay`
+renders and paginates, and `$(ai-hist token)` captures a real token.
