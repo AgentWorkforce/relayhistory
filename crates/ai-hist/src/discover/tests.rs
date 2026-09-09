@@ -630,6 +630,130 @@ fn codex_subagent_threads_are_not_sessions() {
 }
 
 #[test]
+fn linked_codex_source_marked_subagent_is_not_a_root_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    codex_rollout(
+        home.path(),
+        "codex-linked-guardian",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-linked-guardian","cwd":"/work/api","parent_thread_id":"codex-1","source":{"subagent":{"other":"guardian"}}}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(found.ids(), vec!["codex:codex-1"]);
+    assert_eq!(found.summary.providers["codex"].candidates, 2);
+    assert_eq!(found.summary.discovered, 1);
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn standalone_codex_guardian_source_marker_is_a_root_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    let guardian = codex_rollout(
+        home.path(),
+        "codex-guardian",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-guardian","cwd":"/work/api","source":{"subagent":{"other":"guardian"}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-20T11:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"guardian prompt"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-20T11:02:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"guardian answer"}}"#,
+            "\n",
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(found.ids().contains(&"codex:codex-guardian".to_string()));
+    assert_eq!(found.summary.providers["codex"].candidates, 2);
+    assert_eq!(found.summary.discovered, 2);
+    let row = found.row("codex-guardian");
+    assert_eq!(row.cwd.as_deref(), Some("/work/api"));
+    assert_eq!(row.first_prompt.as_deref(), Some("guardian prompt"));
+    assert_eq!(row.raw_path.as_deref(), Some(guardian.to_str().unwrap()));
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+}
+
+/// A guardian an older release classified as a subagent was remembered in
+/// `discovery_skips`. Its bytes never change, so only the scanner version in the
+/// stored stamp can invalidate that memory -- without a bump, upgraded installs
+/// keep skipping the file and the catalog never gains the session.
+#[test]
+fn an_upgrade_re_reads_a_guardian_an_older_scanner_skipped() {
+    const GUARDIAN: &str = concat!(
+        r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-guardian","cwd":"/work/api","source":{"subagent":{"other":"guardian"}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-06-20T11:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"guardian prompt"}}"#,
+        "\n",
+    );
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_200_000);
+    let guardian = codex_rollout(home.path(), "codex-guardian", GUARDIAN, 1_750_000_300_000);
+    let locator = guardian.to_string_lossy().to_string();
+
+    // Learn this fixture's raw stamp the way discovery computes it, so the seeded
+    // skip below differs from a live one *only* by its version prefix.
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(first.ids().contains(&"codex:codex-guardian".to_string()));
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source='codex' AND session_id='codex-guardian'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1
+        .to_string();
+
+    let seed_skip = |stamp: String| {
+        conn.execute("DELETE FROM sessions", []).unwrap();
+        conn.execute(
+            "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
+             VALUES ('codex', ?, ?, 'not-a-session', 0) \
+             ON CONFLICT(source, locator) DO UPDATE SET stamp = excluded.stamp",
+            params![locator, stamp],
+        )
+        .unwrap();
+    };
+
+    // Control: a skip at the current version does suppress the re-read, so the
+    // assertion below is about the version prefix and nothing else.
+    seed_skip(stored_stamp(&raw));
+    let skipped = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        !skipped.ids().contains(&"codex:codex-guardian".to_string()),
+        "a current-version skip is expected to suppress the read"
+    );
+
+    // What an older release left behind: same bytes, its own scanner version.
+    seed_skip(format!("v{}:{raw}", SHALLOW_SCANNER_VERSION - 1));
+    let after_upgrade = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        after_upgrade
+            .ids()
+            .contains(&"codex:codex-guardian".to_string()),
+        "a skip written by an older scanner version must not survive the upgrade"
+    );
+}
+
+#[test]
 fn codex_rescan_is_stamp_guarded_and_identity_stable() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
