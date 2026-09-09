@@ -113,3 +113,52 @@ on missing/expired Cloudflare credentials; the authorized dev workflow supplied
 its existing environment credentials and completed deployment successfully.
 Earlier dev recall 404s were resolved by this deployment; persistence is now
 verified by exact event content and the session-link read above.
+
+## Rebase onto 0.15.1 and re-verification against the installed artifact
+
+The branch was rebased from its original base (`865a536`, release 0.15.0) onto
+`5188b13` (release 0.15.1), picking up the four changes that landed underneath
+it: `2fd5bbc` (Rust `token`), `3d559ed` (first-run bootstrap), `5f3246b`
+(npx first-search verification and pretty session output) and `d56f64d` (the
+native Linux glibc floor). The only conflicts were in `sdk-ts/src/cli.ts` and
+both were unions rather than competing edits: `BOOLEAN_FLAGS` now carries both
+main's `pretty` and this branch's `once`, and the usage block lists both
+`enable-cloud` and `sessions list --pretty`.
+
+The bootstrap seam was checked explicitly: `bootstrapLocal` runs only on a bare
+`ai-hist` invocation with no command, so it cannot write to stdout ahead of
+`token`. `token` writes the token and nothing else to stdout; the
+secret-in-scrollback warning goes to stderr and only when stdout is a TTY.
+
+Post-rebase evidence, all on darwin-arm64 with mise Node 22.22.2:
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets
+  -- -A clippy::too_many_arguments -D warnings` clean.
+- Native contract: `verify-native-contract.mjs` reports contract version 9
+  agreeing across the Rust binding source, the TypeScript SDK source and the
+  built addon; `git diff --exit-code -- crates/ai-hist-napi/index.d.ts` clean,
+  so the checked-in declarations match what the build regenerates.
+- `sdk-ts`: `tsc --noEmit` clean, `npm test` 73/73 passing.
+- `node --test scripts/*.test.mjs`: 10/10 passing.
+
+### Verified against the artifact, not the source
+
+Packing and installing the tarballs the way CI does — SDK, loader and the
+darwin-arm64 platform addon — into a scratch project, and then running the
+installed `./node_modules/.bin/ai-hist`:
+
+- The installed CLI's usage block lists `ai-hist token [--base-url URL]` and
+  `ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N]
+  [--json] [--out PATH]`.
+- For contrast, the same check against the actually-published `ai-hist@0.15.1`
+  from the registry lists neither: zero matches for `token` or `replay`. This
+  independently reproduces the QA report that the published CLI cannot reach
+  these commands.
+- `cloud-commands.test.js` was rerun with `AI_HIST_TEST_PACKAGE_DIR` pointed at
+  the installed package and passed, covering token stdout exactness, proactive
+  refresh with credential rotation, secret-safe failures, stage selection,
+  replay pagination and atomic `--out` replacement.
+- The specific failure QA reported — `$(ai-hist token)` silently yielding an
+  empty string — was reproduced as a shell command substitution against a
+  fixture cloud using the installed binary. It captured a 27-character token
+  identical to the one the fixture issued, with a non-zero length.
