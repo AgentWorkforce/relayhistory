@@ -434,21 +434,42 @@ export interface SessionThreadOptions {
 /**
  * Persist a rotated pair over the file it came from, in that store's own
  * schema, via temp-file + rename so a crash cannot leave a torn session.
+ *
+ * The rotated fields are merged **over the file's existing contents**, never
+ * written in place of them. The native store records fields this SDK does not
+ * model — `workspace_id` today, whatever the engine adds next — and the Rust
+ * CLI reads the same file, so rewriting it whole would quietly delete that
+ * state and degrade the CLI's session.
  */
 async function persistRotated(candidate: StoredCandidate, auth: RelayhistoryAuth): Promise<void> {
-  const body = candidate.origin === 'native'
+  let existing: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(await readFile(candidate.path, 'utf-8')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      existing = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Unreadable or malformed. Still write, with the fields this SDK knows:
+    // leaving a revoked refresh token on disk strands the next caller.
+  }
+  const rotated: Record<string, unknown> = candidate.origin === 'native'
     ? {
-      base_url: auth.baseUrl,
+      base_url: existing.base_url ?? auth.baseUrl,
       access_token: auth.accessToken,
       access_token_expires_at: auth.accessTokenExpiresAt ?? null,
       refresh_token: auth.refreshToken ?? null,
-      org_id: auth.orgId ?? null,
-      workspace_id: null,
     }
-    : auth;
+    : {
+      baseUrl: existing.baseUrl ?? auth.baseUrl,
+      accessToken: auth.accessToken,
+      // Written as `undefined` when absent so `JSON.stringify` drops the key
+      // rather than preserving a superseded value from `existing`.
+      accessTokenExpiresAt: auth.accessTokenExpiresAt,
+      refreshToken: auth.refreshToken,
+    };
   const tmp = `${candidate.path}.tmp.${process.pid}.${Date.now()}`;
   await mkdir(dirname(candidate.path), { recursive: true });
-  await writeFile(tmp, JSON.stringify(body, null, 2), { mode: 0o600 });
+  await writeFile(tmp, JSON.stringify({ ...existing, ...rotated }, null, 2), { mode: 0o600 });
   await rename(tmp, candidate.path);
 }
 

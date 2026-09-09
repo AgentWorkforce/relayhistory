@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the `get_session_thread` MCP tool and its `getSessionThread()` SDK
+  function: the lifecycle fan-out for one session — the commits it shipped plus
+  the pull requests, reviews, incidents, tickets, Slack threads, hotfixes and
+  follow-up sessions the cloud has linked to it. It complements
+  `get_session_tree`'s subagent fan-out. Cloud-only and never cached, backed by
+  `GET /v1/sessions/:sessionId/thread`. Takes `source`, `session_id`, and
+  optional `kinds`, `since`, `cursor` and `limit` (1..500); returns the recall
+  envelope unchanged. The MCP server now registers 14 tools.
+- Resolve cloud credentials from the native `ai-hist login` store
+  (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory/stages/*.auth.json`)
+  in addition to this SDK's `~/.config/ai-hist/auth.json`, holding native
+  sessions to the same preconditions the `cloud` connector applies to recall.
+  An expired session with a refresh token is rotated once and the new pair
+  merged over the file it came from, so the CLI and the MCP stay in step.
+  `SessionThreadOptions.resolveSession` overrides that resolution for tests; no
+  other credential hook is exposed, and none was released.
 - Export immutable `SOURCES` and derived `CATALOG_SOURCES` runtime registries alongside
   `isSource()` and `isCatalogSource()` guards, so consumers can validate source
   input without duplicating the SDK's provider registry.

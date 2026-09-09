@@ -625,6 +625,51 @@ test('a rejected token is rotated once and the new pair is persisted', async () 
   });
 });
 
+test('rotation preserves native-store fields this SDK does not model', async () => {
+  await withStores(async ({ nativeHome }) => {
+    // The Rust CLI reads this same file. Rewriting it whole would delete state
+    // the SDK has no type for — `workspace_id` today, whatever comes next.
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      workspace_id: 'workspace-example',
+      some_future_field: { nested: true },
+      ...ELIGIBLE,
+    });
+    const { impl } = rotatingFetch({
+      accept: ['rth_at_new'],
+      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
+    });
+    await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
+
+    const stored = await readStage(nativeHome);
+    assert.equal(stored.access_token, 'rth_at_new', 'the pair rotated');
+    assert.equal(stored.workspace_id, 'workspace-example', 'workspace survives rotation');
+    assert.deepEqual(stored.some_future_field, { nested: true }, 'unmodelled fields survive');
+    assert.equal(stored.org_id, 'org-example');
+  });
+});
+
+test('rotation replaces a superseded expiry rather than keeping the stale one', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    const later = new Date(Date.now() + 7_200_000).toISOString();
+    const { impl } = rotatingFetch({
+      accept: ['rth_at_new'],
+      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new', expiresAt: later },
+    });
+    await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
+    const stored = await readStage(nativeHome);
+    assert.equal(stored.access_token_expires_at, later, 'merging must not keep the old expiry');
+  });
+});
+
 test('a pair another process already rotated is adopted without spending the refresh token', async () => {
   await withStores(async ({ nativeHome }) => {
     await writeStage(nativeHome, 'stage', {
