@@ -351,3 +351,34 @@ Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
 with 75/75, `scripts` 10/10, contract 9, `index.d.ts` clean. Against the
 repacked and reinstalled artifact both suites pass, `replay` renders and
 paginates, and `$(ai-hist token)` captures a real token.
+
+## Consolidating the selector rule, and explicit destinations winning
+
+Rejecting a malformed selector introduced a narrower defect that cursor caught:
+`load_sdk_auth` validated the environment *before* considering the caller's
+`base_url`, so a stale or mistyped exported variable blocked an explicit
+`--base-url` or SDK `baseUrl` even though that value would have won anyway.
+
+Both problems trace to the same shape: `access_token` and `load_sdk_auth` each
+carried their own idea of what counted as a stage selection, and they disagreed.
+They now share one `env_selected_stage()`, and both apply the same precedence —
+an explicit destination wins outright and the environment is not consulted at
+all; only when nothing was passed does the environment decide, and then a
+malformed value is an error rather than a silent fallback to production.
+
+Three properties now have tests, where before they were one function's
+implicit behaviour:
+
+- several stages and no selector refuses to guess, rather than defaulting to
+  production;
+- a malformed selector is reported by variable name, with neither the value nor
+  an embedded password reaching stderr;
+- an explicit `--base-url` succeeds even when the environment variable is
+  malformed.
+
+Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 441 passed and 0 failed, 14 token tests where
+this PR began with 11, `tsc` 0, `npm test` 0 with 75/75, `scripts` 10/10,
+contract 9, `index.d.ts` clean. Against the repacked and reinstalled artifact
+both suites pass, `replay` renders and paginates, and `$(ai-hist token)`
+captures a real token.

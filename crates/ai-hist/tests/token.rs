@@ -337,23 +337,34 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
     assert!(failure(&command(home.path()).output().unwrap()).contains("not authenticated"));
 }
 
-// access_token treats a stage selector as "selected" only when it normalizes,
-// while load_sdk_auth treats any non-empty RELAYHISTORY_BASE_URL as a selection
-// and falls back to production. If the ambiguity probe goes through the latter,
-// a malformed selector silently turns a multi-stage refusal into the production
-// credential — token would print the wrong stage's secret.
+// With no selector at all and several stages configured, token must refuse to
+// guess rather than fall back to production. The ambiguity probe stays on
+// load_auth for this reason: load_sdk_auth infers a destination from the
+// environment, which would defeat the refusal.
 #[test]
-fn unnormalizable_base_url_env_still_refuses_between_stages() {
+fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
     save(home.path(), PROD, OLD, Some(FUTURE));
     save(home.path(), "http://localhost:8787", NEW, Some(FUTURE));
-    let mut cmd = command(home.path());
-    cmd.env("RELAYHISTORY_BASE_URL", "not-a-url");
-    let err = failure(&cmd.output().unwrap());
+    let err = failure(&command(home.path()).output().unwrap());
     assert!(
         err.contains("stages are configured; pass --base-url to select one"),
-        "a malformed stage selector must not silently select production: {err}"
+        "an unselected multi-stage setup must not silently select production: {err}"
     );
+}
+
+// An explicit destination wins outright. A broken environment variable must not
+// block a caller who already chose a stage, or --base-url becomes unusable on any
+// machine with a stale or mistyped selector exported.
+#[test]
+fn explicit_base_url_wins_over_a_malformed_environment() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let mut cmd = command(home.path());
+    cmd.env("RELAYHISTORY_BASE_URL", "not-a-url")
+        .arg("--base-url")
+        .arg(PROD);
+    success(&cmd.output().unwrap(), OLD);
 }
 
 // default_base_url() ignores a malformed selector and returns production, so

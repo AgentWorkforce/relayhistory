@@ -294,6 +294,27 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     }
 }
 
+/// The stage selected by the environment, if any. A non-empty value that does not
+/// normalize is a mistake rather than a request for production: reject it, because
+/// default_base_url() would silently substitute the production origin. Never echo
+/// the value — normalize_base_url rejects URLs carrying embedded credentials, so a
+/// rejected value is exactly the kind that may hold one.
+///
+/// access_token and load_sdk_auth must share this: when they disagreed about what
+/// counts as a selection, a malformed selector silently meant production.
+fn env_selected_stage() -> Result<Option<String>> {
+    match ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+        .find(|(_, value)| !value.trim().is_empty())
+    {
+        Some((key, value)) => Ok(Some(normalize_base_url(&value).with_context(|| {
+            format!("{key} is not a usable base URL; unset it or set a full https:// origin")
+        })?)),
+        None => Ok(None),
+    }
+}
+
 /// Replace parser errors before they surface: a serde_json failure can quote the
 /// credential values it choked on, and this command's output is a secret.
 fn sanitize_auth_error(error: anyhow::Error) -> anyhow::Error {
@@ -308,10 +329,12 @@ fn sanitize_auth_error(error: anyhow::Error) -> anyhow::Error {
 /// Unknown legacy expiry is refreshed too: an opaque token cannot prove its own lifetime.
 pub fn access_token(base_url: Option<&str>) -> Result<String> {
     let explicit_base = base_url.map(normalized_stage).transpose()?;
-    let env_base = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find_map(|value| normalize_base_url(&value));
+    // An explicit destination wins outright; the environment is not consulted, so
+    // a broken variable cannot block a caller who already chose a stage.
+    let env_base = match explicit_base {
+        Some(_) => None,
+        None => env_selected_stage()?,
+    };
     // Resolve the destination with the SDK loader, not load_auth: npm users
     // upgrading from the TypeScript client have credentials only in
     // ~/.config/ai-hist/auth.json. token is one of the two commands this exists
@@ -1900,21 +1923,13 @@ fn humanize_secs(secs: u64) -> String {
 /// no credential exists for that destination. Never let a stale SDK token replace
 /// a refreshed Rust token, and retain load_auth's refusal to guess between stages.
 pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
-    // A non-empty selector that does not normalize is a mistake, not a request for
-    // production. default_base_url() swallows malformed values and returns the
-    // production origin, so treating "set" as "selected" would silently retarget
-    // the caller's stage — reading, and for enable/push writing, against prod.
-    // Never echo the value: normalize_base_url rejects embedded credentials, so a
-    // rejected value is exactly the kind that may carry them.
-    let env_base = match ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
-        .find(|(_, value)| !value.trim().is_empty())
-    {
-        Some((key, value)) => Some(normalize_base_url(&value).with_context(|| {
-            format!("{key} is not a usable base URL; unset it or set a full https:// origin")
-        })?),
-        None => None,
+    // An explicit destination wins outright, so a malformed variable must not
+    // block a caller who already chose a stage. Only when nothing was passed does
+    // the environment decide, and then a malformed value is an error rather than a
+    // silent fallback to production.
+    let env_base = match base_url {
+        Some(_) => None,
+        None => env_selected_stage()?,
     };
     let base_url = base_url.or(env_base.as_deref());
     if let Some(auth) = load_auth(base_url)? {
