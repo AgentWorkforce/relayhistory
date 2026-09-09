@@ -1752,6 +1752,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        // Carried from the catalog row seeded above rather than recomputed, so this
+        // stays on that fixture's literal across scanner-version bumps.
         assert_eq!(presence_stamp, "v2:test-discovery-stamp");
 
         let second =

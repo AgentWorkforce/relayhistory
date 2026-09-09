@@ -79,7 +79,14 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 2;
+pub const SHALLOW_SCANNER_VERSION: u32 = 3;
+
+/// Version 2 shipped the classification that hid standalone guardians (see
+/// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
+/// only thing that can invalidate an upgraded install's stored `discovery_skips`
+/// is this version, and reusing 2 would leave those catalogs permanently missing
+/// the sessions. Kept as a compile-time guard so the pair cannot drift apart.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

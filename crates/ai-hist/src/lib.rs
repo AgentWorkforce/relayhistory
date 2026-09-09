@@ -4656,7 +4656,8 @@ impl Drop for SyncStateLock {
 ///
 /// Returns `None` when disk already reflects everything here, so a steady-state
 /// run that finds every source up to date does not rewrite the file per source.
-/// State keys earlier versions wrote and no longer maintain.
+/// State keys earlier versions wrote and no longer maintain, each paired with the
+/// key that supersedes it.
 ///
 /// [`merged_sync_state`] folds this run's keys into what is already on disk and
 /// deliberately never walks the on-disk keys: a run legitimately omits every
@@ -4666,13 +4667,19 @@ impl Drop for SyncStateLock {
 /// completes. Retirements therefore have to be declared here, where the merge
 /// can act on them, rather than inferred from a key's absence.
 ///
-/// Adding a key here is a one-way migration: it is dropped from every state file
-/// it is found in. Only list keys no supported version still reads.
-const RETIRED_SYNC_STATE_KEYS: &[&str] = &[
-    "codex_rollouts",
-    "codex_rollout_user_messages_v2",
-    "codex_rollouts_v3",
-    "codex_rollouts_v4",
+/// The pairing is an ordering rule, not decoration. `checkpoint_sync_state` runs
+/// once per source against the whole state map, and `codex_rollouts_v4` is still
+/// *read* by this version to seed the v5 migration. Sweeping unconditionally
+/// would drop it during an earlier source's checkpoint, before
+/// `sync_codex_rollouts` has written `codex_rollouts_v5`; a crash or an
+/// overlapping sync in that window would find neither map and force a full
+/// re-read of the archive. Requiring the successor in the same write closes that
+/// gap: the old map only leaves disk once its replacement is on the way there.
+const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
+    ("codex_rollouts", "codex_rollouts_v5"),
+    ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
+    ("codex_rollouts_v3", "codex_rollouts_v5"),
+    ("codex_rollouts_v4", "codex_rollouts_v5"),
 ];
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
@@ -4690,10 +4697,13 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
         merged.insert(key.clone(), next);
         changed = true;
     }
-    // Runs concurrent with this one may still be writing a retired key, so sweep
-    // after the fold rather than before it.
-    for key in RETIRED_SYNC_STATE_KEYS {
-        if merged.remove(*key).is_some() {
+    // Sweep after the fold, so a run concurrent with this one cannot resurrect a
+    // retired key, and only once this run actually carries the successor.
+    for (retired, superseded_by) in RETIRED_SYNC_STATE_KEYS {
+        if !ours.contains_key(*superseded_by) {
+            continue;
+        }
+        if merged.remove(*retired).is_some() {
             changed = true;
         }
     }
@@ -9024,7 +9034,7 @@ mod tests {
         checkpoint_sync_state(&path, &ours);
 
         let saved = load_sync_state(&path).unwrap();
-        for retired in super::RETIRED_SYNC_STATE_KEYS {
+        for (retired, _) in super::RETIRED_SYNC_STATE_KEYS {
             assert!(
                 !saved.contains_key(*retired),
                 "{retired} must not survive the migration on disk"
@@ -9041,6 +9051,48 @@ mod tests {
         // Idempotent: with nothing retired left on disk, a steady-state run that
         // changes nothing must not rewrite the file.
         assert!(super::merged_sync_state(&path, &ours).unwrap().is_none());
+    }
+
+    /// `checkpoint_sync_state` runs once per source, and `codex_rollouts_v4` is
+    /// still read to seed the v5 migration. An earlier source's checkpoint must
+    /// therefore not drop it: if a crash landed between that checkpoint and
+    /// `sync_codex_rollouts` writing v5, neither map would survive and the next
+    /// run would re-read the whole archive.
+    #[test]
+    fn a_retired_key_survives_until_its_successor_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".sync-state.json");
+        let mut on_disk = Map::new();
+        on_disk.insert(
+            "codex_rollouts_v4".into(),
+            json!({"a.jsonl": {"stamp": "1:1"}}),
+        );
+        save_sync_state(&path, &on_disk).unwrap();
+
+        // An earlier source checkpoints first; codex has not run yet, so nothing
+        // in this write supersedes v4.
+        let mut early = Map::new();
+        early.insert("claude".into(), json!({"c.jsonl": 3}));
+        checkpoint_sync_state(&path, &early);
+        assert_eq!(
+            load_sync_state(&path).unwrap()["codex_rollouts_v4"],
+            json!({"a.jsonl": {"stamp": "1:1"}}),
+            "v4 must still be readable until v5 replaces it"
+        );
+
+        // Codex then runs and writes v5 in the same state map.
+        let mut after_codex = early.clone();
+        after_codex.insert(
+            "codex_rollouts_v5".into(),
+            json!({"a.jsonl": {"stamp": "2:2"}}),
+        );
+        checkpoint_sync_state(&path, &after_codex);
+        let saved = load_sync_state(&path).unwrap();
+        assert!(!saved.contains_key("codex_rollouts_v4"));
+        assert_eq!(
+            saved["codex_rollouts_v5"],
+            json!({"a.jsonl": {"stamp": "2:2"}})
+        );
     }
 
     #[test]
