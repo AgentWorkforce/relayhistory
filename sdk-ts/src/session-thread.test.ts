@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { InvalidArgumentError, UnsupportedOperationError } from './index.js';
 import {
@@ -296,7 +296,9 @@ void _typecheck;
 // login flow report the connector unconfigured.
 // ---------------------------------------------------------------------------
 
-const STORE_ENV = ['RELAYHISTORY_HOME', 'AI_HIST_CONFIG_DIR', 'AI_HIST_BASE_URL'] as const;
+const STORE_ENV = [
+  'RELAYHISTORY_HOME', 'AI_HIST_CONFIG_DIR', 'AI_HIST_BASE_URL', 'RELAYHISTORY_BASE_URL',
+] as const;
 
 /** Runs one case against private stores so the developer's own login is invisible. */
 async function withStores(
@@ -311,6 +313,7 @@ async function withStores(
   process.env.RELAYHISTORY_HOME = nativeHome;
   process.env.AI_HIST_CONFIG_DIR = sdkDir;
   delete process.env.AI_HIST_BASE_URL;
+  delete process.env.RELAYHISTORY_BASE_URL;
   try {
     await body({ nativeHome, sdkDir });
   } finally {
@@ -328,6 +331,21 @@ async function writeStage(
   fields: Record<string, unknown>,
 ): Promise<void> {
   await writeFile(join(nativeHome, 'stages', `${key}.auth.json`), JSON.stringify(fields), { mode: 0o600 });
+}
+
+/** Mirrors how `getSessionThread` derives its requested stage from the env. */
+function requestedStageForTest(): string | undefined {
+  for (const key of ['RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL'] as const) {
+    const value = process.env[key];
+    if (value === undefined) continue;
+    try {
+      const url = new URL(value.trim());
+      if (url.hostname && !url.username && !url.password && !url.search && !url.hash) {
+        return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}${url.pathname}`.replace(/\/+$/, '');
+      }
+    } catch { /* names no stage */ }
+  }
+  return undefined;
 }
 
 const HOUR_AHEAD = new Date(Date.now() + 3_600_000).toISOString();
@@ -783,5 +801,113 @@ test('an expired session that can rotate is refreshed, not reported unconfigured
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth, null);
     assert.ok(resolved.auth === null && resolved.detail.includes('expiry'));
+  });
+});
+
+test('the engine\'s documented stage variables are both honoured, in its order', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'prod', {
+      base_url: 'https://history.agentrelay.com', access_token: 'rth_at_prod', ...ELIGIBLE,
+    });
+    await writeStage(nativeHome, 'dev', {
+      base_url: 'http://127.0.0.1:8787', access_token: 'rth_at_dev', ...ELIGIBLE,
+    });
+    // A multi-stage CLI install already sets RELAYHISTORY_BASE_URL; ignoring it
+    // would answer from the wrong org or refuse outright.
+    process.env.RELAYHISTORY_BASE_URL = 'http://127.0.0.1:8787';
+    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_dev');
+
+    // RELAYHISTORY_BASE_URL wins, matching `cloud::default_base_url`'s order.
+    process.env.AI_HIST_BASE_URL = 'https://history.agentrelay.com';
+    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_dev');
+
+    // An unparseable value names no stage and falls through to the next one.
+    process.env.RELAYHISTORY_BASE_URL = 'not a url';
+    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_prod');
+
+    // Empty everywhere: back to the refusal to guess, not a failure to select.
+    process.env.RELAYHISTORY_BASE_URL = '';
+    delete process.env.AI_HIST_BASE_URL;
+    const ambiguous = await resolveCloudSession(requestedStageForTest());
+    assert.equal(ambiguous.auth, null);
+    assert.ok(ambiguous.auth === null && ambiguous.detail.includes('2 relayhistory stages'));
+  });
+});
+
+test('a forbidden response is not an expired session and does not spend the refresh token', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_ok',
+      refresh_token: 'rth_rt_ok',
+      ...ELIGIBLE,
+    });
+    const calls: string[] = [];
+    const impl = (async (input: string | URL | Request) => {
+      calls.push(String(input).includes('/token/refresh') ? 'refresh' : 'thread');
+      return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
+      (error: unknown) => (error as { code?: string }).code === 'CONNECTOR_FAILURE'
+        && String((error as Error).message).includes('rth:read'),
+    );
+    assert.deepEqual(calls, ['thread'], 'a one-time refresh token must not be spent on a scope error');
+  });
+});
+
+test('a rotation that cannot be saved is reported, not silently succeeded', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    // Make the stage directory unwritable so the atomic replace fails after the
+    // refresh token has already been spent.
+    const { impl } = rotatingFetch({
+      accept: ['rth_at_new'],
+      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
+    });
+    await chmod(join(nativeHome, 'stages'), 0o500);
+    try {
+      await assert.rejects(
+        () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
+        (error: unknown) => (error as { code?: string }).code === 'CONNECTOR_FAILURE'
+          && String((error as Error).message).includes('rotated but could not be saved')
+          && String((error as Error).message).includes('now revoked'),
+      );
+    } finally {
+      await chmod(join(nativeHome, 'stages'), 0o700);
+    }
+  });
+});
+
+test('a rotation onto an unreadable session file keeps the org', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    const resolved = await resolveCloudSession();
+    // The file turns to garbage between resolution and rotation. The overlay is
+    // all that will be left, so it has to carry the org or the next resolve
+    // reports the connector unconfigured despite a fresh token on disk.
+    await writeFile(join(nativeHome, 'stages', 'stage.auth.json'), 'not json', { mode: 0o600 });
+    const { impl } = rotatingFetch({
+      accept: ['rth_at_new'],
+      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
+    });
+    await getSessionThread(
+      { source: 'claude', sessionId: 'sid' },
+      { fetchImpl: impl, resolveSession: async () => resolved },
+    );
+    const stored = await readStage(nativeHome);
+    assert.equal(stored.access_token, 'rth_at_new');
+    assert.equal(stored.org_id, 'org-example', 'the org survives a fallback write');
+    assert.equal((await resolveCloudSession()).auth?.accessToken, 'rth_at_new', 'still resolvable');
   });
 });

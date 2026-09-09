@@ -153,6 +153,58 @@ function normalizeStage(baseUrl: string): string {
 }
 
 /**
+ * A base URL reduced to its stage identity, or `null` when it does not name
+ * one. Mirrors `cloud::normalize_base_url`, which rejects a value with no
+ * host, or carrying credentials, a query or a fragment — and, like it, treats
+ * a rejected value as "no stage named" rather than as an error.
+ */
+function parseStageUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (!url.hostname || url.username || url.password || url.search || url.hash) return null;
+  return normalizeStage(trimmed);
+}
+
+/**
+ * The stage this call names, or `undefined` for "whichever single stage is
+ * stored".
+ *
+ * The engine reads `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL` and
+ * ignores a value that does not parse, falling through to its single-stage
+ * rule. Honouring only `AI_HIST_BASE_URL` would ignore the variable a
+ * multi-stage CLI install already sets, and treating an empty or malformed one
+ * as an explicit request would fail closed where the engine falls through.
+ */
+function requestedStage(explicit: string | undefined): string | undefined {
+  if (explicit !== undefined) {
+    const named = parseStageUrl(explicit);
+    if (!named) {
+      // An explicit argument is the caller's own words, so a malformed one is a
+      // mistake to report, not an environment default to skip past.
+      throw new InvalidArgumentError(
+        `baseUrl '${explicit}' does not name a stage (expected an absolute URL with a host `
+          + 'and no credentials, query or fragment)',
+        'INVALID_ARGUMENT',
+      );
+    }
+    return named;
+  }
+  for (const key of ['RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL'] as const) {
+    const value = process.env[key];
+    if (value === undefined) continue;
+    const named = parseStageUrl(value);
+    if (named) return named;
+  }
+  return undefined;
+}
+
+/**
  * The store the native `ai-hist login` writes: `RELAYHISTORY_HOME`, else
  * `~/.agentworkforce/relayhistory`. Sessions live in `stages/<key>.auth.json`
  * with snake_case fields, plus a legacy single `auth.json` from before stages
@@ -458,6 +510,10 @@ async function persistRotated(candidate: StoredCandidate, auth: RelayhistoryAuth
       access_token: auth.accessToken,
       access_token_expires_at: auth.accessTokenExpiresAt ?? null,
       refresh_token: auth.refreshToken ?? null,
+      // Carried explicitly: when the existing file could not be read there is
+      // nothing to merge, and a native session without an org fails its own
+      // provenance precondition on the very next resolve.
+      org_id: existing.org_id ?? auth.orgId ?? null,
     }
     : {
       baseUrl: existing.baseUrl ?? auth.baseUrl,
@@ -587,7 +643,7 @@ export async function getSessionThread(
   // what `cloud::load_auth`'s `same_stage` check refuses. A stage no stored
   // session can serve is an unconfigured connector, not a request to attempt.
   const resolve = opts.resolveSession ?? resolveCloudSession;
-  const resolved = await resolve(opts.baseUrl ?? process.env.AI_HIST_BASE_URL);
+  const resolved = await resolve(requestedStage(opts.baseUrl));
   if (!resolved.auth) {
     throw new UnsupportedOperationError(
       cloudUnconfiguredMessage(THREAD_OPERATION, resolved.detail),
@@ -645,17 +701,34 @@ export async function getSessionThread(
   // one: a refresh that loses the race re-reads and adopts the winner's pair.
   // The flock-correct version belongs behind a napi export of the recall
   // transport; see the PR discussion.
+  // Only 401 means "this token is spent". `cloud::is_unauthorized` matches the
+  // same single status, and the recall API answers 403 for a session that is
+  // authenticated but lacks `rth:read` — rotating on that would spend a
+  // one-time refresh token to fix a scope problem it cannot fix.
   const rotatable = resolved.session;
-  if ((resp.status === 401 || resp.status === 403) && rotatable) {
+  if (resp.status === 401 && rotatable) {
     const current = await rereadSession(rotatable);
     if (current && current.accessToken !== auth.accessToken) {
       resp = await send(current.accessToken);
     } else {
       const refreshed = await refreshCloudSession(auth, baseUrl, doFetch);
       if (refreshed) {
-        // Persist before retrying: the old refresh token is already revoked, so
-        // a crash between here and the retry must not strand the next caller.
-        await persistRotated(rotatable, refreshed).catch(() => undefined);
+        // Persist before retrying, and never swallow the failure: the old
+        // refresh token is already revoked, so a store left holding it strands
+        // the next caller — and the `ai-hist` CLI reading the same file with
+        // it. Reporting a rotation that could not be saved is better than one
+        // silent success followed by an unexplained dead session.
+        try {
+          await persistRotated(rotatable, refreshed);
+        } catch (cause) {
+          throw new ConnectorFailureError(
+            `the relayhistory session rotated but could not be saved to ${rotatable.path}: `
+              + `${cause instanceof Error ? cause.message : String(cause)}. The previous refresh `
+              + 'token is now revoked; run `ai-hist login` to store a new session.',
+            'CONNECTOR_FAILURE',
+            { cause },
+          );
+        }
         resp = await send(refreshed.accessToken);
       } else {
         // Lost the race, most likely. Whoever won has persisted a live pair.
@@ -667,10 +740,18 @@ export async function getSessionThread(
     }
   }
 
-  if (resp.status === 401 || resp.status === 403) {
+  if (resp.status === 401) {
     throw new AuthenticationExpiredError(
-      `the stored relayhistory session was rejected (HTTP ${resp.status}); run \`ai-hist login\``,
+      'the stored relayhistory session was rejected (HTTP 401); run `ai-hist login`',
       'AUTHENTICATION_EXPIRED',
+    );
+  }
+  if (resp.status === 403) {
+    // Authenticated but not permitted: a different session, and a different fix.
+    throw new ConnectorFailureError(
+      'the stored relayhistory session is not permitted to read this thread (HTTP 403); '
+        + 'it needs the `rth:read` scope',
+      'CONNECTOR_FAILURE',
     );
   }
   if (!resp.ok) {

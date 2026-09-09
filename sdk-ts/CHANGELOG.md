@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions to the same preconditions the `cloud` connector applies to recall.
   An expired session with a refresh token is rotated once and the new pair
   merged over the file it came from, so the CLI and the MCP stay in step.
+  Stage selection honours `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL`,
+  ignoring a value that names no stage, as the engine does.
   `SessionThreadOptions.resolveSession` overrides that resolution for tests; no
   other credential hook is exposed, and none was released.
 - Export immutable `SOURCES` and derived `CATALOG_SOURCES` runtime registries alongside
