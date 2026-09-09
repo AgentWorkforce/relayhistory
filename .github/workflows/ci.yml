@@ -86,7 +86,13 @@ jobs:
             "$PACK_DIR/ai-hist-native-linux-x64-gnu-$VERSION.tgz"
           export HOME="$SMOKE/home" USERPROFILE="$SMOKE/home" XDG_DATA_HOME="$SMOKE/share"
           mkdir -p "$HOME"
-          ./node_modules/.bin/ai-hist sessions list --db "$SMOKE/missing.db" --no-bootstrap --json
+          set +e
+          out=$(./node_modules/.bin/ai-hist sessions list --db "$SMOKE/missing.db" --no-bootstrap --json 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" -eq 1
+          echo "$out" | grep -q '"status":"unbuilt"'
           ./node_modules/.bin/ai-hist login --token smoke --base-url http://127.0.0.1:9; test $? -ne 2
           node --input-type=module -e 'await import("ai-hist")'
           node -e 'require("ai-hist/package.json")'
