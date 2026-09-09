@@ -37,9 +37,11 @@ pub fn replay(
     out: Option<&Path>,
 ) -> Result<ReplayOutput> {
     anyhow::ensure!(!session_id.trim().is_empty(), "sessionId must not be empty");
-    let base_url = base_url
-        .map(String::from)
-        .unwrap_or_else(cloud::default_base_url);
+    // Resolve rather than defaulting: default_base_url() turns a malformed
+    // RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL into the production origin, and
+    // passing that on as an explicit destination would let replay silently hit
+    // production where token rejects the same selector.
+    let base_url = cloud::resolve_base_url(base_url)?;
     // load_sdk_auth, not load_auth: an npm user upgrading from the TypeScript
     // client keeps credentials in ~/.config/ai-hist/auth.json, and replay must
     // migrate that store like the rest of the SDK surface.

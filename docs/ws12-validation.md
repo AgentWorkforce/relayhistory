@@ -382,3 +382,28 @@ this PR began with 11, `tsc` 0, `npm test` 0 with 75/75, `scripts` 10/10,
 contract 9, `index.d.ts` clean. Against the repacked and reinstalled artifact
 both suites pass, `replay` renders and paginates, and `$(ai-hist token)`
 captures a real token.
+
+## replay resolved its destination differently from token
+
+cursor found the last gap in this family. `replay` synthesized its destination
+with `default_base_url()` and then passed the result to `load_sdk_auth` as
+though the caller had chosen it. Because `default_base_url()` turns a value that
+does not normalize into the production origin, and `load_sdk_auth` cannot tell a
+synthesized origin from a deliberate one, a malformed selector made `replay`
+silently read production while `token` rejected the same selector.
+
+Destination resolution is now a single shared `cloud::resolve_base_url`: an
+explicit value wins, a malformed environment selector is an error, and only an
+unset environment takes the default. `replay` uses it instead of defaulting.
+
+That is the third defect in this family, and all three had one shape — two code
+paths each deciding for themselves what a stage selection means. The rule now
+lives in one place (`env_selected_stage`, wrapped by `resolve_base_url`), which
+is why this fix removes a call site rather than adding a guard to one.
+
+Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 443 passed and 0 failed — 14 token and 10 replay
+tests, where this PR began with 11 and 8. `tsc` 0, `npm test` 0 with 75/75,
+`scripts` 10/10, contract 9, `index.d.ts` clean. Against the repacked and
+reinstalled artifact both suites pass, `replay` renders and paginates, and
+`$(ai-hist token)` captures a real token.

@@ -343,3 +343,35 @@ fn replay_explicit_base_url_overrides_default_and_does_not_open_an_invalid_db() 
         "not sqlite"
     );
 }
+
+// replay used to synthesize its destination with default_base_url(), which turns
+// a malformed selector into the production origin, and then passed that on as if
+// the user had chosen it. The result was replay silently hitting production while
+// token rejected the very same selector. Both must reject it.
+#[test]
+fn malformed_base_url_env_is_rejected_instead_of_silently_using_production() {
+    let home = tempfile::tempdir().unwrap();
+    let output = replay(home.path(), "not-a-url", &["some-session"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "a malformed selector must be reported, not replaced by production: {err}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a rejected destination must not print a transcript"
+    );
+}
+
+// An explicit destination still wins over a broken environment, matching token.
+#[test]
+fn explicit_base_url_wins_over_a_malformed_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);
+    save_auth(home.path(), &base, false);
+    let output = replay(home.path(), "not-a-url", &["unknown", "--base-url", &base]);
+    success(&output);
+    server.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No events found."));
+}

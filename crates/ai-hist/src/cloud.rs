@@ -315,6 +315,21 @@ fn env_selected_stage() -> Result<Option<String>> {
     }
 }
 
+/// Resolve a concrete destination for a caller that needs one up front. An explicit
+/// value wins; otherwise a malformed environment selector is an error rather than a
+/// silent production fallback, and an unset environment takes the default.
+///
+/// Callers that synthesize a destination with default_base_url() and then pass it as
+/// though the user chose it lose that check: default_base_url() swallows a malformed
+/// value and returns production, and load_sdk_auth cannot tell a synthesized origin
+/// from a deliberate one.
+pub fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
+    match base_url {
+        Some(explicit) => Ok(explicit.to_string()),
+        None => Ok(env_selected_stage()?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
+    }
+}
+
 /// Replace parser errors before they surface: a serde_json failure can quote the
 /// credential values it choked on, and this command's output is a secret.
 fn sanitize_auth_error(error: anyhow::Error) -> anyhow::Error {
