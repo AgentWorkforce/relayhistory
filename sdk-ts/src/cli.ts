@@ -3,12 +3,12 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  bootstrapLocal, discoverSessions, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
+  discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  listSessionCatalogPage, login, recent, resumeCommand, search, stats, sync,
   enableCloud, accessToken, replay,
-  type CatalogCursor, type EvidenceCursor, type HistoryEntry, type SessionFileEditsPage,
-  type SessionRelationship, type SessionScope, type SessionToolCallsPage,
+  type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
+  type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
@@ -17,8 +17,8 @@ type PackageMetadata = { version?: string };
 
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
-  'base-url', 'interval', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'project', 'source', 'tag', 'tokens',
+  'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'max-depth', 'max-nodes', 'project', 'source', 'tag', 'token', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -211,10 +211,14 @@ function usage(message?: string): never {
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
+  ai-hist login [--base-url URL] [--token TOKEN] [--label LABEL] [--json]
   ai-hist token [--base-url URL]
   ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
+
+Every command that reads local history indexes it on first use; pass
+--no-bootstrap to answer from the store exactly as it stands.
 `);
   process.exit(2);
 }
@@ -374,7 +378,6 @@ function queryPositionals(subcommand: string | undefined, rest: string[], comman
 }
 
 async function runResume(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
-  validateFlags(args, 'resume', ['all', 'db', 'fts', 'json', 'local', 'remote']);
   const query = queryPositionals(subcommand, rest, 'resume');
   // Matches the Rust CLI: search is capped to the single best match, then that
   // one row is checked for a usable session id rather than scanning further.
@@ -429,9 +432,6 @@ function takeCodePoints(text: string, limit: number): { truncated: boolean; text
 }
 
 async function runPack(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
-  validateFlags(args, 'pack', [
-    'all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens',
-  ]);
   const query = queryPositionals(subcommand, rest, 'pack');
   const queryStr = query.join(' ');
   const tokens = nonNegativeIntFlag(args, 'tokens') ?? 0;
@@ -508,6 +508,123 @@ function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boo
   if (value.truncated) process.stdout.write('truncated: node/depth budget reached\n');
 }
 
+interface CommandSpec {
+  /** Name used in flag- and argument-rejection messages. */
+  name: string;
+  allowed: readonly string[];
+  /** Positional arguments after the command words: [minimum, maximum]. */
+  positionals: readonly [number, number | null];
+  /** Named in the usage error when fewer than the minimum are given. */
+  requires?: string;
+  /** Answers from the local database, so it takes the shared first-use bootstrap. */
+  readsLocalStore?: boolean;
+  /** Addresses a session by identity; --local/--remote/--all are meaningless. */
+  rejectsScope?: boolean;
+  /** Remaining command-line checks, run before any store work. */
+  validate?: (args: Parsed) => void;
+}
+
+function validateInterval(args: Parsed): void {
+  // --interval is seconds; validate before converting so the error names the
+  // unit the caller actually typed rather than a millisecond bound.
+  const seconds = numberFlag(args, 'interval') ?? 60;
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 2_147_483) {
+    usage('--interval must be a whole number of seconds between 1 and 2147483');
+  }
+}
+
+// The whole dispatch surface in one table. `readsLocalStore` is the decision
+// that used to live only in the bare-invocation branch: keeping it here is what
+// stops `search` and `ai-hist` disagreeing about whether a store exists.
+const COMMANDS = new Map<string, CommandSpec>([
+  ['', { name: 'ai-hist', positionals: [0, 0], allowed: ['db', 'json'], readsLocalStore: true }],
+  ['login', { name: 'login', positionals: [0, 0],
+    allowed: ['base-url', 'json', 'label', 'token'],
+    validate: (args: Parsed) => {
+      if (textFlag(args, 'token') && !textFlag(args, 'base-url')) usage('login requires --base-url with --token');
+    } }],
+  ['token', { name: 'token', positionals: [0, 0], allowed: ['base-url'] }],
+  ['replay', { name: 'replay', positionals: [1, 1], requires: 'replay requires SESSION_ID',
+    allowed: ['base-url', 'limit', 'max-content', 'json', 'out'] }],
+  ['enable-cloud', { name: 'enable-cloud', positionals: [0, 0], validate: validateInterval,
+    allowed: ['base-url', 'db', 'interval', 'once', 'json'] }],
+  ['sessions list', { name: 'sessions list', positionals: [0, 0], readsLocalStore: true,
+    validate: (args) => {
+      if (args.flags.has('json') && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
+    },
+    allowed: [
+      'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
+      'json', 'limit', 'local', 'pretty', 'remote', 'source',
+    ] }],
+  ['sessions discover', { name: 'sessions discover', positionals: [0, 0],
+    allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source'] }],
+  ['sessions hydrate', { name: 'sessions hydrate', positionals: [2, 2], readsLocalStore: true,
+    requires: 'sessions hydrate requires SOURCE and SESSION_ID',
+    allowed: ['all', 'db', 'json', 'local', 'no-related', 'remote'] }],
+  ['sessions relationships', { name: 'sessions relationships', positionals: [2, 2], readsLocalStore: true,
+    rejectsScope: true, requires: 'sessions relationships requires SOURCE and SESSION_ID',
+    allowed: ['all', 'db', 'json', 'local', 'remote'] }],
+  ['sessions tree', { name: 'sessions tree', positionals: [2, 2], readsLocalStore: true, rejectsScope: true,
+    requires: 'sessions tree requires SOURCE and SESSION_ID',
+    allowed: ['all', 'db', 'json', 'local', 'max-depth', 'max-nodes', 'remote'] }],
+  ['sessions tools', { name: 'sessions tools', positionals: [2, 2], readsLocalStore: true,
+    requires: 'sessions tools requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
+  ['sessions edits', { name: 'sessions edits', positionals: [2, 2], readsLocalStore: true,
+    requires: 'sessions edits requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
+  ['search', { name: 'search', positionals: [1, null], requires: 'search requires a query', readsLocalStore: true,
+    allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+  ['recent', { name: 'recent', positionals: [0, 1], readsLocalStore: true,
+    validate: (args) => {
+      const count = args.positional[1];
+      if (count !== undefined && !Number.isFinite(Number(count))) {
+        usage(`recent count must be a number (got '${count}')`);
+      }
+    },
+    allowed: ['all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
+  ['session', { name: 'session', positionals: [1, 1], requires: 'session requires SESSION_ID',
+    readsLocalStore: true, rejectsScope: true,
+    allowed: ['all', 'db', 'json', 'local', 'remote', 'source', 'tag'] }],
+  ['events', { name: 'events', positionals: [1, 1], requires: 'events requires SESSION_ID',
+    readsLocalStore: true, rejectsScope: true,
+    allowed: ['after', 'all', 'db', 'json', 'limit', 'local', 'remote', 'source'] }],
+  ['resume', { name: 'resume', positionals: [1, null], requires: 'resume requires a query', readsLocalStore: true,
+    allowed: ['all', 'db', 'fts', 'json', 'local', 'remote'] }],
+  ['pack', { name: 'pack', positionals: [1, null], requires: 'pack requires a query', readsLocalStore: true,
+    validate: (args) => { nonNegativeIntFlag(args, 'tokens'); },
+    allowed: ['all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens'] }],
+  ['stats', { name: 'stats', positionals: [0, 0], readsLocalStore: true,
+    allowed: ['all', 'db', 'json', 'local', 'remote', 'tag'] }],
+  // sync and `sessions discover` build the store rather than read it, so they
+  // do not bootstrap first; running them is itself the remedy for an empty one.
+  ['sync', { name: 'sync', positionals: [0, 0], allowed: ['all', 'db', 'json', 'local', 'remote'] }],
+]);
+
+/** Command words consumed before the positional arguments start. */
+function commandWords(command: string | undefined): number {
+  if (command === undefined) return 0;
+  return command === 'sessions' ? 2 : 1;
+}
+
+function commandSpec(command: string | undefined, subcommand: string | undefined): CommandSpec | undefined {
+  if (command === undefined) return COMMANDS.get('');
+  if (command === 'sessions') return subcommand ? COMMANDS.get(`sessions ${subcommand}`) : undefined;
+  return COMMANDS.get(command);
+}
+
+// A store that was never built and a store holding no match are different
+// answers, and `No results.` is only true of the second. Wording and exit code
+// separate them; the query is not run against a store that cannot hold one.
+function reportUnusableStore(readiness: LocalStoreReadiness, json: boolean): boolean {
+  if (readiness.status === 'ready' || readiness.status === 'skipped') return false;
+  const message = readiness.status === 'unbuilt'
+    ? 'No local index yet: run ai-hist (or ai-hist sync) to build one.'
+    : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.';
+  if (json) output({ status: readiness.status, indexedPrompts: readiness.indexedPrompts, message }, true);
+  else process.stdout.write(`${message}\n`);
+  process.exitCode = 1;
+  return true;
+}
+
 async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   const versionArgs = rawArgs.filter((arg) => arg !== '--no-warning');
@@ -521,34 +638,67 @@ async function main(): Promise<void> {
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
+  const spec = commandSpec(command, subcommand);
+  if (!spec) usage();
+  // The whole command line is checked before any work: a line that is going to
+  // be rejected must not first spend a first-run bootstrap only to exit 2.
+  validateFlags(args, spec.name, spec.readsLocalStore ? [...spec.allowed, 'no-bootstrap'] : spec.allowed);
+  if (spec.rejectsScope) rejectScopeFlag(args, spec.name);
+  const tail = args.positional.slice(commandWords(command));
+  const [least, most] = spec.positionals;
+  if (tail.length < least) usage(spec.requires);
+  if (most !== null && tail.length > most) rejectSurplusPositionals(tail.slice(most), spec.name);
+  spec.validate?.(args);
+  const intervalSeconds = numberFlag(args, 'interval') ?? 60;
+  const sessionSource = command === 'sessions' ? tail[0] : undefined;
+  const sessionId = command === 'sessions' ? tail[1] : undefined;
+  const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
+  let readiness: LocalStoreReadiness | null = null;
+  if (spec.readsLocalStore) {
+    readiness = await ensureLocalStore({
+      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), bootstrap: !args.flags.has('no-bootstrap'),
+    });
+    if (readiness.bootstrap?.status === 'partial') {
+      process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
+    }
+    // The bare invocation reports the store's condition as its result and
+    // succeeds either way. Every command that asks the store a question refuses
+    // to answer out of one that cannot hold an answer.
+    if (command !== undefined && reportUnusableStore(readiness, json)) return;
+  }
+
   if (command === undefined) {
-    validateFlags(args, 'ai-hist', ['db', 'json', 'no-bootstrap']);
-    if (args.flags.has('no-bootstrap')) {
+    // --no-bootstrap answers from the catalog as it stands; the bootstrap path
+    // reports what it just indexed.
+    if (!readiness?.bootstrap) {
       output(await listSessionCatalogPage({ dbPath: textFlag(args, 'db') }), json);
       return;
     }
-    const result = await bootstrapLocal({ dbPath: textFlag(args, 'db') });
-    if (json) output(result, true);
+    if (json) output(readiness.bootstrap, true);
     else {
-      process.stdout.write(result.indexedPrompts > 0
-        ? `Ready: ${result.indexedPrompts} indexed prompt(s). Search with: ai-hist search "your query"\n`
+      process.stdout.write(readiness.indexedPrompts > 0
+        ? `Ready: ${readiness.indexedPrompts} indexed prompt(s). Search with: ai-hist search "your query"\n`
         : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.\n');
-      if (result.status === 'partial') process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
     }
     return;
   }
+  if (command === 'login') {
+    const auth = await login({
+      baseUrl: textFlag(args, 'base-url'),
+      relayAccessToken: textFlag(args, 'token'),
+      label: textFlag(args, 'label'),
+    });
+    if (json) output({ ok: true, baseUrl: auth.baseUrl }, true);
+    else process.stdout.write(`Logged in to ${auth.baseUrl} (session stored).\n`);
+    return;
+  }
   if (command === 'token') {
-    validateFlags(args, 'token', ['base-url']);
-    rejectSurplusPositionals(args.positional.slice(1), 'token');
     const token = await accessToken({ baseUrl: textFlag(args, 'base-url') });
     if (process.stdout.isTTY) process.stderr.write('Warning: this access token is a secret and will remain in terminal scrollback.\n');
     process.stdout.write(`${token}\n`);
     return;
   }
   if (command === 'replay') {
-    validateFlags(args, 'replay', ['base-url', 'limit', 'max-content', 'json', 'out']);
-    if (!subcommand) usage('replay requires SESSION_ID');
-    rejectSurplusPositionals(rest, 'replay');
     const result = await replay(subcommand, {
       baseUrl: textFlag(args, 'base-url'), limit: nonNegativeIntFlag(args, 'limit'),
       maxContent: nonNegativeIntFlag(args, 'max-content'), json, out: textFlag(args, 'out'),
@@ -557,14 +707,6 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'enable-cloud') {
-    validateFlags(args, 'enable-cloud', ['base-url', 'db', 'interval', 'once', 'json']);
-    rejectSurplusPositionals(args.positional.slice(1), 'enable-cloud');
-    // --interval is seconds; validate before converting so the error names the
-    // unit the caller actually typed rather than a millisecond bound.
-    const intervalSeconds = numberFlag(args, 'interval') ?? 60;
-    if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 1 || intervalSeconds > 2_147_483) {
-      usage('--interval must be a whole number of seconds between 1 and 2147483');
-    }
     const handle = await enableCloud({
       baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
       intervalMs: intervalSeconds * 1000,
@@ -582,13 +724,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'sessions' && subcommand === 'list') {
-    validateFlags(args, 'sessions list', [
-      'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
-      'json', 'limit', 'local', 'pretty', 'remote', 'source',
-    ]);
-    rejectSurplusPositionals(rest, 'sessions list');
     const sources = textFlags(args, 'source');
-    if (json && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
     const page = await listSessionCatalogPage({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
@@ -604,8 +740,6 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'sessions' && subcommand === 'discover') {
-    validateFlags(args, 'sessions discover', ['all', 'db', 'json', 'limit', 'local', 'remote', 'source']);
-    rejectSurplusPositionals(rest, 'sessions discover');
     const sources = textFlags(args, 'source');
     outputDiscovery(await discoverSessions({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
@@ -614,13 +748,9 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'sessions' && subcommand === 'hydrate') {
-    validateFlags(args, 'sessions hydrate', ['all', 'db', 'json', 'local', 'no-related', 'remote']);
-    const [source, sessionId, ...surplus] = rest;
-    if (!source || !sessionId) usage('sessions hydrate requires SOURCE and SESSION_ID');
-    rejectSurplusPositionals(surplus, 'sessions hydrate');
     outputHydration(await hydrateSession({
-      source: source as never,
-      sessionId,
+      source: sessionSource as never,
+      sessionId: sessionId!,
       scope: scopeFlag(args),
       dbPath: textFlag(args, 'db'),
       includeRelated: !args.flags.has('no-related'),
@@ -628,77 +758,45 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'sessions' && subcommand === 'relationships') {
-    validateFlags(args, 'sessions relationships', ['all', 'db', 'json', 'local', 'remote']);
-    const [source, sessionId, ...surplus] = rest;
-    if (!source || !sessionId) usage('sessions relationships requires SOURCE and SESSION_ID');
-    rejectSurplusPositionals(surplus, 'sessions relationships');
-    rejectScopeFlag(args, 'sessions relationships');
     outputRelationships(await getSessionRelationships({
-      source: source as never, sessionId, dbPath: textFlag(args, 'db'),
+      source: sessionSource as never, sessionId: sessionId!, dbPath: textFlag(args, 'db'),
     }), json);
     return;
   }
   if (command === 'sessions' && subcommand === 'tree') {
-    validateFlags(args, 'sessions tree', ['all', 'db', 'json', 'local', 'max-depth', 'max-nodes', 'remote']);
-    const [source, sessionId, ...surplus] = rest;
-    if (!source || !sessionId) usage('sessions tree requires SOURCE and SESSION_ID');
-    rejectSurplusPositionals(surplus, 'sessions tree');
-    rejectScopeFlag(args, 'sessions tree');
     outputTree(await getSessionTree({
-      source: source as never, sessionId, dbPath: textFlag(args, 'db'),
+      source: sessionSource as never, sessionId: sessionId!, dbPath: textFlag(args, 'db'),
       maxDepth: numberFlag(args, 'max-depth'), maxNodes: numberFlag(args, 'max-nodes'),
     }), json);
     return;
   }
   if (command === 'sessions' && (subcommand === 'tools' || subcommand === 'edits')) {
     const name = `sessions ${subcommand}`;
-    validateFlags(args, name, ['after', 'db', 'json', 'limit']);
-    const [source, sessionId, ...surplus] = rest;
-    if (!source || !sessionId) usage(`${name} requires SOURCE and SESSION_ID`);
-    rejectSurplusPositionals(surplus, name);
     const options = {
       dbPath: textFlag(args, 'db'),
       limit: numberFlag(args, 'limit'),
       after: evidenceCursorFlag(args),
     };
     if (subcommand === 'tools') {
-      outputToolCalls(await getSessionToolCallsPage(source as never, sessionId, options), json);
+      outputToolCalls(await getSessionToolCallsPage(sessionSource as never, sessionId!, options), json);
     } else {
-      outputFileEdits(await getSessionFileEditsPage(source as never, sessionId, options), json);
+      outputFileEdits(await getSessionFileEditsPage(sessionSource as never, sessionId!, options), json);
     }
     return;
   }
   if (command === 'search') {
-    validateFlags(args, 'search', [
-      'all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag',
-    ]);
-    if (!subcommand) usage();
     output(await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
     return;
   }
   if (command === 'recent') {
-    validateFlags(args, 'recent', [
-      'all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag',
-    ]);
-    rejectSurplusPositionals(rest, 'recent');
-    const fallback = subcommand ? Number(subcommand) : undefined;
-    if (fallback !== undefined && !Number.isFinite(fallback)) usage(`recent count must be a number (got '${subcommand}')`);
-    output(await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? fallback }), json);
+    output(await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback }), json);
     return;
   }
   if (command === 'session') {
-    validateFlags(args, 'session', ['all', 'db', 'json', 'local', 'remote', 'source', 'tag']);
-    if (!subcommand) usage();
-    rejectSurplusPositionals(rest, 'session');
-    rejectScopeFlag(args, 'session');
     output(await getSession(subcommand, { dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never, tag: textFlag(args, 'tag') }), json);
     return;
   }
   if (command === 'events') {
-    validateFlags(args, 'events', ['after', 'all', 'db', 'json', 'limit', 'local', 'remote', 'source']);
-    if (!subcommand) usage();
-    rejectSurplusPositionals(rest, 'events');
-    rejectScopeFlag(args, 'events');
     output(await getSessionEventsPage(subcommand, {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
@@ -714,14 +812,10 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'stats') {
-    validateFlags(args, 'stats', ['all', 'db', 'json', 'local', 'remote', 'tag']);
-    rejectSurplusPositionals([subcommand, ...rest].filter((value): value is string => value !== undefined), 'stats');
     output(await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
     return;
   }
   if (command === 'sync') {
-    validateFlags(args, 'sync', ['all', 'db', 'json', 'local', 'remote']);
-    rejectSurplusPositionals([subcommand, ...rest].filter((value): value is string => value !== undefined), 'sync');
     output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args) }), json);
     return;
   }

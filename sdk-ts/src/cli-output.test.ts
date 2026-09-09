@@ -74,11 +74,23 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
 test('sessions list keeps human and JSON output contracts distinct', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-empty-'));
   const db = join(root, 'missing.db');
+  const env = { ...process.env, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, 'share') };
   try {
-    const human = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--no-warning']);
-    assert.match(human.stdout, /No sessions in the catalog/);
-    const json = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
-    assert.deepEqual(JSON.parse(json.stdout), { contract_version: 3, scope: 'local', sessions: [], next_cursor: null });
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--no-warning'], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stdout' in error && String(error.stdout).includes('No searchable local sessions found'),
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning'], { env }),
+      (error: unknown) => {
+        if (typeof error !== 'object' || error === null || !('stdout' in error)) return false;
+        return JSON.stringify(JSON.parse(String(error.stdout))) === JSON.stringify({
+          status: 'empty', indexed_prompts: 0,
+          message: 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.',
+        });
+      },
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -104,7 +116,8 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
     assert.equal(hydrated.contract_version, 2);
-    assert.equal(hydrated.status, 'hydrated');
+    assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
+      `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
     assert.deepEqual(hydrated.evidence, {

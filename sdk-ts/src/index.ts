@@ -1505,6 +1505,52 @@ export async function bootstrapLocal(options: BootstrapLocalOptions = {}): Promi
     alreadyIndexed: false, indexedPrompts: indexed.total, hydratedSessions, discovery, diagnostics };
 }
 
+/**
+ * `ready` — the store answers queries. `empty` — bootstrap ran and this machine
+ * has no local coding-agent history at all. `unbuilt` — bootstrap was declined,
+ * so nothing is indexed yet and that is not the same as having no history.
+ * `skipped` — the caller is not reading the local store.
+ */
+export type LocalStoreStatus = 'ready' | 'empty' | 'unbuilt' | 'skipped';
+
+export interface LocalStoreReadiness {
+  status: LocalStoreStatus;
+  indexedPrompts: number;
+  /** The bootstrap that ran on this call, or null when none did. */
+  bootstrap: BootstrapLocalResult | null;
+}
+
+export interface EnsureLocalStoreOptions {
+  dbPath?: string;
+  /** Only `local` and `all` read the local database; `remote` skips the check. */
+  scope?: SessionScope;
+  /** False for `--no-bootstrap`: report the store as it stands, build nothing. */
+  bootstrap?: boolean;
+}
+
+/**
+ * The single first-use decision behind every local read. Callers must not each
+ * choose whether to bootstrap: a fresh install has to answer the same way
+ * whichever command the user happens to type first, and a store that was never
+ * built has to be distinguishable from one that holds no match.
+ */
+export async function ensureLocalStore(options: EnsureLocalStoreOptions = {}): Promise<LocalStoreReadiness> {
+  const { dbPath, scope = 'local' } = options;
+  if (scope === 'remote') return { status: 'skipped', indexedPrompts: 0, bootstrap: null };
+  if (options.bootstrap === false) {
+    const existing = await stats({ dbPath, scope: 'local' });
+    return { status: existing.total > 0 ? 'ready' : 'unbuilt', indexedPrompts: existing.total, bootstrap: null };
+  }
+  const bootstrap = await bootstrapLocal({ dbPath });
+  // `partial` reports indexing diagnostics, not emptiness: whether the store can
+  // answer is decided by the prompt count alone.
+  return {
+    status: bootstrap.indexedPrompts > 0 ? 'ready' : 'empty',
+    indexedPrompts: bootstrap.indexedPrompts,
+    bootstrap,
+  };
+}
+
 export function resumeCommand(entry: Pick<HistoryEntry, 'source' | 'sessionId' | 'project' | 'locations'>): string | null {
   if (!entry.sessionId) return null;
   if (entry.locations.length > 0 && !entry.locations.includes('local')) return null;
@@ -1570,9 +1616,27 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
+export interface LoginOptions {
+  baseUrl?: string;
+  relayAccessToken?: string;
+  label?: string;
+}
+
+/** Authenticate to relayhistory-cloud via device login or a supplied bearer token. */
+export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
+  if (options.relayAccessToken && !options.baseUrl) {
+    throw new InvalidArgumentError('`--base-url` is required with manual `--token` login', 'INVALID_ARGUMENT');
+  }
+  return nativeCall((native) => native.cloudLogin({
+    baseUrl: options.baseUrl,
+    relayAccessToken: options.relayAccessToken,
+    label: options.label,
+  }));
+}
+
 export async function loginCloud(relayAccessToken: string, options: { baseUrl?: string; label?: string } = {}): Promise<LoginCloudResult> {
   try {
-    const auth = await nativeCall((native) => native.cloudLogin({ ...options, relayAccessToken }));
+    const auth = await login({ ...options, relayAccessToken });
     return { ok: true, auth };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
