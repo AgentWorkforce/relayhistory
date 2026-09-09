@@ -42,6 +42,8 @@ ai-hist resume "auth rewrite"                        # print the native resume c
 ai-hist pack "auth rewrite" --tokens 1500            # compact context to hand another agent
 ai-hist sessions tree <harness> <id>                 # walk the parent/subagent tree
 ai-hist sessions relationships <harness> <id>        # which sessions spawned which
+ai-hist recent 20                                    # the last N prompts, newest first
+ai-hist stats                                        # how much history is indexed, by source and project
 ```
 
 `<harness>` is the session's source — `claude`, `codex`, `cursor`, `grok`, `opencode`, or `relay` — and is required alongside the ID, because session IDs collide across providers. `ai-hist sessions list` prints both.
@@ -58,11 +60,11 @@ Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_to
 
 `get_session_thread` is the one cloud-backed tool. Given a `source` and a `session_id` it returns the commits that session shipped plus the pull requests, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions linked to it — the *lifecycle* fan-out, complementing `get_session_tree`'s *subagent* fan-out. It fetches on every call and caches nothing, because a thread keeps growing as PRs and incidents land. Optional `kinds`, `since`, `limit` and `cursor` narrow and page the links. Tenancy comes from the stored cloud session's token, never from a parameter.
 
-It reads the native `ai-hist login` store first (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory`) and this SDK's `~/.config/ai-hist/auth.json` second, holding a native session to the same preconditions the `cloud` connector applies to recall. An expired session with a refresh token is rotated once and the new pair merged back over the stored session, so a long-running MCP install does not stop working at the token boundary. Without a usable cloud session it returns `UNSUPPORTED_OPERATION`, names the missing precondition, and makes no request.
+It reads the native `ai-hist enable-cloud` store first (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory`) and this SDK's `~/.config/ai-hist/auth.json` second, holding a native session to the same preconditions the `cloud` connector applies to recall. An expired session with a refresh token is rotated once and the new pair merged back over the stored session, so a long-running MCP install does not stop working at the token boundary. Without a usable cloud session it returns `UNSUPPORTED_OPERATION`, names the missing precondition, and makes no request.
 
 ## Team + Cloud
 
-Every read command takes a location scope — `--local` (the default), `--remote`, or `--all`:
+The search-style read commands — `search`, `recent`, `sessions list`, `sessions discover`, `sessions hydrate`, `resume`, `pack`, `stats` and `sync` — take a location scope: `--local` (the default), `--remote`, or `--all`.
 
 ```sh
 ai-hist sessions discover --remote     # pull in sessions your providers keep server-side
@@ -70,9 +72,31 @@ ai-hist sync --all                     # ingest local and remote together
 ai-hist search "auth rewrite" --all    # search both at once
 ```
 
+Commands that address one session by identity do not take a scope, and reject one rather than guessing — they already name a single session. They split by how they take that identity:
+
+```sh
+ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits
+ai-hist session SESSION_ID [--source SOURCE]   # session and events take the id alone
+ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused id
+```
+
+`sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
+
 Optional: `ai-hist enable-cloud` authenticates and syncs your sessions to RelayHistory Cloud. Threading commits to a PR is a separate opt-in hook install. See [cloud setup, Git hooks, and sharing](docs/enable-cloud.md).
 
 Remote acquisition runs through connectors that reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
+
+Two commands read a session back out of the cloud once `enable-cloud` is set up:
+
+```sh
+ai-hist replay <session-id>                 # print a cloud session's events, oldest first
+ai-hist replay <session-id> --out log.txt   # write that transcript to a file instead
+ai-hist token                               # print a cloud API token for your own tooling
+```
+
+`replay` prints the whole transcript. `--limit` is the per-request page size, not a cap: `replay` follows the server's cursor until the session is exhausted, so a 5-event session under `--limit 1` still prints all 5, one request at a time. `--max-content` truncates long events, and truncated ones are marked in the output; `--json` emits the raw event array. (`events --limit N` does cap, because it prints one page and a `nextCursor`.) Without a stored cloud session it stops and names what is missing rather than printing a partial transcript, and `--out` is written atomically only after the whole fetch succeeds, so an interrupted replay never truncates a transcript you already had.
+
+`ai-hist token` prints a live credential to stdout — treat it like a password, and don't paste its output into a terminal you are sharing or a log.
 
 A hosted layer for sharing sessions across a team — so every PR threads back to the session that produced it — is in progress at `history.agentrelay.com`; its connector is not yet wired into the npm CLI. Want early access, or to self-host it? Reach out at hello@agentrelay.com.
 
