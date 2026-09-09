@@ -113,8 +113,9 @@ test('cloud compatibility entrypoint does not reimplement the native cloud opera
 
 test('token and replay SDK operations delegate to native code', async () => {
   const source = await readFile(join(sourceDir, 'index.ts'), 'utf8');
-  const cloudCommands = source.slice(source.indexOf('export async function accessToken('), source.indexOf('export interface CloudOptions'));
+  const cloudCommands = source.slice(source.indexOf('export async function accessToken('), source.indexOf('export async function pushCloud('));
   assert.match(cloudCommands, /native\.accessToken\(/);
   assert.match(cloudCommands, /native\.replay\(/);
+  assert.match(cloudCommands, /native\.cloudLogin\(/);
   assert.doesNotMatch(cloudCommands, /fetch\(|readFile|writeFile|auth\.json|nextCursor|refreshToken/);
 });

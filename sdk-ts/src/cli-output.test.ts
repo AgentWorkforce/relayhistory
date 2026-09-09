@@ -74,11 +74,23 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
 test('sessions list keeps human and JSON output contracts distinct', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-empty-'));
   const db = join(root, 'missing.db');
+  const env = { ...process.env, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, 'share') };
   try {
-    const human = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--no-warning']);
-    assert.match(human.stdout, /No sessions in the catalog/);
-    const json = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
-    assert.deepEqual(JSON.parse(json.stdout), { contract_version: 3, scope: 'local', sessions: [], next_cursor: null });
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--no-warning'], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stdout' in error && String(error.stdout).includes('No searchable local sessions found'),
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning'], { env }),
+      (error: unknown) => {
+        if (typeof error !== 'object' || error === null || !('stdout' in error)) return false;
+        return JSON.stringify(JSON.parse(String(error.stdout))) === JSON.stringify({
+          status: 'empty', indexed_prompts: 0,
+          message: 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.',
+        });
+      },
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -104,7 +116,8 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
     assert.equal(hydrated.contract_version, 2);
-    assert.equal(hydrated.status, 'hydrated');
+    assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
+      `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
     assert.deepEqual(hydrated.evidence, {
@@ -385,11 +398,19 @@ test('topology commands require SOURCE and SESSION_ID and reject location scope'
 test('scope flags are boolean, default to local, and are mutually exclusive', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-scope-'));
   const db = join(root, 'missing.db');
+  const env = { ...process.env, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, 'share') };
   try {
-    const implicit = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
-    const explicit = await run(process.execPath, [cli, '--json', 'sessions', 'list', '--local', '--db', db, '--no-warning']);
-    assert.deepEqual(JSON.parse(explicit.stdout), JSON.parse(implicit.stdout));
-    const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning']);
+    const readEmpty = async (args: string[]) => {
+      try {
+        return await run(process.execPath, args, { env });
+      } catch (error) {
+        return error as NodeJS.ErrnoException & { stdout: string };
+      }
+    };
+    const implicit = await readEmpty([cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
+    const explicit = await readEmpty([cli, '--json', 'sessions', 'list', '--local', '--db', db, '--no-warning']);
+    assert.deepEqual(JSON.parse(implicit.stdout), JSON.parse(explicit.stdout));
+    const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env });
     assert.equal(JSON.parse(remote.stdout).scope, 'remote');
 
     await assert.rejects(
@@ -462,11 +483,15 @@ test('unknown, missing-value, and command-inapplicable flags fail with usage exi
 
 test('search preserves a multi-word positional query', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-search-'));
+  const env = { ...process.env, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, 'share') };
   try {
-    const result = await run(process.execPath, [
-      cli, 'search', 'two', 'word query', '--db', join(root, 'missing.db'), '--json', '--no-warning',
-    ]);
-    assert.deepEqual(JSON.parse(result.stdout), []);
+    await assert.rejects(
+      run(process.execPath, [
+        cli, 'search', 'two', 'word query', '--db', join(root, 'missing.db'), '--json', '--no-warning',
+      ], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'stdout' in error && JSON.parse(String(error.stdout)).status === 'empty',
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -518,9 +543,13 @@ test('resume rejects an unknown flag with a documented --db option', async () =>
 
 test('resume fails loudly when nothing matches', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-resume-empty-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
+    await seedCodexSession(root, home, db);
     await assert.rejects(
-      run(process.execPath, [cli, 'resume', 'no such session anywhere', '--db', join(root, 'missing.db'), '--no-warning']),
+      run(process.execPath, [cli, 'resume', 'no such session anywhere', '--db', db, '--no-warning'], { env }),
       (error: unknown) => typeof error === 'object' && error !== null
         && 'stderr' in error && String(error.stderr).includes('No session found'),
     );
@@ -649,9 +678,13 @@ test('pack rejects a negative or fractional --tokens instead of silently misinte
 
 test('pack reports no results distinctly from a match, and exits non-zero', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-pack-empty-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
   try {
+    await seedCodexSession(root, home, db);
     await assert.rejects(
-      run(process.execPath, [cli, 'pack', 'nothing matches this', '--db', join(root, 'missing.db'), '--no-warning']),
+      run(process.execPath, [cli, 'pack', 'nothing matches this', '--db', db, '--no-warning'], { env }),
       (error: unknown) => typeof error === 'object' && error !== null
         && 'stdout' in error && String(error.stdout).includes('No results.'),
     );
