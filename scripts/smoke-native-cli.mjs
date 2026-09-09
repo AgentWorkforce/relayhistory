@@ -6,7 +6,12 @@ import { spawnSync } from 'node:child_process';
 
 const cli = resolve(process.argv[2]);
 const temporary = mkdtempSync(join(tmpdir(), 'ai-hist-native-smoke-'));
-const env = { ...process.env, HOME: temporary };
+const env = {
+  ...process.env,
+  HOME: temporary,
+  USERPROFILE: temporary,
+  RELAYHISTORY_NO_UPDATE_CHECK: '1',
+};
 const args = ['search', 'anything', '--local', '--db', join(temporary, 'empty.db'), '--json'];
 
 function run(args) {
@@ -18,15 +23,19 @@ function run(args) {
   return result;
 }
 
-function search() {
+function assertEmptyStoreSearch() {
   const result = run(args);
-  assert.equal(result.status, 0, `ai-hist search anything failed:\n${result.stderr}`);
-  assert.deepEqual(JSON.parse(result.stdout), [], 'Fresh database should return no results');
-  console.log('PASS: ai-hist search anything (native addon loaded)');
+  assert.equal(result.status, 1, `empty store search must fail closed:\n${result.stderr}${result.stdout}`);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    status: 'empty',
+    indexed_prompts: 0,
+    message: 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.',
+  }, 'Unindexed store must not masquerade as zero matches');
+  console.log('PASS: ai-hist search on empty store (native addon loaded)');
 }
 
 try {
-  search();
+  assertEmptyStoreSearch();
   if (process.argv.includes('--prove-rejection')) {
     // Resolve the actual loaded binary in a child process so it is unloaded
     // before corruption. Handles both local builds and npm platform packages.
@@ -52,7 +61,7 @@ try {
     } finally {
       writeFileSync(binary, original);
     }
-    search();
+    assertEmptyStoreSearch();
   }
 } finally {
   rmSync(temporary, { recursive: true, force: true });
