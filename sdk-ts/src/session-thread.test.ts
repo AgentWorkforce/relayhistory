@@ -516,7 +516,15 @@ test('the SDK store is held only to the contract it can satisfy', async () => {
 
 test('a malformed stage file is skipped rather than failing every read', async () => {
   await withStores(async ({ nativeHome }) => {
-    await writeFile(join(nativeHome, 'stages', 'broken.auth.json'), '{ not json', { mode: 0o600 });
+    // `JSON.parse` succeeds on all but the first of these, so parsing alone is
+    // not enough — reading fields off `null` would throw an unclassified
+    // TypeError out through resolveCloudSession.
+    for (const [name, body] of [
+      ['broken', '{ not json'], ['null', 'null'], ['array', '[]'],
+      ['scalar', '42'], ['string', '"nope"'],
+    ]) {
+      await writeFile(join(nativeHome, 'stages', `${name}.auth.json`), body!, { mode: 0o600 });
+    }
     await writeStage(nativeHome, 'good', {
       base_url: 'https://history.agentrelay.com',
       access_token: 'rth_at_good',

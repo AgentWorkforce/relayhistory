@@ -220,7 +220,12 @@ function nativeCloudHome(): string {
 async function readNativeAuth(path: string): Promise<RelayhistoryAuth | null> {
   let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+    const raw = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    // `JSON.parse` succeeds on `null`, `[]` and scalars, so parsing is not
+    // enough to know the fields below can be read. Same guard `persistRotated`
+    // applies to this file, so both readers agree on what "malformed" means.
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    parsed = raw as Record<string, unknown>;
   } catch {
     return null;
   }
