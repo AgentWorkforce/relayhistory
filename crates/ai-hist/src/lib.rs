@@ -7600,6 +7600,69 @@ fn sync_cursor_with_scan_hook(
     Ok(inserted)
 }
 
+/// One transcript's worth of prepared work. `checkpoint` is returned rather than
+/// written in place so a transcript that fails midway leaves its saved checkpoint
+/// exactly as it was.
+struct ScannedCursorTranscript {
+    prompts: Vec<String>,
+    timestamp_ms: i64,
+    parse_errors: usize,
+    checkpoint: Option<Value>,
+}
+
+fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
+    let mut source = CompleteJsonlReader::open(jsonl, saved)
+        .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
+    let offset = source.position;
+    let size = source
+        .reader
+        .get_ref()
+        .metadata()
+        .with_context(|| format!("read Cursor transcript metadata {}", jsonl.display()))?
+        .len();
+    let timestamp_ms = jsonl
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut consumed = offset;
+    let mut prompts = Vec::new();
+    let mut parse_errors = 0;
+    if offset < size {
+        let mut line = String::new();
+        while let Some(position) = source
+            .next_line(&mut line)
+            .with_context(|| format!("read Cursor transcript {}", jsonl.display()))?
+        {
+            consumed = position;
+            match parse_cursor_text(&line) {
+                Ok(Some(prompt)) => prompts.push(prompt),
+                Ok(None) => {}
+                Err(_) => parse_errors += 1,
+            }
+        }
+    }
+    let opened_cursor = source.cursor.to_value();
+    let checkpoint = if consumed != offset || saved != Some(&opened_cursor) {
+        Some(
+            source
+                .committed_cursor(consumed, true)
+                .with_context(|| format!("validate Cursor transcript {}", jsonl.display()))?
+                .to_value(),
+        )
+    } else {
+        None
+    };
+    Ok(ScannedCursorTranscript {
+        prompts,
+        timestamp_ms,
+        parse_errors,
+        checkpoint,
+    })
+}
+
 fn prepare_cursor_sync(
     state: &Map<String, Value>,
     root: &Path,
@@ -7637,55 +7700,30 @@ fn prepare_cursor_sync(
             before_transcript(&jsonl);
             files_seen += 1;
             let key = jsonl.to_string_lossy().to_string();
-            let mut source = CompleteJsonlReader::open(&jsonl, cursor_state.get(&key))
-                .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
-            let offset = source.position;
-            let size = source
-                .reader
-                .get_ref()
-                .metadata()
-                .with_context(|| format!("read Cursor transcript metadata {}", jsonl.display()))?
-                .len();
-            let ts_ms = jsonl
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let mut consumed = offset;
-            let mut prompts = Vec::new();
-            if offset < size {
-                let mut line = String::new();
-                while let Some(position) = source
-                    .next_line(&mut line)
-                    .with_context(|| format!("read Cursor transcript {}", jsonl.display()))?
-                {
-                    consumed = position;
-                    match parse_cursor_text(&line) {
-                        Ok(Some(prompt)) => prompts.push(prompt),
-                        Ok(None) => {}
-                        Err(_) => errors += 1,
-                    }
+            // Cursor rewrites and rotates transcripts underneath us, so a file can
+            // vanish or be replaced between enumeration and open. That race is
+            // per-file, not per-source: record it, leave this file's checkpoint
+            // untouched so the next sync retries it from the same offset, and keep
+            // preparing the remaining transcripts.
+            let scan = match scan_cursor_transcript(&jsonl, cursor_state.get(&key)) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
+                    errors += 1;
+                    continue;
                 }
+            };
+            errors += scan.parse_errors;
+            if let Some(checkpoint) = scan.checkpoint {
+                cursor_state.insert(key, checkpoint);
             }
-            let opened_cursor = source.cursor.to_value();
-            if consumed != offset || cursor_state.get(&key) != Some(&opened_cursor) {
-                cursor_state.insert(
-                    key,
-                    source
-                        .committed_cursor(consumed, true)
-                        .with_context(|| format!("validate Cursor transcript {}", jsonl.display()))?
-                        .to_value(),
-                );
-            }
-            if !prompts.is_empty() {
+            if !scan.prompts.is_empty() {
                 transcripts.push(PreparedCursorTranscript {
                     path: jsonl,
                     session_id,
                     project: project_path.clone(),
-                    timestamp_ms: ts_ms,
-                    prompts,
+                    timestamp_ms: scan.timestamp_ms,
+                    prompts: scan.prompts,
                 });
             }
         }
@@ -9775,7 +9813,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_sync_later_preparation_failure_preserves_history_and_state() {
+    fn cursor_sync_recovers_when_a_transcript_vanishes_during_preparation() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("P/agent-transcripts/s1/s1.jsonl");
         let second = dir.path().join("P/agent-transcripts/s2/s2.jsonl");
@@ -9814,36 +9852,52 @@ mod tests {
         )
         .unwrap();
         let mut visited = Vec::new();
-        let error = super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
-            visited.push(path.to_path_buf());
-            if path == second {
-                assert_eq!(
-                    conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
-                        .get::<_, i64>(0))
-                        .unwrap(),
-                    1,
-                    "the earlier transcript must still be pending during preparation"
-                );
-                // The hook runs after the existence check, forcing open to fail.
-                fs::remove_file(path).unwrap();
-            }
-        })
-        .expect_err("a later file disappearing during preparation must fail sync");
-        assert_eq!(visited, vec![first, second.clone()]);
+        let inserted =
+            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+                visited.push(path.to_path_buf());
+                if path == second {
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1,
+                        "the earlier transcript must still be pending during preparation"
+                    );
+                    // The hook runs after the existence check, forcing open to fail.
+                    fs::remove_file(path).unwrap();
+                }
+            })
+            .expect("one vanished transcript must not abort the whole Cursor source");
+        assert_eq!(visited, vec![first.clone(), second.clone()]);
         assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::NotFound
+            inserted, 1,
+            "the surviving transcript must still be ingested"
         );
-        assert!(format!("{error:#}").contains(second.to_string_lossy().as_ref()));
-        assert_eq!(state, saved);
         let rows: Vec<(String, i64)> = conn
-            .prepare("SELECT prompt, timestamp_ms FROM history")
+            .prepare("SELECT prompt, timestamp_ms FROM history ORDER BY id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(rows, vec![("seed".into(), seed_timestamp)]);
+        assert_eq!(
+            rows.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["seed", "pending prompt"],
+            "the readable transcript must be ingested despite its neighbour vanishing"
+        );
+        assert_eq!(rows[0].1, seed_timestamp);
+        // The surviving file advances; the vanished file keeps whatever checkpoint it
+        // had, so the next sync retries it from the same offset.
+        assert_eq!(
+            saved_cursor_offset(&state["cursor"][first.to_string_lossy().as_ref()]),
+            fs::metadata(&first).unwrap().len(),
+            "the readable transcript's checkpoint must advance"
+        );
+        assert_eq!(
+            state["cursor"].get(second.to_string_lossy().as_ref()),
+            saved["cursor"].get(second.to_string_lossy().as_ref()),
+            "the vanished transcript's checkpoint must be left untouched"
+        );
     }
 
     #[test]
