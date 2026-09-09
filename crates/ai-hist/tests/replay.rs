@@ -72,6 +72,11 @@ fn save_auth(home: &Path, base: &str, legacy: bool) {
 fn replay(home: &Path, base: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ai-hist"))
         .env("RELAYHISTORY_HOME", home)
+        // replay migrates the legacy TypeScript store under HOME; pin it so the
+        // developer's real ~/.config/ai-hist/auth.json cannot influence results.
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("AI_HIST_CONFIG_DIR", home.join("legacy-sdk"))
         .env("RELAYHISTORY_BASE_URL", base)
         .env_remove("AI_HIST_BASE_URL")
         .arg("--db")

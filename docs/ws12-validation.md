@@ -238,3 +238,53 @@ $ ai-hist replay sess-117 --json --out transcript.json
 
 `$(ai-hist token)` again captured a 27-character token rather than an empty
 string, and `cloud-commands.test.js` passed against the installed package.
+
+## The split auth store: token and replay must migrate the legacy npm credentials
+
+cursor flagged that `accessToken()` and `replay()` loaded credentials with
+`load_auth`, which never reads or migrates `~/.config/ai-hist/auth.json`, while
+the four other cloud entrypoints in this same change — `enableCloud`,
+`pushCloud`, `loadStoredRelayhistoryAuth` and `createShareableTrace` — go through
+`load_sdk_auth`, which does import it.
+
+That inconsistency defeated the purpose of the PR. An existing npm SDK user has
+credentials in the legacy TypeScript store by definition and not in the Rust
+stage store, so after upgrading they would still have found `token` and `replay`
+unusable — the exact population these commands exist to serve. Both now use
+`load_sdk_auth`.
+
+The regression test is deliberately a negative control rather than a passing
+assertion alone. With the fix reverted it fails with the precise user-visible
+symptom:
+
+```
+code: 1
+stderr: 'ai-hist: CLOUD_TOKEN_FAILED: not authenticated — run `ai-hist login` …'
+```
+
+and with the fix it serves the legacy token and migrates it into the canonical
+stage store. It runs against the installed package under
+`AI_HIST_TEST_PACKAGE_DIR`, so it proves the behaviour in the shipped CLI.
+
+### A test-isolation defect this exposed
+
+`crates/ai-hist/tests/token.rs` and `tests/replay.rs` pinned `RELAYHISTORY_HOME`
+but not `HOME`, so once `token` began consulting the legacy store these tests
+read the developer's real `~/.config/ai-hist/auth.json`. Two of them failed
+locally for that reason. They would have passed in CI, where no such file exists,
+which makes this a latent machine-dependent flake rather than a new break. Both
+harnesses now pin `HOME`, `USERPROFILE` and `AI_HIST_CONFIG_DIR` to the test's
+temporary directory.
+
+### Re-verified
+
+`cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 438 passed and 0 failed, `tsc --noEmit` 0,
+`npm test` 0 with 75/75, `scripts/*.test.mjs` 0 with 10/10, native contract 9
+agreeing across all three sources, `index.d.ts` diff clean. Against the repacked
+and reinstalled artifact both suites pass, including the new legacy-store case,
+and `replay` and `$(ai-hist token)` still run from the installed binary.
+
+Note for follow-up, outside this PR's surface: `cloud::recall_auth` also uses
+`load_auth` and would show the same gap for legacy npm users. It is a CLI-side
+path not exposed by this change, so it was left alone rather than expanding scope.

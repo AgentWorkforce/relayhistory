@@ -40,7 +40,10 @@ pub fn replay(
     let base_url = base_url
         .map(String::from)
         .unwrap_or_else(cloud::default_base_url);
-    let auth = cloud::load_auth(Some(&base_url))?.context(
+    // load_sdk_auth, not load_auth: an npm user upgrading from the TypeScript
+    // client keeps credentials in ~/.config/ai-hist/auth.json, and replay must
+    // migrate that store like the rest of the SDK surface.
+    let auth = cloud::load_sdk_auth(Some(&base_url))?.context(
         "not authenticated for the selected stage — run `ai-hist login` or `ai-hist admin-mint` first",
     )?;
     let events = cloud::replay_events(&auth, session_id, limit, max_content)?;

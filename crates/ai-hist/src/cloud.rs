@@ -304,8 +304,12 @@ pub fn access_token(base_url: Option<&str>) -> Result<String> {
         .find_map(|value| normalize_base_url(&value));
     // Keep push's ambiguity error even though the fallback destination is production.
     // JSON type errors can quote credential values from a malformed auth file.
+    // Use the SDK loader, not load_auth: npm users upgrading from the TypeScript
+    // client have credentials only in ~/.config/ai-hist/auth.json. token is one of
+    // the two commands this exists to deliver, so it must migrate that store the
+    // same way enableCloud, pushCloud, loadStoredRelayhistoryAuth and shares do.
     let load = |base: Option<&str>| {
-        load_auth(base).map_err(|error| {
+        load_sdk_auth(base).map_err(|error| {
             if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
                 anyhow::anyhow!("could not parse stored relayhistory session; run `ai-hist login`")
             } else {

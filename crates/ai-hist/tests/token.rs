@@ -28,7 +28,15 @@ fn save(home: &Path, base: &str, token: &str, expiry: Option<&str>) -> PathBuf {
 
 fn command(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-hist"));
+    // token migrates the legacy TypeScript store, which lives under HOME rather
+    // than RELAYHISTORY_HOME. Pin both, or these tests read the developer's real
+    // ~/.config/ai-hist/auth.json and pass or fail by machine state. The legacy
+    // dir is deliberately a subpath that stays absent unless a test creates it,
+    // so it cannot collide with the RELAYHISTORY_HOME/auth.json legacy location.
     cmd.env("RELAYHISTORY_HOME", home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("AI_HIST_CONFIG_DIR", home.join("legacy-sdk"))
         .env_remove("RELAYHISTORY_BASE_URL")
         .env_remove("AI_HIST_BASE_URL")
         .env("RUST_LOG", "trace")
