@@ -72,7 +72,15 @@ ai-hist sync --all                     # ingest local and remote together
 ai-hist search "auth rewrite" --all    # search both at once
 ```
 
-Commands that address one session by identity — `sessions tree`, `sessions relationships`, `sessions tools`, `sessions edits`, `session` and `events` — do not take a scope, and reject one rather than guessing: the `SOURCE` + `SESSION_ID` pair already names exactly one session.
+Commands that address one session by identity do not take a scope, and reject one rather than guessing — they already name a single session. They split by how they take that identity:
+
+```sh
+ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits
+ai-hist session SESSION_ID [--source SOURCE]   # session and events take the id alone
+ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused id
+```
+
+`sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
 Optional: `ai-hist enable-cloud` authenticates and syncs your sessions to RelayHistory Cloud. Threading commits to a PR is a separate opt-in hook install. See [cloud setup, Git hooks, and sharing](docs/enable-cloud.md).
 
@@ -86,7 +94,7 @@ ai-hist replay <session-id> --out log.txt   # write that transcript to a file in
 ai-hist token                               # print a cloud API token for your own tooling
 ```
 
-`replay` takes `--limit` to cap the number of events and `--max-content` to truncate long ones; `--json` emits the raw event array. Without a stored cloud session it stops and names what is missing rather than printing a partial transcript, and `--out` is written atomically only after the whole fetch succeeds, so an interrupted replay never truncates a transcript you already had.
+`replay` prints the whole transcript. `--limit` is the per-request page size, not a cap: `replay` follows the server's cursor until the session is exhausted, so a 5-event session under `--limit 1` still prints all 5, one request at a time. `--max-content` truncates long events, and truncated ones are marked in the output; `--json` emits the raw event array. (`events --limit N` does cap, because it prints one page and a `nextCursor`.) Without a stored cloud session it stops and names what is missing rather than printing a partial transcript, and `--out` is written atomically only after the whole fetch succeeds, so an interrupted replay never truncates a transcript you already had.
 
 `ai-hist token` prints a live credential to stdout — treat it like a password, and don't paste its output into a terminal you are sharing or a log.
 
