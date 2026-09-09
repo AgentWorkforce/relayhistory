@@ -1,4 +1,4 @@
-import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, readdir, rename, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
@@ -203,13 +203,15 @@ async function nativeStoredSessions(): Promise<StoredCandidate[]> {
     entries = [];
   }
   for (const entry of entries.sort()) {
-    const auth = await readNativeAuth(join(home, 'stages', entry));
-    if (auth) found.push({ auth, origin: 'native' });
+    const path = join(home, 'stages', entry);
+    const auth = await readNativeAuth(path);
+    if (auth) found.push({ auth, origin: 'native', path });
   }
-  const legacy = await readNativeAuth(join(home, 'auth.json'));
+  const legacyPath = join(home, 'auth.json');
+  const legacy = await readNativeAuth(legacyPath);
   if (legacy
     && !found.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(legacy.baseUrl))) {
-    found.push({ auth: legacy, origin: 'native' });
+    found.push({ auth: legacy, origin: 'native', path: legacyPath });
   }
   return found;
 }
@@ -223,6 +225,8 @@ type StoreOrigin = 'native' | 'sdk';
 interface StoredCandidate {
   auth: RelayhistoryAuth;
   origin: StoreOrigin;
+  /** The file this session was read from, so a rotated pair replaces it in place. */
+  path: string;
 }
 
 /**
@@ -249,7 +253,13 @@ function ineligibleReason(candidate: StoredCandidate, now: number): string | nul
   if (origin === 'native' || stated !== undefined) {
     const expiry = stated === undefined ? Number.NaN : Date.parse(stated);
     if (!Number.isFinite(expiry) || expiry < now + EXPIRY_FLOOR_MS) {
-      return 'the stored relayhistory access-token expiry is missing, invalid, or less than 60s away';
+      // Expiry is the one precondition rotation exists to repair, so a session
+      // that can still rotate is not unconfigured — it is stale, and the
+      // transport refreshes it. Without a refresh token there is nothing to
+      // rotate and it is unconfigured exactly as `recall_auth` says.
+      if (!auth.refreshToken?.trim()) {
+        return 'the stored relayhistory access-token expiry is missing, invalid, or less than 60s away';
+      }
     }
   }
   if (origin === 'native' && !auth.orgId?.trim()) {
@@ -260,7 +270,7 @@ function ineligibleReason(candidate: StoredCandidate, now: number): string | nul
 
 /** Why no usable cloud session was found, phrased for {@link cloudUnconfiguredMessage}. */
 export type CloudSessionResolution =
-  | { auth: RelayhistoryAuth }
+  | { auth: RelayhistoryAuth; session?: StoredCandidate }
   | { auth: null; detail: string };
 
 /**
@@ -284,7 +294,7 @@ export async function resolveCloudSession(
   const sdkStored = await loadStoredRelayhistoryAuth();
   if (sdkStored
     && !candidates.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(sdkStored.baseUrl))) {
-    candidates.push({ auth: sdkStored, origin: 'sdk' });
+    candidates.push({ auth: sdkStored, origin: 'sdk', path: authPath() });
   }
 
   const where = `${nativeCloudHome()} or ${relayhistoryConfigDir()}`;
@@ -321,7 +331,7 @@ export async function resolveCloudSession(
   const ineligible = ineligibleReason(selected, now);
   return ineligible
     ? { auth: null, detail: `${where}: ${ineligible} (run \`ai-hist login\`)` }
-    : { auth: selected.auth };
+    : { auth: selected.auth, session: selected };
 }
 
 /**
@@ -421,6 +431,78 @@ export interface SessionThreadOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * Persist a rotated pair over the file it came from, in that store's own
+ * schema, via temp-file + rename so a crash cannot leave a torn session.
+ */
+async function persistRotated(candidate: StoredCandidate, auth: RelayhistoryAuth): Promise<void> {
+  const body = candidate.origin === 'native'
+    ? {
+      base_url: auth.baseUrl,
+      access_token: auth.accessToken,
+      access_token_expires_at: auth.accessTokenExpiresAt ?? null,
+      refresh_token: auth.refreshToken ?? null,
+      org_id: auth.orgId ?? null,
+      workspace_id: null,
+    }
+    : auth;
+  const tmp = `${candidate.path}.tmp.${process.pid}.${Date.now()}`;
+  await mkdir(dirname(candidate.path), { recursive: true });
+  await writeFile(tmp, JSON.stringify(body, null, 2), { mode: 0o600 });
+  await rename(tmp, candidate.path);
+}
+
+/** Re-read this session's file, for the pair another process may have rotated. */
+async function rereadSession(candidate: StoredCandidate): Promise<RelayhistoryAuth | null> {
+  return candidate.origin === 'native'
+    ? readNativeAuth(candidate.path)
+    : loadStoredRelayhistoryAuth();
+}
+
+/**
+ * Exchange the stored refresh token for a new pair. Mirrors
+ * `cloud::refresh_auth`: `POST /v1/auth/token/refresh`, `accessToken` and
+ * `refreshToken` required in the response, org and stage carried over.
+ */
+async function refreshCloudSession(
+  auth: RelayhistoryAuth,
+  baseUrl: string,
+  doFetch: typeof fetch,
+): Promise<RelayhistoryAuth | null> {
+  const refreshToken = auth.refreshToken?.trim();
+  if (!refreshToken) return null;
+  let resp: Response;
+  try {
+    resp = await doFetch(`${baseUrl}/v1/auth/token/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      redirect: 'error',
+      body: JSON.stringify({ refreshToken }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    return null;
+  }
+  if (!resp.ok) return null;
+  let payload: Record<string, unknown>;
+  try {
+    payload = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const accessToken = payload.accessToken;
+  const rotated = payload.refreshToken;
+  if (typeof accessToken !== 'string' || typeof rotated !== 'string') return null;
+  const expiresAt = payload.accessTokenExpiresAt;
+  return {
+    baseUrl: auth.baseUrl,
+    accessToken,
+    refreshToken: rotated,
+    ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
+    ...(auth.orgId ? { orgId: auth.orgId } : {}),
+  };
+}
+
 function requireSecureTransport(baseUrl: string): void {
   if (baseUrl.startsWith('https://')) return;
   const authority = baseUrl.startsWith('http://') ? baseUrl.slice('http://'.length) : null;
@@ -514,20 +596,54 @@ export async function getSessionThread(
   const url = `${baseUrl}/v1/sessions/${encodeURIComponent(query.sessionId)}/thread?${params}`;
   const doFetch = opts.fetchImpl ?? fetch;
 
-  let resp: Response;
-  try {
-    resp = await doFetch(url, {
-      headers: { Authorization: `Bearer ${auth.accessToken}`, Accept: 'application/json' },
-      // A redirect would carry the bearer token to whatever the hop names.
-      redirect: 'error',
-      signal: AbortSignal.timeout(30_000),
-    });
-  } catch (cause) {
-    throw new ConnectorFailureError(
-      `cloud thread request failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-      'CONNECTOR_FAILURE',
-      { cause },
-    );
+  const send = async (bearer: string): Promise<Response> => {
+    try {
+      return await doFetch(url, {
+        headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' },
+        // A redirect would carry the bearer token to whatever the hop names.
+        redirect: 'error',
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (cause) {
+      throw new ConnectorFailureError(
+        `cloud thread request failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        'CONNECTOR_FAILURE',
+        { cause },
+      );
+    }
+  };
+
+  let resp = await send(auth.accessToken);
+
+  // Rotate an expired session at most once, in the order `send_with_auth_refresh`
+  // uses: prefer a pair another process already persisted, and only then spend
+  // the stored refresh token, which is one-time and revokes its predecessor.
+  //
+  // The engine serializes this per stage with an flock that Node cannot take
+  // here, so instead of preventing a concurrent double-spend this recovers from
+  // one: a refresh that loses the race re-reads and adopts the winner's pair.
+  // The flock-correct version belongs behind a napi export of the recall
+  // transport; see the PR discussion.
+  const rotatable = resolved.session;
+  if ((resp.status === 401 || resp.status === 403) && rotatable) {
+    const current = await rereadSession(rotatable);
+    if (current && current.accessToken !== auth.accessToken) {
+      resp = await send(current.accessToken);
+    } else {
+      const refreshed = await refreshCloudSession(auth, baseUrl, doFetch);
+      if (refreshed) {
+        // Persist before retrying: the old refresh token is already revoked, so
+        // a crash between here and the retry must not strand the next caller.
+        await persistRotated(rotatable, refreshed).catch(() => undefined);
+        resp = await send(refreshed.accessToken);
+      } else {
+        // Lost the race, most likely. Whoever won has persisted a live pair.
+        const afterward = await rereadSession(rotatable);
+        if (afterward && afterward.accessToken !== auth.accessToken) {
+          resp = await send(afterward.accessToken);
+        }
+      }
+    }
   }
 
   if (resp.status === 401 || resp.status === 403) {

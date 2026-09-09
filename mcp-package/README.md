@@ -53,10 +53,17 @@ guess rather than answer about the wrong org.
 
 A native-store session must meet the same bar the engine's `cloud` connector
 applies to recall — an `rth_at_` access token, an expiry at least 60s away, and
-a recorded org for provenance. A session missing any of them is one the
+a recorded org for provenance. A session missing a token prefix or an org is one the
 connector itself reports as unconfigured, so the tool reports it the same way
 and names the missing precondition rather than issuing a request that would
-fail. `ai-hist login` restores all three.
+fail. `ai-hist login` restores them.
+
+Expiry is the exception, because rotation exists to repair it: a rejected
+session with a refresh token is rotated once and the new pair persisted over
+the file it came from, in that store's own schema, so the CLI and the MCP stay
+in step. A pair another process rotated first is adopted rather than spending
+the one-time refresh token again. Only a session with nothing left to rotate
+reports expiry as unconfigured.
 
 `get_session_relationships` and `get_session_tree` read the delegation topology
 recorded by hydration and sync: who delegated to whom, what evidence

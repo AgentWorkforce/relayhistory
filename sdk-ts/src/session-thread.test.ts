@@ -559,3 +559,184 @@ test('limit is sent when given and rejected when out of the route range', async 
   }
   assert.equal(calls.length, 1, 'a rejected limit must not reach the transport');
 });
+
+// ---------------------------------------------------------------------------
+// Rotation.
+//
+// An MCP-only install — a WS-4 sandbox, say — has no human to run `ai-hist
+// login` and no Rust CLI rotating the store for it, so without this the tool
+// simply stops working at the token's ~24h boundary.
+// ---------------------------------------------------------------------------
+
+/** A fetch stand-in that answers the thread route by token and the refresh route by script. */
+function rotatingFetch(opts: {
+  accept: string[];
+  refresh?: { accessToken: string; refreshToken: string; expiresAt?: string } | 'reject';
+}) {
+  const calls: string[] = [];
+  const impl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes('/v1/auth/token/refresh')) {
+      calls.push('refresh');
+      if (!opts.refresh || opts.refresh === 'reject') return new Response('no', { status: 401 });
+      return new Response(JSON.stringify({
+        accessToken: opts.refresh.accessToken,
+        refreshToken: opts.refresh.refreshToken,
+        accessTokenExpiresAt: opts.refresh.expiresAt ?? HOUR_AHEAD,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    const bearer = new Headers(init?.headers).get('authorization')?.replace('Bearer ', '') ?? '';
+    calls.push(`thread:${bearer}`);
+    return opts.accept.includes(bearer)
+      ? new Response(JSON.stringify(ENVELOPE), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      : new Response(JSON.stringify({ error: 'invalid_token' }), { status: 401 });
+  }) as unknown as typeof fetch;
+  return { impl, calls };
+}
+
+async function readStage(nativeHome: string, key = 'stage'): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(join(nativeHome, 'stages', `${key}.auth.json`), 'utf8')) as Record<string, unknown>;
+}
+
+test('a rejected token is rotated once and the new pair is persisted', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    const { impl, calls } = rotatingFetch({
+      accept: ['rth_at_new'],
+      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
+    });
+    const thread = await getSessionThread(
+      { source: 'claude', sessionId: 'sid' }, { fetchImpl: impl },
+    );
+    assert.deepEqual(thread as unknown, ENVELOPE);
+    assert.deepEqual(calls, ['thread:rth_at_old', 'refresh', 'thread:rth_at_new']);
+
+    // Persisted in the native store's own schema, so the Rust CLI can read it.
+    const stored = await readStage(nativeHome);
+    assert.equal(stored.access_token, 'rth_at_new');
+    assert.equal(stored.refresh_token, 'rth_rt_new');
+    assert.equal(stored.org_id, 'org-example', 'the org survives rotation');
+    assert.equal(stored.base_url, 'https://history.agentrelay.com');
+  });
+});
+
+test('a pair another process already rotated is adopted without spending the refresh token', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth?.accessToken, 'rth_at_old');
+
+    // Another process rotates between resolution and the retry.
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_theirs',
+      refresh_token: 'rth_rt_theirs',
+      ...ELIGIBLE,
+    });
+    const { impl, calls } = rotatingFetch({ accept: ['rth_at_theirs'] });
+    await getSessionThread(
+      { source: 'claude', sessionId: 'sid' },
+      { fetchImpl: impl, resolveSession: async () => resolved },
+    );
+    assert.deepEqual(calls, ['thread:rth_at_old', 'thread:rth_at_theirs']);
+    assert.equal(calls.includes('refresh'), false, 'a one-time refresh token must not be spent needlessly');
+  });
+});
+
+test('losing the rotation race recovers from the winner\'s persisted pair', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      refresh_token: 'rth_rt_old',
+      ...ELIGIBLE,
+    });
+    const resolved = await resolveCloudSession();
+    // The refresh is rejected because a concurrent process spent the token
+    // first; that process then persists its own live pair.
+    const { impl, calls } = rotatingFetch({ accept: ['rth_at_winner'], refresh: 'reject' });
+    const wrapped = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const out = await impl(input as never, init as never);
+      if (url.includes('/v1/auth/token/refresh')) {
+        await writeStage(nativeHome, 'stage', {
+          base_url: 'https://history.agentrelay.com',
+          access_token: 'rth_at_winner',
+          refresh_token: 'rth_rt_winner',
+          ...ELIGIBLE,
+        });
+      }
+      return out;
+    }) as unknown as typeof fetch;
+
+    const thread = await getSessionThread(
+      { source: 'claude', sessionId: 'sid' },
+      { fetchImpl: wrapped, resolveSession: async () => resolved },
+    );
+    assert.deepEqual(thread as unknown, ENVELOPE);
+    assert.deepEqual(calls, ['thread:rth_at_old', 'refresh', 'thread:rth_at_winner']);
+  });
+});
+
+test('a session with no refresh token still fails cleanly rather than looping', async () => {
+  await withStores(async ({ nativeHome }) => {
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_old',
+      ...ELIGIBLE,
+    });
+    const { impl, calls } = rotatingFetch({ accept: [] });
+    await assert.rejects(
+      () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
+      (error: unknown) => (error as { code?: string }).code === 'AUTHENTICATION_EXPIRED',
+    );
+    assert.deepEqual(calls, ['thread:rth_at_old'], 'nothing to rotate, so no refresh attempt');
+  });
+});
+
+test('an expired session that can rotate is refreshed, not reported unconfigured', async () => {
+  await withStores(async ({ nativeHome }) => {
+    // Expiry is the one precondition rotation repairs. With a refresh token the
+    // session is stale, not unconfigured.
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_stale',
+      refresh_token: 'rth_rt_old',
+      access_token_expires_at: new Date(Date.now() - 1_000).toISOString(),
+      org_id: 'org-example',
+    });
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth?.accessToken, 'rth_at_stale', 'still resolvable');
+
+    const { impl, calls } = rotatingFetch({
+      accept: ['rth_at_fresh'],
+      refresh: { accessToken: 'rth_at_fresh', refreshToken: 'rth_rt_fresh' },
+    });
+    const thread = await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
+    assert.deepEqual(thread as unknown, ENVELOPE);
+    assert.deepEqual(calls, ['thread:rth_at_stale', 'refresh', 'thread:rth_at_fresh']);
+  });
+
+  await withStores(async ({ nativeHome }) => {
+    // Expired with nothing to rotate is still unconfigured, as recall_auth says.
+    await writeStage(nativeHome, 'stage', {
+      base_url: 'https://history.agentrelay.com',
+      access_token: 'rth_at_stale',
+      access_token_expires_at: new Date(Date.now() - 1_000).toISOString(),
+      org_id: 'org-example',
+    });
+    const resolved = await resolveCloudSession();
+    assert.equal(resolved.auth, null);
+    assert.ok(resolved.auth === null && resolved.detail.includes('expiry'));
+  });
+});
