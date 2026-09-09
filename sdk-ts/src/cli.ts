@@ -559,9 +559,15 @@ async function main(): Promise<void> {
   if (command === 'enable-cloud') {
     validateFlags(args, 'enable-cloud', ['base-url', 'db', 'interval', 'once', 'json']);
     rejectSurplusPositionals(args.positional.slice(1), 'enable-cloud');
+    // --interval is seconds; validate before converting so the error names the
+    // unit the caller actually typed rather than a millisecond bound.
+    const intervalSeconds = numberFlag(args, 'interval') ?? 60;
+    if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 1 || intervalSeconds > 2_147_483) {
+      usage('--interval must be a whole number of seconds between 1 and 2147483');
+    }
     const handle = await enableCloud({
       baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
-      intervalMs: (numberFlag(args, 'interval') ?? 60) * 1000,
+      intervalMs: intervalSeconds * 1000,
       watch: !args.flags.has('once'),
       onPush: (result) => output(result, json),
     });

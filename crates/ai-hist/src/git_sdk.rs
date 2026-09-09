@@ -69,6 +69,29 @@ fn resolve_source(options: &GitLinkOptions) -> Result<String> {
     Ok(sources[0].clone())
 }
 
+/// Resolve a path whose tail may not exist yet: canonicalize the nearest existing
+/// ancestor, then apply the remaining components so `..` cannot escape it.
+fn resolve_against_existing(path: &Path) -> Result<std::path::PathBuf> {
+    let Some(base) = path.ancestors().find(|candidate| candidate.exists()) else {
+        return Ok(path.to_path_buf());
+    };
+    let mut resolved = base.canonicalize()?;
+    for component in path
+        .strip_prefix(base)
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    Ok(resolved)
+}
+
 pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result<String> {
     let root = git_repo_root(Path::new(&options.repo))?;
     options.repo = root.display().to_string();
@@ -101,13 +124,22 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     let common = git_stdout(&root, &["rev-parse", "--git-common-dir"])?;
     let common = root.join(common.trim()).canonicalize()?;
     let hook_parent = hook.parent().context("missing hook parent")?;
-    let resolved_parent = if hook_parent.exists() {
-        hook_parent.canonicalize()?
-    } else {
-        hook_parent.to_path_buf()
-    };
+    // Resolve before comparing: an unresolved `..` can satisfy the lexical
+    // containment check while `create_dir_all` lands outside the repository.
+    let resolved_parent = resolve_against_existing(hook_parent)?;
     anyhow::ensure!(resolved_parent.starts_with(&common),
         "Git uses an external shared core.hooksPath; refusing to change another repository's hooks. Configure a repository-local hooks directory first");
+    // Linked worktrees share the common dir's hooks, but this hook embeds one
+    // fixed sessionId and repo. Installing from a worktree would attribute every
+    // other worktree's commits to this session, so refuse instead of corrupting
+    // the linkage we exist to record.
+    let git_dir = git_stdout(&root, &["rev-parse", "--git-dir"])?;
+    let git_dir = root.join(git_dir.trim()).canonicalize()?;
+    anyhow::ensure!(
+        git_dir == common,
+        "this is a linked Git worktree and its hooks are shared with the main worktree; \
+         install from the main worktree instead"
+    );
     let script = hook.with_file_name("ai-hist-post-commit.mjs");
     fs::create_dir_all(hook.parent().context("missing hook parent")?)?;
     let body = format!(
@@ -118,8 +150,14 @@ pub fn install(mut options: GitLinkOptions, node: &str, sdk_url: &str) -> Result
     fs::write(&script, body)?;
     let marker = "# ai-hist SDK hook";
     let backup = hook.with_file_name("post-commit.before-ai-hist");
-    let existing = fs::read_to_string(&hook).unwrap_or_default();
-    if !existing.is_empty() && !existing.contains(marker) {
+    // A compiled or non-UTF-8 hook still deserves preservation: only a missing
+    // file means there is nothing to back up. Decoding failure is not emptiness.
+    let needs_backup = match fs::read_to_string(&hook) {
+        Ok(text) => !text.is_empty() && !text.contains(marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    if needs_backup {
         anyhow::ensure!(
             !backup.exists(),
             "hook backup already exists; refusing to overwrite it"

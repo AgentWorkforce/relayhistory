@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { createShareableTrace, enableCloud, installGitHooks, loadStoredRelayhistoryAuth, pushCloud, sync } from './index.js';
 
 async function run(bin: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
@@ -75,7 +76,7 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     const transcripts = join(root, '.claude', 'projects', 'fixture');
     await mkdir(transcripts, { recursive: true });
     await writeFile(join(transcripts, 'session-a.jsonl'), Array.from({ length: 525 }, (_, i) => JSON.stringify({ type: 'user', uuid: `u-${i}`, sessionId: 'session-a', timestamp: new Date(1_783_000_000_000 + i * 1000).toISOString(), message: { role: 'user', content: `synthetic cloud prompt ${i}` } })).join('\n'));
-    const cli = new URL('./cli.js', import.meta.url).pathname;
+    const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
     const stdout = await run(process.execPath, [cli, 'enable-cloud', '--base-url', baseUrl, '--db', dbPath, '--once', '--json'], process.env);
     assert.equal(JSON.parse(stdout).sent, 525);
     const prompts = bodies.flatMap((body) => body.records).map((row) => row.content);
@@ -135,6 +136,67 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
     server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Regression cover for the three hook-install guards. Each one protects a case
+// where installing would silently damage state the caller expected preserved.
+test('hook install refuses linked worktrees, escaping hooksPath, and preserves opaque hooks', { timeout: 60_000 }, async () => {
+  const saved = { ...process.env };
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-hook-guards-'));
+  try {
+    // Command-scope Git config from the broker must not leak into fixtures.
+    for (const key of Object.keys(process.env)) if (/^GIT_CONFIG(_|$)/.test(key)) delete process.env[key];
+    Object.assign(process.env, { HOME: root, USERPROFILE: root, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' });
+    const dbPath = join(root, 'history.db');
+    // installGitHooks resolves the session before touching Git, so the guards
+    // under test are only reachable once a real session is indexed.
+    const transcripts = join(root, '.claude', 'projects', 'fixture');
+    await mkdir(transcripts, { recursive: true });
+    await writeFile(join(transcripts, 'session-a.jsonl'), JSON.stringify({
+      type: 'user', uuid: 'u-0', sessionId: 'session-a',
+      timestamp: new Date(1_783_000_000_000).toISOString(),
+      message: { role: 'user', content: 'synthetic hook-guard prompt' },
+    }) + '\n');
+    await sync({ dbPath });
+
+    const repo = join(root, 'repo'); await mkdir(repo);
+    await run('git', ['init', '-q'], process.env, repo);
+    await run('git', ['config', 'user.email', 'test@example.com'], process.env, repo);
+    await run('git', ['config', 'user.name', 'SDK test'], process.env, repo);
+    await run('git', ['commit', '-q', '--allow-empty', '-m', 'init'], process.env, repo);
+
+    // A linked worktree shares the main worktree's hooks, but the hook body
+    // embeds one fixed sessionId; installing there would misattribute every
+    // other worktree's commits.
+    const linked = join(root, 'linked');
+    await run('git', ['worktree', 'add', '-q', linked, '-b', 'side'], process.env, repo);
+    await assert.rejects(
+      installGitHooks({ repo: linked, sessionId: 'session-a', source: 'claude', dbPath }),
+      /linked Git worktree/);
+
+    // `..` inside core.hooksPath must not satisfy the containment check by
+    // spelling alone; the resolved path is what has to stay inside the repo.
+    const outside = join(root, 'outside-hooks');
+    await run('git', ['config', 'core.hooksPath', '.git/hooks/../../../outside-hooks'], process.env, repo);
+    await assert.rejects(
+      installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath }),
+      /external shared core.hooksPath/);
+    await assert.rejects(stat(outside), 'the escaping hooks directory must not be created');
+
+    // A compiled or otherwise non-UTF-8 hook is still the user's hook: it must
+    // be backed up, not silently overwritten because decoding failed.
+    await run('git', ['config', 'core.hooksPath', '.git/hooks'], process.env, repo);
+    const opaque = Buffer.from([0xff, 0xfe, 0x00, 0x01, 0x02]);
+    await writeFile(join(repo, '.git', 'hooks', 'post-commit'), opaque, { mode: 0o755 });
+    const installed = await installGitHooks({ repo, sessionId: 'session-a', source: 'claude', dbPath });
+    const backup = await readFile(join(repo, '.git', 'hooks', 'post-commit.before-ai-hist'));
+    assert.deepEqual(backup, opaque, 'the original bytes survive verbatim');
+    assert.match(await readFile(installed.hookPath, 'utf8'), /post-commit.before-ai-hist/);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
     await rm(root, { recursive: true, force: true });
   }
 });

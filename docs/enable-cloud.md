@@ -1,8 +1,11 @@
-# Your sessions, threaded to your PRs, in one command
+# Cloud sync in one command, PR threading in one more
 
 ```sh
 ai-hist enable-cloud
 ```
+
+`enable-cloud` authenticates and syncs. It does not install Git hooks: threading
+commits to a PR needs the separate `installGitHooks()` step described below.
 
 The npm CLI calls the async SDK. It reuses your selected RelayHistory stage or
 starts Agent Relay's device login, exchanges that identity for a service-local

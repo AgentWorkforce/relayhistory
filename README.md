@@ -70,6 +70,8 @@ ai-hist sync --all                     # ingest local and remote together
 ai-hist search "auth rewrite" --all    # search both at once
 ```
 
+Optional: `ai-hist enable-cloud` authenticates and syncs your sessions to RelayHistory Cloud. Threading commits to a PR is a separate opt-in hook install. See [cloud setup, Git hooks, and sharing](docs/enable-cloud.md).
+
 Remote acquisition runs through connectors that reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
 
 A hosted layer for sharing sessions across a team — so every PR threads back to the session that produced it — is in progress at `history.agentrelay.com`; its connector is not yet wired into the npm CLI. Want early access, or to self-host it? Reach out at hello@agentrelay.com.
