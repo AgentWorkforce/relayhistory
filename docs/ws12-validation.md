@@ -446,3 +446,42 @@ with zero warnings, `cargo test --workspace` 0 with 443 passed and 0 failed,
 `tsc` 0, `npm test` 0 with 110/110, `scripts` 10/10, contract 9, `index.d.ts`
 clean. Against the repacked and reinstalled artifact both suites pass, `replay`
 renders and paginates, and `$(ai-hist token)` captures a real token.
+
+## Fixing the primitive instead of the call sites
+
+Two more High findings and one Major arrived, and all three had the same origin:
+`default_base_url()` ignores a value that does not normalize and returns
+production, and callers were synthesizing a destination with it and then passing
+the result on as though the user had chosen it.
+
+- `replay` turned an *absent* selection into production before calling
+  `load_sdk_auth`, which suppressed the multi-stage refusal. With several stages
+  and no selector it silently read production while `token` declined to guess.
+- `login_for_sdk` resolved a missing destination with `default_base_url()`, so
+  `loginCloud` and `enableCloud` with an explicit relay token would
+  *authenticate* against production when the selector was malformed.
+
+An earlier note in this document called tightening `default_base_url()`
+out of scope. That judgement was wrong, and these two findings are the cost of
+it: every fix that stopped at a call site left the leaky primitive in place for
+the next caller. The scope boundary was what kept generating defects.
+
+Resolution keeps the distinction the loaders depend on:
+
+- `resolve_stage(Option<&str>) -> Result<Option<String>>` preserves the
+  difference between "no selection" and "production". Callers that pass their
+  result to `load_auth`/`load_sdk_auth` must use it, because collapsing an
+  absent selection into production suppresses the refusal to guess.
+- `resolve_base_url` is now just `resolve_stage(..)?.unwrap_or(DEFAULT)`, for
+  callers such as login that must end up somewhere concrete.
+
+`replay` uses `resolve_stage`; `login_for_sdk` uses `resolve_base_url`. A
+malformed selector is an error in both, an unset one defaults only where
+defaulting is meaningful, and the multi-stage refusal survives.
+
+Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 445 passed and 0 failed — 15 token and 11 replay
+tests, where this PR began with 11 and 8. `tsc` 0, `npm test` 0 with 110/110,
+`scripts` 10/10, contract 9, `index.d.ts` clean. Against the repacked and
+reinstalled artifact both suites pass, `replay` renders and paginates, and
+`$(ai-hist token)` captures a real token.

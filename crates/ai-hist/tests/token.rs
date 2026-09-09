@@ -389,3 +389,36 @@ fn malformed_base_url_env_is_rejected_without_echoing_the_value() {
         "the rejected value must never be echoed: {err}"
     );
 }
+
+// login_for_sdk resolved a missing destination with default_base_url(), which
+// ignores a malformed selector and returns production — so loginCloud and
+// enableCloud would authenticate against prod where token rejects that selector.
+// The SDK entrypoint is exercised directly; the CLI token path is covered above.
+#[test]
+fn sdk_login_rejects_a_malformed_selector_instead_of_using_production() {
+    let home = tempfile::tempdir().unwrap();
+    let previous: Vec<(String, Option<std::ffi::OsString>)> = [
+        "RELAYHISTORY_HOME",
+        "RELAYHISTORY_BASE_URL",
+        "AI_HIST_BASE_URL",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), std::env::var_os(k)))
+    .collect();
+    std::env::set_var("RELAYHISTORY_HOME", home.path());
+    std::env::set_var("RELAYHISTORY_BASE_URL", "not-a-url");
+    std::env::remove_var("AI_HIST_BASE_URL");
+    let error = ai_hist_engine::cloud::login_for_sdk(None, Some("relay-token"), None)
+        .expect_err("a malformed selector must not authenticate against production");
+    let message = format!("{error:#}");
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(&key, value),
+            None => std::env::remove_var(&key),
+        }
+    }
+    assert!(
+        message.contains("RELAYHISTORY_BASE_URL is not a usable base URL"),
+        "the variable must be named: {message}"
+    );
+}

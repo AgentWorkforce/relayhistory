@@ -375,3 +375,33 @@ fn explicit_base_url_wins_over_a_malformed_environment() {
     server.join().unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("No events found."));
 }
+
+// An absent selection must stay absent all the way to load_auth. Turning it into
+// production would hand the loader a value that looks chosen, suppressing the
+// multi-stage refusal, so replay would silently read production while token
+// declines to guess. Both commands must refuse.
+#[test]
+fn multiple_stages_without_a_selector_refuse_to_guess() {
+    let home = tempfile::tempdir().unwrap();
+    save_auth(home.path(), "https://history.agentrelay.com", false);
+    save_auth(home.path(), "http://localhost:8787", false);
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-hist"))
+        .env("RELAYHISTORY_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("AI_HIST_CONFIG_DIR", home.path().join("legacy-sdk"))
+        .env_remove("RELAYHISTORY_BASE_URL")
+        .env_remove("AI_HIST_BASE_URL")
+        .arg("--db")
+        .arg(home.path().join("must-not-create.db"))
+        .arg("replay")
+        .arg("some-session")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("stages are configured; pass --base-url to select one"),
+        "replay must refuse to guess between stages, not default to production: {err}"
+    );
+}

@@ -37,15 +37,16 @@ pub fn replay(
     out: Option<&Path>,
 ) -> Result<ReplayOutput> {
     anyhow::ensure!(!session_id.trim().is_empty(), "sessionId must not be empty");
-    // Resolve rather than defaulting: default_base_url() turns a malformed
-    // RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL into the production origin, and
-    // passing that on as an explicit destination would let replay silently hit
-    // production where token rejects the same selector.
-    let base_url = cloud::resolve_base_url(base_url)?;
+    // resolve_stage, not resolve_base_url: an absent selection must stay absent.
+    // Turning it into production here would hand load_sdk_auth a value that looks
+    // chosen, suppressing the multi-stage refusal, so replay would silently read
+    // production while token declines to guess. A malformed selector is still an
+    // error rather than a silent fallback.
+    let stage = cloud::resolve_stage(base_url)?;
     // load_sdk_auth, not load_auth: an npm user upgrading from the TypeScript
     // client keeps credentials in ~/.config/ai-hist/auth.json, and replay must
     // migrate that store like the rest of the SDK surface.
-    let auth = cloud::load_sdk_auth(Some(&base_url))?.context(
+    let auth = cloud::load_sdk_auth(stage.as_deref())?.context(
         "not authenticated for the selected stage — run `ai-hist login` or `ai-hist admin-mint` first",
     )?;
     let events = cloud::replay_events(&auth, session_id, limit, max_content)?;

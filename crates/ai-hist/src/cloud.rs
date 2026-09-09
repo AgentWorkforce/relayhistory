@@ -324,9 +324,18 @@ fn env_selected_stage() -> Result<Option<String>> {
 /// value and returns production, and load_sdk_auth cannot tell a synthesized origin
 /// from a deliberate one.
 pub fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
+    Ok(resolve_stage(base_url)?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()))
+}
+
+/// The selected stage, preserving the difference between "no selection" and
+/// "production". Callers that must end up somewhere use resolve_base_url; callers
+/// that pass the result to load_auth/load_sdk_auth must use this, because turning
+/// an absent selection into production suppresses the multi-stage refusal — the
+/// caller would silently read production instead of being told to choose.
+pub fn resolve_stage(base_url: Option<&str>) -> Result<Option<String>> {
     match base_url {
-        Some(explicit) => Ok(explicit.to_string()),
-        None => Ok(env_selected_stage()?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())),
+        Some(explicit) => Ok(Some(explicit.to_string())),
+        None => env_selected_stage(),
     }
 }
 
@@ -1980,7 +1989,11 @@ pub fn login_for_sdk(
     token: Option<&str>,
     label: Option<&str>,
 ) -> Result<StoredAuth> {
-    let base = base_url.map(str::to_owned).unwrap_or_else(default_base_url);
+    // resolve_base_url, not default_base_url: the latter ignores a malformed
+    // RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL and returns production, so a typo
+    // would authenticate against prod. Login must end up somewhere, so an unset
+    // environment still takes the default — only a malformed one is an error.
+    let base = resolve_base_url(base_url)?;
     let base = normalized_stage(&base)?;
     let label = label.unwrap_or("ai-hist enable-cloud");
     let auth = match token {
