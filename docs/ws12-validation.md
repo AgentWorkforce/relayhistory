@@ -288,3 +288,35 @@ and `replay` and `$(ai-hist token)` still run from the installed binary.
 Note for follow-up, outside this PR's surface: `cloud::recall_auth` also uses
 `load_auth` and would show the same gap for legacy npm users. It is a CLI-side
 path not exposed by this change, so it was left alone rather than expanding scope.
+
+## Follow-up: the legacy-store fix regressed the stage-ambiguity probe
+
+cursor caught a regression introduced by the fix above. `access_token` calls
+`load(None)` purely as a probe: it exists to raise push's multi-stage refusal
+when no destination has been selected. Routing that probe through
+`load_sdk_auth` broke it, because the two functions disagree on what counts as
+a selection:
+
+- `access_token` treats a stage selector as chosen only if it *normalizes*
+  (`find_map(normalize_base_url)`).
+- `load_sdk_auth` treats *any non-empty* `RELAYHISTORY_BASE_URL` or
+  `AI_HIST_BASE_URL` as a selection and falls back to production
+  (`.any(|v| !v.trim().is_empty()).then(default_base_url)`).
+
+So with several stages configured and a malformed selector such as
+`RELAYHISTORY_BASE_URL=not-a-url`, the refusal was skipped and `token` printed
+the production credential — the wrong stage's secret, silently.
+
+The probe now uses `load_auth` again while destination resolution keeps
+`load_sdk_auth`, so legacy migration is preserved. Migration is irrelevant to a
+probe that only asks whether the destination is ambiguous.
+
+The regression test was written before the fix and observed to fail in the
+telling way: not on the assertion message but on `!output.status.success()` —
+`token` *succeeded* where it had to refuse.
+
+Re-verified: `cargo fmt --check` 0, `clippy -D warnings` 0 with zero warnings,
+`cargo test --workspace` 0 with 439 passed and 0 failed, `tsc` 0, `npm test` 0
+with 75/75, `scripts` 10/10, contract 9, `index.d.ts` clean. Against the
+repacked and reinstalled artifact both suites pass, including the legacy-store
+case, and `$(ai-hist token)` still captures a real token.

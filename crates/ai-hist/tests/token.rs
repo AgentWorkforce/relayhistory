@@ -336,3 +336,22 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
     save(home.path(), "http://localhost:8787", OLD, Some(FUTURE));
     assert!(failure(&command(home.path()).output().unwrap()).contains("not authenticated"));
 }
+
+// access_token treats a stage selector as "selected" only when it normalizes,
+// while load_sdk_auth treats any non-empty RELAYHISTORY_BASE_URL as a selection
+// and falls back to production. If the ambiguity probe goes through the latter,
+// a malformed selector silently turns a multi-stage refusal into the production
+// credential — token would print the wrong stage's secret.
+#[test]
+fn unnormalizable_base_url_env_still_refuses_between_stages() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    save(home.path(), "http://localhost:8787", NEW, Some(FUTURE));
+    let mut cmd = command(home.path());
+    cmd.env("RELAYHISTORY_BASE_URL", "not-a-url");
+    let err = failure(&cmd.output().unwrap());
+    assert!(
+        err.contains("stages are configured; pass --base-url to select one"),
+        "a malformed stage selector must not silently select production: {err}"
+    );
+}
