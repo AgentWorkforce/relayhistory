@@ -198,7 +198,8 @@ The npm CLI uses the same Rust engine as the public async SDK:
 
 ```bash
 # Shell-safe token export (fails if ai-hist token fails)
-export RTH_TOKEN=$(ai-hist token) || { echo "Failed to get token" >&2; exit 1; }
+RTH_TOKEN="$(ai-hist token)" || { echo "Failed to get token" >&2; exit 1; }
+export RTH_TOKEN
 ai-hist replay SESSION_ID
 ai-hist replay SESSION_ID --json --out transcript.json
 ```
