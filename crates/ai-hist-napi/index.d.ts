@@ -462,6 +462,7 @@ export interface CloudPushResult {
   syncSkipped: boolean
 }
 export declare function cloudLoadAuth(baseUrl?: string | undefined | null): Promise<CloudAuth | null>
+export declare function cloudValidateExchangeBaseUrl(baseUrl?: string | undefined | null): Promise<void>
 export declare function cloudLogin(options?: CloudOptions | undefined | null): Promise<CloudAuth>
 export declare function enableCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>
 export declare function pushCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>

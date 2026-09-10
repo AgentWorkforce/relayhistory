@@ -1267,6 +1267,13 @@ fn validate_cloud_exchange_base_url(base_url: &str) -> Result<()> {
     )
 }
 
+/// Apply the Agent Relay bearer destination gate to an SDK-selected stage
+/// before JavaScript forwards a bearer obtained from the bundled Cloud SDK.
+pub fn validate_cloud_exchange_base_url_for_sdk(base_url: Option<&str>) -> Result<()> {
+    let base = resolve_base_url(base_url)?;
+    validate_cloud_exchange_base_url(&base)
+}
+
 fn field(v: &serde_json::Value, key: &str) -> Result<String> {
     v.get(key)
         .and_then(|x| x.as_str())

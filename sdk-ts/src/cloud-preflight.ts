@@ -32,8 +32,11 @@ function hasTokenFlag(args: readonly string[]): boolean {
 }
 
 /** Whether this command needs Agent Relay Cloud identity prepared by the SDK. */
-export function shouldPrepareCloudSession(args: readonly string[], env: NodeJS.ProcessEnv): boolean {
-  const command = args[0];
+export function shouldPrepareCloudSession(
+  command: string | undefined,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): boolean {
   if (command !== 'enable-cloud' && command !== 'login') return false;
   if (hasTokenFlag(args)) return false;
 
@@ -48,11 +51,12 @@ export function shouldPrepareCloudSession(args: readonly string[], env: NodeJS.P
  * Returns null when the caller supplied credentials that the native layer owns.
  */
 export async function prepareCloudSessionForEnableCloud(
+  command: string | undefined,
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   dependencies: PreflightDependencies = {},
 ): Promise<string | null> {
-  if (!shouldPrepareCloudSession(args, env)) return null;
+  if (!shouldPrepareCloudSession(command, args, env)) return null;
 
   const interactive = dependencies.interactive
     ?? Boolean(process.stdin.isTTY && process.stderr.isTTY);

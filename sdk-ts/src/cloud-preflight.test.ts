@@ -17,6 +17,7 @@ test('enable-cloud prepares and returns an Agent Relay Cloud SDK token', async (
   const env: NodeJS.ProcessEnv = {};
   let received: Record<string, unknown> | undefined;
   const token = await prepareCloudSessionForEnableCloud(
+    'enable-cloud',
     ['enable-cloud', '--once'],
     env,
     {
@@ -39,16 +40,21 @@ test('enable-cloud prepares and returns an Agent Relay Cloud SDK token', async (
 });
 
 test('explicit and environment tokens bypass Agent Relay Cloud preflight', async () => {
-  assert.equal(shouldPrepareCloudSession(['enable-cloud', '--token', 'fixture'], {}), false);
-  assert.equal(shouldPrepareCloudSession(['login', '--token=fixture'], {}), false);
+  assert.equal(shouldPrepareCloudSession('enable-cloud', ['enable-cloud', '--token', 'fixture'], {}), false);
+  assert.equal(shouldPrepareCloudSession('login', ['login', '--token=fixture'], {}), false);
   assert.equal(
-    shouldPrepareCloudSession(['enable-cloud'], { CLOUD_API_ACCESS_TOKEN: 'fixture' }),
+    shouldPrepareCloudSession('enable-cloud', ['enable-cloud'], { CLOUD_API_ACCESS_TOKEN: 'fixture' }),
     false,
   );
-  assert.equal(shouldPrepareCloudSession(['search', 'cloud'], {}), false);
+  assert.equal(shouldPrepareCloudSession('search', ['search', 'cloud'], {}), false);
+  assert.equal(
+    shouldPrepareCloudSession('enable-cloud', ['--no-warning', 'enable-cloud', '--once'], {}),
+    true,
+  );
 
   let calls = 0;
   const prepared = await prepareCloudSessionForEnableCloud(
+    'enable-cloud',
     ['enable-cloud', '--once'],
     { CLOUD_API_ACCESS_TOKEN: 'fixture' },
     { ensureCloudSession: async () => { calls++; return { auth: { accessToken: 'unused' } }; } },
@@ -61,6 +67,7 @@ test('non-interactive preflight fails fast with token and terminal guidance', as
   const started = Date.now();
   await assert.rejects(
     prepareCloudSessionForEnableCloud(
+      'enable-cloud',
       ['enable-cloud', '--once'],
       {},
       {
@@ -135,6 +142,74 @@ test('npm CLI reuses the canonical Agent Relay Cloud session without its CLI', {
     assert.equal(code, 0, stderr);
     assert.equal(exchanges, 1);
     assert.deepEqual(JSON.parse(stdout), { ok: true, base_url: baseUrl });
+
+    // Once RelayHistory has its own stage session, enable-cloud must use it
+    // without requiring the separate Agent Relay auth store.
+    await rm(join(cloudAuthDir, 'cloud-auth.json'));
+    const enableChild = spawn(process.execPath, [
+      cli, '--no-warning', 'enable-cloud', '--base-url', baseUrl, '--once', '--json',
+    ], {
+      cwd: root,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let enableStdout = '', enableStderr = '';
+    enableChild.stdout.on('data', (chunk) => { enableStdout += chunk; });
+    enableChild.stderr.on('data', (chunk) => { enableStderr += chunk; });
+    const [enableCode] = await once(enableChild, 'close');
+    assert.equal(enableCode, 0, enableStderr);
+    assert.equal(JSON.parse(enableStdout).base_url, baseUrl);
+    assert.equal(exchanges, 1, 'stored RelayHistory auth must avoid another Cloud exchange');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('npm CLI trust-gates an SDK bearer before a custom base-url exchange', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-cloud-trust-'));
+  const cloudAuthDir = join(root, '.agentworkforce', 'relay');
+  await mkdir(cloudAuthDir, { recursive: true });
+  await writeFile(join(cloudAuthDir, 'cloud-auth.json'), JSON.stringify({
+    apiUrl: 'https://agentrelay.com/cloud',
+    accessToken: 'cld_at_shared_fixture',
+    refreshToken: 'cld_rt_shared_fixture',
+    accessTokenExpiresAt: '2999-01-01T00:00:00.000Z',
+  }));
+
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests++;
+    response.end('{}');
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    USERPROFILE: root,
+    RELAYHISTORY_HOME: join(root, 'relayhistory'),
+    RELAYHISTORY_NO_UPDATE_CHECK: '1',
+  };
+  delete env.RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL;
+  delete env.CLOUD_API_ACCESS_TOKEN;
+
+  const child = spawn(process.execPath, [cli, 'login', '--base-url', baseUrl], {
+    cwd: root,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const [code] = await once(child, 'close');
+
+  try {
+    assert.notEqual(code, 0);
+    assert.match(stderr, /refusing to send the Agent Relay Cloud bearer/);
+    assert.equal(requests, 0, 'the SDK bearer must not reach an untrusted destination');
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
