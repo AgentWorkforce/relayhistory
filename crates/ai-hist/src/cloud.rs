@@ -366,20 +366,11 @@ pub fn access_token(base_url: Option<&str>) -> Result<String> {
     // pushCloud, loadStoredRelayhistoryAuth and shares do.
     let load = |base: Option<&str>| load_sdk_auth(base).map_err(sanitize_auth_error);
     let selected = explicit_base.or(env_base);
-    if selected.is_none() {
-        // Keep push's ambiguity error even though the fallback destination is
-        // production. This probe must use load_auth: load_sdk_auth counts ANY
-        // non-empty RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL as a stage selection
-        // and falls back to production, whereas a selection here means a value
-        // that actually normalizes. Routing the probe through it would let a
-        // malformed selector skip the multi-stage refusal and print another
-        // stage's credential. Migration is irrelevant to a probe that only asks
-        // whether the destination is ambiguous.
-        load_auth(None).map_err(sanitize_auth_error)?;
-    }
-    let base = selected.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-    let mut auth = load(Some(&base))?
+    // SDK-first resolution: use load_sdk_auth consistently, just like resolveCloudSession()
+    let base_for_load = selected.as_deref();
+    let mut auth = load(base_for_load)?
         .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
+    let base = auth.base_url.clone();
     if !token_has_valid_lifetime(&auth) {
         let _refresh_lock = acquire_refresh_lock(&base)?;
         auth = load(Some(&base))?
