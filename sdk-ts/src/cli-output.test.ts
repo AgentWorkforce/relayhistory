@@ -703,3 +703,42 @@ test('resume and pack reject flags the other commands accept but these do not', 
     (error: unknown) => isUsageFailure(error, 'pack does not accept --after-source'),
   );
 });
+
+test('--help flag works on root and replay commands with exit code 0', async () => {
+  for (const args of [['--help'], ['-h'], ['help']]) {
+    const rootHelp = await run(process.execPath, [cli, ...args]);
+    assert.equal(rootHelp.stderr, '');
+    assert.match(rootHelp.stdout, /Usage:/);
+    assert.match(rootHelp.stdout, /ai-hist \[--no-bootstrap\] \[--db PATH\] \[--json\] \[--help\]/);
+  }
+
+  const replayHelp = await run(process.execPath, [cli, 'replay', '--help']);
+  assert.equal(replayHelp.stderr, '');
+  assert.match(replayHelp.stdout, /Usage:/);
+  assert.match(replayHelp.stdout, /ai-hist replay SESSION_ID.*--help/);
+
+  const sessionsHelp = await run(process.execPath, [cli, 'sessions', '--help']);
+  assert.equal(sessionsHelp.stderr, '');
+  assert.match(sessionsHelp.stdout, /Usage:/);
+});
+
+test('--help is rejected on commands that do not advertise it', async () => {
+  await assert.rejects(
+    run(process.execPath, [cli, 'login', '--help', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'login does not accept --help'),
+  );
+});
+
+test('unknown subcommands name what was unknown instead of generic parse error', async () => {
+  // Test unknown root command
+  await assert.rejects(
+    run(process.execPath, [cli, 'unknown-command', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, "unknown command 'unknown-command'"),
+  );
+
+  // Test unknown sessions subcommand
+  await assert.rejects(
+    run(process.execPath, [cli, 'sessions', 'unknown-subcommand', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, "unknown sessions subcommand 'unknown-subcommand'"),
+  );
+});

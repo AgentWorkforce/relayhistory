@@ -17,7 +17,7 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'project', 'source', 'tag', 'token', 'tokens',
@@ -210,10 +210,9 @@ function output(value: unknown, json: boolean): void {
   }
 }
 
-function usage(message?: string): never {
-  if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
-  process.stderr.write(`Usage:
-  ai-hist [--no-bootstrap] [--db PATH] [--json]
+function showHelp(): never {
+  process.stdout.write(`Usage:
+  ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
   ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
@@ -230,7 +229,37 @@ function usage(message?: string): never {
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
   ai-hist login [--base-url URL] [--token TOKEN] [--label LABEL] [--json]
   ai-hist token [--base-url URL]
-  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH]
+  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
+  ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
+
+Every command that reads local history indexes it on first use; pass
+--no-bootstrap to answer from the store exactly as it stands.
+`);
+  process.exit(0);
+}
+
+function usage(message?: string): never {
+  if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
+  process.stderr.write(`Usage:
+  ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
+  ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
+  ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
+  ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
+  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
+  ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
+  ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
+  ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
+  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
+  ai-hist session SESSION_ID [--source SOURCE] [--json]
+  ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
+  ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
+  ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
+  ai-hist login [--base-url URL] [--token TOKEN] [--label LABEL] [--json]
+  ai-hist token [--base-url URL]
+  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
 
@@ -554,7 +583,7 @@ function validateInterval(args: Parsed): void {
 // that used to live only in the bare-invocation branch: keeping it here is what
 // stops `search` and `ai-hist` disagreeing about whether a store exists.
 const COMMANDS = new Map<string, CommandSpec>([
-  ['', { name: 'ai-hist', positionals: [0, 0], allowed: ['db', 'json'], readsLocalStore: true }],
+  ['', { name: 'ai-hist', positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
   ['login', { name: 'login', positionals: [0, 0],
     allowed: ['base-url', 'json', 'label', 'token'],
     validate: (args: Parsed) => {
@@ -562,7 +591,7 @@ const COMMANDS = new Map<string, CommandSpec>([
     } }],
   ['token', { name: 'token', positionals: [0, 0], allowed: ['base-url'] }],
   ['replay', { name: 'replay', positionals: [1, 1], requires: 'replay requires SESSION_ID',
-    allowed: ['base-url', 'limit', 'max-content', 'json', 'out'] }],
+    allowed: ['base-url', 'limit', 'max-content', 'json', 'out', 'help'] }],
   ['enable-cloud', { name: 'enable-cloud', positionals: [0, 0], validate: validateInterval,
     allowed: ['base-url', 'db', 'interval', 'once', 'json', 'token'] }],
   ['sessions list', { name: 'sessions list', positionals: [0, 0], readsLocalStore: true,
@@ -628,6 +657,15 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
   return COMMANDS.get(command);
 }
 
+function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
+  if (command === undefined) return 'invalid usage';
+  if (command === 'sessions') {
+    if (subcommand === undefined) return 'sessions requires a subcommand';
+    return `unknown sessions subcommand '${subcommand}'`;
+  }
+  return `unknown command '${command}'`;
+}
+
 // A store that was never built and a store holding no match are different
 // answers, and `No results.` is only true of the second. Wording and exit code
 // separate them; the query is not run against a store that cannot hold one.
@@ -651,12 +689,24 @@ async function main(): Promise<void> {
     await maybePrintUpdateNotice(version, rawArgs);
     return;
   }
-  const args = parse(rawArgs);
+  const args = parse(rawArgs.map((arg) => arg === '-h' ? '--help' : arg));
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
+  if ((args.flags.has('help') && command === undefined) || (command === 'help' && subcommand === undefined)) {
+    showHelp();
+  }
+  if (command === 'sessions' && subcommand === undefined && args.flags.has('help')) {
+    showHelp();
+  }
+
   const spec = commandSpec(command, subcommand);
-  if (!spec) usage();
+  if (!spec) usage(unknownCommandMessage(command, subcommand));
+
+  if (args.flags.has('help') && spec.allowed.includes('help')) {
+    showHelp();
+  }
+
   // The whole command line is checked before any work: a line that is going to
   // be rejected must not first spend a first-run bootstrap only to exit 2.
   validateFlags(args, spec.name, spec.readsLocalStore ? [...spec.allowed, 'no-bootstrap'] : spec.allowed);
