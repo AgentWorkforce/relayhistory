@@ -1,0 +1,51 @@
+name: Label garden issues
+
+# Adds the Factory readiness label when local gh auth is unavailable.
+# Push a marker under .release/label-garden-* listing issue numbers, one per line.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.release/label-garden-*'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const marker = fs.readdirSync('.release')
+              .filter((name) => name.startsWith('label-garden-'))
+              .sort()
+              .at(-1);
+            if (!marker) {
+              core.setFailed('No .release/label-garden-* marker found');
+              return;
+            }
+            const numbers = fs.readFileSync(`.release/${marker}`, 'utf8')
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter((line) => /^\d+$/.test(line))
+              .map(Number);
+            if (numbers.length === 0) {
+              core.setFailed(`Marker ${marker} contained no issue numbers`);
+              return;
+            }
+            for (const issue_number of numbers) {
+              core.info(`Adding garden to #${issue_number}`);
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                labels: ['garden'],
+              });
+            }
