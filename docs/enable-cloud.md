@@ -10,9 +10,15 @@ commits to a PR needs the separate `installGitHooks()` step described below.
 The npm CLI calls the async SDK. It reuses your selected RelayHistory stage or
 starts Agent Relay's device login, exchanges that identity for a service-local
 `rth_at_*` session, syncs local history, drains the outbox, and keeps pushing once
-per minute until Ctrl-C. Install `agent-relay` for the interactive login flow;
-a preauthenticated embedding host can pass `relayAccessToken` to the SDK.
+per minute until Ctrl-C. The npm package includes the Agent Relay Cloud login
+slice, so no separate `agent-relay` CLI install is required. A preauthenticated
+host can pass `relayAccessToken` to the SDK or use `--token`; `CLOUD_API_ACCESS_TOKEN`
+preserves the existing environment-token path.
 The loop runs in the current process; it is not an installed background daemon.
+
+Run the first login from an interactive terminal. With stdin closed (for example,
+in CI), the command fails promptly with token and interactive-login guidance
+instead of waiting indefinitely.
 
 Use `--once` to drain and exit, `--interval 30` to change the interval, and
 `--base-url https://dev.history.agentrelay.com` to select development explicitly.
@@ -52,8 +58,10 @@ linkage travels through the durable outbox independently.
 The design follows [Traces' Git-hook documentation](https://traces.com/docs/sharing/git-hooks):
 explicit session IDs, Git notes, and separate upload.
 
-Cloud login, refresh, URL normalization, migration, stage hashing, atomic state
-writes, cursor locks, and outbox batching remain in Rust. The compatibility
+Agent Relay Cloud login and refresh use the bundled Agent Relay SDK and its shared
+`~/.agentworkforce/relay/cloud-auth.json` session. RelayHistory token exchange,
+URL normalization, migration, stage hashing, atomic state writes, cursor locks,
+and outbox batching remain in Rust. The compatibility
 `ai-hist/cloud` export now reads the same Rust store as the engine. It imports the
 old `~/.config/ai-hist/auth.json` only if the requested stage lacks canonical
 credentials; stale SDK tokens never overwrite refreshed Rust tokens. No new

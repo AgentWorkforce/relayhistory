@@ -1622,11 +1622,8 @@ export interface LoginOptions {
   label?: string;
 }
 
-/** Authenticate to relayhistory-cloud via device login or a supplied bearer token. */
+/** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
 export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
-  if (options.relayAccessToken && !options.baseUrl) {
-    throw new InvalidArgumentError('`--base-url` is required with manual `--token` login', 'INVALID_ARGUMENT');
-  }
   return nativeCall((native) => native.cloudLogin({
     baseUrl: options.baseUrl,
     relayAccessToken: options.relayAccessToken,

@@ -69,15 +69,16 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     process.env.RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL = '1';
     delete process.env.RELAYHISTORY_BASE_URL; delete process.env.AI_HIST_BASE_URL;
     delete process.env.CLOUD_API_ACCESS_TOKEN;
-    const fixture = join(root, 'agent-relay');
-    // Exercise the real Rust session -> device-login -> session subprocess path.
-    await writeFile(fixture, `#!/bin/sh\nif [ "$2" = login ]; then touch '${root}/logged-in'; exit 0; fi\nif [ ! -f '${root}/logged-in' ]; then exit 1; fi\necho '{"accessToken":"fixture-cloud-token"}'\n`, { mode: 0o755 });
-    process.env.AGENT_RELAY_BIN = fixture;
     const transcripts = join(root, '.claude', 'projects', 'fixture');
     await mkdir(transcripts, { recursive: true });
     await writeFile(join(transcripts, 'session-a.jsonl'), Array.from({ length: 525 }, (_, i) => JSON.stringify({ type: 'user', uuid: `u-${i}`, sessionId: 'session-a', timestamp: new Date(1_783_000_000_000 + i * 1000).toISOString(), message: { role: 'user', content: `synthetic cloud prompt ${i}` } })).join('\n'));
     const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
-    const stdout = await run(process.execPath, [cli, 'enable-cloud', '--base-url', baseUrl, '--db', dbPath, '--once', '--json'], process.env);
+    // Explicit credentials bypass SDK preflight and go straight to the native
+    // exchange; SDK preparation and environment bypass are covered separately.
+    const stdout = await run(process.execPath, [
+      cli, 'enable-cloud', '--base-url', baseUrl, '--token', 'fixture-cloud-token',
+      '--db', dbPath, '--once', '--json',
+    ], process.env);
     assert.equal(JSON.parse(stdout).sent, 525);
     const prompts = bodies.flatMap((body) => body.records).map((row) => row.content);
     assert.equal(new Set(prompts).size, 525);

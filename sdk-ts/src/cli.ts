@@ -10,6 +10,7 @@ import {
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
+import { prepareCloudSessionForEnableCloud } from './cloud-preflight.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -197,7 +198,7 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json]
-  ai-hist enable-cloud [--base-url URL] [--db PATH] [--interval SECONDS] [--once] [--json]
+  ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
@@ -547,7 +548,7 @@ const COMMANDS = new Map<string, CommandSpec>([
   ['replay', { name: 'replay', positionals: [1, 1], requires: 'replay requires SESSION_ID',
     allowed: ['base-url', 'limit', 'max-content', 'json', 'out'] }],
   ['enable-cloud', { name: 'enable-cloud', positionals: [0, 0], validate: validateInterval,
-    allowed: ['base-url', 'db', 'interval', 'once', 'json'] }],
+    allowed: ['base-url', 'db', 'interval', 'once', 'json', 'token'] }],
   ['sessions list', { name: 'sessions list', positionals: [0, 0], readsLocalStore: true,
     validate: (args) => {
       if (args.flags.has('json') && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
@@ -683,9 +684,12 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'login') {
+    const relayAccessToken = textFlag(args, 'token')
+      ?? await prepareCloudSessionForEnableCloud(rawArgs, process.env)
+      ?? undefined;
     const auth = await login({
       baseUrl: textFlag(args, 'base-url'),
-      relayAccessToken: textFlag(args, 'token'),
+      relayAccessToken,
       label: textFlag(args, 'label'),
     });
     if (json) output({ ok: true, baseUrl: auth.baseUrl }, true);
@@ -707,8 +711,12 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'enable-cloud') {
+    const relayAccessToken = textFlag(args, 'token')
+      ?? await prepareCloudSessionForEnableCloud(rawArgs, process.env)
+      ?? undefined;
     const handle = await enableCloud({
       baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
+      relayAccessToken,
       intervalMs: intervalSeconds * 1000,
       watch: !args.flags.has('once'),
       onPush: (result) => output(result, json),
