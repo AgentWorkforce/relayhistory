@@ -47,6 +47,11 @@
     "dist/cli.*",
     "dist/mcp-server.*",
     "dist/cloud-client.*",
+    "dist/cloud-auth-bundle.*",
+    "dist/cloud-preflight.js",
+    "dist/cloud-preflight.js.map",
+    "dist/cloud-preflight.d.ts",
+    "dist/cloud-preflight.d.ts.map",
     "README.md",
     "package.json"
   ],
@@ -60,7 +65,7 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/build-cloud-auth.mjs",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/*.test.js ../scripts/hydration-benchmark.test.mjs ../scripts/first-search-evidence.test.mjs",
@@ -76,7 +81,9 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@agent-relay/cloud": "^11.8.1",
     "@types/node": "^22.18.0",
+    "esbuild": "^0.25.12",
     "typescript": "^5.9.2"
   },
   "engines": {

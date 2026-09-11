@@ -27,7 +27,7 @@ test('stats with remote scope fails when unauthenticated', async () => {
   }
 });
 
-test('stats with all scope fails when unauthenticated', async () => {
+test('stats with all scope returns local results when unauthenticated', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-all-auth-'));
   const dbPath = join(root, 'history.db');
   const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
@@ -35,13 +35,9 @@ test('stats with all scope fails when unauthenticated', async () => {
   process.env.USERPROFILE = root;
 
   try {
-    await assert.rejects(
-      () => stats({ dbPath, scope: 'all' }),
-      (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message.includes('not authenticated for remote scope')
-        && error.message.includes('ai-hist login'),
-    );
+    const allStats = await stats({ dbPath, scope: 'all' });
+    assert.equal(allStats.scope, 'all');
+    assert.equal(allStats.total, 0);
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
