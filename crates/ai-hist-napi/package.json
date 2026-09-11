@@ -1,6 +1,6 @@
 {
   "name": "ai-hist-native",
-  "version": "0.15.8",
+  "version": "0.15.9",
   "description": "Mandatory Node-API engine for RelayHistory.",
   "main": "index.js",
   "types": "index.d.ts",
