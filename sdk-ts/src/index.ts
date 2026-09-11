@@ -992,17 +992,11 @@ export async function nativeBuildProfile(): Promise<string> {
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
-  return nativeCall(async (native) => (await native.search(query, { ...options, scope })).map(historyEntry));
+  return nativeCall(async (native) => (await native.search(query, { ...options, scope: options.scope ?? 'local' })).map(historyEntry));
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
-  return nativeCall(async (native) => (await native.recent({ ...options, scope })).map(historyEntry));
+  return nativeCall(async (native) => (await native.recent({ ...options, scope: options.scope ?? 'local' })).map(historyEntry));
 }
 
 export async function getSession(sessionId: string, options: SessionOptions = {}): Promise<HistoryEntry[]> {
@@ -1014,11 +1008,8 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
   return nativeCall(async (native) => {
-    const page = await native.listSessionCatalogPage({ ...options, scope, after: options.after ? {
+    const page = await native.listSessionCatalogPage({ ...options, scope: options.scope ?? 'local', after: options.after ? {
       ...options.after,
       lastActivityMs: options.after.lastActivityMs ?? undefined,
     } : undefined });
@@ -1034,11 +1025,8 @@ export async function listSessionCatalogPage(options: ListCatalogOptions = {}): 
 }
 
 export async function discoverSessions(options: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
   return nativeCall(async (native) => {
-    const result = await native.discoverSessions({ ...options, scope });
+    const result = await native.discoverSessions({ ...options, scope: options.scope ?? 'local' });
     const contractVersion = Number(result.contractVersion);
     assertCatalogContract(contractVersion);
     return {
@@ -1070,13 +1058,10 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
   if (typeof options.sessionId !== 'string' || options.sessionId.trim() === '') {
     throw new InvalidArgumentError('sessionId must not be empty', 'INVALID_ARGUMENT');
   }
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
   return nativeCall(async (native) => {
     const value = await native.hydrateSession({
       ...options,
-      scope,
+      scope: options.scope ?? 'local',
       includeRelated: options.includeRelated ?? true,
     });
     const contractVersion = Number(value.contractVersion);
@@ -1423,11 +1408,8 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 }
 
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
-  const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
-  
   return nativeCall(async (native) => {
-    const result = await native.sync({ ...options, scope });
+    const result = await native.sync({ ...options, scope: options.scope ?? 'local' });
     return {
       databasePath: String(result.databasePath),
       scope: validateNativeScope(result.scope),
@@ -1557,12 +1539,6 @@ export interface EnsureLocalStoreOptions {
  */
 export async function ensureLocalStore(options: EnsureLocalStoreOptions = {}): Promise<LocalStoreReadiness> {
   const { dbPath, scope = 'local' } = options;
-  
-  // Check remote authentication first if scope includes remote
-  if (scope === 'remote' || scope === 'all') {
-    await ensureRemoteAuthentication(scope);
-  }
-  
   if (scope === 'remote') return { status: 'skipped', indexedPrompts: 0, bootstrap: null };
   if (options.bootstrap === false) {
     const existing = await stats({ dbPath, scope: 'local' });
@@ -1643,9 +1619,9 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
-/** 
- * Check if authentication is available for remote operations.
- * Throws an error with appropriate message if remote access is requested but not authenticated.
+/**
+ * Remote stats would otherwise return exit 0 with an empty org store (#126).
+ * Connector-based acquisition keeps native UNSUPPORTED_OPERATION semantics.
  */
 async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
   if (scope === 'local') return; // No authentication needed for local scope
