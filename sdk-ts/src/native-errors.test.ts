@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   DatabaseOpenError, InvalidArgumentError, NATIVE_CONTRACT_VERSION, NativeContractMismatchError,
   SessionNotFoundError,
-  RelayHistoryError, UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
+  UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
   hydrateSession, listSessionCatalogPage, recent, stats, sync,
   validateNativeContract, validateNativeLocation, validateNativeScope,
 } from './index.js';
@@ -69,7 +69,7 @@ test('SDK/native contract mismatch is actionable', () => {
   );
 });
 
-test('remote acquisition requires authentication before connector checks', async () => {
+test('unconfigured remote acquisition has one stable SDK error', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-unsupported-remote-'));
   const dbPath = join(root, 'history.db');
   // Connector detection reads the provider CLIs' stored sign-ins under HOME,
@@ -84,9 +84,9 @@ test('remote acquisition requires authentication before connector checks', async
     ]) {
       await assert.rejects(
         operation(),
-        (error: unknown) => error instanceof RelayHistoryError
-          && error.code === 'CLOUD_AUTH_FAILED'
-          && error.message.includes('not authenticated for remote scope'),
+        (error: unknown) => error instanceof UnsupportedOperationError
+          && error.code === 'UNSUPPORTED_OPERATION'
+          && error.message.includes('no remote provider connectors are configured'),
       );
     }
   } finally {

@@ -993,13 +993,11 @@ export async function nativeBuildProfile(): Promise<string> {
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
-  return nativeCall(async (native) => (await native.search(query, { ...options, scope: effectiveScope })).map(historyEntry));
+  return nativeCall(async (native) => (await native.search(query, { ...options, scope: options.scope ?? 'local' })).map(historyEntry));
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
-  return nativeCall(async (native) => (await native.recent({ ...options, scope: effectiveScope })).map(historyEntry));
+  return nativeCall(async (native) => (await native.recent({ ...options, scope: options.scope ?? 'local' })).map(historyEntry));
 }
 
 export async function getSession(sessionId: string, options: SessionOptions = {}): Promise<HistoryEntry[]> {
@@ -1011,9 +1009,8 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const page = await native.listSessionCatalogPage({ ...options, scope: effectiveScope, after: options.after ? {
+    const page = await native.listSessionCatalogPage({ ...options, scope: options.scope ?? 'local', after: options.after ? {
       ...options.after,
       lastActivityMs: options.after.lastActivityMs ?? undefined,
     } : undefined });
@@ -1029,9 +1026,8 @@ export async function listSessionCatalogPage(options: ListCatalogOptions = {}): 
 }
 
 export async function discoverSessions(options: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const result = await native.discoverSessions({ ...options, scope: effectiveScope });
+    const result = await native.discoverSessions({ ...options, scope: options.scope ?? 'local' });
     const contractVersion = Number(result.contractVersion);
     assertCatalogContract(contractVersion);
     return {
@@ -1393,9 +1389,14 @@ export async function getSessionFileEdits(
 }
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
+  const scope = options.scope ?? 'local';
+  // Cache-only remote stats would otherwise exit 0 with an empty org store (#126).
+  // Acquisition paths keep native connector semantics; do not gate those here.
+  if (scope === 'remote') {
+    await ensureRemoteAuthentication('remote');
+  }
   return nativeCall(async (native) => {
-    const result = await native.stats({ ...options, scope: effectiveScope });
+    const result = await native.stats({ ...options, scope });
     const bySource: Partial<Record<Source, number>> = {};
     for (const item of (result.bySource as UnknownRecord[] | undefined) ?? []) {
       bySource[String(item.source) as Source] = Number(item.count);
@@ -1411,9 +1412,8 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 }
 
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
-  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const result = await native.sync({ ...options, scope: effectiveScope });
+    const result = await native.sync({ ...options, scope: options.scope ?? 'local' });
     return {
       databasePath: String(result.databasePath),
       scope: validateNativeScope(result.scope),
@@ -1623,10 +1623,7 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
-/**
- * Remote stats would otherwise return exit 0 with an empty org store (#126).
- * Connector-based acquisition keeps native UNSUPPORTED_OPERATION semantics.
- */
+/** Cache-only remote stats guard (#126). Connector acquisition uses native checks. */
 async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
   if (scope !== 'remote') return;
 
@@ -1647,23 +1644,6 @@ async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
       'CLOUD_AUTH_FAILED'
     );
   }
-}
-
-/** Remote reads require auth; `all` falls back to local when unauthenticated. */
-async function resolveRemoteScope(scope: SessionScope): Promise<SessionScope> {
-  if (scope === 'remote') {
-    await ensureRemoteAuthentication('remote');
-    return 'remote';
-  }
-  if (scope === 'all') {
-    try {
-      await ensureRemoteAuthentication('remote');
-      return 'all';
-    } catch {
-      return 'local';
-    }
-  }
-  return scope;
 }
 
 /** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
