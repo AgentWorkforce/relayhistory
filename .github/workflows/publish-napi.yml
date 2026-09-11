@@ -464,33 +464,11 @@ jobs:
         if: ${{ !inputs.dry_run }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          SMOKE=$(mktemp -d)
-          cd "$SMOKE"
-          npm init -y
-          node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
-            "ai-hist@$VERSION" "ai-hist-mcp@$VERSION"
-          node "$GITHUB_WORKSPACE/scripts/smoke-native-cli.mjs" ./node_modules/ai-hist/dist/cli.js --prove-rejection
-          timeout 2 ./node_modules/.bin/ai-hist-mcp </dev/null || test $? -eq 124
-
-          NO_OPTIONAL=$(mktemp -d)
-          cd "$NO_OPTIONAL"
-          npm init -y
-          node "$GITHUB_WORKSPACE/scripts/npm-install-with-registry-retry.mjs" \
-            --omit=optional "ai-hist@$VERSION"
-          node --input-type=module -e '
-            import("ai-hist").then((sdk) => sdk.recent()).then(
-              () => process.exit(1),
-              (error) => {
-                if (error.code !== "NATIVE_PACKAGE_MISSING") {
-                  console.error(error);
-                  process.exit(1);
-                }
-                console.log(error.message);
-              },
-            );
-          '
+          REGISTRY_VISIBILITY_ATTEMPTS: 36
+          REGISTRY_VISIBILITY_DELAY_MS: 10000
+          NPM_REGISTRY_RETRY_ATTEMPTS: 36
+          NPM_REGISTRY_RETRY_DELAY_MS: 10000
+        run: node "$GITHUB_WORKSPACE/scripts/registry-clean-install-smoke.mjs"
 
       - name: Registry CLI smoke test on older glibc
         if: ${{ !inputs.dry_run }}

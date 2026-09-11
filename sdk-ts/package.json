@@ -68,7 +68,7 @@
     "build": "npm run clean && tsc -p tsconfig.json && node scripts/build-cloud-auth.mjs",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/*.test.js ../scripts/hydration-benchmark.test.mjs ../scripts/first-search-evidence.test.mjs",
+    "test": "npm run build && node --test dist/*.test.js ../scripts/hydration-benchmark.test.mjs ../scripts/first-search-evidence.test.mjs ../scripts/registry-clean-install-smoke.test.mjs ../scripts/npm-install-with-registry-retry.test.mjs",
     "test:architecture": "node --test dist/architecture.test.js",
     "benchmark": "npm run build && node ../scripts/benchmark-native.mjs",
     "benchmark:hydration": "npm run build && node ../scripts/benchmark-hydration.mjs",
