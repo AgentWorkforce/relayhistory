@@ -693,7 +693,11 @@ async function main(): Promise<void> {
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
-  if ((args.flags.has('help') && command === undefined) || (command === 'help' && subcommand === undefined)) {
+  // Handle help before command resolution to prevent unknown command errors
+  if (args.flags.has('help') && command === undefined) {
+    showHelp();
+  }
+  if (command === 'help' && subcommand === undefined && rest.length === 0) {
     showHelp();
   }
   if (command === 'sessions' && subcommand === undefined && args.flags.has('help')) {
