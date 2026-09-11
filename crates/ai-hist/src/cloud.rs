@@ -322,7 +322,11 @@ fn refuse_ambiguous_stages() -> Result<()> {
         if !path.exists() {
             continue;
         }
-        let auth = read_auth(&path)?;
+        // Treat parse or I/O failure as absent, like loadStoredRelayhistoryAuth() in the SDK
+        let auth = match read_auth(&path) {
+            Ok(auth) => auth,
+            Err(_) => continue,
+        };
         if !auths
             .iter()
             .any(|stored| same_stage(&stored.base_url, &auth.base_url))
