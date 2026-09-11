@@ -334,13 +334,13 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
 
     let home = tempfile::tempdir().unwrap();
     save(home.path(), "http://localhost:8787", OLD, Some(FUTURE));
-    assert!(failure(&command(home.path()).output().unwrap()).contains("not authenticated"));
+    // With exactly one stage, it should resolve (issue #125 fix)
+    success(&command(home.path()).output().unwrap(), OLD);
 }
 
 // With no selector at all and several stages configured, token must refuse to
-// guess rather than fall back to production. The ambiguity probe stays on
-// load_auth for this reason: load_sdk_auth infers a destination from the
-// environment, which would defeat the refusal.
+// guess rather than fall back to production. The ambiguity probe must count
+// both the native stage store and the TypeScript SDK legacy store.
 #[test]
 fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
@@ -350,6 +350,29 @@ fn multiple_stages_without_a_selector_refuse_to_guess() {
     assert!(
         err.contains("stages are configured; pass --base-url to select one"),
         "an unselected multi-stage setup must not silently select production: {err}"
+    );
+}
+
+#[test]
+fn native_and_sdk_legacy_stores_without_a_selector_refuse_to_guess() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let legacy_dir = home.path().join("legacy-sdk");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(
+        legacy_dir.join("auth.json"),
+        json!({
+            "baseUrl": "http://localhost:8787",
+            "accessToken": NEW,
+            "accessTokenExpiresAt": FUTURE,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let err = failure(&command(home.path()).output().unwrap());
+    assert!(
+        err.contains("2 relayhistory stages are configured"),
+        "native and SDK legacy stores must refuse together: {err}"
     );
 }
 
@@ -388,6 +411,17 @@ fn malformed_base_url_env_is_rejected_without_echoing_the_value() {
         !err.contains("hunter2") && !err.contains(secret_shaped),
         "the rejected value must never be echoed: {err}"
     );
+}
+
+// When exactly one non-prod stage exists with no selector, CLI and SDK must agree.
+// This reproduces issue #125: CLI said "not authenticated" while SDK resolved it.
+#[test]
+fn single_non_prod_stage_resolves_without_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let dev = "http://localhost:8787";
+    save(home.path(), dev, OLD, Some(FUTURE));
+    // No environment variable, no --base-url: should resolve the single stage.
+    success(&command(home.path()).output().unwrap(), OLD);
 }
 
 // login_for_sdk resolved a missing destination with default_base_url(), which
