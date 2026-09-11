@@ -1389,8 +1389,26 @@ export async function getSessionFileEdits(
 }
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
+  const scope = options.scope ?? 'local';
+  
+  // For 'remote' scope, require authentication
+  if (scope === 'remote') {
+    await ensureRemoteAuthentication(scope);
+  }
+  
+  // For 'all' scope, fall back to 'local' if remote authentication fails
+  let effectiveScope = scope;
+  if (scope === 'all') {
+    try {
+      await ensureRemoteAuthentication('remote');
+    } catch (error) {
+      // If remote authentication fails, use local scope instead
+      effectiveScope = 'local';
+    }
+  }
+  
   return nativeCall(async (native) => {
-    const result = await native.stats({ ...options, scope: options.scope ?? 'local' });
+    const result = await native.stats({ ...options, scope: effectiveScope });
     const bySource: Partial<Record<Source, number>> = {};
     for (const item of (result.bySource as UnknownRecord[] | undefined) ?? []) {
       bySource[String(item.source) as Source] = Number(item.count);
@@ -1615,6 +1633,32 @@ export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
 /** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
 export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
+}
+
+/**
+ * Remote stats would otherwise return exit 0 with an empty org store (#126).
+ * Connector-based acquisition keeps native UNSUPPORTED_OPERATION semantics.
+ */
+async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
+  if (scope !== 'remote') return;
+
+  try {
+    const auth = await loadStoredRelayhistoryAuth();
+    if (!auth) {
+      throw new RelayHistoryError(
+        'not authenticated for remote scope — run `ai-hist login` first',
+        'CLOUD_AUTH_FAILED'
+      );
+    }
+  } catch (error) {
+    if (error instanceof RelayHistoryError) {
+      throw error;
+    }
+    throw new RelayHistoryError(
+      'not authenticated for remote scope — run `ai-hist login` first',
+      'CLOUD_AUTH_FAILED'
+    );
+  }
 }
 
 /** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
