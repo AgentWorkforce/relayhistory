@@ -339,9 +339,8 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
 }
 
 // With no selector at all and several stages configured, token must refuse to
-// guess rather than fall back to production. The ambiguity probe stays on
-// load_auth for this reason: load_sdk_auth infers a destination from the
-// environment, which would defeat the refusal.
+// guess rather than fall back to production. The ambiguity probe must count
+// both the native stage store and the TypeScript SDK legacy store.
 #[test]
 fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
@@ -351,6 +350,29 @@ fn multiple_stages_without_a_selector_refuse_to_guess() {
     assert!(
         err.contains("stages are configured; pass --base-url to select one"),
         "an unselected multi-stage setup must not silently select production: {err}"
+    );
+}
+
+#[test]
+fn native_and_sdk_legacy_stores_without_a_selector_refuse_to_guess() {
+    let home = tempfile::tempdir().unwrap();
+    save(home.path(), PROD, OLD, Some(FUTURE));
+    let legacy_dir = home.path().join("legacy-sdk");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(
+        legacy_dir.join("auth.json"),
+        json!({
+            "baseUrl": "http://localhost:8787",
+            "accessToken": NEW,
+            "accessTokenExpiresAt": FUTURE,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let err = failure(&command(home.path()).output().unwrap());
+    assert!(
+        err.contains("2 relayhistory stages are configured"),
+        "native and SDK legacy stores must refuse together: {err}"
     );
 }
 

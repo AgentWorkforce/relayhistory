@@ -149,6 +149,22 @@ fn legacy_auth_path() -> PathBuf {
     config_dir().join("auth.json")
 }
 
+/// The TypeScript SDK's pre-stages credential file. Distinct from
+/// [`legacy_auth_path`], which is the native store's own one-file layout.
+fn sdk_legacy_auth_path() -> PathBuf {
+    std::env::var_os("AI_HIST_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .unwrap_or_default(),
+            )
+            .join(".config/ai-hist")
+        })
+        .join("auth.json")
+}
+
 fn legacy_cursor_path() -> PathBuf {
     config_dir().join("cursor.json")
 }
@@ -287,10 +303,36 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     match auths.len() {
         0 => Ok(None),
         1 => Ok(auths.into_iter().next()),
-        count => anyhow::bail!(
-            "{count} relayhistory stages are configured; pass --base-url to select one. \
-             Refusing to guess, because a global cloud session can skip records in another stage."
-        ),
+        count => anyhow::bail!(ambiguous_stage_error(count)),
+    }
+}
+
+fn ambiguous_stage_error(count: usize) -> String {
+    format!(
+        "{count} relayhistory stages are configured; pass --base-url to select one. \
+         Refusing to guess, because a global cloud session can skip records in another stage."
+    )
+}
+
+/// Refuse when more than one stage is configured across the native store and the
+/// TypeScript SDK's legacy store. Mirrors `resolveCloudSession()` in the SDK.
+fn refuse_ambiguous_stages() -> Result<()> {
+    let mut auths = staged_auths()?;
+    for path in [legacy_auth_path(), sdk_legacy_auth_path()] {
+        if !path.exists() {
+            continue;
+        }
+        let auth = read_auth(&path)?;
+        if !auths
+            .iter()
+            .any(|stored| same_stage(&stored.base_url, &auth.base_url))
+        {
+            auths.push(auth);
+        }
+    }
+    match auths.len() {
+        0 | 1 => Ok(()),
+        count => anyhow::bail!(ambiguous_stage_error(count)),
     }
 }
 
@@ -366,6 +408,13 @@ pub fn access_token(base_url: Option<&str>) -> Result<String> {
     // pushCloud, loadStoredRelayhistoryAuth and shares do.
     let load = |base: Option<&str>| load_sdk_auth(base).map_err(sanitize_auth_error);
     let selected = explicit_base.or(env_base);
+    if selected.is_none() {
+        // SDK-first resolution must still mirror resolveCloudSession()'s refusal
+        // across both the native stage store and ~/.config/ai-hist/auth.json.
+        // load_sdk_auth returns a native credential before consulting the SDK
+        // store, so an ambiguity probe here is required when no selector is set.
+        refuse_ambiguous_stages().map_err(sanitize_auth_error)?;
+    }
     // SDK-first resolution: use load_sdk_auth consistently, just like resolveCloudSession()
     let base_for_load = selected.as_deref();
     let mut auth = load(base_for_load)?
@@ -1950,17 +1999,7 @@ pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
     if let Some(auth) = load_auth(base_url)? {
         return Ok(Some(auth));
     }
-    let legacy = std::env::var_os("AI_HIST_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .unwrap_or_default(),
-            )
-            .join(".config/ai-hist")
-        })
-        .join("auth.json");
+    let legacy = sdk_legacy_auth_path();
     if !legacy.exists() {
         return Ok(None);
     }
@@ -3043,6 +3082,44 @@ pub(crate) mod tests {
                 "the legacy cursor remains available to its own normalized stage"
             );
         });
+    }
+
+    #[test]
+    fn sdk_legacy_store_counts_toward_unqualified_ambiguity() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", dir.path());
+        let _relayhistory_home = EnvVarGuard::set("RELAYHISTORY_HOME", dir.path().join("state"));
+        let sdk_dir = dir.path().join("legacy-sdk");
+        let _sdk = EnvVarGuard::set("AI_HIST_CONFIG_DIR", &sdk_dir);
+
+        let prod = StoredAuth {
+            base_url: "https://history.agentrelay.com".into(),
+            access_token: "rth_at_prod".into(),
+            access_token_expires_at: Some("2999-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        save_auth(&prod).unwrap();
+
+        let sdk_dev = StoredAuth {
+            base_url: "http://localhost:8787".into(),
+            access_token: "rth_at_dev".into(),
+            access_token_expires_at: Some("2999-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        write_private(
+            &sdk_legacy_auth_path(),
+            &serde_json::to_string_pretty(&sdk_dev).unwrap(),
+        )
+        .unwrap();
+
+        let err = refuse_ambiguous_stages().unwrap_err().to_string();
+        assert!(err.contains("2 relayhistory stages"), "{err}");
+        assert_eq!(load_auth(None).unwrap().unwrap(), prod);
+        let token_err = access_token(None).unwrap_err().to_string();
+        assert!(token_err.contains("2 relayhistory stages"), "{token_err}");
     }
 
     /// A login to a second stage must preserve both the original stage's bearer session and
