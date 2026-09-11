@@ -197,7 +197,9 @@ Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use 
 The npm CLI uses the same Rust engine as the public async SDK:
 
 ```bash
-export RTH_TOKEN=$(ai-hist token)
+# Shell-safe token export (fails if ai-hist token fails)
+RTH_TOKEN="$(ai-hist token)" || { echo "Failed to get token" >&2; exit 1; }
+export RTH_TOKEN
 ai-hist replay SESSION_ID
 ai-hist replay SESSION_ID --json --out transcript.json
 ```
