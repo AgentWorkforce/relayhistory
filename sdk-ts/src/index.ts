@@ -993,11 +993,13 @@ export async function nativeBuildProfile(): Promise<string> {
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
-  return nativeCall(async (native) => (await native.search(query, { ...options, scope: options.scope ?? 'local' })).map(historyEntry));
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
+  return nativeCall(async (native) => (await native.search(query, { ...options, scope: effectiveScope })).map(historyEntry));
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
-  return nativeCall(async (native) => (await native.recent({ ...options, scope: options.scope ?? 'local' })).map(historyEntry));
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
+  return nativeCall(async (native) => (await native.recent({ ...options, scope: effectiveScope })).map(historyEntry));
 }
 
 export async function getSession(sessionId: string, options: SessionOptions = {}): Promise<HistoryEntry[]> {
@@ -1009,8 +1011,9 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const page = await native.listSessionCatalogPage({ ...options, scope: options.scope ?? 'local', after: options.after ? {
+    const page = await native.listSessionCatalogPage({ ...options, scope: effectiveScope, after: options.after ? {
       ...options.after,
       lastActivityMs: options.after.lastActivityMs ?? undefined,
     } : undefined });
@@ -1026,8 +1029,9 @@ export async function listSessionCatalogPage(options: ListCatalogOptions = {}): 
 }
 
 export async function discoverSessions(options: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const result = await native.discoverSessions({ ...options, scope: options.scope ?? 'local' });
+    const result = await native.discoverSessions({ ...options, scope: effectiveScope });
     const contractVersion = Number(result.contractVersion);
     assertCatalogContract(contractVersion);
     return {
@@ -1389,24 +1393,7 @@ export async function getSessionFileEdits(
 }
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
-  const scope = options.scope ?? 'local';
-  
-  // For 'remote' scope, require authentication
-  if (scope === 'remote') {
-    await ensureRemoteAuthentication(scope);
-  }
-  
-  // For 'all' scope, fall back to 'local' if remote authentication fails
-  let effectiveScope = scope;
-  if (scope === 'all') {
-    try {
-      await ensureRemoteAuthentication('remote');
-    } catch (error) {
-      // If remote authentication fails, use local scope instead
-      effectiveScope = 'local';
-    }
-  }
-  
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
     const result = await native.stats({ ...options, scope: effectiveScope });
     const bySource: Partial<Record<Source, number>> = {};
@@ -1424,8 +1411,9 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 }
 
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
+  const effectiveScope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const result = await native.sync({ ...options, scope: options.scope ?? 'local' });
+    const result = await native.sync({ ...options, scope: effectiveScope });
     return {
       databasePath: String(result.databasePath),
       scope: validateNativeScope(result.scope),
@@ -1659,6 +1647,23 @@ async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
       'CLOUD_AUTH_FAILED'
     );
   }
+}
+
+/** Remote reads require auth; `all` falls back to local when unauthenticated. */
+async function resolveRemoteScope(scope: SessionScope): Promise<SessionScope> {
+  if (scope === 'remote') {
+    await ensureRemoteAuthentication('remote');
+    return 'remote';
+  }
+  if (scope === 'all') {
+    try {
+      await ensureRemoteAuthentication('remote');
+      return 'all';
+    } catch {
+      return 'local';
+    }
+  }
+  return scope;
 }
 
 /** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */

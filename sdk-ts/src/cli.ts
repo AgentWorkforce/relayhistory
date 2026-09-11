@@ -669,6 +669,15 @@ function unknownCommandMessage(command: string | undefined, subcommand: string |
 // A store that was never built and a store holding no match are different
 // answers, and `No results.` is only true of the second. Wording and exit code
 // separate them; the query is not run against a store that cannot hold one.
+/** `--all` may skip remote and answer from local even when the local store is empty. */
+function skipUnusableStoreGate(spec: CommandSpec, scope: SessionScope): boolean {
+  if (scope !== 'all') return false;
+  return spec.name === 'stats'
+    || spec.name === 'sessions list'
+    || spec.name === 'search'
+    || spec.name === 'recent';
+}
+
 function reportUnusableStore(readiness: LocalStoreReadiness, json: boolean): boolean {
   if (readiness.status === 'ready' || readiness.status === 'skipped') return false;
   const message = readiness.status === 'unbuilt'
@@ -724,10 +733,11 @@ async function main(): Promise<void> {
   const sessionSource = command === 'sessions' ? tail[0] : undefined;
   const sessionId = command === 'sessions' ? tail[1] : undefined;
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
+  const scope = scopeFlag(args);
   let readiness: LocalStoreReadiness | null = null;
   if (spec.readsLocalStore) {
     readiness = await ensureLocalStore({
-      dbPath: textFlag(args, 'db'), scope: scopeFlag(args), bootstrap: !args.flags.has('no-bootstrap'),
+      dbPath: textFlag(args, 'db'), scope, bootstrap: !args.flags.has('no-bootstrap'),
     });
     if (readiness.bootstrap?.status === 'partial') {
       process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
@@ -735,7 +745,7 @@ async function main(): Promise<void> {
     // The bare invocation reports the store's condition as its result and
     // succeeds either way. Every command that asks the store a question refuses
     // to answer out of one that cannot hold an answer.
-    if (command !== undefined && reportUnusableStore(readiness, json)) return;
+    if (command !== undefined && !skipUnusableStoreGate(spec, scope) && reportUnusableStore(readiness, json)) return;
   }
 
   if (command === undefined) {
