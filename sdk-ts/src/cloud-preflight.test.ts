@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { RelayHistoryError } from './index.js';
 import {
   prepareCloudSessionForEnableCloud,
   shouldPrepareCloudSession,
@@ -78,7 +79,9 @@ test('non-interactive preflight fails fast with token and terminal guidance', as
         },
       },
     ),
-    /interactive terminal.*--token.*CLOUD_API_ACCESS_TOKEN/,
+    (error: unknown) => error instanceof RelayHistoryError
+      && error.code === 'CLOUD_AUTH_FAILED'
+      && /interactive terminal.*--token.*CLOUD_API_ACCESS_TOKEN/.test(error.message),
   );
   assert.ok(Date.now() - started < 1_000);
 });

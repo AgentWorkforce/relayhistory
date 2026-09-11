@@ -410,8 +410,15 @@ test('scope flags are boolean, default to local, and are mutually exclusive', as
     const implicit = await readEmpty([cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
     const explicit = await readEmpty([cli, '--json', 'sessions', 'list', '--local', '--db', db, '--no-warning']);
     assert.deepEqual(JSON.parse(implicit.stdout), JSON.parse(explicit.stdout));
-    const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env });
-    assert.equal(JSON.parse(remote.stdout).scope, 'remote');
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error
+        && error.code === 1
+        && 'stderr' in error
+        && String(error.stderr).includes('CLOUD_AUTH_FAILED')
+        && String(error.stderr).includes('not authenticated for remote scope'),
+    );
 
     await assert.rejects(
       run(process.execPath, [cli, 'sessions', 'list', '--local', '--remote', '--db', db, '--no-warning']),

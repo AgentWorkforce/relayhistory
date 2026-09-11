@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { RelayHistoryError, stats } from './index.js';
+import { listSessionCatalogPage, RelayHistoryError, stats } from './index.js';
 
 const run = promisify(execFile);
 const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
@@ -32,6 +32,39 @@ async function withIsolatedHome(runCase: (root: string, dbPath: string) => Promi
     await rm(root, { recursive: true, force: true });
   }
 }
+
+test('listSessionCatalogPage with remote scope fails when unauthenticated', async () => {
+  await withIsolatedHome(async (_root, dbPath) => {
+    await assert.rejects(
+      () => listSessionCatalogPage({ dbPath, scope: 'remote' }),
+      (error: unknown) => error instanceof RelayHistoryError
+        && error.code === 'CLOUD_AUTH_FAILED'
+        && error.message.includes('not authenticated for remote scope')
+        && error.message.includes('ai-hist login'),
+    );
+  });
+});
+
+test('CLI sessions list --remote exits non-zero when unauthenticated', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-sessions-remote-'));
+  const env = { ...process.env, HOME: root, USERPROFILE: root, RELAYHISTORY_NO_UPDATE_CHECK: '1' };
+
+  try {
+    await assert.rejects(
+      () => run(process.execPath, [
+        cli, 'sessions', 'list', '--remote', '--db', join(root, 'history.db'), '--json', '--no-warning',
+      ], { env }),
+      (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error
+        && error.code === 1
+        && 'stderr' in error
+        && String(error.stderr).includes('CLOUD_AUTH_FAILED')
+        && String(error.stderr).includes('not authenticated for remote scope'),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('stats with remote scope fails when unauthenticated', async () => {
   await withIsolatedHome(async (_root, dbPath) => {
