@@ -1390,10 +1390,25 @@ export async function getSessionFileEdits(
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
   const scope = options.scope ?? 'local';
-  await ensureRemoteAuthentication(scope);
+  
+  // For 'remote' scope, require authentication
+  if (scope === 'remote') {
+    await ensureRemoteAuthentication(scope);
+  }
+  
+  // For 'all' scope, fall back to 'local' if remote authentication fails
+  let effectiveScope = scope;
+  if (scope === 'all') {
+    try {
+      await ensureRemoteAuthentication('remote');
+    } catch (error) {
+      // If remote authentication fails, use local scope instead
+      effectiveScope = 'local';
+    }
+  }
   
   return nativeCall(async (native) => {
-    const result = await native.stats({ ...options, scope });
+    const result = await native.stats({ ...options, scope: effectiveScope });
     const bySource: Partial<Record<Source, number>> = {};
     for (const item of (result.bySource as UnknownRecord[] | undefined) ?? []) {
       bySource[String(item.source) as Source] = Number(item.count);

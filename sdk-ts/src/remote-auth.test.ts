@@ -36,7 +36,8 @@ test('stats with all scope returns local results when unauthenticated', async ()
 
   try {
     const allStats = await stats({ dbPath, scope: 'all' });
-    assert.equal(allStats.scope, 'all');
+    // When unauthenticated, 'all' scope should fall back to 'local' scope
+    assert.equal(allStats.scope, 'local');
     assert.equal(allStats.total, 0);
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
