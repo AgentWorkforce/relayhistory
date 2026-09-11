@@ -993,11 +993,13 @@ export async function nativeBuildProfile(): Promise<string> {
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
-  return nativeCall(async (native) => (await native.search(query, { ...options, scope: options.scope ?? 'local' })).map(historyEntry));
+  const scope = await resolveRemoteScope(options.scope ?? 'local');
+  return nativeCall(async (native) => (await native.search(query, { ...options, scope })).map(historyEntry));
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
-  return nativeCall(async (native) => (await native.recent({ ...options, scope: options.scope ?? 'local' })).map(historyEntry));
+  const scope = await resolveRemoteScope(options.scope ?? 'local');
+  return nativeCall(async (native) => (await native.recent({ ...options, scope })).map(historyEntry));
 }
 
 export async function getSession(sessionId: string, options: SessionOptions = {}): Promise<HistoryEntry[]> {
@@ -1009,8 +1011,9 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
+  const scope = await resolveRemoteScope(options.scope ?? 'local');
   return nativeCall(async (native) => {
-    const page = await native.listSessionCatalogPage({ ...options, scope: options.scope ?? 'local', after: options.after ? {
+    const page = await native.listSessionCatalogPage({ ...options, scope, after: options.after ? {
       ...options.after,
       lastActivityMs: options.after.lastActivityMs ?? undefined,
     } : undefined });
@@ -1390,23 +1393,12 @@ export async function getSessionFileEdits(
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
   const scope = options.scope ?? 'local';
-  
-  // For 'remote' scope, require authentication
+  // Cache-only remote stats would otherwise exit 0 with an empty org store (#126).
+  // Acquisition paths keep native connector semantics; do not gate those here.
   if (scope === 'remote') {
-    await ensureRemoteAuthentication(scope);
+    await ensureRemoteAuthentication('remote');
   }
-  
-  // For 'all' scope, fall back to 'local' if remote authentication fails
-  let effectiveScope = scope;
-  if (scope === 'all') {
-    try {
-      await ensureRemoteAuthentication('remote');
-    } catch (error) {
-      // If remote authentication fails, use local scope instead
-      effectiveScope = 'local';
-    }
-  }
-  
+  const effectiveScope = await resolveRemoteScope(scope);
   return nativeCall(async (native) => {
     const result = await native.stats({ ...options, scope: effectiveScope });
     const bySource: Partial<Record<Source, number>> = {};
@@ -1635,30 +1627,27 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
-/**
- * Remote stats would otherwise return exit 0 with an empty org store (#126).
- * Connector-based acquisition keeps native UNSUPPORTED_OPERATION semantics.
- */
+/** Cache-only remote stats guard (#126). Connector acquisition uses native checks. */
 async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
   if (scope !== 'remote') return;
 
-  try {
-    const auth = await loadStoredRelayhistoryAuth();
-    if (!auth) {
-      throw new RelayHistoryError(
-        'not authenticated for remote scope — run `ai-hist login` first',
-        'CLOUD_AUTH_FAILED'
-      );
-    }
-  } catch (error) {
-    if (error instanceof RelayHistoryError) {
-      throw error;
-    }
+  const auth = await loadStoredRelayhistoryAuth();
+  if (!auth) {
     throw new RelayHistoryError(
       'not authenticated for remote scope — run `ai-hist login` first',
       'CLOUD_AUTH_FAILED'
     );
   }
+}
+
+/**
+ * For `--all`, fall back to local only when RelayHistory credentials are absent.
+ * Credential-store and stage-selection errors propagate unchanged.
+ */
+async function resolveRemoteScope(scope: SessionScope): Promise<SessionScope> {
+  if (scope !== 'all') return scope;
+  const auth = await loadStoredRelayhistoryAuth();
+  return auth ? 'all' : 'local';
 }
 
 /** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
