@@ -31,7 +31,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 9;
+pub const NATIVE_CONTRACT_VERSION: u32 = 10;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -1678,6 +1678,16 @@ pub async fn cloud_load_auth(base_url: Option<String>) -> napi::Result<Option<Cl
     .map_err(worker_error)?
     .map(|auth| auth.map(Into::into))
     .map_err(|error| native_error("CLOUD_AUTH_FAILED", format!("{error:#}")))
+}
+
+#[napi]
+pub async fn cloud_validate_exchange_base_url(base_url: Option<String>) -> napi::Result<()> {
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::validate_cloud_exchange_base_url_for_sdk(base_url.as_deref())
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error| native_error("CLOUD_LOGIN_FAILED", format!("{error:#}")))
 }
 
 #[napi]

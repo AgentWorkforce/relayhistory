@@ -190,7 +190,7 @@ See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/ma
 
 ## Cloud opt-in
 
-Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use `--once` to exit after draining. The async SDK exports `enableCloud`, `pushCloud`, `installGitHooks` and `createShareableTrace`; cloud transport and stage-scoped auth stay in Rust. Interactive login requires Agent Relay. See [cloud setup](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/enable-cloud.md).
+Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use `--once` to exit after draining. The npm CLI bundles Agent Relay Cloud login, so no separate `agent-relay` CLI install is required; a run without a TTY fails promptly with interactive-login and token guidance. The async SDK exports `enableCloud`, `pushCloud`, `installGitHooks` and `createShareableTrace`; RelayHistory exchange, transport, and stage-scoped auth stay in Rust. See [cloud setup](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/enable-cloud.md).
 
 ## Cloud token and replay
 

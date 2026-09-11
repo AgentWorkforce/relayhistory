@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 9;
+export const NATIVE_CONTRACT_VERSION = 10;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
@@ -499,6 +499,7 @@ interface NativeBinding {
   installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
   linkGitCommit(optionsJson: string): Promise<string>;
   cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
+  cloudValidateExchangeBaseUrl(baseUrl?: string): Promise<void>;
   cloudLogin(options: object): Promise<RelayhistoryAuth>;
   enableCloud(options: object): Promise<CloudPushResult>;
   pushCloud(options: object): Promise<CloudPushResult>;
@@ -1616,17 +1617,19 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
+/** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
+export async function validateCloudExchangeBaseUrl(baseUrl?: string): Promise<void> {
+  return nativeCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
+}
+
 export interface LoginOptions {
   baseUrl?: string;
   relayAccessToken?: string;
   label?: string;
 }
 
-/** Authenticate to relayhistory-cloud via device login or a supplied bearer token. */
+/** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
 export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
-  if (options.relayAccessToken && !options.baseUrl) {
-    throw new InvalidArgumentError('`--base-url` is required with manual `--token` login', 'INVALID_ARGUMENT');
-  }
   return nativeCall((native) => native.cloudLogin({
     baseUrl: options.baseUrl,
     relayAccessToken: options.relayAccessToken,
