@@ -1,4 +1,5 @@
 import { ensureCloudSession as bundledEnsureCloudSession } from './cloud-auth-bundle.js';
+import { RelayHistoryError } from './index.js';
 
 const DEFAULT_CLOUD_API_URL = 'https://agentrelay.com/cloud';
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -58,8 +59,7 @@ export async function prepareCloudSessionForEnableCloud(
 ): Promise<string | null> {
   if (!shouldPrepareCloudSession(command, args, env)) return null;
 
-  const interactive = dependencies.interactive
-    ?? Boolean(process.stdin.isTTY && process.stderr.isTTY);
+  const interactive = dependencies.interactive ?? Boolean(process.stdin.isTTY);
   const loginTimeoutMs = interactive ? DEFAULT_LOGIN_TIMEOUT_MS : NON_INTERACTIVE_TIMEOUT_MS;
   const ensureCloudSession = dependencies.ensureCloudSession
     ?? bundledEnsureCloudSession as unknown as EnsureCloudSession;
@@ -91,10 +91,11 @@ export async function prepareCloudSessionForEnableCloud(
     return accessToken;
   } catch (error) {
     if (!interactive) {
-      throw new Error(
+      throw new RelayHistoryError(
         'Agent Relay Cloud login requires an interactive terminal. Re-run this command in a terminal '
         + 'to use browser/device login, or provide --token (with --base-url for login) or '
         + 'CLOUD_API_ACCESS_TOKEN for non-interactive use.',
+        'CLOUD_AUTH_FAILED',
         { cause: error },
       );
     }

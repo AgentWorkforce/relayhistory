@@ -1011,7 +1011,11 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
-  const scope = await resolveRemoteScope(options.scope ?? 'local');
+  const requestedScope = options.scope ?? 'local';
+  if (requestedScope === 'remote') {
+    await ensureRemoteAuthentication('remote');
+  }
+  const scope = await resolveRemoteScope(requestedScope);
   return nativeCall(async (native) => {
     const page = await native.listSessionCatalogPage({ ...options, scope, after: options.after ? {
       ...options.after,
