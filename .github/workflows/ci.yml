@@ -104,7 +104,7 @@ jobs:
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
           for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts --omit=optional
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
             npm --prefix "plugins/$plugin/sdk" run build
           done
       - name: Optional plugin tests
@@ -144,7 +144,7 @@ jobs:
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
           for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts --omit=optional
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
             npm --prefix "plugins/$plugin/sdk" run build
           done
       - name: Verify actual Windows descendant cleanup and missing executable errors

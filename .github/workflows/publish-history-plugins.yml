@@ -153,12 +153,18 @@ jobs:
           npm --prefix crates/ai-hist-napi run build:debug
           npm --prefix sdk-ts ci
           for plugin in relayhistory provider-sources; do
-            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts --omit=optional
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
             npm --prefix "plugins/$plugin/sdk" run build
             (cd "plugins/$plugin/sdk" && npm pack --ignore-scripts --pack-destination ../../../artifacts)
           done
       - name: Verify installed core and optional artifacts
         run: node scripts/smoke-history-packages.mjs --helpers artifacts
+      # A build-only dry run is useful before the core boundary release exists.
+      # Publication checks the oldest core admitted by each peer range, so an
+      # already-published older core cannot be hidden by our staged source SDK.
+      - name: Verify actual published core compatibility before any publication
+        if: ${{ !inputs.dry_run }}
+        run: node scripts/verify-published-history-core.mjs '${{ inputs.plugin }}'
       - name: Publish platform helpers before JavaScript plugins
         if: ${{ !inputs.dry_run }}
         env:
