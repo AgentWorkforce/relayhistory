@@ -355,12 +355,18 @@ pub fn ensure_selected_remote_connectors_configured_for_at(
         );
     }
     // Reject capabilities before probing credentials too. Relaycast currently
-    // supports full sync only, not shallow discovery or targeted hydration.
+    // supports full sync only; commercial recall has no targeted hydration.
     let applicable = SourceConnectorSelection {
         ids: selection
             .ids
             .iter()
-            .filter(|id| operation == "sync" || id.as_str() != RELAYCAST_CONNECTOR)
+            .filter(|id| match operation {
+                "sync" => true,
+                "hydration" | "hydrate" => {
+                    matches!(id.as_str(), CLAUDE_WEB_CONNECTOR | CODEX_CLOUD_CONNECTOR)
+                }
+                _ => id.as_str() != RELAYCAST_CONNECTOR,
+            })
             .cloned()
             .collect(),
     };

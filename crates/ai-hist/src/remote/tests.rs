@@ -1760,3 +1760,38 @@ fn explicit_empty_or_inapplicable_selection_rejects_before_database_creation() {
     assert!(!db.parent().unwrap().exists());
     assert!(SourceConnectorSelection::new(vec!["not-installed".into()]).is_err());
 }
+
+#[test]
+fn hydration_capability_preflight_never_reads_selected_commercial_auth() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    // An unreadable/invalid credential store must be irrelevant to a capability
+    // that none of the commercial adapters implements.
+    std::fs::write(
+        crate::cloud::config_dir().join("auth.json"),
+        "{malformed secret",
+    )
+    .unwrap();
+    for ids in [
+        vec![CLOUD_CONNECTOR.into()],
+        vec![CLOUD_CONNECTOR.into(), CLAUDE_WEB_CONNECTOR.into()],
+    ] {
+        let selection = SourceConnectorSelection::new(ids).unwrap();
+        COMMERCIAL_AUTH_READS.with(|count| count.set(0));
+        let error = ensure_selected_remote_connectors_configured_for_at(
+            "hydration",
+            home.path(),
+            &["claude".into()],
+            &selection,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("malformed"));
+        COMMERCIAL_AUTH_READS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "unsupported hydration adapter must be filtered before auth"
+            )
+        });
+    }
+}
