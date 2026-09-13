@@ -761,6 +761,15 @@ fn hydrate_remote_codex_diff_observed(
             .unwrap_or_else(|| "remote-diff:".into());
         tx.execute("DELETE FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND substr(tool_use_id,1,?)=?",params![options.session_id,prefix.len(),prefix])?;
         for (index, patch) in split_unified_diff(diff).into_iter().enumerate() {
+            // Old releases materialized the only remote diff under this bare
+            // provider key. Its overwritten presence cannot identify an owner.
+            // Retain that canonical projection instead of duplicating it under
+            // the new connector prefix; fresh bytes still enter own evidence.
+            let legacy_id = format!("remote-diff:{index}");
+            if observation.is_some() && tx.query_row("SELECT EXISTS(SELECT 1 FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND tool_use_id=?)",params![options.session_id,legacy_id],|row|row.get::<_,bool>(0))? {
+                continue;
+            }
+
             let (added, removed) = count_unified_diff_lines(&patch.text);
             tx.execute(
                 "INSERT INTO file_edits \
@@ -3209,6 +3218,74 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn legacy_codex_diff_is_not_duplicated_or_claimed_by_a_new_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("history.db")).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_123");
+        conn.execute("INSERT INTO file_edits(source,session_id,tool_use_id,file_path,tool_name,structured_patch_json) VALUES('codex','task_e_123','remote-diff:0','a.txt','codex cloud diff','legacy patch')",[]).unwrap();
+        let observed = SessionObservation {
+            key: ObservationKey {
+                source: "codex".into(),
+                session_id: "task_e_123".into(),
+                location: SessionLocation::Remote,
+                connector_id: "codex-cloud".into(),
+                connector_instance: "default".into(),
+            },
+            raw_locator: Some("task_e_123".into()),
+            source_stamp: Some("listing".into()),
+            discovery_state: "shallow".into(),
+            access_state: "available".into(),
+            updated_ms: 1,
+        };
+        observations::upsert(&conn, &observed).unwrap();
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_123".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let diff =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n old\n+fresh\n";
+        hydrate_remote_codex_diff_observed(
+            &mut conn,
+            &options,
+            diff,
+            "new".into(),
+            100,
+            Instant::now(),
+            Some(&observed),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT structured_patch_json FROM file_edits", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "legacy patch"
+        );
+        assert_eq!(
+            observations::evidence(&conn, &observed.key)
+                .unwrap()
+                .unwrap()["diff"],
+            diff
+        );
+        assert_eq!(
+            observations::checkpoint(&conn, &observed.key)
+                .unwrap()
+                .unwrap()
+                .source_stamp
+                .as_deref(),
+            Some("new")
+        );
     }
 
     #[test]
