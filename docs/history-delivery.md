@@ -173,7 +173,7 @@ history. Long offline periods therefore require enough retained storage.
 
 Configured plugins can register commands and tools. Duplicate identifiers,
 including collisions with core names, fail atomically. Run a configured command
-with `ai-hist plugin COMMAND ARGS --config delivery.json`. MCP loads plugins
+with `ai-hist plugin COMMAND --config delivery.json -- ARGS`. MCP loads plugins
 only when `AI_HIST_PLUGIN_CONFIG` explicitly names that config; core tools work
 without it. Plugin tools receive their object arguments through an `input` field.
 MCP also exposes delivery status, pause, resume, and retry for existing jobs.
@@ -182,3 +182,6 @@ This change supplies generic destination contracts and the durable coordinator.
 The existing RelayHistory cloud API still ships in the current distribution.
 Optional cloud package extraction and migration of its adapter onto this
 coordinator are separate changes; no third-party service compatibility is implied.
+
+Plugin arguments after `--` are passed verbatim, including flags, `-h`, equals signs,
+and empty arguments. Core options before that separator remain strictly validated.

@@ -243,7 +243,7 @@ function showHelp(): never {
   ai-hist export --selection FILE [--out FILE] [--db PATH]
   ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
   ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
-  ai-hist plugin COMMAND [ARGS...] --config FILE
+  ai-hist plugin COMMAND --config FILE -- [ARGS...]
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -277,7 +277,7 @@ function usage(message?: string): never {
   ai-hist export --selection FILE [--out FILE] [--db PATH]
   ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
   ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
-  ai-hist plugin COMMAND [ARGS...] --config FILE
+  ai-hist plugin COMMAND --config FILE -- [ARGS...]
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -723,7 +723,10 @@ async function main(): Promise<void> {
     await maybePrintUpdateNotice(version, rawArgs);
     return;
   }
-  const args = parse(rawArgs.map((arg) => arg === '-h' ? '--help' : arg));
+  const separator = rawArgs[0] === 'plugin' ? rawArgs.indexOf('--') : -1;
+  const pluginArgs = separator < 0 ? [] : rawArgs.slice(separator + 1);
+  const coreArgs = separator < 0 ? rawArgs : rawArgs.slice(0, separator);
+  const args = parse(coreArgs.map((arg) => arg === '-h' ? '--help' : arg));
   const [command, subcommand, ...rest] = args.positional;
   const json = args.flags.has('json');
 
@@ -776,7 +779,7 @@ async function main(): Promise<void> {
     const { registry } = await loadHistoryApplicationConfig(configPath);
     const operation = registry.command(tail[0]);
     if (!operation) usage('configured plugin command not found');
-    output(await operation.run(tail.slice(1)), true);
+    output(await operation.run([...tail.slice(1), ...pluginArgs]), true);
     return;
   }
   let readiness: LocalStoreReadiness | null = null;

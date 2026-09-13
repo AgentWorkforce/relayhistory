@@ -293,3 +293,16 @@ test('NDJSON output cannot replace the active database through its path, symlink
     }
   });
 });
+
+
+test('plugin CLI passes arguments after its explicit separator verbatim', async () => {
+  await fixture(async (_dbPath, root) => {
+    await writeFile(join(root, 'plugin.mjs'), `export function createHistoryPlugin() { return { commands: [{ name: 'echo-args', run: async args => args }] }; }`);
+    const configPath = join(root, 'config.json');
+    await writeFile(configPath, JSON.stringify({ plugins: [{ module: './plugin.mjs' }] }));
+    const pluginArgs = ['--base-url', 'https://example.invalid', '--key=value', '', '-h', '--', '--config', 'plugin-value'];
+    const result = await run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'plugin', 'echo-args', '--config', configPath, '--', ...pluginArgs]);
+    assert.deepEqual(JSON.parse(result.stdout), pluginArgs);
+    await assert.rejects(run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'plugin', 'echo-args', '--unknown', 'value', '--config', configPath, '--', '-h']));
+  });
+});
