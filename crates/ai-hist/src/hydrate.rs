@@ -3242,7 +3242,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let result = hydrate_remote_session(
+        let result = remote_limited_result(
             &mut open_db(&db).unwrap(),
             &HydrateSessionOptions {
                 source: "cursor".into(),
@@ -3250,11 +3250,8 @@ mod tests {
                 scope: SessionScope::Remote,
                 include_related: true,
             },
-            dir.path(),
-            &crate::remote::SourceConnectorSelection::new(vec![
-                crate::remote::CLOUD_CONNECTOR.into()
-            ])
-            .unwrap(),
+            "CONNECTOR_NOT_CONFIGURED",
+            "selected source provides discovery only".into(),
             Instant::now(),
         )
         .unwrap();

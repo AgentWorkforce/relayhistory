@@ -41,14 +41,12 @@ dependencies = [
  "atomicwrites",
  "chrono",
  "fs2",
- "hostname",
  "libc",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "ureq",
  "url",
 ]
 

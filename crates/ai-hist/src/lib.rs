@@ -36,8 +36,7 @@ mod hydrate;
 /// Recording the delegation evidence each provider leaves behind.
 mod relationships;
 
-/// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
-/// and their availability reporting.
+/// Compatibility selectors for optional source plugins. No transport or auth.
 pub mod remote;
 pub mod source_intake;
 pub mod sources;
@@ -102,13 +101,10 @@ pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
 
 /// Full ingestion for a selected session-presence scope.
 ///
-/// Remote provider connectors are intentionally a capability boundary: a
-/// `remote` request fails loudly unless at least one connector (claude.ai/code
-/// web sessions, Codex cloud tasks — see [`remote`]) is configured on this
-/// machine, and `all` runs local ingestion plus every configured connector.
-/// Remote connectors acquire catalog rows and `remote` presences; remote rows
-/// stay `shallow` because neither provider serves full transcripts through a
-/// supported listing interface yet.
+/// The local distribution ingests local providers for `local` and `all`.
+/// Explicit `remote` acquisition requires an installed source plugin composed
+/// through [`sources::SourceRegistry`] or an SDK host. Credentials alone never
+/// add a data source. Cached remote catalog reads remain available.
 pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_scope_exclusive(db_path, scope)

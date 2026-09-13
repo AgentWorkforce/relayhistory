@@ -130,7 +130,8 @@ fn read_snapshot(conn: &Connection, key: &ObservationKey) -> Result<RecordSnapsh
             })
         }
         // Legacy raw snapshots did not record canonical ownership. Retain their
-        // canonical rows conservatively until the source is reacquired.
+        // canonical rows conservatively; reacquisition retains a new independent
+        // snapshot but cannot retroactively prove who owned old canonical rows.
         _ => Ok(RecordSnapshot::default()),
     }
 }
@@ -304,20 +305,46 @@ pub(crate) fn apply_normalized(
     )
 }
 
+/// One acquired catalog row, with a separate opaque handle for subsequent reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceObservation {
+    #[serde(flatten)]
+    pub session: ShallowSession,
+    pub raw_locator: Option<String>,
+}
+impl From<ShallowSession> for SourceObservation {
+    fn from(session: ShallowSession) -> Self {
+        Self {
+            session,
+            raw_locator: None,
+        }
+    }
+}
+impl std::ops::Deref for SourceObservation {
+    type Target = ShallowSession;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+impl std::ops::DerefMut for SourceObservation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
 #[derive(Debug, Deserialize)]
 pub struct ApplyObservationsRequest {
     pub db_path: Option<PathBuf>,
     pub connector_id: String,
     pub connector_instance: String,
     pub location: SessionLocation,
-    pub observations: Vec<ShallowSession>,
+    pub observations: Vec<SourceObservation>,
 }
 struct BatchProvider {
     source: &'static str,
     id: String,
     instance: String,
     location: SessionLocation,
-    rows: Vec<ShallowSession>,
+    rows: Vec<SourceObservation>,
 }
 impl ShallowSessionProvider for BatchProvider {
     fn source(&self) -> &'static str {
@@ -339,8 +366,9 @@ impl ShallowSessionProvider for BatchProvider {
                 Ok(Candidate {
                     source: self.source,
                     locator: row
-                        .raw_path
+                        .raw_locator
                         .clone()
+                        .or_else(|| row.raw_path.clone())
                         .unwrap_or_else(|| row.session_id.clone()),
                     session_id: Some(row.session_id.clone()),
                     recency_hint_ms: row.last_activity_ms,
@@ -366,7 +394,7 @@ impl ShallowSessionProvider for BatchProvider {
             .rows
             .iter()
             .find(|row| Some(&row.session_id) == candidate.session_id.as_ref())
-            .cloned())
+            .map(|row| row.session.clone()))
     }
 }
 pub fn apply_source_observations(request: ApplyObservationsRequest) -> Result<DiscoverySummary> {
@@ -374,7 +402,7 @@ pub fn apply_source_observations(request: ApplyObservationsRequest) -> Result<Di
         request.observations.len() <= 10_000,
         "INVALID_ARGUMENT: observation batch exceeds 10000 rows"
     );
-    let mut grouped: BTreeMap<&'static str, Vec<ShallowSession>> = BTreeMap::new();
+    let mut grouped: BTreeMap<&'static str, Vec<SourceObservation>> = BTreeMap::new();
     let mut identities = BTreeSet::new();
     // Validate the entire batch before opening a DB. Empty batches still validate
     // the connector identity and deliberately create no database.
@@ -400,8 +428,9 @@ pub fn apply_source_observations(request: ApplyObservationsRequest) -> Result<Di
             "INVALID_ARGUMENT: duplicate source observation"
         );
         ensure!(
-            row.raw_path
+            row.raw_locator
                 .as_ref()
+                .or(row.raw_path.as_ref())
                 .is_none_or(|v| !v.is_empty() && !v.contains('\0')),
             "INVALID_ARGUMENT: invalid observation locator"
         );

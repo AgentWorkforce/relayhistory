@@ -2934,6 +2934,10 @@ pub fn discover_sessions_with_provider_refs(
             return Err(error);
         }
         if has_writes {
+            if let Err(error) = crate::reconcile_claude_remote_relationships(conn) {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
             if let Err(error) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error.into());
