@@ -7,21 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
-pub mod convergence;
 /// Generic opt-in durable history export and delivery state.
 pub mod delivery;
 /// Connector-specific acquisition provenance and checkpoints.
 pub mod observations;
-/// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
-pub mod outbox;
 pub mod privacy;
 /// Delegation topology: recorded parent/child relationships and bounded,
 /// cycle-safe traversal over them.
 pub mod relationships;
 pub mod source_evidence;
 pub mod storage;
-pub mod turns;
 
 pub use relationships::{
     relationship_capabilities, session_children, session_children_page, session_parents,

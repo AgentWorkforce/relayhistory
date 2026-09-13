@@ -1,4 +1,3 @@
-use ai_hist_core::convergence::MachineIdentity;
 use ai_hist_core::{
     default_db_path, insert_history, open_db, open_db_readonly, parse_cursor_text, prompt_hash,
     schema_is_catalog_read_current, sync_opencode_db, sync_opencode_session, HistoryEntry,
@@ -24,8 +23,6 @@ use diagnostics::*;
 use history_search::{search_all, SearchRole};
 use paths::{default_opencode_db_path, home_dir};
 
-pub mod cloud;
-
 mod codex;
 
 /// Fast, shallow coding-agent session discovery and the cache-only catalog
@@ -44,8 +41,6 @@ mod relationships;
 pub mod remote;
 pub mod source_intake;
 pub mod sources;
-
-pub mod replay;
 
 pub use discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env,
@@ -70,8 +65,8 @@ pub use relationships::{record_relationship, ObservedRelationship};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 /// When set, sync progress lines (`[claude] +N rows`, …) are suppressed. The
-/// in-process library API ([`sync_and_push`]) sets this so an embedding host's
-/// stdout isn't spammed; the CLI leaves it false.
+/// in-process local sync API sets this to keep the embedding host's stdout
+/// available for its own output; the CLI leaves it false.
 static SYNC_QUIET: AtomicBool = AtomicBool::new(false);
 
 /// `println!` for sync progress that honors [`SYNC_QUIET`].
@@ -81,17 +76,6 @@ macro_rules! sync_note {
             println!($($arg)*);
         }
     };
-}
-
-/// Result of an in-process [`sync_and_push`] run.
-pub struct SyncPushOutcome {
-    pub sent: u64,
-    pub accepted: u64,
-    /// `false` when there's no stored relayhistory auth yet (treated as a no-op
-    /// rather than an error, for background callers).
-    pub authenticated: bool,
-    /// `true` when another process owned the scan lock. Already-indexed rows are still pushed.
-    pub sync_skipped: bool,
 }
 
 /// Refresh local agent history without performing any cloud operation.
@@ -208,132 +192,14 @@ fn sync_scope_with_connectors(
 /// that is the documented "runs whatever is available" contract; a remote-only
 /// request was already rejected by [`sync_scoped_at_with_connectors`] before this point.
 fn sync_remote_connectors(
-    db_path: &Path,
+    _db_path: &Path,
     scope: SessionScope,
-    connectors: &remote::SourceConnectorSelection,
+    _connectors: &remote::SourceConnectorSelection,
 ) -> Result<bool> {
-    let statuses = remote::selected_remote_connector_statuses_at(&home_dir(), connectors, &[]);
-    if !statuses.iter().any(|status| status.configured) {
-        if scope == SessionScope::All {
-            sync_note!("  [remote] no remote provider connectors configured; skipped");
-            return Ok(false);
-        }
-        remote::ensure_selected_remote_connectors_configured_for_at(
-            "sync",
-            &home_dir(),
-            &[],
-            connectors,
-        )?;
+    if scope == SessionScope::All {
+        return Ok(false);
     }
-    let options = DiscoverOptions {
-        scope: SessionScope::Remote,
-        sources: Vec::new(),
-        limit: None,
-    };
-    let mut relaycast_ran = false;
-    if statuses
-        .iter()
-        .any(|s| s.connector == remote::RELAYCAST_CONNECTOR && s.configured)
-    {
-        // Serialize the persisted acquisition cursor with other sync writers.
-        if let Some(_lock) = try_acquire_sync_lock(db_path)? {
-            let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-            let state_path = db_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(".sync-state.json");
-            let mut state = load_sync_state(&state_path)?;
-            sync_relaycast(&conn, &mut state)?;
-            save_sync_state(&state_path, &state)?;
-            relaycast_ran = true;
-        } else {
-            sync_note!("  [relaycast] another sync owns its acquisition cursor; skipped");
-        }
-    }
-    if !statuses
-        .iter()
-        .any(|s| s.connector != remote::RELAYCAST_CONNECTOR && s.configured)
-    {
-        return Ok(relaycast_ran);
-    }
-    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let summary = discover::discover_sessions_with_connectors(
-        &DiscoveryEnv::new(&conn),
-        &options,
-        connectors,
-        |_| {},
-    )?;
-    // `all` ingests local transcripts before remote discovery. Correlate from
-    // the exact ids cached by that local pass; remote-only sync never opens a
-    // local transcript merely to repair topology.
-    reconcile_claude_remote_relationships(&conn)?;
-    for (source, provider) in &summary.providers {
-        sync_note!(
-            "  [remote:{source}] {} session(s): {} discovered, {} unchanged",
-            provider.candidates,
-            provider.discovered,
-            provider.skipped_unchanged
-        );
-    }
-    for diagnostic in &summary.diagnostics {
-        sync_note!(
-            "  [remote:{}] {}: {}",
-            diagnostic.source,
-            diagnostic.locator.as_deref().unwrap_or("(connector)"),
-            diagnostic.error
-        );
-    }
-    Ok(true)
-}
-
-/// Sync local agent history into the DB, then push new records to
-/// relayhistory-cloud — the in-process equivalent of `ai-hist sync && ai-hist
-/// push`, with sync progress output suppressed. This is the entry point the
-/// napi binding exposes so a host (e.g. the Agent Relay runtime) can capture
-/// without spawning the CLI.
-pub fn sync_and_push() -> Result<SyncPushOutcome> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-
-    let db_path = default_db_path();
-    let (conn, sync_skipped) = prepare_local_sync_snapshot(&db_path)?;
-
-    // The in-process runtime has no CLI argument channel. Keep it pinned to the normal Cloud
-    // origin rather than following whichever stage happened to be logged into most recently.
-    let default_base_url = cloud::default_base_url();
-    let auth = match cloud::load_auth(Some(&default_base_url))? {
-        Some(auth) => auth,
-        None => {
-            return Ok(SyncPushOutcome {
-                sent: 0,
-                accepted: 0,
-                authenticated: false,
-                sync_skipped,
-            })
-        }
-    };
-    let machine = MachineIdentity {
-        id: cloud::machine_id()?,
-        hostname: cloud::machine_hostname(),
-        os: Some(std::env::consts::OS.to_string()),
-        cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        ..Default::default()
-    };
-    let cursor = cloud::load_cursor(&auth.base_url)?;
-    let report = cloud::push(
-        &conn,
-        &cloud::UreqIngestor,
-        &auth,
-        &machine,
-        &cursor,
-        500,
-        &HashSet::new(),
-    )?;
-    Ok(SyncPushOutcome {
-        sent: report.sent as u64,
-        accepted: report.accepted,
-        authenticated: true,
-        sync_skipped,
-    })
+    anyhow::bail!("CONNECTOR_NOT_CONFIGURED: remote acquisition requires an explicitly registered source plugin")
 }
 
 /// Cache-only session catalog listing against the default database.
@@ -4727,183 +4593,6 @@ fn parse_iso_ms(raw: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-fn sync_relaycast(conn: &Connection, state: &mut Map<String, Value>) -> Result<usize> {
-    let api_key = std::env::var("RELAYCAST_API_KEY").unwrap_or_default();
-    let workspace = std::env::var("RELAYCAST_WORKSPACE_ID").unwrap_or_default();
-    if api_key.is_empty() || workspace.is_empty() {
-        return Ok(0);
-    }
-    let base =
-        std::env::var("RELAYCAST_BASE_URL").unwrap_or_else(|_| "https://api.relaycast.dev".into());
-    let mut relay_state = state
-        .get("relay")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut inserted = 0;
-    let channels = relay_get(&base, &api_key, "channels", &[])?
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for channel in channels {
-        let Some(name) = channel.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        inserted += sync_relay_messages(
-            conn,
-            &mut relay_state,
-            &base,
-            &api_key,
-            &format!("channels/{name}/messages"),
-            &format!("ch:{name}"),
-            &format!("#{name}"),
-            &workspace,
-        )?;
-    }
-    let conversations = relay_get(&base, &api_key, "dm/conversations/all", &[])
-        .ok()
-        .and_then(|v| v.get("data").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
-    for conversation in conversations {
-        let Some(id) = conversation.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        inserted += sync_relay_messages(
-            conn,
-            &mut relay_state,
-            &base,
-            &api_key,
-            &format!("dm/conversations/{id}/messages"),
-            &format!("dm:{id}"),
-            &format!("dm:{id}"),
-            &workspace,
-        )?;
-    }
-    state.insert("relay".to_string(), Value::Object(relay_state));
-    sync_note!("  [relay] +{inserted} rows");
-    Ok(inserted)
-}
-
-fn sync_relay_messages(
-    conn: &Connection,
-    relay_state: &mut Map<String, Value>,
-    base: &str,
-    api_key: &str,
-    path: &str,
-    state_key: &str,
-    fallback_session: &str,
-    workspace: &str,
-) -> Result<usize> {
-    let mut inserted = 0;
-    let mut after = relay_state
-        .get(state_key)
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let mut max_id = after.clone();
-    loop {
-        let mut params = vec![("limit", "100")];
-        if let Some(after) = after.as_deref() {
-            params.push(("after", after));
-        }
-        let messages = relay_get(base, api_key, path, &params)?
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if messages.is_empty() {
-            break;
-        }
-        for msg in &messages {
-            let text = msg.get("text").and_then(Value::as_str).unwrap_or("");
-            if text.is_empty() {
-                continue;
-            }
-            let sender = msg
-                .get("from_name")
-                .or_else(|| msg.get("from_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let prompt = if sender.is_empty() {
-                text.to_string()
-            } else {
-                format!("[{sender}] {text}")
-            };
-            let session_id = msg
-                .get("thread_id")
-                .and_then(Value::as_str)
-                .unwrap_or(fallback_session);
-            let timestamp_ms = msg
-                .get("created_at")
-                .and_then(Value::as_str)
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
-            inserted += ai_hist_core::insert_history_at_location(
-                conn,
-                &HistoryEntry {
-                    id: 0,
-                    source: "relay".into(),
-                    session_id: Some(session_id.to_string()),
-                    project: Some(workspace.to_string()),
-                    prompt_hash: Some(prompt_hash(&prompt)),
-                    prompt,
-                    timestamp_ms,
-                },
-                SessionLocation::Remote,
-            )?;
-            if let Some(id) = msg.get("id").and_then(Value::as_str) {
-                if max_id.as_deref().is_none_or(|current| id > current) {
-                    max_id = Some(id.to_string());
-                }
-            }
-        }
-        if messages.len() < 100 {
-            break;
-        }
-        after = messages
-            .last()
-            .and_then(|msg| msg.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if after.is_none() {
-            break;
-        }
-    }
-    if let Some(max_id) = max_id {
-        relay_state.insert(state_key.to_string(), json!(max_id));
-    }
-    Ok(inserted)
-}
-
-fn relay_get(base: &str, api_key: &str, path: &str, params_: &[(&str, &str)]) -> Result<Value> {
-    let mut url = format!("{}/v1/{}", base.trim_end_matches('/'), path);
-    if !params_.is_empty() {
-        url.push('?');
-        url.push_str(
-            &params_
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("&"),
-        );
-    }
-    let output = std::process::Command::new("curl")
-        .arg("-fsSL")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {api_key}"))
-        .arg("-H")
-        .arg("Accept: application/json")
-        .arg(url)
-        .output()
-        .context("running curl for Relaycast API")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Relaycast API request failed with status {}",
-        output.status
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
 fn parse_claude_line(line: &str) -> Result<Option<HistoryEntry>> {
     ai_hist_core::parse_claude(line)
 }
@@ -8412,243 +8101,5 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
-    }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    fn history_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
-            .unwrap()
-    }
-
-    fn fresh_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn
-    }
-
-    /// Reads one request line from `stream` and drains its headers so the
-    /// client sees a complete exchange.
-    fn read_request_line(stream: &mut std::net::TcpStream) -> String {
-        use std::io::{BufRead, BufReader};
-
-        // Accepted sockets inherit nonblocking mode on macOS.
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut first_line = String::new();
-        reader.read_line(&mut first_line).unwrap();
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line.trim_end().is_empty() {
-                break;
-            }
-        }
-        first_line.trim_end().to_string()
-    }
-
-    /// Answers exactly `count` HTTP requests off `listener` with `respond`, and
-    /// hands back the request lines it saw.
-    fn serve_http(
-        listener: std::net::TcpListener,
-        count: usize,
-        respond: impl Fn(&str) -> (&'static str, String) + Send + 'static,
-    ) -> std::thread::JoinHandle<Vec<String>> {
-        listener.set_nonblocking(true).unwrap();
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let mut seen = Vec::new();
-            while seen.len() < count && started.elapsed() < Duration::from_secs(20) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => panic!("accept failed: {error}"),
-                };
-                let line = read_request_line(&mut stream);
-                let (status, body) = respond(&line);
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                seen.push(line);
-            }
-            assert_eq!(seen.len(), count, "served {seen:?}");
-            seen
-        })
-    }
-
-    /// A Relaycast messages page holding ids `m{first}`..`m{first + count - 1}`.
-    fn relay_message_page(first: usize, count: usize) -> String {
-        let messages: Vec<Value> = (first..first + count)
-            .map(|n| json!({"id": format!("m{n:03}"), "from_name": "ana", "text": format!("relay message {n:03}")}))
-            .collect();
-        serde_json::to_string(&json!({ "data": messages })).unwrap()
-    }
-
-    fn relaycast_env(base: &str) -> (EnvVarGuard, EnvVarGuard, EnvVarGuard) {
-        (
-            EnvVarGuard::set("RELAYCAST_API_KEY", "rc_test_key"),
-            EnvVarGuard::set("RELAYCAST_WORKSPACE_ID", "ws-e2e"),
-            EnvVarGuard::set("RELAYCAST_BASE_URL", base),
-        )
-    }
-
-    #[test]
-    fn relaycast_sync_pages_through_a_channel_and_saves_the_high_water_mark() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // channels, messages page 1, messages page 2, dm listing.
-        let server = serve_http(listener, 4, |line| {
-            if line.starts_with("GET /v1/channels ") {
-                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
-            } else if line.starts_with("GET /v1/channels/general/messages?limit=100&after=m099 ") {
-                ("200 OK", relay_message_page(100, 2))
-            } else if line.starts_with("GET /v1/channels/general/messages?limit=100 ") {
-                // A full page is the signal that another page may follow.
-                ("200 OK", relay_message_page(0, 100))
-            } else if line.starts_with("GET /v1/dm/conversations/all ") {
-                ("200 OK", r#"{"data":[]}"#.to_string())
-            } else {
-                panic!("unexpected request: {line}");
-            }
-        });
-
-        let conn = fresh_db();
-        let mut state = Map::new();
-        let _env = relaycast_env(&format!("http://{addr}"));
-        let inserted = sync_relaycast(&conn, &mut state).unwrap();
-        let requests = server.join().unwrap();
-
-        assert_eq!(inserted, 102);
-        assert_eq!(history_count(&conn), 102);
-        let locations = ai_hist_core::session_locations(&conn, "relay", "#general").unwrap();
-        assert_eq!(locations, vec!["remote"]);
-        assert!(
-            requests[2].contains("after=m099"),
-            "the second page must continue from the last id of the first: {requests:?}"
-        );
-
-        // Messages are attributed to their sender and the workspace.
-        let (prompt, project, session_id): (String, Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT prompt, project, session_id FROM history WHERE prompt LIKE '%message 000'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(prompt, "[ana] relay message 000");
-        assert_eq!(project.as_deref(), Some("ws-e2e"));
-        // The channel name is the session; "ch:general" is only the state key.
-        assert_eq!(session_id.as_deref(), Some("#general"));
-
-        // The cursor saved is the highest id seen across both pages.
-        assert_eq!(state["relay"]["ch:general"], json!("m101"));
-    }
-
-    #[test]
-    fn relaycast_sync_resumes_from_the_saved_after_cursor() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = serve_http(listener, 3, |line| {
-            if line.starts_with("GET /v1/channels ") {
-                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
-            } else if line.starts_with("GET /v1/channels/general/messages?limit=100&after=m050 ") {
-                ("200 OK", relay_message_page(51, 1))
-            } else if line.starts_with("GET /v1/dm/conversations/all ") {
-                ("200 OK", r#"{"data":[]}"#.to_string())
-            } else {
-                panic!("unexpected request: {line}");
-            }
-        });
-
-        let conn = fresh_db();
-        let mut state = Map::new();
-        state.insert("relay".into(), json!({"ch:general": "m050"}));
-        let _env = relaycast_env(&format!("http://{addr}"));
-        let inserted = sync_relaycast(&conn, &mut state).unwrap();
-        let requests = server.join().unwrap();
-
-        // Only the one message after the cursor is asked for, and stored.
-        assert_eq!(inserted, 1);
-        assert_eq!(history_count(&conn), 1);
-        assert!(requests[1].contains("after=m050"), "{requests:?}");
-        assert_eq!(state["relay"]["ch:general"], json!("m051"));
-    }
-
-    #[test]
-    fn relaycast_sync_keeps_channel_rows_when_the_dm_listing_is_forbidden() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = serve_http(listener, 3, |line| {
-            if line.starts_with("GET /v1/channels ") {
-                ("200 OK", r#"{"data":[{"name":"general"}]}"#.to_string())
-            } else if line.starts_with("GET /v1/channels/general/messages?limit=100 ") {
-                ("200 OK", relay_message_page(0, 1))
-            } else if line.starts_with("GET /v1/dm/conversations/all ") {
-                // Plenty of API keys have channel scope but no DM scope.
-                ("403 Forbidden", r#"{"error":"forbidden"}"#.to_string())
-            } else {
-                panic!("unexpected request: {line}");
-            }
-        });
-
-        let conn = fresh_db();
-        let mut state = Map::new();
-        let _env = relaycast_env(&format!("http://{addr}"));
-        let inserted = sync_relaycast(&conn, &mut state).unwrap();
-        server.join().unwrap();
-
-        // The DM refusal is tolerated: the channel rows still land.
-        assert_eq!(inserted, 1);
-        assert_eq!(history_count(&conn), 1);
-        assert_eq!(state["relay"]["ch:general"], json!("m000"));
-    }
-
-    #[test]
-    fn relaycast_sync_is_a_no_op_without_credentials() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let conn = fresh_db();
-        let mut state = Map::new();
-        // An unreachable base url proves no request is attempted at all.
-        let _env = (
-            EnvVarGuard::set("RELAYCAST_API_KEY", ""),
-            EnvVarGuard::set("RELAYCAST_WORKSPACE_ID", "ws-e2e"),
-            EnvVarGuard::set("RELAYCAST_BASE_URL", "http://127.0.0.1:1"),
-        );
-        assert_eq!(sync_relaycast(&conn, &mut state).unwrap(), 0);
-        assert_eq!(history_count(&conn), 0);
-        assert!(state.is_empty());
     }
 }
