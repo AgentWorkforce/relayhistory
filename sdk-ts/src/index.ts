@@ -7,7 +7,6 @@
  */
 
 import { nativeCall } from './native.js';
-import { loadStoredRelayhistoryAuth } from './cloud-client.js';
 import {
   SESSION_CATALOG_CONTRACT_VERSION,
   SESSION_HYDRATION_CONTRACT_VERSION,
@@ -20,7 +19,6 @@ import {
   isCatalogSource,
   SessionScope,
   SessionLocation,
-  RelayHistoryError,
   NativeContractMismatchError,
   InvalidArgumentError,
   SessionSourceUnavailableError,
@@ -133,7 +131,15 @@ export interface DiscoveryCounters {
 
 export interface SourceExemption { source: string; reason: string }
 
-export interface DiscoverSessionsOptions {
+/** Explicit remote acquisition selection; cached reads never consult connectors. */
+export interface SourceConnectorOptions {
+  /** Omit for provider-only defaults; [] disables remote acquisition. Local scope
+   * never probes remote connectors. Commercial connectors require explicit IDs.
+   * Built-ins: claude-web, codex-cloud, cloud, relaycast (sync only). */
+  sourceConnectors?: string[];
+}
+
+export interface DiscoverSessionsOptions extends SourceConnectorOptions {
   dbPath?: string;
   scope?: SessionScope;
   sources?: CatalogSource[];
@@ -162,7 +168,7 @@ export interface SessionRef {
   scope?: SessionScope;
 }
 
-export interface HydrateSessionOptions extends SessionRef {
+export interface HydrateSessionOptions extends SessionRef, SourceConnectorOptions {
   dbPath?: string;
   includeRelated?: boolean;
 }
@@ -444,7 +450,7 @@ export interface Stats {
 }
 
 export interface StatsOptions { dbPath?: string; scope?: SessionScope; tag?: string }
-export interface SyncOptions { dbPath?: string; scope?: SessionScope }
+export interface SyncOptions extends SourceConnectorOptions { dbPath?: string; scope?: SessionScope }
 export interface SyncResult { databasePath: string; scope: SessionScope; completed: boolean }
 
 type UnknownRecord = Record<string, unknown>;
@@ -784,12 +790,12 @@ export async function nativeBuildProfile(): Promise<string> {
 }
 
 export async function search(query: string, options: SearchOptions = {}): Promise<HistoryEntry[]> {
-  const scope = await resolveRemoteScope(options.scope ?? 'local');
+  const scope = options.scope ?? 'local';
   return nativeCall(async (native) => (await native.search(query, { ...options, scope })).map(historyEntry));
 }
 
 export async function recent(options: ListOptions = {}): Promise<HistoryEntry[]> {
-  const scope = await resolveRemoteScope(options.scope ?? 'local');
+  const scope = options.scope ?? 'local';
   return nativeCall(async (native) => (await native.recent({ ...options, scope })).map(historyEntry));
 }
 
@@ -802,11 +808,7 @@ export async function listSessionCatalog(options: ListCatalogOptions = {}): Prom
 }
 
 export async function listSessionCatalogPage(options: ListCatalogOptions = {}): Promise<SessionCatalogPage> {
-  const requestedScope = options.scope ?? 'local';
-  if (requestedScope === 'remote') {
-    await ensureRemoteAuthentication('remote');
-  }
-  const scope = await resolveRemoteScope(requestedScope);
+  const scope = options.scope ?? 'local';
   return nativeCall(async (native) => {
     const page = await native.listSessionCatalogPage({ ...options, scope, after: options.after ? {
       ...options.after,
@@ -824,8 +826,9 @@ export async function listSessionCatalogPage(options: ListCatalogOptions = {}): 
 }
 
 export async function discoverSessions(options: DiscoverSessionsOptions = {}): Promise<DiscoverResult> {
+  const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
   return nativeCall(async (native) => {
-    const result = await native.discoverSessions({ ...options, scope: options.scope ?? 'local' });
+    const result = await native.discoverSessions({ ...options, sourceConnectors, scope: options.scope ?? 'local' });
     const contractVersion = Number(result.contractVersion);
     assertCatalogContract(contractVersion);
     return {
@@ -857,9 +860,10 @@ export async function hydrateSession(options: HydrateSessionOptions): Promise<Hy
   if (typeof options.sessionId !== 'string' || options.sessionId.trim() === '') {
     throw new InvalidArgumentError('sessionId must not be empty', 'INVALID_ARGUMENT');
   }
+  const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
   return nativeCall(async (native) => {
     const value = await native.hydrateSession({
-      ...options,
+      ...options, sourceConnectors,
       scope: options.scope ?? 'local',
       includeRelated: options.includeRelated ?? true,
     });
@@ -1188,14 +1192,8 @@ export async function getSessionFileEdits(
 
 export async function stats(options: StatsOptions = {}): Promise<Stats> {
   const scope = options.scope ?? 'local';
-  // Cache-only remote stats would otherwise exit 0 with an empty org store (#126).
-  // Acquisition paths keep native connector semantics; do not gate those here.
-  if (scope === 'remote') {
-    await ensureRemoteAuthentication('remote');
-  }
-  const effectiveScope = await resolveRemoteScope(scope);
   return nativeCall(async (native) => {
-    const result = await native.stats({ ...options, scope: effectiveScope });
+    const result = await native.stats({ ...options, scope });
     const bySource: Partial<Record<Source, number>> = {};
     for (const item of (result.bySource as UnknownRecord[] | undefined) ?? []) {
       bySource[String(item.source) as Source] = Number(item.count);
@@ -1211,8 +1209,9 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
 }
 
 export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
+  const sourceConnectors = validateSourceConnectors(options.sourceConnectors);
   return nativeCall(async (native) => {
-    const result = await native.sync({ ...options, scope: options.scope ?? 'local' });
+    const result = await native.sync({ ...options, sourceConnectors, scope: options.scope ?? 'local' });
     return {
       databasePath: String(result.databasePath),
       scope: validateNativeScope(result.scope),
@@ -1374,25 +1373,13 @@ function shellQuote(value: string): string {
   return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-/** Cache-only remote stats guard (#126). Connector acquisition uses native checks. */
-async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
-  if (scope !== 'remote') return;
-
-  const auth = await loadStoredRelayhistoryAuth();
-  if (!auth) {
-    throw new RelayHistoryError(
-      'not authenticated for remote scope — run `ai-hist login` first',
-      'CLOUD_AUTH_FAILED'
-    );
+function validateSourceConnectors(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || [...value].some((id) => typeof id !== 'string' || !id || id.trim() !== id)) {
+    throw new InvalidArgumentError('sourceConnectors must be an array of nonempty, unpadded connector IDs', 'INVALID_ARGUMENT');
   }
-}
-
-/**
- * For `--all`, fall back to local only when RelayHistory credentials are absent.
- * Credential-store and stage-selection errors propagate unchanged.
- */
-async function resolveRemoteScope(scope: SessionScope): Promise<SessionScope> {
-  if (scope !== 'all') return scope;
-  const auth = await loadStoredRelayhistoryAuth();
-  return auth ? 'all' : 'local';
+  if (new Set(value).size !== value.length) {
+    throw new InvalidArgumentError('sourceConnectors must not contain duplicate IDs', 'INVALID_ARGUMENT');
+  }
+  return [...value];
 }

@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 11, catalog contract version 3, hydration contract version 2,
+version 12, catalog contract version 3, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -52,25 +52,38 @@ a logical session was observed, not independent session stores. Collection
 operations accept one scope: `local` (the default), `remote`, or `all`. The
 `all` view is the union of both presences, deduplicated by canonical session
 identity, so materializing a remote session locally does not create a second
-user-visible session. Connector-specific locator, change stamp, and discovery
-state live on each presence, preventing a local scan and a cloud scan from
-overwriting one another's acquisition state.
+user-visible session. Locator, change stamp, and discovery state currently live
+on each location presence. Independent observations from two remote connectors
+can still overwrite those fields; connector-specific provenance is a separate
+migration, not a guarantee of the selection API.
 
-Scope changes selection, not I/O. Cached collection reads (`sessions list`,
-`search`, and `recent`) stay database-only for every scope. Direct session and
-event lookup already names one session and remains scope-independent.
+Cached SDK catalog, search, recent, and statistics reads preserve the requested
+scope without reading commercial credentials or invoking remote transports.
+Stored remote evidence remains readable with absent, malformed, expired, or
+ambiguous commercial auth. Direct session and event lookup already names one
+session and remains scope-independent. The CLI's existing first-use local
+bootstrap can be disabled with `--no-bootstrap`.
 
-Acquisition is still explicit. Local discovery and sync scan provider files;
-remote discovery and sync run provider connectors (`claude-web` for
-claude.ai/code web sessions, `codex-cloud` for Codex cloud tasks — see
-[Remote connectors](remote-connectors.md)). A connector participates only when
-the provider CLI's stored sign-in is present on the machine. Explicit `remote`
-acquisition with no connector configured returns an unsupported operation; the
-engine must not silently fall back to local work. `all` acquisition runs the
-local adapters plus every configured connector. An acquisition result's
-`scope` records the request; its `locations_run` records which connector
-locations actually executed, and observed presences belong to each session
-row's `locations`.
+Acquisition accepts `sourceConnectors` on discovery, hydration, and sync. Omit it
+for the provider defaults (`claude-web`, `codex-cloud`), or pass `[]` to disable
+remote acquisition. Commercial `cloud` recall and `relaycast` ingestion are
+selected explicitly. Selection precedes credential checks; local scope never
+probes any remote connector, even when commercial credentials are present.
+`source` identifies the history provider while a connector ID selects its
+acquisition path. See [Remote connectors](remote-connectors.md).
+
+Remote acquisition without an available selected connector fails before database
+creation. `all` can run local adapters while reporting unavailable selected
+remotes. Its `scope` records the request and `locations_run` records the
+locations executed. Local sync does not contact Relaycast; explicit Relaycast
+sync writes new observations with remote presence. Historical Relay rows are
+not relabeled.
+
+This release adds selection among built-in connectors, not dynamically loaded
+plugins. Cloud code and build dependencies remain in the existing distribution;
+optional package extraction and the destination plugin/durable delivery APIs are
+separate work. Native contract 12 prevents older addons from silently ignoring
+`sourceConnectors`.
 
 ## Operation semantics
 

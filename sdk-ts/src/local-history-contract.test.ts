@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  RelayHistoryError, SessionSourceUnavailableError,
+  SessionSourceUnavailableError,
   discoverSessions, getSessionEvents, getSessionEventsPage, getSessionFileEdits,
   getSessionToolCalls, hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
   type CatalogCursor, type CatalogSession, type EventCursor,
@@ -63,38 +63,28 @@ async function claudeSession(home: string, sessionId: string): Promise<string> {
   return path;
 }
 
-test('KNOWN VIOLATION (stage 2): absent auth rejects only some cached remote query APIs', async () => {
+test('absent commercial auth allows every cached remote query API', async () => {
   await withFixture(async ({ dbPath }) => {
-    // Search/recent already permit offline remote reads. Catalog/stats reject
-    // that same scope before consulting the cache. Stage 2 must make all four
-    // honor the requested scope and replace these rejection assertions.
     assert.deepEqual(await search('contractneedle', { dbPath, scope: 'remote' }), []);
     assert.deepEqual(await recent({ dbPath, scope: 'remote' }), []);
-    for (const operation of [
-      () => listSessionCatalogPage({ dbPath, scope: 'remote' }),
-      () => stats({ dbPath, scope: 'remote' }),
-    ]) {
-      await assert.rejects(operation, (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED');
-    }
+    const page = await listSessionCatalogPage({ dbPath, scope: 'remote' });
+    assert.equal(page.scope, 'remote');
+    assert.deepEqual(page.sessions, []);
+    const counts = await stats({ dbPath, scope: 'remote' });
+    assert.equal(counts.scope, 'remote');
+    assert.equal(counts.total, 0);
   });
 });
 
-test('KNOWN VIOLATION (stage 2): malformed commercial auth breaks every cached all-scope query', async () => {
+test('malformed commercial auth leaves cached all-scope queries unchanged', async () => {
   await withFixture(async ({ cloudHome, dbPath }) => {
     const stages = join(cloudHome, 'stages');
     await mkdir(stages, { recursive: true });
     await writeFile(join(stages, 'broken.auth.json'), '{not-json', { mode: 0o600 });
-    for (const operation of [
-      () => search('contractneedle', { dbPath, scope: 'all' }),
-      () => recent({ dbPath, scope: 'all' }),
-      () => listSessionCatalogPage({ dbPath, scope: 'all' }),
-      () => stats({ dbPath, scope: 'all' }),
-    ]) {
-      await assert.rejects(operation, (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message === 'could not parse stored relayhistory session; run `ai-hist login`');
-    }
+    assert.deepEqual(await search('contractneedle', { dbPath, scope: 'all' }), []);
+    assert.deepEqual(await recent({ dbPath, scope: 'all' }), []);
+    assert.equal((await listSessionCatalogPage({ dbPath, scope: 'all' })).scope, 'all');
+    assert.equal((await stats({ dbPath, scope: 'all' })).scope, 'all');
   });
 });
 

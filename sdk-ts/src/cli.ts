@@ -17,10 +17,10 @@ type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> }
 
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'project', 'source', 'tag', 'token', 'tokens',
+  'max-depth', 'max-nodes', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -127,6 +127,14 @@ function textFlags(args: Parsed, name: string): string[] {
   return (args.flags.get(name) ?? []).filter((value): value is string => typeof value === 'string');
 }
 
+function sourceConnectorFlags(args: Parsed): string[] | undefined {
+  if (args.flags.has('no-source-connectors')) {
+    if (args.flags.has('source-connector')) usage('--no-source-connectors and --source-connector are mutually exclusive');
+    return [];
+  }
+  return args.flags.has('source-connector') ? textFlags(args, 'source-connector') : undefined;
+}
+
 function numberFlag(args: Parsed, name: string): number | undefined {
   const value = textFlag(args, name);
   if (value === undefined) return undefined;
@@ -215,8 +223,8 @@ function showHelp(): never {
   ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
   ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
-  ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
-  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
+  ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--source SOURCE] [--limit N] [--json]
+  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--no-related] [--db PATH] [--json]
   ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
   ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
   ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
@@ -231,7 +239,7 @@ function showHelp(): never {
   ai-hist token [--base-url URL]
   ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
-  ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
+  ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
 --no-bootstrap to answer from the store exactly as it stands.
@@ -245,8 +253,8 @@ function usage(message?: string): never {
   ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
   ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
-  ai-hist sessions discover [--local | --remote | --all] [--source SOURCE] [--limit N] [--json]
-  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--no-related] [--db PATH] [--json]
+  ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--source SOURCE] [--limit N] [--json]
+  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--no-related] [--db PATH] [--json]
   ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
   ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
   ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
@@ -261,7 +269,7 @@ function usage(message?: string): never {
   ai-hist token [--base-url URL]
   ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
-  ai-hist sync [--local | --remote | --all] [--db PATH] [--json]
+  ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
 --no-bootstrap to answer from the store exactly as it stands.
@@ -603,10 +611,12 @@ const COMMANDS = new Map<string, CommandSpec>([
       'json', 'limit', 'local', 'pretty', 'remote', 'source',
     ] }],
   ['sessions discover', { name: 'sessions discover', positionals: [0, 0],
-    allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source'] }],
-  ['sessions hydrate', { name: 'sessions hydrate', positionals: [2, 2], readsLocalStore: true,
+    validate: (args) => { sourceConnectorFlags(args); },
+    allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source', 'source-connector', 'no-source-connectors'] }],
+  ['sessions hydrate', { name: 'sessions hydrate', positionals: [2, 2],
     requires: 'sessions hydrate requires SOURCE and SESSION_ID',
-    allowed: ['all', 'db', 'json', 'local', 'no-related', 'remote'] }],
+    validate: (args) => { sourceConnectorFlags(args); },
+    allowed: ['all', 'db', 'json', 'local', 'no-bootstrap', 'no-related', 'remote', 'source-connector', 'no-source-connectors'] }],
   ['sessions relationships', { name: 'sessions relationships', positionals: [2, 2], readsLocalStore: true,
     rejectsScope: true, requires: 'sessions relationships requires SOURCE and SESSION_ID',
     allowed: ['all', 'db', 'json', 'local', 'remote'] }],
@@ -642,7 +652,8 @@ const COMMANDS = new Map<string, CommandSpec>([
     allowed: ['all', 'db', 'json', 'local', 'remote', 'tag'] }],
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
-  ['sync', { name: 'sync', positionals: [0, 0], allowed: ['all', 'db', 'json', 'local', 'remote'] }],
+  ['sync', { name: 'sync', positionals: [0, 0], validate: (args) => { sourceConnectorFlags(args); },
+    allowed: ['all', 'db', 'json', 'local', 'remote', 'source-connector', 'no-source-connectors'] }],
 ]);
 
 /** Command words consumed before the positional arguments start. */
@@ -669,7 +680,7 @@ function unknownCommandMessage(command: string | undefined, subcommand: string |
 // A store that was never built and a store holding no match are different
 // answers, and `No results.` is only true of the second. Wording and exit code
 // separate them; the query is not run against a store that cannot hold one.
-/** `--all` may skip remote and answer from local even when the local store is empty. */
+/** Cached remote evidence can answer an all-scope query even when local history is empty. */
 function skipUnusableStoreGate(spec: CommandSpec, scope: SessionScope): boolean {
   if (scope !== 'all') return false;
   return spec.name === 'stats'
@@ -826,6 +837,7 @@ async function main(): Promise<void> {
   if (command === 'sessions' && subcommand === 'discover') {
     const sources = textFlags(args, 'source');
     outputDiscovery(await discoverSessions({
+      sourceConnectors: sourceConnectorFlags(args),
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
     }), json);
@@ -833,6 +845,7 @@ async function main(): Promise<void> {
   }
   if (command === 'sessions' && subcommand === 'hydrate') {
     outputHydration(await hydrateSession({
+      sourceConnectors: sourceConnectorFlags(args),
       source: sessionSource as never,
       sessionId: sessionId!,
       scope: scopeFlag(args),
@@ -900,7 +913,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'sync') {
-    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args) }), json);
+    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sourceConnectors: sourceConnectorFlags(args) }), json);
     return;
   }
   usage();

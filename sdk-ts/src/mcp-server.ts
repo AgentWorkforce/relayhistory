@@ -19,11 +19,10 @@ const CLOUD_READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: tr
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
-// Targeted hydration indexes local provider evidence only.
-const LOCAL_WRITE = { readOnlyHint: false, idempotentHint: true, openWorldHint: false } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
+const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit connector IDs; omit for provider defaults, [] disables remote acquisition. Commercial connectors require explicit selection.');
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version as string;
@@ -71,15 +70,17 @@ server.tool('list_sessions', 'Cache-only indexed session catalog listing. This n
 server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates only the session catalog.', {
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
-}, ACQUIRE, (args) => call(() => discoverSessions(args)));
+  source_connectors: SOURCE_CONNECTORS,
+}, ACQUIRE, ({ sources, scope, limit, source_connectors }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors })));
 
 server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   scope: SESSION_SCOPE.optional().default('local'),
   include_related: z.boolean().optional().default(true),
-}, LOCAL_WRITE, ({ source, session_id, scope, include_related }) => call(() => hydrateSession({
-  source, sessionId: session_id, scope, includeRelated: include_related,
+  source_connectors: SOURCE_CONNECTORS,
+}, ACQUIRE, ({ source, session_id, scope, include_related, source_connectors }) => call(() => hydrateSession({
+  source, sessionId: session_id, scope, includeRelated: include_related, sourceConnectors: source_connectors,
 })));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
@@ -149,6 +150,7 @@ server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.'
 
 server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   scope: SESSION_SCOPE.optional().default('local'),
-}, ACQUIRE, ({ scope }) => call(() => sync({ scope })));
+  source_connectors: SOURCE_CONNECTORS,
+}, ACQUIRE, ({ scope, source_connectors }) => call(() => sync({ scope, sourceConnectors: source_connectors })));
 
 await server.connect(new StdioServerTransport());

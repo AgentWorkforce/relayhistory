@@ -20,7 +20,7 @@ import {
 } from './sdk-common.js';
 import type { CloudPushResult, RelayhistoryAuth, ReplayOptions, ReplayResult } from './cloud-client.js';
 
-export const NATIVE_CONTRACT_VERSION = 11;
+export const NATIVE_CONTRACT_VERSION = 12;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {

@@ -70,14 +70,39 @@ offline behavior and making provider-cloud access explicit. The CLI exposes the
 same mutually exclusive `--local`, `--remote`, and `--all` flags; omitting them
 is equivalent to `--local`.
 
-Cached reads already support every scope. Remote acquisition runs through
-provider connectors — claude.ai/code web sessions and Codex cloud tasks —
-that are configured by the provider CLI's own sign-in on the machine (see the
-repository's `docs/remote-connectors.md`). On a machine with no connector
-configured, `discoverSessions({ scope: 'remote' })` and
-`sync({ scope: 'remote' })` fail with `UnsupportedOperationError` and the stable
-code `UNSUPPORTED_OPERATION`; they never fall back to local acquisition.
-`scope: 'all'` runs the local adapters plus every configured connector.
+Cached reads preserve the requested scope and never consult commercial auth.
+Stored remote history can be queried with absent, malformed, expired, or
+ambiguous credentials. Discovery, hydration, and sync accept `sourceConnectors`:
+omit it for provider defaults (`claude-web`, `codex-cloud`), supply an explicit
+list, or use `[]` to disable remote acquisition. Local scope never probes remote
+credentials. Commercial login does not automatically select cloud recall or
+Relaycast.
+
+```ts
+await discoverSessions({ scope: 'remote', sourceConnectors: ['cloud'], sources: ['cursor'] });
+await sync({ scope: 'remote', sourceConnectors: ['relaycast'] });
+await sync({ scope: 'all', sourceConnectors: [] }); // local adapters only
+const cached = await stats({ scope: 'remote' }); // no login required
+```
+
+```bash
+ai-hist sessions discover --remote --source-connector cloud --source cursor
+ai-hist sync --remote --source-connector relaycast
+ai-hist sync --all --no-source-connectors
+```
+
+`--source-connector` is repeatable and cannot be combined with
+`--no-source-connectors`. MCP uses `source_connectors`. Invalid selections fail
+before acquisition. Remote discovery/sync without an available selected connector
+returns `UNSUPPORTED_OPERATION`; targeted hydration returns
+`CONNECTOR_NOT_CONFIGURED`. These failures precede database creation. `all`
+continues local acquisition and reports unavailable selected remotes.
+
+This selection API addresses built-in connectors; plugin loading and optional
+cloud package extraction are separate work. Cloud dependencies remain in the
+current package. SDK/native contract 12 is required so older addons cannot
+silently ignore connector selection. See `docs/remote-connectors.md` for
+connector capabilities and authentication.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
 and discovery results additionally report `locationsRun` — the connector

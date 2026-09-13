@@ -4,12 +4,13 @@ Remote acquisition (`sessions discover --remote`, `sync --remote`, and the
 remote half of `--all`) runs through provider connectors. A connector
 enumerates the sessions a provider keeps on its own service and lands them in
 the shared session ledger as catalog rows with a `remote` presence. There are
-three connectors:
+four built-in connectors:
 
 | Connector | Source | Lists | Interface |
 |---|---|---|---|
 | `claude-web` | `claude` | Claude Code sessions on claude.ai/code | listing plus the CLI's private teleport-evidence interface, with its stored OAuth token |
 | `codex-cloud` | `codex` | Codex cloud tasks | `codex cloud list --json` and `codex cloud diff TASK_ID` |
+| `relaycast` | `relay` | Workspace messages (sync only) | Relaycast API using explicitly configured workspace credentials |
 | `cloud` | Upstream source (`claude`, `codex`, `cursor`, `grok`, `relay`, `trajectory`, `opencode`) | Teammate sessions in the token’s organization | `GET /v1/sessions`, using the stored RelayHistory `rth_at_` session |
 
 Local and remote stay presences of one session ledger: a session observed
@@ -17,6 +18,35 @@ both by a local file adapter and by a connector is one catalog row whose
 `locations` are `["local", "remote"]`.
 
 ## Configuration
+
+
+Discovery, hydration, and sync accept an explicit connector allowlist. Scope
+still controls local/remote location; `--source` selects the upstream history
+provider. With no connector option, remote acquisition uses only the provider
+connectors `claude-web` and `codex-cloud`. A commercial login never enables
+`cloud` or `relaycast` automatically. Local scope ignores remote connectors
+without probing their credentials.
+
+```bash
+# Provider acquisition only (the default remote connector selection):
+ai-hist sessions discover --remote --source-connector claude-web
+# Explicit RelayHistory recall:
+ai-hist sessions discover --remote --source-connector cloud --source cursor
+# Explicit Relaycast message ingestion (never part of ordinary local sync):
+ai-hist sync --remote --source-connector relaycast
+# Keep local acquisition even when remote credentials exist:
+ai-hist sync --all --no-source-connectors
+```
+
+Repeat `--source-connector ID` to select multiple built-ins. The SDK uses
+`sourceConnectors: ['cloud']`; `sourceConnectors: []` is the equivalent of
+`--no-source-connectors`. MCP acquisition tools expose `source_connectors`.
+Unknown IDs, padded/empty SDK IDs, and duplicate SDK IDs are rejected. The CLI
+rejects combining `--source-connector` with `--no-source-connectors`.
+
+This is explicit selection among the built-in implementations. Optional plugin
+packages and dynamic plugin registration are not implemented by this change;
+the ordinary distribution still includes cloud dependencies.
 
 The provider connectors use their CLI’s stored sign-in. The `cloud` connector
 reuses the RelayHistory session created by `ai-hist login`:
@@ -28,6 +58,9 @@ reuses the RelayHistory session created by `ai-hist login`:
 - `codex-cloud` — `~/.codex/auth.json` exists (written by `codex login`).
   The `codex` binary must be on `PATH` when the connector runs; the CLI
   handles token refresh itself.
+- `relaycast` — `RELAYCAST_API_KEY` and `RELAYCAST_WORKSPACE_ID`; optional
+  `RELAYCAST_BASE_URL` selects its endpoint. It supports sync, not catalog
+  discovery or targeted hydration. Newly ingested rows have remote presence.
 - `cloud` — `cloud::config_dir()` (normally `~/.agentworkforce/relayhistory`,
   overridden by `RELAYHISTORY_HOME`) resolves a stored `rth_at_` session with
   `access_token_expires_at` at least 60 seconds in the future. This RFC 3339
@@ -50,8 +83,8 @@ The client never sends an org/workspace selector: tenancy comes from the token.
 
 ```bash
 ai-hist login
-ai-hist sessions discover --remote --source cursor
-ai-hist sync --all
+ai-hist sessions discover --remote --source-connector cloud --source cursor
+ai-hist sync --all --source-connector cloud
 ```
 
 Cloud is a connector, **not** a new `--source` value. Its adapters query each
@@ -63,8 +96,10 @@ fail rather than silently accepting an invalid listing.
 Requesting `--remote` acquisition with no connector configured fails loudly
 with the same `no remote provider connectors are configured` error as before
 connectors shipped, now including the per-connector reason. `--all` runs
-whatever is configured and never errors on absence — the acquisition
-summary's `locations_run` says what executed.
+local adapters plus available selected connectors and reports unavailable ones
+in diagnostics; `locations_run` says what executed. Invalid selections still
+fail. Remote acquisition with an empty selection fails before creating or
+migrating the database.
 
 `claude-web` talks to `https://api.anthropic.com` only. It deliberately does
 **not** honor `ANTHROPIC_BASE_URL` — that variable redirects generic
@@ -86,7 +121,12 @@ contract; a later run continues from fresher listings.
 ## Targeted remote hydration
 
 `hydrateSession({ source, sessionId, scope: "remote" })` addresses exactly one
-cataloged remote session. It never runs discovery or enumerates other tasks.
+cataloged remote session. Its optional `sourceConnectors` uses the same
+selection as discovery and sync. It never runs discovery or enumerates other
+tasks, and the CLI no longer runs a global bootstrap before targeted hydration.
+An unavailable selected hydration connector returns `CONNECTOR_NOT_CONFIGURED`
+before opening the database. Cloud recall currently supplies shallow discovery
+only; Relaycast supplies sync only.
 Results report `capability` as `full`, `partial`, or `shallow_only`; a provider
 limitation is a successful `capability_limited` result rather than a fabricated
 empty transcript. Authentication, missing-session, bounded-partial, and parser
@@ -170,7 +210,9 @@ Cloud stamps hash the recall rollup and provenance marker, so a changed summary,
 event count, or timestamp invalidates that presence's cache.
 
 Cloud discovery and sync populate shallow catalog rows. Cached list/search/recent/
-stats APIs retain their existing read semantics; this connector does not ingest
+stats APIs are cache-only and preserve the requested scope regardless of
+commercial login state. Stored remote evidence needs no authentication. This
+connector does not ingest
 normalized recall events into the local history tables. `cloud.rs` exposes the
 same authenticated page helper for `GET /v1/events` and
 `GET /v1/sessions/:sessionId/events`, but automatic event ingestion and cloud
