@@ -1,24 +1,9 @@
 use crate::cloud;
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 use tempfile::NamedTempFile;
-
-pub fn run(
-    session_id: &str,
-    base_url: Option<&str>,
-    limit: Option<usize>,
-    max_content: Option<usize>,
-    json: bool,
-    out: Option<&Path>,
-) -> Result<()> {
-    let result = replay(session_id, base_url, limit, max_content, json, out)?;
-    if let Some(body) = result.transcript {
-        io::stdout().lock().write_all(body.as_bytes())?;
-    }
-    Ok(())
-}
 
 /// A completed replay. File output stays in Rust so every caller gets the same
 /// fetch-before-write and atomic replacement guarantees. SDK calls never print.

@@ -90,7 +90,7 @@ npm --prefix crates/ai-hist-napi run build:debug
 node scripts/verify-native-contract.mjs crates/ai-hist-napi/index.js
 npm --prefix sdk-ts test
 cargo test -p ai-hist-engine --lib
-cargo test -p ai-hist-engine --test token --test replay
+cargo test -p ai-hist-cli --test token --test replay
 cargo fmt --all -- --check
 git diff --check
 ```

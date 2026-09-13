@@ -8,7 +8,7 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo test -p ai-hist-engine --test discovery_bench -- --ignored --nocapture
+//! cargo test -p ai-hist-cli --test discovery_bench -- --ignored --nocapture
 //! ```
 //!
 //! It is `#[ignore]`d because it writes tens of megabytes of fixtures and runs

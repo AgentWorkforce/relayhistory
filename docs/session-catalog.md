@@ -626,7 +626,7 @@ The claims above are validated by a benchmark harness rather than by wall-clock
 assertions in the test suite:
 
 ```bash
-cargo test -p ai-hist-engine --test discovery_bench -- --ignored --nocapture
+cargo test -p ai-hist-cli --test discovery_bench -- --ignored --nocapture
 ```
 
 It builds a synthetic multi-provider archive in a temp directory, runs both

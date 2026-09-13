@@ -147,7 +147,7 @@ no longer creates a SQLite backup or reports the provider database size as
 Run only this benchmark with:
 
 ```bash
-cargo test -p ai-hist-engine --test discovery_bench \
+cargo test -p ai-hist-cli --test discovery_bench \
   opencode_fixed_limit_scaling_report -- --ignored --nocapture
 ```
 

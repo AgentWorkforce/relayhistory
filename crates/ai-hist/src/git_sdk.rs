@@ -1,5 +1,5 @@
 //! Explicit-session Git linkage for the npm SDK. No network runs in post-commit.
-use crate::{
+use crate::git_helpers::{
     git_branch, git_commit_files, git_commit_numstat, git_commit_time_ms, git_path, git_repo_root,
     git_stdout, sh_single_quote,
 };

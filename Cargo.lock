@@ -30,6 +30,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-hist-cli"
+version = "0.2.0"
+dependencies = [
+ "ai-hist-core",
+ "ai-hist-engine",
+ "anyhow",
+ "chrono",
+ "clap",
+ "flate2",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "ai-hist-core"
 version = "0.1.0"
 dependencies = [
@@ -49,8 +67,6 @@ dependencies = [
  "anyhow",
  "atomicwrites",
  "chrono",
- "clap",
- "flate2",
  "fs2",
  "hostname",
  "libc",
