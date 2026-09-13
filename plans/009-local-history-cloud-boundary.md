@@ -4,7 +4,7 @@
 > behavior established on main by PR #138. Do not combine behavior fixes,
 > schema migration, and physical moves into one unreviewable change.
 >
-> Drift check: `git diff --stat b20fd1e..HEAD -- Cargo.toml Cargo.lock crates sdk-ts mcp-package scripts .github/workflows docs README.md`.
+> Drift check: `git diff --stat 3155117..HEAD -- Cargo.toml Cargo.lock crates sdk-ts mcp-package scripts .github/workflows docs README.md`.
 > Compare changed areas with this plan before executing. Update this plan if
 > its assumptions no longer hold; do not restore superseded implementations.
 
@@ -12,8 +12,7 @@
 
 - Priority: P1; effort: L (multiple PRs); implementation risk: HIGH.
 - Category: architecture, migration, correctness, packaging.
-- Planned at: `b20fd1e`, 2026-09-13. Reconciled from `3155117`; only the
-  0.16.0 release version bump changed the implementation baseline.
+- Planned at: `3155117`, 2026-09-13, after fetching and fast-forwarding main.
 - Depends on: characterization baseline in stage 1, then the order below.
 - Existing plans 006–008 describe native execution, hydration, and relationship
   behavior that must survive. Their completion status was not audited here.
@@ -546,29 +545,29 @@ and tarball inventories in the implementation PRs.
 
 ## Done criteria
 
-- [ ] All six stages have passing checks; known behavioral violations have
+- [x] All six stages have passing checks; known behavioral violations have
   regression tests, not skips.
-- [ ] The local history core builds/tests/typechecks/installs with cloud packages physically
+- [x] The local history core builds/tests/typechecks/installs with cloud packages physically
   absent from the staged workspace and dependency graph.
-- [ ] Local operations read no commercial credential store and invoke no remote
+- [x] Local operations read no commercial credential store and invoke no remote
   transport, including with Relaycast environment variables set.
-- [ ] Cached scope reads preserve requested scope regardless of login.
-- [ ] Discovery/sync/hydration selection and provenance are connector-specific;
+- [x] Cached scope reads preserve requested scope regardless of login.
+- [x] Discovery/sync/hydration selection and provenance are connector-specific;
   canonical identity, evidence ownership, deduplication, and pagination survive.
-- [ ] Core/engine depend on neither cloud, adapter implementations, nor CLI.
-- [ ] Native contracts, declarations, error classes, credential files, locks,
+- [x] Core/engine depend on neither cloud, adapter implementations, nor CLI.
+- [x] Native contracts, declarations, error classes, credential files, locks,
   refresh semantics, and cursor compatibility pass RelayHistory plugin regression tests.
-- [ ] The core tarball works alone; adding a fixture destination works without
+- [x] The core tarball works alone; adding a fixture destination works without
   modifying core or rebuilding its native addon. NDJSON export works independently.
-- [ ] Two destination instances retain independent acknowledgment/checkpoint state.
-- [ ] One-shot and background delivery share the same durable coordinator and pass
+- [x] Two destination instances retain independent acknowledgment/checkpoint state.
+- [x] One-shot and background delivery share the same durable coordinator and pass
   crash/restart, partial acknowledgment, concurrency, and offline recovery tests.
-- [ ] New or revised eligible records cannot fall between ingestion, bootstrap,
+- [x] New or revised eligible records cannot fall between ingestion, bootstrap,
   queueing, and acknowledgment checkpoints. Retries preserve payload/identity.
-- [ ] Delivery status reports backlog and failures accurately; no silent drops or
+- [x] Delivery status reports backlog and failures accurately; no silent drops or
   unsupported exactly-once claims. Core with delivery disabled remains local-only.
-- [ ] Core plus the RelayHistory plugin passes installed CLI/MCP smoke tests.
-- [ ] `git status --short` contains only in-scope changes; update the plan index.
+- [x] Core plus the RelayHistory plugin passes installed CLI/MCP smoke tests.
+- [x] `git status --short` contains only in-scope changes; update the plan index.
 
 ## Stop conditions and maintenance
 
@@ -584,3 +583,66 @@ function into an index file or adding optional imports is not a substitute for
 the physically absent-package gate. This is a focused boundary plan; server
 security, live third-party service protocols, general performance, and unrelated
 repository issues were not audited.
+
+
+## Approved server companion — dependable RelayHistory delivery
+
+During implementation, inspection of sibling `relayhistory-cloud` at `8f4b8af`
+confirmed legacy `/v1/ingest` and `/v1/sessions/:id/turns` use unconditional
+upserts. A delayed request from an expired local lease can overwrite a newer
+revision. On 2026-09-13 the user explicitly approved a companion server PR.
+
+Implement a versioned delivery endpoint with authenticated tenant authority,
+stable origin/record/revision identities, conditional revision upserts,
+conflicting-idempotency detection, durable tombstone fences, and exact batch
+acknowledgments persisted before success. Duplicate payloads return consistent
+receipts; older revisions never replace newer data. Bound requests and provide
+paginated readback of delivered records. Distinguish durable storage from
+search indexing. Keep legacy endpoints/auth compatible. The optional RelayHistory
+plugin uses the new endpoint for dependable jobs and fails clearly against an
+older server; it must not silently fall back to the weaker protocol.
+
+Add real database tests for concurrent/out-of-order requests, duplicate/lost
+responses, conflicting batch/revision reuse, tombstones, auth tenant isolation,
+and bounded readback. Client/server share wire fixtures. Work occurs in a
+separate server worktree and PR; no deployment or production migration is
+included. Server capability must be available before enabling the new plugin
+transport in a release.
+
+## Implemented package layout and compatibility decisions
+
+The local workspace contains `ai-hist-core`, `ai-hist-engine`, `ai-hist-cli`, and
+`ai-hist-napi`; the npm SDK remains `ai-hist`. Optional composition lives in
+`plugins/relayhistory` (`@agent-relay/relayhistory`) and
+`plugins/provider-sources` (`@agent-relay/history-provider-sources`). Each optional
+package uses a platform-specific Rust executable and the one local native addon.
+These concrete package names replace the provisional names used in earlier steps.
+
+The standalone Rust CLI performs local acquisition. Remote acquisition is
+available through the explicit Rust source registry or the SDK/plugin host; the
+SDK CLI and MCP server own installed JavaScript plugin loading. Cached remote
+queries remain available locally without credentials. This avoids maintaining
+another dynamic plugin runtime inside the Rust CLI.
+
+Legacy rows whose provenance was overwritten remain labeled `legacy-unknown`.
+Fresh acquisitions retain independent snapshots but cannot safely delete or
+reassign unknown canonical rows. The aggregate may retain stale legacy content;
+this is documented and tested. Legacy Relaycast remains an explicit incremental
+import in the optional package, retaining its original cursor semantics rather
+than claiming to provide complete snapshots.
+
+The companion server PR adds a versioned revision-fenced endpoint. Its migrated
+SQL and actual SDK/native/helper request path are tested together using PGlite.
+A non-production Neon smoke test remains a release gate. No production migration,
+deployment, release, or scheduled-service change is performed by this work.
+
+## Review outcome
+
+Implemented and verified on the final integration branch. Local tests, native
+contract checks, physically absent-package install/typecheck/tests, optional
+package tests, installed tarballs, and SDK/helper/server recovery all pass.
+GitHub CI remains responsible for Windows runtime and Linux release-platform
+execution. Publishing is deliberately gated on a compatible released core and
+updated plugin peer minimum; the currently published core is incompatible.
+The companion server migration and non-production Neon validation are release
+steps, not actions performed by this implementation. See 009-execution.md.
