@@ -1676,6 +1676,67 @@ mod tests {
     }
 
     #[test]
+    fn unacknowledged_outbox_rebuilds_identically_after_reopening_unchanged_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("history.db");
+        let conn = crate::open_db(&db).unwrap();
+        add_history(&conn, "retry-session", "first prompt", 1);
+        add_history(&conn, "retry-session", "second prompt", 2);
+        // A transcript checkpoint is independent of convergence delivery.
+        let confirmed = SyncCursor {
+            session_event_id: 37,
+            ..SyncCursor::default()
+        };
+        let stored_cursor = serde_json::to_string(&confirmed).unwrap();
+        let first = build_outbox_batch(&conn, &confirmed, 1, &HashSet::new()).unwrap();
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.cursor.history_id, 1);
+        assert_eq!(first.cursor.session_event_id, 37);
+        drop(conn);
+
+        // Simulate a lost response: the caller persisted no acknowledgment.
+        let conn = crate::open_db(&db).unwrap();
+        let resumed: SyncCursor = serde_json::from_str(&stored_cursor).unwrap();
+        let retry = build_outbox_batch(&conn, &resumed, 1, &HashSet::new()).unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(resumed.history_id, 0, "building does not confirm delivery");
+
+        // Only the acknowledged cursor permits the next bounded page.
+        let next = build_outbox_batch(&conn, &retry.cursor, 1, &HashSet::new()).unwrap();
+        assert_eq!(next.records.len(), 1);
+        assert_eq!(next.records[0].content, "second prompt");
+        assert_ne!(next.records[0].event_id, retry.records[0].event_id);
+        assert_eq!(next.cursor.history_id, 2);
+        assert_eq!(next.cursor.session_event_id, 37);
+    }
+
+    #[test]
+    fn characterization_unacknowledged_retry_remaps_changed_evidence_under_the_same_event_id() {
+        // Known limitation for stage 5: a cursor alone cannot retain the exact
+        // payload of an unacknowledged request. The durable coordinator must
+        // materialize revisions before transport and convert this to a stable
+        // retry-payload regression test rather than preserving this behavior.
+        let conn = mem();
+        add_history(&conn, "retry-session", "edit the file", 1);
+        let confirmed = SyncCursor::default();
+        let first = build_outbox_batch(&conn, &confirmed, 100, &HashSet::new()).unwrap();
+        assert_eq!(first.records.len(), 1);
+        assert!(first.records[0].files_touched.is_empty());
+
+        // Hydration can add evidence while an earlier request is in flight.
+        add_file_edit(&conn, "retry-session", "src/new.rs", "Edit");
+        let retry = build_outbox_batch(&conn, &confirmed, 100, &HashSet::new()).unwrap();
+        assert_eq!(retry.records.len(), 1);
+        assert_eq!(first.records[0].event_id, retry.records[0].event_id);
+        assert_ne!(first.records[0], retry.records[0]);
+        assert!(retry.records[0]
+            .files_touched
+            .iter()
+            .any(|file| file.ends_with("src/new.rs")));
+        assert!(retry.cursor.file_edit_id > first.cursor.file_edit_id);
+    }
+
+    #[test]
     fn incognito_sessions_are_excluded_but_advance_cursor() {
         let conn = mem();
         add_history(&conn, "public", "keep me", 1);
