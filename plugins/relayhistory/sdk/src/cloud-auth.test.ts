@@ -7,8 +7,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { inspect } from 'node:util';
 // Exercise the installed package entrypoints, including the cloud subpath.
-import * as main from 'ai-hist';
-import * as cloud from 'ai-hist/cloud';
+import * as main from './index.js';
+import * as cloud from './cloud-client.js';
 
 const FUTURE = '2999-01-01T00:00:00Z';
 
@@ -35,7 +35,7 @@ test('both public imports share login, stage selection, metadata, storage and ro
     assert.ok(error instanceof main.ConnectorFailureError);
     assert.equal(error.code, 'CONNECTOR_FAILURE');
     assert.equal(error.message,
-      'refreshing relayhistory session failed; run `ai-hist login` for the selected --base-url');
+      'RelayHistory operation failed (CONNECTOR_FAILURE)');
     assert.doesNotMatch(inspect(error, { depth: null }), /rth_at_response_secret|rth_rt_response_secret/);
     return true;
   };
@@ -110,7 +110,7 @@ test('both public imports share login, stage selection, metadata, storage and ro
     for (const entry of [main, cloud]) {
       const result = await entry.loginCloud('must-not-send', { baseUrl: 'http://remote.invalid' });
       assert.equal(result.ok, false);
-      if (!result.ok) assert.match(result.error, /cleartext|https:\/\//);
+      if (!result.ok) assert.match(result.error, /CLOUD_LOGIN_FAILED/);
     }
     assert.equal(requests.length, before);
     assert.equal(await readFile(path, 'utf8'), JSON.stringify(stored, null, 2));
@@ -119,14 +119,14 @@ test('both public imports share login, stage selection, metadata, storage and ro
     process.env.RELAYHISTORY_BASE_URL = 'malformed';
     for (const entry of [main, cloud]) {
       assert.equal((await entry.loginCloud('must-not-send')).ok, false);
-      await assert.rejects(entry.loadStoredRelayhistoryAuth(), /RELAYHISTORY_BASE_URL/);
+      await assert.rejects(entry.loadStoredRelayhistoryAuth(), /CLOUD_AUTH_FAILED/);
       assert.equal((await entry.loadStoredRelayhistoryAuth(base))?.baseUrl, base);
       assert.equal((await entry.loginCloud('explicit', { baseUrl: second })).ok, true);
     }
     delete process.env.RELAYHISTORY_BASE_URL;
     for (const entry of [main, cloud]) assert.equal((await entry.loadStoredRelayhistoryAuth())?.baseUrl, second);
     delete process.env.AI_HIST_BASE_URL;
-    for (const entry of [main, cloud]) await assert.rejects(entry.loadStoredRelayhistoryAuth(), /Refusing to guess/);
+    for (const entry of [main, cloud]) await assert.rejects(entry.loadStoredRelayhistoryAuth(), /CLOUD_AUTH_FAILED/);
     assert.equal((await cloud.resolveCloudSession()).auth, null);
     process.env.RELAYHISTORY_BASE_URL = base;
 

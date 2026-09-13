@@ -123,7 +123,7 @@ test('native npm token and replay: secrets, rotation, stages, pagination and ato
     assert.equal(await readFile(out, 'utf8'), complete);
     pageMode = 'repeat';
     const repeated = await command(...replayArgs, '--out', out);
-    failed(repeated); assert.match(repeated.stderr, /repeated nextCursor/);
+    failed(repeated); assert.match(repeated.stderr, /REPLAY_FAILED/);
     assert.equal(await readFile(out, 'utf8'), complete);
     pageMode = 'ok';
     const savedReplay = await sdk.replay('session/with space', { baseUrl, out, json: true });
@@ -132,14 +132,14 @@ test('native npm token and replay: secrets, rotation, stages, pagination and ato
     await writeFile(authPath, JSON.stringify({ ...auth, access_token_expires_at: null }));
     failRefresh = true;
     const rejected = await command('token', '--base-url', baseUrl);
-    failed(rejected); assert.match(rejected.stderr, /refreshing relayhistory session failed/);
+    failed(rejected); assert.match(rejected.stderr, /CLOUD_AUTH_FAILED/);
     await writeFile(authPath, JSON.stringify({ ...auth, access_token: { secret: oldToken } }));
     const malformed = await command('token', '--base-url', baseUrl);
-    failed(malformed); assert.match(malformed.stderr, /could not parse stored relayhistory session/);
+    failed(malformed); assert.match(malformed.stderr, /CLOUD_AUTH_FAILED/);
     await writeFile(authPath, JSON.stringify(auth));
     assert.equal((await sdk.loginCloud('fixture-relay-token', { baseUrl: baseUrl + '/other' })).ok, true);
     const ambiguous = await command('token');
-    failed(ambiguous); assert.match(ambiguous.stderr, /Refusing to guess/);
+    failed(ambiguous); assert.match(ambiguous.stderr, /CLOUD_AUTH_FAILED/);
     process.env.RELAYHISTORY_BASE_URL = baseUrl;
     assert.deepEqual(await command('token'), { code: 0, stdout: oldToken + '\n', stderr: '' });
     assert.equal((await command('token', '--base-url', baseUrl + '/other')).stdout, oldToken + '\n');
@@ -172,7 +172,7 @@ test('token and replay ignore obsolete SDK credentials without migrating them', 
     for (const args of [['token'], ['replay', 'session', '--json']]) {
       const result = await runCli(root, ...args, '--base-url', baseUrl);
       assert.notEqual(result.code, 0);
-      assert.match(result.stderr, /not authenticated/);
+      assert.match(result.stderr, /CLOUD_AUTH_FAILED|REPLAY_FAILED/);
       assert.equal(result.stdout, '');
     }
     await assert.rejects(readdir(join(state, 'stages')), 'obsolete credentials are never migrated');

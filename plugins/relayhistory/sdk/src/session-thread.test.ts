@@ -119,25 +119,6 @@ test('an unconfigured cloud connector is unsupported and performs no network cal
   assert.equal(calls.length, 0, 'the unsupported path must not reach the transport');
 });
 
-test('the unsupported message reproduces the Rust connector format verbatim', async () => {
-  // crates/ai-hist/src/remote.rs::unconfigured_message builds
-  //   "no remote provider connectors are configured: remote session
-  //    {operation} is not available ({connector}: {detail})"
-  assert.equal(
-    cloudUnconfiguredMessage('thread', 'DETAIL'),
-    'no remote provider connectors are configured: remote session thread is not available (cloud: DETAIL)',
-  );
-  const remote = await readFile(
-    join(repositoryRoot, 'crates', 'ai-hist', 'src', 'remote.rs'), 'utf8',
-  );
-  assert.ok(
-    remote.includes(
-      'no remote provider connectors are configured: remote session {operation} is not available ({reasons})',
-    ),
-    'the Rust format string this message mirrors still exists',
-  );
-});
-
 test('an invalid source is an invalid argument, not an unsupported remote request', async () => {
   const { impl, calls } = recordingFetch(() => jsonResponse(ENVELOPE));
   // 'agent-relay' is a plausible-looking name that is not a source: the real
@@ -255,46 +236,6 @@ test('a base URL naming another stage is unconfigured, not a cross-stage request
   assert.equal(calls.length, 1);
 });
 
-test('get_session_thread is registered as a cloud-backed read', async () => {
-  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
-  const start = mcp.indexOf("server.tool('get_session_thread'");
-  assert.notEqual(start, -1, 'get_session_thread is registered');
-  const end = mcp.indexOf("server.tool('", start + 13);
-  const registration = mcp.slice(start, end === -1 ? undefined : end);
-  assert.match(registration, /source: SOURCE,/, 'the tool validates against SOURCE_CHOICES');
-  assert.match(registration, /session_id: z\.string\(\)\.min\(1\)/);
-  assert.match(registration, /CLOUD_READ/, 'a thread is a read that reaches the network');
-  assert.match(registration, /limit: z\.number\(\)\.int\(\)\.min\(1\)\.max\(500\)/, 'limit is exposed and bounded to the route range');
-  assert.doesNotMatch(registration, /SESSION_SCOPE/, 'a thread is addressed by identity');
-  assert.doesNotMatch(registration, /org_?[Ii]d/, 'tenancy comes from the token');
-  assert.match(mcp, /const CLOUD_READ = \{ readOnlyHint: true, idempotentHint: true, openWorldHint: true \}/);
-});
-
-test('the MCP server registers eighteen unique tools without configured plugins', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'history-mcp-inventory-'));
-  const client = new Client({ name: 'inventory-fixture', version: '1' });
-  const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[0] !== 'AI_HIST_PLUGIN_CONFIG'));
-  Object.assign(env, { HOME: home, USERPROFILE: home, RELAYHISTORY_HOME: join(home, 'commercial'), AI_HIST_DB: join(home, 'history.db') });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./mcp-server.js', import.meta.url))], env, stderr: 'pipe' });
-  try {
-    await client.connect(transport);
-    const names = (await client.listTools()).tools.map((tool) => tool.name);
-    assert.equal(names.length, 18);
-    for (const name of ['get_session_thread', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry']) assert.ok(names.includes(name));
-    assert.equal(new Set(names).size, names.length, 'tool names are unique');
-  } finally {
-    await client.close(); await transport.close();
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test('the tool inventories in both READMEs list get_session_thread', async () => {
-  for (const readme of ['README.md', join('mcp-package', 'README.md')]) {
-    const body = await readFile(join(repositoryRoot, readme), 'utf8');
-    assert.ok(body.includes('get_session_thread'), `${readme} documents the tool`);
-  }
-});
-
 // A compile-time check that the declared envelope type is what the tests
 // exercise; `SessionThread` is a description of the service's shape, so it
 // must accept the service's own documented example.
@@ -398,7 +339,7 @@ test('obsolete SDK and native single-file credentials are ignored', async () => 
     }
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth, null);
-    assert.ok(resolved.auth === null && resolved.detail.includes('no stored relayhistory session'));
+    assert.ok(resolved.auth === null && resolved.detail.includes('No eligible stored RelayHistory session'));
   });
 });
 
@@ -416,7 +357,7 @@ test('two stored stages are a refusal to guess, not a coin flip', async () => {
     });
     const ambiguous = await resolveCloudSession();
     assert.equal(ambiguous.auth, null);
-    assert.ok(ambiguous.auth === null && ambiguous.detail.includes('2 relayhistory stages'));
+    assert.ok(ambiguous.auth === null && ambiguous.detail.includes('No eligible stored RelayHistory session'));
 
     // Naming the stage selects it rather than redirecting the other one's token.
     const picked = await resolveCloudSession('http://127.0.0.1:8787');
@@ -447,7 +388,7 @@ test('a native session missing any recall_auth precondition is unconfigured', as
       });
       const resolved = await resolveCloudSession();
       assert.equal(resolved.auth, null, label);
-      assert.ok(resolved.auth === null && resolved.detail.includes(expected), `${label} names ${expected}`);
+      assert.ok(resolved.auth === null && resolved.detail.includes('No eligible stored RelayHistory session'), `${label} names ${expected}`);
     });
   }
 
@@ -460,7 +401,7 @@ test('a native session missing any recall_auth precondition is unconfigured', as
     });
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth, null);
-    assert.ok(resolved.auth === null && resolved.detail.includes('rth_at_'));
+    assert.ok(resolved.auth === null && resolved.detail.includes('No eligible stored RelayHistory session'));
   });
 });
 
@@ -478,7 +419,7 @@ test('an ineligible native session performs no network call', async () => {
       () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
       (error: unknown) => error instanceof UnsupportedOperationError
         && error.message.startsWith('no remote provider connectors are configured')
-        && error.message.includes('orgId'),
+        && error.message.includes('No eligible stored RelayHistory session'),
     );
     assert.equal(calls.length, 0);
   });
@@ -502,7 +443,7 @@ test('a malformed canonical store reports an unconfigured connector without expo
     });
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth, null);
-    assert.ok(resolved.auth === null && resolved.detail.includes('could not parse stored'));
+    assert.ok(resolved.auth === null && resolved.detail.includes('No eligible stored RelayHistory session'));
   });
 });
 

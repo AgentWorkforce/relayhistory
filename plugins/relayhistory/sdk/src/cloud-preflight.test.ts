@@ -211,7 +211,7 @@ test('npm CLI trust-gates an SDK bearer before a custom base-url exchange', { ti
 
   try {
     assert.notEqual(code, 0);
-    assert.match(stderr, /refusing to send the Agent Relay Cloud bearer/);
+    assert.match(stderr, /CLOUD_LOGIN_FAILED/);
     assert.equal(requests, 0, 'the SDK bearer must not reach an untrusted destination');
   } finally {
     server.closeAllConnections();

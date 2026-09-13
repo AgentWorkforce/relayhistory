@@ -1,6 +1,7 @@
+import type { HistorySource } from './source-contracts.js';
 /** Portable export/delivery wire types. Field names match the versioned Rust contract. */
 export type HistoryEvidenceKind = 'history' | 'session_event' | 'tool_call' | 'file_edit'
-  | 'session' | 'presence' | 'relationship' | 'commit_link' | 'trajectory';
+  | 'session' | 'presence' | 'relationship' | 'commit_link' | 'trajectory' | 'source_observation' | 'observation_evidence';
 export interface HistorySessionIdentity { source: string; session_id: string }
 export interface HistoryExportSelection {
   all_sources: boolean;
@@ -79,6 +80,7 @@ export interface HistoryDestination {
 }
 
 export interface HistoryPlugin {
+  sources?: readonly HistorySource[];
   destinations?: ReadonlyArray<{ instanceId: string; destination: HistoryDestination }>;
   /** Optional host integrations, registered only for explicitly loaded plugins. */
   commands?: ReadonlyArray<{ name: string; run(args: readonly string[]): Promise<unknown> }>;

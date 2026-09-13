@@ -1,5 +1,5 @@
 import { ensureCloudSession as bundledEnsureCloudSession } from './cloud-auth-bundle.js';
-import { RelayHistoryError } from './index.js';
+import { RelayHistoryError } from 'ai-hist';
 
 const DEFAULT_CLOUD_API_URL = 'https://agentrelay.com/cloud';
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;

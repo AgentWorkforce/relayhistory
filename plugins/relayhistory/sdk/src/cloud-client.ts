@@ -2,8 +2,8 @@
 import {
   AuthenticationExpiredError, ConnectorFailureError, InvalidArgumentError, SOURCES,
   UnsupportedOperationError, isSource, defaultDbPath,
-} from './sdk-common.js';
-import { nativeCall } from './native.js';
+} from 'ai-hist';
+import { helperCall } from './helper.js';
 
 export interface RelayhistoryAuth {
   baseUrl: string;
@@ -19,7 +19,7 @@ export interface CloudPushResult { baseUrl: string; sent: number; accepted: numb
 /** Return a secret service token with at least 60 seconds of validity. Rust
  * selects the stage, refreshes if needed and atomically saves rotated tokens. */
 export async function accessToken(options: { baseUrl?: string } = {}): Promise<string> {
-  return nativeCall((native) => native.accessToken(options.baseUrl));
+  return helperCall((native) => native.accessToken(options.baseUrl));
 }
 
 export interface ReplayOptions {
@@ -42,7 +42,7 @@ export async function replay(sessionId: string, options: ReplayOptions = {}): Pr
       throw new InvalidArgumentError(`${key} must be an integer between 0 and 4294967295`, 'INVALID_ARGUMENT');
     }
   }
-  const result = await nativeCall((native) => native.replay(sessionId, options));
+  const result = await helperCall((native) => native.replay(sessionId, options));
   return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
 }
 
@@ -58,7 +58,7 @@ export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
 
 /** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
 export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
-  return nativeCall((native) => native.cloudLoadAuth(baseUrl));
+  return helperCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
 export type CloudSessionResolution =
@@ -71,7 +71,7 @@ export type CloudSessionResolution =
 
 /** Read-only connector probe; stage selection and eligibility belong to Rust. */
 export async function resolveCloudSession(baseUrl?: string, now: number = Date.now()): Promise<CloudSessionResolution> {
-  const result = await nativeCall((native) => native.cloudResolveSession(baseUrl, now));
+  const result = await helperCall((native) => native.cloudResolveSession(baseUrl, now));
   return result.auth
     ? { auth: result.auth, session: true }
     : { auth: null, detail: result.detail ?? 'no stored relayhistory session (run `ai-hist login`)' };
@@ -79,12 +79,12 @@ export async function resolveCloudSession(baseUrl?: string, now: number = Date.n
 
 /** Rotate a rejected stored bearer under the native stage lock. */
 export async function refreshCloudSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth | null> {
-  return nativeCall((native) => native.cloudRefreshSession(baseUrl, rejectedToken));
+  return helperCall((native) => native.cloudRefreshSession(baseUrl, rejectedToken));
 }
 
 /** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
 export async function validateCloudExchangeBaseUrl(baseUrl?: string): Promise<void> {
-  return nativeCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
+  return helperCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
 }
 
 export interface LoginOptions {
@@ -95,7 +95,7 @@ export interface LoginOptions {
 
 /** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
 export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
-  return nativeCall((native) => native.cloudLogin({
+  return helperCall((native) => native.cloudLogin({
     baseUrl: options.baseUrl,
     relayAccessToken: options.relayAccessToken,
     label: options.label,
@@ -112,7 +112,7 @@ export async function loginCloud(relayAccessToken: string, options: { baseUrl?: 
 }
 
 export async function pushCloud(options: CloudOptions = {}): Promise<CloudPushResult> {
-  return nativeCall((native) => native.pushCloud(options));
+  return helperCall((native) => native.pushCloud(options));
 }
 
 /** Device login, service-token exchange and first push run in Rust. The optional
@@ -123,7 +123,7 @@ export async function enableCloud(options: EnableCloudOptions = {}): Promise<Clo
   if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 2_147_483_647) {
     throw new InvalidArgumentError('intervalMs must be an integer between 1000 and 2147483647', 'INVALID_ARGUMENT');
   }
-  const first = await nativeCall((native) => native.enableCloud(options));
+  const first = await helperCall((native) => native.enableCloud(options));
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let pending: Promise<void> = Promise.resolve();
@@ -145,23 +145,11 @@ export async function enableCloud(options: EnableCloudOptions = {}): Promise<Clo
   return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
 }
 
-export interface GitHookOptions { repo: string; sessionId: string; source?: string; dbPath?: string; prUrl?: string }
-/** Install a local post-commit recorder for an explicit session. prUrl identifies
- * an existing GitHub PR; linkage is uploaded by the next cloud push. */
-export async function installGitHooks(options: GitHookOptions): Promise<{ hookPath: string; prUrl: string | null }> {
-  const result = await nativeCall((native) => native.installGitHooks(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() }), process.execPath, import.meta.url));
-  return JSON.parse(result) as { hookPath: string; prUrl: string | null };
-}
-export async function linkGitCommit(options: GitHookOptions): Promise<{ commitSha: string }> {
-  const commitSha = await nativeCall((native) => native.linkGitCommit(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() })));
-  return { commitSha };
-}
-
 export type TraceVisibility = 'public' | 'private' | 'direct-link';
 export interface ShareableTrace { url: string; visibility: TraceVisibility; eventCount: number }
 /** Share the already-pushed, frozen server snapshot of a session. */
 export async function createShareableTrace(sessionId: string, options: { visibility: TraceVisibility; source?: string; baseUrl?: string }): Promise<ShareableTrace> {
-  return nativeCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
+  return helperCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
 }
 
 // ---------------------------------------------------------------------------

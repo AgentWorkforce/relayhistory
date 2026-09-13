@@ -1,0 +1,60 @@
+{
+  "name": "@agent-relay/relayhistory",
+  "version": "0.16.0",
+  "description": "Optional RelayHistory destination, auth, sharing and recall plugin for ai-hist.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/index.*",
+    "dist/helper.*",
+    "dist/plugin.*",
+    "dist/cloud-client.*",
+    "dist/cloud-preflight.*",
+    "dist/cloud-auth-bundle.*",
+    "dist/cloud-auth-runtime.*",
+    "dist/cli.*",
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-cloud-auth.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "peerDependencies": {
+    "ai-hist": "^0.16.0"
+  },
+  "devDependencies": {
+    "ai-hist": "file:../../../sdk-ts",
+    "@agent-relay/cloud": "^11.8.1",
+    "@types/node": "^22.18.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.2",
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "relayhistory-plugin": "./dist/cli.js"
+  },
+  "optionalDependencies": {
+    "@agent-relay/relayhistory-darwin-arm64": "0.16.0",
+    "@agent-relay/relayhistory-darwin-x64": "0.16.0",
+    "@agent-relay/relayhistory-linux-x64-gnu": "0.16.0",
+    "@agent-relay/relayhistory-linux-arm64-gnu": "0.16.0",
+    "@agent-relay/relayhistory-linux-x64-musl": "0.16.0",
+    "@agent-relay/relayhistory-linux-arm64-musl": "0.16.0",
+    "@agent-relay/relayhistory-win32-x64-msvc": "0.16.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

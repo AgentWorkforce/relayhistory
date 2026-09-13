@@ -11,25 +11,23 @@ import {
   listSessionCatalogPage, recent, search, stats, sync,
   historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
-import { getSessionThread } from './cloud-client.js';
 
+import type { HistoryPluginRegistry } from './index.js';
 import { loadHistoryApplicationConfig } from './delivery-cli.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
-// A lifecycle thread is served by the cloud recall API and never cached, so it
-// reads nothing locally and reaches the network on every call.
-const CLOUD_READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 // Acquisition can reach provider services when a remote scope is requested
 // (claude.ai/code web sessions, Codex cloud tasks), so it is open-world.
 const ACQUIRE = { readOnlyHint: false, idempotentHint: true, openWorldHint: true } as const;
 const SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode']);
 const CATALOG_SOURCE = z.enum(['claude', 'codex', 'cursor', 'grok', 'relay', 'opencode']);
 const SESSION_SCOPE = z.enum(['local', 'remote', 'all']);
-const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit connector IDs; omit for provider defaults, [] disables remote acquisition. Commercial connectors require explicit selection.');
+const SOURCE_CONNECTORS = z.array(z.string().min(1)).optional().describe('Explicit configured source-plugin IDs; [] disables remote acquisition.');
 const packageVersion = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version as string;
 
+let configuredSources: HistoryPluginRegistry | undefined;
 const server = new McpServer(
   { name: 'ai-hist', version: packageVersion },
   { capabilities: { tools: {} } },
@@ -74,7 +72,7 @@ server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates o
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
   source_connectors: SOURCE_CONNECTORS,
-}, ACQUIRE, ({ sources, scope, limit, source_connectors }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors })));
+}, ACQUIRE, ({ sources, scope, limit, source_connectors }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors, plugins: configuredSources })));
 
 server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
   source: CATALOG_SOURCE,
@@ -83,7 +81,7 @@ server.tool('hydrate_session', 'Fully index one cataloged session without global
   include_related: z.boolean().optional().default(true),
   source_connectors: SOURCE_CONNECTORS,
 }, ACQUIRE, ({ source, session_id, scope, include_related, source_connectors }) => call(() => hydrateSession({
-  source, sessionId: session_id, scope, includeRelated: include_related, sourceConnectors: source_connectors,
+  source, sessionId: session_id, scope, includeRelated: include_related, sourceConnectors: source_connectors, plugins: configuredSources,
 })));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
@@ -111,27 +109,6 @@ server.tool('get_session_tree',
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
 })));
 
-// `get_session_tree` is the subagent fan-out; `get_session_thread` is the
-// lifecycle fan-out. They are complementary and an agent may call both.
-// The thread is cloud-only and never cached: it changes as PRs and incidents
-// land, so every call fetches. Tenancy is derived from the token server-side,
-// which is why there is no org parameter to pass.
-server.tool('get_session_thread',
-  'Lifecycle thread for one session from the RelayHistory cloud: shipped commits plus linked PRs, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions. Known link kinds are github_pr, pr_review, commit, sentry_event, incident, zendesk_ticket, slack_thread, hotfix and followup_session. Links are paged with limit (1-500, default 100) and cursor; outcomes come back whole on every page. Requires a stored cloud session; complements get_session_tree.', {
-  source: SOURCE,
-  session_id: z.string().min(1),
-  kinds: z.array(z.string().min(1)).max(50).optional(),
-  since: z.string().min(1).optional(),
-  cursor: z.string().min(1).optional(),
-  limit: z.number().int().min(1).max(500).optional(),
-}, CLOUD_READ, ({ source, session_id, kinds, since, cursor, limit }) => call(() => getSessionThread({
-  source, sessionId: session_id, kinds, since, cursor, limit,
-})));
-
-// Tool calls and file edits are keyed by (source, session_id): a session id
-// alone can name two sessions from two providers. A cursor's `tsMs` may be
-// null or absent -- both mean "already inside the undated tail" -- and reaches
-// the SDK exactly as the client sent it.
 const EVIDENCE_CURSOR = z.object({ tsMs: z.number().int().nullable().optional(), id: z.number().int() });
 
 server.tool('get_session_tool_calls', 'Get one bounded page of recorded tool calls for one session.', {
@@ -154,7 +131,7 @@ server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.'
 server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   scope: SESSION_SCOPE.optional().default('local'),
   source_connectors: SOURCE_CONNECTORS,
-}, ACQUIRE, ({ scope, source_connectors }) => call(() => sync({ scope, sourceConnectors: source_connectors })));
+}, ACQUIRE, ({ scope, source_connectors }) => call(() => sync({ scope, sourceConnectors: source_connectors, plugins: configuredSources })));
 
 server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
   job_id: z.string().optional(),
@@ -168,6 +145,7 @@ for (const action of ['pause', 'resume', 'retry'] as const) {
 // implicit enablement, credential probing, or background delivery at startup.
 if (process.env.AI_HIST_PLUGIN_CONFIG) {
   const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
+  configuredSources = registry;
   for (const tool of registry.registeredTools()) {
     server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
       ({ input }) => call(() => tool.run(input)));

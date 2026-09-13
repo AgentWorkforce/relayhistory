@@ -1,11 +1,12 @@
+import type { HistorySource } from './source-contracts.js';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { InvalidArgumentError, RelayHistoryError } from './sdk-common.js';
 import type { HistoryDestination, HistoryPlugin } from './delivery-contracts.js';
 
-const CORE_COMMANDS = ['login', 'token', 'replay', 'enable-cloud', 'sessions', 'search', 'recent', 'session', 'events', 'resume', 'pack', 'stats', 'sync', 'export', 'delivery', 'plugin'];
-const CORE_TOOLS = ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_tool_calls', 'get_session_file_edits', 'get_session_thread', 'history_stats', 'sync', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry'];
+const CORE_COMMANDS = ['sessions', 'search', 'recent', 'session', 'events', 'resume', 'pack', 'stats', 'sync', 'export', 'delivery', 'plugin'];
+const CORE_TOOLS = ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'get_session', 'get_session_events', 'get_session_relationships', 'get_session_tree', 'get_session_tool_calls', 'get_session_file_edits', 'history_stats', 'sync', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry'];
 function label(value: string): void {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_.:/@-]{1,200}$/.test(value)) {
     throw new InvalidArgumentError('plugin identifiers must be nonempty non-secret labels', 'INVALID_ARGUMENT');
@@ -14,14 +15,22 @@ function label(value: string): void {
 
 /** Per-client registry. Installing a module never registers or starts it. */
 export class HistoryPluginRegistry {
+  private readonly sources = new Map<string, HistorySource>();
   private readonly destinations = new Map<string, HistoryDestination>();
   private readonly commands = new Map<string, NonNullable<HistoryPlugin['commands']>[number]>();
   private readonly tools = new Map<string, NonNullable<HistoryPlugin['tools']>[number]>();
 
   register(plugin: HistoryPlugin): void {
+    const sources = new Map(this.sources);
     const destinations = new Map(this.destinations);
     const commands = new Map(this.commands);
     const tools = new Map(this.tools);
+    for(const source of plugin.sources ?? []) {
+      label(source.id);label(source.instanceId);
+      const key=JSON.stringify([source.id,source.instanceId]);
+      if(sources.has(key)||source.location!=='remote'||!Array.isArray(source.supportedSources)||typeof source.discover!=='function'||typeof source.hydrate!=='function') throw new InvalidArgumentError('invalid or duplicate source connector','INVALID_ARGUMENT');
+      sources.set(key,source);
+    }
     // Validate the whole registration before mutating this registry.
     for (const { instanceId, destination } of plugin.destinations ?? []) {
       label(instanceId); label(destination.id); label(destination.mappingVersion);
@@ -50,11 +59,19 @@ export class HistoryPluginRegistry {
         catch { throw new RelayHistoryError(`plugin tool ${tool.name} failed`, 'HISTORY_PLUGIN_TOOL_FAILED'); }
       } });
     }
+    for (const [key,value] of sources) this.sources.set(key,value);
     for (const [key, value] of destinations) this.destinations.set(key, value);
     for (const [key, value] of commands) this.commands.set(key, value);
     for (const [key, value] of tools) this.tools.set(key, value);
   }
 
+  sourceConnectors(ids?: readonly string[]): HistorySource[] {
+    const sources=[...this.sources.values()];
+    if(ids===undefined)return sources;
+    if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'||!id||id.trim()!==id)||new Set(ids).size!==ids.length)throw new InvalidArgumentError('sourceConnectors must contain unique nonempty connector IDs','INVALID_ARGUMENT');
+    for(const id of ids)if(!sources.some(source=>source.id===id||`${source.id}:${source.instanceId}`===id))throw new InvalidArgumentError(`unconfigured source connector: ${id}`,'INVALID_ARGUMENT');
+    return sources.filter(source=>ids.includes(source.id)||ids.includes(`${source.id}:${source.instanceId}`));
+  }
   destination(id: string, instanceId: string): HistoryDestination | undefined {
     return this.destinations.get(JSON.stringify([id, instanceId]));
   }

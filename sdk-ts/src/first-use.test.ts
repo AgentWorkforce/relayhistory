@@ -120,13 +120,12 @@ test('--no-bootstrap reports an unbuilt store instead of building or lying', asy
 
 // The usage block is what tells a user bootstrap is the default. Whatever it
 // documents as reading local history must actually accept the opt-out.
-test('the built npm CLI ships login so token/replay errors name a real remedy', async () => {
+test('the local CLI requires explicit plugin configuration for cloud commands', async () => {
   const shipped = await readFile(fileURLToPath(new URL('../dist/cli.js', import.meta.url)), 'utf8');
-  assert.match(shipped, /['"]login['"]/);
-  assert.doesNotMatch(shipped, /admin-mint/);
-  const missingToken = await run(['login', '--token', 'fixture-token'], process.env);
-  assert.equal(missingToken.code, 2);
-  assert.match(missingToken.stderr, /login requires --base-url with --token/);
+  assert.doesNotMatch(shipped, /cloudLoadAuth|enableCloud|cloud-preflight/);
+  const result = await run(['login', '--token', 'fixture-token'], process.env);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /unknown command 'login'/);
 });
 
 test('every documented local-history command accepts --no-bootstrap', async () => {

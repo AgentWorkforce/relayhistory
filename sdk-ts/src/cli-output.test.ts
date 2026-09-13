@@ -706,18 +706,13 @@ test('resume and pack reject flags the other commands accept but these do not', 
   );
 });
 
-test('--help flag works on root and replay commands with exit code 0', async () => {
+test('--help flag works on local root commands with exit code 0', async () => {
   for (const args of [['--help'], ['-h'], ['help']]) {
     const rootHelp = await run(process.execPath, [cli, ...args]);
     assert.equal(rootHelp.stderr, '');
     assert.match(rootHelp.stdout, /Usage:/);
     assert.match(rootHelp.stdout, /ai-hist \[--no-bootstrap\] \[--db PATH\] \[--json\] \[--help\]/);
   }
-
-  const replayHelp = await run(process.execPath, [cli, 'replay', '--help']);
-  assert.equal(replayHelp.stderr, '');
-  assert.match(replayHelp.stdout, /Usage:/);
-  assert.match(replayHelp.stdout, /ai-hist replay SESSION_ID.*--help/);
 
   const sessionsHelp = await run(process.execPath, [cli, 'sessions', '--help']);
   assert.equal(sessionsHelp.stderr, '');
@@ -726,8 +721,8 @@ test('--help flag works on root and replay commands with exit code 0', async () 
 
 test('--help is rejected on commands that do not advertise it', async () => {
   await assert.rejects(
-    run(process.execPath, [cli, 'login', '--help', '--no-warning']),
-    (error: unknown) => isUsageFailure(error, 'login does not accept --help'),
+    run(process.execPath, [cli, 'sync', '--help', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'sync does not accept --help'),
   );
 });
 

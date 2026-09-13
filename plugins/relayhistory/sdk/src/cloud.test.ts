@@ -125,7 +125,7 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     const failingBase = `${baseUrl}/second-stage`;
     // Log into a second stage; it must not borrow stage one's cursor.
     await login({ baseUrl: failingBase, relayAccessToken: 'fixture-cloud-token' });
-    await assert.rejects(loadStoredRelayhistoryAuth(), /Refusing to guess/);
+    await assert.rejects(loadStoredRelayhistoryAuth(), /CLOUD_AUTH_FAILED/);
     rejectIngest = true;
     // Change the fixture server to reject any ingest path for the second destination.
     await assert.rejects(enableCloud({ dbPath, baseUrl: failingBase, watch: false }));

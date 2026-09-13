@@ -83,24 +83,10 @@ for (const state of states) {
   });
 }
 
-test('cached queries never call the native commercial credential loader', async () => {
-  await withFixture('ambiguous', async (dbPath) => {
-    await nativeCall(async (native) => {
-      const original = native.cloudLoadAuth;
-      let reads = 0;
-      native.cloudLoadAuth = async () => { reads++; throw new Error('commercial auth must not be read'); };
-      try {
-        for (const scope of ['local', 'remote', 'all'] as const) {
-          await search('offlinefixture', { dbPath, scope });
-          await recent({ dbPath, scope });
-          await listSessionCatalogPage({ dbPath, scope });
-          await stats({ dbPath, scope });
-        }
-        assert.equal(reads, 0);
-      } finally {
-        native.cloudLoadAuth = original;
-      }
-    });
+test('the local native contract contains no commercial credential operations', async () => {
+  await nativeCall(async native => {
+    assert.equal('cloudLoadAuth' in native, false);
+    assert.equal('pushCloud' in native, false);
   });
 });
 

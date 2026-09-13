@@ -5,14 +5,11 @@ import { readFile } from 'node:fs/promises';
 import {
   discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, loadStoredRelayhistoryAuth, login, recent, resumeCommand, search, stats, sync,
-  enableCloud, accessToken, replay,
-  validateCloudExchangeBaseUrl,
+  listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
 import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
-import { prepareCloudSessionForEnableCloud } from './cloud-preflight.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
@@ -21,7 +18,7 @@ type PackageMetadata = { version?: string };
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
   'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
-  'max-depth', 'max-nodes', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
+  'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -107,21 +104,6 @@ function validateFlags(args: Parsed, command: string, allowed: readonly string[]
 function textFlag(args: Parsed, name: string): string | undefined {
   const value = args.flags.get(name)?.at(-1);
   return typeof value === 'string' ? value : undefined;
-}
-
-async function relayAccessTokenForCloudCommand(
-  command: 'login' | 'enable-cloud',
-  rawArgs: readonly string[],
-  args: Parsed,
-  reuseStoredAuth: boolean,
-): Promise<string | undefined> {
-  const explicitToken = textFlag(args, 'token');
-  if (explicitToken !== undefined) return explicitToken;
-  const baseUrl = textFlag(args, 'base-url');
-  if (reuseStoredAuth && await loadStoredRelayhistoryAuth(baseUrl)) return undefined;
-  const preparedToken = await prepareCloudSessionForEnableCloud(command, rawArgs, process.env);
-  if (preparedToken !== null) await validateCloudExchangeBaseUrl(baseUrl);
-  return preparedToken ?? undefined;
 }
 
 function textFlags(args: Parsed, name: string): string[] {
@@ -222,7 +204,6 @@ function output(value: unknown, json: boolean): void {
 function showHelp(): never {
   process.stdout.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
-  ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--no-related] [--db PATH] [--json]
@@ -236,9 +217,6 @@ function showHelp(): never {
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
-  ai-hist login [--base-url URL] [--token TOKEN] [--label LABEL] [--json]
-  ai-hist token [--base-url URL]
-  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
   ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
@@ -256,7 +234,6 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
   process.stderr.write(`Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
-  ai-hist enable-cloud [--base-url URL] [--token TOKEN] [--db PATH] [--interval SECONDS] [--once] [--json]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--source SOURCE] [--limit N] [--json]
   ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--no-related] [--db PATH] [--json]
@@ -270,9 +247,6 @@ function usage(message?: string): never {
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
-  ai-hist login [--base-url URL] [--token TOKEN] [--label LABEL] [--json]
-  ai-hist token [--base-url URL]
-  ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
   ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
@@ -606,16 +580,6 @@ const COMMANDS = new Map<string, CommandSpec>([
   ...(['enable', 'status', 'drain', 'run', 'pause', 'resume', 'retry', 'cancel'] as const).map((action): [string, CommandSpec] => [`delivery ${action}`, {
     name: `delivery ${action}`, positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
   }]),
-  ['login', { name: 'login', positionals: [0, 0],
-    allowed: ['base-url', 'json', 'label', 'token'],
-    validate: (args: Parsed) => {
-      if (textFlag(args, 'token') && !textFlag(args, 'base-url')) usage('login requires --base-url with --token');
-    } }],
-  ['token', { name: 'token', positionals: [0, 0], allowed: ['base-url'] }],
-  ['replay', { name: 'replay', positionals: [1, 1], requires: 'replay requires SESSION_ID',
-    allowed: ['base-url', 'limit', 'max-content', 'json', 'out', 'help'] }],
-  ['enable-cloud', { name: 'enable-cloud', positionals: [0, 0], validate: validateInterval,
-    allowed: ['base-url', 'db', 'interval', 'once', 'json', 'token'] }],
   ['sessions list', { name: 'sessions list', positionals: [0, 0], readsLocalStore: true,
     validate: (args) => {
       if (args.flags.has('json') && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
@@ -626,11 +590,11 @@ const COMMANDS = new Map<string, CommandSpec>([
     ] }],
   ['sessions discover', { name: 'sessions discover', positionals: [0, 0],
     validate: (args) => { sourceConnectorFlags(args); },
-    allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source', 'source-connector', 'no-source-connectors'] }],
+    allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source', 'config', 'source-connector', 'no-source-connectors'] }],
   ['sessions hydrate', { name: 'sessions hydrate', positionals: [2, 2],
     requires: 'sessions hydrate requires SOURCE and SESSION_ID',
     validate: (args) => { sourceConnectorFlags(args); },
-    allowed: ['all', 'db', 'json', 'local', 'no-bootstrap', 'no-related', 'remote', 'source-connector', 'no-source-connectors'] }],
+    allowed: ['all', 'db', 'json', 'local', 'no-bootstrap', 'no-related', 'remote', 'config', 'source-connector', 'no-source-connectors'] }],
   ['sessions relationships', { name: 'sessions relationships', positionals: [2, 2], readsLocalStore: true,
     rejectsScope: true, requires: 'sessions relationships requires SOURCE and SESSION_ID',
     allowed: ['all', 'db', 'json', 'local', 'remote'] }],
@@ -667,7 +631,7 @@ const COMMANDS = new Map<string, CommandSpec>([
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
   ['sync', { name: 'sync', positionals: [0, 0], validate: (args) => { sourceConnectorFlags(args); },
-    allowed: ['all', 'db', 'json', 'local', 'remote', 'source-connector', 'no-source-connectors'] }],
+    allowed: ['all', 'db', 'json', 'local', 'remote', 'config', 'source-connector', 'no-source-connectors'] }],
 ]);
 
 /** Command words consumed before the positional arguments start. */
@@ -784,6 +748,7 @@ async function main(): Promise<void> {
     output(await operation.run([...tail.slice(1), ...pluginArgs]), true);
     return;
   }
+  const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
   let readiness: LocalStoreReadiness | null = null;
   if (spec.readsLocalStore) {
     readiness = await ensureLocalStore({
@@ -813,50 +778,6 @@ async function main(): Promise<void> {
     }
     return;
   }
-  if (command === 'login') {
-    const relayAccessToken = await relayAccessTokenForCloudCommand(command, rawArgs, args, false);
-    const auth = await login({
-      baseUrl: textFlag(args, 'base-url'),
-      relayAccessToken,
-      label: textFlag(args, 'label'),
-    });
-    if (json) output({ ok: true, baseUrl: auth.baseUrl }, true);
-    else process.stdout.write(`Logged in to ${auth.baseUrl} (session stored).\n`);
-    return;
-  }
-  if (command === 'token') {
-    const token = await accessToken({ baseUrl: textFlag(args, 'base-url') });
-    if (process.stdout.isTTY) process.stderr.write('Warning: this access token is a secret and will remain in terminal scrollback.\n');
-    process.stdout.write(`${token}\n`);
-    return;
-  }
-  if (command === 'replay') {
-    const result = await replay(subcommand, {
-      baseUrl: textFlag(args, 'base-url'), limit: nonNegativeIntFlag(args, 'limit'),
-      maxContent: nonNegativeIntFlag(args, 'max-content'), json, out: textFlag(args, 'out'),
-    });
-    if (result.transcript !== null) process.stdout.write(result.transcript);
-    return;
-  }
-  if (command === 'enable-cloud') {
-    const relayAccessToken = await relayAccessTokenForCloudCommand(command, rawArgs, args, true);
-    const handle = await enableCloud({
-      baseUrl: textFlag(args, 'base-url'), dbPath: textFlag(args, 'db'),
-      relayAccessToken,
-      intervalMs: intervalSeconds * 1000,
-      watch: !args.flags.has('once'),
-      onPush: (result) => output(result, json),
-    });
-    const { stop, ...result } = handle;
-    output(result, json);
-    if (!args.flags.has('once')) {
-      const shutdown = () => { void stop(); };
-      process.once('SIGINT', shutdown);
-      process.once('SIGTERM', shutdown);
-    }
-    return;
-  }
-
   if (command === 'sessions' && subcommand === 'list') {
     const sources = textFlags(args, 'source');
     const page = await listSessionCatalogPage({
@@ -876,7 +797,7 @@ async function main(): Promise<void> {
   if (command === 'sessions' && subcommand === 'discover') {
     const sources = textFlags(args, 'source');
     outputDiscovery(await discoverSessions({
-      sourceConnectors: sourceConnectorFlags(args),
+      sourceConnectors: sourceConnectorFlags(args), plugins: acquisitionPlugins,
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
     }), json);
@@ -884,7 +805,7 @@ async function main(): Promise<void> {
   }
   if (command === 'sessions' && subcommand === 'hydrate') {
     outputHydration(await hydrateSession({
-      sourceConnectors: sourceConnectorFlags(args),
+      sourceConnectors: sourceConnectorFlags(args), plugins: acquisitionPlugins,
       source: sessionSource as never,
       sessionId: sessionId!,
       scope: scopeFlag(args),
@@ -952,7 +873,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'sync') {
-    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sourceConnectors: sourceConnectorFlags(args) }), json);
+    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sourceConnectors: sourceConnectorFlags(args), plugins: acquisitionPlugins }), json);
     return;
   }
   usage();

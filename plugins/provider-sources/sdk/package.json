@@ -1,0 +1,49 @@
+{
+  "name": "@agent-relay/history-provider-sources",
+  "version": "0.16.0",
+  "description": "Optional Claude web and Codex cloud source adapters for local ai-hist.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/index.*",
+    "dist/helper.*",
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "peerDependencies": {
+    "ai-hist": "^0.16.0"
+  },
+  "devDependencies": {
+    "ai-hist": "file:../../../sdk-ts",
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "optionalDependencies": {
+    "@agent-relay/history-provider-sources-darwin-arm64": "0.16.0",
+    "@agent-relay/history-provider-sources-darwin-x64": "0.16.0",
+    "@agent-relay/history-provider-sources-linux-x64-gnu": "0.16.0",
+    "@agent-relay/history-provider-sources-linux-arm64-gnu": "0.16.0",
+    "@agent-relay/history-provider-sources-linux-x64-musl": "0.16.0",
+    "@agent-relay/history-provider-sources-linux-arm64-musl": "0.16.0",
+    "@agent-relay/history-provider-sources-win32-x64-msvc": "0.16.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -18,25 +18,17 @@ import {
   EvidencePartialError,
   ConnectorFailureError,
 } from './sdk-common.js';
-import type { CloudPushResult, RelayhistoryAuth, ReplayOptions, ReplayResult } from './cloud-client.js';
 
-export const NATIVE_CONTRACT_VERSION = 13;
+export const NATIVE_CONTRACT_VERSION = 14;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  getSourceObservation(requestJson:string):Promise<string>;
+  applySourceObservations(requestJson:string):Promise<string>;
+  applySourceEvidence(requestJson:string):Promise<string>;
   historyDelivery(requestJson: string, dbPath?: string): Promise<string>;
-  accessToken(baseUrl?: string): Promise<string>;
-  replay(sessionId: string, options: ReplayOptions): Promise<ReplayResult>;
-  createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;
   installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
   linkGitCommit(optionsJson: string): Promise<string>;
-  cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
-  cloudResolveSession(baseUrl: string | undefined, now: number): Promise<{ auth?: RelayhistoryAuth | null; detail?: string }>;
-  cloudRefreshSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth | null>;
-  cloudValidateExchangeBaseUrl(baseUrl?: string): Promise<void>;
-  cloudLogin(options: object): Promise<RelayhistoryAuth>;
-  enableCloud(options: object): Promise<CloudPushResult>;
-  pushCloud(options: object): Promise<CloudPushResult>;
   nativeContractVersion(): number;
   nativeBuildProfile?(): string;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
