@@ -1642,7 +1642,11 @@ export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<Rela
 }
 
 export type CloudSessionResolution =
-  | { auth: RelayhistoryAuth; session?: true }
+  | {
+    auth: RelayhistoryAuth;
+    /** Marks a stored session eligible for native refresh after a 401. Omit for caller-managed auth. */
+    session?: true;
+  }
   | { auth: null; detail: string };
 
 /** Read-only connector probe; stage selection and eligibility belong to Rust. */

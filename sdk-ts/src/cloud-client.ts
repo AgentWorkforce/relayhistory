@@ -145,9 +145,18 @@ export interface SessionThreadOptions {
    * The connector-status resolver: a usable stored RelayHistory session means
    * the `cloud` connector is configured, and anything else carries the reason
    * it is not. Defaults to {@link resolveCloudSession}.
+   * Return `{ auth }` without `session: true` for caller-managed credentials or
+   * isolated mocks: a 401 then throws AuthenticationExpiredError without refresh.
    */
   resolveSession?: (requestedBaseUrl?: string) => Promise<CloudSessionResolution>;
-  /** HTTP transport. Defaults to the global `fetch`. */
+  /**
+   * Transport for thread GET requests and their retries. Defaults to global fetch.
+   * Does not handle authentication requests: stored-session refresh uses Rust's
+   * native HTTP client and can make a real network request after a 401, even when
+   * this function is a mock. Proxy and TLS settings here do not configure refresh.
+   * For isolated mocks, also provide resolveSession returning `{ auth }` without
+   * `session: true`, which disables automatic refresh.
+   */
   fetchImpl?: typeof fetch;
 }
 

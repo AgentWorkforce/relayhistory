@@ -176,3 +176,75 @@ test('both public imports share login, stage selection, metadata, storage and ro
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('fetchImpl handles thread retries while stored-session refresh uses native HTTP', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-thread-transport-'));
+  const savedHome = process.env.RELAYHISTORY_HOME;
+  const nativeRequests: string[] = [];
+  const envelope = { session: null, outcomes: [], links: [], nextCursor: null };
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    nativeRequests.push(req.url!);
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/cli/login') {
+      res.end(JSON.stringify({ accessToken: 'rth_at_old', refreshToken: 'rth_rt_old',
+        accessTokenExpiresAt: FUTURE, orgId: 'org-test' }));
+    } else if (req.url === '/v1/auth/token/refresh') {
+      assert.deepEqual(JSON.parse(raw), { refreshToken: 'rth_rt_old' });
+      res.end(JSON.stringify({ accessToken: 'rth_at_new', refreshToken: 'rth_rt_new',
+        accessTokenExpiresAt: FUTURE }));
+    } else {
+      res.statusCode = 500;
+      res.end('{}');
+    }
+  });
+  try {
+    process.env.RELAYHISTORY_HOME = root;
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    await main.login({ baseUrl, relayAccessToken: 'fixture' });
+    nativeRequests.length = 0;
+    const threadBearers: string[] = [];
+    const query = { source: 'claude', sessionId: 'sid' };
+    const result = await cloud.getSessionThread(query, {
+      baseUrl,
+      fetchImpl: async (url, init) => {
+        assert.equal(String(url), `${baseUrl}/v1/sessions/sid/thread?source=claude`);
+        assert.equal(init?.redirect, 'error');
+        const bearer = new Headers(init?.headers).get('Authorization')!;
+        threadBearers.push(bearer);
+        return new Response(JSON.stringify(envelope), {
+          status: bearer === 'Bearer rth_at_new' ? 200 : 401,
+        });
+      },
+    });
+    assert.deepEqual(result, envelope);
+    assert.deepEqual(threadBearers, ['Bearer rth_at_old', 'Bearer rth_at_new']);
+    assert.deepEqual(nativeRequests, ['/v1/auth/token/refresh']);
+    const auth = await main.loadStoredRelayhistoryAuth(baseUrl);
+    assert.equal(auth?.accessToken, 'rth_at_new');
+    assert.equal(auth?.refreshToken, 'rth_rt_new');
+    assert.equal(auth?.orgId, 'org-test');
+    assert.ok(auth);
+
+    // A caller-managed resolution does not enable native refresh, even when the
+    // same credentials are stored locally and contain a usable refresh token.
+    nativeRequests.length = 0;
+    let mockCalls = 0;
+    await assert.rejects(cloud.getSessionThread(query, {
+      resolveSession: async () => ({ auth }),
+      fetchImpl: async () => {
+        mockCalls++;
+        return new Response('{}', { status: 401 });
+      },
+    }), (error: unknown) => error instanceof main.AuthenticationExpiredError);
+    assert.equal(mockCalls, 1);
+    assert.deepEqual(nativeRequests, [], 'isolated mocks must not trigger a native authentication request');
+  } finally {
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (savedHome === undefined) delete process.env.RELAYHISTORY_HOME;
+    else process.env.RELAYHISTORY_HOME = savedHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -10,7 +10,10 @@ metadata and session resolution/refresh operations. User-facing setup is in
 The Rust cloud layer owns login, credential loading, stage selection, and token
 rotation. `loginCloud` and `loadStoredRelayhistoryAuth` from `ai-hist` and
 `ai-hist/cloud` are the same functions. Thread reads delegate credential
-resolution and refresh to Rust.
+resolution and refresh to Rust. `SessionThreadOptions.fetchImpl` handles only
+thread GET requests and their retries; authentication requests use the native
+HTTP client. A custom `resolveSession` returning `{ auth }` without `session: true`
+disables automatic refresh for isolated mocks or caller-managed credentials.
 
 - Credential and cursor files live under `$RELAYHISTORY_HOME/stages`, defaulting
   to `~/.agentworkforce/relayhistory/stages`, keyed by normalized service URL.
@@ -58,8 +61,8 @@ a PR created after installation.
 ## Regression suites
 
 - [Cloud auth](../sdk-ts/src/cloud-auth.test.ts): both public imports, stage
-  selection, metadata, credential permissions, concurrent rotation, and failed
-  refresh/persistence.
+  selection, metadata, credential permissions, concurrent rotation, failed
+  refresh/persistence, and custom thread transport with native authentication.
 - [Cloud commands](../sdk-ts/src/cloud-commands.test.ts): npm token and replay
   behavior, including the installed-package test mode.
 - [Session threads](../sdk-ts/src/session-thread.test.ts): response shape,
@@ -72,7 +75,7 @@ a PR created after installation.
   [replay tests](../crates/ai-hist/tests/replay.rs): storage, transport, concurrency,
   stage selection, and command behavior.
 
-Local validation for this implementation passed 128 SDK tests, 286 Rust engine
+Local validation for this implementation passed 129 SDK tests, 286 Rust engine
 library tests, and 28 Rust token/replay integration tests. The focused auth suite
 passed its missing-refresh-token and failed-persistence cases. The SDK and native
 debug builds passed.
