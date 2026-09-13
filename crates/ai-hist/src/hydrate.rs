@@ -747,8 +747,10 @@ fn hydrate_remote_codex_diff_observed(
                 format!(
                     "remote-diff:{:x}:",
                     Sha256::digest(format!(
-                        "{}\0{}",
-                        observation.key.connector_id, observation.key.connector_instance
+                        "{}\0{}\0{}",
+                        observation.key.location.as_str(),
+                        observation.key.connector_id,
+                        observation.key.connector_instance
                     ))
                 )
             })
@@ -3186,6 +3188,71 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn same_connector_instance_diff_locations_do_not_delete_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("history.db")).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_123");
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_123".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let diff =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n old\n+new\n";
+        let observation = |location| SessionObservation {
+            key: ObservationKey {
+                source: "codex".into(),
+                session_id: "task_e_123".into(),
+                location,
+                connector_id: "same".into(),
+                connector_instance: "same".into(),
+            },
+            raw_locator: Some("diff".into()),
+            source_stamp: Some("1".into()),
+            discovery_state: "shallow".into(),
+            access_state: "available".into(),
+            updated_ms: 1,
+        };
+        for location in [SessionLocation::Local, SessionLocation::Remote] {
+            let observed = observation(location);
+            observations::upsert(&conn, &observed).unwrap();
+            hydrate_remote_codex_diff_observed(
+                &mut conn,
+                &options,
+                diff,
+                "1".into(),
+                100,
+                Instant::now(),
+                Some(&observed),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        hydrate_remote_codex_diff_observed(
+            &mut conn,
+            &options,
+            "",
+            "2".into(),
+            0,
+            Instant::now(),
+            Some(&observation(SessionLocation::Remote)),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

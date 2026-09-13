@@ -20,6 +20,8 @@ struct Fixture {
     instance: &'static str,
     location: SessionLocation,
     locator_override: Option<String>,
+    display_override: Option<String>,
+    enumeration_knows_id: bool,
     state: Arc<Mutex<State>>,
     probes: Arc<AtomicUsize>,
 }
@@ -38,6 +40,8 @@ impl Fixture {
             instance,
             location: SessionLocation::Remote,
             locator_override: None,
+            display_override: None,
+            enumeration_knows_id: true,
             state: Arc::new(Mutex::new(State {
                 stamp: "v1".into(),
                 events: vec![event("shared", id), event(id, id)],
@@ -103,7 +107,7 @@ impl ShallowSessionProvider for Fixture {
             vec![Candidate {
                 source: "claude",
                 locator: self.locator(),
-                session_id: Some("session".into()),
+                session_id: self.enumeration_knows_id.then(|| "session".into()),
                 recency_hint_ms: Some(1),
                 stamp: state.stamp.clone(),
             }]
@@ -123,7 +127,11 @@ impl ShallowSessionProvider for Fixture {
         Ok(Some(ShallowSession {
             source: "claude".into(),
             session_id: "session".into(),
-            raw_path: Some(self.locator()),
+            raw_path: Some(
+                self.display_override
+                    .clone()
+                    .unwrap_or_else(|| self.locator()),
+            ),
             ..Default::default()
         }))
     }
@@ -535,5 +543,42 @@ fn provider_and_two_recall_instances_keep_four_observations_one_session_two_loca
             4
         );
     }
+    Ok(())
+}
+
+#[test]
+fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_id() -> Result<()> {
+    let mut fixture = Fixture::new("opaque", "default");
+    fixture.locator_override = Some("opaque-acquire-key".into());
+    fixture.display_override = Some("https://display.example/session".into());
+    fixture.enumeration_knows_id = false;
+    let mut registry = SourceRegistry::new();
+    registry.register(Box::new(fixture.clone()))?;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    let first = registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
+    assert_eq!(first.discovered, 1);
+    let second = registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
+    assert_eq!(second.skipped_unchanged, 1);
+    let conn = ai_hist_core::open_db(&db)?;
+    assert_eq!(
+        observations::list(&conn, "claude", "session")?[0]
+            .raw_locator
+            .as_deref(),
+        Some("opaque-acquire-key")
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT raw_path FROM sessions WHERE session_id='session'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "https://display.example/session"
+    );
+    registry.hydrate_at(&db, &hydration(), &fixture.identity())?;
+    assert_eq!(
+        fixture.state.lock().unwrap().locators,
+        ["opaque-acquire-key"]
+    );
     Ok(())
 }

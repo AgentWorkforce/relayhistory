@@ -220,7 +220,6 @@ pub fn set_access(conn: &Connection, key: &ObservationKey, state: &str) -> Resul
 
 fn refresh_projection(conn: &Connection, key: &ObservationKey) -> Result<()> {
     conn.execute("INSERT INTO session_presences(source,session_id,location,raw_locator,source_stamp,discovery_state) SELECT source,session_id,location,raw_locator,source_stamp,CASE WHEN EXISTS(SELECT 1 FROM session_observations o WHERE o.source=?1 AND o.session_id=?2 AND o.location=?3 AND o.discovery_state='full') OR EXISTS(SELECT 1 FROM session_presences p WHERE p.source=?1 AND p.session_id=?2 AND p.location=?3 AND p.discovery_state='full') THEN 'full' ELSE discovery_state END FROM session_observations WHERE source=?1 AND session_id=?2 AND location=?3 ORDER BY connector_id='legacy-unknown',access_state!='available',connector_id,connector_instance LIMIT 1 ON CONFLICT(source,session_id,location) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=excluded.discovery_state",params![key.source,key.session_id,key.location.as_str()])?;
-    conn.execute("UPDATE sessions SET raw_path=COALESCE((SELECT raw_locator FROM session_presences WHERE source=?1 AND session_id=?2 ORDER BY location!='local' LIMIT 1),raw_path) WHERE source=?1 AND session_id=?2",params![key.source,key.session_id])?;
     Ok(())
 }
 

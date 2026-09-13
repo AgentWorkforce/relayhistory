@@ -2124,9 +2124,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
              SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
              AND p.session_id = sessions.session_id AND p.location = 'local') \
-             THEN COALESCE((SELECT p.raw_locator FROM session_presences p \
-                 WHERE p.source = sessions.source AND p.session_id = sessions.session_id \
-                 AND p.location = 'local'), sessions.raw_path, excluded.raw_path) \
+             THEN COALESCE(sessions.raw_path, excluded.raw_path) \
              ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
@@ -2885,7 +2883,7 @@ pub fn discover_sessions_with_provider_refs(
                 conn,
                 &ai_hist_core::observations::SessionObservation {
                     key: observation_key(provider, &session.source, &session.session_id),
-                    raw_locator: session.raw_path.clone(),
+                    raw_locator: Some(candidate.locator.clone()),
                     source_stamp: session.source_stamp.clone(),
                     discovery_state: session.discovery_state.clone(),
                     access_state: "available".into(),
