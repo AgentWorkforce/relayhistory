@@ -294,7 +294,7 @@ pub fn sync_and_push() -> Result<SyncPushOutcome> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
 
     let db_path = default_db_path();
-    let (conn, sync_skipped) = prepare_sync_and_push_db(&db_path)?;
+    let (conn, sync_skipped) = prepare_local_sync_snapshot(&db_path)?;
 
     // The in-process runtime has no CLI argument channel. Keep it pinned to the normal Cloud
     // origin rather than following whichever stage happened to be logged into most recently.
@@ -750,7 +750,10 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     Ok(true)
 }
 
-fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
+/// Synchronize local providers, or read the current snapshot when another sync owns the lock.
+/// The boolean reports that synchronization was skipped. No destination or credentials are read.
+pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         // Pushing already-indexed rows only reads SQLite and remains useful while another
         // process scans. A read-only connection avoids joining the writer contention.
@@ -4983,7 +4986,7 @@ mod tests {
         drop(open_db(&db_path).unwrap());
         let _scan_owner = try_acquire_sync_lock(&db_path).unwrap().unwrap();
 
-        let (conn, sync_skipped) = prepare_sync_and_push_db(&db_path).unwrap();
+        let (conn, sync_skipped) = prepare_local_sync_snapshot(&db_path).unwrap();
         assert!(sync_skipped);
         assert!(conn
             .query_row("SELECT COUNT(*) FROM history", [], |row| row

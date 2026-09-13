@@ -2,7 +2,7 @@
 //! to relayhistory-cloud (Agent Relay Loop).
 //!
 //! This is the **binding layer** — it does the network I/O the WASM-bound `ai-hist-core`
-//! deliberately avoids. It wires `ai_hist_core::outbox::build_outbox_batch` (pure batch
+//! deliberately avoids. It wires `crate::outbox::build_outbox_batch` (pure batch
 //! building) to `POST /v1/ingest` with `rth_at_` bearer auth, persists a cursor per Cloud
 //! stage, and advances only that stage's server-confirmed watermark.
 //!
@@ -12,9 +12,9 @@
 //! The HTTP call is behind the [`Ingestor`] trait so the push orchestration (batch build,
 //! cursor advance, idempotent batchId, no-op-on-empty) is unit-testable without a server.
 
-use ai_hist_core::convergence::{IngestRequest, IngestResponse, MachineIdentity};
-use ai_hist_core::outbox::{build_outbox_batch, SyncCursor};
-use ai_hist_core::turns::{build_turns_batch, ConversationTurn, DEFAULT_SESSION_BUDGET};
+use crate::convergence::{IngestRequest, IngestResponse, MachineIdentity};
+use crate::outbox::{build_outbox_batch, SyncCursor};
+use crate::turns::{build_turns_batch, ConversationTurn, DEFAULT_SESSION_BUDGET};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -1148,6 +1148,7 @@ fn ensure_agent_relay_session(
             eprintln!("Agent Relay Cloud login required; starting `agent-relay cloud login`.");
             let status = std::process::Command::new(bin)
                 .args(["cloud", "login"])
+                .stdout(std::io::stderr())
                 .status()
                 .with_context(|| {
                     format!(
@@ -1924,8 +1925,7 @@ pub struct CloudPushOutcome {
 pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
     let auth =
         load_selected_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
-    crate::SYNC_QUIET.store(true, crate::AtomicOrdering::Relaxed);
-    let (conn, sync_skipped) = crate::prepare_local_sync_snapshot(db_path)?;
+    let (conn, sync_skipped) = ai_hist_engine::prepare_local_sync_snapshot(db_path)?;
     let machine = MachineIdentity {
         id: machine_id()?,
         hostname: machine_hostname(),

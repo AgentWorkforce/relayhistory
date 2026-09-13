@@ -18,6 +18,7 @@ pub mod outbox;
 /// Delegation topology: recorded parent/child relationships and bounded,
 /// cycle-safe traversal over them.
 pub mod relationships;
+pub mod storage;
 pub mod turns;
 
 pub use relationships::{
