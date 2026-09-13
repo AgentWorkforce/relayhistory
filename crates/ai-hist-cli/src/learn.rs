@@ -1,4 +1,4 @@
-use ai_hist_core::convergence::normalize_home_path;
+use ai_hist_core::privacy::normalize_home_path;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection};
@@ -765,11 +765,7 @@ pub fn provider_from_str(value: &str) -> Result<LearnProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{
-        init_db, insert_history, outbox::build_outbox_batch, outbox::SyncCursor, prompt_hash,
-        HistoryEntry,
-    };
-    use std::collections::HashSet;
+    use ai_hist_core::{init_db, insert_history, prompt_hash, HistoryEntry};
     use tempfile::tempdir;
 
     fn mem() -> Connection {
@@ -813,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn learn_rollup_maps_with_learn_tags_and_no_summary_event() {
+    fn learn_rollup_persists_distilled_evidence_without_raw_prompt() {
         let conn = mem();
         insert_history(
             &conn,
@@ -859,26 +855,12 @@ mod tests {
         let compacted = learn_rollup_from_output(&id, &transcript, output).unwrap();
         upsert_learn_rollup(&conn, &transcript, &compacted).unwrap();
 
-        let batch = build_outbox_batch(&conn, &SyncCursor::default(), 10, &HashSet::new()).unwrap();
-        let learn_events = batch
-            .records
-            .iter()
-            .filter(|event| event.session_id == id)
-            .collect::<Vec<_>>();
-        assert!(learn_events.iter().all(|event| event.tags == vec!["learn"]));
-        assert!(learn_events.iter().all(|event| event.source == "learn"));
-        assert!(learn_events
-            .iter()
-            .all(|event| event.lens.as_deref() == Some("learn")));
-        assert!(learn_events
-            .iter()
-            .any(|event| event.event_id == format!("reflection:{id}:lesson:0")));
-        assert!(learn_events.iter().any(|event| event
-            .content
-            .contains("ghp_FAKE0000000000000000000000000000abcd")));
-        assert!(!learn_events
-            .iter()
-            .any(|event| event.event_id == format!("reflection:{id}:summary")));
+        let stored = ai_hist_core::storage::trajectories_after(&conn, 0, 0, 10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, id);
+        assert!(stored[0]
+            .retrospective_json
+            .contains("Token rotation must accompany middleware edits"));
         assert!(!serde_json::to_string(&compacted)
             .unwrap()
             .contains("Refactor auth middleware"));

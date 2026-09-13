@@ -15,6 +15,7 @@ pub mod delivery;
 pub mod observations;
 /// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
 pub mod outbox;
+pub mod privacy;
 /// Delegation topology: recorded parent/child relationships and bounded,
 /// cycle-safe traversal over them.
 pub mod relationships;

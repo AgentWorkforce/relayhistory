@@ -684,6 +684,7 @@ fn publish_session_turns(
     (accepted, sessions, batch.session_event_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_once(
     conn: &Connection,
     client: &dyn Ingestor,

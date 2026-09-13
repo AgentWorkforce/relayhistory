@@ -3,6 +3,7 @@
 pub mod cloud;
 pub mod convergence;
 pub mod helper;
+pub mod legacy_cli;
 pub mod outbox;
 pub mod replay;
 pub mod turns;

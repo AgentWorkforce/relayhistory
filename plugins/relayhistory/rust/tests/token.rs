@@ -27,7 +27,7 @@ fn save(home: &Path, base: &str, token: &str, expiry: Option<&str>) -> PathBuf {
 }
 
 fn command(home: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-hist"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_relayhistory-plugin"));
     // Isolate credential state from the developer home.
     cmd.env("RELAYHISTORY_HOME", home)
         .env("HOME", home)
@@ -433,7 +433,7 @@ fn sdk_login_rejects_a_malformed_selector_instead_of_using_production() {
     std::env::set_var("RELAYHISTORY_HOME", home.path());
     std::env::set_var("RELAYHISTORY_BASE_URL", "not-a-url");
     std::env::remove_var("AI_HIST_BASE_URL");
-    let error = ai_hist_engine::cloud::login_for_sdk(None, Some("relay-token"), None)
+    let error = relayhistory_plugin::cloud::login_for_sdk(None, Some("relay-token"), None)
         .expect_err("a malformed selector must not authenticate against production");
     let message = format!("{error:#}");
     for (key, value) in previous {

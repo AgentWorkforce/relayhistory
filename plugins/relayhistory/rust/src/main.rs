@@ -9,6 +9,13 @@ fn main() {
         eprintln!("RelayHistory helper deadline exceeded");
         std::process::exit(124);
     });
+    if std::env::args_os().len() > 1 {
+        if let Err(error) = relayhistory_plugin::legacy_cli::run() {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if run().is_err() {
         eprintln!("RelayHistory helper protocol failure");
         std::process::exit(1);

@@ -66,7 +66,7 @@ fn save_auth(home: &Path, base: &str) {
 }
 
 fn replay(home: &Path, base: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ai-hist"))
+    Command::new(env!("CARGO_BIN_EXE_relayhistory-plugin"))
         .env("RELAYHISTORY_HOME", home)
         // Isolate all state from the developer home.
         .env("HOME", home)
@@ -379,7 +379,7 @@ fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
     save_auth(home.path(), "https://history.agentrelay.com");
     save_auth(home.path(), "http://localhost:8787");
-    let output = Command::new(env!("CARGO_BIN_EXE_ai-hist"))
+    let output = Command::new(env!("CARGO_BIN_EXE_relayhistory-plugin"))
         .env("RELAYHISTORY_HOME", home.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())

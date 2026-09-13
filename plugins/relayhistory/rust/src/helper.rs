@@ -100,12 +100,13 @@ fn execute(request: Request) -> Result<Value> {
             )?;
             json!({"eventCount":result.event_count,"transcript":result.transcript,"outputPath":result.output_path})
         }
-        "createShareableTrace" => cloud::create_share(
+        "createShareableTrace" => json!(cloud::create_share(
             a.session_id.as_deref().context("sessionId required")?,
             a.visibility.as_deref().unwrap_or("direct-link"),
             a.source.as_deref(),
             base,
-        )?,
+        )?
+        .to_string()),
         _ => bail!("unknown helper operation"),
     })
 }

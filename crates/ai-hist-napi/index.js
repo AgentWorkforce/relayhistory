@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { historyDelivery, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, syncAndPush, accessToken, replay, cloudLoadAuth, cloudResolveSession, cloudRefreshSession, cloudValidateExchangeBaseUrl, cloudLogin, enableCloud, pushCloud, installGitHooks, linkGitCommit, createShareableTrace } = nativeBinding
+const { historyDelivery, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
 
 module.exports.historyDelivery = historyDelivery
 module.exports.nativeContractVersion = nativeContractVersion
@@ -331,16 +331,5 @@ module.exports.getSessionTree = getSessionTree
 module.exports.getSessionChildrenPage = getSessionChildrenPage
 module.exports.sync = sync
 module.exports.syncLocal = syncLocal
-module.exports.syncAndPush = syncAndPush
-module.exports.accessToken = accessToken
-module.exports.replay = replay
-module.exports.cloudLoadAuth = cloudLoadAuth
-module.exports.cloudResolveSession = cloudResolveSession
-module.exports.cloudRefreshSession = cloudRefreshSession
-module.exports.cloudValidateExchangeBaseUrl = cloudValidateExchangeBaseUrl
-module.exports.cloudLogin = cloudLogin
-module.exports.enableCloud = enableCloud
-module.exports.pushCloud = pushCloud
 module.exports.installGitHooks = installGitHooks
 module.exports.linkGitCommit = linkGitCommit
-module.exports.createShareableTrace = createShareableTrace

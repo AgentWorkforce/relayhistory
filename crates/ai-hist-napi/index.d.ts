@@ -426,59 +426,5 @@ export interface SyncResult {
 export declare function sync(options?: SyncOptions | undefined | null): Promise<SyncResult>
 /** Backward-compatible internal capture entry point; not used by the SDK. */
 export declare function syncLocal(): Promise<void>
-export interface SyncPushResult {
-  sent: number
-  accepted: number
-  authenticated: boolean
-  syncSkipped: boolean
-}
-/** Cloud capture hook retained for Agent Relay integration. */
-export declare function syncAndPush(): Promise<SyncPushResult>
-export interface CloudOptions {
-  dbPath?: string
-  baseUrl?: string
-  relayAccessToken?: string
-  label?: string
-}
-export declare function accessToken(baseUrl?: string | undefined | null): Promise<string>
-export interface ReplayOptions {
-  baseUrl?: string
-  limit?: number
-  maxContent?: number
-  json?: boolean
-  out?: string
-}
-export interface ReplayResult {
-  eventCount: number
-  transcript?: string
-  outputPath?: string
-}
-export declare function replay(sessionId: string, options?: ReplayOptions | undefined | null): Promise<ReplayResult>
-export interface CloudAuth {
-  baseUrl: string
-  accessToken: string
-  refreshToken?: string
-  accessTokenExpiresAt?: string
-  orgId?: string
-  workspaceId?: string
-}
-export interface CloudPushResult {
-  baseUrl: string
-  sent: number
-  accepted: number
-  syncSkipped: boolean
-}
-export declare function cloudLoadAuth(baseUrl?: string | undefined | null): Promise<CloudAuth | null>
-export interface CloudSessionResolution {
-  auth?: CloudAuth
-  detail?: string
-}
-export declare function cloudResolveSession(baseUrl: string | undefined | null, now: number): Promise<CloudSessionResolution>
-export declare function cloudRefreshSession(baseUrl: string, rejectedToken: string): Promise<CloudAuth | null>
-export declare function cloudValidateExchangeBaseUrl(baseUrl?: string | undefined | null): Promise<void>
-export declare function cloudLogin(options?: CloudOptions | undefined | null): Promise<CloudAuth>
-export declare function enableCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>
-export declare function pushCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>
 export declare function installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>
 export declare function linkGitCommit(optionsJson: string): Promise<string>
-export declare function createShareableTrace(sessionId: string, visibility: string, source?: string | undefined | null, baseUrl?: string | undefined | null): Promise<string>
