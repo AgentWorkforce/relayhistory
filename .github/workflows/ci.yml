@@ -24,6 +24,9 @@ jobs:
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
+      - name: Physically remove optional cloud and provider packages
+        run: rm -rf plugins
+
       - name: Rust formatting
         run: cargo fmt --all -- --check
 
@@ -51,56 +54,8 @@ jobs:
           npm run lint
           npm test
 
-      - name: Installed SDK and CLI smoke test
-        working-directory: sdk-ts
-        run: |
-          set -euo pipefail
-          PACK_DIR=$(mktemp -d)
-          SDK_STAGE=$(mktemp -d)
-          PLATFORM_STAGE=$(mktemp -d)
-          SMOKE=$(mktemp -d)
-          VERSION=$(node -p "require('../crates/ai-hist-napi/package.json').version")
-
-          (cd ../crates/ai-hist-napi && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
-          cp package.json README.md "$SDK_STAGE/"
-          cp -R dist "$SDK_STAGE/dist"
-          (cd "$SDK_STAGE" && npm pkg set dependencies.ai-hist-native="$VERSION" && npm pkg delete scripts.prepare && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
-
-          cp ../crates/ai-hist-napi/ai-hist-native.linux-x64-gnu.node "$PLATFORM_STAGE/"
-          VERSION="$VERSION" node -e '
-            const fs = require("node:fs");
-            fs.writeFileSync(process.argv[1], JSON.stringify({
-              name: "ai-hist-native-linux-x64-gnu", version: process.env.VERSION,
-              main: "ai-hist-native.linux-x64-gnu.node",
-              files: ["ai-hist-native.linux-x64-gnu.node"],
-              os: ["linux"], cpu: ["x64"], libc: ["glibc"]
-            }, null, 2));
-          ' "$PLATFORM_STAGE/package.json"
-          (cd "$PLATFORM_STAGE" && npm pack --ignore-scripts --pack-destination "$PACK_DIR")
-
-          cd "$SMOKE"
-          npm init -y >/dev/null
-          npm install --ignore-scripts \
-            "$PACK_DIR/ai-hist-$VERSION.tgz" \
-            "$PACK_DIR/ai-hist-native-$VERSION.tgz" \
-            "$PACK_DIR/ai-hist-native-linux-x64-gnu-$VERSION.tgz"
-          export HOME="$SMOKE/home" USERPROFILE="$SMOKE/home" XDG_DATA_HOME="$SMOKE/share"
-          mkdir -p "$HOME"
-          set +e
-          out=$(./node_modules/.bin/ai-hist sessions list --db "$SMOKE/missing.db" --no-bootstrap --json 2>&1)
-          code=$?
-          set -e
-          echo "$out"
-          test "$code" -eq 1
-          echo "$out" | grep -q '"status":"unbuilt"'
-          set +e
-          ./node_modules/.bin/ai-hist login --token smoke --base-url http://127.0.0.1:9
-          login_code=$?
-          set -e
-          test "$login_code" -ne 2
-          node --input-type=module -e 'await import("ai-hist")'
-          node -e 'require("ai-hist/package.json")'
-          AI_HIST_TEST_PACKAGE_DIR="$SMOKE/node_modules/ai-hist" node --test "$GITHUB_WORKSPACE/sdk-ts/dist/cloud-commands.test.js"
+      - name: Installed local SDK and CLI smoke test
+        run: node scripts/smoke-history-packages.mjs
 
   node-22-sdk:
     runs-on: ubuntu-latest
@@ -130,3 +85,71 @@ jobs:
 
       - name: Verify repeated private-state replacement
         run: cargo test -p ai-hist-engine write_private_replaces_existing_state
+
+  optional-history-plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Optional helper packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Build composed distribution
+        run: |
+          cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --locked
+          cargo build --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          for plugin in relayhistory provider-sources; do
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts --omit=optional
+            npm --prefix "plugins/$plugin/sdk" run build
+          done
+      - name: Optional plugin tests
+        env:
+          RELAYHISTORY_PLUGIN_BIN: ${{ github.workspace }}/plugins/relayhistory/rust/target/debug/relayhistory-plugin
+          HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources
+        run: |
+          npm --prefix plugins/relayhistory/sdk test
+          npm --prefix plugins/provider-sources/sdk test
+      - name: Installed composed tarballs
+        run: |
+          mkdir -p helper-packs
+          for plugin in relayhistory provider-sources; do
+            binary=history-provider-sources
+            if [ "$plugin" = relayhistory ]; then binary=relayhistory-plugin; fi
+            version=$(node -p "require('./plugins/$plugin/sdk/package.json').version")
+            node scripts/package-history-helper.mjs "$plugin" linux-x64-gnu "$version" "plugins/$plugin/rust/target/debug/$binary" "helper-stage/$plugin"
+            (cd "helper-stage/$plugin" && npm pack --ignore-scripts --pack-destination ../../helper-packs)
+          done
+          node scripts/smoke-history-packages.mjs --helpers helper-packs
+
+  windows-helper-cancellation:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build local native addon and optional SDK runtimes
+        run: |
+          set -euo pipefail
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          for plugin in relayhistory provider-sources; do
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts --omit=optional
+            npm --prefix "plugins/$plugin/sdk" run build
+          done
+      - name: Verify actual Windows descendant cleanup and missing executable errors
+        run: node --test plugins/relayhistory/sdk/dist/helper-runtime.test.js plugins/provider-sources/sdk/dist/helper-runtime.test.js
+      - name: Verify shell-free packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Verify installed local SDK on Windows
+        run: node scripts/smoke-history-packages.mjs
