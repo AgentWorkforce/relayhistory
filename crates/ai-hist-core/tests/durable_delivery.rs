@@ -655,3 +655,80 @@ fn terminal_receipts_can_be_compacted_without_accepting_a_stale_ack() {
     assert!(acknowledge(&conn, &claim.lease, &ack(&claim), 2).is_err());
     assert_eq!(status(&conn, &job.job_id).unwrap().acknowledged_records, 1);
 }
+
+#[test]
+fn permanent_failure_cannot_resume_through_pause_without_explicit_retry() {
+    for failure in [
+        DeliveryFailure::AuthenticationRequired,
+        DeliveryFailure::PermissionDenied,
+        DeliveryFailure::InvalidPayload,
+        DeliveryFailure::UnsupportedEvidence,
+        DeliveryFailure::MappingVersionMismatch,
+    ] {
+        let conn = db();
+        event(&conn, "one", "pending");
+        let job = create_job(&conn, &config("blocked"), 0).unwrap();
+        let first = claim(&conn, &job.job_id, 0).unwrap();
+        prepare(&conn, &first, 0);
+        let expected_prepared = validate_dispatch(&conn, &first.lease, 0).unwrap();
+        let blocked = record_failure(&conn, &first.lease, failure, None, 1).unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert!(pause_job(&conn, &job.job_id).is_err());
+        assert!(resume_job(&conn, &job.job_id).is_err());
+        assert_eq!(status(&conn, &job.job_id).unwrap(), blocked);
+        assert!(claim_batch(&conn, &job.job_id, "other", 1000, 100_000)
+            .unwrap()
+            .is_none());
+        // A paused row written by the previous buggy version also remains blocked.
+        conn.execute(
+            "UPDATE delivery_jobs SET state='paused' WHERE id=?",
+            [&job.job_id],
+        )
+        .unwrap();
+        assert!(resume_job(&conn, &job.job_id).is_err());
+        assert!(pause_job(&conn, &job.job_id).is_err());
+        assert_eq!(status(&conn, &job.job_id).unwrap().failure, blocked.failure);
+        retry_job(&conn, &job.job_id).unwrap();
+        let next = claim_batch(&conn, &job.job_id, "other", 1000, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.batch, first.batch);
+        assert_eq!(next.prepared, Some(expected_prepared));
+        acknowledge(&conn, &next.lease, &ack(&next), 3).unwrap();
+    }
+}
+
+#[test]
+fn resume_checks_state_after_acquiring_the_write_transaction() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WAITING_FOR_WRITE: AtomicBool = AtomicBool::new(false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resume.db");
+    let writer = open_db(&path).unwrap();
+    let reader = open_db(&path).unwrap();
+    let job = create_job(&writer, &config("race"), 0).unwrap();
+    pause_job(&writer, &job.job_id).unwrap();
+    reader
+        .busy_handler(Some(|_| {
+            WAITING_FOR_WRITE.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }))
+        .unwrap();
+    let tx = writer.unchecked_transaction().unwrap();
+    tx.execute(
+        "UPDATE delivery_jobs SET state='blocked',failure='permission_denied' WHERE id=?",
+        [&job.job_id],
+    )
+    .unwrap();
+    let id = job.job_id.clone();
+    let resumer = std::thread::spawn(move || resume_job(&reader, &id));
+    let started = std::time::Instant::now();
+    while !WAITING_FOR_WRITE.load(Ordering::SeqCst) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::yield_now();
+    }
+    tx.commit().unwrap();
+    assert!(resumer.join().unwrap().is_err());
+    assert_eq!(status(&writer, &job.job_id).unwrap().state, "blocked");
+}

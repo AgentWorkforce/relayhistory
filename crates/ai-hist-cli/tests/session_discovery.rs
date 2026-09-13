@@ -1019,3 +1019,58 @@ fn explicit_relaycast_sync_uses_remote_presence_and_persists_checkpoint() {
         serde_json::from_slice(&fs::read(temp.path().join(".sync-state.json")).unwrap()).unwrap();
     assert_eq!(state["relay"]["ch:general"], "m001");
 }
+
+#[test]
+fn busy_relaycast_lock_skips_only_relaycast_and_does_not_initialize_its_database() {
+    for include_codex in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("history.db");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp.path().join("history.db.sync.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let mut command = isolated(
+            &temp,
+            &db,
+            &["sync", "--remote", "--source-connector", "relaycast"],
+        );
+        command
+            .env("RELAYCAST_API_KEY", "fixture-key")
+            .env("RELAYCAST_WORKSPACE_ID", "fixture-workspace")
+            .env("RELAYCAST_BASE_URL", "http://127.0.0.1:1");
+        if include_codex {
+            let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
+            prepend_path(&mut command, &bin);
+            command.args(["--source-connector", "codex-cloud"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if include_codex {
+            let conn = open_db(&db).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='task_e_42'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "busy Relaycast cannot skip selected independent Codex discovery"
+            );
+        } else {
+            assert!(
+                !db.exists(),
+                "busy Relaycast-only sync must not initialize the database"
+            );
+        }
+    }
+}
