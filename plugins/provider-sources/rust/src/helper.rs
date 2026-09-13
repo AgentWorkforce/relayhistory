@@ -51,7 +51,12 @@ fn execute(request: Request) -> Result<Value> {
             if let Some(mut row) = provider.read_shallow(&env.scan(), None, &candidate)? {
                 row.source_stamp = Some(candidate.stamp.clone());
                 row.locations = vec!["remote".into()];
-                observations.push(row);
+                let mut value = serde_json::to_value(row)?;
+                value
+                    .as_object_mut()
+                    .context("source observation object required")?
+                    .insert("raw_locator".into(), json!(candidate.locator));
+                observations.push(value);
             }
         }
         Ok(json!({"observations": observations}))

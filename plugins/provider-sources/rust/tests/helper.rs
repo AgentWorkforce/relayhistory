@@ -51,7 +51,7 @@ fn real_helper_lists_codex_and_normalizes_only_file_edit_capability() {
     let script = home.path().join("bin/codex");
     std::fs::write(&script, r#"#!/bin/sh
 if [ "$1 $2" = 'cloud list' ]; then
-  printf '%s' '{"tasks":[{"id":"task_fixture","title":"Review fixture","updated_at":"2026-01-01T00:00:00Z","status":"ready"}]}'
+  printf '%s' '{"tasks":[{"id":"task_fixture","title":"Review fixture","url":"https://chatgpt.com/codex/tasks/task_fixture","updated_at":"2026-01-01T00:00:00Z","status":"ready"}]}'
 elif [ "$1 $2 $3" = 'cloud diff task_fixture' ]; then
   printf '%s\n' 'diff --git a/example.ts b/example.ts' '--- a/example.ts' '+++ b/example.ts' '@@ -1 +1 @@' '-old' '+new'
 else
@@ -66,7 +66,12 @@ fi
     assert_eq!(discovered["ok"], true, "{discovered}");
     let row = &discovered["value"]["observations"][0];
     assert_eq!(row["session_id"], "task_fixture");
-    let observation = json!({"key":{"source":"codex","session_id":"task_fixture","location":"remote","connector_id":"codex-cloud","connector_instance":"work"},"raw_locator":row["raw_path"],"source_stamp":row["source_stamp"],"discovery_state":"shallow","access_state":"available","updated_ms":1});
+    assert_eq!(row["raw_locator"], "task_fixture");
+    assert_eq!(
+        row["raw_path"],
+        "https://chatgpt.com/codex/tasks/task_fixture"
+    );
+    let observation = json!({"key":{"source":"codex","session_id":"task_fixture","location":"remote","connector_id":"codex-cloud","connector_instance":"work"},"raw_locator":row["raw_locator"],"source_stamp":row["source_stamp"],"discovery_state":"shallow","access_state":"available","updated_ms":1});
     let hydrated = invoke(
         home.path(),
         json!({"version":1,"operation":"hydrate","args":{"connectorId":"codex-cloud","connectorInstance":"work","observation":observation}}),

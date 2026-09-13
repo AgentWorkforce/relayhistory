@@ -525,7 +525,12 @@ pub fn discover(
         );
         for candidate in provider.enumerate(&env, remaining)? {
             if let Some(row) = provider.read_shallow(&env.scan(), None, &candidate)? {
-                observations.push(row);
+                let mut value = serde_json::to_value(row)?;
+                value
+                    .as_object_mut()
+                    .context("source observation object required")?
+                    .insert("raw_locator".into(), serde_json::json!(candidate.locator));
+                observations.push(value);
             }
         }
     }
