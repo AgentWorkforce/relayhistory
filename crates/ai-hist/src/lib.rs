@@ -119,12 +119,21 @@ pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
 }
 
 fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
-    sync_scoped_at_with_connectors(db_path, scope, &remote::SourceConnectorSelection::default())
+    sync_scope_with_connectors(db_path, scope, &remote::SourceConnectorSelection::default())
 }
 
 /// Full ingestion with an explicit remote connector allowlist. Local scope
 /// ignores all remote connectors and never probes their credentials.
 pub fn sync_scoped_at_with_connectors(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+) -> Result<bool> {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_scope_with_connectors(db_path, scope, connectors)
+}
+
+fn sync_scope_with_connectors(
     db_path: &Path,
     scope: SessionScope,
     connectors: &remote::SourceConnectorSelection,
@@ -1101,8 +1110,7 @@ pub fn run() -> Result<()> {
             if *uninstall_service {
                 return uninstall_managed_service(&SYNC_SERVICE);
             }
-            return sync_scoped_at_with_connectors(&db_path, scope.resolve(), &connectors)
-                .map(|_| ());
+            return sync_scope_with_connectors(&db_path, scope.resolve(), &connectors).map(|_| ());
         }
         Command::Watch { scope, interval } => {
             if scope.resolve() == SessionScope::Remote {
@@ -3444,7 +3452,7 @@ fn watch_loop_with_connectors(
 ) -> Result<()> {
     println!("Watching every {interval}s (Ctrl-C to stop)...");
     loop {
-        match sync_scoped_at_with_connectors(db_path, scope, connectors) {
+        match sync_scope_with_connectors(db_path, scope, connectors) {
             Ok(_) => {}
             Err(err) => eprintln!("Error: {err:#}"),
         }
