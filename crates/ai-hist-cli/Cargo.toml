@@ -22,5 +22,6 @@ sha2 = "0.10"
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
+fs2 = "0.4"
 tempfile = "3"
 url = "2"
