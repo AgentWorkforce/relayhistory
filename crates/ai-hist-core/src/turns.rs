@@ -66,7 +66,9 @@ pub struct SessionTurns {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnsBatch {
     pub sessions: Vec<SessionTurns>,
-    /// Highest `session_events.id` scanned, emitted or not.
+    /// End of the safely scanned event prefix, including suppressed events.
+    /// Whole transcripts may contain later events without advancing past an
+    /// unselected session's first pending event.
     pub session_event_id: i64,
 }
 
@@ -126,21 +128,43 @@ pub fn build_turns_batch(
     session_budget: usize,
     incognito: &HashSet<String>,
 ) -> Result<TurnsBatch> {
+    // Selection and transcript reads must see the same snapshot: a concurrent
+    // append must not move this batch's watermark beyond unselected history.
+    // Respect an existing caller transaction instead of trying to nest BEGIN.
+    let snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let batch = build_turns_batch_in_snapshot(conn, session_event_id, session_budget, incognito)?;
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(batch)
+}
+
+fn build_turns_batch_in_snapshot(
+    conn: &Connection,
+    session_event_id: i64,
+    session_budget: usize,
+    incognito: &HashSet<String>,
+) -> Result<TurnsBatch> {
     let budget = session_budget.max(1);
+    let lookahead = i64::try_from(budget.saturating_add(1)).unwrap_or(i64::MAX);
 
     // Which sessions have anything new, oldest change first so the backlog drains in a
-    // predictable order rather than jumping around.
+    // predictable order rather than jumping around. One extra session identifies
+    // the first event this batch cannot acknowledge.
     let mut stmt = conn.prepare(
         "SELECT session_id, source, MIN(id) AS first_new_id \
          FROM session_events WHERE id > ?1 \
          GROUP BY session_id, source ORDER BY first_new_id ASC LIMIT ?2",
     )?;
-    let pending: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![session_event_id, budget as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    let mut pending: Vec<(String, String, i64)> = stmt
+        .query_map(rusqlite::params![session_event_id, lookahead], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
-        .filter_map(|row| row.ok())
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
 
     if pending.is_empty() {
         return Ok(TurnsBatch {
@@ -149,8 +173,16 @@ pub fn build_turns_batch(
         });
     }
 
-    // Advance to the highest id belonging to the sessions actually taken this run. Using
-    // the table-wide MAX would skip every session whose events sort after the budget cut.
+    let watermark_ceiling = if pending.len() > budget {
+        pending.pop().map(|(_, _, first_new_id)| first_new_id - 1)
+    } else {
+        None
+    };
+
+    // A selected session may have later events beyond an unselected session.
+    // Publish it whole, but acknowledge only the contiguous processed prefix.
+    // Revisiting its tail is safe and finite: each nonempty batch advances past
+    // at least its first pending event, even if all its turns are suppressed.
     let mut watermark = session_event_id;
     let mut sessions = Vec::new();
 
@@ -160,7 +192,7 @@ pub fn build_turns_batch(
          ORDER BY ts_ms ASC, id ASC",
     )?;
 
-    for (session_id, source) in pending {
+    for (session_id, source, _) in pending {
         let rows = events_stmt.query_map(rusqlite::params![&session_id, &source], |r| {
             Ok((
                 RawEvent {
@@ -178,10 +210,7 @@ pub fn build_turns_batch(
 
         let mut turns: Vec<ConversationTurn> = Vec::new();
         for row in rows {
-            let (event, id) = match row {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
+            let (event, id) = row?;
             watermark = watermark.max(id);
 
             // An event with no text carries nothing a reader can use. Skip it, but only
@@ -229,7 +258,7 @@ pub fn build_turns_batch(
 
     Ok(TurnsBatch {
         sessions,
-        session_event_id: watermark,
+        session_event_id: watermark_ceiling.map_or(watermark, |ceiling| watermark.min(ceiling)),
     })
 }
 
@@ -423,6 +452,200 @@ mod tests {
 
         let third = build_turns_batch(&conn, second.session_event_id, 1, &HashSet::new()).unwrap();
         assert_eq!(third.sessions[0].session_id, "s3");
+    }
+
+    #[test]
+    fn budget_does_not_skip_interleaved_sessions() {
+        let conn = db();
+        insert(&conn, "a", 1000, "user", "text", "a first");
+        insert(&conn, "b", 2000, "user", "text", "b first");
+        insert(&conn, "a", 3000, "assistant", "text", "a last");
+
+        let first = build_turns_batch(&conn, 0, 1, &HashSet::new()).unwrap();
+        assert_eq!(first.sessions[0].session_id, "a");
+        assert_eq!(first.sessions[0].chunks[0].len(), 2);
+        assert_eq!(first.session_event_id, 1);
+        assert_eq!(
+            build_turns_batch(&conn, 0, 1, &HashSet::new()).unwrap(),
+            first,
+            "a retry before acknowledgment preserves the batch for unchanged storage"
+        );
+        let second = build_turns_batch(&conn, first.session_event_id, 1, &HashSet::new()).unwrap();
+        assert_eq!(second.sessions[0].session_id, "b");
+        assert_eq!(second.session_event_id, 2);
+        let third = build_turns_batch(&conn, second.session_event_id, 1, &HashSet::new()).unwrap();
+        assert_eq!(third.sessions, first.sessions);
+        assert_eq!(third.session_event_id, 3);
+        assert!(
+            build_turns_batch(&conn, third.session_event_id, 1, &HashSet::new())
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn interleaved_backlog_drains_in_stable_order_with_bounded_sessions() {
+        for budget in [0, 1, 2, 3, 20, usize::MAX] {
+            let conn = db();
+            let order = ["a", "b", "c", "a", "d", "b", "e", "c", "a", "e"];
+            for (index, session) in order.iter().enumerate() {
+                insert(&conn, session, index as i64, "user", "text", session);
+            }
+            let mut cursor = 0;
+            let mut observed = HashSet::new();
+            let mut batches = 0;
+            while cursor < order.len() as i64 {
+                let expected: Vec<&str> = order[cursor as usize..]
+                    .iter()
+                    .copied()
+                    .fold(Vec::new(), |mut sessions, session| {
+                        if !sessions.contains(&session) {
+                            sessions.push(session);
+                        }
+                        sessions
+                    })
+                    .into_iter()
+                    .take(budget.max(1))
+                    .collect();
+                let batch = build_turns_batch(&conn, cursor, budget, &HashSet::new()).unwrap();
+                let actual: Vec<&str> = batch
+                    .sessions
+                    .iter()
+                    .map(|s| s.session_id.as_str())
+                    .collect();
+                assert_eq!(actual, expected);
+                assert!(batch.session_event_id > cursor);
+                assert!(batch.session_event_id <= order.len() as i64);
+                for session in &batch.sessions {
+                    let expected_turns =
+                        order.iter().filter(|id| **id == session.session_id).count();
+                    assert_eq!(session.chunks[0].len(), expected_turns);
+                    observed.insert(session.session_id.clone());
+                }
+                batches += 1;
+                assert!(
+                    batches <= order.len(),
+                    "every batch must make durable progress"
+                );
+                cursor = batch.session_event_id;
+            }
+            assert_eq!(observed.len(), 5);
+            let exhausted = build_turns_batch(&conn, cursor, budget, &HashSet::new()).unwrap();
+            assert!(exhausted.sessions.is_empty());
+            assert_eq!(exhausted.session_event_id, cursor);
+        }
+    }
+
+    #[test]
+    fn interleaved_suppressed_sessions_cannot_skip_public_history() {
+        let conn = db();
+        for (index, (session, text)) in [
+            ("secret", "private"),
+            ("public", "visible"),
+            ("secret", "private tail"),
+            ("empty", "   "),
+            ("public-two", "also visible"),
+            ("empty", ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert(&conn, session, index as i64, "user", "text", text);
+        }
+        let incognito = HashSet::from(["secret".to_string()]);
+        let mut cursor = 0;
+        let mut published = Vec::new();
+        for _ in 0..6 {
+            let batch = build_turns_batch(&conn, cursor, 1, &incognito).unwrap();
+            assert!(batch.session_event_id > cursor);
+            published.extend(batch.sessions.into_iter().map(|s| s.session_id));
+            cursor = batch.session_event_id;
+        }
+        assert_eq!(published, ["public", "public-two"]);
+        assert_eq!(cursor, 6);
+        assert!(build_turns_batch(&conn, cursor, 1, &incognito)
+            .unwrap()
+            .sessions
+            .is_empty());
+    }
+
+    #[test]
+    fn equal_session_ids_from_different_sources_have_independent_budget_positions() {
+        let conn = db();
+        insert(&conn, "shared", 1, "user", "text", "claude first");
+        insert(&conn, "shared", 2, "user", "text", "codex");
+        conn.execute(
+            "UPDATE session_events SET source = 'codex' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "shared", 3, "user", "text", "claude last");
+        let first = build_turns_batch(&conn, 0, 1, &HashSet::new()).unwrap();
+        assert_eq!(first.sessions[0].source, "claude");
+        assert_eq!(first.session_event_id, 1);
+        let next = build_turns_batch(&conn, first.session_event_id, 1, &HashSet::new()).unwrap();
+        assert_eq!(next.sessions[0].source, "codex");
+        assert_eq!(next.sessions[0].chunks[0][0].content, "codex");
+        assert_eq!(next.session_event_id, 2);
+    }
+
+    #[test]
+    fn transcript_build_does_not_commit_the_callers_transaction() {
+        let mut conn = db();
+        let transaction = conn.transaction().unwrap();
+        insert(&transaction, "pending", 1, "user", "text", "not committed");
+        let batch = build_turns_batch(&transaction, 0, 1, &HashSet::new()).unwrap();
+        assert_eq!(batch.session_event_id, 1);
+        assert!(!transaction.is_autocommit());
+        transaction.rollback().unwrap();
+        assert!(build_turns_batch(&conn, 0, 1, &HashSet::new())
+            .unwrap()
+            .sessions
+            .is_empty());
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn concurrent_appends_remain_pending_beyond_the_read_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.db");
+        let mut reader = crate::open_db(&path).unwrap();
+        insert(&reader, "a", 1, "user", "text", "a first");
+        let writer = crate::open_db(&path).unwrap();
+        let snapshot = reader.transaction().unwrap();
+        let count: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // WAL permits ingestion while the delivery reader holds its snapshot.
+        insert(&writer, "b", 2, "user", "text", "b first");
+        insert(&writer, "a", 3, "assistant", "text", "a last");
+        let first = build_turns_batch(&snapshot, 0, 1, &HashSet::new()).unwrap();
+        assert_eq!(first.session_event_id, 1);
+        assert_eq!(first.sessions[0].chunks[0].len(), 1);
+        snapshot.commit().unwrap();
+
+        let next = build_turns_batch(&reader, first.session_event_id, 2, &HashSet::new()).unwrap();
+        assert_eq!(next.session_event_id, 3);
+        assert_eq!(next.sessions[0].session_id, "b");
+        assert_eq!(next.sessions[1].session_id, "a");
+        assert_eq!(next.sessions[1].chunks[0].len(), 2);
+    }
+
+    #[test]
+    fn malformed_event_fails_the_batch_instead_of_acknowledging_past_it() {
+        let conn = db();
+        insert(&conn, "broken", 1, "user", "text", "bad timestamp");
+        insert(&conn, "valid", 2, "user", "text", "must not hide the error");
+        conn.execute(
+            "UPDATE session_events SET ts_ms = 'invalid' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert!(build_turns_batch(&conn, 0, 2, &HashSet::new()).is_err());
+        assert!(conn.is_autocommit(), "a failed read releases its snapshot");
     }
 
     #[test]
