@@ -1,3 +1,5 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -139,7 +141,9 @@ test('request deadline and worker shutdown leave unconfirmed work retryable', as
   await fixture(async (dbPath) => {
     await createHistoryDelivery(config(), { dbPath });
     let aborted = false;
-    const hanging = registry(destination({ send: async (_payload, { signal }) => {
+    // The deadline covers mapping and native persistence too. Hang in the first
+    // plugin phase so this checks cancellation even on a slow debug-native host.
+    const hanging = registry(destination({ prepare: async (_batch, { signal }) => {
       signal.addEventListener('abort', () => { aborted = true; }, { once: true });
       return new Promise(() => {});
     } }));
@@ -165,10 +169,12 @@ test('lease renewal prevents a concurrent host from dispatching the same batch',
     const release = new Promise<void>((resolve) => { finish = resolve; });
     let sends = 0;
     const selected = registry(destination({ send: async (_payload, { batch }) => { sends++; entered(); await release; return ack(batch); } }));
-    const first = drainHistoryDelivery(selected, { dbPath, leaseMs: 300, requestTimeoutMs: 3_000 });
+    // Allow native I/O scheduler latency, then wait longer than the original
+    // lease: only successful renewal can prevent the second dispatch.
+    const first = drainHistoryDelivery(selected, { dbPath, leaseMs: 3_000, requestTimeoutMs: 15_000 });
     await sending;
-    await pause(500);
-    const second = await drainHistoryDelivery(selected, { dbPath, leaseMs: 300, requestTimeoutMs: 3_000 });
+    await pause(4_000);
+    const second = await drainHistoryDelivery(selected, { dbPath, leaseMs: 3_000, requestTimeoutMs: 15_000 });
     assert.equal(second.attempts, 0);
     finish();
     assert.equal((await first).statuses[0].acknowledged_records, 3);
@@ -226,12 +232,12 @@ test('installed fixture plugin survives process termination after acceptance and
     const options = { instanceId: 'one', accountId: 'fixture-account', receiverPath };
     const script = `import { loadHistoryPlugins, drainHistoryDelivery } from ${JSON.stringify(sdkModule)};
       const registry = await loadHistoryPlugins([{ module: 'history-fixture-destination', options: ${JSON.stringify({ ...options, crashAfterAcceptance: true })} }], { baseDirectory: ${JSON.stringify(root)} });
-      await drainHistoryDelivery(registry, { dbPath: ${JSON.stringify(dbPath)}, leaseMs: 100, requestTimeoutMs: 5000 });`;
+      await drainHistoryDelivery(registry, { dbPath: ${JSON.stringify(dbPath)}, leaseMs: 2_000, requestTimeoutMs: 10000 });`;
     await assert.rejects(run(process.execPath, ['--input-type=module', '--eval', script]), { code: 73 });
     const accepted = JSON.parse(await readFile(receiverPath, 'utf8')) as { records: Record<string, { origin_id: string; record_id: string; revision_id: string; revision: number }>; latest: Record<string, { revision_id: string; revision: number }>; attempts: unknown[] };
     assert.equal(Object.keys(accepted.records).length, 3);
     assert.equal((await historyDeliveryStatus(job.job_id, { dbPath }))[0].acknowledged_records, 0);
-    await pause(150);
+    await pause(2_100);
     const restarted = await loadHistoryPlugins([{ module: 'history-fixture-destination', options }], { baseDirectory: root });
     const result = await drainHistoryDelivery(restarted, { dbPath });
     assert.equal(result.statuses[0].acknowledged_records, 3);
@@ -301,8 +307,52 @@ test('plugin CLI passes arguments after its explicit separator verbatim', async 
     const configPath = join(root, 'config.json');
     await writeFile(configPath, JSON.stringify({ plugins: [{ module: './plugin.mjs' }] }));
     const pluginArgs = ['--base-url', 'https://example.invalid', '--key=value', '', '-h', '--', '--config', 'plugin-value'];
-    const result = await run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'plugin', 'echo-args', '--config', configPath, '--', ...pluginArgs]);
+    const result = await run(process.execPath, [join(sdkRoot, 'dist/cli.js'), '--no-warning', 'plugin', 'echo-args', '--config', configPath, '--', ...pluginArgs]);
     assert.deepEqual(JSON.parse(result.stdout), pluginArgs);
     await assert.rejects(run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'plugin', 'echo-args', '--unknown', 'value', '--config', configPath, '--', '-h']));
+  });
+});
+
+
+test('export rejects aliases through symlinked parents before creating a new database', async () => {
+  await fixture(async (_dbPath, root) => {
+    const real = join(root, 'real'); const alias = join(root, 'alias');
+    await mkdir(real); await symlink(real, alias, 'dir');
+    const selectionPath = join(root, 'selection.json');
+    await writeFile(selectionPath, JSON.stringify(selection));
+    const {runHistoryExportCommand} = await import('./delivery-cli.js');
+    await assert.rejects(runHistoryExportCommand({dbPath:join(real,'new.db'),outputPath:join(alias,'new.db'),selectionPath}), /active history database/);
+    await assert.rejects(readFile(join(real,'new.db')), {code:'ENOENT'});
+  });
+});
+
+test('native delivery envelope permits worst-case escaping within the decoded payload limit', async () => {
+  await fixture(async (dbPath) => {
+    const settings = config(); settings.limits.max_prepared_bytes = 8 * 1_048_576;
+    await createHistoryDelivery(settings,{dbPath});
+    const body = '\0'.repeat(7 * 1_048_576);
+    let received = false;
+    const result = await drainHistoryDelivery(registry(destination({prepare:async()=>({content_type:'application/octet-stream',body}),send:async(payload,{batch})=>{
+      assert.equal(payload.body,body); received=true; return ack(batch);
+    }})),{dbPath,requestTimeoutMs:30_000});
+    assert.equal(received,true); assert.equal(result.statuses[0].acknowledged_records,3);
+  });
+});
+
+
+test('arbitrary plugin MCP tools have conservative side-effect annotations', async () => {
+  await fixture(async (dbPath, root) => {
+    const plugin = join(root,'tool.mjs');
+    await writeFile(plugin, `export function createHistoryPlugin() { return {tools:[{name:'write_fixture',description:'Arbitrary fixture action',run:async()=>({ok:true})}]}; }`);
+    const configPath=join(root,'tools.json'); await writeFile(configPath,JSON.stringify({plugins:[{module:plugin}]}));
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string,string]=>entry[1]!==undefined));
+    Object.assign(env,{HOME:root,USERPROFILE:root,AI_HIST_DB:dbPath,AI_HIST_PLUGIN_CONFIG:configPath});
+    const transport = new StdioClientTransport({command:process.execPath,args:[join(sdkRoot,'dist/mcp-server.js')],env,stderr:'pipe'});
+    const client = new Client({name:'plugin-annotations-test',version:'1'});
+    try {
+      await client.connect(transport);
+      const tool=(await client.listTools()).tools.find(item=>item.name==='write_fixture');
+      assert.deepEqual(tool?.annotations,{readOnlyHint:false,destructiveHint:true,idempotentHint:false,openWorldHint:true});
+    } finally {await client.close();await transport.close();}
   });
 });

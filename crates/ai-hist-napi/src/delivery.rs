@@ -103,7 +103,10 @@ pub async fn history_delivery(
 ) -> napi::Result<String> {
     // Native JSON is bounded even when called without the SDK. Payload bytes
     // have stricter per-job limits enforced by core before persistence.
-    if request_json.len() > 40 * 1_048_576 {
+    // JSON escapes a decoded byte as up to six ASCII bytes. Allow the core
+    // 32 MiB prepared-body maximum plus envelope metadata, then let typed core
+    // limits validate the decoded body.
+    if request_json.len() > 200 * 1_048_576 {
         return Err(crate::native_error(
             "INVALID_ARGUMENT",
             "delivery request too large",

@@ -185,3 +185,8 @@ coordinator are separate changes; no third-party service compatibility is implie
 
 Plugin arguments after `--` are passed verbatim, including flags, `-h`, equals signs,
 and empty arguments. Core options before that separator remain strictly validated.
+
+Arbitrary plugin MCP callbacks default to non-idempotent, potentially destructive,
+open-world annotations. The host does not infer safety from registration. Export
+file targets are checked against the active database through existing ancestor
+symlinks and again before the final rename.

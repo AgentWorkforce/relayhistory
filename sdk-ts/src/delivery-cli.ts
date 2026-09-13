@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
-import { readFile, rename, rm, stat } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { readFile, realpath, rename, rm, stat } from 'node:fs/promises';
+import { basename, dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import type { Writable } from 'node:stream';
@@ -62,18 +62,31 @@ async function write(stream: Writable, chunk: string): Promise<void> {
   await new Promise<void>((resolve, reject) => stream.write(chunk, (error) => error ? reject(error) : resolve()));
 }
 export async function runHistoryExportCommand(options: { dbPath?: string; selectionPath: string; outputPath?: string }): Promise<void> {
-  if (options.outputPath) {
+  const canonicalTarget = async (path: string): Promise<string> => {
+    try { return await realpath(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(path);
+      if (parent === path) throw error;
+      return resolve(await canonicalTarget(parent), basename(path));
+    }
+  };
+  const assertSafeOutput = async () => {
+    if (!options.outputPath) return;
     const target = resolve(options.outputPath);
     const database = resolve(options.dbPath ?? defaultDbPath());
     const metadata = async (path: string) => stat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
-    const [targetStat, databaseStat] = await Promise.all([metadata(target), metadata(database)]);
-    if (target === database || (targetStat && databaseStat && targetStat.dev === databaseStat.dev && targetStat.ino === databaseStat.ino)) {
+    const [targetPath, databasePath, targetStat, databaseStat] = await Promise.all([
+      canonicalTarget(target), canonicalTarget(database), metadata(target), metadata(database),
+    ]);
+    if (targetPath === databasePath || (targetStat && databaseStat && targetStat.dev === databaseStat.dev && targetStat.ino === databaseStat.ino)) {
       throw new InvalidArgumentError('export output must not replace the active history database', 'INVALID_ARGUMENT');
     }
-  }
+  };
+  await assertSafeOutput();
   const selection = JSON.parse(await readFile(options.selectionPath, 'utf8')) as HistoryExportSelection;
   const temporary = options.outputPath ? `${resolve(options.outputPath)}.${randomUUID()}.tmp` : undefined;
   const stream = temporary ? createWriteStream(temporary, { flags: 'wx', mode: 0o600 }) : process.stdout;
@@ -90,6 +103,7 @@ export async function runHistoryExportCommand(options: { dbPath?: string; select
     if (temporary) {
       stream.end();
       await finished(stream);
+      await assertSafeOutput();
       await rename(temporary, resolve(options.outputPath!));
     }
     if (streamError) throw streamError;

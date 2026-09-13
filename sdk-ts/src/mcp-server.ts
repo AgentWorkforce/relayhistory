@@ -169,7 +169,7 @@ for (const action of ['pause', 'resume', 'retry'] as const) {
 if (process.env.AI_HIST_PLUGIN_CONFIG) {
   const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
   for (const tool of registry.registeredTools()) {
-    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, ACQUIRE,
+    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
       ({ input }) => call(() => tool.run(input)));
   }
 }

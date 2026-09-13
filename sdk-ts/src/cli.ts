@@ -723,7 +723,9 @@ async function main(): Promise<void> {
     await maybePrintUpdateNotice(version, rawArgs);
     return;
   }
-  const separator = rawArgs[0] === 'plugin' ? rawArgs.indexOf('--') : -1;
+  const boundary = rawArgs.indexOf('--');
+  const beforeBoundary = boundary < 0 ? rawArgs : rawArgs.slice(0, boundary);
+  const separator = boundary >= 0 && parse(beforeBoundary).positional[0] === 'plugin' ? boundary : -1;
   const pluginArgs = separator < 0 ? [] : rawArgs.slice(separator + 1);
   const coreArgs = separator < 0 ? rawArgs : rawArgs.slice(0, separator);
   const args = parse(coreArgs.map((arg) => arg === '-h' ? '--help' : arg));
