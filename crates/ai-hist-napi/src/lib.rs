@@ -1724,7 +1724,12 @@ pub async fn cloud_refresh_session(
     .await
     .map_err(worker_error)?
     .map(|auth| auth.map(Into::into))
-    .map_err(|error| native_error("CONNECTOR_FAILURE", format!("{error:#}")))
+    .map_err(|_| {
+        native_error(
+            "CONNECTOR_FAILURE",
+            "refreshing relayhistory session failed; run `ai-hist login` for the selected --base-url",
+        )
+    })
 }
 
 #[napi]

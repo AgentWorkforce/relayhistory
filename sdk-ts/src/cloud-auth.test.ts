@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { inspect } from 'node:util';
 // Exercise the installed package entrypoints, including the cloud subpath.
 import * as main from 'ai-hist';
 import * as cloud from 'ai-hist/cloud';
@@ -30,6 +31,14 @@ test('both public imports share login, stage selection, metadata, storage and ro
   let accepted = '';
   let status = 200;
   let refreshFails = false;
+  const expectSafeRefreshFailure = (error: unknown): boolean => {
+    assert.ok(error instanceof main.ConnectorFailureError);
+    assert.equal(error.code, 'CONNECTOR_FAILURE');
+    assert.equal(error.message,
+      'refreshing relayhistory session failed; run `ai-hist login` for the selected --base-url');
+    assert.doesNotMatch(inspect(error, { depth: null }), /rth_at_response_secret|rth_rt_response_secret/);
+    return true;
+  };
   let blockSavePath: string | undefined;
   const server = createServer(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk;
@@ -43,7 +52,11 @@ test('both public imports share login, stage selection, metadata, storage and ro
         accessTokenExpiresAt: FUTURE, orgId: 'org-test', workspaceId: 'workspace-test' }));
     } else if (req.url === '/v1/auth/token/refresh') {
       refreshCount++;
-      if (refreshFails) { res.statusCode = 401; res.end('{}'); return; }
+      if (refreshFails) {
+        res.statusCode = 401;
+        res.end(JSON.stringify({ error: 'rth_at_response_secret rth_rt_response_secret' }));
+        return;
+      }
       if (blockSavePath) {
         await rm(blockSavePath);
         await mkdir(blockSavePath);
@@ -157,7 +170,7 @@ test('both public imports share login, stage selection, metadata, storage and ro
     status = 200;
     accepted = 'rth_at_reject';
     refreshFails = true;
-    await assert.rejects(cloud.getSessionThread(query), /refreshing relayhistory session/);
+    await assert.rejects(cloud.getSessionThread(query), expectSafeRefreshFailure);
     assert.equal(refreshCount, 3, 'failed refresh is attempted only once');
 
     // Without a refresh token, a rejection is final and no refresh is attempted.
@@ -173,7 +186,7 @@ test('both public imports share login, stage selection, metadata, storage and ro
     refreshFails = false;
     blockSavePath = path;
     const requestCount = requests.length;
-    await assert.rejects(cloud.getSessionThread(query), /persisting refreshed relayhistory session/);
+    await assert.rejects(cloud.getSessionThread(query), expectSafeRefreshFailure);
     assert.equal(refreshCount, 4);
     assert.equal(requests.length - requestCount, 2, 'failed save prevents a retry with an unpersisted pair');
   } finally {
