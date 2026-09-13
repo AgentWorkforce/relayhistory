@@ -1,43 +1,61 @@
-# Cloud sync in one command, PR threading in one more
+# Connect history to a cloud service
+
+History stays local until you explicitly export it or enable a destination.
+Install RelayHistory separately from the local SDK:
 
 ```sh
-ai-hist enable-cloud
+npm install ai-hist @agent-relay/relayhistory
 ```
 
-`enable-cloud` authenticates and syncs. It does not install Git hooks: threading
-commits to a PR needs the separate `installGitHooks()` step described below.
+Other services can implement the same source and destination interfaces. A source
+plugin reads remote history; a destination plugin receives your local history.
+Either can be used independently.
 
-The npm CLI calls the async SDK. It reuses your selected RelayHistory stage or
-starts Agent Relay's device login, exchanges that identity for a service-local
-`rth_at_*` session, syncs local history, drains the outbox, and keeps pushing once
-per minute until Ctrl-C. The npm package includes the Agent Relay Cloud login
-slice, so no separate `agent-relay` CLI install is required. A preauthenticated
-host can pass `relayAccessToken` to the SDK or use `--token`; `CLOUD_API_ACCESS_TOKEN`
-supplies the bearer for non-interactive use.
-The loop runs in the current process; it is not an installed background daemon.
+## Dependable background delivery
 
-Run the first login from an interactive terminal. With stdin closed (for example,
-in CI), the command fails promptly with token and interactive-login guidance
-instead of waiting indefinitely.
+For new installations, follow the [RelayHistory plugin setup](../plugins/relayhistory/sdk/README.md)
+to create `history.json` and an explicit `selection.json`, then run:
 
-Use `--once` to drain and exit, `--interval 30` to change the interval, and
-`--base-url https://dev.history.agentrelay.com` to select development explicitly.
-The Rust trust gate requires
-`RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1` for the trusted dev exchange.
-Never use production for development acceptance tests.
+```sh
+relayhistory-plugin login --base-url https://history.agentrelay.com
+ai-hist plugin relayhistory-migration-status --config history.json
+ai-hist plugin relayhistory-enable --config history.json -- --selection selection.json
+ai-hist delivery run --config history.json
+ai-hist delivery status
+```
+
+These are the npm SDK CLI commands. The standalone Rust `ai-hist-cli` binary
+handles local history and does not load JavaScript plugins.
+
+The durable worker stores prepared bytes before sending, retries uncertain
+outcomes with the same revision identities, and advances only on exact durable
+acknowledgments. Run it under your existing supervisor for background operation.
+Stop and remove old managed push schedules before enabling a new generation;
+the setup checks for them and does not modify live services automatically.
+Existing auth files and legacy cursors remain intact. Legacy positional cursors
+are not imported as delivery acknowledgments.
+
+See [export and delivery](history-delivery.md) for selection, exclusions, queue
+limits, cancellation, and building a destination for another service.
+
+## Existing cloud API migration
+
+Cloud functions are exported by `@agent-relay/relayhistory`. Neither `ai-hist`
+nor the removed `ai-hist/cloud` entrypoint exports them. Git hooks and commit
+linking remain in the local SDK:
 
 ```ts
-import { enableCloud, installGitHooks, createShareableTrace } from 'ai-hist';
+import { installGitHooks } from 'ai-hist';
+import { enableCloud, createShareableTrace } from '@agent-relay/relayhistory';
 
-const cloud = await enableCloud({ intervalMs: 60_000 });
+// Compatibility with an existing legacy cloud workflow, not durable delivery.
+const cloud = await enableCloud({ watch: false });
 await installGitHooks({
   repo: process.cwd(),
   sessionId: 'YOUR_SESSION_ID',
   source: 'claude',
   prUrl: 'https://github.com/OWNER/REPO/pull/123',
 });
-// The next commit writes refs/notes/ai-hist plus a durable local link.
-// The next successful push projects it to session_links.link_kind='github_pr'.
 const trace = await createShareableTrace('YOUR_SESSION_ID', {
   source: 'claude', visibility: 'direct-link',
 });
@@ -45,49 +63,51 @@ console.log(trace.url);
 await cloud.stop();
 ```
 
-Hooks use an explicit, already-indexed session. Installation finds an existing PR
-through `git config ai-hist.pr-url` or `gh pr view`, or you can pass `prUrl` directly.
-The result reports `prUrl: null` when no PR was found. When a PR is created later,
-reinstall the hook before the next commit.
-Installations with an external shared `core.hooksPath` are rejected rather than
-modifying other repositories; configure a repository-local hooks directory first.
-Hooks perform no network I/O and preserve the previous post-commit hook in
-`post-commit.before-ai-hist`. Git notes append session IDs without replacing other
-notes. They are local until you explicitly push `refs/notes/ai-hist`; cloud
-linkage travels through the durable outbox independently.
-The design follows [Traces' Git-hook documentation](https://traces.com/docs/sharing/git-hooks):
-explicit session IDs, Git notes, and separate upload.
+`enableCloud`, `pushCloud`, legacy replay, and sharing retain their existing
+service protocol. A new durable delivery acknowledgment does not imply the
+legacy sharing index has processed a session. Sharing requires a session already
+available through that legacy API.
+
+The optional npm package also retains these compatibility commands:
+
+```sh
+relayhistory-plugin enable-cloud --once
+relayhistory-plugin replay SESSION_ID --out transcript.txt
+relayhistory-plugin token --base-url https://history.agentrelay.com
+```
+
+Without `--once`, legacy `enable-cloud` repeats in the current process until
+stopped; it does not install a daemon. Do not run that loop alongside a new
+durable worker for the same history. Token output is a live credential.
 
 ## Authentication and stages
 
-The Rust cloud layer owns RelayHistory login, credential loading, and token
-rotation. `ai-hist/cloud` owns the SDK wrappers that call it through N-API.
-The root `ai-hist` entrypoint re-exports that cloud API, and the npm CLI and
-MCP server use those SDK functions.
+The optional Rust helper owns RelayHistory login, credential loading, rotation,
+and stage selection. The optional SDK invokes it; the local native binding,
+SDK, and default MCP server do not read commercial auth.
 
-Credentials and sync cursors live under `$RELAYHISTORY_HOME/stages`, defaulting
-to `~/.agentworkforce/relayhistory/stages`. Each normalized service URL has its
-own files. Credential files use mode `0600`; token rotation holds a stage lock
-and atomically saves the new pair before retrying a request. Expiry, org, and
-workspace metadata are preserved. Org and workspace are cached provenance;
-the server derives authorization from the bearer token.
+Credentials and legacy cursors retain their existing location under
+`$RELAYHISTORY_HOME/stages`, defaulting to
+`~/.agentworkforce/relayhistory/stages`. Each normalized service URL has its own
+files. Rotation holds the stage lock and atomically saves the refreshed pair.
 
-Select a stage with `baseUrl` in the SDK or `--base-url` in the CLI. Otherwise,
-`RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`. Malformed
-selectors are errors. With no selector, credential reads use the single stored
-stage and refuse to guess when multiple stages exist. Login defaults to
-`https://history.agentrelay.com` when no destination is selected.
+Use `baseUrl` in SDK/plugin options or `--base-url` in the optional CLI. Plugin
+configuration pins the service endpoint; durable jobs also bind an authenticated
+organization/workspace account. A changed endpoint or account requires a new
+instance or job. For remote readback, resolve `deliveryAccount({ baseUrl })` and
+pin it as `expectedAccount` before selecting the cloud source.
 
-Requests carrying credentials require HTTPS, with HTTP allowed for loopback
-development endpoints. A new stage starts from its own cursor; enabling cloud
-never seeds it from the local maximum or another stage's watermark.
+The optional legacy CLI preserves its existing environment/stage selection
+behavior. A bare login defaults to `https://history.agentrelay.com`. Use an
+explicit development endpoint for development acceptance tests; exchanging an
+Agent Relay identity at a nondefault endpoint also requires the helper's
+`RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL=1` opt-in.
 
-## Sharing
+## Local Git linkage
 
-Sharing creates a frozen snapshot of already-pushed convergence events. Public
-shares permit indexing; direct-link shares are bearer URLs with noindex headers;
-private shares require the same user, organization, workspace and read scope.
-Private links can be read with an authenticated HTTP client; there is no browser
-login page on the share route yet. The creator must own the session. Later events
-are excluded. Revoke with authenticated `DELETE /v1/shares/:token`. The server
-caps snapshots at 10,000 events and 5 MB and rejects oversized sessions explicitly.
+Hooks use an explicit, already-indexed session. `installGitHooks()` accepts a PR
+URL or finds one through repository configuration or `gh pr view`. It writes Git
+notes and local commit linkage without network I/O, preserving the prior
+post-commit hook. Notes remain local until you explicitly push
+`refs/notes/ai-hist`. Sending commit-link evidence to a destination is a separate
+operation, selected through the delivery configuration.

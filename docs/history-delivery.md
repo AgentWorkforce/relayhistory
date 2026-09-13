@@ -3,7 +3,7 @@
 History can stay local, be exported as NDJSON, or be delivered to an explicitly
 enabled destination. Export and delivery share versioned Rust evidence records.
 Delivery adds a durable queue, immutable mapped payloads, acknowledgments, retry
-times, and fenced worker leases. Native contract 13 is required.
+times, and fenced worker leases. Native contract 14 is required.
 
 ## Export a snapshot
 
@@ -178,10 +178,10 @@ only when `AI_HIST_PLUGIN_CONFIG` explicitly names that config; core tools work
 without it. Plugin tools receive their object arguments through an `input` field.
 MCP also exposes delivery status, pause, resume, and retry for existing jobs.
 
-This change supplies generic destination contracts and the durable coordinator.
-The existing RelayHistory cloud API still ships in the current distribution.
-Optional cloud package extraction and migration of its adapter onto this
-coordinator are separate changes; no third-party service compatibility is implied.
+The local package supplies destination contracts and the durable coordinator.
+RelayHistory is an optional adapter package; its legacy cloud API is not shipped
+in the local SDK. A different service must supply an adapter implementing these
+contracts; compatibility is not inferred from its URL.
 
 Plugin arguments after `--` are passed verbatim, including flags, `-h`, equals signs,
 and empty arguments. Core options before that separator remain strictly validated.
@@ -190,3 +190,8 @@ Arbitrary plugin MCP callbacks default to non-idempotent, potentially destructiv
 open-world annotations. The host does not infer safety from registration. Export
 file targets are checked against the active database through existing ancestor
 symlinks and again before the final rename.
+
+RelayHistory is one optional implementation in `plugins/relayhistory/sdk`. It uses
+the new atomic delivery endpoint and checks endpoint/account identity on every
+attempt. It never falls back to legacy positional ingest; see its README for the
+explicit legacy-scheduler transition and new-generation setup.

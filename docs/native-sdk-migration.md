@@ -39,10 +39,9 @@ Collection APIs, including statistics, now use a shared `scope` option: `'local'
 exclusive `--local`, `--remote`, and `--all` flags. Local and remote rows live
 in one ledger and represent presences of the same session, so `all` is
 deduplicated. Direct session and event lookup does not take a scope. Remote
-discovery and sync run through provider connectors
-([Remote connectors](remote-connectors.md)) and fail explicitly on a machine
-where none is configured; `all` acquisition runs all currently configured
-adapters.
+discovery and sync require explicitly installed source plugins
+([Source plugins](remote-connectors.md)); provider or commercial login does not
+select them. `all` acquisition runs local adapters and the selected plugins.
 
 The acquisition result's `scope` echoes what was requested; the separate
 `locationsRun` list reports the connector locations that actually executed.
@@ -53,7 +52,9 @@ recent, and direct-session history rows also carry `locations`;
 Rust embedders must also update and recompile. Catalog/discovery option, page,
 summary, and row structs gained scope/location fields. The local-named wrapper
 functions now reject a non-local option instead of silently coercing it; call
-the corresponding `*_scoped*` API for `remote` or `all`. Human CLI parsers must
+the corresponding `*_scoped*` API for cached `remote` or `all` reads. Remote
+acquisition must compose optional adapters through `SourceRegistry`; the local
+engine has no built-in HTTP or auth transports. Human CLI parsers must
 account for a locations column in catalog rows, a scope line in statistics,
 and requested/executed wording in discovery summaries. Remote-only matches do
 not produce a local resume command.
@@ -65,12 +66,21 @@ const page = await getSessionEventsPage(id, { limit: 200 });
 for await (const event of sessionEvents(id, { limit: 200 })) consume(event);
 ```
 
-The 1.0 CLI covers `sessions list`, `sessions discover`, `search`, `recent`,
-`session`, `events`, `stats`, `sync`, `token`, `replay`, and `enable-cloud`.
-`accessToken()` and `replay()` expose the existing Rust cloud operations through
-NAPI. Token output stays secret-only on stdout; replay pagination, rendering and
-atomic `--out` replacement remain in Rust and never open the local history DB.
-Removed legacy cloud/Pair/tag/
-trajectory convenience commands must migrate to dedicated services or future
-native-backed SDK operations; they are not retained through subprocess or
-JavaScript-SQL fallbacks.
+The local npm CLI covers sessions, search, recent, events, statistics, sync,
+export, and generic delivery/plugin operations. Cloud auth, sharing, and replay
+moved out of the mandatory native binding and SDK into the optional
+`@agent-relay/relayhistory` package. Replace imports of `accessToken`, `replay`,
+`enableCloud`, and other cloud functions from `ai-hist` or `ai-hist/cloud` with
+imports from that package. Local Git linkage remains in `ai-hist`.
+
+Use `relayhistory-plugin login|token|replay|enable-cloud` for the optional legacy
+CLI. New dependable background delivery uses `ai-hist plugin relayhistory-enable`
+and `ai-hist delivery run` with explicit configuration and selection. Stop old
+managed push schedules before enabling a durable generation; existing positional
+cursors cannot be converted to acknowledgments. See [cloud setup](enable-cloud.md).
+
+Native contract 14 rejects older addons whose credential-driven source selection
+or cloud exports would violate the new boundary. Optional source plugins use the
+fixed JSON observation/evidence intake; installing another source does not
+require rebuilding that addon. JavaScript and MCP hosts continue to use public
+SDK operations rather than opening SQLite themselves.

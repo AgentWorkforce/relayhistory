@@ -1,6 +1,6 @@
 # Production architecture
 
-RelayHistory has one production call graph:
+The local history packages have this production call graph:
 
 ```text
 provider files / SQLite
@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 13, catalog contract version 3, hydration contract version 2,
+version 14, catalog contract version 3, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -29,21 +29,27 @@ helpers.
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
-## Cloud authentication
+## Optional services and package boundaries
 
-The Rust cloud layer (`crates/ai-hist/src/cloud.rs`) owns RelayHistory token
-exchange, stage selection, credential storage, and refresh. The SDK exposes
-those operations through the `ai-hist/cloud` entrypoint. The root `ai-hist`
-entrypoint re-exports the cloud API; the CLI and MCP server use the SDK. Both
-entrypoints use the shared internal native loader and error definitions, and
-the cloud module does not depend on the root module.
+The local Rust workspace contains storage, identity, observations, evidence,
+relationships, local parsing and generic durable delivery. CLI parsing and
+presentation live in `ai-hist-cli`; reusable ingestion remains in the engine.
+The SDK separates contracts, native loading, normalization, pagination, local
+operations and generic plugin orchestration. Core, native, SDK and MCP build
+without the `plugins/` tree; CI physically removes it before local checks.
 
-Each normalized service URL has a credential file and sync cursor under
-`$RELAYHISTORY_HOME/stages` (default `~/.agentworkforce/relayhistory/stages`).
-Rotation uses a stage lock and atomically persists the new token pair before
-retrying. The native binding carries expiry, org, and workspace metadata to
-the SDK. See [cloud setup](enable-cloud.md#authentication-and-stages) for
-stage selection and transport requirements.
+`plugins/relayhistory` owns commercial auth, convergence/outbox mapping, legacy
+push/replay/share and the new delivery transport. `plugins/provider-sources`
+owns remote provider credentials/transports. Their Rust helpers depend on
+public local-history APIs and ship in optional platform packages. Their JS
+packages share the installed SDK's public error classes. No second addon or
+implicit plugin discovery is involved. Explicit registration is inert until an
+operation selects the plugin; normal local operations do not read its auth.
+
+RelayHistory retains its stage files, rotation locks and legacy cursor format.
+New delivery jobs require explicit selection/generation and a checked legacy
+scheduler transition; no positional cursor becomes an acknowledgment. See the
+[optional package](../plugins/relayhistory/sdk/README.md).
 
 ## Session ledger and location scope
 
@@ -52,10 +58,10 @@ a logical session was observed, not independent session stores. Collection
 operations accept one scope: `local` (the default), `remote`, or `all`. The
 `all` view is the union of both presences, deduplicated by canonical session
 identity, so materializing a remote session locally does not create a second
-user-visible session. Locator, change stamp, and discovery state currently live
-on each location presence. Independent observations from two remote connectors
-can still overwrite those fields; connector-specific provenance is a separate
-migration, not a guarantee of the selection API.
+user-visible session. Each connector/instance has an independent observation with its own opaque
+locator, stamp, access state, revision and hydration checkpoint. Location
+presences are aggregate views. Per-record evidence ownership prevents one
+connector snapshot from deleting evidence retained by another.
 
 Cached SDK catalog, search, recent, and statistics reads preserve the requested
 scope without reading commercial credentials or invoking remote transports.
@@ -64,26 +70,21 @@ ambiguous commercial auth. Direct session and event lookup already names one
 session and remains scope-independent. The CLI's existing first-use local
 bootstrap can be disabled with `--no-bootstrap`.
 
-Acquisition accepts `sourceConnectors` on discovery, hydration, and sync. Omit it
-for the provider defaults (`claude-web`, `codex-cloud`), or pass `[]` to disable
-remote acquisition. Commercial `cloud` recall and `relaycast` ingestion are
-selected explicitly. Selection precedes credential checks; local scope never
-probes any remote connector, even when commercial credentials are present.
-`source` identifies the history provider while a connector ID selects its
-acquisition path. See [Remote connectors](remote-connectors.md).
+Acquisition accepts an explicit `HistoryPluginRegistry` and `sourceConnectors`
+on discovery, hydration and sync. Omitted selection means the sources explicitly
+registered in that registry; `[]` disables them. Without a registry the native
+engine performs local acquisition only and rejects unknown remote selectors.
+Local scope never probes remote credentials. Source identifies the provider;
+connector/instance identifies its acquisition path.
 
-Remote acquisition without an available selected connector fails before database
-creation. `all` can run local adapters while reporting unavailable selected
-remotes. Its `scope` records the request and `locations_run` records the
-locations executed. Local sync does not contact Relaycast; explicit Relaycast
-sync writes new observations with remote presence. Historical Relay rows are
-not relabeled.
-
-This release adds selection among built-in connectors, not dynamically loaded
-plugins. Cloud code and build dependencies remain in the existing distribution;
-optional package extraction and the destination plugin/durable delivery APIs are
-separate work. Native contract 12 prevents older addons from silently ignoring
-`sourceConnectors`.
+Source plugins return normalized evidence with an explicit covered-kind set.
+The native JSON intake validates identities before DB writes and requires the
+observation revision acquired before external work. A stale completion fails
+with `SOURCE_REVISION_CONFLICT`. Complete snapshots replace only covered kinds
+for that connector. JavaScript source and destination plugins use the public SDK/native contracts
+and do not open SQLite. Optional Rust compatibility implementations depend on
+public core storage operations; they do not move transport or credential
+dependencies back into the local engine. See [source plugins](remote-connectors.md).
 
 ## Operation semantics
 
@@ -91,8 +92,8 @@ separate work. Native contract 12 prevents older addons from silently ignoring
 |---|---:|---|---|
 | `listSessionCatalog*` (`local` / `remote` / `all`) | none | one indexed cache query | empty page |
 | `discoverSessions` (`local`, default) | bounded shallow reads | catalog upserts | creates catalog DB |
-| `discoverSessions` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates catalog DB |
-| `discoverSessions` (`all`) | local adapters + configured remote connectors | catalog upserts + presences | creates catalog DB |
+| `discoverSessions` (`remote`) | explicitly selected source plugins (error when none) | catalog upserts + presences | creates catalog DB |
+| `discoverSessions` (`all`) | local adapters + explicitly selected source plugins | catalog upserts + presences | creates catalog DB |
 | `hydrateSession` | one selected provider session and linked evidence | transactional evidence + checkpoint upsert | `SESSION_NOT_FOUND` |
 | `search`, `recent` (`local` / `remote` / `all`) | none | indexed reads | empty result |
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
@@ -103,8 +104,8 @@ separate work. Native contract 12 prevents older addons from silently ignoring
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
-| `sync` (`remote`) | configured remote connectors (error when none) | catalog upserts + presences | creates DB |
-| `sync` (`all`) | full local scan + configured remote connectors | migrations + ingestion | creates DB |
+| `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
+| `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
 
 No read operation invokes discovery or sync. A common cold start is:
 
@@ -115,9 +116,11 @@ await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessio
 ```
 
 Global sync owns enumeration while targeted hydration resolves one persisted
-catalog presence. Both call the same Rust provider normalization helpers.
-TypeScript never parses a provider source or opens SQLite. Per-session
-checkpoints make unchanged calls constant-work after source resolution. Remote
+connector observation. Optional provider helpers use the public Rust normalizer;
+other source plugins can supply already-normalized records.
+TypeScript never parses a provider source or opens SQLite. Per-observation checkpoints retain acquisition progress independently. Local
+provider stamps avoid reparsing unchanged files; remote plugins may need a full
+readback traversal to establish whether their snapshot changed. Remote
 hydration stays provider-bounded: Claude uses the CLI's private
 teleport-evidence contract, while Codex indexes the supported cloud diff and
 reports partial capability because no transcript export exists.
@@ -207,12 +210,14 @@ There is no alternate runtime after any native-load error.
 `ai-hist-core::delivery` owns opt-in journaling, bounded snapshots, immutable
 queue/payload persistence, exact acknowledgments, retention, and fenced leases.
 The SDK host registers explicitly selected destination modules and runs the same
-drain loop for foreground and background delivery. Native contract 13 adds a
+drain loop for foreground and background delivery. Native contract 14 includes a
 typed serialized delivery/export bridge to the existing addon. No TypeScript or
 plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
 selection, failure states, background operation, and the independent NDJSON path.
 
 Core maintenance is bounded. The host expires abandoned snapshots and compacts
 consumed journal/receipt rows during drains; status exposes retained bytes and
-limits. The existing RelayHistory cloud package boundary and outbox migration
-remain separate from the generic coordinator.
+limits. Destination plugins own endpoint/account fences and transport mapping;
+the generic coordinator owns retries, leases, immutable payloads and exact
+acknowledgments. The RelayHistory server protocol is tested with the real SDK
+coordinator, helper and migrated database under lost-receipt/restart conditions.

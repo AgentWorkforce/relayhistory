@@ -1,18 +1,28 @@
-# Cloud sync
+# Optional cloud delivery
 
-Run `ai-hist enable-cloud` to authenticate, sync local history, and keep pushing
-while the command runs. Use `--once` to drain and exit:
+Install `ai-hist` for local history. Install and explicitly configure a source
+or destination plugin to connect it to a cloud service. Neither login nor package
+installation automatically adds sources or starts uploads.
+
+For dependable delivery to RelayHistory, install `@agent-relay/relayhistory`,
+create a plugin config and selection, then enable and run a durable job:
 
 ```sh
-ai-hist enable-cloud --once
+ai-hist plugin relayhistory-enable --config history.json -- --selection selection.json
+ai-hist delivery run --config history.json
+ai-hist delivery status
 ```
 
-The npm CLI uses the async TypeScript SDK backed by the Rust engine. The Rust
-cloud layer manages RelayHistory credentials, stage selection, token rotation,
-and sync cursors. The SDK's `enableCloud()` runs the same workflow; `pushCloud()`
-pushes using a stored session.
+Follow [cloud setup](enable-cloud.md) for the complete login and legacy-scheduler
+migration steps. The same generic coordinator supports another destination
+plugin, and [NDJSON export](history-delivery.md#export-a-snapshot) can feed your
+own program.
 
-See [Cloud setup](enable-cloud.md) for login, stage selection, Git hooks, and
-sharing, and the [SDK guide](../sdk-ts/README.md#cloud-token-and-replay) for token
-export and transcript replay. [Remote connectors](remote-connectors.md) explains
-how cloud sessions are discovered into the local session ledger.
+Existing `enableCloud()` and `pushCloud()` integrations move their imports from
+`ai-hist` or `ai-hist/cloud` to `@agent-relay/relayhistory`. The optional
+`relayhistory-plugin enable-cloud --once` command retains legacy push behavior;
+it does not use the new durable delivery protocol.
+
+[Source plugins](remote-connectors.md) explains optional remote discovery and
+hydration. Cached local/remote/all reads remain available without cloud packages
+or credentials.

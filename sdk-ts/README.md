@@ -1,8 +1,9 @@
 # ai-hist
 
-The public TypeScript SDK, Node CLI, and MCP server for RelayHistory. Every
-operation uses the mandatory `ai-hist-native` Node-API engine; there is no
-JavaScript SQLite implementation or provider-file fallback.
+The local history TypeScript SDK, Node CLI, and MCP server. Storage and local
+ingestion use one mandatory `ai-hist-native` Node-API engine. Optional source and
+destination plugins compose through public interfaces; no JavaScript SQL or
+commercial dependency is required by this package.
 
 ```bash
 npm install ai-hist
@@ -50,7 +51,8 @@ cache-only. `discoverSessions` is shallow discovery. `hydrateSession` is
 targeted evidence acquisition for one existing catalog row. It returns
 `hydrated`, `updated`, `unchanged`, or `capability_limited`, an indexed source
 stamp, evidence counts, related native session IDs, and bounded-work metrics.
-Targeted remote hydration uses `scope: 'remote'`: Claude web sessions can
+Targeted remote hydration uses `scope: 'remote'` and an explicitly configured
+source plugin registry: Claude web sessions can
 return `capability: 'full'` after complete teleport evidence is acquired;
 Codex cloud tasks return `partial` when their supported unified diff is indexed
 or `shallow_only` when no richer evidence is exposed. Partial results retain
@@ -72,37 +74,27 @@ is equivalent to `--local`.
 
 Cached reads preserve the requested scope and never consult commercial auth.
 Stored remote history can be queried with absent, malformed, expired, or
-ambiguous credentials. Discovery, hydration, and sync accept `sourceConnectors`:
-omit it for provider defaults (`claude-web`, `codex-cloud`), supply an explicit
-list, or use `[]` to disable remote acquisition. Local scope never probes remote
-credentials. Commercial login does not automatically select cloud recall or
-Relaycast.
+ambiguous credentials. Remote acquisition requires an explicitly loaded plugin
+registry. Install `@agent-relay/history-provider-sources` for Claude web/Codex
+cloud, or `@agent-relay/relayhistory` for RelayHistory. Installing a package does
+not register it, inspect auth or start delivery.
 
 ```ts
-await discoverSessions({ scope: 'remote', sourceConnectors: ['cloud'], sources: ['cursor'] });
-await sync({ scope: 'remote', sourceConnectors: ['relaycast'] });
-await sync({ scope: 'all', sourceConnectors: [] }); // local adapters only
-const cached = await stats({ scope: 'remote' }); // no login required
+import { HistoryPluginRegistry } from 'ai-hist';
+import { createHistoryPlugin } from '@agent-relay/history-provider-sources';
+const plugins = new HistoryPluginRegistry();
+plugins.register(createHistoryPlugin({connectors:['claude-web']}));
+await discoverSessions({ scope:'remote', plugins, sourceConnectors:['claude-web'] });
+await sync({ scope:'all', plugins, sourceConnectors:[] }); // local adapters only
+const cached = await stats({ scope:'remote' }); // no login required
 ```
 
-```bash
-ai-hist sessions discover --remote --source-connector cloud --source cursor
-ai-hist sync --remote --source-connector relaycast
-ai-hist sync --all --no-source-connectors
-```
-
-`--source-connector` is repeatable and cannot be combined with
-`--no-source-connectors`. MCP uses `source_connectors`. Invalid selections fail
-before acquisition. Remote discovery/sync without an available selected connector
-returns `UNSUPPORTED_OPERATION`; targeted hydration returns
-`CONNECTOR_NOT_CONFIGURED`. These failures precede database creation. `all`
-continues local acquisition and reports unavailable selected remotes.
-
-This selection API addresses built-in connectors; plugin loading and optional
-cloud package extraction are separate work. Cloud dependencies remain in the
-current package. SDK/native contract 13 is required so older addons cannot
-silently ignore connector selection. See `docs/remote-connectors.md` for
-connector capabilities and authentication.
+The CLI accepts `--config history.json` on acquisition commands. Config lists
+explicit plugin modules/options; `--source-connector` selects their IDs and is
+repeatable. `--no-source-connectors` disables remote acquisition. MCP uses
+`AI_HIST_PLUGIN_CONFIG` and `source_connectors`. Scope defaults to local even
+with plugins configured. See [source plugins](../docs/remote-connectors.md).
+Native contract 14 rejects old addons that lack the source/delivery boundary.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
 and discovery results additionally report `locationsRun` — the connector
@@ -213,49 +205,14 @@ evidence, and connector/parser failures with dedicated error subclasses.
 The old synchronous `AiHist` class and `openAiHist()` API were removed in 1.0.
 See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/native-sdk-migration.md).
 
-## Cloud opt-in
+## Optional cloud services
 
-Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use `--once` to exit after draining. The npm CLI bundles Agent Relay Cloud login, so no separate `agent-relay` CLI install is required; a run without a TTY fails promptly with interactive-login and token guidance. The async SDK exports `enableCloud`, `pushCloud`, `installGitHooks` and `createShareableTrace`; RelayHistory exchange, transport, and stage-scoped auth stay in Rust. See [cloud setup](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/enable-cloud.md).
-
-`ai-hist/cloud` owns the cloud API wrappers, including `loginCloud` and
-`loadStoredRelayhistoryAuth`, and delegates to the Rust cloud layer through N-API.
-The root `ai-hist` entrypoint re-exports the cloud API for convenience. Credentials
-live in `$RELAYHISTORY_HOME/stages`, defaulting to
-`~/.agentworkforce/relayhistory/stages`. The Rust layer selects the stage, checks
-transport security, preserves session metadata, and saves rotated tokens atomically.
-
-## Session thread transport
-
-`getSessionThread` accepts `SessionThreadOptions.fetchImpl` for the thread GET
-request and its retries. Authentication requests use the Rust HTTP client.
-A stored-session 401 can therefore trigger a native refresh request even when
-`fetchImpl` is mocked. Custom proxy or TLS settings supplied through `fetchImpl`
-apply only to thread requests; the auth endpoint must also be reachable by the
-native client for automatic refresh to succeed.
-
-For isolated mocks or caller-managed credentials, supply `resolveSession` that
-returns `{ auth }` without the `session: true` marker:
-
-```ts
-import { getSessionThread } from 'ai-hist/cloud';
-
-const thread = await getSessionThread(
-  { source: 'claude', sessionId: 'example-session' },
-  {
-    resolveSession: async () => ({
-      auth: { baseUrl: 'https://history.example.com', accessToken: 'rth_at_fixture' },
-    }),
-    fetchImpl: async () => new Response(JSON.stringify({
-      session: null, outcomes: [], links: [], nextCursor: null,
-    })),
-  },
-);
-```
-
-This resolver disables automatic refresh. A 401 from the selected transport
-throws `AuthenticationExpiredError` without an authentication request. The
-default `resolveCloudSession` returns the marker for stored credentials and
-enables native refresh.
+Use a `HistoryDestination` plugin for any service or pipe the public NDJSON
+export to your own program. The local package has no cloud exports, login CLI,
+or default cloud MCP tool. RelayHistory's auth, sharing, replay, durable upload
+and readback live in [`@agent-relay/relayhistory`](../plugins/relayhistory/sdk/README.md).
+Move imports from `ai-hist/cloud` to that package. Git hooks and commit linking
+remain local SDK operations.
 
 ## Export and durable delivery
 
@@ -264,33 +221,4 @@ Use `exportHistory(selection)` for a bounded historical snapshot or
 delivery jobs use `createHistoryDelivery`, `HistoryPluginRegistry`, and
 `drainHistoryDelivery`/`runHistoryDelivery`. The same Rust queue handles one-shot
 and background runs, immutable retries, exact acknowledgments, and worker leases.
-Native contract 13 is required. See [delivery setup and contracts](../docs/history-delivery.md).
-
-## Cloud token and replay
-
-The npm CLI uses the same Rust engine as the public async SDK:
-
-```bash
-# Shell-safe token export (fails if ai-hist token fails)
-RTH_TOKEN="$(ai-hist token)" || { echo "Failed to get token" >&2; exit 1; }
-export RTH_TOKEN
-ai-hist replay SESSION_ID
-ai-hist replay SESSION_ID --json --out transcript.json
-```
-
-```ts
-import { accessToken, replay } from 'ai-hist';
-
-const token = await accessToken(); // Secret: do not log it.
-const result = await replay('SESSION_ID', { json: true });
-const events = JSON.parse(result.transcript!);
-await replay('SESSION_ID', { json: true, out: 'transcript.json' });
-```
-
-Both APIs accept `baseUrl` (`--base-url` in the CLI) for explicit stage selection.
-Token refresh and persistence run in Rust before returning a token with at least
-60 seconds of recorded validity. Piped `token` stdout contains only the token
-and one newline; failures leave stdout empty. Replay fetches every page in
-server order; `limit` is the page size, and `maxContent` caps each event's content.
-File output replaces its destination atomically only after all pages succeed.
-Neither command opens or imports into the local history database.
+Native contract 14 is required. See [delivery setup and contracts](../docs/history-delivery.md).
