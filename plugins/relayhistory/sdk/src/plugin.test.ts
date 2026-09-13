@@ -389,3 +389,14 @@ test('source discovery orders by evidence recency before applying its limit', as
   assert.equal(page.observations[0].first_activity_ms, 900);
   assert.equal(page.observations[0].last_activity_ms, 900);
 });
+
+
+test('oversized persisted helper requests block as invalid payload instead of retrying forever',async t=>{
+  const {helperRequest}=await import('./helper.js');
+  const binaryPath=await fixtureHelper(t);const options={binaryPath,baseUrl:'https://fixture.invalid'};
+  const prepared={mapping_version:'relayhistory-delivery-v1',content_type:'application/json',body:'x'.repeat(16*1_048_576),sha256:'fixture'};
+  // The actual serializer bound fires before any helper executable is launched.
+  await assert.rejects(helperRequest('deliverySend',{prepared},{binaryPath:'/never-launched-for-oversize'}),(error:unknown)=>error instanceof RelayHistoryError&&error.code==='INVALID_ARGUMENT');
+  const batch={instance_id:relayHistoryInstance(options),account_id:account} as HistoryExportBatch;
+  await assert.rejects(relayHistoryDestination(options).send(prepared,{signal:new AbortController().signal,batch,idempotencyKey:'fixture'}),(error:unknown)=>error instanceof HistoryDeliveryError&&error.failure==='invalid_payload');
+});

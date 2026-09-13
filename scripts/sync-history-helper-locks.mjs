@@ -1,7 +1,8 @@
 /** npm cannot resolve unpublished optional platform releases while preparing the
  * split. Record their declared registry coordinates and platform constraints.
  * No integrity hash is invented; installation resolves the published artifact.
- * Development/CI builds omit these optional helpers and compile them explicitly.
+ * Ordinary CI installs retain optional build tools such as esbuild. Missing
+ * unpublished helper artifacts remain optional; CI builds those helpers explicitly.
  */
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';

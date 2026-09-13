@@ -198,6 +198,8 @@ async function requireMigration(options: RelayHistoryPluginOptions): Promise<voi
 }
 function classified(error: unknown): never {
   if (error instanceof HistoryDeliveryError) throw error;
+  // A deterministic helper envelope/input rejection cannot recover on retry.
+  if (error instanceof InvalidArgumentError) throw new HistoryDeliveryError('invalid_payload');
   if (error instanceof RelayHistoryError && error.code.startsWith('DELIVERY_')) {
     const failure = error.code.slice(9).toLowerCase();
     if (
