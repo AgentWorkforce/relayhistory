@@ -785,7 +785,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
-    assert_eq!(statuses.len(), 3);
+    assert_eq!(statuses.len(), 2);
     assert!(statuses.iter().all(|status| !status.configured));
     let error = ensure_remote_connectors_configured_at("discovery", home.path())
         .unwrap_err()
@@ -833,10 +833,10 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     );
     assert!(error.contains("claude-web"), "{error}");
     assert!(!error.contains("codex-cloud"), "{error}");
-    // Cloud can serve cursor, but it is not configured in this isolated home.
+    // Cursor has no selected provider connector; commercial login cannot widen selection.
     let error = ok(&["cursor"]).unwrap_err().to_string();
     assert!(
-        error.starts_with("no remote provider connectors are configured"),
+        error.contains("no matching remote provider connectors exist"),
         "{error}"
     );
     // A misspelled source is an invalid argument, not an unsupported request.
@@ -1115,12 +1115,12 @@ fn cloud_http(pages: Vec<(u16, Value)>) -> (String, std::thread::JoinHandle<Vec<
 fn cloud_unconfigured_empty_home_preserves_error_prefix() {
     let _isolated = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
-    let status = remote_connector_statuses_at(home.path())
+    let status = selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[])
         .into_iter()
         .find(|s| s.connector == CLOUD_CONNECTOR)
         .unwrap();
     assert!(!status.configured);
-    let error = ensure_remote_connectors_configured_for_at("discovery", home.path(), &[])
+    let error = ensure_cloud_configured_for_at("discovery", home.path(), &[])
         .unwrap_err()
         .to_string();
     assert!(
@@ -1138,17 +1138,14 @@ fn cloud_positive_catalog_preserves_source_remote_marker_and_cache() {
     let page = cloud_listing("cursor", "teammate-1");
     let (base, server) = cloud_http(vec![(200, page.clone()), (200, page)]);
     crate::cloud::save_auth(&cloud_auth(&base)).unwrap();
-    ensure_remote_connectors_configured_for_at("discovery", home.path(), &["cursor".into()])
-        .unwrap();
+    ensure_cloud_configured_for_at("discovery", home.path(), &["cursor".into()]).unwrap();
     let conn = catalog();
     let options = DiscoverOptions {
         scope: SessionScope::Remote,
         sources: vec!["cursor".into()],
         ..Default::default()
     };
-    let first =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap();
+    let first = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     assert_eq!(first.discovered, 1);
     let presence: (String, String, String) = conn.query_row(
         "SELECT source, location, raw_locator FROM session_presences WHERE session_id = 'teammate-1'", [],
@@ -1161,9 +1158,7 @@ fn cloud_positive_catalog_preserves_source_remote_marker_and_cache() {
             "cloud://org-teammates/teammate-1".into()
         )
     );
-    let second =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap();
+    let second = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     assert_eq!(second.discovered, 0);
     assert_eq!(second.skipped_unchanged, 1);
     let requests = server.join().unwrap();
@@ -1199,8 +1194,7 @@ fn cloud_teleport_adds_second_presence_and_keeps_local_evidence() {
         sources: vec!["codex".into()],
         ..Default::default()
     };
-    crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-        .unwrap();
+    discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     let presences: Vec<(String, String)> = conn.prepare(
         "SELECT location, raw_locator FROM session_presences WHERE source='codex' AND session_id='teleport-1' ORDER BY location"
     ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
@@ -1261,7 +1255,7 @@ fn cloud_cleartext_guard_is_inherited() {
     let home = tempfile::tempdir().unwrap();
     let evil = cloud_auth("http://evil.example");
     crate::cloud::save_auth(&evil).unwrap();
-    let status = remote_connector_statuses_at(home.path())
+    let status = selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[])
         .into_iter()
         .find(|s| s.connector == CLOUD_CONNECTOR)
         .unwrap();
@@ -1296,7 +1290,7 @@ fn cloud_status_rejects_bad_missing_and_expiring_tokens_without_hard_errors() {
         auth.access_token_expires_at = expiry.map(String::from);
         crate::cloud::save_auth(&auth).unwrap();
         assert!(
-            !remote_connector_statuses_at(home.path())
+            !selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[])
                 .into_iter()
                 .find(|s| s.connector == CLOUD_CONNECTOR)
                 .unwrap()
@@ -1305,7 +1299,7 @@ fn cloud_status_rejects_bad_missing_and_expiring_tokens_without_hard_errors() {
     }
     std::fs::write(crate::cloud::config_dir().join("auth.json"), "invalid JSON").unwrap();
     assert!(
-        !remote_connector_statuses_at(home.path())
+        !selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[])
             .into_iter()
             .find(|s| s.connector == CLOUD_CONNECTOR)
             .unwrap()
@@ -1330,9 +1324,7 @@ fn cloud_pagination_and_source_filter_preserve_opaque_cursor() {
         sources: vec!["trajectory".into()],
         ..Default::default()
     };
-    let result =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap();
+    let result = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     assert_eq!(result.discovered, 2);
     for scope in [SessionScope::Remote, SessionScope::All] {
         let cached = list_session_catalog(
@@ -1415,9 +1407,7 @@ fn cloud_all_sources_fan_out_without_widening_source_choices() {
         scope: SessionScope::Remote,
         ..Default::default()
     };
-    let summary =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap();
+    let summary = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     assert_eq!(summary.discovered, SOURCE_CHOICES.len());
     assert_eq!(
         SOURCE_CHOICES,
@@ -1431,14 +1421,12 @@ fn cloud_all_sources_fan_out_without_widening_source_choices() {
             "opencode"
         ]
     );
-    assert!(ensure_remote_connectors_configured_for_at(
-        "discovery",
-        home.path(),
-        &["cloud".into()]
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("invalid source 'cloud'"));
+    assert!(
+        ensure_cloud_configured_for_at("discovery", home.path(), &["cloud".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("invalid source 'cloud'")
+    );
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), SOURCE_CHOICES.len());
 }
@@ -1457,9 +1445,7 @@ fn cloud_repeated_cursor_is_a_diagnostic_and_does_not_cache_partial_listing() {
         sources: vec!["cursor".into()],
         ..Default::default()
     };
-    let error =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap_err();
+    let error = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap_err();
     let summary = &error
         .downcast_ref::<crate::discover::AllProvidersFailed>()
         .unwrap()
@@ -1568,9 +1554,7 @@ fn cloud_page_cap_retains_bounded_catalog_results() {
         sources: vec!["cursor".into()],
         ..Default::default()
     };
-    let summary =
-        crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-            .unwrap();
+    let summary = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     assert_eq!(summary.discovered, MAX_LIST_PAGES);
     assert!(summary.diagnostics.is_empty());
     let rows = list_session_catalog(
@@ -1599,13 +1583,13 @@ fn cloud_status_requires_cached_org_for_provenance() {
         let mut auth = cloud_auth("https://history.agentrelay.com");
         auth.org_id = org_id.map(String::from);
         crate::cloud::save_auth(&auth).unwrap();
-        let status = remote_connector_statuses_at(home.path())
+        let status = selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[])
             .into_iter()
             .find(|s| s.connector == CLOUD_CONNECTOR)
             .unwrap();
         assert!(!status.configured);
         assert!(status.detail.contains("no orgId for provenance"));
-        assert!(configured_remote_providers(home.path(), None).is_empty());
+        assert!(selected_remote_providers(home.path(), None, &cloud_selection(), &[]).is_empty());
     }
 }
 
@@ -1648,8 +1632,7 @@ fn cloud_preserves_presence_less_local_session_during_full_ingestion_gap() {
         sources: vec!["grok".into()],
         ..Default::default()
     };
-    crate::discover::discover_sessions_with_env(&env_at(&conn, home.path()), &options, |_| {})
-        .unwrap();
+    discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap();
     let local = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
     assert_eq!(local.len(), 1);
     assert_eq!(local[0].raw_path.as_deref(), Some("/local/chat.json"));
@@ -1665,4 +1648,115 @@ fn cloud_preserves_presence_less_local_session_during_full_ingestion_gap() {
     );
     server.join().unwrap();
     println!("legacy local gap: {presences:?}; canonical raw_path=/local/chat.json; state=full");
+}
+
+fn cloud_selection() -> SourceConnectorSelection {
+    SourceConnectorSelection::new(vec![CLOUD_CONNECTOR.into()]).unwrap()
+}
+
+fn ensure_cloud_configured_for_at(operation: &str, home: &Path, sources: &[String]) -> Result<()> {
+    ensure_selected_remote_connectors_configured_for_at(
+        operation,
+        home,
+        sources,
+        &cloud_selection(),
+    )
+}
+
+fn discover_with_cloud(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<crate::DiscoverySummary> {
+    crate::discover::discover_sessions_with_connectors(env, options, &cloud_selection(), on_row)
+}
+
+#[test]
+fn ordinary_remote_selection_never_adds_commercial_recall_after_login() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    crate::cloud::save_auth(&cloud_auth("http://127.0.0.1:1")).unwrap();
+    assert!(remote_connector_statuses_at(home.path())
+        .iter()
+        .all(|status| status.connector != CLOUD_CONNECTOR));
+    assert!(configured_remote_providers(home.path(), None).is_empty());
+}
+
+#[test]
+fn unselected_commercial_auth_is_never_read_for_status_or_discovery() {
+    let _isolated = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    COMMERCIAL_AUTH_READS.with(|count| count.set(0));
+    let conn = catalog();
+    for selection in [
+        SourceConnectorSelection::default(),
+        SourceConnectorSelection::new(vec![]).unwrap(),
+    ] {
+        selected_remote_connector_statuses_at(home.path(), &selection, &[]);
+        crate::discover::discover_sessions_with_connectors(
+            &env_at(&conn, home.path()),
+            &DiscoverOptions {
+                scope: SessionScope::All,
+                ..Default::default()
+            },
+            &selection,
+            |_| {},
+        )
+        .unwrap();
+    }
+    // Even an explicitly installed commercial connector stays inert in local scope.
+    crate::discover::discover_sessions_with_connectors(
+        &env_at(&conn, home.path()),
+        &DiscoverOptions::default(),
+        &cloud_selection(),
+        |_| {},
+    )
+    .unwrap();
+    COMMERCIAL_AUTH_READS.with(|count| assert_eq!(count.get(), 0));
+    // Positive control: the instrumentation observes the selected commercial path.
+    selected_remote_connector_statuses_at(home.path(), &cloud_selection(), &[]);
+    COMMERCIAL_AUTH_READS.with(|count| assert_eq!(count.get(), 1));
+}
+
+#[test]
+fn source_filter_is_applied_before_any_provider_credential_probe() {
+    let home = tempfile::tempdir().unwrap();
+    let selection = SourceConnectorSelection::default();
+    assert!(
+        selected_remote_connector_statuses_at(home.path(), &selection, &["cursor".into()])
+            .is_empty()
+    );
+    assert!(
+        selected_remote_providers(home.path(), None, &selection, &["cursor".into()]).is_empty()
+    );
+}
+
+#[test]
+fn explicit_empty_or_inapplicable_selection_rejects_before_database_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent/history.db");
+    let selection = SourceConnectorSelection::new(vec![]).unwrap();
+    assert!(crate::discover_sessions_scoped_at_with_connectors(
+        &db,
+        &DiscoverOptions {
+            scope: SessionScope::Remote,
+            ..Default::default()
+        },
+        &selection
+    )
+    .is_err());
+    assert!(crate::sync_scoped_at_with_connectors(&db, SessionScope::Remote, &selection).is_err());
+    assert!(crate::hydrate_session_at_with_connectors(
+        &db,
+        &crate::HydrateSessionOptions {
+            source: "claude".into(),
+            session_id: "session_01missing".into(),
+            scope: SessionScope::Remote,
+            include_related: false
+        },
+        &selection
+    )
+    .is_err());
+    assert!(!db.parent().unwrap().exists());
+    assert!(SourceConnectorSelection::new(vec!["not-installed".into()]).is_err());
 }

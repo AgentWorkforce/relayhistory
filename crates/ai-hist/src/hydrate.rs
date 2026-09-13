@@ -89,15 +89,51 @@ pub fn hydrate_session_at(
     db_path: &Path,
     options: &HydrateSessionOptions,
 ) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_home(db_path, options, &home_dir())
+    hydrate_session_at_with_connectors(
+        db_path,
+        options,
+        &crate::remote::SourceConnectorSelection::default(),
+    )
 }
 
+pub fn hydrate_session_at_with_connectors(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    connectors: &crate::remote::SourceConnectorSelection,
+) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_home_and_connectors(db_path, options, &home_dir(), connectors)
+}
+
+#[cfg(test)]
 fn hydrate_session_at_with_home(
     db_path: &Path,
     options: &HydrateSessionOptions,
     home: &Path,
 ) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_home_and_connectors(
+        db_path,
+        options,
+        home,
+        &crate::remote::SourceConnectorSelection::default(),
+    )
+}
+
+fn hydrate_session_at_with_home_and_connectors(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    home: &Path,
+    connectors: &crate::remote::SourceConnectorSelection,
+) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    if options.scope == SessionScope::Remote {
+        crate::remote::ensure_selected_remote_connectors_configured_for_at(
+            "hydration",
+            home,
+            std::slice::from_ref(&options.source),
+            connectors,
+        )
+        .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
+    }
     let started = Instant::now();
     // Acquisition and replacement are one per-session critical section. The
     // provider call has to be inside it: otherwise an older response can wait
@@ -109,7 +145,7 @@ fn hydrate_session_at_with_home(
     let mut conn = open_db(db_path)?;
     let target = catalog_target(&conn, options)?;
     if options.scope == SessionScope::Remote {
-        return hydrate_remote_session(&mut conn, options, home, started);
+        return hydrate_remote_session(&mut conn, options, home, connectors, started);
     }
     let snapshot = source_snapshot(options, &target, home)?;
     let previous: Option<(Option<String>, i64, bool)> = conn
@@ -256,9 +292,15 @@ fn hydrate_remote_session(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
     home: &Path,
+    connectors: &crate::remote::SourceConnectorSelection,
     started: Instant,
 ) -> Result<HydrateSessionResult> {
-    if !matches!(options.source.as_str(), "claude" | "codex") {
+    let provider_id = match options.source.as_str() {
+        "claude" => crate::remote::CLAUDE_WEB_CONNECTOR,
+        "codex" => crate::remote::CODEX_CLOUD_CONNECTOR,
+        _ => "",
+    };
+    if !connectors.contains(provider_id) {
         return remote_limited_result(
             conn,
             options,
@@ -2836,8 +2878,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let result = hydrate_session_at_with_home(
-            &db,
+        let result = hydrate_remote_session(
+            &mut open_db(&db).unwrap(),
             &HydrateSessionOptions {
                 source: "cursor".into(),
                 session_id: "remote-cursor".into(),
@@ -2845,6 +2887,11 @@ mod tests {
                 include_related: true,
             },
             dir.path(),
+            &crate::remote::SourceConnectorSelection::new(vec![
+                crate::remote::CLOUD_CONNECTOR.into()
+            ])
+            .unwrap(),
+            Instant::now(),
         )
         .unwrap();
         assert_eq!(result.status, "capability_limited");

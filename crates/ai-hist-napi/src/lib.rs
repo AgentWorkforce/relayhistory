@@ -31,7 +31,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 11;
+pub const NATIVE_CONTRACT_VERSION: u32 = 12;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -133,12 +133,24 @@ fn ensure_acquisition_scope_supported(
     scope: SessionScope,
     operation: &str,
     sources: &[String],
+    connectors: &ai_hist_engine::remote::SourceConnectorSelection,
 ) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        ai_hist_engine::remote::ensure_remote_connectors_configured_for(operation, sources)
-            .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
+        ai_hist_engine::remote::ensure_selected_remote_connectors_configured_for(
+            operation, sources, connectors,
+        )
+        .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
     }
     Ok(())
+}
+
+fn source_connector_selection(
+    ids: Option<Vec<String>>,
+) -> napi::Result<ai_hist_engine::remote::SourceConnectorSelection> {
+    ids.map(ai_hist_engine::remote::SourceConnectorSelection::new)
+        .transpose()
+        .map(|selection| selection.unwrap_or_default())
+        .map_err(|error| native_error("INVALID_ARGUMENT", error.to_string()))
 }
 
 /// Contract version implemented by this native addon.
@@ -867,6 +879,7 @@ pub async fn list_session_catalog(
 
 #[napi(object)]
 pub struct DiscoverOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
@@ -924,6 +937,7 @@ pub struct DiscoverResult {
 #[napi]
 pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result<DiscoverResult> {
     let options = options.unwrap_or(DiscoverOptions {
+        source_connectors: None,
         scope: None,
         db_path: None,
         sources: None,
@@ -931,7 +945,8 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     });
     let scope = parse_scope(options.scope)?;
     let sources = options.sources.unwrap_or_default();
-    ensure_acquisition_scope_supported(scope, "discovery", &sources)?;
+    let connectors = source_connector_selection(options.source_connectors)?;
+    ensure_acquisition_scope_supported(scope, "discovery", &sources, &connectors)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::DiscoverOptions {
         scope,
@@ -939,7 +954,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::discover_sessions_scoped_at(&path, &request)
+        ai_hist_engine::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -993,6 +1008,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
 
 #[napi(object)]
 pub struct HydrateSessionOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub source: String,
     pub session_id: String,
     pub scope: Option<String>,
@@ -1062,6 +1078,7 @@ fn hydration_error(error: anyhow::Error) -> napi::Error {
 /// Fully index one cataloged session without enumerating unrelated sessions.
 #[napi]
 pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<HydrateSessionResult> {
+    let connectors = source_connector_selection(options.source_connectors)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::HydrateSessionOptions {
@@ -1071,7 +1088,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
         include_related: options.include_related.unwrap_or(true),
     };
     let result = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::hydrate_session_at(&path, &request)
+        ai_hist_engine::hydrate_session_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1506,6 +1523,7 @@ pub async fn get_session_children_page(
 
 #[napi(object)]
 pub struct SyncOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub db_path: Option<String>,
     pub scope: Option<String>,
 }
@@ -1521,18 +1539,21 @@ pub struct SyncResult {
 #[napi]
 pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
     let options = options.unwrap_or(SyncOptions {
+        source_connectors: None,
         db_path: None,
         scope: None,
     });
     let scope = parse_scope(options.scope)?;
-    ensure_acquisition_scope_supported(scope, "sync", &[])?;
+    let connectors = source_connector_selection(options.source_connectors)?;
+    ensure_acquisition_scope_supported(scope, "sync", &[], &connectors)?;
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
-    let completed =
-        napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_scoped_at(&path, scope))
-            .await
-            .map_err(worker_error)?
-            .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
+    let completed = napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::sync_scoped_at_with_connectors(&path, scope, &connectors)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
     Ok(SyncResult {
         database_path: result_path,
         completed,

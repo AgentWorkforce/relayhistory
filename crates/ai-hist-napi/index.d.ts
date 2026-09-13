@@ -223,6 +223,7 @@ export declare function listSessionCatalogPage(options?: ListCatalogOptions | un
 /** Convenience first-page catalog listing with identical cache-only semantics. */
 export declare function listSessionCatalog(options?: ListCatalogOptions | undefined | null): Promise<Array<CatalogSession>>
 export interface DiscoverOptions {
+  sourceConnectors?: Array<string>
   scope?: string
   dbPath?: string
   sources?: Array<string>
@@ -268,6 +269,7 @@ export interface DiscoverResult {
 /** Explicit bounded provider discovery. It updates only the session catalog. */
 export declare function discoverSessions(options?: DiscoverOptions | undefined | null): Promise<DiscoverResult>
 export interface HydrateSessionOptions {
+  sourceConnectors?: Array<string>
   source: string
   sessionId: string
   scope?: string
@@ -410,6 +412,7 @@ export declare function getSessionTree(options: SessionTreeOptions): Promise<Nat
  */
 export declare function getSessionChildrenPage(options: SessionChildrenPageOptions): Promise<NativeSessionChildrenPage>
 export interface SyncOptions {
+  sourceConnectors?: Array<string>
   dbPath?: string
   scope?: string
 }

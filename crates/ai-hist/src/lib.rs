@@ -48,8 +48,8 @@ pub use discover::{
     DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 pub use hydrate::{
-    hydrate_session, hydrate_session_at, HydrateSessionOptions, HydrateSessionResult,
-    HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
+    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
+    HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
     SESSION_HYDRATION_CONTRACT_VERSION,
 };
 pub(crate) use relationships::now_ms;
@@ -119,22 +119,32 @@ pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
 }
 
 fn sync_scope_exclusive(db_path: &Path, scope: SessionScope) -> Result<bool> {
-    validate_sync_scope(scope)?;
+    sync_scoped_at_with_connectors(db_path, scope, &remote::SourceConnectorSelection::default())
+}
+
+/// Full ingestion with an explicit remote connector allowlist. Local scope
+/// ignores all remote connectors and never probes their credentials.
+pub fn sync_scoped_at_with_connectors(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+) -> Result<bool> {
+    if scope == SessionScope::Remote {
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "sync",
+            &home_dir(),
+            &[],
+            connectors,
+        )?;
+    }
     let mut ran = false;
     if matches!(scope, SessionScope::Local | SessionScope::All) {
         ran |= sync_exclusive(db_path)?;
     }
     if matches!(scope, SessionScope::Remote | SessionScope::All) {
-        ran |= sync_remote_connectors(db_path, scope)?;
+        ran |= sync_remote_connectors(db_path, scope, connectors)?;
     }
     Ok(ran)
-}
-
-fn validate_sync_scope(scope: SessionScope) -> Result<()> {
-    if scope == SessionScope::Remote {
-        remote::ensure_remote_connectors_configured("sync")?;
-    }
-    Ok(())
 }
 
 /// Run every configured remote connector's acquisition into the ledger.
@@ -144,15 +154,24 @@ fn validate_sync_scope(scope: SessionScope) -> Result<()> {
 /// the sync advisory lock (the same concurrency argument as [`discover`]).
 /// Under `all` scope a machine with no connector configured skips quietly —
 /// that is the documented "runs whatever is available" contract; a remote-only
-/// request was already rejected by [`validate_sync_scope`] before this point.
-fn sync_remote_connectors(db_path: &Path, scope: SessionScope) -> Result<bool> {
-    let statuses = remote::remote_connector_statuses();
+/// request was already rejected by [`sync_scoped_at_with_connectors`] before this point.
+fn sync_remote_connectors(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+) -> Result<bool> {
+    let statuses = remote::selected_remote_connector_statuses_at(&home_dir(), connectors, &[]);
     if !statuses.iter().any(|status| status.configured) {
         if scope == SessionScope::All {
             sync_note!("  [remote] no remote provider connectors configured; skipped");
             return Ok(false);
         }
-        remote::ensure_remote_connectors_configured("sync")?;
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "sync",
+            &home_dir(),
+            &[],
+            connectors,
+        )?;
     }
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let options = DiscoverOptions {
@@ -160,7 +179,34 @@ fn sync_remote_connectors(db_path: &Path, scope: SessionScope) -> Result<bool> {
         sources: Vec::new(),
         limit: None,
     };
-    let summary = discover_sessions(&conn, &options, |_| {})?;
+    if statuses
+        .iter()
+        .any(|s| s.connector == remote::RELAYCAST_CONNECTOR && s.configured)
+    {
+        // Serialize the persisted acquisition cursor with other sync writers.
+        let Some(_lock) = try_acquire_sync_lock(db_path)? else {
+            return Ok(false);
+        };
+        let state_path = db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".sync-state.json");
+        let mut state = load_sync_state(&state_path)?;
+        sync_relaycast(&conn, &mut state)?;
+        save_sync_state(&state_path, &state)?;
+    }
+    if !statuses
+        .iter()
+        .any(|s| s.connector != remote::RELAYCAST_CONNECTOR && s.configured)
+    {
+        return Ok(true);
+    }
+    let summary = discover::discover_sessions_with_connectors(
+        &DiscoveryEnv::new(&conn),
+        &options,
+        connectors,
+        |_| {},
+    )?;
     // `all` ingests local transcripts before remote discovery. Correlate from
     // the exact ids cached by that local pass; remote-only sync never opens a
     // local transcript merely to repair topology.
@@ -316,9 +362,35 @@ pub fn discover_sessions_scoped_at(
     db_path: &Path,
     options: &DiscoverOptions,
 ) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    validate_discovery_scope(options.scope)?;
+    discover_sessions_scoped_at_with_connectors(
+        db_path,
+        options,
+        &remote::SourceConnectorSelection::default(),
+    )
+}
+
+pub fn discover_sessions_scoped_at_with_connectors(
+    db_path: &Path,
+    options: &DiscoverOptions,
+    connectors: &remote::SourceConnectorSelection,
+) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
+    if options.scope == SessionScope::Remote {
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "discovery",
+            &home_dir(),
+            &options.sources,
+            connectors,
+        )?;
+    }
     let conn = open_db(db_path)?;
-    discover_sessions_collect(&conn, options)
+    let mut rows = Vec::new();
+    let summary = discover::discover_sessions_with_connectors(
+        &DiscoveryEnv::new(&conn),
+        options,
+        connectors,
+        |row| rows.push(row.clone()),
+    )?;
+    Ok((rows, summary))
 }
 
 #[derive(Args, Debug, Clone, Copy, Default)]
@@ -364,6 +436,16 @@ impl SessionScopeArgs {
     about = "Sync, search, tag, and relay AI coding agent history"
 )]
 struct Cli {
+    /// Explicit remote source connector (repeatable). Defaults to provider CLIs only.
+    #[arg(
+        long = "source-connector",
+        global = true,
+        conflicts_with = "no_source_connectors"
+    )]
+    source_connectors: Vec<String>,
+    /// Disable all remote source connectors, including provider CLIs.
+    #[arg(long, global = true)]
+    no_source_connectors: bool,
     #[arg(long)]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -952,6 +1034,13 @@ fn read_only_connection(command: &Command, db_path: &Path) -> Option<Connection>
 /// code is available as a library (for the napi binding).
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let connectors = if cli.no_source_connectors {
+        remote::SourceConnectorSelection::new(Vec::new())?
+    } else if cli.source_connectors.is_empty() {
+        remote::SourceConnectorSelection::default()
+    } else {
+        remote::SourceConnectorSelection::new(cli.source_connectors.clone())?
+    };
     let db_path = cli.db.unwrap_or_else(default_db_path);
     // Sync commands must acquire their advisory lock before opening a writable connection.
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
@@ -993,21 +1082,43 @@ pub fn run() -> Result<()> {
             interval,
         } => {
             if *install_service {
-                validate_sync_scope(scope.resolve())?;
-                return install_managed_service(&SYNC_SERVICE, *interval, &scope.service_args());
+                if scope.resolve() == SessionScope::Remote {
+                    remote::ensure_selected_remote_connectors_configured_for(
+                        "sync",
+                        &[],
+                        &connectors,
+                    )?;
+                }
+                let mut service_args = scope.service_args();
+                if cli.no_source_connectors {
+                    service_args.push("--no-source-connectors".into());
+                }
+                for id in &cli.source_connectors {
+                    service_args.extend(["--source-connector".to_string(), id.clone()]);
+                }
+                return install_managed_service(&SYNC_SERVICE, *interval, &service_args);
             }
             if *uninstall_service {
                 return uninstall_managed_service(&SYNC_SERVICE);
             }
-            return sync_scope_exclusive(&db_path, scope.resolve()).map(|_| ());
+            return sync_scoped_at_with_connectors(&db_path, scope.resolve(), &connectors)
+                .map(|_| ());
         }
         Command::Watch { scope, interval } => {
-            validate_sync_scope(scope.resolve())?;
-            return watch_loop(&db_path, *interval, scope.resolve());
+            if scope.resolve() == SessionScope::Remote {
+                remote::ensure_selected_remote_connectors_configured_for("sync", &[], &connectors)?;
+            }
+            return watch_loop_with_connectors(&db_path, *interval, scope.resolve(), &connectors);
         }
         Command::Sessions {
-            action: SessionsAction::Discover { scope, .. },
-        } => validate_discovery_scope(scope.resolve())?,
+            action: SessionsAction::Discover { scope, source, .. },
+        } if scope.resolve() == SessionScope::Remote => {
+            remote::ensure_selected_remote_connectors_configured_for(
+                "discovery",
+                source,
+                &connectors,
+            )?;
+        }
         Command::SyncOpencode { opencode_db } => {
             let source = opencode_db.clone().unwrap_or_else(default_opencode_db_path);
             return sync_opencode_exclusive(&db_path, &source).map(|_| ());
@@ -1654,7 +1765,7 @@ pub fn run() -> Result<()> {
                 source,
                 limit,
                 json,
-            } => run_session_discovery(&conn, scope.resolve(), source, limit, json),
+            } => run_session_discovery(&conn, scope.resolve(), source, limit, json, &connectors),
         },
     }
 }
@@ -1740,6 +1851,7 @@ fn run_session_discovery(
     sources: Vec<String>,
     limit: Option<usize>,
     as_json: bool,
+    connectors: &remote::SourceConnectorSelection,
 ) -> Result<()> {
     let options = DiscoverOptions {
         scope,
@@ -1747,23 +1859,28 @@ fn run_session_discovery(
         limit,
     };
     let mut count = 0usize;
-    let outcome = discover_sessions(conn, &options, |session| {
-        count += 1;
-        if as_json {
-            match serde_json::to_value(session) {
-                Ok(Value::Object(mut map)) => {
-                    map.insert("type".to_string(), json!("session"));
-                    println!("{}", Value::Object(map));
+    let outcome = discover::discover_sessions_with_connectors(
+        &DiscoveryEnv::new(conn),
+        &options,
+        connectors,
+        |session| {
+            count += 1;
+            if as_json {
+                match serde_json::to_value(session) {
+                    Ok(Value::Object(mut map)) => {
+                        map.insert("type".to_string(), json!("session"));
+                        println!("{}", Value::Object(map));
+                    }
+                    _ => eprintln!(
+                        "ai-hist: could not serialize session {}",
+                        session.session_id
+                    ),
                 }
-                _ => eprintln!(
-                    "ai-hist: could not serialize session {}",
-                    session.session_id
-                ),
+            } else {
+                println!("{}", fmt_session_row(session));
             }
-        } else {
-            println!("{}", fmt_session_row(session));
-        }
-    });
+        },
+    );
     // An every-provider failure is still a failure, but the diagnostics are
     // the reason a caller ran this at all. Render the collected stream and the
     // summary trailer first, so a JSONL consumer never sees a truncated stream
@@ -3179,10 +3296,6 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         }
         total_inserted += open_inserted;
     }
-    if let Some(inserted) = report.capture("relay", sync_relaycast(conn, &mut state)) {
-        total_inserted += inserted;
-        checkpoint_sync_state(&state_path, &state);
-    }
     report.finish(db_path)?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
@@ -3315,9 +3428,23 @@ fn prepare_sync_and_push_db(db_path: &Path) -> Result<(Connection, bool)> {
 }
 
 fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
+    watch_loop_with_connectors(
+        db_path,
+        interval,
+        scope,
+        &remote::SourceConnectorSelection::default(),
+    )
+}
+
+fn watch_loop_with_connectors(
+    db_path: &Path,
+    interval: u64,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+) -> Result<()> {
     println!("Watching every {interval}s (Ctrl-C to stop)...");
     loop {
-        match sync_scope_exclusive(db_path, scope) {
+        match sync_scoped_at_with_connectors(db_path, scope, connectors) {
             Ok(_) => {}
             Err(err) => eprintln!("Error: {err:#}"),
         }
@@ -8605,7 +8732,7 @@ fn sync_relay_messages(
                 .and_then(Value::as_str)
                 .and_then(parse_iso_ms)
                 .unwrap_or(0);
-            inserted += insert_history(
+            inserted += ai_hist_core::insert_history_at_location(
                 conn,
                 &HistoryEntry {
                     id: 0,
@@ -8616,6 +8743,7 @@ fn sync_relay_messages(
                     prompt,
                     timestamp_ms,
                 },
+                SessionLocation::Remote,
             )?;
             if let Some(id) = msg.get("id").and_then(Value::as_str) {
                 if max_id.as_deref().is_none_or(|current| id > current) {
@@ -12923,6 +13051,8 @@ mod tests {
 
         assert_eq!(inserted, 102);
         assert_eq!(history_count(&conn), 102);
+        let locations = ai_hist_core::session_locations(&conn, "relay", "#general").unwrap();
+        assert_eq!(locations, vec!["remote"]);
         assert!(
             requests[2].contains("after=m099"),
             "the second page must continue from the last id of the first: {requests:?}"

@@ -24,7 +24,8 @@
 //!
 //! Requesting `--remote` acquisition with no connector configured fails
 //! loudly, exactly as before connectors existed; `--all` runs whatever is
-//! configured and never errors on absence.
+//! selected and configured and never errors on absence. Commercial connectors
+//! require an explicit allowlist; login alone never enables them.
 //!
 //! # Fidelity
 //!
@@ -90,7 +91,7 @@ const MAX_REMOTE_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-pub(crate) enum RemoteSessionEvidence {
+pub enum RemoteSessionEvidence {
     ClaudeFull {
         records: Vec<Value>,
         source_stamp: String,
@@ -134,43 +135,114 @@ fn codex_auth_path(home: &Path) -> PathBuf {
     home.join(".codex/auth.json")
 }
 
-/// Report each connector's availability under an explicit home directory.
+/// Explicit built-in source connector allowlist. Omission retains provider CLI
+/// connectors; an empty list disables remote acquisition. Commercial credentials
+/// never add a connector. Instance-specific registration follows the observation
+/// migration; these built-ins currently represent one default instance each.
+#[derive(Debug, Clone)]
+pub struct SourceConnectorSelection {
+    ids: Vec<String>,
+}
+
+impl Default for SourceConnectorSelection {
+    fn default() -> Self {
+        Self {
+            ids: vec![CLAUDE_WEB_CONNECTOR.into(), CODEX_CLOUD_CONNECTOR.into()],
+        }
+    }
+}
+
+impl SourceConnectorSelection {
+    pub fn new(ids: Vec<String>) -> Result<Self> {
+        for id in &ids {
+            anyhow::ensure!(
+                [
+                    CLAUDE_WEB_CONNECTOR,
+                    CODEX_CLOUD_CONNECTOR,
+                    CLOUD_CONNECTOR,
+                    RELAYCAST_CONNECTOR
+                ]
+                .contains(&id.as_str()),
+                "invalid source connector '{id}'"
+            );
+        }
+        let mut ids = ids;
+        ids.sort();
+        ids.dedup();
+        Ok(Self { ids })
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.iter().any(|selected| selected == id)
+    }
+
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+}
+
+pub const RELAYCAST_CONNECTOR: &str = "relaycast";
+
+#[cfg(test)]
+thread_local! {
+    static COMMERCIAL_AUTH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn selected_recall_auth() -> Result<crate::cloud::StoredAuth> {
+    #[cfg(test)]
+    COMMERCIAL_AUTH_READS.with(|count| count.set(count.get() + 1));
+    crate::cloud::recall_auth()
+}
+
+/// Provider-only availability; this operation never reads commercial auth.
 pub fn remote_connector_statuses_at(home: &Path) -> Vec<RemoteConnectorStatus> {
-    let claude_path = claude_credentials_path(home);
-    let codex_path = codex_auth_path(home);
-    let cloud_auth = crate::cloud::recall_auth();
-    vec![
-        RemoteConnectorStatus {
-            connector: CLAUDE_WEB_CONNECTOR,
-            source: "claude",
-            configured: claude_path.is_file(),
-            detail: if claude_path.is_file() {
-                format!("claude.ai credentials at {}", claude_path.display())
+    selected_remote_connector_statuses_at(home, &SourceConnectorSelection::default(), &[])
+}
+
+/// Probe only selected connectors applicable to the source filter. Selection is
+/// evaluated before touching any credential store or commercial environment.
+pub fn selected_remote_connector_statuses_at(
+    home: &Path,
+    selection: &SourceConnectorSelection,
+    sources: &[String],
+) -> Vec<RemoteConnectorStatus> {
+    let mut statuses = Vec::new();
+    for (connector, source) in [
+        (CLAUDE_WEB_CONNECTOR, "claude"),
+        (CODEX_CLOUD_CONNECTOR, "codex"),
+    ] {
+        if !selection.contains(connector)
+            || (!sources.is_empty() && !sources.iter().any(|s| s == source))
+        {
+            continue;
+        }
+        let path = if connector == CLAUDE_WEB_CONNECTOR {
+            claude_credentials_path(home)
+        } else {
+            codex_auth_path(home)
+        };
+        let configured = path.is_file();
+        statuses.push(RemoteConnectorStatus {
+            connector,
+            source,
+            configured,
+            detail: if configured {
+                format!("provider CLI login at {}", path.display())
             } else {
                 format!(
-                    "no claude.ai credentials at {} (sign in with the Claude Code CLI)",
-                    claude_path.display()
+                    "no provider CLI credentials at {} (sign in with the provider CLI)",
+                    path.display()
                 )
             },
-        },
-        RemoteConnectorStatus {
-            connector: CODEX_CLOUD_CONNECTOR,
-            source: "codex",
-            configured: codex_path.is_file(),
-            detail: if codex_path.is_file() {
-                format!("Codex CLI login at {}", codex_path.display())
-            } else {
-                format!(
-                    "no Codex CLI login at {} (run `codex login`)",
-                    codex_path.display()
-                )
-            },
-        },
-        RemoteConnectorStatus {
+        });
+    }
+    if selection.contains(CLOUD_CONNECTOR) {
+        let auth = selected_recall_auth();
+        statuses.push(RemoteConnectorStatus {
             connector: CLOUD_CONNECTOR,
             source: "*",
-            configured: cloud_auth.is_ok(),
-            detail: match cloud_auth {
+            configured: auth.is_ok(),
+            detail: match auth {
                 Ok(auth) => format!(
                     "RelayHistory session at {} ({})",
                     crate::cloud::config_dir().display(),
@@ -178,8 +250,22 @@ pub fn remote_connector_statuses_at(home: &Path) -> Vec<RemoteConnectorStatus> {
                 ),
                 Err(error) => format!("{}: {error:#}", crate::cloud::config_dir().display()),
             },
-        },
-    ]
+        });
+    }
+    if selection.contains(RELAYCAST_CONNECTOR)
+        && (sources.is_empty() || sources.iter().any(|s| s == "relay"))
+    {
+        statuses.push(RemoteConnectorStatus {
+            connector: RELAYCAST_CONNECTOR,
+            source: "relay",
+            configured: ["RELAYCAST_API_KEY", "RELAYCAST_WORKSPACE_ID"]
+                .iter()
+                .all(|key| std::env::var(key).is_ok_and(|v| !v.is_empty())),
+            detail: "requires RELAYCAST_API_KEY and RELAYCAST_WORKSPACE_ID; supports full sync"
+                .into(),
+        });
+    }
+    statuses
 }
 
 /// [`remote_connector_statuses_at`] under the process home directory.
@@ -231,6 +317,33 @@ pub fn ensure_remote_connectors_configured_for_at(
     home: &Path,
     sources: &[String],
 ) -> Result<()> {
+    ensure_selected_remote_connectors_configured_for_at(
+        operation,
+        home,
+        sources,
+        &SourceConnectorSelection::default(),
+    )
+}
+
+pub fn ensure_selected_remote_connectors_configured_for(
+    operation: &str,
+    sources: &[String],
+    selection: &SourceConnectorSelection,
+) -> Result<()> {
+    ensure_selected_remote_connectors_configured_for_at(
+        operation,
+        &crate::home_dir(),
+        sources,
+        selection,
+    )
+}
+
+pub fn ensure_selected_remote_connectors_configured_for_at(
+    operation: &str,
+    home: &Path,
+    sources: &[String],
+    selection: &SourceConnectorSelection,
+) -> Result<()> {
     // A misspelled source is an invalid argument, not an unsupported remote
     // request — reject it with the engine's own invalid-source message before
     // classifying anything.
@@ -241,14 +354,17 @@ pub fn ensure_remote_connectors_configured_for_at(
             SOURCE_CHOICES.join(", ")
         );
     }
-    let statuses: Vec<RemoteConnectorStatus> = remote_connector_statuses_at(home)
-        .into_iter()
-        .filter(|status| {
-            status.connector == CLOUD_CONNECTOR
-                || sources.is_empty()
-                || sources.iter().any(|s| s == status.source)
-        })
-        .collect();
+    // Reject capabilities before probing credentials too. Relaycast currently
+    // supports full sync only, not shallow discovery or targeted hydration.
+    let applicable = SourceConnectorSelection {
+        ids: selection
+            .ids
+            .iter()
+            .filter(|id| operation == "sync" || id.as_str() != RELAYCAST_CONNECTOR)
+            .cloned()
+            .collect(),
+    };
+    let statuses = selected_remote_connector_statuses_at(home, &applicable, sources);
     anyhow::ensure!(
         !statuses.is_empty(),
         "remote session {operation} is not available for the requested source(s): no matching remote provider connectors exist"
@@ -265,13 +381,24 @@ pub fn ensure_remote_connectors_configured_for_at(
 /// simply absent — for `all` scope that is the documented "runs whatever is
 /// available" behaviour, and for `remote` scope the caller has already
 /// rejected the empty set.
+#[cfg(test)]
 pub(crate) fn configured_remote_providers(
     home: &Path,
     limit: Option<usize>,
 ) -> Vec<Box<dyn ShallowSessionProvider>> {
+    selected_remote_providers(home, limit, &SourceConnectorSelection::default(), &[])
+}
+
+pub(crate) fn selected_remote_providers(
+    home: &Path,
+    limit: Option<usize>,
+    selection: &SourceConnectorSelection,
+    sources: &[String],
+) -> Vec<Box<dyn ShallowSessionProvider>> {
+    let applicable = |source: &str| sources.is_empty() || sources.iter().any(|s| s == source);
     let mut providers: Vec<Box<dyn ShallowSessionProvider>> = Vec::new();
     let claude_path = claude_credentials_path(home);
-    if claude_path.is_file() {
+    if selection.contains(CLAUDE_WEB_CONNECTOR) && applicable("claude") && claude_path.is_file() {
         providers.push(Box::new(ClaudeWebProvider::new(
             claude_path,
             claude_api_base_url(),
@@ -280,16 +407,20 @@ pub(crate) fn configured_remote_providers(
         )));
     }
     let codex_path = codex_auth_path(home);
-    if codex_path.is_file() {
+    if selection.contains(CODEX_CLOUD_CONNECTOR) && applicable("codex") && codex_path.is_file() {
         providers.push(Box::new(CodexCloudProvider::new(
             Box::new(ExecCodexCli),
             limit,
         )));
     }
-    if let Ok(auth) = crate::cloud::recall_auth() {
+    if let Some(auth) = selection
+        .contains(CLOUD_CONNECTOR)
+        .then(selected_recall_auth)
+        .and_then(Result::ok)
+    {
         // One adapter per upstream source preserves the engine's source filters,
         // diagnostics and global recency ordering without inventing a cloud source.
-        for source in SOURCE_CHOICES {
+        for source in SOURCE_CHOICES.iter().filter(|source| applicable(source)) {
             providers.push(Box::new(CloudProvider::new(auth.clone(), source, limit)));
         }
     }
@@ -689,6 +820,9 @@ impl ClaudeWebProvider {
 }
 
 impl ShallowSessionProvider for ClaudeWebProvider {
+    fn connector_id(&self) -> &str {
+        CLAUDE_WEB_CONNECTOR
+    }
     fn source(&self) -> &'static str {
         "claude"
     }
@@ -1056,6 +1190,9 @@ impl CodexCloudProvider {
 }
 
 impl ShallowSessionProvider for CodexCloudProvider {
+    fn connector_id(&self) -> &str {
+        CODEX_CLOUD_CONNECTOR
+    }
     fn source(&self) -> &'static str {
         "codex"
     }
@@ -1188,6 +1325,9 @@ fn map_cloud_session(value: &Value, org_id: &str) -> Result<(Candidate, ShallowS
 }
 
 impl ShallowSessionProvider for CloudProvider {
+    fn connector_id(&self) -> &str {
+        CLOUD_CONNECTOR
+    }
     fn source(&self) -> &'static str {
         self.source
     }

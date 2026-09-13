@@ -376,6 +376,15 @@ pub enum ShallowReadAccess {
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
 pub trait ShallowSessionProvider: Sync {
+    /// Stable acquisition identity, independent of the evidence source.
+    fn connector_id(&self) -> &str {
+        self.source()
+    }
+    /// Non-secret instance key. Applications must override this for multiple accounts.
+    fn connector_instance(&self) -> &str {
+        "default"
+    }
+
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
     /// Where this adapter's evidence lives. Local file-backed adapters keep
@@ -2294,6 +2303,7 @@ pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
 fn select_providers(
     options: &DiscoverOptions,
     home: &Path,
+    connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<Vec<Box<dyn ShallowSessionProvider>>> {
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
@@ -2317,10 +2327,11 @@ fn select_providers(
     // filter that leaves a remote-only request with nothing configured is
     // the same unsupported request, scoped down.
     if options.scope == SessionScope::Remote {
-        crate::remote::ensure_remote_connectors_configured_for_at(
+        crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "discovery",
             home,
             &options.sources,
+            connectors,
         )?;
     }
     let mut providers: Vec<Box<dyn ShallowSessionProvider>> = Vec::new();
@@ -2328,9 +2339,11 @@ fn select_providers(
         providers.extend(shallow_providers());
     }
     if matches!(options.scope, SessionScope::Remote | SessionScope::All) {
-        providers.extend(crate::remote::configured_remote_providers(
+        providers.extend(crate::remote::selected_remote_providers(
             home,
             options.limit,
+            connectors,
+            &options.sources,
         ));
     }
     if !options.sources.is_empty() {
@@ -2366,8 +2379,39 @@ pub fn discover_sessions_with_env(
     options: &DiscoverOptions,
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
-    let providers = select_providers(options, &env.home)?;
-    discover_sessions_with_providers(env, options, &providers, on_row)
+    discover_sessions_with_connectors(
+        env,
+        options,
+        &crate::remote::SourceConnectorSelection::default(),
+        on_row,
+    )
+}
+
+/// Discover using an explicit allowlist; an empty selection runs local adapters only.
+pub fn discover_sessions_with_connectors(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    connectors: &crate::remote::SourceConnectorSelection,
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<DiscoverySummary> {
+    let providers = select_providers(options, &env.home, connectors)?;
+    let mut summary = discover_sessions_with_providers(env, options, &providers, on_row)?;
+    if options.scope == SessionScope::All {
+        for status in crate::remote::selected_remote_connector_statuses_at(
+            &env.home,
+            connectors,
+            &options.sources,
+        ) {
+            if !status.configured || status.connector == crate::remote::RELAYCAST_CONNECTOR {
+                summary.diagnostics.push(DiscoveryDiagnostic {
+                    source: status.source.into(),
+                    locator: None,
+                    error: format!("{}: {}", status.connector, status.detail),
+                });
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// [`discover_sessions_with_env`] over an explicit adapter set.

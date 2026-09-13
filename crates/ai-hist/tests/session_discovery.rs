@@ -899,3 +899,123 @@ fn a_source_filter_with_no_matching_connector_is_rejected_as_unsupported() {
     );
     assert!(stderr.contains("claude-web"), "{stderr}");
 }
+
+#[test]
+fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials() {
+    let temp = fake_home();
+    let db = temp.path().join("history.db");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    for args in [
+        vec!["sync", "--local", "--source-connector", "relaycast"],
+        vec!["sync", "--all", "--no-source-connectors"],
+        vec![
+            "sessions",
+            "discover",
+            "--local",
+            "--source-connector",
+            "cloud",
+            "--json",
+        ],
+    ] {
+        let output = isolated(&temp, &db, &args)
+            .env("RELAYHISTORY_HOME", temp.path().join("commercial"))
+            .env("RELAYCAST_API_KEY", "synthetic-key")
+            .env("RELAYCAST_WORKSPACE_ID", "synthetic-workspace")
+            .env("RELAYCAST_BASE_URL", &base)
+            .env("RELAYHISTORY_BASE_URL", &base)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!temp.path().join("commercial").exists());
+}
+
+#[test]
+fn explicit_relaycast_sync_uses_remote_presence_and_persists_checkpoint() {
+    use std::io::{BufRead, BufReader, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("history.db");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut requests = Vec::new();
+        while requests.len() < 3 && started.elapsed() < std::time::Duration::from_secs(10) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let body = if line.starts_with("GET /v1/channels ") {
+                r#"{"data":[{"name":"general"}]}"#
+            } else if line.starts_with("GET /v1/channels/general/messages?") {
+                r#"{"data":[{"id":"m001","text":"explicit remote message","created_at":"2026-09-13T00:00:00Z"}]}"#
+            } else if line.starts_with("GET /v1/dm/conversations/all ") {
+                r#"{"data":[]}"#
+            } else {
+                panic!("unexpected {line}")
+            };
+            requests.push(line);
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.trim().is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+        requests
+    });
+    let output = isolated(
+        &temp,
+        &db,
+        &["sync", "--remote", "--source-connector", "relaycast"],
+    )
+    .env("RELAYCAST_API_KEY", "synthetic-key")
+    .env("RELAYCAST_WORKSPACE_ID", "synthetic-workspace")
+    .env("RELAYCAST_BASE_URL", &base)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.join().unwrap().len(), 3);
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        ai_hist_core::session_locations(&conn, "relay", "#general").unwrap(),
+        vec!["remote"]
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(temp.path().join(".sync-state.json")).unwrap()).unwrap();
+    assert_eq!(state["relay"]["ch:general"], "m001");
+}
