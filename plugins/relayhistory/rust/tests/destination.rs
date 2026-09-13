@@ -17,7 +17,7 @@ fn batch() -> HistoryExportBatch {
         account_id("org-fixture", Some("workspace-fixture"))
     );
     let mut batch: HistoryExportBatch = serde_json::from_value(fixture["batch"].clone()).unwrap();
-    batch.mapping_version = MAPPING_VERSION.into();
+    assert_eq!(batch.mapping_version, MAPPING_VERSION);
     batch.account_id = account_id("org-fixture", None);
     batch
 }
