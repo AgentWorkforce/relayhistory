@@ -136,3 +136,16 @@ test("every platform package includes the selected executable and correct platfo
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('unpublished optional helpers have complete lock entries for clean npm ci', async()=>{
+  for(const plugin of Object.keys(plugins)){
+    const directory=new URL(`../plugins/${plugin}/sdk/`,import.meta.url);
+    const manifest=JSON.parse(await readFile(new URL('package.json',directory),'utf8'));
+    const lock=JSON.parse(await readFile(new URL('package-lock.json',directory),'utf8'));
+    validatePluginManifest(plugin,manifest);
+    for(const [name,version] of Object.entries(manifest.optionalDependencies)){
+      const entry=lock.packages['node_modules/'+name];assert.ok(entry,`${name} must be locked before publication`);
+      assert.equal(entry.version,version);assert.equal(entry.optional,true);assert.ok(entry.resolved.startsWith('https://registry.npmjs.org/'));
+    }
+  }
+});
