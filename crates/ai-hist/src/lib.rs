@@ -182,34 +182,38 @@ fn sync_remote_connectors(
             connectors,
         )?;
     }
-    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let options = DiscoverOptions {
         scope: SessionScope::Remote,
         sources: Vec::new(),
         limit: None,
     };
+    let mut relaycast_ran = false;
     if statuses
         .iter()
         .any(|s| s.connector == remote::RELAYCAST_CONNECTOR && s.configured)
     {
         // Serialize the persisted acquisition cursor with other sync writers.
-        let Some(_lock) = try_acquire_sync_lock(db_path)? else {
-            return Ok(false);
-        };
-        let state_path = db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".sync-state.json");
-        let mut state = load_sync_state(&state_path)?;
-        sync_relaycast(&conn, &mut state)?;
-        save_sync_state(&state_path, &state)?;
+        if let Some(_lock) = try_acquire_sync_lock(db_path)? {
+            let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+            let state_path = db_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".sync-state.json");
+            let mut state = load_sync_state(&state_path)?;
+            sync_relaycast(&conn, &mut state)?;
+            save_sync_state(&state_path, &state)?;
+            relaycast_ran = true;
+        } else {
+            sync_note!("  [relaycast] another sync owns its acquisition cursor; skipped");
+        }
     }
     if !statuses
         .iter()
         .any(|s| s.connector != remote::RELAYCAST_CONNECTOR && s.configured)
     {
-        return Ok(true);
+        return Ok(relaycast_ran);
     }
+    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let summary = discover::discover_sessions_with_connectors(
         &DiscoveryEnv::new(&conn),
         &options,
