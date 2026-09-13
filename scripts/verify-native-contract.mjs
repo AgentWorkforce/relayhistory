@@ -20,7 +20,7 @@ const rustVersion = readVersion(
   'the Rust binding',
 );
 const sdkVersion = readVersion(
-  'sdk-ts/src/index.ts',
+  'sdk-ts/src/native.ts',
   /export const NATIVE_CONTRACT_VERSION\s*=\s*(\d+)\s*;/,
   'the TypeScript SDK',
 );

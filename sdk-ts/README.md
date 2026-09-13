@@ -192,6 +192,46 @@ See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/ma
 
 Run `ai-hist enable-cloud` to log in, drain local history and keep pushing. Use `--once` to exit after draining. The npm CLI bundles Agent Relay Cloud login, so no separate `agent-relay` CLI install is required; a run without a TTY fails promptly with interactive-login and token guidance. The async SDK exports `enableCloud`, `pushCloud`, `installGitHooks` and `createShareableTrace`; RelayHistory exchange, transport, and stage-scoped auth stay in Rust. See [cloud setup](https://github.com/AgentWorkforce/relayhistory/blob/main/docs/enable-cloud.md).
 
+`ai-hist/cloud` owns the cloud API wrappers, including `loginCloud` and
+`loadStoredRelayhistoryAuth`, and delegates to the Rust cloud layer through N-API.
+The root `ai-hist` entrypoint re-exports the cloud API for convenience. Credentials
+live in `$RELAYHISTORY_HOME/stages`, defaulting to
+`~/.agentworkforce/relayhistory/stages`. The Rust layer selects the stage, checks
+transport security, preserves session metadata, and saves rotated tokens atomically.
+
+## Session thread transport
+
+`getSessionThread` accepts `SessionThreadOptions.fetchImpl` for the thread GET
+request and its retries. Authentication requests use the Rust HTTP client.
+A stored-session 401 can therefore trigger a native refresh request even when
+`fetchImpl` is mocked. Custom proxy or TLS settings supplied through `fetchImpl`
+apply only to thread requests; the auth endpoint must also be reachable by the
+native client for automatic refresh to succeed.
+
+For isolated mocks or caller-managed credentials, supply `resolveSession` that
+returns `{ auth }` without the `session: true` marker:
+
+```ts
+import { getSessionThread } from 'ai-hist/cloud';
+
+const thread = await getSessionThread(
+  { source: 'claude', sessionId: 'example-session' },
+  {
+    resolveSession: async () => ({
+      auth: { baseUrl: 'https://history.example.com', accessToken: 'rth_at_fixture' },
+    }),
+    fetchImpl: async () => new Response(JSON.stringify({
+      session: null, outcomes: [], links: [], nextCursor: null,
+    })),
+  },
+);
+```
+
+This resolver disables automatic refresh. A 401 from the selected transport
+throws `AuthenticationExpiredError` without an authentication request. The
+default `resolveCloudSession` returns the marker for stored credentials and
+enables native refresh.
+
 ## Cloud token and replay
 
 The npm CLI uses the same Rust engine as the public async SDK:

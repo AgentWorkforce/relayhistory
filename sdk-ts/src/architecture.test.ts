@@ -8,7 +8,7 @@ const sourceDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const repositoryRoot = join(sourceDir, '..', '..');
 
 test('production TypeScript has one native implementation', async () => {
-  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'cloud-client.ts'];
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'cloud-client.ts', 'native.ts', 'sdk-common.ts'];
   const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
   for (const forbidden of ['sql.js', 'node:child_process', 'AI_HIST_RUST_BIN', "fallback: 'jsonl'", 'readFile(dbPath)']) {
     assert.equal(source.includes(forbidden), false, `production source contains ${forbidden}`);
@@ -92,27 +92,22 @@ test('MCP evidence tools require both halves of a session identity', async () =>
 });
 
 
-// cloud-client.ts still carries #112's getSessionThread recall client together
-// with its own stage resolution, rotation and `~/.config/ai-hist/auth.json`
-// handling, so it is not yet a pure delegation to the native SDK. It also still
-// defines loginCloud and loadStoredRelayhistoryAuth alongside the Rust-backed
-// versions in index.ts — a second credential implementation in the same package.
-// Consolidating that is tracked in docs/ws12-validation.md and deliberately not
-// attempted here. Until then, guard the narrower invariant this change did
-// establish: the operations moved to Rust must have exactly one implementation.
-test('cloud compatibility entrypoint does not reimplement the native cloud operations', async () => {
-  const source = await readFile(join(sourceDir, 'cloud-client.ts'), 'utf8');
-  assert.match(source, /from '\.\/index\.js'/);
-  for (const operation of ['enableCloud', 'pushCloud', 'accessToken', 'replay', 'createShareableTrace']) {
-    assert.equal(
-      source.includes(`export async function ${operation}`), false,
-      `${operation} has one native implementation; cloud-client must not add a second`,
-    );
+test('the root re-exports cloud wrappers without a reverse dependency', async () => {
+  const [root, cloud, native, common] = await Promise.all(
+    ['index.ts', 'cloud-client.ts', 'native.ts', 'sdk-common.ts'].map((file) => readFile(join(sourceDir, file), 'utf8')),
+  );
+  assert.match(root, /export \* from '\.\/cloud-client\.js'/);
+  assert.match(cloud, /from '\.\/native\.js'/);
+  assert.doesNotMatch(cloud + native + common, /from '\.\/index\.js'/);
+  for (const operation of ['enableCloud', 'pushCloud', 'accessToken', 'replay', 'createShareableTrace', 'login', 'loginCloud', 'loadStoredRelayhistoryAuth', 'resolveCloudSession', 'refreshCloudSession', 'validateCloudExchangeBaseUrl', 'installGitHooks', 'linkGitCommit', 'getSessionThread']) {
+    assert.equal(root.includes(`export async function ${operation}(`), false, `${operation} is re-exported by the root`);
+    assert.equal(cloud.includes(`export async function ${operation}(`), true, `${operation} belongs to the cloud API`);
   }
+  assert.doesNotMatch(cloud, /node:fs|auth\.json|token\/refresh|cli\/login|RELAYHISTORY_HOME|AI_HIST_CONFIG_DIR|AI_HIST_BASE_URL|RELAYHISTORY_BASE_URL/);
 });
 
 test('token and replay SDK operations delegate to native code', async () => {
-  const source = await readFile(join(sourceDir, 'index.ts'), 'utf8');
+  const source = await readFile(join(sourceDir, 'cloud-client.ts'), 'utf8');
   const cloudCommands = source.slice(source.indexOf('export async function accessToken('), source.indexOf('export async function pushCloud('));
   assert.match(cloudCommands, /native\.accessToken\(/);
   assert.match(cloudCommands, /native\.replay\(/);

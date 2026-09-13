@@ -32,8 +32,8 @@ reuses the RelayHistory session created by `ai-hist login`:
   overridden by `RELAYHISTORY_HOME`) resolves a stored `rth_at_` session with
   `access_token_expires_at` at least 60 seconds in the future. This RFC 3339
   expiry is persisted from the service's `accessTokenExpiresAt` during login,
-  mint, and refresh. Legacy auth without expiry remains usable for push, but
-  needs a fresh login/refresh before cloud discovery advertises availability.
+  mint, and refresh. Cloud discovery requires a recorded, valid expiry; use
+  `ai-hist login` or refresh the session with `ai-hist token` when needed.
   Missing, malformed, expired, or ambiguous credentials report an unconfigured
   reason; status probes never refresh or perform network requests. The stored
   session must also have a non-empty cached `org_id` to construct provenance

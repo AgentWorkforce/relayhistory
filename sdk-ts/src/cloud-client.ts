@@ -1,103 +1,167 @@
-import { readFile, readdir, rename, writeFile, mkdir } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+/** Cloud API wrappers over the shared Rust engine. */
 import {
   AuthenticationExpiredError, ConnectorFailureError, InvalidArgumentError, SOURCES,
-  UnsupportedOperationError, isSource,
-} from './index.js';
+  UnsupportedOperationError, isSource, defaultDbPath,
+} from './sdk-common.js';
+import { nativeCall } from './native.js';
 
 export interface RelayhistoryAuth {
   baseUrl: string;
   accessToken: string;
   refreshToken?: string;
-  /** Server-issued RFC 3339 expiry. Absent in sessions stored before it existed. */
   accessTokenExpiresAt?: string;
-  /**
-   * Locally cached org, for provenance only — never sent as an authorization
-   * selector. The native store records it; this SDK's own login does not.
-   */
+  /** Cached provenance; never an authorization selector. */
   orgId?: string;
+  workspaceId?: string;
+}
+export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
+export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
+/** Return a secret service token with at least 60 seconds of validity. Rust
+ * selects the stage, refreshes if needed and atomically saves rotated tokens. */
+export async function accessToken(options: { baseUrl?: string } = {}): Promise<string> {
+  return nativeCall((native) => native.accessToken(options.baseUrl));
 }
 
-export type LoginCloudResult =
-  | { ok: true; auth: RelayhistoryAuth }
-  | { ok: false; error: string };
+export interface ReplayOptions {
+  baseUrl?: string;
+  /** Page size, not a total cap; Rust fetches every page in server order. */
+  limit?: number;
+  maxContent?: number;
+  /** Return the raw event array serialized as JSON instead of readable text. */
+  json?: boolean;
+  /** Atomically save in Rust after all pages succeed; transcript is then null. */
+  out?: string;
+}
+export interface ReplayResult { eventCount: number; transcript: string | null; outputPath: string | null }
 
-function authPath(): string {
-  const configDir = process.env.AI_HIST_CONFIG_DIR ?? join(homedir(), '.config', 'ai-hist');
-  return join(configDir, 'auth.json');
+/** Fetch a cloud transcript without opening or importing into the local DB. */
+export async function replay(sessionId: string, options: ReplayOptions = {}): Promise<ReplayResult> {
+  for (const key of ['limit', 'maxContent'] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)) {
+      throw new InvalidArgumentError(`${key} must be an integer between 0 and 4294967295`, 'INVALID_ARGUMENT');
+    }
+  }
+  const result = await nativeCall((native) => native.replay(sessionId, options));
+  return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
 }
 
-async function saveRelayhistoryAuth(auth: RelayhistoryAuth): Promise<void> {
-  const p = authPath();
-  await mkdir(dirname(p), { recursive: true });
-  await writeFile(p, JSON.stringify(auth, null, 2), { mode: 0o600 });
+export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
+export interface EnableCloudOptions extends CloudOptions {
+  /** Keep syncing until stop() is called. Defaults to true. */
+  watch?: boolean;
+  intervalMs?: number;
+  onPush?: (result: CloudPushResult) => void;
+  onError?: (error: unknown) => void;
+}
+export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
+
+/** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
+export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
+  return nativeCall((native) => native.cloudLoadAuth(baseUrl));
 }
 
-export async function loadStoredRelayhistoryAuth(): Promise<RelayhistoryAuth | null> {
+export type CloudSessionResolution =
+  | {
+    auth: RelayhistoryAuth;
+    /** Marks a stored session eligible for native refresh after a 401. Omit for caller-managed auth. */
+    session?: true;
+  }
+  | { auth: null; detail: string };
+
+/** Read-only connector probe; stage selection and eligibility belong to Rust. */
+export async function resolveCloudSession(baseUrl?: string, now: number = Date.now()): Promise<CloudSessionResolution> {
+  const result = await nativeCall((native) => native.cloudResolveSession(baseUrl, now));
+  return result.auth
+    ? { auth: result.auth, session: true }
+    : { auth: null, detail: result.detail ?? 'no stored relayhistory session (run `ai-hist login`)' };
+}
+
+/** Rotate a rejected stored bearer under the native stage lock. */
+export async function refreshCloudSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth | null> {
+  return nativeCall((native) => native.cloudRefreshSession(baseUrl, rejectedToken));
+}
+
+/** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
+export async function validateCloudExchangeBaseUrl(baseUrl?: string): Promise<void> {
+  return nativeCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
+}
+
+export interface LoginOptions {
+  baseUrl?: string;
+  relayAccessToken?: string;
+  label?: string;
+}
+
+/** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
+export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
+  return nativeCall((native) => native.cloudLogin({
+    baseUrl: options.baseUrl,
+    relayAccessToken: options.relayAccessToken,
+    label: options.label,
+  }));
+}
+
+export async function loginCloud(relayAccessToken: string, options: { baseUrl?: string; label?: string } = {}): Promise<LoginCloudResult> {
   try {
-    const body = await readFile(authPath(), 'utf-8');
-    const parsed = JSON.parse(body) as Partial<RelayhistoryAuth>;
-    if (typeof parsed.accessToken !== 'string' || typeof parsed.baseUrl !== 'string') return null;
-    return parsed as RelayhistoryAuth;
-  } catch {
-    return null;
+    const auth = await login({ ...options, relayAccessToken });
+    return { ok: true, auth };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
-export async function loginCloud(
-  relayAccessToken: string,
-  opts: { baseUrl?: string; label?: string } = {}
-): Promise<LoginCloudResult> {
-  const baseUrl = opts.baseUrl ?? process.env.AI_HIST_BASE_URL ?? 'https://history.agentrelay.com';
-  const url = `${baseUrl.replace(/\/$/, '')}/v1/cli/login`;
+export async function pushCloud(options: CloudOptions = {}): Promise<CloudPushResult> {
+  return nativeCall((native) => native.pushCloud(options));
+}
 
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentRelayToken: relayAccessToken, label: opts.label }),
-      signal: AbortSignal.timeout(15_000),
-    });
-  } catch (err) {
-    return { ok: false, error: `Network error: ${err instanceof Error ? err.message : String(err)}` };
+/** Device login, service-token exchange and first push run in Rust. The optional
+ * loop is host orchestration only: no token, refresh, stage or cursor logic in JS.
+ * The loop remains in this process; await stop() before shutdown. */
+export async function enableCloud(options: EnableCloudOptions = {}): Promise<CloudHandle> {
+  const intervalMs = options.intervalMs ?? 60_000;
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 2_147_483_647) {
+    throw new InvalidArgumentError('intervalMs must be an integer between 1000 and 2147483647', 'INVALID_ARGUMENT');
   }
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    return { ok: false, error: `Login failed (HTTP ${resp.status}): ${text.slice(0, 200)}` };
-  }
-
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await resp.json()) as Record<string, unknown>;
-  } catch {
-    return { ok: false, error: 'Login response was not valid JSON' };
-  }
-
-  const accessToken = payload.accessToken;
-  const refreshToken = payload.refreshToken;
-  if (typeof accessToken !== 'string') {
-    return { ok: false, error: 'Login response missing accessToken' };
-  }
-
-  const auth: RelayhistoryAuth = {
-    baseUrl,
-    accessToken,
-    ...(typeof refreshToken === 'string' ? { refreshToken } : {}),
+  const first = await nativeCall((native) => native.enableCloud(options));
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: Promise<void> = Promise.resolve();
+  const schedule = () => {
+    if (stopped || options.watch === false) return;
+    timer = setTimeout(() => {
+      pending = (async () => {
+        try {
+          const result = await pushCloud({ dbPath: options.dbPath, baseUrl: first.baseUrl });
+          options.onPush?.(result);
+        } catch (error) {
+          if (options.onError) options.onError(error);
+          else process.stderr.write(`ai-hist cloud push failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        } finally { schedule(); }
+      })();
+    }, intervalMs);
   };
+  schedule();
+  return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
+}
 
-  try {
-    await saveRelayhistoryAuth(auth);
-  } catch (err) {
-    return {
-      ok: false,
-      error: `Failed to save auth: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
+export interface GitHookOptions { repo: string; sessionId: string; source?: string; dbPath?: string; prUrl?: string }
+/** Install a local post-commit recorder for an explicit session. prUrl identifies
+ * an existing GitHub PR; linkage is uploaded by the next cloud push. */
+export async function installGitHooks(options: GitHookOptions): Promise<{ hookPath: string; prUrl: string | null }> {
+  const result = await nativeCall((native) => native.installGitHooks(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() }), process.execPath, import.meta.url));
+  return JSON.parse(result) as { hookPath: string; prUrl: string | null };
+}
+export async function linkGitCommit(options: GitHookOptions): Promise<{ commitSha: string }> {
+  const commitSha = await nativeCall((native) => native.linkGitCommit(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() })));
+  return { commitSha };
+}
 
-  return { ok: true, auth };
+export type TraceVisibility = 'public' | 'private' | 'direct-link';
+export interface ShareableTrace { url: string; visibility: TraceVisibility; eventCount: number }
+/** Share the already-pushed, frozen server snapshot of a session. */
+export async function createShareableTrace(sessionId: string, options: { visibility: TraceVisibility; source?: string; baseUrl?: string }): Promise<ShareableTrace> {
+  return nativeCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +189,6 @@ const TENANCY_PARAMS: ReadonlySet<string> = new Set([
 
 const DEFAULT_CLOUD_BASE_URL = 'https://history.agentrelay.com';
 
-/** Where the stored RelayHistory session lives for this process. */
-function relayhistoryConfigDir(): string {
-  return process.env.AI_HIST_CONFIG_DIR ?? join(homedir(), '.config', 'ai-hist');
-}
-
 /**
  * A base URL reduced to the identity of its stage, so two spellings of one
  * stage compare equal. Mirrors `cloud::normalized_stage`.
@@ -150,245 +209,6 @@ function normalizeStage(baseUrl: string): string {
   }
   return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname}`
     .replace(/\/+$/, '');
-}
-
-/**
- * A base URL reduced to its stage identity, or `null` when it does not name
- * one. Mirrors `cloud::normalize_base_url`, which rejects a value with no
- * host, or carrying credentials, a query or a fragment — and, like it, treats
- * a rejected value as "no stage named" rather than as an error.
- */
-function parseStageUrl(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    return null;
-  }
-  if (!url.hostname || url.username || url.password || url.search || url.hash) return null;
-  return normalizeStage(trimmed);
-}
-
-/**
- * The stage this call names, or `undefined` for "whichever single stage is
- * stored".
- *
- * The engine reads `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL` and
- * ignores a value that does not parse, falling through to its single-stage
- * rule. Honouring only `AI_HIST_BASE_URL` would ignore the variable a
- * multi-stage CLI install already sets, and treating an empty or malformed one
- * as an explicit request would fail closed where the engine falls through.
- */
-function requestedStage(explicit: string | undefined): string | undefined {
-  if (explicit !== undefined) {
-    const named = parseStageUrl(explicit);
-    if (!named) {
-      // An explicit argument is the caller's own words, so a malformed one is a
-      // mistake to report, not an environment default to skip past.
-      throw new InvalidArgumentError(
-        `baseUrl '${explicit}' does not name a stage (expected an absolute URL with a host `
-          + 'and no credentials, query or fragment)',
-        'INVALID_ARGUMENT',
-      );
-    }
-    return named;
-  }
-  for (const key of ['RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL'] as const) {
-    const value = process.env[key];
-    if (value === undefined) continue;
-    const named = parseStageUrl(value);
-    if (named) return named;
-  }
-  return undefined;
-}
-
-/**
- * The store the native `ai-hist login` writes: `RELAYHISTORY_HOME`, else
- * `~/.agentworkforce/relayhistory`. Sessions live in `stages/<key>.auth.json`
- * with snake_case fields, plus a legacy single `auth.json` from before stages
- * existed.
- */
-function nativeCloudHome(): string {
-  const configured = process.env.RELAYHISTORY_HOME;
-  if (configured) return configured;
-  return join(homedir(), '.agentworkforce', 'relayhistory');
-}
-
-/** Reads one native store file, mapping its snake_case fields. Absent or malformed reads as none. */
-async function readNativeAuth(path: string): Promise<RelayhistoryAuth | null> {
-  let parsed: Record<string, unknown>;
-  try {
-    const raw = JSON.parse(await readFile(path, 'utf-8')) as unknown;
-    // `JSON.parse` succeeds on `null`, `[]` and scalars, so parsing is not
-    // enough to know the fields below can be read. Same guard `persistRotated`
-    // applies to this file, so both readers agree on what "malformed" means.
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-    parsed = raw as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const baseUrl = parsed.base_url ?? parsed.baseUrl;
-  const accessToken = parsed.access_token ?? parsed.accessToken;
-  if (typeof baseUrl !== 'string' || typeof accessToken !== 'string') return null;
-  const refreshToken = parsed.refresh_token ?? parsed.refreshToken;
-  const expiresAt = parsed.access_token_expires_at ?? parsed.accessTokenExpiresAt;
-  const orgId = parsed.org_id ?? parsed.orgId;
-  return {
-    baseUrl,
-    accessToken,
-    ...(typeof refreshToken === 'string' ? { refreshToken } : {}),
-    ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
-    ...(typeof orgId === 'string' ? { orgId } : {}),
-  };
-}
-
-/**
- * Every session the native store holds, newest layout first. Mirrors
- * `cloud::staged_auths` plus its legacy fallback: the stage directory is
- * enumerated and each file's own `base_url` identifies it, so this never has
- * to reproduce the engine's stage-key hash.
- */
-async function nativeStoredSessions(): Promise<StoredCandidate[]> {
-  const home = nativeCloudHome();
-  const found: StoredCandidate[] = [];
-  let entries: string[] = [];
-  try {
-    entries = (await readdir(join(home, 'stages'))).filter((name) => name.endsWith('.auth.json'));
-  } catch {
-    entries = [];
-  }
-  for (const entry of entries.sort()) {
-    const path = join(home, 'stages', entry);
-    const auth = await readNativeAuth(path);
-    if (auth) found.push({ auth, origin: 'native', path });
-  }
-  const legacyPath = join(home, 'auth.json');
-  const legacy = await readNativeAuth(legacyPath);
-  if (legacy
-    && !found.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(legacy.baseUrl))) {
-    found.push({ auth: legacy, origin: 'native', path: legacyPath });
-  }
-  return found;
-}
-
-/** Milliseconds of remaining validity below which a session is treated as spent. */
-const EXPIRY_FLOOR_MS = 60_000;
-
-/** Which store a candidate came from. The two carry different written contracts. */
-type StoreOrigin = 'native' | 'sdk';
-
-interface StoredCandidate {
-  auth: RelayhistoryAuth;
-  origin: StoreOrigin;
-  /** The file this session was read from, so a rotated pair replaces it in place. */
-  path: string;
-}
-
-/**
- * Why a stored session cannot serve a recall read, or `null` when it can.
- *
- * For native-store sessions this is `cloud::recall_auth`'s contract, whole: an
- * `rth_at_` access token, an expiry that is present, parseable and at least
- * {@link EXPIRY_FLOOR_MS} away, and a non-blank `org_id`. A session failing any
- * of those is one the engine's own connector already reports as unconfigured,
- * so answering a thread from it would claim a capability the rest of the
- * toolchain denies.
- *
- * The SDK store is held to the subset it can satisfy. {@link loginCloud} has
- * never persisted an expiry or an org, so requiring them there would not
- * enforce a contract — it would retire a login path that works. Teaching
- * `loginCloud` to store both, then holding one bar everywhere, is the follow-up.
- */
-function ineligibleReason(candidate: StoredCandidate, now: number): string | null {
-  const { auth, origin } = candidate;
-  if (!auth.accessToken.startsWith('rth_at_')) {
-    return 'the stored relayhistory session has no rth_at_ access token';
-  }
-  const stated = auth.accessTokenExpiresAt;
-  if (origin === 'native' || stated !== undefined) {
-    const expiry = stated === undefined ? Number.NaN : Date.parse(stated);
-    if (!Number.isFinite(expiry) || expiry < now + EXPIRY_FLOOR_MS) {
-      // Expiry is the one precondition rotation exists to repair, so a session
-      // that can still rotate is not unconfigured — it is stale, and the
-      // transport refreshes it. Without a refresh token there is nothing to
-      // rotate and it is unconfigured exactly as `recall_auth` says.
-      if (!auth.refreshToken?.trim()) {
-        return 'the stored relayhistory access-token expiry is missing, invalid, or less than 60s away';
-      }
-    }
-  }
-  if (origin === 'native' && !auth.orgId?.trim()) {
-    return 'the stored cloud session has no orgId for provenance';
-  }
-  return null;
-}
-
-/** Why no usable cloud session was found, phrased for {@link cloudUnconfiguredMessage}. */
-export type CloudSessionResolution =
-  | { auth: RelayhistoryAuth; session?: StoredCandidate }
-  | { auth: null; detail: string };
-
-/**
- * Resolve the cloud session a thread read should use.
- *
- * Both stores are consulted, native first: the Rust `ai-hist login` writes
- * `~/.agentworkforce/relayhistory/stages/*.auth.json`, while this SDK's own
- * {@link loginCloud} writes `~/.config/ai-hist/auth.json`. Reading only the
- * latter is what made the documented login flow look unconfigured.
- *
- * A caller that names a stage gets that stage or nothing. A caller that does
- * not, with more than one stage stored, gets a refusal rather than a guess —
- * the same rule as `cloud::load_auth`, and for the same reason: silently
- * picking a stage sends a token somewhere the caller did not ask for.
- */
-export async function resolveCloudSession(
-  requestedBaseUrl?: string,
-  now: number = Date.now(),
-): Promise<CloudSessionResolution> {
-  const candidates = await nativeStoredSessions();
-  const sdkStored = await loadStoredRelayhistoryAuth();
-  if (sdkStored
-    && !candidates.some((c) => normalizeStage(c.auth.baseUrl) === normalizeStage(sdkStored.baseUrl))) {
-    candidates.push({ auth: sdkStored, origin: 'sdk', path: authPath() });
-  }
-
-  const where = `${nativeCloudHome()} or ${relayhistoryConfigDir()}`;
-  if (candidates.length === 0) {
-    return { auth: null, detail: `${where}: no stored relayhistory session (run \`ai-hist login\`)` };
-  }
-
-  // Selection first, eligibility second — the engine's order, where `load_auth`
-  // picks the stage and `recall_auth` then judges the one it picked.
-  let selected: StoredCandidate;
-  if (requestedBaseUrl !== undefined) {
-    const wanted = normalizeStage(requestedBaseUrl);
-    const match = candidates.find((c) => normalizeStage(c.auth.baseUrl) === wanted);
-    if (!match) {
-      return {
-        auth: null,
-        detail: `${where}: no stored relayhistory session for ${wanted} `
-          + `(stored: ${candidates.map((c) => normalizeStage(c.auth.baseUrl)).join(', ')})`,
-      };
-    }
-    selected = match;
-  } else if (candidates.length > 1) {
-    return {
-      auth: null,
-      detail: `${where}: ${candidates.length} relayhistory stages are configured `
-        + `(${candidates.map((c) => normalizeStage(c.auth.baseUrl)).join(', ')}); `
-        + 'set AI_HIST_BASE_URL to select one. Refusing to guess, because a thread read '
-        + 'against the wrong stage answers about a different org',
-    };
-  } else {
-    selected = candidates[0]!;
-  }
-
-  const ineligible = ineligibleReason(selected, now);
-  return ineligible
-    ? { auth: null, detail: `${where}: ${ineligible} (run \`ai-hist login\`)` }
-    : { auth: selected.auth, session: selected };
 }
 
 /**
@@ -482,107 +302,19 @@ export interface SessionThreadOptions {
    * The connector-status resolver: a usable stored RelayHistory session means
    * the `cloud` connector is configured, and anything else carries the reason
    * it is not. Defaults to {@link resolveCloudSession}.
+   * Return `{ auth }` without `session: true` for caller-managed credentials or
+   * isolated mocks: a 401 then throws AuthenticationExpiredError without refresh.
    */
   resolveSession?: (requestedBaseUrl?: string) => Promise<CloudSessionResolution>;
-  /** HTTP transport. Defaults to the global `fetch`. */
+  /**
+   * Transport for thread GET requests and their retries. Defaults to global fetch.
+   * Does not handle authentication requests: stored-session refresh uses Rust's
+   * native HTTP client and can make a real network request after a 401, even when
+   * this function is a mock. Proxy and TLS settings here do not configure refresh.
+   * For isolated mocks, also provide resolveSession returning `{ auth }` without
+   * `session: true`, which disables automatic refresh.
+   */
   fetchImpl?: typeof fetch;
-}
-
-/**
- * Persist a rotated pair over the file it came from, in that store's own
- * schema, via temp-file + rename so a crash cannot leave a torn session.
- *
- * The rotated fields are merged **over the file's existing contents**, never
- * written in place of them. The native store records fields this SDK does not
- * model — `workspace_id` today, whatever the engine adds next — and the Rust
- * CLI reads the same file, so rewriting it whole would quietly delete that
- * state and degrade the CLI's session.
- */
-async function persistRotated(candidate: StoredCandidate, auth: RelayhistoryAuth): Promise<void> {
-  let existing: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(await readFile(candidate.path, 'utf-8')) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      existing = parsed as Record<string, unknown>;
-    }
-  } catch {
-    // Unreadable or malformed. Still write, with the fields this SDK knows:
-    // leaving a revoked refresh token on disk strands the next caller.
-  }
-  const rotated: Record<string, unknown> = candidate.origin === 'native'
-    ? {
-      base_url: existing.base_url ?? auth.baseUrl,
-      access_token: auth.accessToken,
-      access_token_expires_at: auth.accessTokenExpiresAt ?? null,
-      refresh_token: auth.refreshToken ?? null,
-      // Carried explicitly: when the existing file could not be read there is
-      // nothing to merge, and a native session without an org fails its own
-      // provenance precondition on the very next resolve.
-      org_id: existing.org_id ?? auth.orgId ?? null,
-    }
-    : {
-      baseUrl: existing.baseUrl ?? auth.baseUrl,
-      accessToken: auth.accessToken,
-      // Written as `undefined` when absent so `JSON.stringify` drops the key
-      // rather than preserving a superseded value from `existing`.
-      accessTokenExpiresAt: auth.accessTokenExpiresAt,
-      refreshToken: auth.refreshToken,
-    };
-  const tmp = `${candidate.path}.tmp.${process.pid}.${Date.now()}`;
-  await mkdir(dirname(candidate.path), { recursive: true });
-  await writeFile(tmp, JSON.stringify({ ...existing, ...rotated }, null, 2), { mode: 0o600 });
-  await rename(tmp, candidate.path);
-}
-
-/** Re-read this session's file, for the pair another process may have rotated. */
-async function rereadSession(candidate: StoredCandidate): Promise<RelayhistoryAuth | null> {
-  return candidate.origin === 'native'
-    ? readNativeAuth(candidate.path)
-    : loadStoredRelayhistoryAuth();
-}
-
-/**
- * Exchange the stored refresh token for a new pair. Mirrors
- * `cloud::refresh_auth`: `POST /v1/auth/token/refresh`, `accessToken` and
- * `refreshToken` required in the response, org and stage carried over.
- */
-async function refreshCloudSession(
-  auth: RelayhistoryAuth,
-  baseUrl: string,
-  doFetch: typeof fetch,
-): Promise<RelayhistoryAuth | null> {
-  const refreshToken = auth.refreshToken?.trim();
-  if (!refreshToken) return null;
-  let resp: Response;
-  try {
-    resp = await doFetch(`${baseUrl}/v1/auth/token/refresh`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      redirect: 'error',
-      body: JSON.stringify({ refreshToken }),
-      signal: AbortSignal.timeout(30_000),
-    });
-  } catch {
-    return null;
-  }
-  if (!resp.ok) return null;
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await resp.json()) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const accessToken = payload.accessToken;
-  const rotated = payload.refreshToken;
-  if (typeof accessToken !== 'string' || typeof rotated !== 'string') return null;
-  const expiresAt = payload.accessTokenExpiresAt;
-  return {
-    baseUrl: auth.baseUrl,
-    accessToken,
-    refreshToken: rotated,
-    ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
-    ...(auth.orgId ? { orgId: auth.orgId } : {}),
-  };
 }
 
 function requireSecureTransport(baseUrl: string): void {
@@ -648,7 +380,7 @@ export async function getSessionThread(
   // what `cloud::load_auth`'s `same_stage` check refuses. A stage no stored
   // session can serve is an unconfigured connector, not a request to attempt.
   const resolve = opts.resolveSession ?? resolveCloudSession;
-  const resolved = await resolve(requestedStage(opts.baseUrl));
+  const resolved = await resolve(opts.baseUrl);
   if (!resolved.auth) {
     throw new UnsupportedOperationError(
       cloudUnconfiguredMessage(THREAD_OPERATION, resolved.detail),
@@ -697,52 +429,11 @@ export async function getSessionThread(
 
   let resp = await send(auth.accessToken);
 
-  // Rotate an expired session at most once, in the order `send_with_auth_refresh`
-  // uses: prefer a pair another process already persisted, and only then spend
-  // the stored refresh token, which is one-time and revokes its predecessor.
-  //
-  // The engine serializes this per stage with an flock that Node cannot take
-  // here, so instead of preventing a concurrent double-spend this recovers from
-  // one: a refresh that loses the race re-reads and adopts the winner's pair.
-  // The flock-correct version belongs behind a napi export of the recall
-  // transport; see the PR discussion.
-  // Only 401 means "this token is spent". `cloud::is_unauthorized` matches the
-  // same single status, and the recall API answers 403 for a session that is
-  // authenticated but lacks `rth:read` — rotating on that would spend a
-  // one-time refresh token to fix a scope problem it cannot fix.
-  const rotatable = resolved.session;
-  if (resp.status === 401 && rotatable) {
-    const current = await rereadSession(rotatable);
-    if (current && current.accessToken !== auth.accessToken) {
-      resp = await send(current.accessToken);
-    } else {
-      const refreshed = await refreshCloudSession(auth, baseUrl, doFetch);
-      if (refreshed) {
-        // Persist before retrying, and never swallow the failure: the old
-        // refresh token is already revoked, so a store left holding it strands
-        // the next caller — and the `ai-hist` CLI reading the same file with
-        // it. Reporting a rotation that could not be saved is better than one
-        // silent success followed by an unexplained dead session.
-        try {
-          await persistRotated(rotatable, refreshed);
-        } catch (cause) {
-          throw new ConnectorFailureError(
-            `the relayhistory session rotated but could not be saved to ${rotatable.path}: `
-              + `${cause instanceof Error ? cause.message : String(cause)}. The previous refresh `
-              + 'token is now revoked; run `ai-hist login` to store a new session.',
-            'CONNECTOR_FAILURE',
-            { cause },
-          );
-        }
-        resp = await send(refreshed.accessToken);
-      } else {
-        // Lost the race, most likely. Whoever won has persisted a live pair.
-        const afterward = await rereadSession(rotatable);
-        if (afterward && afterward.accessToken !== auth.accessToken) {
-          resp = await send(afterward.accessToken);
-        }
-      }
-    }
+  // Only sessions resolved from the canonical store can spend a refresh token.
+  // Rust serializes rotation with the same stage lock used by native requests.
+  if (resp.status === 401 && resolved.session) {
+    const refreshed = await refreshCloudSession(auth.baseUrl, auth.accessToken);
+    if (refreshed) resp = await send(refreshed.accessToken);
   }
 
   if (resp.status === 401) {

@@ -1,7 +1,7 @@
 # Release and platform validation
 
 All public packages use one version: `ai-hist`, `ai-hist-native`, each native
-platform package, and `ai-hist-mcp`. The SDK checks native contract version 7
+platform package, and `ai-hist-mcp`. The SDK checks native contract version 11
 at initialization.
 
 The `Publish RelayHistory npm packages` workflow:

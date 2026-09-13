@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { InvalidArgumentError, UnsupportedOperationError } from './index.js';
 import {
@@ -330,22 +331,9 @@ async function writeStage(
   key: string,
   fields: Record<string, unknown>,
 ): Promise<void> {
-  await writeFile(join(nativeHome, 'stages', `${key}.auth.json`), JSON.stringify(fields), { mode: 0o600 });
-}
-
-/** Mirrors how `getSessionThread` derives its requested stage from the env. */
-function requestedStageForTest(): string | undefined {
-  for (const key of ['RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL'] as const) {
-    const value = process.env[key];
-    if (value === undefined) continue;
-    try {
-      const url = new URL(value.trim());
-      if (url.hostname && !url.username && !url.password && !url.search && !url.hash) {
-        return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}${url.pathname}`.replace(/\/+$/, '');
-      }
-    } catch { /* names no stage */ }
-  }
-  return undefined;
+  const stage = new URL(String(fields.base_url)).toString().replace(/\/+$/, '');
+  const hash = createHash('sha256').update(stage).digest('hex').slice(0, 16);
+  await writeFile(join(nativeHome, 'stages', `${hash}.auth.json`), JSON.stringify(fields), { mode: 0o600 });
 }
 
 const HOUR_AHEAD = new Date(Date.now() + 3_600_000).toISOString();
@@ -388,23 +376,17 @@ test('the native store is reached through getSessionThread, not just the resolve
   });
 });
 
-test('the SDK store still works when the native store is empty', async () => {
-  await withStores(async ({ sdkDir }) => {
-    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({
-      baseUrl: 'https://history.agentrelay.com',
-      accessToken: 'rth_at_sdk',
-    }), { mode: 0o600 });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth?.accessToken, 'rth_at_sdk');
-  });
-});
-
-test('an empty pair of stores is unconfigured and names both', async () => {
+test('obsolete SDK and native single-file credentials are ignored', async () => {
   await withStores(async ({ nativeHome, sdkDir }) => {
+    for (const dir of [nativeHome, sdkDir]) {
+      await writeFile(join(dir, 'auth.json'), JSON.stringify({
+        baseUrl: 'https://history.agentrelay.com', accessToken: 'rth_at_obsolete',
+        base_url: 'https://history.agentrelay.com', access_token: 'rth_at_obsolete', ...ELIGIBLE,
+      }));
+    }
     const resolved = await resolveCloudSession();
     assert.equal(resolved.auth, null);
-    assert.ok(resolved.auth === null && resolved.detail.includes(nativeHome));
-    assert.ok(resolved.auth === null && resolved.detail.includes(sdkDir));
+    assert.ok(resolved.auth === null && resolved.detail.includes('no stored relayhistory session'));
   });
 });
 
@@ -457,7 +439,7 @@ test('a native session missing any recall_auth precondition is unconfigured', as
     });
   }
 
-  // A token that is not an rth_at_ session is rejected in either store.
+  // A token that is not an rth_at_ session is rejected.
   await withStores(async ({ nativeHome }) => {
     await writeStage(nativeHome, 'stage', {
       base_url: 'https://history.agentrelay.com',
@@ -490,31 +472,7 @@ test('an ineligible native session performs no network call', async () => {
   });
 });
 
-test('the SDK store is held only to the contract it can satisfy', async () => {
-  // `loginCloud` has never written an expiry or an org. Requiring them here
-  // would retire a working login path rather than enforce anything.
-  await withStores(async ({ sdkDir }) => {
-    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({
-      baseUrl: 'https://history.agentrelay.com',
-      accessToken: 'rth_at_sdk',
-    }), { mode: 0o600 });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth?.accessToken, 'rth_at_sdk');
-  });
-
-  // A stated expiry is still honoured there when it is spent.
-  await withStores(async ({ sdkDir }) => {
-    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({
-      baseUrl: 'https://history.agentrelay.com',
-      accessToken: 'rth_at_sdk',
-      accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString(),
-    }), { mode: 0o600 });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth, null);
-  });
-});
-
-test('a malformed stage file is skipped rather than failing every read', async () => {
+test('a malformed canonical store reports an unconfigured connector without exposing credentials', async () => {
   await withStores(async ({ nativeHome }) => {
     // `JSON.parse` succeeds on all but the first of these, so parsing alone is
     // not enough — reading fields off `null` would throw an unclassified
@@ -531,7 +489,8 @@ test('a malformed stage file is skipped rather than failing every read', async (
       ...ELIGIBLE,
     });
     const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth?.accessToken, 'rth_at_good');
+    assert.equal(resolved.auth, null);
+    assert.ok(resolved.auth === null && resolved.detail.includes('could not parse stored'));
   });
 });
 
@@ -584,338 +543,4 @@ test('limit is sent when given and rejected when out of the route range', async 
     );
   }
   assert.equal(calls.length, 1, 'a rejected limit must not reach the transport');
-});
-
-// ---------------------------------------------------------------------------
-// Rotation.
-//
-// An MCP-only install — a WS-4 sandbox, say — has no human to run `ai-hist
-// login` and no Rust CLI rotating the store for it, so without this the tool
-// simply stops working at the token's ~24h boundary.
-// ---------------------------------------------------------------------------
-
-/** A fetch stand-in that answers the thread route by token and the refresh route by script. */
-function rotatingFetch(opts: {
-  accept: string[];
-  refresh?: { accessToken: string; refreshToken: string; expiresAt?: string } | 'reject';
-}) {
-  const calls: string[] = [];
-  const impl = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    if (url.includes('/v1/auth/token/refresh')) {
-      calls.push('refresh');
-      if (!opts.refresh || opts.refresh === 'reject') return new Response('no', { status: 401 });
-      return new Response(JSON.stringify({
-        accessToken: opts.refresh.accessToken,
-        refreshToken: opts.refresh.refreshToken,
-        accessTokenExpiresAt: opts.refresh.expiresAt ?? HOUR_AHEAD,
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-    const bearer = new Headers(init?.headers).get('authorization')?.replace('Bearer ', '') ?? '';
-    calls.push(`thread:${bearer}`);
-    return opts.accept.includes(bearer)
-      ? new Response(JSON.stringify(ENVELOPE), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      : new Response(JSON.stringify({ error: 'invalid_token' }), { status: 401 });
-  }) as unknown as typeof fetch;
-  return { impl, calls };
-}
-
-async function readStage(nativeHome: string, key = 'stage'): Promise<Record<string, unknown>> {
-  return JSON.parse(await readFile(join(nativeHome, 'stages', `${key}.auth.json`), 'utf8')) as Record<string, unknown>;
-}
-
-test('a rejected token is rotated once and the new pair is persisted', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    const { impl, calls } = rotatingFetch({
-      accept: ['rth_at_new'],
-      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
-    });
-    const thread = await getSessionThread(
-      { source: 'claude', sessionId: 'sid' }, { fetchImpl: impl },
-    );
-    assert.deepEqual(thread as unknown, ENVELOPE);
-    assert.deepEqual(calls, ['thread:rth_at_old', 'refresh', 'thread:rth_at_new']);
-
-    // Persisted in the native store's own schema, so the Rust CLI can read it.
-    const stored = await readStage(nativeHome);
-    assert.equal(stored.access_token, 'rth_at_new');
-    assert.equal(stored.refresh_token, 'rth_rt_new');
-    assert.equal(stored.org_id, 'org-example', 'the org survives rotation');
-    assert.equal(stored.base_url, 'https://history.agentrelay.com');
-  });
-});
-
-test('rotation preserves native-store fields this SDK does not model', async () => {
-  await withStores(async ({ nativeHome }) => {
-    // The Rust CLI reads this same file. Rewriting it whole would delete state
-    // the SDK has no type for — `workspace_id` today, whatever comes next.
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      workspace_id: 'workspace-example',
-      some_future_field: { nested: true },
-      ...ELIGIBLE,
-    });
-    const { impl } = rotatingFetch({
-      accept: ['rth_at_new'],
-      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
-    });
-    await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
-
-    const stored = await readStage(nativeHome);
-    assert.equal(stored.access_token, 'rth_at_new', 'the pair rotated');
-    assert.equal(stored.workspace_id, 'workspace-example', 'workspace survives rotation');
-    assert.deepEqual(stored.some_future_field, { nested: true }, 'unmodelled fields survive');
-    assert.equal(stored.org_id, 'org-example');
-  });
-});
-
-test('rotation replaces a superseded expiry rather than keeping the stale one', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    const later = new Date(Date.now() + 7_200_000).toISOString();
-    const { impl } = rotatingFetch({
-      accept: ['rth_at_new'],
-      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new', expiresAt: later },
-    });
-    await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
-    const stored = await readStage(nativeHome);
-    assert.equal(stored.access_token_expires_at, later, 'merging must not keep the old expiry');
-  });
-});
-
-test('a pair another process already rotated is adopted without spending the refresh token', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth?.accessToken, 'rth_at_old');
-
-    // Another process rotates between resolution and the retry.
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_theirs',
-      refresh_token: 'rth_rt_theirs',
-      ...ELIGIBLE,
-    });
-    const { impl, calls } = rotatingFetch({ accept: ['rth_at_theirs'] });
-    await getSessionThread(
-      { source: 'claude', sessionId: 'sid' },
-      { fetchImpl: impl, resolveSession: async () => resolved },
-    );
-    assert.deepEqual(calls, ['thread:rth_at_old', 'thread:rth_at_theirs']);
-    assert.equal(calls.includes('refresh'), false, 'a one-time refresh token must not be spent needlessly');
-  });
-});
-
-test('losing the rotation race recovers from the winner\'s persisted pair', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    const resolved = await resolveCloudSession();
-    // The refresh is rejected because a concurrent process spent the token
-    // first; that process then persists its own live pair.
-    const { impl, calls } = rotatingFetch({ accept: ['rth_at_winner'], refresh: 'reject' });
-    const wrapped = (async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input);
-      const out = await impl(input as never, init as never);
-      if (url.includes('/v1/auth/token/refresh')) {
-        await writeStage(nativeHome, 'stage', {
-          base_url: 'https://history.agentrelay.com',
-          access_token: 'rth_at_winner',
-          refresh_token: 'rth_rt_winner',
-          ...ELIGIBLE,
-        });
-      }
-      return out;
-    }) as unknown as typeof fetch;
-
-    const thread = await getSessionThread(
-      { source: 'claude', sessionId: 'sid' },
-      { fetchImpl: wrapped, resolveSession: async () => resolved },
-    );
-    assert.deepEqual(thread as unknown, ENVELOPE);
-    assert.deepEqual(calls, ['thread:rth_at_old', 'refresh', 'thread:rth_at_winner']);
-  });
-});
-
-test('a session with no refresh token still fails cleanly rather than looping', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      ...ELIGIBLE,
-    });
-    const { impl, calls } = rotatingFetch({ accept: [] });
-    await assert.rejects(
-      () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
-      (error: unknown) => (error as { code?: string }).code === 'AUTHENTICATION_EXPIRED',
-    );
-    assert.deepEqual(calls, ['thread:rth_at_old'], 'nothing to rotate, so no refresh attempt');
-  });
-});
-
-test('an expired session that can rotate is refreshed, not reported unconfigured', async () => {
-  await withStores(async ({ nativeHome }) => {
-    // Expiry is the one precondition rotation repairs. With a refresh token the
-    // session is stale, not unconfigured.
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_stale',
-      refresh_token: 'rth_rt_old',
-      access_token_expires_at: new Date(Date.now() - 1_000).toISOString(),
-      org_id: 'org-example',
-    });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth?.accessToken, 'rth_at_stale', 'still resolvable');
-
-    const { impl, calls } = rotatingFetch({
-      accept: ['rth_at_fresh'],
-      refresh: { accessToken: 'rth_at_fresh', refreshToken: 'rth_rt_fresh' },
-    });
-    const thread = await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
-    assert.deepEqual(thread as unknown, ENVELOPE);
-    assert.deepEqual(calls, ['thread:rth_at_stale', 'refresh', 'thread:rth_at_fresh']);
-  });
-
-  await withStores(async ({ nativeHome }) => {
-    // Expired with nothing to rotate is still unconfigured, as recall_auth says.
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_stale',
-      access_token_expires_at: new Date(Date.now() - 1_000).toISOString(),
-      org_id: 'org-example',
-    });
-    const resolved = await resolveCloudSession();
-    assert.equal(resolved.auth, null);
-    assert.ok(resolved.auth === null && resolved.detail.includes('expiry'));
-  });
-});
-
-test('the engine\'s documented stage variables are both honoured, in its order', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'prod', {
-      base_url: 'https://history.agentrelay.com', access_token: 'rth_at_prod', ...ELIGIBLE,
-    });
-    await writeStage(nativeHome, 'dev', {
-      base_url: 'http://127.0.0.1:8787', access_token: 'rth_at_dev', ...ELIGIBLE,
-    });
-    // A multi-stage CLI install already sets RELAYHISTORY_BASE_URL; ignoring it
-    // would answer from the wrong org or refuse outright.
-    process.env.RELAYHISTORY_BASE_URL = 'http://127.0.0.1:8787';
-    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_dev');
-
-    // RELAYHISTORY_BASE_URL wins, matching `cloud::default_base_url`'s order.
-    process.env.AI_HIST_BASE_URL = 'https://history.agentrelay.com';
-    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_dev');
-
-    // An unparseable value names no stage and falls through to the next one.
-    process.env.RELAYHISTORY_BASE_URL = 'not a url';
-    assert.equal((await resolveCloudSession(requestedStageForTest())).auth?.accessToken, 'rth_at_prod');
-
-    // Empty everywhere: back to the refusal to guess, not a failure to select.
-    process.env.RELAYHISTORY_BASE_URL = '';
-    delete process.env.AI_HIST_BASE_URL;
-    const ambiguous = await resolveCloudSession(requestedStageForTest());
-    assert.equal(ambiguous.auth, null);
-    assert.ok(ambiguous.auth === null && ambiguous.detail.includes('2 relayhistory stages'));
-  });
-});
-
-test('a forbidden response is not an expired session and does not spend the refresh token', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_ok',
-      refresh_token: 'rth_rt_ok',
-      ...ELIGIBLE,
-    });
-    const calls: string[] = [];
-    const impl = (async (input: string | URL | Request) => {
-      calls.push(String(input).includes('/token/refresh') ? 'refresh' : 'thread');
-      return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
-    }) as unknown as typeof fetch;
-    await assert.rejects(
-      () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
-      (error: unknown) => (error as { code?: string }).code === 'CONNECTOR_FAILURE'
-        && String((error as Error).message).includes('rth:read'),
-    );
-    assert.deepEqual(calls, ['thread'], 'a one-time refresh token must not be spent on a scope error');
-  });
-});
-
-test('a rotation that cannot be saved is reported, not silently succeeded', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    // Make the stage directory unwritable so the atomic replace fails after the
-    // refresh token has already been spent.
-    const { impl } = rotatingFetch({
-      accept: ['rth_at_new'],
-      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
-    });
-    await chmod(join(nativeHome, 'stages'), 0o500);
-    try {
-      await assert.rejects(
-        () => getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl }),
-        (error: unknown) => (error as { code?: string }).code === 'CONNECTOR_FAILURE'
-          && String((error as Error).message).includes('rotated but could not be saved')
-          && String((error as Error).message).includes('now revoked'),
-      );
-    } finally {
-      await chmod(join(nativeHome, 'stages'), 0o700);
-    }
-  });
-});
-
-test('a rotation onto an unreadable session file keeps the org', async () => {
-  await withStores(async ({ nativeHome }) => {
-    await writeStage(nativeHome, 'stage', {
-      base_url: 'https://history.agentrelay.com',
-      access_token: 'rth_at_old',
-      refresh_token: 'rth_rt_old',
-      ...ELIGIBLE,
-    });
-    const resolved = await resolveCloudSession();
-    // The file turns to garbage between resolution and rotation. The overlay is
-    // all that will be left, so it has to carry the org or the next resolve
-    // reports the connector unconfigured despite a fresh token on disk.
-    await writeFile(join(nativeHome, 'stages', 'stage.auth.json'), 'not json', { mode: 0o600 });
-    const { impl } = rotatingFetch({
-      accept: ['rth_at_new'],
-      refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new' },
-    });
-    await getSessionThread(
-      { source: 'claude', sessionId: 'sid' },
-      { fetchImpl: impl, resolveSession: async () => resolved },
-    );
-    const stored = await readStage(nativeHome);
-    assert.equal(stored.access_token, 'rth_at_new');
-    assert.equal(stored.org_id, 'org-example', 'the org survives a fallback write');
-    assert.equal((await resolveCloudSession()).auth?.accessToken, 'rth_at_new', 'still resolvable');
-  });
 });

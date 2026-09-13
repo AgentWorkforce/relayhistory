@@ -3,78 +3,35 @@
  *
  * Every production operation crosses one mandatory Node-API boundary into the
  * Rust engine. This module owns only input defaults, object normalization,
- * pagination ergonomics, and stable JavaScript errors.
+ * pagination ergonomics, and re-exports of the shared SDK and cloud APIs.
  */
 
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { nativeCall } from './native.js';
+import { loadStoredRelayhistoryAuth } from './cloud-client.js';
+import {
+  SESSION_CATALOG_CONTRACT_VERSION,
+  SESSION_HYDRATION_CONTRACT_VERSION,
+  SESSION_RELATIONSHIP_CONTRACT_VERSION,
+  SESSION_EVIDENCE_CONTRACT_VERSION,
+  SOURCES,
+  Source,
+  CatalogSource,
+  CATALOG_SOURCES,
+  isCatalogSource,
+  SessionScope,
+  SessionLocation,
+  RelayHistoryError,
+  NativeContractMismatchError,
+  InvalidArgumentError,
+  SessionSourceUnavailableError,
+  SessionSourceMismatchError,
+  HydrationUnsupportedError,
+  HydrationFailedError,
+} from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 10;
-export const SESSION_CATALOG_CONTRACT_VERSION = 3;
-export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
-export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
-export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
-
-/**
- * The provider ids this build knows, as a value. `Source` is derived from it
- * so the runtime checks below and the compile-time type cannot drift apart,
- * and it is the same list the MCP server's `SOURCE` enum publishes.
- */
-export const SOURCES = Object.freeze([
-  'claude',
-  'codex',
-  'cursor',
-  'grok',
-  'relay',
-  'trajectory',
-  'opencode',
-] as const);
-
-export type Source = (typeof SOURCES)[number];
-export type CatalogSource = Exclude<Source, 'trajectory'>;
-export const CATALOG_SOURCES: readonly CatalogSource[] = Object.freeze(
-  SOURCES.filter((source): source is CatalogSource => source !== 'trajectory'),
-);
-
-const SOURCE_SET: ReadonlySet<string> = new Set(SOURCES);
-const CATALOG_SOURCE_SET: ReadonlySet<string> = new Set(CATALOG_SOURCES);
-
-/** Return whether an unknown value is a source recognized by this SDK build. */
-export function isSource(value: unknown): value is Source {
-  return typeof value === 'string' && SOURCE_SET.has(value);
-}
-
-/** Return whether an unknown value can identify a session catalog entry. */
-export function isCatalogSource(value: unknown): value is CatalogSource {
-  return typeof value === 'string' && CATALOG_SOURCE_SET.has(value);
-}
-
-export type SessionScope = 'local' | 'remote' | 'all';
-export type SessionLocation = Exclude<SessionScope, 'all'>;
-
-export class RelayHistoryError extends Error {
-  constructor(message: string, readonly code: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = new.target.name;
-  }
-}
-
-export class UnsupportedPlatformError extends RelayHistoryError {}
-export class NativePackageMissingError extends RelayHistoryError {}
-export class NativeLoadError extends RelayHistoryError {}
-export class NativeContractMismatchError extends RelayHistoryError {}
-export class DatabaseOpenError extends RelayHistoryError {}
-export class InvalidArgumentError extends RelayHistoryError {}
-export class UnsupportedOperationError extends RelayHistoryError {}
-export class SessionNotFoundError extends RelayHistoryError {}
-export class SessionSourceUnavailableError extends RelayHistoryError {}
-export class SessionSourceMismatchError extends RelayHistoryError {}
-export class HydrationUnsupportedError extends RelayHistoryError {}
-export class HydrationFailedError extends RelayHistoryError {}
-export class ConnectorNotConfiguredError extends RelayHistoryError {}
-export class AuthenticationExpiredError extends RelayHistoryError {}
-export class EvidencePartialError extends RelayHistoryError {}
-export class ConnectorFailureError extends RelayHistoryError {}
+export * from './sdk-common.js';
+export { NATIVE_CONTRACT_VERSION, runtimePlatform, validateNativeContract } from './native.js';
+export * from './cloud-client.js';
 
 export interface HistoryEntry {
   id: number;
@@ -492,170 +449,11 @@ export interface SyncResult { databasePath: string; scope: SessionScope; complet
 
 type UnknownRecord = Record<string, unknown>;
 
-interface NativeBinding {
-  accessToken(baseUrl?: string): Promise<string>;
-  replay(sessionId: string, options: ReplayOptions): Promise<ReplayResult>;
-  createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;
-  installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
-  linkGitCommit(optionsJson: string): Promise<string>;
-  cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
-  cloudValidateExchangeBaseUrl(baseUrl?: string): Promise<void>;
-  cloudLogin(options: object): Promise<RelayhistoryAuth>;
-  enableCloud(options: object): Promise<CloudPushResult>;
-  pushCloud(options: object): Promise<CloudPushResult>;
-  nativeContractVersion(): number;
-  nativeBuildProfile?(): string;
-  search(query: string, options?: object): Promise<UnknownRecord[]>;
-  recent(options?: object): Promise<UnknownRecord[]>;
-  getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
-  getSessionEventsPage(sessionId: string, options?: object): Promise<UnknownRecord>;
-  getSessionToolCallsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;
-  getSessionFileEditsPage(source: string, sessionId: string, options?: object): Promise<UnknownRecord>;
-  stats(options?: object): Promise<UnknownRecord>;
-  listSessionCatalog(options?: object): Promise<UnknownRecord[]>;
-  listSessionCatalogPage(options?: object): Promise<UnknownRecord>;
-  discoverSessions(options?: object): Promise<UnknownRecord>;
-  hydrateSession(options: object): Promise<UnknownRecord>;
-  getSessionRelationships(options: object): Promise<UnknownRecord>;
-  getSessionTree(options: object): Promise<UnknownRecord>;
-  getSessionChildrenPage(options: object): Promise<UnknownRecord>;
-  sync(options?: object): Promise<UnknownRecord>;
-}
-
 const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
 const DEFAULT_TREE_MAX_DEPTH = 32;
 const MAX_TREE_MAX_DEPTH = 64;
 const DEFAULT_TREE_MAX_NODES = 1_000;
 const MAX_TREE_MAX_NODES = 10_000;
-
-const SUPPORTED_PLATFORMS = new Set([
-  'darwin-arm64', 'darwin-x64',
-  'linux-arm64-gnu', 'linux-arm64-musl',
-  'linux-x64-gnu', 'linux-x64-musl',
-  'win32-x64-msvc',
-]);
-
-function linuxLibc(): 'gnu' | 'musl' {
-  const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined;
-  return report?.header?.glibcVersionRuntime ? 'gnu' : 'musl';
-}
-
-export function runtimePlatform(): string {
-  if (process.platform === 'linux') return `linux-${process.arch}-${linuxLibc()}`;
-  if (process.platform === 'win32') return `win32-${process.arch}-msvc`;
-  return `${process.platform}-${process.arch}`;
-}
-
-let nativePromise: Promise<NativeBinding> | null = null;
-
-export function validateNativeContract(actual: number): void {
-  if (actual !== NATIVE_CONTRACT_VERSION) {
-    throw new NativeContractMismatchError(
-      `ai-hist requires native contract ${NATIVE_CONTRACT_VERSION}, but ai-hist-native provides ${actual}. Reinstall matching versions.`,
-      'NATIVE_CONTRACT_MISMATCH',
-    );
-  }
-}
-
-async function loadNative(): Promise<NativeBinding> {
-  if (nativePromise) return nativePromise;
-  nativePromise = (async () => {
-    const platform = runtimePlatform();
-    if (!SUPPORTED_PLATFORMS.has(platform)) {
-      throw new UnsupportedPlatformError(
-        `RelayHistory has no native build for ${platform}. Supported platforms: ${[...SUPPORTED_PLATFORMS].join(', ')}.`,
-        'UNSUPPORTED_PLATFORM',
-      );
-    }
-    let loaded: unknown;
-    try {
-      // Kept as a variable so TypeScript does not require native build-time
-      // declarations; npm installs this mandatory production dependency.
-      const packageName = 'ai-hist-native';
-      loaded = await import(packageName);
-    } catch (cause) {
-      const error = cause as NodeJS.ErrnoException;
-      if (error.code === 'ERR_MODULE_NOT_FOUND' || error.code === 'MODULE_NOT_FOUND') {
-        throw new NativePackageMissingError(
-          `RelayHistory supports ${platform}, but its native package is missing. Reinstall ai-hist with optional dependencies enabled.`,
-          'NATIVE_PACKAGE_MISSING',
-          { cause },
-        );
-      }
-      throw new NativeLoadError(
-        `RelayHistory's native package for ${platform} failed to load: ${error.message}`,
-        'NATIVE_LOAD_FAILED',
-        { cause },
-      );
-    }
-    const binding = ((loaded as { default?: unknown }).default ?? loaded) as NativeBinding;
-    if (typeof binding.nativeContractVersion !== 'function') {
-      throw new NativeContractMismatchError(
-        'The installed ai-hist-native package does not expose a contract version. Reinstall matching ai-hist packages.',
-        'NATIVE_CONTRACT_MISMATCH',
-      );
-    }
-    validateNativeContract(binding.nativeContractVersion());
-    return binding;
-  })();
-  return nativePromise.catch((error) => {
-    nativePromise = null;
-    throw error;
-  });
-}
-
-function nativeMessage(error: unknown): { code: string; message: string } | null {
-  const message = error instanceof Error ? error.message : String(error);
-  const match = message.match(/RELAYHISTORY_NATIVE::([A-Z_]+)::([\s\S]*)/);
-  return match ? { code: match[1], message: match[2] } : null;
-}
-
-async function nativeCall<T>(call: (binding: NativeBinding) => Promise<T>): Promise<T> {
-  try {
-    return await call(await loadNative());
-  } catch (error) {
-    if (error instanceof RelayHistoryError) throw error;
-    const native = nativeMessage(error);
-    if (!native) throw new NativeLoadError(String(error), 'NATIVE_CALL_FAILED', { cause: error });
-    if (native.code === 'DATABASE_OPEN_FAILED') {
-      throw new DatabaseOpenError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'INVALID_ARGUMENT') {
-      throw new InvalidArgumentError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'UNSUPPORTED_OPERATION') {
-      throw new UnsupportedOperationError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'SESSION_NOT_FOUND') {
-      throw new SessionNotFoundError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'SESSION_SOURCE_UNAVAILABLE') {
-      throw new SessionSourceUnavailableError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'SESSION_SOURCE_MISMATCH') {
-      throw new SessionSourceMismatchError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'HYDRATION_UNSUPPORTED') {
-      throw new HydrationUnsupportedError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'HYDRATION_FAILED') {
-      throw new HydrationFailedError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'CONNECTOR_NOT_CONFIGURED') {
-      throw new ConnectorNotConfiguredError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'AUTHENTICATION_EXPIRED') {
-      throw new AuthenticationExpiredError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'EVIDENCE_PARTIAL') {
-      throw new EvidencePartialError(native.message, native.code, { cause: error });
-    }
-    if (native.code === 'CONNECTOR_FAILURE') {
-      throw new ConnectorFailureError(native.message, native.code, { cause: error });
-    }
-    throw new RelayHistoryError(native.message, native.code, { cause: error });
-  }
-}
 
 function nullableString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
@@ -975,13 +773,6 @@ function evidenceIdentity(source: unknown, sessionId: unknown, operation: string
   }
 }
 
-export function defaultDbPath(): string {
-  if (process.env.AI_HIST_DB !== undefined) return process.env.AI_HIST_DB;
-  if (process.env.XDG_DATA_HOME !== undefined) {
-    return join(process.env.XDG_DATA_HOME, 'ai-hist', 'ai-history.db');
-  }
-  return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
-}
 
 /**
  * Optimization profile of the loaded native addon: 'release', 'debug', or
@@ -1583,54 +1374,6 @@ function shellQuote(value: string): string {
   return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-export interface RelayhistoryAuth { baseUrl: string; accessToken: string; refreshToken?: string }
-export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
-export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
-/** Return a secret service token with at least 60 seconds of validity. Rust
- * selects the stage, refreshes if needed and atomically saves rotated tokens. */
-export async function accessToken(options: { baseUrl?: string } = {}): Promise<string> {
-  return nativeCall((native) => native.accessToken(options.baseUrl));
-}
-
-export interface ReplayOptions {
-  baseUrl?: string;
-  /** Page size, not a total cap; Rust fetches every page in server order. */
-  limit?: number;
-  maxContent?: number;
-  /** Return the raw event array serialized as JSON instead of readable text. */
-  json?: boolean;
-  /** Atomically save in Rust after all pages succeed; transcript is then null. */
-  out?: string;
-}
-export interface ReplayResult { eventCount: number; transcript: string | null; outputPath: string | null }
-
-/** Fetch a cloud transcript without opening or importing into the local DB. */
-export async function replay(sessionId: string, options: ReplayOptions = {}): Promise<ReplayResult> {
-  for (const key of ['limit', 'maxContent'] as const) {
-    const value = options[key];
-    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff)) {
-      throw new InvalidArgumentError(`${key} must be an integer between 0 and 4294967295`, 'INVALID_ARGUMENT');
-    }
-  }
-  const result = await nativeCall((native) => native.replay(sessionId, options));
-  return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
-}
-
-export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
-export interface EnableCloudOptions extends CloudOptions {
-  /** Keep syncing until stop() is called. Defaults to true. */
-  watch?: boolean;
-  intervalMs?: number;
-  onPush?: (result: CloudPushResult) => void;
-  onError?: (error: unknown) => void;
-}
-export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
-
-/** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
-export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
-  return nativeCall((native) => native.cloudLoadAuth(baseUrl));
-}
-
 /** Cache-only remote stats guard (#126). Connector acquisition uses native checks. */
 async function ensureRemoteAuthentication(scope: SessionScope): Promise<void> {
   if (scope !== 'remote') return;
@@ -1652,86 +1395,4 @@ async function resolveRemoteScope(scope: SessionScope): Promise<SessionScope> {
   if (scope !== 'all') return scope;
   const auth = await loadStoredRelayhistoryAuth();
   return auth ? 'all' : 'local';
-}
-
-/** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
-export async function validateCloudExchangeBaseUrl(baseUrl?: string): Promise<void> {
-  return nativeCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
-}
-
-export interface LoginOptions {
-  baseUrl?: string;
-  relayAccessToken?: string;
-  label?: string;
-}
-
-/** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
-export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
-  return nativeCall((native) => native.cloudLogin({
-    baseUrl: options.baseUrl,
-    relayAccessToken: options.relayAccessToken,
-    label: options.label,
-  }));
-}
-
-export async function loginCloud(relayAccessToken: string, options: { baseUrl?: string; label?: string } = {}): Promise<LoginCloudResult> {
-  try {
-    const auth = await login({ ...options, relayAccessToken });
-    return { ok: true, auth };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-export async function pushCloud(options: CloudOptions = {}): Promise<CloudPushResult> {
-  return nativeCall((native) => native.pushCloud(options));
-}
-
-/** Device login, service-token exchange and first push run in Rust. The optional
- * loop is host orchestration only: no token, refresh, stage or cursor logic in JS.
- * The loop remains in this process; await stop() before shutdown. */
-export async function enableCloud(options: EnableCloudOptions = {}): Promise<CloudHandle> {
-  const intervalMs = options.intervalMs ?? 60_000;
-  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 2_147_483_647) {
-    throw new InvalidArgumentError('intervalMs must be an integer between 1000 and 2147483647', 'INVALID_ARGUMENT');
-  }
-  const first = await nativeCall((native) => native.enableCloud(options));
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let pending: Promise<void> = Promise.resolve();
-  const schedule = () => {
-    if (stopped || options.watch === false) return;
-    timer = setTimeout(() => {
-      pending = (async () => {
-        try {
-          const result = await pushCloud({ dbPath: options.dbPath, baseUrl: first.baseUrl });
-          options.onPush?.(result);
-        } catch (error) {
-          if (options.onError) options.onError(error);
-          else process.stderr.write(`ai-hist cloud push failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        } finally { schedule(); }
-      })();
-    }, intervalMs);
-  };
-  schedule();
-  return { ...first, async stop() { stopped = true; clearTimeout(timer); await pending; } };
-}
-
-export interface GitHookOptions { repo: string; sessionId: string; source?: string; dbPath?: string; prUrl?: string }
-/** Install a local post-commit recorder for an explicit session. prUrl identifies
- * an existing GitHub PR; linkage is uploaded by the next cloud push. */
-export async function installGitHooks(options: GitHookOptions): Promise<{ hookPath: string; prUrl: string | null }> {
-  const result = await nativeCall((native) => native.installGitHooks(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() }), process.execPath, import.meta.url));
-  return JSON.parse(result) as { hookPath: string; prUrl: string | null };
-}
-export async function linkGitCommit(options: GitHookOptions): Promise<{ commitSha: string }> {
-  const commitSha = await nativeCall((native) => native.linkGitCommit(JSON.stringify({ ...options, dbPath: options.dbPath ?? defaultDbPath() })));
-  return { commitSha };
-}
-
-export type TraceVisibility = 'public' | 'private' | 'direct-link';
-export interface ShareableTrace { url: string; visibility: TraceVisibility; eventCount: number }
-/** Share the already-pushed, frozen server snapshot of a session. */
-export async function createShareableTrace(sessionId: string, options: { visibility: TraceVisibility; source?: string; baseUrl?: string }): Promise<ShareableTrace> {
-  return nativeCall(async (native) => JSON.parse(await native.createShareableTrace(sessionId, options.visibility, options.source, options.baseUrl)) as ShareableTrace);
 }

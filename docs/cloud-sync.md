@@ -1,14 +1,18 @@
-# Cloud sync (legacy)
+# Cloud sync
 
-The standalone cloud-sync workflow documented before RelayHistory 1.0 has
-been retired. The npm CLI does not provide `login`, `admin-mint`, `push`, or
-service-installation commands, and the old curl installer no longer exists.
+Run `ai-hist enable-cloud` to authenticate, sync local history, and keep pushing
+while the command runs. Use `--once` to drain and exit:
 
-Do not use pre-1.0 setup snippets copied from older releases. Local history is
-available through the native-backed SDK, CLI, and MCP server documented in
-[Getting started](getting-started.md). Run `ai-hist sync` for explicit local
-full ingestion or `ai-hist sessions discover` for shallow catalog discovery.
+```sh
+ai-hist enable-cloud --once
+```
 
-Agent Relay's in-process capture integration is an internal host API, not a
-replacement public cloud-sync command. A future public cloud workflow should
-be documented here only when it ships as a supported native-backed surface.
+The npm CLI uses the async TypeScript SDK backed by the Rust engine. The Rust
+cloud layer manages RelayHistory credentials, stage selection, token rotation,
+and sync cursors. The SDK's `enableCloud()` runs the same workflow; `pushCloud()`
+pushes using a stored session.
+
+See [Cloud setup](enable-cloud.md) for login, stage selection, Git hooks, and
+sharing, and the [SDK guide](../sdk-ts/README.md#cloud-token-and-replay) for token
+export and transcript replay. [Remote connectors](remote-connectors.md) explains
+how cloud sessions are discovered into the local session ledger.

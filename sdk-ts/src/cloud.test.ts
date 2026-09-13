@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createShareableTrace, enableCloud, installGitHooks, loadStoredRelayhistoryAuth, pushCloud, sync } from './index.js';
+import { createShareableTrace, enableCloud, installGitHooks, loadStoredRelayhistoryAuth, pushCloud, sync, login } from './index.js';
 
 async function run(bin: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
   const child = spawn(bin, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -30,7 +30,7 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     let body = ''; for await (const chunk of req) body += chunk;
     const data = body ? JSON.parse(body) : {};
     res.setHeader('Content-Type', 'application/json');
-    if (req.url === '/v1/cli/login') {
+    if (req.url?.endsWith('/v1/cli/login')) {
       assert.equal(data.mode, 'sync');
       res.end(JSON.stringify({ accessToken: 'rth_at_first', refreshToken: 'rth_rt_first' }));
     } else if (req.url === '/v1/auth/token/refresh') {
@@ -123,9 +123,8 @@ test('npm command: fresh auth to 525-record push, refresh, stage isolation, SDK 
     const cursorFile = files.find((file) => file.endsWith('.cursor.json'))!;
     const before = await readFile(join(root, 'auth', 'stages', cursorFile), 'utf8');
     const failingBase = `${baseUrl}/second-stage`;
-    // Seed a second stage through the legacy SDK migration; it must not borrow stage one's cursor.
-    await writeFile(join(process.env.AI_HIST_CONFIG_DIR!, 'auth.json'), JSON.stringify({ baseUrl: failingBase, accessToken: acceptToken }));
-    await loadStoredRelayhistoryAuth(failingBase);
+    // Log into a second stage; it must not borrow stage one's cursor.
+    await login({ baseUrl: failingBase, relayAccessToken: 'fixture-cloud-token' });
     await assert.rejects(loadStoredRelayhistoryAuth(), /Refusing to guess/);
     rejectIngest = true;
     // Change the fixture server to reject any ingest path for the second destination.

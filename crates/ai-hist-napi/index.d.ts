@@ -454,6 +454,9 @@ export interface CloudAuth {
   baseUrl: string
   accessToken: string
   refreshToken?: string
+  accessTokenExpiresAt?: string
+  orgId?: string
+  workspaceId?: string
 }
 export interface CloudPushResult {
   baseUrl: string
@@ -462,6 +465,12 @@ export interface CloudPushResult {
   syncSkipped: boolean
 }
 export declare function cloudLoadAuth(baseUrl?: string | undefined | null): Promise<CloudAuth | null>
+export interface CloudSessionResolution {
+  auth?: CloudAuth
+  detail?: string
+}
+export declare function cloudResolveSession(baseUrl: string | undefined | null, now: number): Promise<CloudSessionResolution>
+export declare function cloudRefreshSession(baseUrl: string, rejectedToken: string): Promise<CloudAuth | null>
 export declare function cloudValidateExchangeBaseUrl(baseUrl?: string | undefined | null): Promise<void>
 export declare function cloudLogin(options?: CloudOptions | undefined | null): Promise<CloudAuth>
 export declare function enableCloud(options?: CloudOptions | undefined | null): Promise<CloudPushResult>

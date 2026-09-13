@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- Advance the native-addon contract to 7 and the session-catalog contract to
-  3. Discovery counters add `providerQueries` and `recordsInspected`; OpenCode
-  no longer reports its database file size as `bytesRead`. The native contract
-  also includes the delegation topology additions below.
+- Require native-addon contract 11 and session-catalog contract 3. Cloud auth
+  results include expiry, org, and workspace metadata; thread reads use native
+  stage selection and locked token rotation. Discovery counters include
+  `providerQueries` and `recordsInspected`, and OpenCode discovery measures
+  `bytesRead` from inspected records.
 - Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
   async native-backed functions.
 - Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
@@ -36,16 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET /v1/sessions/:sessionId/thread`. Takes `source`, `session_id`, and
   optional `kinds`, `since`, `cursor` and `limit` (1..500); returns the recall
   envelope unchanged. The MCP server now registers 14 tools.
-- Resolve cloud credentials from the native `ai-hist login` store
-  (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory/stages/*.auth.json`)
-  in addition to this SDK's `~/.config/ai-hist/auth.json`, holding native
-  sessions to the same preconditions the `cloud` connector applies to recall.
-  An expired session with a refresh token is rotated once and the new pair
-  merged over the file it came from, so the CLI and the MCP stay in step.
-  Stage selection honours `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL`,
-  ignoring a value that names no stage, as the engine does.
-  `SessionThreadOptions.resolveSession` overrides that resolution for tests; no
-  other credential hook is exposed, and none was released.
+- Resolve cloud credentials exclusively through the Rust stage store. Session
+  thread reads use the same credential eligibility checks and locked, atomic
+  rotation as native cloud operations. Stage selection honours
+  `RELAYHISTORY_BASE_URL` before `AI_HIST_BASE_URL` and rejects malformed values.
+  `SessionThreadOptions.resolveSession` can override resolution for tests.
 - Export immutable `SOURCES` and derived `CATALOG_SOURCES` runtime registries alongside
   `isSource()` and `isCatalogSource()` guards, so consumers can validate source
   input without duplicating the SDK's provider registry.
