@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io::Read, time::Duration};
 pub const MAPPING_VERSION: &str = "relayhistory-delivery-v1";
 pub const MAX_BODY_BYTES: usize = 2_097_152;
+pub const MAX_BATCH_RECORDS: usize = 100;
 const MAX_RESPONSE_BYTES: u64 = 8_388_608;
 
 #[derive(Debug)]
@@ -93,7 +94,7 @@ fn validate(batch: &HistoryExportBatch) -> Result<()> {
         batch.schema_version == 1
             && batch.account_id.starts_with("relayhistory:")
             && !batch.records.is_empty()
-            && batch.records.len() <= 1000,
+            && batch.records.len() <= MAX_BATCH_RECORDS,
         DeliveryFailure::InvalidPayload,
     )?;
     let mut ids = HashSet::new();

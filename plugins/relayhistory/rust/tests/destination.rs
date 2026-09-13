@@ -248,3 +248,23 @@ fn default_size_payload_survives_helper_json_escaping() {
     assert!(prepared.body.len() > 900_000);
     assert!(prepared.body.len() < 1_048_576);
 }
+
+#[test]
+fn preparation_matches_server_record_limit_before_persisting_invalid_payload() {
+    let mut batch = batch();
+    let template = batch.records[0].clone();
+    batch.records = (0..100)
+        .map(|index| {
+            let mut record = template.clone();
+            record.record_id = format!("record-{index}");
+            record.revision_id = format!("revision-{index}");
+            record
+        })
+        .collect();
+    assert!(prepare(batch.clone()).is_ok());
+    let mut extra = template;
+    extra.record_id = "record-100".into();
+    extra.revision_id = "revision-100".into();
+    batch.records.push(extra);
+    assert!(prepare(batch).is_err());
+}
