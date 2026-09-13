@@ -451,7 +451,7 @@ struct SyncSourceReport {
 
 struct SyncSourceFailure {
     source: String,
-    error: String,
+    error: anyhow::Error,
     is_contention: bool,
     contention_path: Option<PathBuf>,
 }
@@ -466,16 +466,16 @@ impl SyncSourceReport {
             Err(error) => {
                 self.failures.push(SyncSourceFailure {
                     source: source.to_string(),
-                    error: format!("{error:#}"),
                     is_contention: is_sqlite_contention(&error),
                     contention_path: source_database_path(&error).map(Path::to_path_buf),
+                    error,
                 });
                 None
             }
         }
     }
 
-    fn finish(&self, db_path: &Path) -> Result<()> {
+    fn finish(mut self, db_path: &Path) -> Result<()> {
         if self.failures.is_empty() {
             return Ok(());
         }
@@ -486,7 +486,7 @@ impl SyncSourceReport {
             self.succeeded
         );
         for failure in &self.failures {
-            eprintln!("  [{}] {}", failure.source, failure.error);
+            eprintln!("  [{}] {:#}", failure.source, failure.error);
         }
         let mut diagnosed = HashSet::new();
         for failure in self.failures.iter().filter(|failure| failure.is_contention) {
@@ -494,6 +494,19 @@ impl SyncSourceReport {
             if diagnosed.insert(path.to_path_buf()) {
                 eprintln!("{}", write_contention_diagnostic(path));
             }
+        }
+        // An enabled durable capture job cannot silently lose history. Missing
+        // providers count as successful no-ops, so the ordinary partial-source
+        // policy would otherwise turn a full capture store into sync success.
+        // Preserve the cause so native/SDK callers can report its safe code.
+        if let Some(index) = self
+            .failures
+            .iter()
+            .position(|failure| ai_hist_core::delivery::is_retention_limit(&failure.error))
+        {
+            let failure = self.failures.remove(index);
+            return Err(failure.error)
+                .with_context(|| format!("{} history delivery capture failed", failure.source));
         }
         if self.succeeded == 0 {
             anyhow::bail!(
@@ -4349,7 +4362,10 @@ fn sync_trajectories(conn: &Connection, state: &mut Map<String, Value>) -> Resul
                 r.get(0)
             })
             .ok();
-        if upsert_trajectory(conn, &row).is_err() {
+        if let Err(error) = upsert_trajectory(conn, &row) {
+            if ai_hist_core::delivery::is_retention_limit(&error) {
+                return Err(error);
+            }
             errors += 1;
             continue;
         }
