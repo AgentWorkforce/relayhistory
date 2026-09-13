@@ -1020,6 +1020,7 @@ fn explicit_relaycast_sync_uses_remote_presence_and_persists_checkpoint() {
     assert_eq!(state["relay"]["ch:general"], "m001");
 }
 
+#[cfg(unix)]
 #[test]
 fn busy_relaycast_lock_skips_only_relaycast_and_does_not_initialize_its_database() {
     for include_codex in [false, true] {
