@@ -140,3 +140,20 @@ test('MCP acquisition exposes and forwards source connector selection', async ()
     }
   });
 });
+
+test('fresh SDK local sync emits no native progress text on stdout', async () => {
+  await isolated(async (dbPath) => {
+    const project = join(process.env.HOME!, '.claude', 'projects', '-fixture-project');
+    await mkdir(project, { recursive: true });
+    await writeFile(join(project, 'quiet-session.jsonl'), JSON.stringify({
+      type: 'user', uuid: 'quiet-user', sessionId: 'quiet-session', cwd: '/fixture/project',
+      timestamp: '2026-09-01T10:00:00.000Z', message: { role: 'user', content: 'quiet fixture' },
+    }) + '\n');
+    const module = new URL('./index.js', import.meta.url).href;
+    const source = `import { sync } from ${JSON.stringify(module)};
+      const result = await sync({ dbPath: ${JSON.stringify(dbPath)}, scope: 'local', sourceConnectors: [] });
+      process.stdout.write(JSON.stringify({ completed: result.completed }) + '\\n');`;
+    const { stdout } = await run(process.execPath, ['--input-type=module', '--eval', source], { env: process.env });
+    assert.equal(stdout, '{"completed":true}\n');
+  });
+});
