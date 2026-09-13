@@ -42,6 +42,7 @@ mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
+pub mod source_intake;
 pub mod sources;
 
 pub mod replay;

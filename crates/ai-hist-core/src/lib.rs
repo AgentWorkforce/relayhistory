@@ -19,6 +19,7 @@ pub mod privacy;
 /// Delegation topology: recorded parent/child relationships and bounded,
 /// cycle-safe traversal over them.
 pub mod relationships;
+pub mod source_evidence;
 pub mod storage;
 pub mod turns;
 

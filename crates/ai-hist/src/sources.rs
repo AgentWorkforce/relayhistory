@@ -40,6 +40,7 @@ pub enum AcquiredEvidence {
     /// Valid only for the built-in source/default connector identity.
     LocalFiles,
     Events(ConnectorEvidence),
+    Normalized(crate::source_intake::NormalizedSourceEvidence),
     ClaudeFull {
         records: Vec<Value>,
         source_stamp: String,
@@ -143,6 +144,35 @@ impl SourceRegistry {
             .map(|provider| provider.as_ref())
             .collect())
     }
+    fn available<'a>(
+        &self,
+        providers: Vec<&'a dyn ShallowSessionProvider>,
+        scope: SessionScope,
+    ) -> Result<(
+        Vec<&'a dyn ShallowSessionProvider>,
+        Vec<DiscoveryDiagnostic>,
+    )> {
+        let mut available = vec![];
+        let mut diagnostics = vec![];
+        for provider in providers {
+            match provider.check_available(&home_dir()) {
+                Ok(()) => available.push(provider),
+                Err(error) => diagnostics.push(DiscoveryDiagnostic {
+                    source: provider.source().into(),
+                    connector_id: Some(provider.connector_id().into()),
+                    connector_instance: Some(provider.connector_instance().into()),
+                    location: Some(provider.location()),
+                    locator: None,
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        ensure!(
+            scope != SessionScope::Remote || !available.is_empty(),
+            "CONNECTOR_NOT_CONFIGURED: no selected remote source connector is available"
+        );
+        Ok((available, diagnostics))
+    }
     pub fn discover_at(
         &self,
         db_path: &Path,
@@ -155,13 +185,12 @@ impl SourceRegistry {
             options.scope != SessionScope::Remote || !providers.is_empty(),
             "CONNECTOR_NOT_CONFIGURED: no selected remote source connector"
         );
-        let home = home_dir();
-        for provider in &providers {
-            provider.check_available(&home)?;
-        }
+        let (providers, diagnostics) = self.available(providers, options.scope)?;
         let conn = open_db(db_path)?;
         let env = DiscoveryEnv::new(&conn);
-        discover_sessions_with_provider_refs(&env, options, &providers, on_row)
+        let mut summary = discover_sessions_with_provider_refs(&env, options, &providers, on_row)?;
+        summary.diagnostics.extend(diagnostics);
+        Ok(summary)
     }
     /// Local full ingestion followed by selected adapters' bounded catalog refresh.
     /// Remote full evidence is acquired through `hydrate_at` for a selected session.
@@ -176,16 +205,13 @@ impl SourceRegistry {
             scope != SessionScope::Remote || !providers.is_empty(),
             "CONNECTOR_NOT_CONFIGURED: no selected remote source connector"
         );
-        let home = home_dir();
-        for provider in &providers {
-            provider.check_available(&home)?;
-        }
+        let (providers, diagnostics) = self.available(providers, scope)?;
         if scope != SessionScope::Remote {
             sync_local_at(db_path)?;
         }
         let conn = open_db(db_path)?;
         let env = DiscoveryEnv::new(&conn);
-        discover_sessions_with_provider_refs(
+        let mut summary = discover_sessions_with_provider_refs(
             &env,
             &DiscoverOptions {
                 scope,
@@ -193,7 +219,9 @@ impl SourceRegistry {
             },
             &providers,
             |_| {},
-        )
+        )?;
+        summary.diagnostics.extend(diagnostics);
+        Ok(summary)
     }
     pub fn hydrate_at(
         &self,
@@ -238,3 +266,6 @@ pub(crate) fn observed(
         "SESSION_NOT_FOUND: selected connector has not observed this session; discover it first",
     )
 }
+
+pub use crate::hydrate::normalize_source_evidence;
+pub use crate::source_intake::NormalizedSourceEvidence;

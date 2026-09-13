@@ -64,7 +64,7 @@ use ai_hist_core::{
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Version of the machine-readable session-catalog contract.
@@ -112,7 +112,8 @@ pub const DEFAULT_CATALOG_LIMIT: i64 = 50;
 /// Catalog row: one coding-agent session as shallow discovery knows it.
 ///
 /// See the module docs for which fields are observed and which are derived.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShallowSession {
     /// Provider that owns the session (`claude`, `codex`, …). Observed.
     pub source: String,

@@ -5,6 +5,7 @@
 #![deny(clippy::all)]
 
 pub mod delivery;
+pub mod sources;
 
 use std::path::{Path, PathBuf};
 

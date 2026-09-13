@@ -29,6 +29,7 @@ struct State {
     stamp: String,
     events: Vec<SessionEvent>,
     fail: bool,
+    availability_fail: bool,
     listed: bool,
     not_session: bool,
     locators: Vec<String>,
@@ -46,6 +47,7 @@ impl Fixture {
                 stamp: "v1".into(),
                 events: vec![event("shared", id), event(id, id)],
                 fail: false,
+                availability_fail: false,
                 listed: true,
                 not_session: false,
                 locators: vec![],
@@ -96,6 +98,10 @@ impl ShallowSessionProvider for Fixture {
     }
     fn check_available(&self, _home: &Path) -> Result<()> {
         self.probes.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(
+            !self.state.lock().unwrap().availability_fail,
+            "fixture credentials missing"
+        );
         Ok(())
     }
     fn enumerate(&self, _env: &DiscoveryEnv<'_>, _limit: Option<usize>) -> Result<Vec<Candidate>> {
@@ -580,5 +586,46 @@ fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_i
         fixture.state.lock().unwrap().locators,
         ["opaque-acquire-key"]
     );
+    Ok(())
+}
+
+#[test]
+fn unavailable_adapter_does_not_block_independent_local_or_remote_sources() -> Result<()> {
+    let unavailable = Fixture::new("unavailable", "default");
+    unavailable.state.lock().unwrap().availability_fail = true;
+    let healthy = Fixture::new("healthy", "default");
+    let mut registry = SourceRegistry::new();
+    registry.register(Box::new(unavailable.clone()))?;
+    registry.register(Box::new(healthy.clone()))?;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    assert!(registry
+        .discover_at(&db, &options(), &[unavailable.identity()], |_| {})
+        .unwrap_err()
+        .to_string()
+        .contains("CONNECTOR_NOT_CONFIGURED"));
+    assert!(!db.exists());
+    let result = registry.discover_at(
+        &db,
+        &options(),
+        &[unavailable.identity(), healthy.identity()],
+        |_| {},
+    )?;
+    assert_eq!(result.discovered, 1);
+    assert_eq!(result.diagnostics.len(), 1);
+    let mut local = Fixture::new("local", "default");
+    local.location = SessionLocation::Local;
+    registry.register(Box::new(local))?;
+    let result = registry.discover_at(
+        &db,
+        &DiscoverOptions {
+            scope: SessionScope::All,
+            ..options()
+        },
+        &[unavailable.identity()],
+        |_| {},
+    )?;
+    assert_eq!(result.discovered, 1);
+    assert_eq!(result.diagnostics.len(), 1);
     Ok(())
 }

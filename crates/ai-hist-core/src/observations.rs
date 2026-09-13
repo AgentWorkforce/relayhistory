@@ -5,7 +5,7 @@
 //! recover overwritten provenance and are marked `legacy-unknown`; old hydration
 //! checkpoints are deliberately not assigned to a guessed connector.
 use crate::SessionLocation;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +71,9 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         "observation_evidence",
         "idx_observation_locator",
         "delete_session_observations",
+        "observation_versions",
+        "observation_clock",
+        "delete_observation_version",
     ] {
         if !conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
@@ -109,6 +112,12 @@ CREATE TABLE IF NOT EXISTS session_observations (
  PRIMARY KEY(source,session_id,location,connector_id,connector_instance)
 );
 CREATE INDEX IF NOT EXISTS idx_observation_locator ON session_observations(source,location,connector_id,connector_instance,raw_locator);
+CREATE TABLE IF NOT EXISTS observation_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);
+INSERT OR IGNORE INTO observation_clock(singleton,version) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS observation_versions(source TEXT NOT NULL,session_id TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(source,session_id,location,connector_id,connector_instance));
+CREATE TRIGGER IF NOT EXISTS delete_observation_version AFTER DELETE ON session_observations BEGIN
+ DELETE FROM observation_versions WHERE source=OLD.source AND session_id=OLD.session_id AND location=OLD.location AND connector_id=OLD.connector_id AND connector_instance=OLD.connector_instance;
+END;
 CREATE TABLE IF NOT EXISTS observation_hydration_checkpoints (
  source TEXT NOT NULL,session_id TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,
  source_stamp TEXT,parser_version INTEGER NOT NULL,last_event_at_ms INTEGER,source_bytes INTEGER NOT NULL,records_parsed INTEGER NOT NULL,include_related INTEGER NOT NULL,updated_ms INTEGER NOT NULL,
@@ -134,6 +143,9 @@ INSERT OR IGNORE INTO session_observations(source,session_id,location,connector_
  SELECT source,session_id,location,'legacy-unknown','default',raw_locator,source_stamp,COALESCE(discovery_state,'shallow'),'available',0
  FROM session_presences WHERE NOT EXISTS(SELECT 1 FROM schema_migrations WHERE name='connector_observations_v1');
 INSERT OR IGNORE INTO schema_migrations(name) VALUES ('connector_observations_v1');
+INSERT OR IGNORE INTO observation_versions(source,session_id,location,connector_id,connector_instance,version) SELECT source,session_id,location,connector_id,connector_instance,rowid+(SELECT version FROM observation_clock WHERE singleton=1) FROM session_observations;
+UPDATE observation_clock SET version=MAX(version,COALESCE((SELECT MAX(version) FROM observation_versions),0)) WHERE singleton=1;
+
 "#)?;
     ensure!(
         schema_is_current(conn)?,
@@ -203,7 +215,8 @@ fn upsert_inner(conn: &Connection, observation: &SessionObservation) -> Result<(
         "invalid observation discovery state"
     );
     conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,discovery_state,access_state,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET raw_locator=excluded.raw_locator,source_stamp=excluded.source_stamp,discovery_state=CASE WHEN session_observations.discovery_state='full' THEN 'full' ELSE excluded.discovery_state END,access_state=excluded.access_state,updated_ms=excluded.updated_ms",params![k.source,k.session_id,k.location.as_str(),k.connector_id,k.connector_instance,observation.raw_locator,observation.source_stamp,observation.discovery_state,observation.access_state,observation.updated_ms])?;
-    refresh_projection(conn, k)
+    refresh_projection(conn, k)?;
+    bump_revision(conn, k)
 }
 
 /// Withdrawal is an access change, not deletion of cached evidence or provenance.
@@ -235,13 +248,29 @@ pub fn write_checkpoint(
     key: &ObservationKey,
     checkpoint: &ObservationCheckpoint,
 ) -> Result<()> {
+    let transaction = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    write_checkpoint_inner(conn, key, checkpoint)?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(())
+}
+fn write_checkpoint_inner(
+    conn: &Connection,
+    key: &ObservationKey,
+    checkpoint: &ObservationCheckpoint,
+) -> Result<()> {
     key.validate()?;
     ensure!(
         get(conn, key)?.is_some(),
         "observation checkpoint requires an observation"
     );
     conn.execute("INSERT INTO observation_hydration_checkpoints(source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET source_stamp=excluded.source_stamp,parser_version=excluded.parser_version,last_event_at_ms=excluded.last_event_at_ms,source_bytes=excluded.source_bytes,records_parsed=excluded.records_parsed,include_related=excluded.include_related,updated_ms=excluded.updated_ms",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,checkpoint.source_stamp,checkpoint.parser_version,checkpoint.last_event_at_ms,checkpoint.source_bytes,checkpoint.records_parsed,checkpoint.include_related,checkpoint.updated_ms])?;
-    Ok(())
+    bump_revision(conn, key)
 }
 
 /// Replace one successful snapshot as independently deliverable records. Long
@@ -281,6 +310,28 @@ fn save_evidence_inner(
         .ok_or_else(|| anyhow::anyhow!("observation evidence format is required"))?;
     let mut records = std::collections::BTreeMap::new();
     match format {
+        "records" => {
+            use sha2::{Digest, Sha256};
+            let items = payload
+                .get("records")
+                .and_then(Value::as_array)
+                .context("normalized records are required")?;
+            records.insert(
+                "manifest".into(),
+                json!({"format":format,"covered_kinds":payload["covered_kinds"]}),
+            );
+            for (index, item) in items.iter().enumerate() {
+                let record: crate::source_evidence::EvidenceRecord =
+                    serde_json::from_value(item["record"].clone())?;
+                let uid = format!("record:{:x}", Sha256::digest(record.identity()));
+                ensure!(
+                    records
+                        .insert(uid, json!({"format":format,"index":index,"item":item}))
+                        .is_none(),
+                    "duplicate normalized observation record"
+                );
+            }
+        }
         "events" => {
             let events = payload
                 .get("events")
@@ -351,7 +402,7 @@ fn save_evidence_inner(
     for (uid, payload) in records {
         conn.execute("INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance,evidence_uid) DO UPDATE SET payload_json=excluded.payload_json WHERE observation_evidence.payload_json!=excluded.payload_json",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,uid,serde_json::to_string(&payload)?])?;
     }
-    Ok(())
+    bump_revision(conn, key)
 }
 
 /// Reconstruct one connector's snapshot for canonical evidence reconciliation.
@@ -377,6 +428,9 @@ pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_
         "mixed observation evidence formats"
     );
     Ok(Some(match format {
+        "records" => {
+            json!({"format":format,"covered_kinds":rows.iter().find_map(|row|row.get("covered_kinds")).context("missing snapshot manifest")?,"records":rows.iter().filter_map(|row|row.get("item")).collect::<Vec<_>>()})
+        }
         "events" => {
             json!({"format":format,"events":rows.iter().filter_map(|row|row.get("event")).collect::<Vec<_>>(),"managed":rows.iter().filter(|row|row.get("managed").and_then(Value::as_bool)==Some(true)).filter_map(|row|row.get("event").and_then(|event|event.get("event_uid"))).collect::<Vec<_>>()})
         }
@@ -388,6 +442,24 @@ pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_
         }
         _ => anyhow::bail!("unsupported stored observation evidence format"),
     }))
+}
+
+/// Opaque persisted revision for optimistic acquisition outside the engine.
+/// The database-wide monotonic clock prevents ABA after delete/recreate and
+/// distinguishes updates sharing the same millisecond timestamp.
+pub fn revision(conn: &Connection, key: &ObservationKey) -> Result<Option<String>> {
+    key.validate()?;
+    let version:Option<i64>=conn.query_row("SELECT version FROM observation_versions WHERE source=? AND session_id=? AND location=? AND connector_id=? AND connector_instance=?",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance],|row|row.get(0)).optional()?;
+    Ok(version.map(|version| format!("v1:{version}")))
+}
+fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
+    let version: i64 = conn.query_row(
+        "UPDATE observation_clock SET version=version+1 WHERE singleton=1 RETURNING version",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute("INSERT INTO observation_versions(source,session_id,location,connector_id,connector_instance,version) VALUES(?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET version=excluded.version",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,version])?;
+    Ok(())
 }
 
 #[cfg(test)]

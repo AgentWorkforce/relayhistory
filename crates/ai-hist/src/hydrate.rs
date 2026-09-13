@@ -367,7 +367,8 @@ fn hydrate_remote_session(
         crate::remote::acquire_remote_session_at(home, &options.source, &options.session_id)
             .map_err(classify_remote_error)?;
     match evidence {
-        crate::remote::RemoteSessionEvidence::Events(_)
+        crate::remote::RemoteSessionEvidence::Normalized(_)
+        | crate::remote::RemoteSessionEvidence::Events(_)
         | crate::remote::RemoteSessionEvidence::LocalFiles => anyhow::bail!(
             "CONNECTOR_FAILURE: builtin adapter returned unexpected normalized evidence"
         ),
@@ -963,7 +964,7 @@ fn write_hydration_checkpoint(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_remote_result(
+pub(crate) fn build_remote_result(
     conn: &Connection,
     options: &HydrateSessionOptions,
     status: &str,
@@ -1797,6 +1798,232 @@ fn max_event_time(conn: &Connection, source: &str, session_id: &str) -> Result<O
         params![source, session_id],
         |row| row.get(0),
     )?)
+}
+
+pub(crate) fn hydrate_with_provider(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    provider: &dyn ShallowSessionProvider,
+) -> Result<HydrateSessionResult> {
+    validate_options(options)?;
+    // Keep transport response acquisition and replacement in the same critical section.
+    let _lock = acquire_remote_hydration_lock(db_path, options)?;
+    let started = Instant::now();
+    let mut conn = open_db(db_path)?;
+    let observation = crate::sources::observed(&conn, provider, &options.session_id)?;
+    anyhow::ensure!(
+        observation.access_state != "withdrawn",
+        "CONNECTOR_NOT_CONFIGURED: selected observation is withdrawn"
+    );
+    let revision =
+        observations::revision(&conn, &observation.key)?.context("missing observation revision")?;
+    let evidence = match provider.acquire(&home_dir(), &observation) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            observations::set_access(&conn, &observation.key, "unavailable")?;
+            return Err(classify_remote_error(error));
+        }
+    };
+    match evidence {
+        crate::sources::AcquiredEvidence::LocalFiles => {
+            anyhow::ensure!(
+                observation.key.location == SessionLocation::Local
+                    && observation.key.connector_id == options.source
+                    && observation.key.connector_instance == "default",
+                "CONNECTOR_FAILURE: local parser requires its built-in observation identity"
+            );
+            hydrate_session_at_with_home_and_connectors(
+                db_path,
+                options,
+                &home_dir(),
+                &crate::remote::SourceConnectorSelection::new(Vec::new())?,
+            )
+        }
+        evidence @ (crate::sources::AcquiredEvidence::Events(_)
+        | crate::sources::AcquiredEvidence::Normalized(_)
+        | crate::sources::AcquiredEvidence::ClaudeFull { .. }
+        | crate::sources::AcquiredEvidence::CodexDiff { .. }) => {
+            let evidence =
+                normalize_source_evidence(&options.source, &options.session_id, evidence)?;
+            crate::source_intake::apply_normalized(
+                &mut conn,
+                &observation.key,
+                &revision,
+                evidence,
+                started,
+            )
+        }
+        crate::sources::AcquiredEvidence::CapabilityLimited { code, message } => {
+            // A failed or listing-only adapter must not remove another connector's evidence.
+            build_remote_result(
+                &conn,
+                options,
+                "capability_limited",
+                "shallow_only",
+                &observation.discovery_state,
+                observation.source_stamp.clone().unwrap_or_default(),
+                0,
+                0,
+                code,
+                &message,
+                started,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_observation_progress(
+    conn: &Connection,
+    observation: &SessionObservation,
+    stamp: &str,
+    bytes: i64,
+    records: i64,
+    include_related: bool,
+    full: bool,
+) -> Result<()> {
+    let mut observation = observation.clone();
+    observation.updated_ms = now_ms();
+    observation.access_state = "available".into();
+    if full {
+        observation.discovery_state = "full".into();
+    }
+    observations::upsert(conn, &observation)?;
+    observations::write_checkpoint(
+        conn,
+        &observation.key,
+        &ObservationCheckpoint {
+            source_stamp: Some(stamp.into()),
+            parser_version: HYDRATION_PARSER_VERSION,
+            last_event_at_ms: max_event_time(
+                conn,
+                &observation.key.source,
+                &observation.key.session_id,
+            )?,
+            source_bytes: bytes,
+            records_parsed: records,
+            include_related,
+            updated_ms: now_ms(),
+        },
+    )
+}
+
+/// Parse provider wire evidence in an isolated database. No managed catalog,
+/// credentials or transports are accessed by this normalization operation.
+pub fn normalize_source_evidence(
+    source: &str,
+    session_id: &str,
+    evidence: crate::sources::AcquiredEvidence,
+) -> Result<crate::source_intake::NormalizedSourceEvidence> {
+    use crate::sources::AcquiredEvidence;
+    use ai_hist_core::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+    let (source_stamp, source_bytes, covered_kinds, records) = match evidence {
+        AcquiredEvidence::Events(evidence) => {
+            let records = evidence
+                .events
+                .into_iter()
+                .map(|event| {
+                    Ok(EvidenceRecord {
+                        kind: EvidenceKind::SessionEvent,
+                        payload: serde_json::to_value(event)?
+                            .as_object()
+                            .context("event object")?
+                            .clone(),
+                        record_id: None,
+                        revision_id: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (
+                evidence.source_stamp,
+                evidence.source_bytes,
+                vec![EvidenceKind::SessionEvent],
+                records,
+            )
+        }
+        AcquiredEvidence::ClaudeFull {
+            mut records,
+            source_stamp,
+            source_bytes,
+        } => {
+            anyhow::ensure!(
+                source == "claude",
+                "CONNECTOR_FAILURE: Claude evidence returned for another source"
+            );
+            let mut transcript = tempfile::NamedTempFile::new()?;
+            for record in &mut records {
+                let object = record
+                    .as_object_mut()
+                    .context("CONNECTOR_FAILURE: Claude record must be an object")?;
+                let id = object
+                    .get("sessionId")
+                    .or_else(|| object.get("session_id"))
+                    .and_then(Value::as_str);
+                anyhow::ensure!(
+                    id.is_none_or(|id| id == session_id),
+                    "CONNECTOR_FAILURE: Claude record identity does not match requested session"
+                );
+                object.insert("sessionId".into(), Value::String(session_id.into()));
+                serde_json::to_writer(&mut transcript, record)?;
+                transcript.write_all(b"\n")?;
+            }
+            transcript.flush()?;
+            let conn = Connection::open_in_memory()?;
+            ai_hist_core::init_db(&conn)?;
+            ingest_claude_transcript(&conn, transcript.path())?;
+            let records =
+                source_evidence::read_session(&conn, source, session_id, FULL_SESSION_KINDS)?;
+            (
+                source_stamp,
+                source_bytes,
+                FULL_SESSION_KINDS.to_vec(),
+                records,
+            )
+        }
+        AcquiredEvidence::CodexDiff {
+            diff,
+            source_stamp,
+            source_bytes,
+        } => {
+            anyhow::ensure!(
+                source == "codex",
+                "CONNECTOR_FAILURE: Codex evidence returned for another source"
+            );
+            let records=split_unified_diff(&diff).into_iter().enumerate().map(|(index,patch)| {
+                let (added,removed)=count_unified_diff_lines(&patch.text);
+                let payload=json!({"source":source,"session_id":session_id,"tool_use_id":format!("remote-diff:{index}"),"file_path":patch.path,"tool_name":"codex cloud diff","lines_added":added,"lines_removed":removed,"structured_patch_json":json!({"unified_diff":patch.text}).to_string()}).as_object().unwrap().clone();
+                EvidenceRecord{kind:EvidenceKind::FileEdit,payload,record_id:None,revision_id:None}
+            }).collect();
+            (
+                source_stamp,
+                source_bytes,
+                vec![EvidenceKind::FileEdit],
+                records,
+            )
+        }
+        AcquiredEvidence::Normalized(evidence) => return Ok(evidence),
+        AcquiredEvidence::LocalFiles | AcquiredEvidence::CapabilityLimited { .. } => {
+            anyhow::bail!("PROVIDER_CAPABILITY_LIMITED: no portable evidence snapshot")
+        }
+    };
+    let mut normalized = crate::source_intake::NormalizedSourceEvidence {
+        source_stamp,
+        source_bytes,
+        covered_kinds,
+        records,
+    };
+    source_evidence::validate_records(
+        &ObservationKey {
+            source: source.into(),
+            session_id: session_id.into(),
+            location: SessionLocation::Remote,
+            connector_id: "normalizer".into(),
+            connector_instance: "default".into(),
+        },
+        &normalized.covered_kinds,
+        &mut normalized.records,
+    )?;
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -3455,284 +3682,4 @@ mod tests {
             )]
         );
     }
-}
-
-pub(crate) fn hydrate_with_provider(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-    provider: &dyn ShallowSessionProvider,
-) -> Result<HydrateSessionResult> {
-    validate_options(options)?;
-    // Keep transport response acquisition and replacement in the same critical section.
-    let _lock = acquire_remote_hydration_lock(db_path, options)?;
-    let started = Instant::now();
-    let mut conn = open_db(db_path)?;
-    let observation = crate::sources::observed(&conn, provider, &options.session_id)?;
-    anyhow::ensure!(
-        observation.access_state != "withdrawn",
-        "CONNECTOR_NOT_CONFIGURED: selected observation is withdrawn"
-    );
-    let evidence = match provider.acquire(&home_dir(), &observation) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            observations::set_access(&conn, &observation.key, "unavailable")?;
-            return Err(classify_remote_error(error));
-        }
-    };
-    match evidence {
-        crate::sources::AcquiredEvidence::LocalFiles => {
-            anyhow::ensure!(
-                observation.key.location == SessionLocation::Local
-                    && observation.key.connector_id == options.source
-                    && observation.key.connector_instance == "default",
-                "CONNECTOR_FAILURE: local parser requires its built-in observation identity"
-            );
-            hydrate_session_at_with_home_and_connectors(
-                db_path,
-                options,
-                &home_dir(),
-                &crate::remote::SourceConnectorSelection::new(Vec::new())?,
-            )
-        }
-        crate::sources::AcquiredEvidence::Events(evidence) => {
-            hydrate_events(&mut conn, options, &observation, evidence, started)
-        }
-        crate::sources::AcquiredEvidence::ClaudeFull {
-            records,
-            source_stamp,
-            source_bytes,
-        } => {
-            anyhow::ensure!(
-                options.source == "claude",
-                "CONNECTOR_FAILURE: Claude evidence returned for another source"
-            );
-            hydrate_remote_claude_observed(
-                &mut conn,
-                options,
-                records,
-                source_stamp,
-                source_bytes,
-                started,
-                Some(&observation),
-            )
-        }
-        crate::sources::AcquiredEvidence::CodexDiff {
-            diff,
-            source_stamp,
-            source_bytes,
-        } => {
-            anyhow::ensure!(
-                options.source == "codex",
-                "CONNECTOR_FAILURE: Codex evidence returned for another source"
-            );
-            hydrate_remote_codex_diff_observed(
-                &mut conn,
-                options,
-                &diff,
-                source_stamp,
-                source_bytes,
-                started,
-                Some(&observation),
-            )
-        }
-        crate::sources::AcquiredEvidence::CapabilityLimited { code, message } => {
-            // A failed or listing-only adapter must not remove another connector's evidence.
-            build_remote_result(
-                &conn,
-                options,
-                "capability_limited",
-                "shallow_only",
-                &observation.discovery_state,
-                observation.source_stamp.clone().unwrap_or_default(),
-                0,
-                0,
-                code,
-                &message,
-                started,
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn save_observation_progress(
-    conn: &Connection,
-    observation: &SessionObservation,
-    stamp: &str,
-    bytes: i64,
-    records: i64,
-    include_related: bool,
-    full: bool,
-) -> Result<()> {
-    let mut observation = observation.clone();
-    observation.updated_ms = now_ms();
-    observation.access_state = "available".into();
-    if full {
-        observation.discovery_state = "full".into();
-    }
-    observations::upsert(conn, &observation)?;
-    observations::write_checkpoint(
-        conn,
-        &observation.key,
-        &ObservationCheckpoint {
-            source_stamp: Some(stamp.into()),
-            parser_version: HYDRATION_PARSER_VERSION,
-            last_event_at_ms: max_event_time(
-                conn,
-                &observation.key.source,
-                &observation.key.session_id,
-            )?,
-            source_bytes: bytes,
-            records_parsed: records,
-            include_related,
-            updated_ms: now_ms(),
-        },
-    )
-}
-
-#[derive(Serialize, Deserialize)]
-struct EventSnapshot {
-    format: String,
-    events: Vec<ai_hist_core::SessionEvent>,
-    managed: HashSet<String>,
-}
-
-fn hydrate_events(
-    conn: &mut Connection,
-    options: &HydrateSessionOptions,
-    observation: &SessionObservation,
-    evidence: crate::sources::ConnectorEvidence,
-    started: Instant,
-) -> Result<HydrateSessionResult> {
-    anyhow::ensure!(
-        evidence.source_bytes >= 0,
-        "CONNECTOR_FAILURE: negative evidence size"
-    );
-    let mut unique = HashSet::new();
-    for event in &evidence.events {
-        anyhow::ensure!(
-            event.source == options.source
-                && event.session_id == options.session_id
-                && !event.event_uid.trim().is_empty()
-                && unique.insert(&event.event_uid),
-            "CONNECTOR_FAILURE: malformed or duplicate event identity"
-        );
-        anyhow::ensure!(
-            ["user", "assistant", "tool_result"].contains(&event.role.as_str())
-                && ["text", "thinking", "tool_use", "tool_result"].contains(&event.kind.as_str()),
-            "CONNECTOR_FAILURE: invalid event kind or role"
-        );
-    }
-    let previous = observations::checkpoint(conn, &observation.key)?;
-    if previous.as_ref().is_some_and(|value| {
-        value.source_stamp.as_deref() == Some(&evidence.source_stamp)
-            && value.parser_version == HYDRATION_PARSER_VERSION
-    }) {
-        observations::set_access(conn, &observation.key, "available")?;
-        return build_remote_result(
-            conn,
-            options,
-            "unchanged",
-            "partial",
-            "shallow",
-            evidence.source_stamp,
-            evidence.source_bytes,
-            evidence.events.len() as i64,
-            "SOURCE_EVENTS_INDEXED",
-            "selected connector events are unchanged; other evidence kinds are not supplied",
-            started,
-        );
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut snapshots = std::collections::BTreeMap::new();
-    for other in observations::list(&tx, &options.source, &options.session_id)? {
-        if let Some(payload) = observations::evidence(&tx, &other.key)? {
-            if payload.get("format").and_then(Value::as_str) == Some("events") {
-                let snapshot: EventSnapshot = serde_json::from_value(payload)?;
-                snapshots.insert(
-                    (
-                        other.key.connector_id,
-                        other.key.connector_instance,
-                        other.key.location.as_str(),
-                    ),
-                    snapshot,
-                );
-            }
-        }
-    }
-    let previously_managed = snapshots
-        .values()
-        .flat_map(|value| value.managed.iter().cloned())
-        .collect::<HashSet<_>>();
-    let mut managed = HashSet::new();
-    for event in &evidence.events {
-        let existed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM session_events WHERE source=? AND session_id=? AND event_uid=?)",params![options.source,options.session_id,event.event_uid],|row|row.get(0))?;
-        if !existed || previously_managed.contains(&event.event_uid) {
-            managed.insert(event.event_uid.clone());
-        }
-    }
-    let records = evidence.events.len() as i64;
-    let snapshot = EventSnapshot {
-        format: "events".into(),
-        events: evidence.events,
-        managed,
-    };
-    observations::save_evidence(&tx, &observation.key, &serde_json::to_value(&snapshot)?)?;
-    snapshots.insert(
-        (
-            observation.key.connector_id.clone(),
-            observation.key.connector_instance.clone(),
-            observation.key.location.as_str(),
-        ),
-        snapshot,
-    );
-    // Deterministic winner for shared provider event ids, independent of scan order.
-    let mut union = std::collections::BTreeMap::new();
-    let mut managed_union = HashSet::new();
-    for snapshot in snapshots.values() {
-        managed_union.extend(snapshot.managed.iter().cloned());
-        for event in &snapshot.events {
-            union.entry(event.event_uid.clone()).or_insert(event);
-        }
-    }
-    for uid in &previously_managed {
-        if !union.contains_key(uid) {
-            tx.execute(
-                "DELETE FROM session_events WHERE source=? AND session_id=? AND event_uid=?",
-                params![options.source, options.session_id, uid],
-            )?;
-        }
-    }
-    for (uid, event) in union {
-        if managed_union.contains(&uid) {
-            tx.execute("INSERT INTO session_events(source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id,event_uid) DO UPDATE SET project=excluded.project,cwd=excluded.cwd,git_branch=excluded.git_branch,message_id=excluded.message_id,parent_id=excluded.parent_id,ts_ms=excluded.ts_ms,role=excluded.role,kind=excluded.kind,text=excluded.text,model=excluded.model,token_json=excluded.token_json",params![event.source,event.session_id,event.project,event.cwd,event.git_branch,event.message_id,event.parent_id,event.ts_ms,event.role,event.kind,event.text,event.model,event.token_json,event.event_uid])?;
-        }
-    }
-    save_observation_progress(
-        &tx,
-        observation,
-        &evidence.source_stamp,
-        evidence.source_bytes,
-        records,
-        options.include_related,
-        false,
-    )?;
-    tx.commit()?;
-    build_remote_result(
-        conn,
-        options,
-        if previous.is_some() {
-            "updated"
-        } else {
-            "hydrated"
-        },
-        "partial",
-        "shallow",
-        evidence.source_stamp,
-        evidence.source_bytes,
-        records,
-        "SOURCE_EVENTS_INDEXED",
-        "selected connector events indexed; other evidence kinds are not supplied",
-        started,
-    )
 }
