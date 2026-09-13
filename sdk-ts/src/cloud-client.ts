@@ -517,8 +517,10 @@ async function persistRotated(candidate: StoredCandidate, auth: RelayhistoryAuth
       refresh_token: auth.refreshToken ?? null,
       // Carried explicitly: when the existing file could not be read there is
       // nothing to merge, and a native session without an org fails its own
-      // provenance precondition on the very next resolve.
-      org_id: existing.org_id ?? auth.orgId ?? null,
+      // provenance precondition on the very next resolve. The rotated org wins,
+      // as in `cloud::refresh_auth`: it is the service's answer for this bearer
+      // (or, when the service reported none, the org this session already had).
+      org_id: auth.orgId ?? existing.org_id ?? null,
     }
     : {
       baseUrl: existing.baseUrl ?? auth.baseUrl,
@@ -576,12 +578,17 @@ async function refreshCloudSession(
   const rotated = payload.refreshToken;
   if (typeof accessToken !== 'string' || typeof rotated !== 'string') return null;
   const expiresAt = payload.accessTokenExpiresAt;
+  // Same rule as `cloud::reported_tenancy`: the service derives tenancy from the
+  // bearer, so a reported org is authoritative for this token, and adopting it
+  // repairs a session stored without one. Blank or absent keeps what was stored.
+  const reportedOrg = typeof payload.orgId === 'string' ? payload.orgId.trim() : '';
+  const orgId = reportedOrg || auth.orgId;
   return {
     baseUrl: auth.baseUrl,
     accessToken,
     refreshToken: rotated,
     ...(typeof expiresAt === 'string' ? { accessTokenExpiresAt: expiresAt } : {}),
-    ...(auth.orgId ? { orgId: auth.orgId } : {}),
+    ...(orgId ? { orgId } : {}),
   };
 }
 

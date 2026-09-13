@@ -1108,9 +1108,28 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
             .and_then(|v| v.as_str())
             .map(String::from),
         refresh_token: Some(field(&payload, "refreshToken")?),
-        org_id: auth.org_id.clone(),
-        workspace_id: auth.workspace_id.clone(),
+        org_id: reported_tenancy(&payload, "orgId").or_else(|| auth.org_id.clone()),
+        workspace_id: reported_tenancy(&payload, "workspaceId")
+            .or_else(|| auth.workspace_id.clone()),
     })
+}
+
+/// A tenancy field (`orgId`, `workspaceId`) the service reported for this session.
+///
+/// Sessions from `/v1/cli/login` were stored with no org because the service did not
+/// return one, and `recall_auth` refuses a session without an org, so every
+/// `--remote` read came back empty while push kept working. The service now reports
+/// tenancy on login and refresh; adopting it here repairs such a session on its next
+/// routine refresh, without a re-login. The service derives tenancy from the bearer,
+/// so its answer is authoritative for this token. A blank or absent value keeps what
+/// was stored, so an older service can never erase a known org.
+fn reported_tenancy(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from)
 }
 
 /// `POST /v1/admin/mint` (dev-only bootstrap) → store the `rth_at_` session.
@@ -2922,6 +2941,72 @@ pub(crate) mod tests {
             let stored = load_auth(Some(&auth.base_url)).unwrap().unwrap();
             assert_eq!(stored.access_token, "rth_at_fresh");
             assert_eq!(stored.refresh_token.as_deref(), Some("rth_rt_fresh"));
+        });
+    }
+
+    /// Serve exactly one `POST /v1/auth/token/refresh` with `body`, then stop.
+    fn one_refresh_response(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (line, _, _) = read_http_request(&mut stream);
+            assert!(line.starts_with("POST /v1/auth/token/refresh "), "{line}");
+            write_http_response(&mut stream, "200 OK", body);
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// Regression: a `/v1/cli/login` session was stored with no org because
+    /// the service never returned one, `recall_auth` refused it, and every `--remote`
+    /// read was empty while push kept working. A refresh that reports tenancy must
+    /// repair that session with no re-login, so `recall_auth` accepts it afterwards.
+    #[test]
+    fn refresh_adopts_reported_tenancy_and_unblocks_recall() {
+        with_temp_home(|| {
+            let (base_url, server) = one_refresh_response(
+                r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z","orgId":"org_a","workspaceId":"ws_a"}"#,
+            );
+            let stored = StoredAuth {
+                base_url,
+                access_token: "rth_at_old".into(),
+                access_token_expires_at: Some("2999-01-01T00:00:00.000Z".into()),
+                refresh_token: Some("rth_rt_old".into()),
+                org_id: None,
+                workspace_id: None,
+            };
+            save_auth(&stored).unwrap();
+            let before = recall_auth().unwrap_err().to_string();
+            assert!(before.contains("no orgId"), "{before}");
+
+            refresh_and_save_auth(&stored).unwrap();
+            server.join().unwrap();
+
+            let repaired = recall_auth().expect("a refreshed session with an org is readable");
+            assert_eq!(repaired.org_id.as_deref(), Some("org_a"));
+            assert_eq!(repaired.workspace_id.as_deref(), Some("ws_a"));
+        });
+    }
+
+    /// An older service that reports no tenancy must never erase an org already stored.
+    #[test]
+    fn refresh_without_reported_tenancy_keeps_the_stored_org() {
+        with_temp_home(|| {
+            let (base_url, server) = one_refresh_response(
+                r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh","orgId":"  "}"#,
+            );
+            let stored = StoredAuth {
+                base_url,
+                access_token: "rth_at_old".into(),
+                access_token_expires_at: None,
+                refresh_token: Some("rth_rt_old".into()),
+                org_id: Some("org_a".into()),
+                workspace_id: Some("ws_a".into()),
+            };
+            let refreshed = refresh_auth(&stored).unwrap();
+            server.join().unwrap();
+            assert_eq!(refreshed.org_id.as_deref(), Some("org_a"));
+            assert_eq!(refreshed.workspace_id.as_deref(), Some("ws_a"));
         });
     }
 
