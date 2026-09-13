@@ -11,6 +11,7 @@ import {
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
 } from './index.js';
+import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
 import { prepareCloudSessionForEnableCloud } from './cloud-preflight.js';
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
@@ -19,7 +20,7 @@ type PackageMetadata = { version?: string };
 
 const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 const VALUE_FLAGS = new Set([
-  'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
+  'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
@@ -239,6 +240,10 @@ function showHelp(): never {
   ai-hist token [--base-url URL]
   ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist export --selection FILE [--out FILE] [--db PATH]
+  ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
+  ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
+  ai-hist plugin COMMAND [ARGS...] --config FILE
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -269,6 +274,10 @@ function usage(message?: string): never {
   ai-hist token [--base-url URL]
   ai-hist replay SESSION_ID [--base-url URL] [--limit N] [--max-content N] [--json] [--out PATH] [--help]
   ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist export --selection FILE [--out FILE] [--db PATH]
+  ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
+  ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
+  ai-hist plugin COMMAND [ARGS...] --config FILE
   ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
@@ -592,6 +601,11 @@ function validateInterval(args: Parsed): void {
 // stops `search` and `ai-hist` disagreeing about whether a store exists.
 const COMMANDS = new Map<string, CommandSpec>([
   ['', { name: 'ai-hist', positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
+  ['export', { name: 'export', positionals: [0, 0], allowed: ['db', 'selection', 'out'] }],
+  ['plugin', { name: 'plugin', positionals: [1, null], allowed: ['config'], requires: 'plugin requires a command name' }],
+  ...(['enable', 'status', 'drain', 'run', 'pause', 'resume', 'retry', 'cancel'] as const).map((action): [string, CommandSpec] => [`delivery ${action}`, {
+    name: `delivery ${action}`, positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
+  }]),
   ['login', { name: 'login', positionals: [0, 0],
     allowed: ['base-url', 'json', 'label', 'token'],
     validate: (args: Parsed) => {
@@ -659,12 +673,12 @@ const COMMANDS = new Map<string, CommandSpec>([
 /** Command words consumed before the positional arguments start. */
 function commandWords(command: string | undefined): number {
   if (command === undefined) return 0;
-  return command === 'sessions' ? 2 : 1;
+  return command === 'sessions' || command === 'delivery' ? 2 : 1;
 }
 
 function commandSpec(command: string | undefined, subcommand: string | undefined): CommandSpec | undefined {
   if (command === undefined) return COMMANDS.get('');
-  if (command === 'sessions') return subcommand ? COMMANDS.get(`sessions ${subcommand}`) : undefined;
+  if (command === 'sessions' || command === 'delivery') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
   return COMMANDS.get(command);
 }
 
@@ -745,6 +759,26 @@ async function main(): Promise<void> {
   const sessionId = command === 'sessions' ? tail[1] : undefined;
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
   const scope = scopeFlag(args);
+  if (command === 'delivery') {
+    await runDeliveryCommand(subcommand!, { dbPath: textFlag(args, 'db'), configPath: textFlag(args, 'config'),
+      jobId: textFlag(args, 'job'), pollIntervalMs: numberFlag(args, 'poll-ms'), requestTimeoutMs: numberFlag(args, 'timeout-ms') });
+    return;
+  }
+  if (command === 'export') {
+    const selectionPath = textFlag(args, 'selection');
+    if (!selectionPath) usage('export requires --selection FILE');
+    await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') });
+    return;
+  }
+  if (command === 'plugin') {
+    const configPath = textFlag(args, 'config');
+    if (!configPath) usage('plugin requires --config FILE');
+    const { registry } = await loadHistoryApplicationConfig(configPath);
+    const operation = registry.command(tail[0]);
+    if (!operation) usage('configured plugin command not found');
+    output(await operation.run(tail.slice(1)), true);
+    return;
+  }
   let readiness: LocalStoreReadiness | null = null;
   if (spec.readsLocalStore) {
     readiness = await ensureLocalStore({

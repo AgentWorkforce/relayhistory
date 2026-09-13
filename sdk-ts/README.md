@@ -100,7 +100,7 @@ continues local acquisition and reports unavailable selected remotes.
 
 This selection API addresses built-in connectors; plugin loading and optional
 cloud package extraction are separate work. Cloud dependencies remain in the
-current package. SDK/native contract 12 is required so older addons cannot
+current package. SDK/native contract 13 is required so older addons cannot
 silently ignore connector selection. See `docs/remote-connectors.md` for
 connector capabilities and authentication.
 
@@ -256,6 +256,15 @@ This resolver disables automatic refresh. A 401 from the selected transport
 throws `AuthenticationExpiredError` without an authentication request. The
 default `resolveCloudSession` returns the marker for stored credentials and
 enables native refresh.
+
+## Export and durable delivery
+
+Use `exportHistory(selection)` for a bounded historical snapshot or
+`ai-hist export --selection selection.json` for NDJSON stdout. Explicitly enabled
+delivery jobs use `createHistoryDelivery`, `HistoryPluginRegistry`, and
+`drainHistoryDelivery`/`runHistoryDelivery`. The same Rust queue handles one-shot
+and background runs, immutable retries, exact acknowledgments, and worker leases.
+Native contract 13 is required. See [delivery setup and contracts](../docs/history-delivery.md).
 
 ## Cloud token and replay
 

@@ -28,6 +28,8 @@ import {
 } from './sdk-common.js';
 
 export * from './sdk-common.js';
+export * from './delivery.js';
+export * from './history-export.js';
 export { NATIVE_CONTRACT_VERSION, runtimePlatform, validateNativeContract } from './native.js';
 export * from './cloud-client.js';
 

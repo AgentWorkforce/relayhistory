@@ -310,8 +310,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, syncAndPush, accessToken, replay, cloudLoadAuth, cloudResolveSession, cloudRefreshSession, cloudValidateExchangeBaseUrl, cloudLogin, enableCloud, pushCloud, installGitHooks, linkGitCommit, createShareableTrace } = nativeBinding
+const { historyDelivery, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionFileEditsPage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, syncAndPush, accessToken, replay, cloudLoadAuth, cloudResolveSession, cloudRefreshSession, cloudValidateExchangeBaseUrl, cloudLogin, enableCloud, pushCloud, installGitHooks, linkGitCommit, createShareableTrace } = nativeBinding
 
+module.exports.historyDelivery = historyDelivery
 module.exports.nativeContractVersion = nativeContractVersion
 module.exports.nativeBuildProfile = nativeBuildProfile
 module.exports.search = search

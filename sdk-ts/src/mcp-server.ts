@@ -9,8 +9,11 @@ import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync,
+  historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
 import { getSessionThread } from './cloud-client.js';
+
+import { loadHistoryApplicationConfig } from './delivery-cli.js';
 
 const READ = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
 // A lifecycle thread is served by the cloud recall API and never cached, so it
@@ -153,4 +156,21 @@ server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   source_connectors: SOURCE_CONNECTORS,
 }, ACQUIRE, ({ scope, source_connectors }) => call(() => sync({ scope, sourceConnectors: source_connectors })));
 
+server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
+  job_id: z.string().optional(),
+}, READ, ({ job_id }) => call(async () => ({ jobs: await historyDeliveryStatus(job_id), retention: await historyDeliveryRetention() })));
+for (const action of ['pause', 'resume', 'retry'] as const) {
+  server.tool(`delivery_${action}`, `${action} an already enabled delivery job.`, {
+    job_id: z.string().min(1),
+  }, { readOnlyHint: false, idempotentHint: true, openWorldHint: false }, ({ job_id }) => call(() => controlHistoryDelivery(job_id, action)));
+}
+// Only an explicitly named config may load installed modules. No package scan,
+// implicit enablement, credential probing, or background delivery at startup.
+if (process.env.AI_HIST_PLUGIN_CONFIG) {
+  const { registry } = await loadHistoryApplicationConfig(process.env.AI_HIST_PLUGIN_CONFIG);
+  for (const tool of registry.registeredTools()) {
+    server.tool(tool.name, tool.description, { input: z.record(z.string(), z.unknown()) }, ACQUIRE,
+      ({ input }) => call(() => tool.run(input)));
+  }
+}
 await server.connect(new StdioServerTransport());

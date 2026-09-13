@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { fileURLToPath } from 'node:url';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -268,12 +270,22 @@ test('get_session_thread is registered as a cloud-backed read', async () => {
   assert.match(mcp, /const CLOUD_READ = \{ readOnlyHint: true, idempotentHint: true, openWorldHint: true \}/);
 });
 
-test('the MCP server registers fourteen tools', async () => {
-  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
-  const names = [...mcp.matchAll(/server\.tool\('([a-z_]+)'/g)].map((match) => match[1]);
-  assert.equal(names.length, 14, `expected 14 tools, got ${names.length}: ${names.join(', ')}`);
-  assert.ok(names.includes('get_session_thread'));
-  assert.equal(new Set(names).size, names.length, 'tool names are unique');
+test('the MCP server registers eighteen unique tools without configured plugins', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'history-mcp-inventory-'));
+  const client = new Client({ name: 'inventory-fixture', version: '1' });
+  const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[0] !== 'AI_HIST_PLUGIN_CONFIG'));
+  Object.assign(env, { HOME: home, USERPROFILE: home, RELAYHISTORY_HOME: join(home, 'commercial'), AI_HIST_DB: join(home, 'history.db') });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('./mcp-server.js', import.meta.url))], env, stderr: 'pipe' });
+  try {
+    await client.connect(transport);
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    assert.equal(names.length, 18);
+    for (const name of ['get_session_thread', 'delivery_status', 'delivery_pause', 'delivery_resume', 'delivery_retry']) assert.ok(names.includes(name));
+    assert.equal(new Set(names).size, names.length, 'tool names are unique');
+  } finally {
+    await client.close(); await transport.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test('the tool inventories in both READMEs list get_session_thread', async () => {

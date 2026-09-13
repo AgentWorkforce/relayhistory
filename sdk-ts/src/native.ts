@@ -20,10 +20,11 @@ import {
 } from './sdk-common.js';
 import type { CloudPushResult, RelayhistoryAuth, ReplayOptions, ReplayResult } from './cloud-client.js';
 
-export const NATIVE_CONTRACT_VERSION = 12;
+export const NATIVE_CONTRACT_VERSION = 13;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
+  historyDelivery(requestJson: string, dbPath?: string): Promise<string>;
   accessToken(baseUrl?: string): Promise<string>;
   replay(sessionId: string, options: ReplayOptions): Promise<ReplayResult>;
   createShareableTrace(sessionId: string, visibility: string, source?: string, baseUrl?: string): Promise<string>;

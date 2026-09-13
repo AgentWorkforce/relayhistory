@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 12, catalog contract version 3, hydration contract version 2,
+version 13, catalog contract version 3, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -201,3 +201,18 @@ The SDK distinguishes unsupported platform, supported platform package
 missing, addon load failure, native/SDK contract mismatch, database-open
 failure, invalid argument, query failure, discovery failure, and sync failure.
 There is no alternate runtime after any native-load error.
+
+## Durable delivery and snapshot export
+
+`ai-hist-core::delivery` owns opt-in journaling, bounded snapshots, immutable
+queue/payload persistence, exact acknowledgments, retention, and fenced leases.
+The SDK host registers explicitly selected destination modules and runs the same
+drain loop for foreground and background delivery. Native contract 13 adds a
+typed serialized delivery/export bridge to the existing addon. No TypeScript or
+plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
+selection, failure states, background operation, and the independent NDJSON path.
+
+Core maintenance is bounded. The host expires abandoned snapshots and compacts
+consumed journal/receipt rows during drains; status exposes retained bytes and
+limits. The existing RelayHistory cloud package boundary and outbox migration
+remain separate from the generic coordinator.

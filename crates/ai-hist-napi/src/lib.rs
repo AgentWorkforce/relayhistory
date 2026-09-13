@@ -4,6 +4,8 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
+pub mod delivery;
+
 use std::path::{Path, PathBuf};
 
 use ai_hist_core::{
@@ -31,7 +33,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 12;
+pub const NATIVE_CONTRACT_VERSION: u32 = 13;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
