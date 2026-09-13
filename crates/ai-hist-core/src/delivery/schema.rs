@@ -73,6 +73,34 @@ pub(super) const TABLES: &[Table] = &[
         session: "id",
         key: &["id"],
     },
+    // Append new kinds: bootstrap_kind is a persisted index into this list.
+    Table {
+        name: "session_observations",
+        kind: "source_observation",
+        source: "source",
+        session: "session_id",
+        key: &[
+            "source",
+            "session_id",
+            "location",
+            "connector_id",
+            "connector_instance",
+        ],
+    },
+    Table {
+        name: "observation_evidence",
+        kind: "observation_evidence",
+        source: "source",
+        session: "session_id",
+        key: &[
+            "source",
+            "session_id",
+            "location",
+            "connector_id",
+            "connector_instance",
+            "evidence_uid",
+        ],
+    },
 ];
 
 impl Table {
@@ -168,6 +196,12 @@ CREATE TABLE IF NOT EXISTS delivery_exclusions (
     source TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(source,session_id)
 );
 "#)?;
+    // A pre-upgrade job/export has no snapshot boundary for newly introduced
+    // tables. Give it an empty historical snapshot; new observation writes are
+    // captured by the journal. A newly created generation exports current rows.
+    for kind in ["source_observation", "observation_evidence"] {
+        conn.execute("INSERT OR IGNORE INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT id,?,0 FROM delivery_jobs UNION ALL SELECT id,?,0 FROM history_exports",[kind,kind])?;
+    }
     // Count retained logical bytes, including key/payload duplication and row
     // overhead. This is a retention cap, not a promise about SQLite page size.
     for (table, size) in [

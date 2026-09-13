@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod convergence;
 /// Generic opt-in durable history export and delivery state.
 pub mod delivery;
+/// Connector-specific acquisition provenance and checkpoints.
+pub mod observations;
 /// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
 pub mod outbox;
 /// Delegation topology: recorded parent/child relationships and bounded,
@@ -104,7 +106,7 @@ pub enum SessionLocation {
 }
 
 impl SessionLocation {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Remote => "remote",
@@ -565,7 +567,9 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
-    Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)? && delivery::schema_is_current(conn)?)
+    Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
+        && delivery::schema_is_current(conn)?
+        && observations::schema_is_current(conn)?)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -1012,6 +1016,7 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    observations::init_schema(conn)?;
     delivery::init_schema(conn)?;
     Ok(())
 }

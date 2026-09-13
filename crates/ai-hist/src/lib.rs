@@ -42,6 +42,7 @@ mod relationships;
 /// Remote session connectors (claude.ai/code web sessions, Codex cloud tasks)
 /// and their availability reporting.
 pub mod remote;
+pub mod sources;
 
 pub mod replay;
 
@@ -616,6 +617,16 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
         total_inserted += open_inserted;
     }
     report.finish(db_path)?;
+    // Establish connector-owned locators from actual provider enumeration after
+    // ingestion, including on a checkpoint-only retry. Never infer an adapter
+    // from an old aggregate presence row.
+    let discovery_env = DiscoveryEnv::with_roots(conn, home, opencode);
+    discover::discover_sessions_with_providers(
+        &discovery_env,
+        &DiscoverOptions::default(),
+        &shallow_providers(),
+        |_| {},
+    )?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -725,6 +736,17 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     let inserted = sync_opencode_db(&conn, opencode_path)
         .map_err(|error| enrich_sync_error(db_path, error))?;
     sync_note!("  [opencode] +{inserted} rows");
+    let env = DiscoveryEnv::with_roots(&conn, home_dir(), opencode_path.to_path_buf());
+    let options = DiscoverOptions {
+        sources: vec!["opencode".into()],
+        ..Default::default()
+    };
+    discover::discover_sessions_with_connectors(
+        &env,
+        &options,
+        &remote::SourceConnectorSelection::new(Vec::new())?,
+        |_| {},
+    )?;
     Ok(true)
 }
 

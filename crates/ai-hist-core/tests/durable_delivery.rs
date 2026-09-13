@@ -423,6 +423,8 @@ INSERT INTO file_edits(source,session_id,tool_use_id,file_path,tool_name,structu
 INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES('codex','s','rel','child','delegation','observed','fixture',1,1);
 INSERT INTO session_commit_links(source,session_id,repo,commit_sha,match_method,confidence,created_at_ms) VALUES('codex','s','repo','sha','cwd',1,1);
 INSERT INTO trajectories(id,decisions_json,retrospective_json,search_text,updated_ms,timestamp_ms) VALUES('traj','[]','{}','',1,1);
+INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,updated_ms) VALUES('codex','s','remote','fixture','account','fixture://s','v1',1);
+INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES('codex','s','remote','fixture','account','record','{ "events": [] }');
 "#).unwrap();
     event(&conn, "a", "event");
     let mut cfg = config("all");
@@ -437,6 +439,14 @@ INSERT INTO trajectories(id,decisions_json,retrospective_json,search_text,update
         "[ 1 ]"
     );
     assert_eq!(by_kind["presence"].payload["location"], "remote");
+    assert_eq!(
+        by_kind["source_observation"].payload["connector_instance"],
+        "account"
+    );
+    assert_eq!(
+        by_kind["observation_evidence"].payload["payload_json"],
+        r#"{ "events": [] }"#
+    );
     assert_eq!(by_kind["history"].payload["git_branch"], "main");
     assert!(records
         .iter()
@@ -731,4 +741,76 @@ fn resume_checks_state_after_acquiring_the_write_transaction() {
     tx.commit().unwrap();
     assert!(resumer.join().unwrap().is_err());
     assert_eq!(status(&writer, &job.job_id).unwrap().state, "blocked");
+}
+
+#[test]
+fn observation_revisions_keep_instance_identity_and_deletions() {
+    let conn = db();
+    let mut cfg = config("observations");
+    cfg.selection.kinds = vec!["source_observation".into(), "observation_evidence".into()];
+    let job = create_job(&conn, &cfg, 0).unwrap();
+    drain(&conn, &job.job_id);
+    for account in ["first", "second"] {
+        conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,updated_ms) VALUES('claude','session','remote','fixture',?,'fixture://session',1)",[account]).unwrap();
+        conn.execute("INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES('claude','session','remote','fixture',?,'record','{\"v\":1}')",[account]).unwrap();
+    }
+    conn.execute(
+        "UPDATE session_observations SET source_stamp='v2' WHERE connector_instance='first'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE observation_evidence SET payload_json='{\"v\":2}' WHERE connector_instance='first'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM observation_evidence WHERE connector_instance='second'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM session_observations WHERE connector_instance='second'",
+        [],
+    )
+    .unwrap();
+    let rows = drain(&conn, &job.job_id);
+    assert_eq!(rows.len(), 8);
+    let observation_rows = rows
+        .iter()
+        .filter(|row| row.kind == "source_observation")
+        .collect::<Vec<_>>();
+    assert_eq!(observation_rows.len(), 4);
+    assert_ne!(observation_rows[0].record_id, observation_rows[1].record_id);
+    assert_eq!(observation_rows[0].record_id, observation_rows[2].record_id);
+    assert_ne!(
+        observation_rows[0].revision_id,
+        observation_rows[2].revision_id
+    );
+    assert_eq!(observation_rows[3].operation, "delete");
+    assert!(rows
+        .iter()
+        .any(|row| row.kind == "observation_evidence" && row.operation == "delete"));
+}
+
+#[test]
+fn old_delivery_generations_get_empty_bounds_for_new_observation_kinds() {
+    let conn = db();
+    let cfg = config("old");
+    let job = create_job(&conn, &cfg, 0).unwrap();
+    // Simulate a generation created before these kinds existed.
+    conn.execute("DELETE FROM delivery_bootstrap_bounds WHERE kind IN ('source_observation','observation_evidence')",[]).unwrap();
+    conn.execute_batch("DROP TRIGGER delivery_session_observations_insert;")
+        .unwrap();
+    init_db(&conn).unwrap();
+    let bounds:i64=conn.query_row("SELECT COUNT(*) FROM delivery_bootstrap_bounds WHERE job_id=? AND kind IN ('source_observation','observation_evidence') AND max_rowid=0",[&job.job_id],|row|row.get(0)).unwrap();
+    assert_eq!(bounds, 2);
+    assert!(drain(&conn, &job.job_id).is_empty());
+    conn.execute("INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,updated_ms) VALUES('claude','new','remote','fixture','account',1)",[]).unwrap();
+    // Frozen old selections do not silently gain a new exported evidence kind.
+    assert!(drain(&conn, &job.job_id).is_empty());
+    let mut next = config("new-generation");
+    next.selection.kinds = vec!["source_observation".into()];
+    let next = create_job(&conn, &next, 1).unwrap();
+    assert_eq!(drain(&conn, &next.job_id).len(), 1);
 }

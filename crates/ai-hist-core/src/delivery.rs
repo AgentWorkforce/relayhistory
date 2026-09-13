@@ -42,6 +42,8 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "relationship",
     "commit_link",
     "trajectory",
+    "source_observation",
+    "observation_evidence",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

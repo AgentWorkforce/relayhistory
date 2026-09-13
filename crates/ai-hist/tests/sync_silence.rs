@@ -43,6 +43,14 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
         count, 1,
         "the silent operation must actually ingest the provider fixture"
     );
+    let observations = ai_hist_core::observations::list(&conn, "claude", "first").unwrap();
+    assert_eq!(
+        observations.len(),
+        1,
+        "ordinary local sync must establish executing connector provenance"
+    );
+    assert_eq!(observations[0].key.connector_id, "claude");
+    assert_eq!(observations[0].raw_locator.as_deref(), transcript.to_str());
 }
 
 #[test]

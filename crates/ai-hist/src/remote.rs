@@ -90,23 +90,7 @@ const CLAUDE_EVIDENCE_PAGE_LIMIT: usize = 1_000;
 const MAX_REMOTE_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
-pub enum RemoteSessionEvidence {
-    ClaudeFull {
-        records: Vec<Value>,
-        source_stamp: String,
-        source_bytes: i64,
-    },
-    CodexDiff {
-        diff: String,
-        source_stamp: String,
-        source_bytes: i64,
-    },
-    CapabilityLimited {
-        code: &'static str,
-        message: String,
-    },
-}
+pub use crate::sources::AcquiredEvidence as RemoteSessionEvidence;
 
 /// Whether one remote connector can run on this machine, and why not when it
 /// cannot.
@@ -826,6 +810,19 @@ impl ClaudeWebProvider {
 }
 
 impl ShallowSessionProvider for ClaudeWebProvider {
+    fn acquire(
+        &self,
+        home: &Path,
+        observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<RemoteSessionEvidence> {
+        acquire_claude_remote_session_at(
+            home,
+            &observation.key.session_id,
+            &self.base_url,
+            self.transport.as_ref(),
+        )
+    }
+
     fn connector_id(&self) -> &str {
         CLAUDE_WEB_CONNECTOR
     }
@@ -1196,6 +1193,14 @@ impl CodexCloudProvider {
 }
 
 impl ShallowSessionProvider for CodexCloudProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<RemoteSessionEvidence> {
+        acquire_codex_remote_session(&observation.key.session_id)
+    }
+
     fn connector_id(&self) -> &str {
         CODEX_CLOUD_CONNECTOR
     }
@@ -1257,6 +1262,7 @@ impl ShallowSessionProvider for CodexCloudProvider {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct CloudProvider {
+    instance: String,
     auth: crate::cloud::StoredAuth,
     source: &'static str,
     limit: Option<usize>,
@@ -1265,7 +1271,18 @@ pub(crate) struct CloudProvider {
 
 impl CloudProvider {
     fn new(auth: crate::cloud::StoredAuth, source: &'static str, limit: Option<usize>) -> Self {
+        use sha2::{Digest, Sha256};
+        let instance = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}\0{}\0{}",
+                auth.base_url,
+                auth.org_id.as_deref().unwrap_or_default(),
+                auth.workspace_id.as_deref().unwrap_or_default()
+            ))
+        );
         Self {
+            instance,
             auth,
             source,
             limit,
@@ -1331,6 +1348,9 @@ fn map_cloud_session(value: &Value, org_id: &str) -> Result<(Candidate, ShallowS
 }
 
 impl ShallowSessionProvider for CloudProvider {
+    fn connector_instance(&self) -> &str {
+        &self.instance
+    }
     fn connector_id(&self) -> &str {
         CLOUD_CONNECTOR
     }
