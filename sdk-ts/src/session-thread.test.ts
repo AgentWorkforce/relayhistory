@@ -597,7 +597,7 @@ test('limit is sent when given and rejected when out of the route range', async 
 /** A fetch stand-in that answers the thread route by token and the refresh route by script. */
 function rotatingFetch(opts: {
   accept: string[];
-  refresh?: { accessToken: string; refreshToken: string; expiresAt?: string } | 'reject';
+  refresh?: { accessToken: string; refreshToken: string; expiresAt?: string; orgId?: string } | 'reject';
 }) {
   const calls: string[] = [];
   const impl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -609,6 +609,7 @@ function rotatingFetch(opts: {
         accessToken: opts.refresh.accessToken,
         refreshToken: opts.refresh.refreshToken,
         accessTokenExpiresAt: opts.refresh.expiresAt ?? HOUR_AHEAD,
+        ...(opts.refresh.orgId !== undefined ? { orgId: opts.refresh.orgId } : {}),
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     const bearer = new Headers(init?.headers).get('authorization')?.replace('Bearer ', '') ?? '';
@@ -649,6 +650,25 @@ test('a rejected token is rotated once and the new pair is persisted', async () 
     assert.equal(stored.org_id, 'org-example', 'the org survives rotation');
     assert.equal(stored.base_url, 'https://history.agentrelay.com');
   });
+});
+
+test('rotation adopts a reported org, and a blank one never erases the stored org', async () => {
+  for (const [reported, expected] of [['org-reported', 'org-reported'], ['   ', 'org-example']] as const) {
+    await withStores(async ({ nativeHome }) => {
+      await writeStage(nativeHome, 'stage', {
+        base_url: 'https://history.agentrelay.com',
+        access_token: 'rth_at_old',
+        refresh_token: 'rth_rt_old',
+        ...ELIGIBLE,
+      });
+      const { impl } = rotatingFetch({
+        accept: ['rth_at_new'],
+        refresh: { accessToken: 'rth_at_new', refreshToken: 'rth_rt_new', orgId: reported },
+      });
+      await getSessionThread({ source: 'claude', sessionId: 'sid' }, { fetchImpl: impl });
+      assert.equal((await readStage(nativeHome)).org_id, expected, `reported ${JSON.stringify(reported)}`);
+    });
+  }
 });
 
 test('rotation preserves native-store fields this SDK does not model', async () => {

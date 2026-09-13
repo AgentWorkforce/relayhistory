@@ -257,6 +257,21 @@ pub fn ensure_remote_connectors_configured_for_at(
         statuses.iter().any(|status| status.configured),
         unconfigured_message(operation, &statuses)
     );
+    // Another connector being signed in is enough to pass the gate, but the cloud
+    // connector is the only one that serves this org's pushed history. Without this
+    // line a machine with claude.ai or Codex credentials and a cloud session that
+    // `recall_auth` refuses got an empty `--remote` answer with exit 0 and no hint
+    // why, which read as "the cloud holds nothing".
+    if let Some(cloud) = statuses
+        .iter()
+        .find(|status| status.connector == CLOUD_CONNECTOR && !status.configured)
+    {
+        eprintln!(
+            "warning: remote session {operation} is running without the cloud connector, so \
+             pushed history is not included ({})",
+            cloud.detail
+        );
+    }
     Ok(())
 }
 
