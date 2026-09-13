@@ -8,9 +8,10 @@ metadata and session resolution/refresh operations. User-facing setup is in
 ## Authentication contract
 
 The Rust cloud layer owns login, credential loading, stage selection, and token
-rotation. `loginCloud` and `loadStoredRelayhistoryAuth` from `ai-hist` and
-`ai-hist/cloud` are the same functions. Thread reads delegate credential
-resolution and refresh to Rust. `SessionThreadOptions.fetchImpl` handles only
+rotation. `ai-hist/cloud` owns the SDK cloud wrappers; the root `ai-hist`
+entrypoint re-exports them. Shared internal modules provide native loading and
+SDK errors without a dependency from cloud back to the root. Thread reads
+delegate credential resolution and refresh to Rust. `SessionThreadOptions.fetchImpl` handles only
 thread GET requests and their retries; authentication requests use the native
 HTTP client. A custom `resolveSession` returning `{ auth }` without `session: true`
 disables automatic refresh for isolated mocks or caller-managed credentials.
@@ -75,10 +76,12 @@ a PR created after installation.
   [replay tests](../crates/ai-hist/tests/replay.rs): storage, transport, concurrency,
   stage selection, and command behavior.
 
-Local validation for this implementation passed 129 SDK tests, 286 Rust engine
+Local validation for this implementation passed 130 SDK tests, 286 Rust engine
 library tests, and 28 Rust token/replay integration tests. The focused auth suite
 passed its missing-refresh-token and failed-persistence cases. The SDK and native
-debug builds passed.
+debug builds passed. The packed SDK supports importing `ai-hist/cloud` first,
+root re-exports of every cloud operation, native calls, and TypeScript consumers
+of both entrypoints.
 
 Run the checks from the repository root:
 

@@ -44,6 +44,8 @@
   "homepage": "https://github.com/AgentWorkforce/relayhistory",
   "files": [
     "dist/index.*",
+    "dist/native.*",
+    "dist/sdk-common.*",
     "dist/cli.*",
     "dist/mcp-server.*",
     "dist/cloud-client.*",

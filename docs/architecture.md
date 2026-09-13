@@ -33,9 +33,10 @@ open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
 The Rust cloud layer (`crates/ai-hist/src/cloud.rs`) owns RelayHistory token
 exchange, stage selection, credential storage, and refresh. The SDK exposes
-those operations through N-API. The `ai-hist` and `ai-hist/cloud` package
-entrypoints share the same login and credential functions; the CLI and MCP
-server use the SDK.
+those operations through the `ai-hist/cloud` entrypoint. The root `ai-hist`
+entrypoint re-exports the cloud API; the CLI and MCP server use the SDK. Both
+entrypoints use the shared internal native loader and error definitions, and
+the cloud module does not depend on the root module.
 
 Each normalized service URL has a credential file and sync cursor under
 `$RELAYHISTORY_HOME/stages` (default `~/.agentworkforce/relayhistory/stages`).

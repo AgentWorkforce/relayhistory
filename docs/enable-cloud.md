@@ -61,8 +61,9 @@ explicit session IDs, Git notes, and separate upload.
 ## Authentication and stages
 
 The Rust cloud layer owns RelayHistory login, credential loading, and token
-rotation. The `ai-hist` and `ai-hist/cloud` SDK exports call it through N-API;
-the npm CLI and MCP server use those SDK functions.
+rotation. `ai-hist/cloud` owns the SDK wrappers that call it through N-API.
+The root `ai-hist` entrypoint re-exports that cloud API, and the npm CLI and
+MCP server use those SDK functions.
 
 Credentials and sync cursors live under `$RELAYHISTORY_HOME/stages`, defaulting
 to `~/.agentworkforce/relayhistory/stages`. Each normalized service URL has its

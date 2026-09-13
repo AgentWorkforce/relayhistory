@@ -11,6 +11,14 @@ import * as cloud from 'ai-hist/cloud';
 
 const FUTURE = '2999-01-01T00:00:00Z';
 
+test('the root SDK re-exports every cloud operation', () => {
+  for (const [name, operation] of Object.entries(cloud)) {
+    assert.equal(typeof operation, 'function', `${name} is a cloud operation`);
+    assert.equal((main as Record<string, unknown>)[name], operation, `${name} is the same function through both imports`);
+  }
+  assert.equal('nativeCall' in main, false, 'the native adapter stays internal');
+});
+
 test('both public imports share login, stage selection, metadata, storage and rotation', { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'ai-hist-one-auth-'));
   const saved = { ...process.env };
