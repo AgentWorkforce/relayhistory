@@ -78,7 +78,7 @@ fn normalize_base_url(value: &str) -> Option<String> {
     Some(parsed.to_string().trim_end_matches('/').to_string())
 }
 
-fn normalized_stage(value: &str) -> Result<String> {
+pub(crate) fn normalized_stage(value: &str) -> Result<String> {
     normalize_base_url(value).with_context(|| {
         format!(
             "invalid relayhistory base URL `{}`; expected an absolute URL without credentials, query, or fragment",
@@ -102,7 +102,7 @@ fn normalized_stage(value: &str) -> Result<String> {
 /// This is applied at every call site rather than only the newest one. Guarding `coverage`
 /// alone would have left the high-frequency `push` path sending the same token to the same
 /// URL — an inconsistent CLI that closes none of the exposure.
-fn require_secure_transport(base_url: &str) -> Result<()> {
+pub(crate) fn require_secure_transport(base_url: &str) -> Result<()> {
     let normalized = normalized_stage(base_url)?;
     let url = normalized.as_str();
     if url.starts_with("https://") {
@@ -912,7 +912,17 @@ fn send_with_auth_refresh(
     send: impl Fn(&StoredAuth) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
     map_error: impl Fn(ureq::Error) -> anyhow::Error,
 ) -> Result<ureq::Response> {
+    send_with_auth_refresh_checked(auth, send, map_error, |_| Ok(()))
+}
+
+pub(crate) fn send_with_auth_refresh_checked(
+    auth: &StoredAuth,
+    send: impl Fn(&StoredAuth) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    map_error: impl Fn(ureq::Error) -> anyhow::Error,
+    check: impl Fn(&StoredAuth) -> Result<()>,
+) -> Result<ureq::Response> {
     let attempted = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+    check(&attempted)?;
     let mut unauthorized = match send(&attempted) {
         Ok(response) => return Ok(response),
         Err(error) if is_unauthorized(&error) => *error,
@@ -924,6 +934,7 @@ fn send_with_auth_refresh(
 
     // A concurrent process may have completed rotation while this caller waited. Try its
     // persisted access token before touching the one-time refresh token again.
+    check(&current)?;
     if current.access_token != attempted.access_token {
         match send(&current) {
             Ok(response) => return Ok(response),
@@ -940,6 +951,7 @@ fn send_with_auth_refresh(
         return Err(map_error(unauthorized));
     }
     let refreshed = refresh_and_save_auth(&current)?;
+    check(&refreshed)?;
     send(&refreshed).map_err(|error| map_error(*error))
 }
 

@@ -1,7 +1,9 @@
 //! Optional RelayHistory authentication, legacy mapping and transports.
 //! Local history packages never depend on this crate.
 pub mod cloud;
+pub mod compat;
 pub mod convergence;
+pub mod destination;
 pub mod helper;
 pub mod legacy_cli;
 pub mod outbox;

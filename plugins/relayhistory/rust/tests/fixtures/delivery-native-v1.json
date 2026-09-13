@@ -1,0 +1,79 @@
+{
+  "protocolVersion": 1,
+  "batch": {
+    "account_id": "relayhistory:9939d7a303cbb84809ac6e2356d23856de8a2cf59f7f53258710febf7a3cfe51",
+    "batch_id": "25007a3a5d04f75bbc3f4d3ce847b3c0",
+    "destination_id": "relayhistory",
+    "generation": 1,
+    "instance_id": "synthetic-fixture",
+    "job_id": "b1a389ff555fd609c1fc6b62ec708644",
+    "mapping_version": "1",
+    "origin_id": "7d185f60f8bf2ebb2edfd367bc111f35",
+    "records": [
+      {
+        "kind": "history",
+        "operation": "upsert",
+        "origin_id": "7d185f60f8bf2ebb2edfd367bc111f35",
+        "payload": {
+          "git_branch": null,
+          "id": 1,
+          "project": "/fixture/project",
+          "prompt": "offlinefixture both",
+          "prompt_hash": "6cad39b67c965eaf",
+          "session_id": "both",
+          "source": "claude",
+          "timestamp_ms": 1788256800000
+        },
+        "record_id": "504ae5a01c86732b5cd26d371738d6324f6d88700f2d822fffb8f8dc54afa84b",
+        "revision": 1,
+        "revision_id": "3ccdc2113f1bdb57ab9a07e8a0fe0cbadf10f9003d1db3c75ac5d3b08d12ed84",
+        "schema_version": 1,
+        "session_id": "both",
+        "source": "claude"
+      },
+      {
+        "kind": "history",
+        "operation": "upsert",
+        "origin_id": "7d185f60f8bf2ebb2edfd367bc111f35",
+        "payload": {
+          "git_branch": null,
+          "id": 2,
+          "project": "/fixture/project",
+          "prompt": "offlinefixture local-only",
+          "prompt_hash": "1815e47521ee00b2",
+          "session_id": "local-only",
+          "source": "claude",
+          "timestamp_ms": 1788256800000
+        },
+        "record_id": "6cf46848932e5b2d58647c6e98ef497ff7ac62d6725c527ac0f4f22c47f36085",
+        "revision": 1,
+        "revision_id": "28e1e1c614956c1fbd892331cab6e5c6aa92e9e0c06ed95c9cb12ea0c96f9366",
+        "schema_version": 1,
+        "session_id": "local-only",
+        "source": "claude"
+      },
+      {
+        "kind": "history",
+        "operation": "upsert",
+        "origin_id": "7d185f60f8bf2ebb2edfd367bc111f35",
+        "payload": {
+          "git_branch": null,
+          "id": 3,
+          "project": "/fixture/project",
+          "prompt": "offlinefixture remote-only",
+          "prompt_hash": "a5142b1ee28252bc",
+          "session_id": "remote-only",
+          "source": "claude",
+          "timestamp_ms": 1788256800000
+        },
+        "record_id": "15f191125cdd8e40a7786a158e5818d25ae573a7c80d2752eaed10c3b76706cb",
+        "revision": 1,
+        "revision_id": "d9f76c8b7cc1e6e192f8d466ad5caa92d12faaefcad439aa837d19575cd04f1c",
+        "schema_version": 1,
+        "session_id": "remote-only",
+        "source": "claude"
+      }
+    ],
+    "schema_version": 1
+  }
+}

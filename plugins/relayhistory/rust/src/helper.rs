@@ -16,6 +16,9 @@ pub struct Request {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Arguments {
+    pub read_options: Option<crate::destination::ReadOptions>,
+    pub batch: Option<ai_hist_core::delivery::HistoryExportBatch>,
+    pub prepared: Option<ai_hist_core::delivery::PreparedPayload>,
     pub base_url: Option<String>,
     pub db_path: Option<String>,
     pub now: Option<i64>,
@@ -43,7 +46,20 @@ fn execute(request: Request) -> Result<Value> {
     let a = request.args;
     let base = a.base_url.as_deref();
     Ok(match request.operation.as_str() {
+        "deliveryRead" => serde_json::to_value(crate::destination::read_page(
+            base,
+            &a.read_options.context("readOptions required")?,
+        )?)?,
+        "deliveryAccount" => json!(crate::destination::selected_account(base)?),
+        "deliveryPrepare" => serde_json::to_value(crate::destination::prepare(
+            a.batch.context("batch required")?,
+        )?)?,
+        "deliverySend" => serde_json::to_value(crate::destination::send(
+            base,
+            &a.prepared.context("prepared required")?,
+        )?)?,
         "accessToken" => json!(cloud::access_token(base)?),
+        "syncAndPush" => serde_json::to_value(crate::compat::sync_and_push()?)?,
         "cloudLoadAuth" => cloud::load_selected_auth(base)?
             .map(auth_value)
             .unwrap_or(Value::Null),
@@ -112,6 +128,9 @@ fn execute(request: Request) -> Result<Value> {
 }
 /// Reply with a fixed safe error category. Raw errors may contain HTTP response bodies.
 pub fn handle(request: Request) -> Value {
+    if request.version != 1 {
+        return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Unsupported helper protocol version"}});
+    }
     let code = match request.operation.as_str() {
         "accessToken" => "CLOUD_AUTH_FAILED",
         "replay" => "REPLAY_FAILED",
@@ -119,13 +138,17 @@ pub fn handle(request: Request) -> Value {
         "cloudRefreshSession" => "CONNECTOR_FAILURE",
         "cloudValidateExchangeBaseUrl" | "cloudLogin" => "CLOUD_LOGIN_FAILED",
         "enableCloud" => "CLOUD_ENABLE_FAILED",
-        "pushCloud" => "CLOUD_PUSH_FAILED",
+        "pushCloud" | "syncAndPush" => "CLOUD_PUSH_FAILED",
         "createShareableTrace" => "CLOUD_SHARE_FAILED",
         _ => "INVALID_ARGUMENT",
     };
     match execute(request) {
         Ok(value) => json!({"version":1,"ok":true,"value":value}),
-        Err(_) => {
+        Err(error) => {
+            let code = error
+                .downcast_ref::<crate::destination::TransportFailure>()
+                .map(|error| error.code())
+                .unwrap_or(code);
             json!({"version":1,"ok":false,"error":{"code":code,"message":"RelayHistory operation failed; verify the selected stage, credentials and connectivity"}})
         }
     }
