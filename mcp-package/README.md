@@ -45,13 +45,13 @@ server-side; there is no org parameter. `kinds` filters `link_kind`, `since`
 bounds link event time, and `limit` (1-500, default 100) with `cursor` pages the
 links; outcomes come back whole on every page.
 
-Credentials come from whichever store holds a session: the native `ai-hist
-login` store (`RELAYHISTORY_HOME`, else `~/.agentworkforce/relayhistory`) is
-read first, then this SDK's own `~/.config/ai-hist/auth.json`. With more than
-one stage stored and no `AI_HIST_BASE_URL` naming one, the tool refuses to
-guess rather than answer about the wrong org.
+Credentials come exclusively from the native stage store
+(`$RELAYHISTORY_HOME/stages`, default `~/.agentworkforce/relayhistory/stages`).
+`RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`; with multiple
+stages and no selection, the tool refuses to guess. Obsolete single-file SDK
+and native stores are ignored; run `ai-hist login` again if needed.
 
-A native-store session must meet the same bar the engine's `cloud` connector
+A stored session must meet the same bar the engine's `cloud` connector
 applies to recall — an `rth_at_` access token, an expiry at least 60s away, and
 a recorded org for provenance. A session missing a token prefix or an org is one the
 connector itself reports as unconfigured, so the tool reports it the same way
@@ -59,9 +59,8 @@ and names the missing precondition rather than issuing a request that would
 fail. `ai-hist login` restores them.
 
 Expiry is the exception, because rotation exists to repair it: a rejected
-session with a refresh token is rotated once and the new pair persisted over
-the file it came from, in that store's own schema, so the CLI and the MCP stay
-in step. A pair another process rotated first is adopted rather than spending
+session with a refresh token is rotated under the native stage lock and the
+new pair saved atomically, so the CLI and the MCP stay in step. A pair another process rotated first is adopted rather than spending
 the one-time refresh token again. Only a session with nothing left to rotate
 reports expiry as unconfigured.
 

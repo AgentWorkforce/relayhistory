@@ -485,3 +485,24 @@ tests, where this PR began with 11 and 8. `tsc` 0, `npm test` 0 with 110/110,
 `scripts` 10/10, contract 9, `index.d.ts` clean. Against the repacked and
 reinstalled artifact both suites pass, `replay` renders and paginates, and
 `$(ai-hist token)` captures a real token.
+
+
+## Auth consolidation: hard cut to the stage store
+
+The split-auth and deferred-deduplication notes above describe the previous
+implementation. Both public SDK imports now share the native login and credential
+loader. TypeScript no longer reads, writes, selects, or rotates credential files.
+Thread reads delegate selection, eligibility, and locked rotation to the Rust
+cloud layer; login results retain expiry, org, and workspace metadata through N-API.
+
+Legacy SDK and native single-file auth/cursor loading, field aliases, migration,
+and cross-store ambiguity probes have been removed. Only the canonical stage
+store is supported. Old files are ignored; their users must log in again.
+The native contract is now 11 so an older binding cannot silently drop metadata
+or omit the shared resolver/refresh entrypoints.
+
+Regression coverage exercises both package imports, environment precedence,
+explicit stage selection, ambiguous stages, transport rejection, metadata and
+private writes, ignored obsolete stores, and concurrent thread refresh through
+the native stage lock. The architecture guard forbids auth storage and refresh
+implementations in the TypeScript cloud client.

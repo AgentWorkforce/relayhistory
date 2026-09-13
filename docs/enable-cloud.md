@@ -60,12 +60,10 @@ explicit session IDs, Git notes, and separate upload.
 
 Agent Relay Cloud login and refresh use the bundled Agent Relay SDK and its shared
 `~/.agentworkforce/relay/cloud-auth.json` session. RelayHistory token exchange,
-URL normalization, migration, stage hashing, atomic state writes, cursor locks,
+URL normalization, stage hashing, atomic state writes, cursor locks,
 and outbox batching remain in Rust. The compatibility
-`ai-hist/cloud` export now reads the same Rust store as the engine. It imports the
-old `~/.config/ai-hist/auth.json` only if the requested stage lacks canonical
-credentials; stale SDK tokens never overwrite refreshed Rust tokens. No new
-TypeScript auth store is written. Multiple stages require an explicit selection.
+`ai-hist/cloud` export uses the same Rust credential implementation as the engine.
+Multiple stages require an explicit selection.
 A new stage starts from its own cursor; enabling cloud never seeds it from the
 local maximum or another stage's watermark.
 
@@ -76,3 +74,10 @@ Private links can be read with an authenticated HTTP client; there is no browser
 login page on the share route yet. The creator must own the session. Later events
 are excluded. Revoke with authenticated `DELETE /v1/shares/:token`. The server
 caps snapshots at 10,000 events and 5 MB and rejects oversized sessions explicitly.
+
+RelayHistory has one credential implementation in the Rust cloud layer. Both
+`ai-hist` and `ai-hist/cloud` use the stage files under
+`$RELAYHISTORY_HOME/stages` (default `~/.agentworkforce/relayhistory/stages`).
+The former `~/.config/ai-hist/auth.json` and native single-file `auth.json` and
+`cursor.json` layouts are no longer read or migrated. Run `ai-hist login` again
+if your credentials exist only in those files. Existing stage files remain valid.

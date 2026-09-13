@@ -31,16 +31,12 @@ const DEFAULT_BASE_URL: &str = "https://history.agentrelay.com";
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredAuth {
     /// Base URL of the relayhistory-cloud service, e.g. `http://localhost:8787`.
-    #[serde(alias = "baseUrl")]
     pub base_url: String,
-    #[serde(alias = "accessToken")]
     pub access_token: String,
-    /// Server-issued expiry (RFC 3339). Legacy sessions without this remain
-    /// usable by push, but cannot advertise recall availability until login/refresh.
-    #[serde(default, alias = "accessTokenExpiresAt")]
+    /// Server-issued expiry (RFC 3339). Missing expiry requires refresh.
+    #[serde(default)]
     pub access_token_expires_at: Option<String>,
     #[serde(default)]
-    #[serde(alias = "refreshToken")]
     pub refresh_token: Option<String>,
     /// Local cache only — never authoritative; the server owns tenancy from the token.
     #[serde(default)]
@@ -143,30 +139,6 @@ fn authority_is_loopback(rest: &str) -> bool {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn legacy_auth_path() -> PathBuf {
-    config_dir().join("auth.json")
-}
-
-/// The TypeScript SDK's pre-stages credential file. Distinct from
-/// [`legacy_auth_path`], which is the native store's own one-file layout.
-fn sdk_legacy_auth_path() -> PathBuf {
-    std::env::var_os("AI_HIST_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .unwrap_or_default(),
-            )
-            .join(".config/ai-hist")
-        })
-        .join("auth.json")
-}
-
-fn legacy_cursor_path() -> PathBuf {
-    config_dir().join("cursor.json")
 }
 
 fn stage_key(base_url: &str) -> Result<String> {
@@ -281,25 +253,10 @@ pub fn load_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
             );
             return Ok(Some(auth));
         }
-        let legacy = legacy_auth_path();
-        if !legacy.exists() {
-            return Ok(None);
-        }
-        let auth = read_auth(&legacy)?;
-        return Ok(same_stage(&auth.base_url, base_url).then_some(auth));
+        return Ok(None);
     }
 
-    let mut auths = staged_auths()?;
-    let legacy = legacy_auth_path();
-    if legacy.exists() {
-        let legacy_auth = read_auth(&legacy)?;
-        if !auths
-            .iter()
-            .any(|auth| same_stage(&auth.base_url, &legacy_auth.base_url))
-        {
-            auths.push(legacy_auth);
-        }
-    }
+    let auths = staged_auths()?;
     match auths.len() {
         0 => Ok(None),
         1 => Ok(auths.into_iter().next()),
@@ -314,39 +271,13 @@ fn ambiguous_stage_error(count: usize) -> String {
     )
 }
 
-/// Refuse when more than one stage is configured across the native store and the
-/// TypeScript SDK's legacy store. Mirrors `resolveCloudSession()` in the SDK.
-fn refuse_ambiguous_stages() -> Result<()> {
-    let mut auths = staged_auths()?;
-    for path in [legacy_auth_path(), sdk_legacy_auth_path()] {
-        if !path.exists() {
-            continue;
-        }
-        // Treat parse or I/O failure as absent, like loadStoredRelayhistoryAuth() in the SDK
-        let auth = match read_auth(&path) {
-            Ok(auth) => auth,
-            Err(_) => continue,
-        };
-        if !auths
-            .iter()
-            .any(|stored| same_stage(&stored.base_url, &auth.base_url))
-        {
-            auths.push(auth);
-        }
-    }
-    match auths.len() {
-        0 | 1 => Ok(()),
-        count => anyhow::bail!(ambiguous_stage_error(count)),
-    }
-}
-
 /// The stage selected by the environment, if any. A non-empty value that does not
 /// normalize is a mistake rather than a request for production: reject it, because
 /// default_base_url() would silently substitute the production origin. Never echo
 /// the value — normalize_base_url rejects URLs carrying embedded credentials, so a
 /// rejected value is exactly the kind that may hold one.
 ///
-/// access_token and load_sdk_auth must share this: when they disagreed about what
+/// access_token and load_selected_auth must share this: when they disagreed about what
 /// counts as a selection, a malformed selector silently meant production.
 fn env_selected_stage() -> Result<Option<String>> {
     match ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
@@ -367,7 +298,7 @@ fn env_selected_stage() -> Result<Option<String>> {
 ///
 /// Callers that synthesize a destination with default_base_url() and then pass it as
 /// though the user chose it lose that check: default_base_url() swallows a malformed
-/// value and returns production, and load_sdk_auth cannot tell a synthesized origin
+/// value and returns production, and load_selected_auth cannot tell a synthesized origin
 /// from a deliberate one.
 pub fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
     Ok(resolve_stage(base_url)?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()))
@@ -375,7 +306,7 @@ pub fn resolve_base_url(base_url: Option<&str>) -> Result<String> {
 
 /// The selected stage, preserving the difference between "no selection" and
 /// "production". Callers that must end up somewhere use resolve_base_url; callers
-/// that pass the result to load_auth/load_sdk_auth must use this, because turning
+/// that pass the result to load_auth/load_selected_auth must use this, because turning
 /// an absent selection into production suppresses the multi-stage refusal — the
 /// caller would silently read production instead of being told to choose.
 pub fn resolve_stage(base_url: Option<&str>) -> Result<Option<String>> {
@@ -396,32 +327,10 @@ fn sanitize_auth_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 /// Return an access token with at least 60 seconds of recorded validity remaining.
-/// Unknown legacy expiry is refreshed too: an opaque token cannot prove its own lifetime.
+/// Missing expiry is refreshed too: an opaque token cannot prove its own lifetime.
 pub fn access_token(base_url: Option<&str>) -> Result<String> {
-    let explicit_base = base_url.map(normalized_stage).transpose()?;
-    // An explicit destination wins outright; the environment is not consulted, so
-    // a broken variable cannot block a caller who already chose a stage.
-    let env_base = match explicit_base {
-        Some(_) => None,
-        None => env_selected_stage()?,
-    };
-    // Resolve the destination with the SDK loader, not load_auth: npm users
-    // upgrading from the TypeScript client have credentials only in
-    // ~/.config/ai-hist/auth.json. token is one of the two commands this exists
-    // to deliver, so it must migrate that store the same way enableCloud,
-    // pushCloud, loadStoredRelayhistoryAuth and shares do.
-    let load = |base: Option<&str>| load_sdk_auth(base).map_err(sanitize_auth_error);
-    let selected = explicit_base.or(env_base);
-    if selected.is_none() {
-        // SDK-first resolution must still mirror resolveCloudSession()'s refusal
-        // across both the native stage store and ~/.config/ai-hist/auth.json.
-        // load_sdk_auth returns a native credential before consulting the SDK
-        // store, so an ambiguity probe here is required when no selector is set.
-        refuse_ambiguous_stages().map_err(sanitize_auth_error)?;
-    }
-    // SDK-first resolution: use load_sdk_auth consistently, just like resolveCloudSession()
-    let base_for_load = selected.as_deref();
-    let mut auth = load(base_for_load)?
+    let load = load_selected_auth;
+    let mut auth = load(base_url)?
         .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
     let base = auth.base_url.clone();
     if !token_has_valid_lifetime(&auth) {
@@ -460,45 +369,14 @@ fn token_has_valid_lifetime(auth: &StoredAuth) -> bool {
     })
 }
 
-/// Store a session only under its base URL. If upgrading from the old one-file layout, preserve
-/// that old stage and cursor before adding the new one; overwriting it is exactly what caused
-/// cross-stage cursor corruption.
+/// Store a session atomically under its normalized stage URL.
 pub fn save_auth(auth: &StoredAuth) -> Result<()> {
-    migrate_legacy_stage()?;
     let mut stored = auth.clone();
     stored.base_url = normalized_stage(&auth.base_url)?;
     write_private(
         &auth_path(&stored.base_url)?,
         &serde_json::to_string_pretty(&stored)?,
     )
-}
-
-fn migrate_legacy_stage() -> Result<()> {
-    let legacy_auth = legacy_auth_path();
-    if !legacy_auth.exists() {
-        return Ok(());
-    }
-    let mut auth = read_auth(&legacy_auth)?;
-    auth.base_url = normalized_stage(&auth.base_url)?;
-    let staged_auth_path = auth_path(&auth.base_url)?;
-    if !staged_auth_path.exists() {
-        write_private(&staged_auth_path, &serde_json::to_string_pretty(&auth)?)?;
-    }
-
-    let legacy_cursor = legacy_cursor_path();
-    if legacy_cursor.exists() {
-        let staged_cursor = cursor_path(&auth.base_url)?;
-        if !staged_cursor.exists() {
-            let body = fs::read_to_string(&legacy_cursor)?;
-            write_private(&staged_cursor, &body)?;
-        }
-    }
-
-    fs::remove_file(legacy_auth)?;
-    if legacy_cursor.exists() {
-        fs::remove_file(legacy_cursor)?;
-    }
-    Ok(())
 }
 
 pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
@@ -508,19 +386,7 @@ pub fn load_cursor(base_url: &str) -> Result<SyncCursor> {
         return serde_json::from_str(&body).context("parsing stage-scoped cursor.json");
     }
 
-    // Compatibility for an existing single-stage install. The next successful push writes the
-    // scoped path; a subsequent login migrates it eagerly with the corresponding auth session.
-    let legacy_auth = legacy_auth_path();
-    let legacy = legacy_cursor_path();
-    if !legacy_auth.exists() || !legacy.exists() {
-        return Ok(SyncCursor::default());
-    }
-    let auth = read_auth(&legacy_auth)?;
-    if !same_stage(&auth.base_url, base_url) {
-        return Ok(SyncCursor::default());
-    }
-    let body = fs::read_to_string(&legacy)?;
-    serde_json::from_str(&body).context("parsing legacy cursor.json")
+    Ok(SyncCursor::default())
 }
 
 pub fn save_cursor(base_url: &str, cursor: &SyncCursor) -> Result<()> {
@@ -1076,6 +942,26 @@ fn send_with_auth_refresh(
     send(&refreshed).map_err(|error| map_error(*error))
 }
 
+/// Retry a rejected SDK bearer using the same locked rotation as native transports.
+pub fn refresh_rejected_auth(base_url: &str, rejected_token: &str) -> Result<Option<StoredAuth>> {
+    require_secure_transport(base_url)?;
+    let _refresh_lock = acquire_refresh_lock(base_url)?;
+    let Some(current) = load_auth(Some(base_url))? else {
+        return Ok(None);
+    };
+    if current.access_token != rejected_token {
+        return Ok(Some(current));
+    }
+    if current
+        .refresh_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    refresh_and_save_auth(&current).map(Some)
+}
+
 // Callers hold the stage refresh lock and reload the current pair before entering.
 fn refresh_and_save_auth(auth: &StoredAuth) -> Result<StoredAuth> {
     let refreshed = refresh_auth(auth).context("refreshing relayhistory session")?;
@@ -1338,16 +1224,15 @@ fn map_http_err(e: ureq::Error) -> anyhow::Error {
 /// Resolve recall credentials using the same stage selection and storage as push.
 /// This is read-only: status probes must never refresh, log in, or fail hard.
 pub fn recall_auth() -> Result<StoredAuth> {
-    let explicit_stage = ["RELAYHISTORY_BASE_URL", "AI_HIST_BASE_URL"]
-        .iter()
-        .any(|key| {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| normalize_base_url(&v))
-                .is_some()
-        });
-    let base = explicit_stage.then(default_base_url);
-    let auth = load_auth(base.as_deref())?
+    resolve_recall_auth(None, chrono::Utc::now().timestamp_millis(), false)
+}
+
+pub fn resolve_recall_auth(
+    base_url: Option<&str>,
+    now: i64,
+    allow_refresh: bool,
+) -> Result<StoredAuth> {
+    let auth = load_selected_auth(base_url)?
         .context("no stored relayhistory session (run `ai-hist login`)")?;
     require_secure_transport(&auth.base_url)?;
     anyhow::ensure!(
@@ -1358,11 +1243,12 @@ pub fn recall_auth() -> Result<StoredAuth> {
         .access_token_expires_at
         .as_deref()
         .and_then(crate::parse_iso_ms);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    anyhow::ensure!(expiry.is_some_and(|expiry| expiry >= now.saturating_add(60_000)),
+    let can_refresh = allow_refresh
+        && auth
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+    anyhow::ensure!(can_refresh || expiry.is_some_and(|expiry| expiry >= now.saturating_add(60_000)),
         "stored relayhistory access-token expiry is missing, invalid, or less than 60s away (run `ai-hist login`)");
     // Recall rollups omit tenancy; the locally cached org is needed only for
     // provenance markers, never sent to the service as an authorization selector.
@@ -1994,33 +1880,10 @@ fn humanize_secs(secs: u64) -> String {
     }
 }
 
-/// Read the canonical stage store, importing the old TypeScript store only when
-/// no credential exists for that destination. Never let a stale SDK token replace
-/// a refreshed Rust token, and retain load_auth's refusal to guess between stages.
-pub fn load_sdk_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
-    // An explicit destination wins outright, so a malformed variable must not
-    // block a caller who already chose a stage. Only when nothing was passed does
-    // the environment decide, and then a malformed value is an error rather than a
-    // silent fallback to production.
-    let env_base = match base_url {
-        Some(_) => None,
-        None => env_selected_stage()?,
-    };
-    let base_url = base_url.or(env_base.as_deref());
-    if let Some(auth) = load_auth(base_url)? {
-        return Ok(Some(auth));
-    }
-    let legacy = sdk_legacy_auth_path();
-    if !legacy.exists() {
-        return Ok(None);
-    }
-    let auth = read_auth(&legacy)?;
-    if base_url.is_some_and(|base| !same_stage(base, &auth.base_url)) {
-        return Ok(None);
-    }
-    require_secure_transport(&auth.base_url)?;
-    save_auth(&auth)?;
-    Ok(Some(auth))
+/// Read the sole credential store using explicit, environment, or single-stage selection.
+pub fn load_selected_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> {
+    let selected = resolve_stage(base_url)?;
+    load_auth(selected.as_deref()).map_err(sanitize_auth_error)
 }
 
 /// Exchange a caller-supplied Cloud bearer or run the existing Cloud device login.
@@ -2059,7 +1922,8 @@ pub struct CloudPushOutcome {
 /// Drain the existing outbox at the selected stage. Login never initializes a
 /// cursor from local maxima: only push's server-confirmed progress may advance it.
 pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
-    let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    let auth =
+        load_selected_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
     crate::SYNC_QUIET.store(true, crate::AtomicOrdering::Relaxed);
     let (conn, sync_skipped) = crate::prepare_sync_and_push_db(db_path)?;
     let machine = MachineIdentity {
@@ -2105,7 +1969,7 @@ pub fn enable_for_sdk(
     let auth = if token.is_some() {
         login_for_sdk(base_url, token, label)?
     } else {
-        match load_sdk_auth(base_url)? {
+        match load_selected_auth(base_url)? {
             Some(auth) => auth,
             None => login_for_sdk(base_url, None, label)?,
         }
@@ -2125,7 +1989,8 @@ pub fn create_share(
         ["public", "private", "direct-link"].contains(&visibility),
         "visibility must be public, private or direct-link"
     );
-    let auth = load_sdk_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
+    let auth =
+        load_selected_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
     require_secure_transport(&auth.base_url)?;
     let url = format!(
         "{}/v1/sessions/{}/shares",
@@ -3050,87 +2915,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_state_cannot_make_an_unqualified_command_guess_or_leak_a_cursor() {
+    fn single_file_auth_and_cursor_are_ignored() {
         with_temp_home(|| {
-            let prod = StoredAuth {
-                base_url: "https://history.agentrelay.com".into(),
-                access_token: "rth_at_prod".into(),
-                ..Default::default()
-            };
-            save_auth(&prod).unwrap();
-
-            let legacy_dev = StoredAuth {
-                base_url: "http://localhost:8787".into(),
-                access_token: "rth_at_dev".into(),
-                ..Default::default()
-            };
             write_private(
-                &legacy_auth_path(),
-                &serde_json::to_string_pretty(&legacy_dev).unwrap(),
+                &config_dir().join("auth.json"),
+                "invalid obsolete credentials",
             )
             .unwrap();
-            let legacy_cursor = SyncCursor {
-                history_id: 900,
-                trajectory_rowid: 42,
-                ..Default::default()
-            };
-            write_private(
-                &legacy_cursor_path(),
-                &serde_json::to_string_pretty(&legacy_cursor).unwrap(),
-            )
-            .unwrap();
-
-            let err = load_auth(None).unwrap_err().to_string();
-            assert!(err.contains("2 relayhistory stages"), "{err}");
+            write_private(&config_dir().join("cursor.json"), "invalid obsolete cursor").unwrap();
+            assert!(load_auth(None).unwrap().is_none());
+            assert!(load_auth(Some(DEFAULT_BASE_URL)).unwrap().is_none());
             assert_eq!(
-                load_cursor(&prod.base_url).unwrap(),
-                SyncCursor::default(),
-                "a prod push must not inherit the dev cursor"
+                load_cursor(DEFAULT_BASE_URL).unwrap(),
+                SyncCursor::default()
             );
+            let auth = StoredAuth {
+                base_url: DEFAULT_BASE_URL.into(),
+                access_token: "rth_at_new".into(),
+                ..Default::default()
+            };
+            save_auth(&auth).unwrap();
+            assert_eq!(load_auth(None).unwrap(), Some(auth));
             assert_eq!(
-                load_cursor("http://LOCALHOST:8787/").unwrap(),
-                legacy_cursor,
-                "the legacy cursor remains available to its own normalized stage"
+                fs::read_to_string(config_dir().join("auth.json")).unwrap(),
+                "invalid obsolete credentials"
             );
         });
-    }
-
-    #[test]
-    fn sdk_legacy_store_counts_toward_unqualified_ambiguity() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path());
-        let _userprofile = EnvVarGuard::set("USERPROFILE", dir.path());
-        let _relayhistory_home = EnvVarGuard::set("RELAYHISTORY_HOME", dir.path().join("state"));
-        let sdk_dir = dir.path().join("legacy-sdk");
-        let _sdk = EnvVarGuard::set("AI_HIST_CONFIG_DIR", &sdk_dir);
-
-        let prod = StoredAuth {
-            base_url: "https://history.agentrelay.com".into(),
-            access_token: "rth_at_prod".into(),
-            access_token_expires_at: Some("2999-01-01T00:00:00Z".into()),
-            ..Default::default()
-        };
-        save_auth(&prod).unwrap();
-
-        let sdk_dev = StoredAuth {
-            base_url: "http://localhost:8787".into(),
-            access_token: "rth_at_dev".into(),
-            access_token_expires_at: Some("2999-01-01T00:00:00Z".into()),
-            ..Default::default()
-        };
-        std::fs::create_dir_all(&sdk_dir).unwrap();
-        write_private(
-            &sdk_legacy_auth_path(),
-            &serde_json::to_string_pretty(&sdk_dev).unwrap(),
-        )
-        .unwrap();
-
-        let err = refuse_ambiguous_stages().unwrap_err().to_string();
-        assert!(err.contains("2 relayhistory stages"), "{err}");
-        assert_eq!(load_auth(None).unwrap().unwrap(), prod);
-        let token_err = access_token(None).unwrap_err().to_string();
-        assert!(token_err.contains("2 relayhistory stages"), "{token_err}");
     }
 
     /// A login to a second stage must preserve both the original stage's bearer session and

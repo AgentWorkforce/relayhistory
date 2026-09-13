@@ -9,7 +9,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const NATIVE_CONTRACT_VERSION = 10;
+export const NATIVE_CONTRACT_VERSION = 11;
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
@@ -499,6 +499,8 @@ interface NativeBinding {
   installGitHooks(optionsJson: string, node: string, sdkUrl: string): Promise<string>;
   linkGitCommit(optionsJson: string): Promise<string>;
   cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
+  cloudResolveSession(baseUrl: string | undefined, now: number): Promise<{ auth?: RelayhistoryAuth | null; detail?: string }>;
+  cloudRefreshSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth | null>;
   cloudValidateExchangeBaseUrl(baseUrl?: string): Promise<void>;
   cloudLogin(options: object): Promise<RelayhistoryAuth>;
   enableCloud(options: object): Promise<CloudPushResult>;
@@ -1583,7 +1585,15 @@ function shellQuote(value: string): string {
   return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-export interface RelayhistoryAuth { baseUrl: string; accessToken: string; refreshToken?: string }
+export interface RelayhistoryAuth {
+  baseUrl: string;
+  accessToken: string;
+  refreshToken?: string;
+  accessTokenExpiresAt?: string;
+  /** Cached provenance; never an authorization selector. */
+  orgId?: string;
+  workspaceId?: string;
+}
 export type LoginCloudResult = { ok: true; auth: RelayhistoryAuth } | { ok: false; error: string };
 export interface CloudPushResult { baseUrl: string; sent: number; accepted: number; syncSkipped: boolean }
 /** Return a secret service token with at least 60 seconds of validity. Rust
@@ -1629,6 +1639,23 @@ export interface CloudHandle extends CloudPushResult { stop(): Promise<void> }
 /** Both SDK consumers and the engine use the same stage-scoped Rust auth store. */
 export async function loadStoredRelayhistoryAuth(baseUrl?: string): Promise<RelayhistoryAuth | null> {
   return nativeCall((native) => native.cloudLoadAuth(baseUrl));
+}
+
+export type CloudSessionResolution =
+  | { auth: RelayhistoryAuth; session?: true }
+  | { auth: null; detail: string };
+
+/** Read-only connector probe; stage selection and eligibility belong to Rust. */
+export async function resolveCloudSession(baseUrl?: string, now: number = Date.now()): Promise<CloudSessionResolution> {
+  const result = await nativeCall((native) => native.cloudResolveSession(baseUrl, now));
+  return result.auth
+    ? { auth: result.auth, session: true }
+    : { auth: null, detail: result.detail ?? 'no stored relayhistory session (run `ai-hist login`)' };
+}
+
+/** Rotate a rejected stored bearer under the native stage lock. */
+export async function refreshCloudSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth | null> {
+  return nativeCall((native) => native.cloudRefreshSession(baseUrl, rejectedToken));
 }
 
 /** Cache-only remote stats guard (#126). Connector acquisition uses native checks. */

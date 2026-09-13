@@ -155,56 +155,30 @@ test('native npm token and replay: secrets, rotation, stages, pagination and ato
   }
 });
 
-// The whole point of shipping token and replay through npm is the npm user, who
-// upgrading from the TypeScript client has credentials ONLY in the legacy
-// ~/.config/ai-hist/auth.json store. If these two commands read the Rust stage
-// store alone they fail for exactly the population they exist to serve.
-test('token and replay migrate the legacy TypeScript credential store', { timeout: 60_000 }, async () => {
+test('token and replay ignore obsolete SDK credentials without migrating them', async () => {
   const saved = { ...process.env };
-  const root = await mkdtemp(join(tmpdir(), 'ai-hist-legacy-auth-'));
-  const legacyToken = 'rth_at_legacy_sdk_store';
-  const events = [{ eventId: 'l1', ts: '2026-09-09T09:00:00Z', source: 'claude', kind: 'prompt', content: 'legacy store prompt' }];
-  const server = createServer((req, res) => {
-    res.setHeader('Content-Type', 'application/json');
-    const url = new URL(req.url!, 'http://fixture');
-    if (url.pathname === '/v1/sessions/legacy-session/events') {
-      assert.equal(req.headers.authorization, `Bearer ${legacyToken}`);
-      res.end(JSON.stringify({ events, nextCursor: null }));
-    } else { res.statusCode = 404; res.end('{}'); }
-  });
-  server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const root = await mkdtemp(join(tmpdir(), 'ai-hist-obsolete-auth-'));
+  const state = join(root, 'state');
+  const sdkDir = join(root, 'old-sdk');
   try {
-    const legacyDir = join(root, 'legacy-sdk');
-    const state = join(root, 'state');
-    Object.assign(process.env, {
-      HOME: root, USERPROFILE: root, RELAYHISTORY_HOME: state,
-      AI_HIST_CONFIG_DIR: legacyDir, RELAYHISTORY_NO_UPDATE_CHECK: '1',
-    });
-    for (const key of ['RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL', 'CLOUD_API_ACCESS_TOKEN', 'CODEX_HOME']) delete process.env[key];
-
-    // Only the legacy store exists; the Rust stage store is untouched.
-    await mkdir(legacyDir, { recursive: true });
-    await writeFile(join(legacyDir, 'auth.json'), JSON.stringify({
-      baseUrl, accessToken: legacyToken, accessTokenExpiresAt: '2999-01-01T00:00:00Z',
-    }));
-    await assert.rejects(readdir(join(state, 'stages')), 'no Rust stage credential exists yet');
-
-    const token = await runCli(root, 'token', '--base-url', baseUrl);
-    assert.deepEqual(token, { code: 0, stdout: `${legacyToken}\n`, stderr: '' },
-      'token must serve the legacy npm user, not report "not authenticated"');
-
-    // The import is a migration, so the canonical store now holds it.
-    const stages = await readdir(join(state, 'stages'));
-    assert.ok(stages.some((file) => file.endsWith('.auth.json')), 'the legacy credential was migrated');
-
-    const replayed = await runCli(root, 'replay', 'legacy-session', '--base-url', baseUrl, '--json');
-    assert.equal(replayed.code, 0, replayed.stderr);
-    assert.deepEqual(JSON.parse(replayed.stdout), events);
+    Object.assign(process.env, { HOME: root, USERPROFILE: root, RELAYHISTORY_HOME: state,
+      AI_HIST_CONFIG_DIR: sdkDir, RELAYHISTORY_NO_UPDATE_CHECK: '1' });
+    delete process.env.RELAYHISTORY_BASE_URL;
+    delete process.env.AI_HIST_BASE_URL;
+    await mkdir(sdkDir, { recursive: true });
+    const baseUrl = 'http://127.0.0.1:1';
+    await writeFile(join(sdkDir, 'auth.json'), JSON.stringify({ baseUrl,
+      accessToken: 'rth_at_obsolete', accessTokenExpiresAt: '2999-01-01T00:00:00Z' }));
+    for (const args of [['token'], ['replay', 'session', '--json']]) {
+      const result = await runCli(root, ...args, '--base-url', baseUrl);
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, /not authenticated/);
+      assert.equal(result.stdout, '');
+    }
+    await assert.rejects(readdir(join(state, 'stages')), 'obsolete credentials are never migrated');
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
-    server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
 });

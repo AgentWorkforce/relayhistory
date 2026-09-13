@@ -31,7 +31,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 10;
+pub const NATIVE_CONTRACT_VERSION: u32 = 11;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -1638,6 +1638,9 @@ pub struct CloudAuth {
     pub base_url: String,
     pub access_token: String,
     pub refresh_token: Option<String>,
+    pub access_token_expires_at: Option<String>,
+    pub org_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 impl From<ai_hist_engine::cloud::StoredAuth> for CloudAuth {
@@ -1646,6 +1649,9 @@ impl From<ai_hist_engine::cloud::StoredAuth> for CloudAuth {
             base_url: auth.base_url,
             access_token: auth.access_token,
             refresh_token: auth.refresh_token,
+            access_token_expires_at: auth.access_token_expires_at,
+            org_id: auth.org_id,
+            workspace_id: auth.workspace_id,
         }
     }
 }
@@ -1672,12 +1678,53 @@ impl From<ai_hist_engine::cloud::CloudPushOutcome> for CloudPushResult {
 #[napi]
 pub async fn cloud_load_auth(base_url: Option<String>) -> napi::Result<Option<CloudAuth>> {
     napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::load_sdk_auth(base_url.as_deref())
+        ai_hist_engine::cloud::load_selected_auth(base_url.as_deref())
     })
     .await
     .map_err(worker_error)?
     .map(|auth| auth.map(Into::into))
     .map_err(|error| native_error("CLOUD_AUTH_FAILED", format!("{error:#}")))
+}
+
+#[napi(object)]
+pub struct CloudSessionResolution {
+    pub auth: Option<CloudAuth>,
+    pub detail: Option<String>,
+}
+
+#[napi]
+pub async fn cloud_resolve_session(
+    base_url: Option<String>,
+    now: i64,
+) -> napi::Result<CloudSessionResolution> {
+    napi::tokio::task::spawn_blocking(move || {
+        match ai_hist_engine::cloud::resolve_recall_auth(base_url.as_deref(), now, true) {
+            Ok(auth) => CloudSessionResolution {
+                auth: Some(auth.into()),
+                detail: None,
+            },
+            Err(error) => CloudSessionResolution {
+                auth: None,
+                detail: Some(format!("{error:#}")),
+            },
+        }
+    })
+    .await
+    .map_err(worker_error)
+}
+
+#[napi]
+pub async fn cloud_refresh_session(
+    base_url: String,
+    rejected_token: String,
+) -> napi::Result<Option<CloudAuth>> {
+    napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::cloud::refresh_rejected_auth(&base_url, &rejected_token)
+    })
+    .await
+    .map_err(worker_error)?
+    .map(|auth| auth.map(Into::into))
+    .map_err(|error| native_error("CONNECTOR_FAILURE", format!("{error:#}")))
 }
 
 #[napi]

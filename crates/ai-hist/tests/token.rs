@@ -28,11 +28,7 @@ fn save(home: &Path, base: &str, token: &str, expiry: Option<&str>) -> PathBuf {
 
 fn command(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-hist"));
-    // token migrates the legacy TypeScript store, which lives under HOME rather
-    // than RELAYHISTORY_HOME. Pin both, or these tests read the developer's real
-    // ~/.config/ai-hist/auth.json and pass or fail by machine state. The legacy
-    // dir is deliberately a subpath that stays absent unless a test creates it,
-    // so it cannot collide with the RELAYHISTORY_HOME/auth.json legacy location.
+    // Isolate credential state from the developer home.
     cmd.env("RELAYHISTORY_HOME", home)
         .env("HOME", home)
         .env("USERPROFILE", home)
@@ -326,11 +322,11 @@ fn expired_session_without_refresh_token_fails_without_stdout() {
 }
 
 #[test]
-fn legacy_auth_is_supported_and_default_stage_is_production() {
+fn obsolete_auth_is_ignored_and_a_single_stage_is_selected() {
     let home = tempfile::tempdir().unwrap();
     let path = save(home.path(), PROD, OLD, Some(FUTURE));
     std::fs::rename(path, home.path().join("auth.json")).unwrap();
-    success(&command(home.path()).output().unwrap(), OLD);
+    assert!(failure(&command(home.path()).output().unwrap()).contains("not authenticated"));
 
     let home = tempfile::tempdir().unwrap();
     save(home.path(), "http://localhost:8787", OLD, Some(FUTURE));
@@ -339,8 +335,7 @@ fn legacy_auth_is_supported_and_default_stage_is_production() {
 }
 
 // With no selector at all and several stages configured, token must refuse to
-// guess rather than fall back to production. The ambiguity probe must count
-// both the native stage store and the TypeScript SDK legacy store.
+// guess rather than fall back to production.
 #[test]
 fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
@@ -354,7 +349,7 @@ fn multiple_stages_without_a_selector_refuse_to_guess() {
 }
 
 #[test]
-fn native_and_sdk_legacy_stores_without_a_selector_refuse_to_guess() {
+fn obsolete_sdk_store_does_not_affect_canonical_stage_selection() {
     let home = tempfile::tempdir().unwrap();
     save(home.path(), PROD, OLD, Some(FUTURE));
     let legacy_dir = home.path().join("legacy-sdk");
@@ -369,11 +364,7 @@ fn native_and_sdk_legacy_stores_without_a_selector_refuse_to_guess() {
         .to_string(),
     )
     .unwrap();
-    let err = failure(&command(home.path()).output().unwrap());
-    assert!(
-        err.contains("2 relayhistory stages are configured"),
-        "native and SDK legacy stores must refuse together: {err}"
-    );
+    success(&command(home.path()).output().unwrap(), OLD);
 }
 
 // An explicit destination wins outright. A broken environment variable must not

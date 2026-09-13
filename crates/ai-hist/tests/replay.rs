@@ -51,14 +51,10 @@ fn server(pages: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<String>>)
     (base, handle)
 }
 
-fn save_auth(home: &Path, base: &str, legacy: bool) {
-    let path = if legacy {
-        home.join("auth.json")
-    } else {
-        let stages = home.join("stages");
-        std::fs::create_dir_all(&stages).unwrap();
-        stages.join(format!("{}.auth.json", ai_hist_core::prompt_hash(base)))
-    };
+fn save_auth(home: &Path, base: &str) {
+    let stages = home.join("stages");
+    std::fs::create_dir_all(&stages).unwrap();
+    let path = stages.join(format!("{}.auth.json", ai_hist_core::prompt_hash(base)));
     std::fs::write(
         path,
         json!({
@@ -72,8 +68,7 @@ fn save_auth(home: &Path, base: &str, legacy: bool) {
 fn replay(home: &Path, base: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ai-hist"))
         .env("RELAYHISTORY_HOME", home)
-        // replay migrates the legacy TypeScript store under HOME; pin it so the
-        // developer's real ~/.config/ai-hist/auth.json cannot influence results.
+        // Isolate all state from the developer home.
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("AI_HIST_CONFIG_DIR", home.join("legacy-sdk"))
@@ -120,7 +115,7 @@ fn replay_pages_past_a_short_page_and_preserves_raw_events_and_cursor_ties() {
         ),
         (200, json!({"events": [third.clone()], "nextCursor": null})),
     ]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let output = replay(
         home.path(),
         &base,
@@ -171,7 +166,7 @@ fn replay_renders_chronology_and_marks_truncation_even_without_content() {
         event("second", "2026-09-06T12:01:00Z", Value::Null, true)
     ], "nextCursor": null}),
     )]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let path = home.path().join("offline.txt");
     let output = replay(
         home.path(),
@@ -212,7 +207,7 @@ fn replay_over_an_existing_transcript_replaces_it() {
         200,
         json!({"events": [event("only", "2026-09-06T12:00:00Z", json!("fresh"), false)], "nextCursor": null}),
     )]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let path = home.path().join("offline.txt");
     std::fs::write(&path, "stale transcript from an earlier replay").unwrap();
     let output = replay(
@@ -248,7 +243,7 @@ fn replay_over_an_existing_transcript_replaces_it() {
 fn replay_unknown_session_is_an_empty_array_and_json_can_be_saved() {
     let home = tempfile::tempdir().unwrap();
     let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);
-    save_auth(home.path(), &base, true);
+    save_auth(home.path(), &base);
     let path = home.path().join("offline.json");
     let output = replay(
         home.path(),
@@ -265,8 +260,7 @@ fn replay_unknown_session_is_an_empty_array_and_json_can_be_saved() {
 #[test]
 fn replay_without_selected_stage_auth_explains_login_without_opening_sqlite() {
     let home = tempfile::tempdir().unwrap();
-    save_auth(home.path(), "http://127.0.0.1:2", false);
-    save_auth(home.path(), "http://127.0.0.1:2", true);
+    save_auth(home.path(), "http://127.0.0.1:2");
     let output = replay(home.path(), "http://127.0.0.1:1", &["session"]);
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
@@ -289,7 +283,7 @@ fn replay_expired_token_on_later_page_leaves_existing_transcript_intact() {
         ),
         (401, json!({"error": "expired token"})),
     ]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let path = home.path().join("offline.txt");
     std::fs::write(&path, "previous transcript").unwrap();
     let output = replay(
@@ -316,7 +310,7 @@ fn replay_rejects_repeated_cursors_instead_of_saving_an_incomplete_transcript() 
     let home = tempfile::tempdir().unwrap();
     let page = json!({"events": [], "nextCursor": "2026-09-06T12:00:00Z|same"});
     let (base, server) = server(vec![(200, page.clone()), (200, page)]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let output = replay(home.path(), &base, &["session", "--json"]);
     server.join().unwrap();
     assert!(!output.status.success());
@@ -329,7 +323,7 @@ fn replay_explicit_base_url_overrides_default_and_does_not_open_an_invalid_db() 
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("must-not-create.db"), "not sqlite").unwrap();
     let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let output = replay(
         home.path(),
         "http://127.0.0.1:1",
@@ -369,7 +363,7 @@ fn malformed_base_url_env_is_rejected_instead_of_silently_using_production() {
 fn explicit_base_url_wins_over_a_malformed_environment() {
     let home = tempfile::tempdir().unwrap();
     let (base, server) = server(vec![(200, json!({"events": [], "nextCursor": null}))]);
-    save_auth(home.path(), &base, false);
+    save_auth(home.path(), &base);
     let output = replay(home.path(), "not-a-url", &["unknown", "--base-url", &base]);
     success(&output);
     server.join().unwrap();
@@ -383,8 +377,8 @@ fn explicit_base_url_wins_over_a_malformed_environment() {
 #[test]
 fn multiple_stages_without_a_selector_refuse_to_guess() {
     let home = tempfile::tempdir().unwrap();
-    save_auth(home.path(), "https://history.agentrelay.com", false);
-    save_auth(home.path(), "http://localhost:8787", false);
+    save_auth(home.path(), "https://history.agentrelay.com");
+    save_auth(home.path(), "http://localhost:8787");
     let output = Command::new(env!("CARGO_BIN_EXE_ai-hist"))
         .env("RELAYHISTORY_HOME", home.path())
         .env("HOME", home.path())
