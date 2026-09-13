@@ -888,10 +888,44 @@ pub fn record_failure(
     tx.commit()?;
     status(conn, &lease.job_id)
 }
-fn change_state(conn: &Connection, job_id: &str, state: &str) -> Result<DeliveryStatus> {
+enum JobTransition {
+    Pause,
+    Resume,
+}
+fn change_state(
+    conn: &Connection,
+    job_id: &str,
+    transition: JobTransition,
+) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
     let existing = job(&tx, job_id)?;
     ensure!(existing.state != "cancelled", "delivery job is cancelled");
+    // Older versions allowed blocked -> paused. Preserve that recorded failure
+    // as well as the current state until an explicit retry clears it.
+    let permanent_failure: bool = tx.query_row(
+        "SELECT failure IS NOT NULL AND failure NOT IN ('transient','rate_limited') FROM delivery_jobs WHERE id=?",
+        [job_id], |row| row.get(0),
+    )?;
+    ensure!(
+        !permanent_failure,
+        "delivery job is blocked; retry explicitly"
+    );
+    let state = match transition {
+        JobTransition::Pause => {
+            ensure!(
+                matches!(existing.state.as_str(), "active" | "paused"),
+                "only active or paused jobs can pause; retry blocked jobs explicitly"
+            );
+            "paused"
+        }
+        JobTransition::Resume => {
+            ensure!(
+                existing.state == "paused",
+                "only a paused job can resume; retry blocked jobs explicitly"
+            );
+            "active"
+        }
+    };
     tx.execute("UPDATE delivery_jobs SET state=?,fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",params![state,job_id])?;
     tx.execute(
         "UPDATE delivery_batches SET state='pending' WHERE job_id=? AND state='leased'",
@@ -900,15 +934,13 @@ fn change_state(conn: &Connection, job_id: &str, state: &str) -> Result<Delivery
     tx.commit()?;
     status(conn, job_id)
 }
+/// Pause an active job without clearing failures. Blocked jobs require explicit retry.
 pub fn pause_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
-    change_state(conn, job_id, "paused")
+    change_state(conn, job_id, JobTransition::Pause)
 }
+/// Resume only a paused job. State and failure checks share the write transaction.
 pub fn resume_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
-    ensure!(
-        job(conn, job_id)?.state == "paused",
-        "only a paused job can resume; retry blocked jobs explicitly"
-    );
-    change_state(conn, job_id, "active")
+    change_state(conn, job_id, JobTransition::Resume)
 }
 pub fn retry_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
