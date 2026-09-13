@@ -48,8 +48,8 @@ links; outcomes come back whole on every page.
 Credentials come exclusively from the native stage store
 (`$RELAYHISTORY_HOME/stages`, default `~/.agentworkforce/relayhistory/stages`).
 `RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`; with multiple
-stages and no selection, the tool refuses to guess. Obsolete single-file SDK
-and native stores are ignored; run `ai-hist login` again if needed.
+stages and no selection, the tool refuses to guess. Use `ai-hist login` to
+create a session for the selected stage.
 
 A stored session must meet the same bar the engine's `cloud` connector
 applies to recall — an `rth_at_` access token, an expiry at least 60s away, and

@@ -9,16 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- Use one Rust cloud credential implementation for `ai-hist`, `ai-hist/cloud`,
-  and the CLI. Remove obsolete SDK/native single-file auth and cursor readers,
-  field aliases, and migration. Users with only obsolete files must log in again.
-  Preserve expiry, org, and workspace metadata through both SDK imports and use
-  native locked rotation for thread reads. Native-addon contract advances to 11.
-
-- Advance the native-addon contract to 7 and the session-catalog contract to
-  3. Discovery counters add `providerQueries` and `recordsInspected`; OpenCode
-  no longer reports its database file size as `bytesRead`. The native contract
-  also includes the delegation topology additions below.
+- Require native-addon contract 11 and session-catalog contract 3. Cloud auth
+  results include expiry, org, and workspace metadata; thread reads use native
+  stage selection and locked token rotation. Discovery counters include
+  `providerQueries` and `recordsInspected`, and OpenCode discovery measures
+  `bytesRead` from inspected records.
 - Replace the synchronous `openAiHist()`/`AiHist` snapshot API with top-level
   async native-backed functions.
 - Remove `sql.js`, JSONL/trajectory fallback scanners, CLI subprocess bridges,
