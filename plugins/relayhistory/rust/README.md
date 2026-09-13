@@ -63,3 +63,30 @@ and generation; legacy cursors are never interpreted as generic delivery
 checkpoints. Arbitrary manually named schedules cannot be discovered by this
 check and must be stopped by their owner. A status check cannot revoke a request
 that another process has already sent.
+
+### Explicit legacy source operations
+
+`source::CloudProvider` implements the public local-history source interface for
+legacy catalog recall. Its account/stage-derived connector instance and locators
+are preserved. The helper operation `discover` requires `connectorId:"cloud"`,
+accepts `baseUrl`, `source`, `limit` (at most 10000), and optional
+`connectorInstance` (the account-derived fingerprint to assert), and returns
+`{observations:[ShallowSession]}`. It reads only the explicitly selected stage's
+auth. This is catalog-only; the new durable record readback source is separate.
+
+`relaycast::sync_relaycast(connection,state)` preserves the old Relaycast
+incremental history importer, using public core insert APIs. The helper operation
+`relaycastSync` requires `connectorId:"relaycast"`, `dbPath`, and the previous
+`state` object, and returns `{inserted,state,capability:"legacy-incremental-history"}`.
+Only this explicit invocation reads `RELAYCAST_API_KEY`,
+`RELAYCAST_WORKSPACE_ID`, and `RELAYCAST_BASE_URL`. The caller must persist the
+returned state after successful local ingestion; retrying an earlier state keeps
+history inserts idempotent. Existing `state.relay` channel/DM high-water marks
+retain their original meaning and must not be relabeled as generic delivery
+checkpoints. Reuse the old cursor map when migrating an installation.
+
+This legacy importer can retain channel history when DM listing is forbidden and
+is not a complete normalized source snapshot. It does not advertise `covered_kinds`
+or participate in automatic discovery. New full snapshot support requires a
+separately verified Relaycast traversal/permission contract. The local packages
+contain no Relaycast transport or implicit credentials-driven acquisition.

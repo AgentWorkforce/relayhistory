@@ -16,6 +16,9 @@ pub struct Request {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Arguments {
+    pub connector_id: Option<String>,
+    pub connector_instance: Option<String>,
+    pub state: Option<serde_json::Map<String, Value>>,
     pub read_options: Option<crate::destination::ReadOptions>,
     pub batch: Option<ai_hist_core::delivery::HistoryExportBatch>,
     pub prepared: Option<ai_hist_core::delivery::PreparedPayload>,
@@ -46,6 +49,32 @@ fn execute(request: Request) -> Result<Value> {
     let a = request.args;
     let base = a.base_url.as_deref();
     Ok(match request.operation.as_str() {
+        "discover" => {
+            anyhow::ensure!(
+                a.connector_id.as_deref() == Some("cloud"),
+                "explicit cloud connector required"
+            );
+            crate::source::discover(
+                base,
+                a.source.as_deref(),
+                a.connector_instance.as_deref(),
+                a.limit,
+            )?
+        }
+        "relaycastSync" => {
+            anyhow::ensure!(
+                a.connector_id.as_deref() == Some("relaycast"),
+                "explicit relaycast connector required"
+            );
+            let path = a.db_path.context("dbPath required")?;
+            let conn = rusqlite::Connection::open(path)?;
+            ai_hist_core::init_db(&conn)?;
+            let mut state = a
+                .state
+                .context("state required; preserve the previous relay cursor map")?;
+            let inserted = crate::relaycast::sync_relaycast(&conn, &mut state)?;
+            json!({"inserted":inserted,"state":state,"capability":"legacy-incremental-history"})
+        }
         "deliveryMigrationStatus" => serde_json::to_value(crate::migration::status())?,
         "deliveryRead" => serde_json::to_value(crate::destination::read_page(
             base,
@@ -133,6 +162,7 @@ pub fn handle(request: Request) -> Value {
         return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Unsupported helper protocol version"}});
     }
     let code = match request.operation.as_str() {
+        "discover" | "relaycastSync" => "CONNECTOR_FAILURE",
         "accessToken" => "CLOUD_AUTH_FAILED",
         "replay" => "REPLAY_FAILED",
         "cloudLoadAuth" | "cloudResolveSession" => "CLOUD_AUTH_FAILED",

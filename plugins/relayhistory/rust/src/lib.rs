@@ -8,7 +8,9 @@ pub mod helper;
 pub mod legacy_cli;
 pub mod migration;
 pub mod outbox;
+pub mod relaycast;
 pub mod replay;
+pub mod source;
 pub mod turns;
 fn parse_iso_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
