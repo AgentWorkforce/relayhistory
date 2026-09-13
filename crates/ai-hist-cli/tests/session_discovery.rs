@@ -574,332 +574,6 @@ fn discovery_leaves_a_fully_synced_session_marked_full() {
 /// that answers `cloud list --json`: `first` for the opening page, `next`
 /// whenever a `--cursor` is passed. Returns the bin directory to prepend to
 /// PATH.
-#[cfg(unix)]
-fn fake_codex_cloud(temp: &tempfile::TempDir, first: &str, next: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    fs::create_dir_all(temp.path().join(".codex")).unwrap();
-    fs::write(temp.path().join(".codex/auth.json"), "{}").unwrap();
-    let bin = temp.path().join("fake-bin");
-    fs::create_dir_all(&bin).unwrap();
-    let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1\" != cloud ] || [ \"$2\" != list ]; then\n\
-           echo \"unexpected codex invocation: $*\" >&2; exit 2\n\
-         fi\n\
-         case \" $* \" in\n\
-           *\" --cursor \"*) cat <<'PAYLOAD2'\n{next}\nPAYLOAD2\n;;\n\
-           *) cat <<'PAYLOAD1'\n{first}\nPAYLOAD1\n;;\n\
-         esac\n"
-    );
-    let path = bin.join("codex");
-    fs::write(&path, script).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    bin
-}
-
-#[cfg(unix)]
-const CODEX_CLOUD_EMPTY_PAGE: &str = r#"{"tasks":[],"cursor":null}"#;
-
-#[cfg(unix)]
-fn prepend_path(command: &mut Command, bin: &Path) {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut joined = bin.as_os_str().to_os_string();
-    joined.push(":");
-    joined.push(path);
-    command.env("PATH", joined);
-}
-
-const CODEX_CLOUD_LISTING: &str = r#"{"tasks":[{"id":"task_e_42","url":"https://chatgpt.com/codex/tasks/task_e_42","title":"Speed up the indexer","status":"ready","updated_at":"2026-06-23T08:00:00Z","environment_id":"env_1","environment_label":"api","is_review":false,"attempt_total":1}],"cursor":null}"#;
-
-#[cfg(unix)]
-#[test]
-fn codex_cloud_tasks_discover_through_the_codex_cli() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
-
-    let mut command = isolated(
-        &temp,
-        &db_path,
-        &["sessions", "discover", "--remote", "--json"],
-    );
-    prepend_path(&mut command, &bin);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
-    let sessions: Vec<&Value> = lines
-        .iter()
-        .filter(|line| line["type"] == "session")
-        .collect();
-    assert_eq!(sessions.len(), 1, "{lines:#?}");
-    assert_eq!(sessions[0]["source"], "codex");
-    assert_eq!(sessions[0]["session_id"], "task_e_42");
-    assert_eq!(sessions[0]["first_prompt"], "Speed up the indexer");
-    assert_eq!(sessions[0]["locations"], serde_json::json!(["remote"]));
-    assert_eq!(sessions[0]["discovery_state"], "shallow");
-    let summary = lines.last().unwrap();
-    assert_eq!(summary["locations_run"], serde_json::json!(["remote"]));
-    assert_eq!(summary["providers"]["codex"]["discovered"], 1);
-    assert_eq!(summary["counters"]["files_opened"], 0);
-
-    // The cached ledger now serves the remote row to scoped reads, and the
-    // local scope stays untouched by it.
-    let remote_list = isolated(&temp, &db_path, &["sessions", "list", "--remote", "--json"])
-        .output()
-        .unwrap();
-    let payload: Value = serde_json::from_slice(&remote_list.stdout).unwrap();
-    assert_eq!(payload["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(payload["sessions"][0]["session_id"], "task_e_42");
-    let local_list = isolated(&temp, &db_path, &["sessions", "list", "--json"])
-        .output()
-        .unwrap();
-    let payload: Value = serde_json::from_slice(&local_list.stdout).unwrap();
-    assert!(payload["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|row| row["session_id"] != "task_e_42"));
-}
-
-#[cfg(unix)]
-#[test]
-fn an_all_scope_run_executes_local_and_remote_connectors_together() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
-
-    let mut command = isolated(
-        &temp,
-        &db_path,
-        &["sessions", "discover", "--all", "--json"],
-    );
-    prepend_path(&mut command, &bin);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
-    let ids: Vec<&str> = lines
-        .iter()
-        .filter(|line| line["type"] == "session")
-        .map(|line| line["session_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        ids,
-        ["task_e_42", "codex-cli", "claude-cli"],
-        "global recency order spans both locations"
-    );
-    let summary = lines.last().unwrap();
-    assert_eq!(
-        summary["locations_run"],
-        serde_json::json!(["local", "remote"])
-    );
-    // One providers entry per source, local and remote tallies merged.
-    assert_eq!(summary["providers"]["codex"]["candidates"], 2);
-    assert_eq!(summary["providers"]["codex"]["discovered"], 2);
-
-    let all_list = isolated(&temp, &db_path, &["sessions", "list", "--all", "--json"])
-        .output()
-        .unwrap();
-    let payload: Value = serde_json::from_slice(&all_list.stdout).unwrap();
-    assert_eq!(payload["sessions"].as_array().unwrap().len(), 3);
-}
-
-#[cfg(unix)]
-#[test]
-fn sync_remote_runs_configured_connectors_and_reports_them() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
-
-    let mut command = isolated(&temp, &db_path, &["sync", "--remote"]);
-    prepend_path(&mut command, &bin);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("[remote:codex]"), "{stdout}");
-
-    let remote_list = isolated(&temp, &db_path, &["sessions", "list", "--remote", "--json"])
-        .output()
-        .unwrap();
-    let payload: Value = serde_json::from_slice(&remote_list.stdout).unwrap();
-    assert_eq!(payload["sessions"].as_array().unwrap().len(), 1);
-
-    // `sync --all` on a home with no connectors configured stays local-only
-    // and says so instead of failing.
-    let plain = fake_home();
-    let plain_db = plain.path().join("history.db");
-    let output = isolated(&plain, &plain_db, &["sync", "--all"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("no remote provider connectors configured"),
-        "{stdout}"
-    );
-}
-
-/// Serve one-shot HTTP responses for the claude.ai session-list endpoint on a
-/// loopback port, one accepted connection per queued body.
-fn serve_json_pages(bodies: Vec<String>) -> std::net::SocketAddr {
-    use std::io::{Read as _, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for body in bodies {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 8192];
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    addr
-}
-
-#[test]
-fn claude_web_sessions_discover_through_the_session_list_endpoint() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    fs::create_dir_all(temp.path().join(".claude")).unwrap();
-    fs::write(
-        temp.path().join(".claude/.credentials.json"),
-        r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"r","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
-    )
-    .unwrap();
-    let page = serde_json::json!({
-        "data": [{
-            "id": "session_01Web",
-            "title": "Refactor the auth flow",
-            "status": "idle",
-            "worker_status": "idle",
-            "created_at": "2026-06-24T09:00:00Z",
-            "last_event_at": "2026-06-24T10:30:00Z",
-            "environment_kind": "cloud",
-            "config": {"sources": [{"type": "git_repository", "url": "https://github.com/acme/app"}]}
-        }, {
-            "id": "session_01Bridge",
-            "title": "A remote-control bridge",
-            "environment_kind": "bridge",
-            "created_at": "2026-06-24T09:00:00Z"
-        }],
-        "next_cursor": null
-    })
-    .to_string();
-    let addr = serve_json_pages(vec![page]);
-
-    let mut command = isolated(
-        &temp,
-        &db_path,
-        &["sessions", "discover", "--remote", "--json"],
-    );
-    command.env("RELAYHISTORY_CLAUDE_API_BASE_URL", format!("http://{addr}"));
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
-    let sessions: Vec<&Value> = lines
-        .iter()
-        .filter(|line| line["type"] == "session")
-        .collect();
-    assert_eq!(
-        sessions.len(),
-        1,
-        "the bridge session is not remote evidence"
-    );
-    assert_eq!(sessions[0]["source"], "claude");
-    assert_eq!(sessions[0]["session_id"], "session_01Web");
-    assert_eq!(sessions[0]["first_prompt"], "Refactor the auth flow");
-    assert_eq!(sessions[0]["repo_url"], "https://github.com/acme/app");
-    assert_eq!(
-        sessions[0]["raw_path"],
-        "https://claude.ai/code/session_01Web"
-    );
-    assert_eq!(sessions[0]["locations"], serde_json::json!(["remote"]));
-    let summary = lines.last().unwrap();
-    assert_eq!(summary["locations_run"], serde_json::json!(["remote"]));
-    assert_eq!(summary["providers"]["claude"]["discovered"], 1);
-}
-
-#[cfg(unix)]
-#[test]
-fn codex_cloud_discovery_follows_the_cli_cursor_across_pages() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    let first = r#"{"tasks":[{"id":"task_e_1","title":"one","status":"ready","updated_at":"2026-06-23T08:00:00Z"}],"cursor":"page-2"}"#;
-    let next = r#"{"tasks":[{"id":"task_e_2","title":"two","status":"ready","updated_at":"2026-06-22T08:00:00Z"}],"cursor":null}"#;
-    let bin = fake_codex_cloud(&temp, first, next);
-
-    let mut command = isolated(
-        &temp,
-        &db_path,
-        &["sessions", "discover", "--remote", "--json"],
-    );
-    prepend_path(&mut command, &bin);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let lines = jsonl(&String::from_utf8_lossy(&output.stdout));
-    let ids: Vec<&str> = lines
-        .iter()
-        .filter(|line| line["type"] == "session")
-        .map(|line| line["session_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["task_e_1", "task_e_2"]);
-}
-
-#[cfg(unix)]
-#[test]
-fn a_source_filter_with_no_matching_connector_is_rejected_as_unsupported() {
-    let temp = fake_home();
-    let db_path = temp.path().join("history.db");
-    // Only codex is signed in; a claude-only remote request is unsupported.
-    let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
-
-    let mut command = isolated(
-        &temp,
-        &db_path,
-        &[
-            "sessions", "discover", "--remote", "--source", "claude", "--json",
-        ],
-    );
-    prepend_path(&mut command, &bin);
-    let output = command.output().unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("no remote provider connectors are configured"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("claude-web"), "{stderr}");
-}
-
 #[test]
 fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials() {
     let temp = fake_home();
@@ -940,138 +614,50 @@ fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials
     assert!(!temp.path().join("commercial").exists());
 }
 
+// Provider HTTP/CLI and Relaycast behavior tests live with the optional adapter
+// packages. This binary's contract is local acquisition plus cached remote reads.
 #[test]
-fn explicit_relaycast_sync_uses_remote_presence_and_persists_checkpoint() {
-    use std::io::{BufRead, BufReader, Write};
-    let temp = tempfile::tempdir().unwrap();
-    let db = temp.path().join("history.db");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    listener.set_nonblocking(true).unwrap();
-    let server = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let mut requests = Vec::new();
-        while requests.len() < 3 && started.elapsed() < std::time::Duration::from_secs(10) {
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("{error}"),
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let body = if line.starts_with("GET /v1/channels ") {
-                r#"{"data":[{"name":"general"}]}"#
-            } else if line.starts_with("GET /v1/channels/general/messages?") {
-                r#"{"data":[{"id":"m001","text":"explicit remote message","created_at":"2026-09-13T00:00:00Z"}]}"#
-            } else if line.starts_with("GET /v1/dm/conversations/all ") {
-                r#"{"data":[]}"#
-            } else {
-                panic!("unexpected {line}")
-            };
-            requests.push(line);
-            loop {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                if header.trim().is_empty() {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
+fn installed_credentials_do_not_compose_remote_sources_into_local_cli() {
+    let temp = fake_home();
+    for (path, body) in [
+        (".claude/.credentials.json", "{poisoned credentials"),
+        (".codex/auth.json", "{poisoned credentials"),
+        ("commercial/auth.json", "{poisoned commercial auth"),
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let db = temp.path().join("fresh.db");
+    for args in [
+        vec!["sync", "--remote"],
+        vec!["sessions", "discover", "--remote", "--json"],
+        vec!["sync", "--remote", "--source-connector", "claude-web"],
+        vec!["sync", "--remote", "--source-connector", "relaycast"],
+    ] {
+        let output = isolated(&temp, &db, &args)
+            .env("RELAYHISTORY_HOME", temp.path().join("commercial"))
+            .output()
             .unwrap();
-        }
-        requests
-    });
-    let output = isolated(
-        &temp,
-        &db,
-        &["sync", "--remote", "--source-connector", "relaycast"],
-    )
-    .env("RELAYCAST_API_KEY", "synthetic-key")
-    .env("RELAYCAST_WORKSPACE_ID", "synthetic-workspace")
-    .env("RELAYCAST_BASE_URL", &base)
-    .output()
-    .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("source plugin"), "{stderr}");
+        assert!(!db.exists());
+    }
+    let output = isolated(&temp, &db, &["sessions", "discover", "--all", "--json"])
+        .env("RELAYHISTORY_HOME", temp.path().join("commercial"))
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(server.join().unwrap().len(), 3);
-    let conn = open_db(&db).unwrap();
-    assert_eq!(
-        ai_hist_core::session_locations(&conn, "relay", "#general").unwrap(),
-        vec!["remote"]
-    );
-    let state: Value =
-        serde_json::from_slice(&fs::read(temp.path().join(".sync-state.json")).unwrap()).unwrap();
-    assert_eq!(state["relay"]["ch:general"], "m001");
-}
-
-#[cfg(unix)]
-#[test]
-fn busy_relaycast_lock_skips_only_relaycast_and_does_not_initialize_its_database() {
-    for include_codex in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let db = temp.path().join("history.db");
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(temp.path().join("history.db.sync.lock"))
-            .unwrap();
-        fs2::FileExt::lock_exclusive(&lock).unwrap();
-        let mut command = isolated(
-            &temp,
-            &db,
-            &["sync", "--remote", "--source-connector", "relaycast"],
-        );
-        command
-            .env("RELAYCAST_API_KEY", "fixture-key")
-            .env("RELAYCAST_WORKSPACE_ID", "fixture-workspace")
-            .env("RELAYCAST_BASE_URL", "http://127.0.0.1:1");
-        if include_codex {
-            let bin = fake_codex_cloud(&temp, CODEX_CLOUD_LISTING, CODEX_CLOUD_EMPTY_PAGE);
-            prepend_path(&mut command, &bin);
-            command.args(["--source-connector", "codex-cloud"]);
-        }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if include_codex {
-            let conn = open_db(&db).unwrap();
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='task_e_42'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                count, 1,
-                "busy Relaycast cannot skip selected independent Codex discovery"
-            );
-        } else {
-            assert!(
-                !db.exists(),
-                "busy Relaycast-only sync must not initialize the database"
-            );
-        }
-    }
+    let records = jsonl(&String::from_utf8_lossy(&output.stdout));
+    let summary = records.last().unwrap();
+    assert_eq!(summary["locations_run"], serde_json::json!(["local"]));
+    assert!(records
+        .iter()
+        .filter(|row| row.get("session_id").is_some())
+        .all(|row| row["locations"] == serde_json::json!(["local"])));
 }

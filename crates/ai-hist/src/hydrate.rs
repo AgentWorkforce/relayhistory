@@ -325,83 +325,15 @@ fn acquire_remote_hydration_lock(
 }
 
 fn hydrate_remote_session(
-    conn: &mut Connection,
-    options: &HydrateSessionOptions,
-    home: &Path,
-    connectors: &crate::remote::SourceConnectorSelection,
-    started: Instant,
+    _conn: &mut Connection,
+    _options: &HydrateSessionOptions,
+    _home: &Path,
+    _connectors: &crate::remote::SourceConnectorSelection,
+    _started: Instant,
 ) -> Result<HydrateSessionResult> {
-    let provider_id = match options.source.as_str() {
-        "claude" => crate::remote::CLAUDE_WEB_CONNECTOR,
-        "codex" => crate::remote::CODEX_CLOUD_CONNECTOR,
-        _ => "",
-    };
-    if !connectors.contains(provider_id) {
-        return remote_limited_result(
-            conn,
-            options,
-            "CONNECTOR_NOT_CONFIGURED",
-            format!(
-                "no remote hydration connector exists for source '{}'",
-                options.source
-            ),
-            started,
-        );
-    }
-    let key = ObservationKey {
-        source: options.source.clone(),
-        session_id: options.session_id.clone(),
-        location: SessionLocation::Remote,
-        connector_id: provider_id.into(),
-        connector_instance: "default".into(),
-    };
-    let observation = observations::get(conn, &key)?.unwrap_or(SessionObservation {
-        key,
-        raw_locator: Some(options.session_id.clone()),
-        source_stamp: None,
-        discovery_state: "shallow".into(),
-        access_state: "available".into(),
-        updated_ms: now_ms(),
-    });
-    let evidence =
-        crate::remote::acquire_remote_session_at(home, &options.source, &options.session_id)
-            .map_err(classify_remote_error)?;
-    match evidence {
-        crate::remote::RemoteSessionEvidence::Normalized(_)
-        | crate::remote::RemoteSessionEvidence::Events(_)
-        | crate::remote::RemoteSessionEvidence::LocalFiles => anyhow::bail!(
-            "CONNECTOR_FAILURE: builtin adapter returned unexpected normalized evidence"
-        ),
-        crate::remote::RemoteSessionEvidence::CapabilityLimited { code, message } => {
-            remote_limited_result(conn, options, code, message, started)
-        }
-        crate::remote::RemoteSessionEvidence::ClaudeFull {
-            records,
-            source_stamp,
-            source_bytes,
-        } => hydrate_remote_claude_observed(
-            conn,
-            options,
-            records,
-            source_stamp,
-            source_bytes,
-            started,
-            Some(&observation),
-        ),
-        crate::remote::RemoteSessionEvidence::CodexDiff {
-            diff,
-            source_stamp,
-            source_bytes,
-        } => hydrate_remote_codex_diff_observed(
-            conn,
-            options,
-            &diff,
-            source_stamp,
-            source_bytes,
-            started,
-            Some(&observation),
-        ),
-    }
+    anyhow::bail!(
+        "CONNECTOR_NOT_CONFIGURED: install a source plugin and use the composed source registry"
+    )
 }
 
 fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
@@ -482,6 +414,7 @@ fn probable_secret(part: &str) -> bool {
         && value.bytes().any(|byte| byte.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn remote_limited_result(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
@@ -555,6 +488,7 @@ fn hydrate_remote_claude(
     )
 }
 
+#[cfg(test)]
 fn hydrate_remote_claude_observed(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
@@ -723,6 +657,7 @@ fn hydrate_remote_codex_diff(
     )
 }
 
+#[cfg(test)]
 fn hydrate_remote_codex_diff_observed(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
@@ -912,11 +847,13 @@ fn take_git_path(input: &mut &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 struct HydrationCheckpoint {
     source_stamp: Option<String>,
     parser_version: i64,
 }
 
+#[cfg(test)]
 fn hydration_checkpoint(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -931,6 +868,7 @@ fn hydration_checkpoint(
         .optional()?)
 }
 
+#[cfg(test)]
 fn write_hydration_checkpoint(
     conn: &Connection,
     options: &HydrateSessionOptions,
