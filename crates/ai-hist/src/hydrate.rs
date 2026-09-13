@@ -157,7 +157,11 @@ fn hydrate_session_at_with_home_and_connectors(
     };
     let local_observation = observations::get(&conn, &local_key)?;
     if let Some(observation) = &local_observation {
-        target.locator = observation.raw_locator.clone();
+        // OpenCode enumerates by session id, while its local parser needs the
+        // separately recorded provider database path from the catalog.
+        if options.source != "opencode" {
+            target.locator = observation.raw_locator.clone();
+        }
         target.discovery_state = Some(observation.discovery_state.clone());
     } else {
         anyhow::ensure!(
@@ -1040,7 +1044,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
     };
     let row = conn
         .query_row(
-            "SELECT p.raw_locator, COALESCE(p.discovery_state, s.discovery_state) \
+            "SELECT CASE WHEN s.source='opencode' AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
              FROM sessions s JOIN session_presences p \
                ON p.source = s.source AND p.session_id = s.session_id AND p.location = ? \
              WHERE s.source = ? AND s.session_id = ?",
@@ -2070,7 +2074,24 @@ mod tests {
         drop(src);
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "opencode", "selected", Some(&source));
+        let env = DiscoveryEnv::with_roots(&conn, dir.path().into(), source.clone());
+        crate::discover::discover_sessions_with_env(
+            &env,
+            &DiscoverOptions {
+                scope: SessionScope::Local,
+                sources: vec!["opencode".into()],
+                limit: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            observations::list(&conn, "opencode", "selected").unwrap()[0]
+                .raw_locator
+                .as_deref(),
+            Some("selected")
+        );
+
         drop(conn);
         let result =
             hydrate_session_at_with_home(&db, &options("opencode", "selected"), dir.path())
