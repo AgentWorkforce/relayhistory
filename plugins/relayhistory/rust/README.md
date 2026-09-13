@@ -35,3 +35,31 @@ Safe helper failures use `DELIVERY_TRANSIENT`, `DELIVERY_RATE_LIMITED`, `DELIVER
 `deliveryRead` takes `args.baseUrl` and `args.readOptions` (`expectedAccount`, optional `kind`, `source`, `sessionId`, `cursor`, `includeDeleted`, `limit` from 1–100). It sends the expected-account header and returns `{protocolVersion:1,listing:"live",records,nextCursor}`. This is a live keyset listing of current retained records. Refreshes must restart from the beginning; retaining its cursor as an incremental watermark would miss revisions of earlier record IDs. A source adapter must not advertise snapshot/change-feed capability for this endpoint.
 
 The JSON fixture in `tests/fixtures/delivery-native-v1.json` is shared with the companion server tests and was generated through the local native delivery coordinator. The client pins its own mapping version when preparing it. Deploying the new server protocol is a release prerequisite for enabling this destination; this change itself performs no deployment or live service migration.
+
+### Legacy scheduler migration guard
+
+`deliveryMigrationStatus` takes no arguments and returns
+`{state:"clear"|"active"|"unknown",jobs:string[]}`. Job labels are fixed safe names;
+scheduler commands, credentials, and history are never returned. On macOS it
+checks both `~/Library/LaunchAgents/com.ai-hist.push.plist` and the loaded
+`com.ai-hist.push` launchd label. On macOS/Linux it checks uncommented user cron
+entries bearing `# ai-hist push (managed)`. An unloaded plist still blocks because
+it can restart at login. Command failures, timeouts, and oversized output produce `unknown`;
+positive evidence takes precedence as
+`active`. Each scheduler command has a two-second deadline and a 1 MiB output cap.
+
+The SDK must inspect status before enabling a new durable job and before prepare
+or send. `active` always blocks. `unknown` requires an explicit user acknowledgment
+that inspection was unavailable and they have checked/stopped legacy scheduling;
+that acknowledgment must never be reported as a successful inspection. Platforms
+other than macOS/Linux return `clear` with `legacy-installer-unsupported` because
+the old automatic installer never supported them.
+
+Stop and remove an active old managed job explicitly using the previous
+installation or the platform scheduler, then rerun this check. This operation
+never stops a service, changes scheduler files, reads auth, migrates watermarks,
+or modifies existing auth/cursor files. New jobs require an explicit selection
+and generation; legacy cursors are never interpreted as generic delivery
+checkpoints. Arbitrary manually named schedules cannot be discovered by this
+check and must be stopped by their owner. A status check cannot revoke a request
+that another process has already sent.

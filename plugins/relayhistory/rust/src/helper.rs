@@ -46,6 +46,7 @@ fn execute(request: Request) -> Result<Value> {
     let a = request.args;
     let base = a.base_url.as_deref();
     Ok(match request.operation.as_str() {
+        "deliveryMigrationStatus" => serde_json::to_value(crate::migration::status())?,
         "deliveryRead" => serde_json::to_value(crate::destination::read_page(
             base,
             &a.read_options.context("readOptions required")?,

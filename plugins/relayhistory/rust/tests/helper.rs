@@ -61,3 +61,17 @@ fn helper_errors_do_not_echo_supplied_secrets_or_malformed_input() {
         .unwrap()
         .contains("secret-bearer-fixture"));
 }
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn migration_status_without_home_fails_closed_without_reading_schedulers() {
+    let output = invoke(
+        std::path::Path::new(""),
+        &json!({"version":1,"operation":"deliveryMigrationStatus"}),
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"version":1,"ok":true,"value":{"state":"unknown","jobs":["home-unavailable"]}})
+    );
+    assert!(output.stderr.is_empty());
+}

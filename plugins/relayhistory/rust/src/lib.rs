@@ -6,6 +6,7 @@ pub mod convergence;
 pub mod destination;
 pub mod helper;
 pub mod legacy_cli;
+pub mod migration;
 pub mod outbox;
 pub mod replay;
 pub mod turns;
