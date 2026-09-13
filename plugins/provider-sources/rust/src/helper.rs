@@ -22,12 +22,65 @@ pub struct Arguments {
     pub limit: Option<usize>,
     pub observation: Option<SessionObservation>,
 }
-fn execute(request: Request) -> Result<Value> {
+// Validate caller-controlled identities before resolving HOME, constructing an
+// adapter, or probing credentials. Classification is based on this phase, never
+// on error text returned by a provider or transport.
+fn validate_request(request: &Request) -> Result<()> {
     ensure!(request.version == 1, "unsupported helper version");
     ensure!(
         matches!(request.operation.as_str(), "discover" | "hydrate"),
         "unknown operation"
     );
+    let args = &request.args;
+    let connector = args
+        .connector_id
+        .as_deref()
+        .context("connectorId required")?;
+    let source = match connector {
+        crate::remote::CLAUDE_WEB_CONNECTOR => "claude",
+        crate::remote::CODEX_CLOUD_CONNECTOR => "codex",
+        _ => anyhow::bail!("unknown source connector"),
+    };
+    let instance = args.connector_instance.as_deref().unwrap_or("default");
+    ensure!(
+        !instance.is_empty()
+            && instance.trim() == instance
+            && instance.len() <= 512
+            && !instance.chars().any(char::is_control),
+        "invalid connector instance"
+    );
+    ensure!(
+        args.limit.is_none_or(|limit| limit <= 10_000),
+        "invalid source limit"
+    );
+    ensure!(
+        args.source
+            .as_deref()
+            .is_none_or(|selected| selected == source),
+        "source mismatch"
+    );
+    if request.operation == "hydrate" {
+        let observation = args.observation.as_ref().context("observation required")?;
+        observation.key.validate()?;
+        ensure!(
+            observation.key.connector_id == connector
+                && observation.key.connector_instance == instance
+                && observation.key.source == source
+                && observation.key.location == SessionLocation::Remote,
+            "observation identity mismatch"
+        );
+        ensure!(
+            ["available", "unavailable", "withdrawn"].contains(&observation.access_state.as_str()),
+            "invalid observation access state"
+        );
+        ensure!(
+            ["shallow", "full"].contains(&observation.discovery_state.as_str()),
+            "invalid observation discovery state"
+        );
+    }
+    Ok(())
+}
+fn execute(request: Request) -> Result<Value> {
     let args = request.args;
     let connector = args.connector_id.context("connectorId required")?;
     let instance = args.connector_instance.as_deref().unwrap_or("default");
@@ -85,6 +138,9 @@ fn execute(request: Request) -> Result<Value> {
     }
 }
 pub fn handle(request: Request) -> Value {
+    if validate_request(&request).is_err() {
+        return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Invalid provider source request; verify operation, connector identity, source and limits"}});
+    }
     match execute(request) {
         Ok(value) => json!({"version":1,"ok":true,"value":value}),
         Err(_) => {

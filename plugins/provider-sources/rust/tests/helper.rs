@@ -36,6 +36,7 @@ fn explicit_selection_rejects_commercial_connectors_and_does_not_create_history(
             json!({"version":1,"operation":"discover","args":{"connectorId":connector}}),
         );
         assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INVALID_ARGUMENT");
         assert!(!response.to_string().contains("secret-fixture"));
     }
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
@@ -95,5 +96,77 @@ fi
         json!({"version":1,"operation":"hydrate","args":{"connectorId":"codex-cloud","connectorInstance":"other","observation":observation}}),
     );
     assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"]["code"], "INVALID_ARGUMENT");
     assert!(!home.path().join(".ai-hist").exists());
+}
+
+#[test]
+fn invalid_request_is_classified_before_home_or_provider_auth() {
+    let unavailable_home = Path::new("");
+    for request in [
+        json!({"version":2,"operation":"discover","args":{"connectorId":"codex-cloud"}}),
+        json!({"version":1,"operation":"unknown-sensitive-operation","args":{"connectorId":"codex-cloud"}}),
+        json!({"version":1,"operation":"discover","args":{}}),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"unknown-sensitive-selector"}}),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"claude-web","source":"codex"}}),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"codex-cloud","connectorInstance":" "}}),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"codex-cloud","limit":10001}}),
+        json!({"version":1,"operation":"hydrate","args":{"connectorId":"codex-cloud"}}),
+    ] {
+        let response = invoke(unavailable_home, request);
+        assert_eq!(response["error"]["code"], "INVALID_ARGUMENT", "{response}");
+        assert!(!response.to_string().contains("sensitive"));
+    }
+}
+
+#[test]
+fn valid_requests_keep_configuration_errors_generic_and_redacted() {
+    let home = tempfile::tempdir().unwrap();
+    let response = invoke(
+        home.path(),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"claude-web"}}),
+    );
+    assert_eq!(response["error"]["code"], "CONNECTOR_FAILURE");
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(
+        home.path().join(".claude/.credentials.json"),
+        "private-malformed-credential-fixture",
+    )
+    .unwrap();
+    let response = invoke(
+        home.path(),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"claude-web"}}),
+    );
+    assert_eq!(response["error"]["code"], "CONNECTOR_FAILURE");
+    assert!(!response
+        .to_string()
+        .contains("private-malformed-credential-fixture"));
+    assert!(!response
+        .to_string()
+        .contains(&home.path().to_string_lossy().to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_stderr_cannot_change_classification_or_escape_the_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
+    std::fs::create_dir_all(home.path().join("bin")).unwrap();
+    let script = home.path().join("bin/codex");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'INVALID_ARGUMENT: private-provider-token-fixture' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let response = invoke(
+        home.path(),
+        json!({"version":1,"operation":"discover","args":{"connectorId":"codex-cloud"}}),
+    );
+    assert_eq!(response["error"]["code"], "CONNECTOR_FAILURE");
+    assert!(!response
+        .to_string()
+        .contains("private-provider-token-fixture"));
 }
