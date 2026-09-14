@@ -3,8 +3,13 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 fn invoke(home: &Path, request: Value) -> Value {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_history-provider-sources"))
-        .env("HOME", home)
+    invoke_with_profile(home, request, false)
+}
+fn invoke_with_profile(home: &Path, request: Value, profile_only: bool) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_history-provider-sources"));
+    command.env_remove("HOME").env_remove("USERPROFILE");
+    command.env(if profile_only { "USERPROFILE" } else { "HOME" }, home);
+    let mut child = command
         .env("PATH", home.join("bin"))
         .env_remove("RELAYHISTORY_CLAUDE_CREDENTIALS")
         .stdin(Stdio::piped())
@@ -60,9 +65,12 @@ else
 fi
 "#).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let discovered = invoke(
+    // A Windows-style launch has USERPROFILE and no HOME. The same fixture
+    // proves the executable resolves that profile before provider discovery.
+    let discovered = invoke_with_profile(
         home.path(),
         json!({"version":1,"operation":"discover","args":{"connectorId":"codex-cloud","connectorInstance":"work","source":"codex","limit":10}}),
+        true,
     );
     assert_eq!(discovered["ok"], true, "{discovered}");
     let row = &discovered["value"]["observations"][0];

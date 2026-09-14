@@ -84,10 +84,8 @@ fn execute(request: Request) -> Result<Value> {
     let args = request.args;
     let connector = args.connector_id.context("connectorId required")?;
     let instance = args.connector_instance.as_deref().unwrap_or("default");
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .context("HOME required")?;
-    let home = std::path::Path::new(&home);
+    let home = resolve_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))?;
+    let home = home.as_path();
     let provider = crate::remote::provider(home, &connector, instance, args.limit)?;
     if let Some(source) = &args.source {
         ensure!(provider.source() == source, "source mismatch");
@@ -146,5 +144,40 @@ pub fn handle(request: Request) -> Value {
         Err(_) => {
             json!({"version":1,"ok":false,"error":{"code":"CONNECTOR_FAILURE","message":"Provider source operation failed; verify explicit connector configuration and provider CLI sign-in"}})
         }
+    }
+}
+
+fn resolve_home(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf> {
+    home.filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
+        .map(Into::into)
+        .context("HOME or USERPROFILE required")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_home;
+    use std::path::PathBuf;
+
+    #[test]
+    fn home_resolution_supports_windows_profile_and_rejects_empty_paths() {
+        let profile = PathBuf::from("fixture-user-profile");
+        assert_eq!(
+            resolve_home(None, Some(profile.clone().into_os_string())).unwrap(),
+            profile
+        );
+        assert_eq!(
+            resolve_home(Some("".into()), Some(profile.clone().into_os_string())).unwrap(),
+            profile
+        );
+        assert_eq!(
+            resolve_home(Some("fixture-home".into()), Some(profile.into_os_string())).unwrap(),
+            PathBuf::from("fixture-home")
+        );
+        assert!(resolve_home(None, None).is_err());
+        assert!(resolve_home(Some("".into()), Some("".into())).is_err());
     }
 }
