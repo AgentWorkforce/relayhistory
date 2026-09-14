@@ -732,3 +732,54 @@ fn resume_checks_state_after_acquiring_the_write_transaction() {
     assert!(resumer.join().unwrap().is_err());
     assert_eq!(status(&writer, &job.job_id).unwrap().state, "blocked");
 }
+
+#[test]
+fn clearing_consumed_exclusions_requires_a_new_baseline_generation() {
+    for queued in [false, true] {
+        let conn = db();
+        let session = SessionIdentity {
+            source: "claude".into(),
+            session_id: "private".into(),
+        };
+        event(&conn, "private", "historical baseline");
+        let cfg = config("one");
+        let job = create_job(&conn, &cfg, 0).unwrap();
+        if queued {
+            assert!(claim(&conn, &job.job_id, 0).is_some());
+        }
+        set_session_excluded(&conn, &session, true).unwrap();
+        assert!(drain(&conn, &job.job_id).is_empty());
+        let error = set_session_excluded(&conn, &session, false).unwrap_err();
+        assert!(error.to_string().contains("DELIVERY_GENERATION_REQUIRED"));
+        assert!(drain(&conn, &job.job_id).is_empty());
+        cancel_job(&conn, &job.job_id).unwrap();
+        set_session_excluded(&conn, &session, false).unwrap();
+        let next = create_job(&conn, &cfg, 1).unwrap();
+        let records = drain(&conn, &next.job_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload["text"], "historical baseline");
+        assert!(next.generation > job.generation);
+    }
+}
+
+#[test]
+fn clearing_exclusions_does_not_require_cancelling_unaffected_jobs() {
+    let conn = db();
+    let session = SessionIdentity {
+        source: "claude".into(),
+        session_id: "private".into(),
+    };
+    set_session_excluded(&conn, &session, true).unwrap();
+    let mut cfg = config("other");
+    cfg.selection.all_sources = false;
+    cfg.selection.sessions = vec![SessionIdentity {
+        source: "claude".into(),
+        session_id: "other".into(),
+    }];
+    create_job(&conn, &cfg, 0).unwrap();
+    let mut explicit = config("permanent");
+    explicit.selection.excluded_sessions.push(session.clone());
+    create_job(&conn, &explicit, 0).unwrap();
+    set_session_excluded(&conn, &session, false).unwrap();
+    set_session_excluded(&conn, &session, false).unwrap();
+}
