@@ -3,7 +3,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -13,7 +13,7 @@ import { gunzipSync } from 'node:zlib';
 import {
   beginHistoryExport, closeHistoryExport, controlHistoryDelivery, createHistoryDelivery,
   DEFAULT_DELIVERY_LIMITS, deliveryRequest, drainHistoryDelivery, exportHistory, historyDeliveryStatus,
-  HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage, runHistoryDelivery,
+  historyDeliveryRetention, HistoryDeliveryError, HistoryPluginRegistry, loadHistoryPlugins, readHistoryExportPage, runHistoryDelivery,
   type DeliveryJobConfig, type HistoryDestination, type HistoryExportBatch, type HistoryExportSelection,
 } from './index.js';
 
@@ -367,4 +367,30 @@ test('removing a delivery exclusion exposes the required generation recovery cod
     await controlHistoryDelivery(job.job_id, 'cancel', { dbPath });
     await deliveryRequest({ ...request, excluded: false }, { dbPath });
   });
+});
+
+
+test('SDK, CLI and MCP delivery status leave a missing store and its parents absent', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'history-status-missing-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const parent = join(root, 'absent');
+  const dbPath = join(parent, 'history.db');
+  assert.deepEqual(await historyDeliveryStatus(undefined, { dbPath }), []);
+  assert.deepEqual(await historyDeliveryRetention({ dbPath }), { usedBytes: 0, limitBytes: 256 * 1048576 });
+  await assert.rejects(historyDeliveryStatus('unknown', { dbPath }), /unknown delivery job/);
+  await assert.rejects(access(parent));
+  const output = await run(process.execPath, [join(sdkRoot, 'dist/cli.js'), 'delivery', 'status', '--db', dbPath]);
+  assert.deepEqual(JSON.parse(output.stdout).jobs, []);
+  await assert.rejects(access(parent));
+  const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string,string] => entry[1] !== undefined));
+  env.AI_HIST_DB = dbPath;
+  delete env.AI_HIST_PLUGIN_CONFIG;
+  const transport = new StdioClientTransport({ command: process.execPath, args: [join(sdkRoot, 'dist/mcp-server.js')], env, stderr: 'pipe' });
+  const client = new Client({ name: 'missing-delivery-status', version: '1' });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'delivery_status', arguments: {} });
+    assert.notEqual(result.isError, true);
+    await assert.rejects(access(parent));
+  } finally { await client.close(); }
 });

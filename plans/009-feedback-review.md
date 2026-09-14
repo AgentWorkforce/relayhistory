@@ -2,7 +2,7 @@
 
 Reviewed all inline comments, review bodies and PR discussions for client PRs 139–146 and server PR 45. Snapshot fetched from GitHub for this review. All endpoints returned fewer than 100 entries, so no additional pages were needed. General comments contain review status/walkthroughs rather than additional actionable findings. No messages or review replies were posted.
 
-There are 22 inline findings, including one duplicate. All seven newly identified findings are fixed. Thirteen findings were already addressed (including one duplicate); one Promise.race report is a false positive, and one legacy-ownership behavior is intentionally conservative.
+There are 24 inline findings, including one duplicate. Eight newly identified findings are fixed. Thirteen findings were already addressed (including one duplicate); one Promise.race report is a false positive, one legacy-ownership behavior is intentionally conservative, and limited discovery intentionally defers opaque aliases to preserve bounded reads.
 
 | PR | Finding | Disposition |
 | --- | --- | --- |
@@ -17,7 +17,9 @@ There are 22 inline findings, including one duplicate. All seven newly identifie
 | #144 | [Reject output aliases through symlinked parent directories](https://github.com/AgentWorkforce/relayhistory/pull/144#discussion_r4001051995) | Fixed previously: canonicalize existing parents and recheck before rename. |
 | #144 | [Allow JSON expansion for valid prepared payloads](https://github.com/AgentWorkforce/relayhistory/pull/144#discussion_r4001051997) | Fixed previously: native envelope cap includes worst-case JSON expansion. |
 | #144 | [Do not mark every plugin tool idempotent](https://github.com/AgentWorkforce/relayhistory/pull/144#discussion_r4001051999) | Fixed previously: arbitrary plugin tools use conservative annotations. |
+| #144 | [Status creates a missing database](https://github.com/AgentWorkforce/relayhistory/pull/144#discussion_r4001486944) | Fixed in `ed4e031`: missing-store job/retention reads and missing-job errors do not create SQLite or parent directories. SDK, CLI and MCP regression passed. |
 | #144 | [Delivery usage hides subcommand errors](https://github.com/AgentWorkforce/relayhistory/pull/144#discussion_r4001096799) | Fixed in `b24ae93`: delivery help, missing and unknown subcommands report the right usage without creating a database. |
+| #145 | [Limited discovery defers opaque aliases](https://github.com/AgentWorkforce/relayhistory/pull/145#discussion_r4001484742) | Retained intentionally, characterized/documented in `94ed91c`: discovering whether unread opaque paths alias an emitted session requires scanning beyond the read budget. A targeted connector scan collects its independent observation; later limited scans never delete it. Existing archive-scaling counters prove bounded reads. |
 | #145 | [Persist the candidate locator for acquisition](https://github.com/AgentWorkforce/relayhistory/pull/145#discussion_r4001083139) | Fixed previously: observation stores candidate locator separately from display path. |
 | #145 | [Include the observation location in Codex evidence keys](https://github.com/AgentWorkforce/relayhistory/pull/145#discussion_r4001083142) | Fixed previously: Codex evidence prefix includes observation location. |
 | #145 | [Codex diff IDs break upgrades](https://github.com/AgentWorkforce/relayhistory/pull/145#discussion_r4001098666) | Fixed previously: retain unknown legacy projection without duplicate namespaced rows. |
@@ -39,10 +41,10 @@ PRs 139, 140, 142 have no inline findings. CodeRabbit skipped or rate-limited su
 - SDK acquisition regressions cover typed failures, secret redaction, healthy-source isolation, long snapshots, cancellation, timeout, invalid budgets and no partial native commit.
 - Provider SDK regression confirms both discovery and hydration budgets reach the spawned helper.
 - Server typecheck passes. Real SDK/native/helper/Hono/PGlite composed suite: 4 tests pass, including the deliberately slow-process run.
-- Final merged workspace: 327 Rust tests passed, 2 existing benchmark tests ignored; formatting and Clippy passed.
-- Final rebuilt native contract 14 verified; generated declarations unchanged. Core SDK: 130 tests passed.
+- Full workspace run: 327 Rust tests passed, 2 existing benchmark tests ignored. After the final status follow-up, all 27 delivery and 9 source-registry tests passed, along with the archive read-budget regression; formatting and Clippy passed.
+- Final rebuilt native contract 14 verified; generated declarations unchanged. Core SDK: 131 tests passed, including missing-store SDK/CLI/MCP status.
 - Optional SDK suites: 45 RelayHistory and 7 provider tests passed.
-- Installed local tarball smoke test passed on darwin-arm64.
-- Server CI first caught a formatting violation in the test helper; corrected with Prettier, then formatting and typecheck passed locally. Hosted reruns are pending as this report is committed.
+- Installed local and composed optional-plugin tarball smoke tests passed on darwin-arm64.
+- Server CI first caught a formatting violation in the test helper; corrected with Prettier, then formatting and typecheck passed locally. Client and server CI passed before the final missing-store status fix. The follow-up reruns for PRs 144–146 are pending at this commit. Full local server suite: 375 passed; four optional helper tests pass separately.
 
 No PR was merged or deployed. Existing release gates remain in place.

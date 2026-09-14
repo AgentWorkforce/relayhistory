@@ -116,8 +116,20 @@ pub async fn history_delivery(
         .map_err(|_| crate::native_error("INVALID_ARGUMENT", "invalid typed delivery request"))?;
     let path = crate::db_path(db_path);
     napi::tokio::task::spawn_blocking(move || {
-        if !path.exists() && matches!(request, Request::ListJobs) {
-            return Ok("[]".to_owned());
+        if !path.exists() {
+            match request {
+                Request::ListJobs => return Ok("[]".to_owned()),
+                Request::RetainedBytes => {
+                    return Ok(format!("[0,{}]", core::DEFAULT_RETENTION_LIMIT_BYTES))
+                }
+                Request::Status { .. } => {
+                    return Err(crate::native_error(
+                        "HISTORY_DELIVERY_FAILED",
+                        "unknown delivery job",
+                    ))
+                }
+                _ => {}
+            }
         }
         let conn = open_db(&path).map_err(|error| crate::database_error(&path, error))?;
         let result: anyhow::Result<serde_json::Value> = (|| {
