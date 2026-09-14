@@ -232,6 +232,11 @@ pub async fn history_delivery(
         let value = result.map_err(|error| {
             let code = if core::is_retention_limit(&error) {
                 "DELIVERY_RETENTION_LIMIT"
+            } else if error
+                .to_string()
+                .starts_with("DELIVERY_GENERATION_REQUIRED:")
+            {
+                "DELIVERY_GENERATION_REQUIRED"
             } else {
                 "HISTORY_DELIVERY_FAILED"
             };
