@@ -356,3 +356,15 @@ test('arbitrary plugin MCP tools have conservative side-effect annotations', asy
     } finally {await client.close();await transport.close();}
   });
 });
+
+
+test('removing a delivery exclusion exposes the required generation recovery code', async () => {
+  await fixture(async (dbPath) => {
+    const job = await createHistoryDelivery(config(), { dbPath });
+    const request = { operation: 'set_session_excluded', session: { source: 'claude', session_id: 'local-only' } };
+    await deliveryRequest({ ...request, excluded: true }, { dbPath });
+    await assert.rejects(deliveryRequest({ ...request, excluded: false }, { dbPath }), { code: 'DELIVERY_GENERATION_REQUIRED' });
+    await controlHistoryDelivery(job.job_id, 'cancel', { dbPath });
+    await deliveryRequest({ ...request, excluded: false }, { dbPath });
+  });
+});
