@@ -114,10 +114,10 @@ impl Table {
 }
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(r#"
+    conn.execute_batch(&format!(r#"
 CREATE TABLE IF NOT EXISTS delivery_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), origin_id TEXT NOT NULL,
-    retained_bytes INTEGER NOT NULL DEFAULT 0, max_retained_bytes INTEGER NOT NULL DEFAULT 268435456
+    retained_bytes INTEGER NOT NULL DEFAULT 0, max_retained_bytes INTEGER NOT NULL DEFAULT {retention_limit}
 );
 INSERT OR IGNORE INTO delivery_state(singleton, origin_id) VALUES (1, lower(hex(randomblob(16))));
 CREATE TABLE IF NOT EXISTS delivery_jobs (
@@ -167,7 +167,7 @@ CREATE INDEX IF NOT EXISTS history_export_page_owner ON history_export_pages(exp
 CREATE TABLE IF NOT EXISTS delivery_exclusions (
     source TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(source,session_id)
 );
-"#)?;
+"#, retention_limit = super::DEFAULT_RETENTION_LIMIT_BYTES))?;
     // Count retained logical bytes, including key/payload duplication and row
     // overhead. This is a retention cap, not a promise about SQLite page size.
     for (table, size) in [
