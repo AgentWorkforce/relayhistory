@@ -167,7 +167,6 @@ pub(crate) fn apply_normalized(
     );
     let previous = observations::checkpoint(&tx, key)?;
     let mut snapshots = BTreeMap::new();
-    let mut observation_keys = BTreeMap::new();
     let mut ambiguous_local = false;
     for observed in observations::list(&tx, &key.source, &key.session_id)? {
         let snapshot = read_snapshot(&tx, &observed.key)?;
@@ -176,7 +175,6 @@ pub(crate) fn apply_normalized(
         // evidence, while retaining each remote snapshot separately.
         ambiguous_local |=
             observed.key.location == SessionLocation::Local && snapshot.covered_kinds.is_empty();
-        observation_keys.insert(owner(&observed.key), observed.key.clone());
         snapshots.insert(owner(&observed.key), snapshot);
     }
     let mut previous_winners = BTreeMap::new();
@@ -187,26 +185,20 @@ pub(crate) fn apply_normalized(
                 .or_insert(&item.record);
         }
     }
-    let mut revoked = BTreeSet::new();
+    let mut revoked = observations::protected_canonical_evidence(&tx, key)?;
     for (identity, record) in previous_winners {
         if (ambiguous_local && record.exists(&tx)?) || !record.matches_canonical(&tx)? {
+            observations::protect_canonical_evidence(&tx, key, &identity)?;
             revoked.insert(identity);
         }
     }
-    for (identity, snapshot) in &mut snapshots {
-        let mut changed = false;
+    // Apply canonical protection only to this reconciliation view. Other
+    // connectors retain their exact acquired snapshot and revision fence.
+    for snapshot in snapshots.values_mut() {
         for item in &mut snapshot.records {
-            if item.managed && revoked.contains(&item.record.identity()) {
+            if revoked.contains(&item.record.identity()) {
                 item.managed = false;
-                changed = true;
             }
-        }
-        if changed {
-            observations::save_evidence(
-                &tx,
-                &observation_keys[identity],
-                &serde_json::to_value(&snapshot)?,
-            )?;
         }
     }
     let mut previously_managed = BTreeMap::new();
@@ -226,7 +218,8 @@ pub(crate) fn apply_normalized(
     kinds.extend(evidence.covered_kinds.iter().copied());
     own.covered_kinds = kinds.into_iter().collect();
     for record in &evidence.records {
-        let managed = previously_managed.contains_key(&record.identity()) || !record.exists(&tx)?;
+        let managed = !revoked.contains(&record.identity())
+            && (previously_managed.contains_key(&record.identity()) || !record.exists(&tx)?);
         own.records.push(ManagedRecord {
             record: record.clone(),
             managed,

@@ -69,6 +69,8 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         "observation_hydration_checkpoints",
         "observation_discovery_skips",
         "observation_evidence",
+        "canonical_evidence_protection",
+        "delete_canonical_evidence_protection",
         "idx_observation_locator",
         "delete_session_observations",
         "observation_versions",
@@ -88,6 +90,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         ("observation_hydration_checkpoints", "source,session_id,location,connector_id,connector_instance,source_stamp,parser_version,last_event_at_ms,source_bytes,records_parsed,include_related,updated_ms"),
         ("observation_discovery_skips", "source,location,connector_id,connector_instance,locator,stamp,updated_ms"),
         ("observation_evidence", "source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json"),
+        ("canonical_evidence_protection", "source,session_id,record_identity"),
     ] {
         let columns=conn.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
         if required.split(',').any(|column| !columns.iter().any(|present|present==column)) { return Ok(false); }
@@ -128,6 +131,13 @@ CREATE TABLE IF NOT EXISTS observation_discovery_skips (
  source TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,locator TEXT NOT NULL,stamp TEXT NOT NULL,updated_ms INTEGER NOT NULL,
  PRIMARY KEY(source,location,connector_id,connector_instance,locator)
 );
+CREATE TABLE IF NOT EXISTS canonical_evidence_protection (
+ source TEXT NOT NULL, session_id TEXT NOT NULL, record_identity TEXT NOT NULL,
+ PRIMARY KEY(source,session_id,record_identity)
+);
+CREATE TRIGGER IF NOT EXISTS delete_canonical_evidence_protection AFTER DELETE ON sessions BEGIN
+ DELETE FROM canonical_evidence_protection WHERE source=OLD.source AND session_id=OLD.session_id;
+END;
 CREATE TABLE IF NOT EXISTS observation_evidence (
  source TEXT NOT NULL,session_id TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,
  evidence_uid TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -459,6 +469,30 @@ fn bump_revision(conn: &Connection, key: &ObservationKey) -> Result<()> {
         |row| row.get(0),
     )?;
     conn.execute("INSERT INTO observation_versions(source,session_id,location,connector_id,connector_instance,version) VALUES(?,?,?,?,?,?) ON CONFLICT(source,session_id,location,connector_id,connector_instance) DO UPDATE SET version=excluded.version",params![key.source,key.session_id,key.location.as_str(),key.connector_id,key.connector_instance,version])?;
+    Ok(())
+}
+
+/// Canonical rows with local or unknown ownership cannot be changed by a remote
+/// projection. This local reconciliation state is not connector evidence and
+/// must not advance observation revisions or enter delivery capture.
+pub fn protected_canonical_evidence(
+    conn: &Connection,
+    key: &ObservationKey,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT record_identity FROM canonical_evidence_protection WHERE source=? AND session_id=?",
+    )?;
+    let rows = statement.query_map(params![key.source, key.session_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Persist protection independently of the lifetime of any source observation.
+pub fn protect_canonical_evidence(
+    conn: &Connection,
+    key: &ObservationKey,
+    identity: &str,
+) -> Result<()> {
+    conn.execute("INSERT OR IGNORE INTO canonical_evidence_protection(source,session_id,record_identity) VALUES(?,?,?)", params![key.source,key.session_id,identity])?;
     Ok(())
 }
 

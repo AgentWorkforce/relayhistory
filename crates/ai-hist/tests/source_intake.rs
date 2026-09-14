@@ -576,3 +576,102 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
     );
     Ok(())
 }
+
+#[test]
+fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    for instance in ["a", "b"] {
+        observe(&path, instance)?;
+        apply(
+            &path,
+            instance,
+            state(&path, instance)?.revision.unwrap(),
+            vec![EvidenceKind::SessionEvent],
+            vec![event("shared", "remote")],
+        )?;
+    }
+    let conn = ai_hist_core::open_db(&path)?;
+    let sibling_revision = state(&path, "b")?.revision.unwrap();
+    let sibling_evidence = ai_hist_core::observations::evidence(&conn, &key("b"))?;
+    ai_hist_core::observations::upsert(
+        &conn,
+        &ai_hist_core::observations::SessionObservation {
+            key: ObservationKey {
+                location: SessionLocation::Local,
+                connector_id: "claude".into(),
+                ..key("local")
+            },
+            raw_locator: Some("local.jsonl".into()),
+            source_stamp: Some("local1".into()),
+            discovery_state: "full".into(),
+            access_state: "available".into(),
+            updated_ms: 1,
+        },
+    )?;
+    // Stand in for bounded delivery capture: acquiring a must not recapture b.
+    conn.execute_batch("CREATE TRIGGER reject_sibling_evidence DELETE ON observation_evidence WHEN OLD.connector_instance='b' BEGIN SELECT RAISE(ABORT,'unexpected sibling capture'); END;")?;
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::SessionEvent],
+        vec![],
+    )?;
+    assert_eq!(
+        state(&path, "b")?.revision.as_deref(),
+        Some(sibling_revision.as_str())
+    );
+    assert_eq!(
+        ai_hist_core::observations::evidence(&conn, &key("b"))?,
+        sibling_evidence
+    );
+    conn.execute_batch("DROP TRIGGER reject_sibling_evidence; DELETE FROM session_observations WHERE location='local';")?;
+    // Revocation survives reopen and disappearance of ambiguous local provenance.
+    drop(conn);
+    apply(
+        &path,
+        "b",
+        sibling_revision,
+        vec![EvidenceKind::SessionEvent],
+        vec![],
+    )?;
+    let conn = ai_hist_core::open_db(&path)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT text FROM session_events WHERE event_uid='shared'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "remote"
+    );
+    // A later remote refresh still cannot reclaim the protected canonical row.
+    apply(
+        &path,
+        "b",
+        state(&path, "b")?.revision.unwrap(),
+        vec![EvidenceKind::SessionEvent],
+        vec![event("shared", "remote replacement")],
+    )?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT text FROM session_events WHERE event_uid='shared'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "remote"
+    );
+    conn.execute(
+        "DELETE FROM sessions WHERE source='claude' AND session_id='s'",
+        [],
+    )?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM canonical_evidence_protection",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    Ok(())
+}
