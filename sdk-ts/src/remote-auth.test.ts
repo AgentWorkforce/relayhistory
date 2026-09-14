@@ -1,165 +1,106 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { listSessionCatalogPage, RelayHistoryError, stats } from './index.js';
+import { gunzipSync } from 'node:zlib';
+import { getSessionEvents, listSessionCatalogPage, recent, search, stats, type CatalogCursor, type SessionScope } from './index.js';
+import { nativeCall } from './native.js';
 
 const run = promisify(execFile);
-const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
-const HOUR_AHEAD = new Date(Date.now() + 3_600_000).toISOString();
-const ELIGIBLE = { access_token_expires_at: HOUR_AHEAD, org_id: 'org-example' };
+const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
+const states = ['absent', 'malformed', 'expired', 'ambiguous'] as const;
+type AuthState = typeof states[number];
 
-async function withIsolatedHome(runCase: (root: string, dbPath: string) => Promise<void>): Promise<void> {
-  const root = await mkdtemp(join(tmpdir(), 'relayhistory-remote-auth-'));
-  const dbPath = join(root, 'history.db');
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, RELAYHISTORY_HOME: process.env.RELAYHISTORY_HOME };
+async function withFixture(state: AuthState, body: (dbPath: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cached-scope-'));
+  const keys = ['HOME', 'USERPROFILE', 'RELAYHISTORY_HOME', 'RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL', 'RELAYHISTORY_NO_UPDATE_CHECK'];
+  const saved = new Map(keys.map((name) => [name, process.env[name]]));
+  for (const name of keys) delete process.env[name];
   process.env.HOME = root;
   process.env.USERPROFILE = root;
-  delete process.env.RELAYHISTORY_HOME;
-  delete process.env.RELAYHISTORY_BASE_URL;
-  delete process.env.AI_HIST_BASE_URL;
-
+  process.env.RELAYHISTORY_HOME = join(root, 'commercial');
+  process.env.RELAYHISTORY_NO_UPDATE_CHECK = '1';
   try {
-    await runCase(root, dbPath);
+    const stages = join(process.env.RELAYHISTORY_HOME, 'stages');
+    await mkdir(stages, { recursive: true });
+    if (state === 'malformed') await writeFile(join(stages, 'broken.auth.json'), '{not-json', { mode: 0o600 });
+    if (state === 'expired' || state === 'ambiguous') {
+      for (const stage of state === 'expired' ? ['prod'] : ['prod', 'dev']) {
+        await writeFile(join(stages, `${stage}.auth.json`), JSON.stringify({
+          base_url: `https://${stage}.example.invalid`, access_token: 'synthetic-expired-token',
+          refresh_token: 'synthetic-refresh-token', access_token_expires_at: '2000-01-01T00:00:00Z',
+          org_id: 'fixture-org', workspace_id: null,
+        }), { mode: 0o600 });
+      }
+    }
+    // Current core schema, generated only from three synthetic Claude sessions.
+    // The regeneration recipe is fixtures/regenerate-offline-history.mjs. Each
+    // test gets its own copy, including when a later native schema migrates it.
+    const dbPath = join(root, 'history.db');
+    await writeFile(dbPath, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+    await body(dbPath);
   } finally {
-    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
-    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
-    if (saved.RELAYHISTORY_HOME === undefined) delete process.env.RELAYHISTORY_HOME; else process.env.RELAYHISTORY_HOME = saved.RELAYHISTORY_HOME;
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 }
 
-test('listSessionCatalogPage with remote scope fails when unauthenticated', async () => {
-  await withIsolatedHome(async (_root, dbPath) => {
-    await assert.rejects(
-      () => listSessionCatalogPage({ dbPath, scope: 'remote' }),
-      (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message.includes('not authenticated for remote scope')
-        && error.message.includes('ai-hist login'),
-    );
+const expected: Record<SessionScope, string[]> = {
+  local: ['both', 'local-only'], remote: ['both', 'remote-only'], all: ['both', 'local-only', 'remote-only'],
+};
+
+for (const state of states) {
+  test(`cached scope reads preserve remote evidence with ${state} commercial credentials`, async () => {
+    await withFixture(state, async (dbPath) => {
+      for (const scope of ['local', 'remote', 'all'] as const) {
+        const options = { dbPath, scope };
+        assert.deepEqual((await search('offlinefixture', options)).map((row) => row.sessionId).sort(), expected[scope]);
+        assert.deepEqual((await recent(options)).map((row) => row.sessionId).sort(), expected[scope]);
+        const counts = await stats(options);
+        assert.equal(counts.scope, scope);
+        assert.equal(counts.total, expected[scope].length);
+        const sessions: string[] = [];
+        let after: CatalogCursor | undefined;
+        do {
+          const page = await listSessionCatalogPage({ ...options, limit: 1, after });
+          assert.equal(page.scope, scope);
+          sessions.push(...page.sessions.map((row) => row.sessionId));
+          assert.ok(sessions.length <= expected[scope].length, 'pagination cannot repeat a session');
+          after = page.nextCursor ?? undefined;
+        } while (after);
+        assert.deepEqual(sessions.sort(), expected[scope]);
+      }
+      const events = await getSessionEvents('remote-only', { dbPath, source: 'claude' });
+      assert.equal(events.length, 1);
+      assert.equal(events[0].text, 'offlinefixture remote-only');
+    });
+  });
+}
+
+test('the local native contract contains no commercial credential operations', async () => {
+  await nativeCall(async native => {
+    assert.equal('cloudLoadAuth' in native, false);
+    assert.equal('pushCloud' in native, false);
   });
 });
 
-test('CLI sessions list --remote exits non-zero when unauthenticated', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-sessions-remote-'));
-  const env = { ...process.env, HOME: root, USERPROFILE: root, RELAYHISTORY_NO_UPDATE_CHECK: '1' };
-
-  try {
-    await assert.rejects(
-      () => run(process.execPath, [
-        cli, 'sessions', 'list', '--remote', '--db', join(root, 'history.db'), '--json', '--no-warning',
-      ], { env }),
-      (error: unknown) => typeof error === 'object' && error !== null
-        && 'code' in error
-        && error.code === 1
-        && 'stderr' in error
-        && String(error.stderr).includes('CLOUD_AUTH_FAILED')
-        && String(error.stderr).includes('not authenticated for remote scope'),
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('stats with remote scope fails when unauthenticated', async () => {
-  await withIsolatedHome(async (_root, dbPath) => {
-    await assert.rejects(
-      () => stats({ dbPath, scope: 'remote' }),
-      (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message.includes('not authenticated for remote scope')
-        && error.message.includes('ai-hist login'),
-    );
-  });
-});
-
-test('stats with remote scope propagates ambiguous stage selection errors', async () => {
-  await withIsolatedHome(async (root, dbPath) => {
-    const nativeHome = join(root, 'relayhistory');
-    const stages = join(nativeHome, 'stages');
-    await mkdir(stages, { recursive: true });
-    process.env.RELAYHISTORY_HOME = nativeHome;
-    for (const [key, baseUrl] of [['prod', 'https://history.agentrelay.com'], ['dev', 'https://dev.agentrelay.com']] as const) {
-      await writeFile(join(stages, `${key}.auth.json`), JSON.stringify({
-        base_url: baseUrl,
-        access_token: `rth_at_${key}`,
-        refresh_token: `rth_rt_${key}`,
-        workspace_id: null,
-        ...ELIGIBLE,
-      }), { mode: 0o600 });
+test('CLI cached remote/all reads work with malformed commercial credentials', async () => {
+  await withFixture('malformed', async (dbPath) => {
+    for (const scope of ['remote', 'all'] as const) {
+      const flags = [`--${scope}`, '--db', dbPath, '--json', '--no-warning', '--no-bootstrap'];
+      const catalog = await run(process.execPath, [cli, 'sessions', 'list', ...flags], { env: process.env });
+      const page = JSON.parse(catalog.stdout) as { scope: string; sessions: Array<{ session_id: string }> };
+      assert.equal(page.scope, scope);
+      assert.deepEqual(page.sessions.map((row) => row.session_id).sort(), expected[scope]);
+      const counts = JSON.parse((await run(process.execPath, [cli, 'stats', ...flags], { env: process.env })).stdout) as { scope: string; total: number };
+      assert.equal(counts.scope, scope);
+      assert.equal(counts.total, expected[scope].length);
     }
-
-    await assert.rejects(
-      () => stats({ dbPath, scope: 'remote' }),
-      (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message.includes('Refusing to guess'),
-    );
-  });
-});
-
-test('stats with all scope falls back to local when credentials are absent', async () => {
-  await withIsolatedHome(async (_root, dbPath) => {
-    const allStats = await stats({ dbPath, scope: 'all' });
-    assert.equal(allStats.scope, 'local');
-    assert.equal(allStats.total, 0);
-  });
-});
-
-test('stats with all scope propagates ambiguous stage selection errors', async () => {
-  await withIsolatedHome(async (root, dbPath) => {
-    const nativeHome = join(root, 'relayhistory');
-    const stages = join(nativeHome, 'stages');
-    await mkdir(stages, { recursive: true });
-    process.env.RELAYHISTORY_HOME = nativeHome;
-    for (const [key, baseUrl] of [['prod', 'https://history.agentrelay.com'], ['dev', 'https://dev.agentrelay.com']] as const) {
-      await writeFile(join(stages, `${key}.auth.json`), JSON.stringify({
-        base_url: baseUrl,
-        access_token: `rth_at_${key}`,
-        refresh_token: `rth_rt_${key}`,
-        workspace_id: null,
-        ...ELIGIBLE,
-      }), { mode: 0o600 });
-    }
-
-    await assert.rejects(
-      () => stats({ dbPath, scope: 'all' }),
-      (error: unknown) => error instanceof RelayHistoryError
-        && error.code === 'CLOUD_AUTH_FAILED'
-        && error.message.includes('Refusing to guess'),
-    );
-  });
-});
-
-test('CLI stats --all returns local-scope results when unauthenticated', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-stats-all-'));
-  const env = { ...process.env, HOME: root, USERPROFILE: root, RELAYHISTORY_NO_UPDATE_CHECK: '1' };
-
-  try {
-    const { stdout } = await run(process.execPath, [
-      cli, 'stats', '--all', '--db', join(root, 'history.db'), '--json', '--no-warning',
-    ], { env });
-    const result = JSON.parse(stdout) as { scope: string; total: number };
-    assert.equal(result.scope, 'local');
-    assert.equal(result.total, 0);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test('stats with local scope works without authentication', async () => {
-  await withIsolatedHome(async (_root, dbPath) => {
-    const localStats = await stats({ dbPath, scope: 'local' });
-    assert.equal(localStats.scope, 'local');
-    assert.equal(localStats.total, 0);
-
-    const defaultStats = await stats({ dbPath });
-    assert.equal(defaultStats.scope, 'local');
-    assert.equal(defaultStats.total, 0);
   });
 });

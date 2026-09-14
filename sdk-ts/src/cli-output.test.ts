@@ -410,15 +410,10 @@ test('scope flags are boolean, default to local, and are mutually exclusive', as
     const implicit = await readEmpty([cli, 'sessions', 'list', '--db', db, '--json', '--no-warning']);
     const explicit = await readEmpty([cli, '--json', 'sessions', 'list', '--local', '--db', db, '--no-warning']);
     assert.deepEqual(JSON.parse(implicit.stdout), JSON.parse(explicit.stdout));
-    await assert.rejects(
-      run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env }),
-      (error: unknown) => typeof error === 'object' && error !== null
-        && 'code' in error
-        && error.code === 1
-        && 'stderr' in error
-        && String(error.stderr).includes('CLOUD_AUTH_FAILED')
-        && String(error.stderr).includes('not authenticated for remote scope'),
-    );
+    const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env });
+    assert.deepEqual(JSON.parse(remote.stdout), {
+      contract_version: 3, scope: 'remote', sessions: [], next_cursor: null,
+    });
 
     await assert.rejects(
       run(process.execPath, [cli, 'sessions', 'list', '--local', '--remote', '--db', db, '--no-warning']),
@@ -711,18 +706,13 @@ test('resume and pack reject flags the other commands accept but these do not', 
   );
 });
 
-test('--help flag works on root and replay commands with exit code 0', async () => {
+test('--help flag works on local root commands with exit code 0', async () => {
   for (const args of [['--help'], ['-h'], ['help']]) {
     const rootHelp = await run(process.execPath, [cli, ...args]);
     assert.equal(rootHelp.stderr, '');
     assert.match(rootHelp.stdout, /Usage:/);
     assert.match(rootHelp.stdout, /ai-hist \[--no-bootstrap\] \[--db PATH\] \[--json\] \[--help\]/);
   }
-
-  const replayHelp = await run(process.execPath, [cli, 'replay', '--help']);
-  assert.equal(replayHelp.stderr, '');
-  assert.match(replayHelp.stdout, /Usage:/);
-  assert.match(replayHelp.stdout, /ai-hist replay SESSION_ID.*--help/);
 
   const sessionsHelp = await run(process.execPath, [cli, 'sessions', '--help']);
   assert.equal(sessionsHelp.stderr, '');
@@ -731,8 +721,8 @@ test('--help flag works on root and replay commands with exit code 0', async () 
 
 test('--help is rejected on commands that do not advertise it', async () => {
   await assert.rejects(
-    run(process.execPath, [cli, 'login', '--help', '--no-warning']),
-    (error: unknown) => isUsageFailure(error, 'login does not accept --help'),
+    run(process.execPath, [cli, 'sync', '--help', '--no-warning']),
+    (error: unknown) => isUsageFailure(error, 'sync does not accept --help'),
   );
 });
 

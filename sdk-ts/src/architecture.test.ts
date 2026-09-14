@@ -8,7 +8,7 @@ const sourceDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const repositoryRoot = join(sourceDir, '..', '..');
 
 test('production TypeScript has one native implementation', async () => {
-  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'cloud-client.ts', 'native.ts', 'sdk-common.ts'];
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'native.ts', 'sdk-common.ts'];
   const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
   for (const forbidden of ['sql.js', 'node:child_process', 'AI_HIST_RUST_BIN', "fallback: 'jsonl'", 'readFile(dbPath)']) {
     assert.equal(source.includes(forbidden), false, `production source contains ${forbidden}`);
@@ -32,7 +32,6 @@ test('MCP session operations expose scope and acquisition is declared open-world
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
   assert.match(mcp, /const SESSION_SCOPE = z\.enum\(\['local', 'remote', 'all'\]\)/);
   assert.match(mcp, /const ACQUIRE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
-  assert.match(mcp, /const LOCAL_WRITE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: false \}/);
   for (const tool of ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'history_stats', 'sync']) {
     const start = mcp.indexOf(`server.tool('${tool}'`);
     assert.notEqual(start, -1, `${tool} is registered`);
@@ -48,7 +47,7 @@ test('MCP session operations expose scope and acquisition is declared open-world
   {
     const start = mcp.indexOf("server.tool('hydrate_session'");
     const end = mcp.indexOf("server.tool('", start + 13);
-    assert.match(mcp.slice(start, end === -1 ? undefined : end), /LOCAL_WRITE/, 'hydrate_session indexes local provider evidence, closed-world');
+    assert.match(mcp.slice(start, end === -1 ? undefined : end), /ACQUIRE/, 'hydrate_session can acquire explicitly selected remote evidence');
   }
 });
 
@@ -65,7 +64,7 @@ test('identity-addressed MCP tools are read-only and take no scope', async () =>
 });
 
 test('native topology enums are validated rather than cast', async () => {
-  const source = await readFile(join(sourceDir, 'index.ts'), 'utf8');
+  const source = await readFile(join(sourceDir, 'normalization.ts'), 'utf8');
   const start = source.indexOf('function relationship(value: UnknownRecord)');
   assert.notEqual(start, -1, 'the relationship normalizer exists');
   const body = source.slice(start, source.indexOf('\n}', start));
@@ -92,25 +91,12 @@ test('MCP evidence tools require both halves of a session identity', async () =>
 });
 
 
-test('the root re-exports cloud wrappers without a reverse dependency', async () => {
-  const [root, cloud, native, common] = await Promise.all(
-    ['index.ts', 'cloud-client.ts', 'native.ts', 'sdk-common.ts'].map((file) => readFile(join(sourceDir, file), 'utf8')),
-  );
-  assert.match(root, /export \* from '\.\/cloud-client\.js'/);
-  assert.match(cloud, /from '\.\/native\.js'/);
-  assert.doesNotMatch(cloud + native + common, /from '\.\/index\.js'/);
-  for (const operation of ['enableCloud', 'pushCloud', 'accessToken', 'replay', 'createShareableTrace', 'login', 'loginCloud', 'loadStoredRelayhistoryAuth', 'resolveCloudSession', 'refreshCloudSession', 'validateCloudExchangeBaseUrl', 'installGitHooks', 'linkGitCommit', 'getSessionThread']) {
-    assert.equal(root.includes(`export async function ${operation}(`), false, `${operation} is re-exported by the root`);
-    assert.equal(cloud.includes(`export async function ${operation}(`), true, `${operation} belongs to the cloud API`);
-  }
-  assert.doesNotMatch(cloud, /node:fs|auth\.json|token\/refresh|cli\/login|RELAYHISTORY_HOME|AI_HIST_CONFIG_DIR|AI_HIST_BASE_URL|RELAYHISTORY_BASE_URL/);
-});
-
-test('token and replay SDK operations delegate to native code', async () => {
-  const source = await readFile(join(sourceDir, 'cloud-client.ts'), 'utf8');
-  const cloudCommands = source.slice(source.indexOf('export async function accessToken('), source.indexOf('export async function pushCloud('));
-  assert.match(cloudCommands, /native\.accessToken\(/);
-  assert.match(cloudCommands, /native\.replay\(/);
-  assert.match(cloudCommands, /native\.cloudLogin\(/);
-  assert.doesNotMatch(cloudCommands, /fetch\(|readFile|writeFile|auth\.json|nextCursor|refreshToken/);
+test('local artifacts exclude cloud APIs and dependencies', async () => {
+  const files=['index.ts','operations.ts','native.ts','sdk-common.ts','cli.ts','mcp-server.ts'];
+  const source=(await Promise.all(files.map(file=>readFile(join(sourceDir,file),'utf8')))).join('\n');
+  assert.doesNotMatch(source,/cloud-client|cloud-auth|@agent-relay\/cloud|cloudLoadAuth|pushCloud/);
+  const pkg=JSON.parse(await readFile(join(sourceDir,'../package.json'),'utf8'));
+  assert.equal(pkg.exports['./cloud'],undefined);
+  assert.equal(pkg.devDependencies['@agent-relay/cloud'],undefined);
+  assert.doesNotMatch(pkg.scripts.build,/cloud/);
 });

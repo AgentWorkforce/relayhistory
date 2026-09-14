@@ -1,4 +1,10 @@
-# Cloud SDK and CLI validation
+# Historical cloud SDK and CLI validation
+
+This records the earlier contract-11 implementation and its validation. It is
+not the current installation or package boundary. Cloud APIs now live in
+`@agent-relay/relayhistory`; the local native contract is 14. See
+[optional cloud setup](enable-cloud.md) and [architecture](architecture.md) for
+the current interfaces.
 
 The npm CLI and MCP server use the public TypeScript SDK, which calls the Rust
 engine through N-API. Native contract **11** covers the cloud authentication
@@ -71,7 +77,7 @@ a PR created after installation.
 - [Cloud workflow](../sdk-ts/src/cloud.test.ts): push, sharing, and Git hooks.
 - [Architecture guards](../sdk-ts/src/architecture.test.ts): TypeScript cloud
   entrypoints delegate credential operations to Rust.
-- Rust [cloud tests](../crates/ai-hist/src/cloud.rs),
+- Rust [cloud tests](../plugins/relayhistory/rust/src/cloud.rs),
   [token tests](../crates/ai-hist/tests/token.rs), and
   [replay tests](../crates/ai-hist/tests/replay.rs): storage, transport, concurrency,
   stage selection, and command behavior.
@@ -90,7 +96,7 @@ npm --prefix crates/ai-hist-napi run build:debug
 node scripts/verify-native-contract.mjs crates/ai-hist-napi/index.js
 npm --prefix sdk-ts test
 cargo test -p ai-hist-engine --lib
-cargo test -p ai-hist-engine --test token --test replay
+cargo test -p ai-hist-cli --test token --test replay
 cargo fmt --all -- --check
 git diff --check
 ```

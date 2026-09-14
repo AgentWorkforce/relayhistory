@@ -1,0 +1,183 @@
+name: Build and publish optional history plugins
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: Optional package to publish (versions are independent)
+        type: choice
+        options: [all, relayhistory, provider-sources]
+        default: all
+      dry_run:
+        description: Build and test without publishing
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: publish-history-plugins
+  cancel-in-progress: false
+jobs:
+  helpers:
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [relayhistory, provider-sources]
+        platform:
+          [
+            darwin-arm64,
+            darwin-x64,
+            linux-x64-gnu,
+            linux-arm64-gnu,
+            linux-x64-musl,
+            linux-arm64-musl,
+            win32-x64-msvc,
+          ]
+        include:
+          - {
+              platform: darwin-arm64,
+              os: macos-15,
+              target: aarch64-apple-darwin,
+            }
+          - {
+              platform: darwin-x64,
+              os: macos-15-intel,
+              target: x86_64-apple-darwin,
+            }
+          - {
+              platform: linux-x64-gnu,
+              os: ubuntu-latest,
+              target: x86_64-unknown-linux-gnu,
+              abi: ".2.28",
+              cross: true,
+            }
+          - {
+              platform: linux-arm64-gnu,
+              os: ubuntu-24.04-arm,
+              target: aarch64-unknown-linux-gnu,
+              abi: ".2.28",
+              cross: true,
+              rust: "1.97.0",
+            }
+          - {
+              platform: linux-x64-musl,
+              os: ubuntu-latest,
+              target: x86_64-unknown-linux-musl,
+              cross: true,
+            }
+          - {
+              platform: linux-arm64-musl,
+              os: ubuntu-24.04-arm,
+              target: aarch64-unknown-linux-musl,
+              cross: true,
+              rust: "1.97.0",
+            }
+          - {
+              platform: win32-x64-msvc,
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              suffix: ".exe",
+            }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust || 'stable' }}
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/${{ matrix.plugin }}/rust
+          key: helper-${{ matrix.target }}
+      - uses: mlugg/setup-zig@v1
+        if: matrix.cross
+        with:
+          version: "0.13.0"
+      - name: Install pinned cross linker
+        if: matrix.cross
+        run: cargo install cargo-zigbuild --version 0.20.1 --locked
+      - name: Test helper packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Build and stage executable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="plugins/${{ matrix.plugin }}/rust/Cargo.toml"
+          command=build
+          if [ '${{ matrix.cross }}' = true ]; then command=zigbuild; fi
+          cargo "$command" --manifest-path "$manifest" --locked --release --target '${{ matrix.target }}${{ matrix.abi }}'
+          binary=history-provider-sources
+          if [ '${{ matrix.plugin }}' = relayhistory ]; then binary=relayhistory-plugin; fi
+          artifact="plugins/${{ matrix.plugin }}/rust/target/${{ matrix.target }}/release/$binary${{ matrix.suffix }}"
+          version=$(node -p "require('./plugins/${{ matrix.plugin }}/sdk/package.json').version")
+          node scripts/package-history-helper.mjs '${{ matrix.plugin }}' '${{ matrix.platform }}' "$version" "$artifact" staged
+          if [[ '${{ matrix.platform }}' == *musl ]]; then
+            docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work node:22-alpine node scripts/verify-history-helper.mjs "/work/$artifact"
+          else
+            node scripts/verify-history-helper.mjs "$artifact"
+          fi
+          if [ -n '${{ matrix.abi }}' ]; then
+            readelf --version-info "$artifact" > versions.txt
+            python3 -c 'import re; versions=[tuple(map(int,v.split("."))) for v in re.findall(r"GLIBC_(\d+\.\d+(?:\.\d+)?)",open("versions.txt").read())]; assert versions and max(versions)<=(2,28), versions'
+          fi
+          (cd staged && npm pack --ignore-scripts)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ matrix.plugin }}-${{ matrix.platform }}
+          path: staged/*.tgz
+  packages:
+    needs: helpers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: helper-*
+          path: artifacts
+          merge-multiple: true
+      - name: Build local SDK and optional packages
+        run: |
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          for plugin in relayhistory provider-sources; do
+            npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
+            npm --prefix "plugins/$plugin/sdk" run build
+            (cd "plugins/$plugin/sdk" && npm pack --ignore-scripts --pack-destination ../../../artifacts)
+          done
+      - name: Verify installed core and optional artifacts
+        run: node scripts/smoke-history-packages.mjs --helpers artifacts
+      # A build-only dry run is useful before the core boundary release exists.
+      # Publication checks the oldest core admitted by each peer range, so an
+      # already-published older core cannot be hidden by our staged source SDK.
+      - name: Verify actual published core compatibility before any publication
+        if: ${{ !inputs.dry_run }}
+        run: node scripts/verify-published-history-core.mjs '${{ inputs.plugin }}'
+      - name: Publish platform helpers before JavaScript plugins
+        if: ${{ !inputs.dry_run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for plugin in relayhistory provider-sources; do
+            if [ '${{ inputs.plugin }}' != all ] && [ '${{ inputs.plugin }}' != "$plugin" ]; then continue; fi
+            version=$(node -p "require('./plugins/$plugin/sdk/package.json').version")
+            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@agent-relay/', '')")
+            for package in artifacts/agent-relay-$prefix-darwin-*-$version.tgz artifacts/agent-relay-$prefix-linux-*-$version.tgz artifacts/agent-relay-$prefix-win32-*-$version.tgz; do
+              npm publish "$package" --access public --provenance
+            done
+            npm publish "artifacts/agent-relay-$prefix-$version.tgz" --access public --provenance
+          done

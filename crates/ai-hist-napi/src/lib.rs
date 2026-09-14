@@ -4,6 +4,9 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
+pub mod delivery;
+pub mod sources;
+
 use std::path::{Path, PathBuf};
 
 use ai_hist_core::{
@@ -31,7 +34,7 @@ use ai_hist_core::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 11;
+pub const NATIVE_CONTRACT_VERSION: u32 = 14;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -133,12 +136,24 @@ fn ensure_acquisition_scope_supported(
     scope: SessionScope,
     operation: &str,
     sources: &[String],
+    connectors: &ai_hist_engine::remote::SourceConnectorSelection,
 ) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        ai_hist_engine::remote::ensure_remote_connectors_configured_for(operation, sources)
-            .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
+        ai_hist_engine::remote::ensure_selected_remote_connectors_configured_for(
+            operation, sources, connectors,
+        )
+        .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
     }
     Ok(())
+}
+
+fn source_connector_selection(
+    ids: Option<Vec<String>>,
+) -> napi::Result<ai_hist_engine::remote::SourceConnectorSelection> {
+    ids.map(ai_hist_engine::remote::SourceConnectorSelection::new)
+        .transpose()
+        .map(|selection| selection.unwrap_or_default())
+        .map_err(|error| native_error("INVALID_ARGUMENT", error.to_string()))
 }
 
 /// Contract version implemented by this native addon.
@@ -867,6 +882,7 @@ pub async fn list_session_catalog(
 
 #[napi(object)]
 pub struct DiscoverOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
@@ -924,6 +940,7 @@ pub struct DiscoverResult {
 #[napi]
 pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result<DiscoverResult> {
     let options = options.unwrap_or(DiscoverOptions {
+        source_connectors: None,
         scope: None,
         db_path: None,
         sources: None,
@@ -931,7 +948,8 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     });
     let scope = parse_scope(options.scope)?;
     let sources = options.sources.unwrap_or_default();
-    ensure_acquisition_scope_supported(scope, "discovery", &sources)?;
+    let connectors = source_connector_selection(options.source_connectors)?;
+    ensure_acquisition_scope_supported(scope, "discovery", &sources, &connectors)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::DiscoverOptions {
         scope,
@@ -939,7 +957,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::discover_sessions_scoped_at(&path, &request)
+        ai_hist_engine::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -993,6 +1011,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
 
 #[napi(object)]
 pub struct HydrateSessionOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub source: String,
     pub session_id: String,
     pub scope: Option<String>,
@@ -1062,6 +1081,7 @@ fn hydration_error(error: anyhow::Error) -> napi::Error {
 /// Fully index one cataloged session without enumerating unrelated sessions.
 #[napi]
 pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<HydrateSessionResult> {
+    let connectors = source_connector_selection(options.source_connectors)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     let request = ai_hist_engine::HydrateSessionOptions {
@@ -1071,7 +1091,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
         include_related: options.include_related.unwrap_or(true),
     };
     let result = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::hydrate_session_at(&path, &request)
+        ai_hist_engine::hydrate_session_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1506,6 +1526,7 @@ pub async fn get_session_children_page(
 
 #[napi(object)]
 pub struct SyncOptions {
+    pub source_connectors: Option<Vec<String>>,
     pub db_path: Option<String>,
     pub scope: Option<String>,
 }
@@ -1521,18 +1542,21 @@ pub struct SyncResult {
 #[napi]
 pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
     let options = options.unwrap_or(SyncOptions {
+        source_connectors: None,
         db_path: None,
         scope: None,
     });
     let scope = parse_scope(options.scope)?;
-    ensure_acquisition_scope_supported(scope, "sync", &[])?;
+    let connectors = source_connector_selection(options.source_connectors)?;
+    ensure_acquisition_scope_supported(scope, "sync", &[], &connectors)?;
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
-    let completed =
-        napi::tokio::task::spawn_blocking(move || ai_hist_engine::sync_scoped_at(&path, scope))
-            .await
-            .map_err(worker_error)?
-            .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
+    let completed = napi::tokio::task::spawn_blocking(move || {
+        ai_hist_engine::sync_scoped_at_with_connectors(&path, scope, &connectors)
+    })
+    .await
+    .map_err(worker_error)?
+    .map_err(|error| native_error("SYNC_FAILED", format!("{error:#}")))?;
     Ok(SyncResult {
         database_path: result_path,
         completed,
@@ -1544,247 +1568,6 @@ pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
 #[napi]
 pub async fn sync_local() -> napi::Result<()> {
     sync(None).await.map(|_| ())
-}
-
-#[napi(object)]
-pub struct SyncPushResult {
-    pub sent: u32,
-    pub accepted: u32,
-    pub authenticated: bool,
-    pub sync_skipped: bool,
-}
-
-/// Cloud capture hook retained for Agent Relay integration.
-#[napi]
-pub async fn sync_and_push() -> napi::Result<SyncPushResult> {
-    let outcome = napi::tokio::task::spawn_blocking(ai_hist_engine::sync_and_push)
-        .await
-        .map_err(worker_error)?
-        .map_err(|error| native_error("SYNC_PUSH_FAILED", format!("{error:#}")))?;
-    Ok(SyncPushResult {
-        sent: outcome.sent as u32,
-        accepted: outcome.accepted as u32,
-        authenticated: outcome.authenticated,
-        sync_skipped: outcome.sync_skipped,
-    })
-}
-
-#[napi(object)]
-#[derive(Default)]
-pub struct CloudOptions {
-    pub db_path: Option<String>,
-    pub base_url: Option<String>,
-    pub relay_access_token: Option<String>,
-    pub label: Option<String>,
-}
-
-#[napi]
-pub async fn access_token(base_url: Option<String>) -> napi::Result<String> {
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::access_token(base_url.as_deref())
-    })
-    .await
-    .map_err(worker_error)?
-    // access_token deliberately sanitizes refresh/parser errors. Preserve that
-    // boundary; do not attach the auth state or a server response to this error.
-    .map_err(|error| native_error("CLOUD_TOKEN_FAILED", format!("{error:#}")))
-}
-
-#[napi(object)]
-#[derive(Default)]
-pub struct ReplayOptions {
-    pub base_url: Option<String>,
-    pub limit: Option<u32>,
-    pub max_content: Option<u32>,
-    pub json: Option<bool>,
-    pub out: Option<String>,
-}
-
-#[napi(object)]
-pub struct ReplayResult {
-    pub event_count: i64,
-    pub transcript: Option<String>,
-    pub output_path: Option<String>,
-}
-
-#[napi]
-pub async fn replay(
-    session_id: String,
-    options: Option<ReplayOptions>,
-) -> napi::Result<ReplayResult> {
-    let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::replay::replay(
-            &session_id,
-            options.base_url.as_deref(),
-            options.limit.map(|n| n as usize),
-            options.max_content.map(|n| n as usize),
-            options.json.unwrap_or(false),
-            options.out.as_deref().map(std::path::Path::new),
-        )
-    })
-    .await
-    .map_err(worker_error)?
-    .map(|result| ReplayResult {
-        event_count: result.event_count as i64,
-        transcript: result.transcript,
-        output_path: result.output_path,
-    })
-    .map_err(|error| native_error("CLOUD_REPLAY_FAILED", format!("{error:#}")))
-}
-
-#[napi(object)]
-pub struct CloudAuth {
-    pub base_url: String,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub access_token_expires_at: Option<String>,
-    pub org_id: Option<String>,
-    pub workspace_id: Option<String>,
-}
-
-impl From<ai_hist_engine::cloud::StoredAuth> for CloudAuth {
-    fn from(auth: ai_hist_engine::cloud::StoredAuth) -> Self {
-        Self {
-            base_url: auth.base_url,
-            access_token: auth.access_token,
-            refresh_token: auth.refresh_token,
-            access_token_expires_at: auth.access_token_expires_at,
-            org_id: auth.org_id,
-            workspace_id: auth.workspace_id,
-        }
-    }
-}
-
-#[napi(object)]
-pub struct CloudPushResult {
-    pub base_url: String,
-    pub sent: i64,
-    pub accepted: i64,
-    pub sync_skipped: bool,
-}
-
-impl From<ai_hist_engine::cloud::CloudPushOutcome> for CloudPushResult {
-    fn from(outcome: ai_hist_engine::cloud::CloudPushOutcome) -> Self {
-        Self {
-            base_url: outcome.base_url,
-            sent: outcome.sent as i64,
-            accepted: outcome.accepted as i64,
-            sync_skipped: outcome.sync_skipped,
-        }
-    }
-}
-
-#[napi]
-pub async fn cloud_load_auth(base_url: Option<String>) -> napi::Result<Option<CloudAuth>> {
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::load_selected_auth(base_url.as_deref())
-    })
-    .await
-    .map_err(worker_error)?
-    .map(|auth| auth.map(Into::into))
-    .map_err(|error| native_error("CLOUD_AUTH_FAILED", format!("{error:#}")))
-}
-
-#[napi(object)]
-pub struct CloudSessionResolution {
-    pub auth: Option<CloudAuth>,
-    pub detail: Option<String>,
-}
-
-#[napi]
-pub async fn cloud_resolve_session(
-    base_url: Option<String>,
-    now: i64,
-) -> napi::Result<CloudSessionResolution> {
-    napi::tokio::task::spawn_blocking(move || {
-        match ai_hist_engine::cloud::resolve_recall_auth(base_url.as_deref(), now, true) {
-            Ok(auth) => CloudSessionResolution {
-                auth: Some(auth.into()),
-                detail: None,
-            },
-            Err(error) => CloudSessionResolution {
-                auth: None,
-                detail: Some(format!("{error:#}")),
-            },
-        }
-    })
-    .await
-    .map_err(worker_error)
-}
-
-#[napi]
-pub async fn cloud_refresh_session(
-    base_url: String,
-    rejected_token: String,
-) -> napi::Result<Option<CloudAuth>> {
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::refresh_rejected_auth(&base_url, &rejected_token)
-    })
-    .await
-    .map_err(worker_error)?
-    .map(|auth| auth.map(Into::into))
-    .map_err(|_| {
-        native_error(
-            "CONNECTOR_FAILURE",
-            "refreshing relayhistory session failed; run `ai-hist login` for the selected --base-url",
-        )
-    })
-}
-
-#[napi]
-pub async fn cloud_validate_exchange_base_url(base_url: Option<String>) -> napi::Result<()> {
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::validate_cloud_exchange_base_url_for_sdk(base_url.as_deref())
-    })
-    .await
-    .map_err(worker_error)?
-    .map_err(|error| native_error("CLOUD_LOGIN_FAILED", format!("{error:#}")))
-}
-
-#[napi]
-pub async fn cloud_login(options: Option<CloudOptions>) -> napi::Result<CloudAuth> {
-    let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::login_for_sdk(
-            options.base_url.as_deref(),
-            options.relay_access_token.as_deref(),
-            options.label.as_deref(),
-        )
-    })
-    .await
-    .map_err(worker_error)?
-    .map(Into::into)
-    .map_err(|error| native_error("CLOUD_LOGIN_FAILED", format!("{error:#}")))
-}
-
-#[napi]
-pub async fn enable_cloud(options: Option<CloudOptions>) -> napi::Result<CloudPushResult> {
-    let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::enable_for_sdk(
-            &db_path(options.db_path),
-            options.base_url.as_deref(),
-            options.relay_access_token.as_deref(),
-            options.label.as_deref(),
-        )
-    })
-    .await
-    .map_err(worker_error)?
-    .map(Into::into)
-    .map_err(|error| native_error("CLOUD_ENABLE_FAILED", format!("{error:#}")))
-}
-
-#[napi]
-pub async fn push_cloud(options: Option<CloudOptions>) -> napi::Result<CloudPushResult> {
-    let options = options.unwrap_or_default();
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::push_for_sdk(&db_path(options.db_path), options.base_url.as_deref())
-    })
-    .await
-    .map_err(worker_error)?
-    .map(Into::into)
-    .map_err(|error| native_error("CLOUD_PUSH_FAILED", format!("{error:#}")))
 }
 
 #[napi]
@@ -1811,25 +1594,4 @@ pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
     .await
     .map_err(worker_error)?
     .map_err(|error: anyhow::Error| native_error("GIT_LINK_FAILED", format!("{error:#}")))
-}
-
-#[napi]
-pub async fn create_shareable_trace(
-    session_id: String,
-    visibility: String,
-    source: Option<String>,
-    base_url: Option<String>,
-) -> napi::Result<String> {
-    napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::cloud::create_share(
-            &session_id,
-            &visibility,
-            source.as_deref(),
-            base_url.as_deref(),
-        )
-        .map(|value| value.to_string())
-    })
-    .await
-    .map_err(worker_error)?
-    .map_err(|error| native_error("CLOUD_SHARE_FAILED", format!("{error:#}")))
 }

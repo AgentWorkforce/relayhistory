@@ -64,7 +64,7 @@ use ai_hist_core::{
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Version of the machine-readable session-catalog contract.
@@ -112,7 +112,8 @@ pub const DEFAULT_CATALOG_LIMIT: i64 = 50;
 /// Catalog row: one coding-agent session as shallow discovery knows it.
 ///
 /// See the module docs for which fields are observed and which are derived.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShallowSession {
     /// Provider that owns the session (`claude`, `codex`, …). Observed.
     pub source: String,
@@ -376,6 +377,32 @@ pub enum ShallowReadAccess {
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
 pub trait ShallowSessionProvider: Sync {
+    /// Stable acquisition identity, independent of the evidence source.
+    fn connector_id(&self) -> &str {
+        self.source()
+    }
+    /// Non-secret instance key. Applications must override this for multiple accounts.
+    fn connector_instance(&self) -> &str {
+        "default"
+    }
+
+    /// Called only after the full explicit connector selection is validated.
+    fn check_available(&self, _home: &Path) -> Result<()> {
+        Ok(())
+    }
+    /// Acquire exactly this observation's locator. Listing-only adapters keep
+    /// the default capability response; adapters must not consult other locators.
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::CapabilityLimited {
+            code: "PROVIDER_CAPABILITY_LIMITED",
+            message: "this source connector provides catalog discovery only".into(),
+        })
+    }
+
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
     /// Where this adapter's evidence lives. Local file-backed adapters keep
@@ -671,6 +698,13 @@ fn claude_timestamp(value: &Value) -> Option<i64> {
 }
 
 impl ShallowSessionProvider for ClaudeProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
     fn source(&self) -> &'static str {
         "claude"
     }
@@ -834,6 +868,13 @@ impl ShallowSessionProvider for ClaudeProvider {
 struct CodexProvider;
 
 impl ShallowSessionProvider for CodexProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
     fn source(&self) -> &'static str {
         "codex"
     }
@@ -978,6 +1019,13 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 struct CursorProvider;
 
 impl ShallowSessionProvider for CursorProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
     fn source(&self) -> &'static str {
         "cursor"
     }
@@ -1064,6 +1112,13 @@ impl ShallowSessionProvider for CursorProvider {
 struct GrokProvider;
 
 impl ShallowSessionProvider for GrokProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
     fn source(&self) -> &'static str {
         "grok"
     }
@@ -1323,6 +1378,13 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &ai_hist_core::observations::SessionObservation,
+    ) -> Result<crate::sources::AcquiredEvidence> {
+        Ok(crate::sources::AcquiredEvidence::LocalFiles)
+    }
     fn source(&self) -> &'static str {
         "opencode"
     }
@@ -1922,6 +1984,7 @@ fn fetch_catalog_row(
         .ok())
 }
 
+#[cfg(test)]
 fn fetch_catalog_row_at_location(
     conn: &Connection,
     source: &str,
@@ -1955,24 +2018,43 @@ fn fetch_catalog_row_at_location(
     Ok(Some(row))
 }
 
-fn fetch_catalog_row_by_path(
-    conn: &Connection,
+fn observation_key(
+    provider: &dyn ShallowSessionProvider,
     source: &str,
-    raw_path: &str,
-) -> Result<Option<ShallowSession>> {
-    let session_id = conn
-        .prepare_cached(
-            "SELECT session_id FROM session_presences \
-             WHERE location = 'local' AND source = ? AND raw_locator = ? LIMIT 1",
-        )?
-        .query_row(params![source, raw_path], |row| row.get::<_, String>(0))
-        .optional()?;
-    match session_id {
-        Some(session_id) => {
-            fetch_catalog_row_at_location(conn, source, &session_id, SessionLocation::Local)
-        }
-        None => Ok(None),
+    session_id: &str,
+) -> ai_hist_core::observations::ObservationKey {
+    ai_hist_core::observations::ObservationKey {
+        source: source.into(),
+        session_id: session_id.into(),
+        location: provider.location(),
+        connector_id: provider.connector_id().into(),
+        connector_instance: provider.connector_instance().into(),
     }
+}
+
+fn fetch_observed_candidate(
+    conn: &Connection,
+    provider: &dyn ShallowSessionProvider,
+    candidate: &Candidate,
+) -> Result<Option<ShallowSession>> {
+    let id = match candidate.session_id.as_ref() {
+        Some(id) => Some(id.clone()),
+        None => conn.query_row("SELECT session_id FROM session_observations WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND raw_locator=? AND access_state='available' ORDER BY session_id LIMIT 1",params![candidate.source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),candidate.locator],|r|r.get(0)).optional()?,
+    };
+    let Some(id) = id else { return Ok(None) };
+    let Some(observation) =
+        ai_hist_core::observations::get(conn, &observation_key(provider, candidate.source, &id))?
+    else {
+        return Ok(None);
+    };
+    if observation.access_state != "available" {
+        return Ok(None);
+    }
+    let Some(mut row) = fetch_catalog_row(conn, candidate.source, &id)? else {
+        return Ok(None);
+    };
+    row.source_stamp = observation.source_stamp;
+    Ok(Some(row))
 }
 
 /// Whether this source was already examined at this exact stamp and found not
@@ -1983,33 +2065,33 @@ fn fetch_catalog_row_by_path(
 /// single run, because "no row" left nothing for the stamp check to match.
 fn is_known_non_session(
     conn: &Connection,
+    provider: &dyn ShallowSessionProvider,
     source: &str,
     locator: &str,
     stamp: &str,
 ) -> Result<bool> {
-    let known: Option<String> = conn
-        .prepare_cached("SELECT stamp FROM discovery_skips WHERE source = ? AND locator = ?")
-        .and_then(|mut stmt| stmt.query_row(params![source, locator], |row| row.get(0)))
-        .ok();
+    let known:Option<String>=conn.query_row("SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator],|r|r.get(0)).optional()?;
     Ok(known.as_deref() == Some(stamp))
 }
 
-/// Remember that this source, at this stamp, is not a session.
-fn record_non_session(conn: &Connection, source: &str, locator: &str, stamp: &str) -> Result<()> {
-    conn.prepare_cached(
-        "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
-         VALUES (?, ?, ?, 'not-a-session', ?) \
-         ON CONFLICT(source, locator) DO UPDATE SET \
-         stamp = excluded.stamp, reason = excluded.reason, updated_ms = excluded.updated_ms",
-    )?
-    .execute(params![source, locator, stamp, now_ms()])?;
+fn record_non_session(
+    conn: &Connection,
+    provider: &dyn ShallowSessionProvider,
+    source: &str,
+    locator: &str,
+    stamp: &str,
+) -> Result<()> {
+    conn.execute("INSERT INTO observation_discovery_skips(source,location,connector_id,connector_instance,locator,stamp,updated_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,location,connector_id,connector_instance,locator) DO UPDATE SET stamp=excluded.stamp,updated_ms=excluded.updated_ms",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator,stamp,now_ms()])?;
     Ok(())
 }
 
-/// Drop a stale non-session marker once a source does resolve to a session.
-fn clear_non_session(conn: &Connection, source: &str, locator: &str) -> Result<()> {
-    conn.prepare_cached("DELETE FROM discovery_skips WHERE source = ? AND locator = ?")?
-        .execute(params![source, locator])?;
+fn clear_non_session(
+    conn: &Connection,
+    provider: &dyn ShallowSessionProvider,
+    source: &str,
+    locator: &str,
+) -> Result<()> {
+    conn.execute("DELETE FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator])?;
     Ok(())
 }
 
@@ -2043,9 +2125,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
              SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
              AND p.session_id = sessions.session_id AND p.location = 'local') \
-             THEN COALESCE((SELECT p.raw_locator FROM session_presences p \
-                 WHERE p.source = sessions.source AND p.session_id = sessions.session_id \
-                 AND p.location = 'local'), sessions.raw_path, excluded.raw_path) \
+             THEN COALESCE(sessions.raw_path, excluded.raw_path) \
              ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
@@ -2195,6 +2275,9 @@ pub struct DiscoverOptions {
 /// Something one provider (or one session) could not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveryDiagnostic {
+    pub connector_id: Option<String>,
+    pub connector_instance: Option<String>,
+    pub location: Option<SessionLocation>,
     /// Source the failure belongs to.
     pub source: String,
     /// Candidate locator, when the failure was scoped to one session.
@@ -2218,6 +2301,16 @@ pub struct ProviderSummary {
     pub failed: bool,
 }
 
+/// Per-instance counters alongside the legacy per-source totals.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorSummary {
+    pub source: String,
+    pub location: SessionLocation,
+    pub connector_id: String,
+    pub connector_instance: String,
+    pub summary: ProviderSummary,
+}
+
 /// Outcome of one discovery run.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DiscoverySummary {
@@ -2237,6 +2330,7 @@ pub struct DiscoverySummary {
     pub skipped_unchanged: usize,
     /// Per-provider tallies, keyed by source.
     pub providers: BTreeMap<String, ProviderSummary>,
+    pub connectors: Vec<ConnectorSummary>,
     /// Sources that deliberately have no adapter.
     pub exempt_sources: Vec<SourceExemption>,
     /// Non-fatal failures. A provider failing here never blocks another.
@@ -2294,6 +2388,7 @@ pub fn validate_discovery_scope(scope: SessionScope) -> Result<()> {
 fn select_providers(
     options: &DiscoverOptions,
     home: &Path,
+    connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<Vec<Box<dyn ShallowSessionProvider>>> {
     for source in &options.sources {
         if let Some(exempt) = DISCOVERY_EXEMPTIONS
@@ -2317,10 +2412,11 @@ fn select_providers(
     // filter that leaves a remote-only request with nothing configured is
     // the same unsupported request, scoped down.
     if options.scope == SessionScope::Remote {
-        crate::remote::ensure_remote_connectors_configured_for_at(
+        crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "discovery",
             home,
             &options.sources,
+            connectors,
         )?;
     }
     let mut providers: Vec<Box<dyn ShallowSessionProvider>> = Vec::new();
@@ -2328,9 +2424,11 @@ fn select_providers(
         providers.extend(shallow_providers());
     }
     if matches!(options.scope, SessionScope::Remote | SessionScope::All) {
-        providers.extend(crate::remote::configured_remote_providers(
+        providers.extend(crate::remote::selected_remote_providers(
             home,
             options.limit,
+            connectors,
+            &options.sources,
         ));
     }
     if !options.sources.is_empty() {
@@ -2366,8 +2464,42 @@ pub fn discover_sessions_with_env(
     options: &DiscoverOptions,
     on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
-    let providers = select_providers(options, &env.home)?;
-    discover_sessions_with_providers(env, options, &providers, on_row)
+    discover_sessions_with_connectors(
+        env,
+        options,
+        &crate::remote::SourceConnectorSelection::default(),
+        on_row,
+    )
+}
+
+/// Discover using an explicit allowlist; an empty selection runs local adapters only.
+pub fn discover_sessions_with_connectors(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    connectors: &crate::remote::SourceConnectorSelection,
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<DiscoverySummary> {
+    let providers = select_providers(options, &env.home, connectors)?;
+    let mut summary = discover_sessions_with_providers(env, options, &providers, on_row)?;
+    if options.scope == SessionScope::All {
+        for status in crate::remote::selected_remote_connector_statuses_at(
+            &env.home,
+            connectors,
+            &options.sources,
+        ) {
+            if !status.configured || status.connector == crate::remote::RELAYCAST_CONNECTOR {
+                summary.diagnostics.push(DiscoveryDiagnostic {
+                    connector_id: Some(status.connector.into()),
+                    connector_instance: None,
+                    location: Some(SessionLocation::Remote),
+                    source: status.source.into(),
+                    locator: None,
+                    error: format!("{}: {}", status.connector, status.detail),
+                });
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// [`discover_sessions_with_env`] over an explicit adapter set.
@@ -2380,13 +2512,49 @@ pub fn discover_sessions_with_providers(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
     providers: &[Box<dyn ShallowSessionProvider>],
+    on_row: impl FnMut(&ShallowSession),
+) -> Result<DiscoverySummary> {
+    let providers = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    discover_sessions_with_provider_refs(env, options, &providers, on_row)
+}
+
+pub fn discover_sessions_with_provider_refs(
+    env: &DiscoveryEnv<'_>,
+    options: &DiscoverOptions,
+    providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
+    let mut identities = std::collections::HashSet::new();
+    for provider in providers {
+        observation_key(*provider, provider.source(), "validation").validate()?;
+        anyhow::ensure!(
+            identities.insert((
+                provider.source(),
+                provider.location().as_str(),
+                provider.connector_id(),
+                provider.connector_instance()
+            )),
+            "INVALID_ARGUMENT: duplicate source connector instance"
+        );
+    }
     let conn = env.conn();
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
         scope: options.scope,
         exempt_sources: DISCOVERY_EXEMPTIONS.to_vec(),
+        connectors: providers
+            .iter()
+            .map(|provider| ConnectorSummary {
+                source: provider.source().into(),
+                location: provider.location(),
+                connector_id: provider.connector_id().into(),
+                connector_instance: provider.connector_instance().into(),
+                summary: ProviderSummary::default(),
+            })
+            .collect(),
         ..Default::default()
     };
     {
@@ -2413,14 +2581,28 @@ pub fn discover_sessions_with_providers(
             .or_default();
         match provider.enumerate(env, options.limit) {
             Ok(found) => {
+                if found
+                    .iter()
+                    .any(|candidate| candidate.source != provider.source())
+                {
+                    anyhow::bail!(
+                        "source connector '{}' returned a mismatched candidate source",
+                        provider.connector_id()
+                    );
+                }
                 entry.candidates += found.len();
+                summary.connectors[provider_index].summary.candidates += found.len();
                 env.note_candidates(found.len() as u64);
                 candidates.extend(found.into_iter().map(|found| (provider_index, found)));
             }
             Err(error) => {
                 entry.failed = true;
+                summary.connectors[provider_index].summary.failed = true;
                 failed_providers += 1;
                 summary.diagnostics.push(DiscoveryDiagnostic {
+                    connector_id: Some(provider.connector_id().into()),
+                    connector_instance: Some(provider.connector_instance().into()),
+                    location: Some(provider.location()),
                     source: provider.source().to_string(),
                     locator: None,
                     error: format!("{error:#}"),
@@ -2465,24 +2647,27 @@ pub fn discover_sessions_with_providers(
     let scan = env.scan();
     let mut position = 0usize;
 
-    while emitted < limit && position < candidates.len() {
-        let window_cap = (limit - emitted).min(MAX_READ_WINDOW);
+    while position < candidates.len() {
+        let window_cap = if emitted >= limit {
+            MAX_READ_WINDOW
+        } else {
+            (limit - emitted).min(MAX_READ_WINDOW)
+        };
         let mut entries: Vec<WindowEntry<'_>> = Vec::new();
         let mut potential = 0usize;
         while position < candidates.len() && potential < window_cap {
             let (provider_index, candidate) = &candidates[position];
             position += 1;
-            let provider = providers[*provider_index].as_ref();
+            if emitted >= limit
+                && !candidate.session_id.as_ref().is_some_and(|id| {
+                    emitted_sessions.contains(&(candidate.source.to_string(), id.clone()))
+                })
+            {
+                continue;
+            }
+            let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
-            let cached = match candidate.session_id.as_deref() {
-                Some(session_id) => fetch_catalog_row_at_location(
-                    conn,
-                    candidate.source,
-                    session_id,
-                    provider.location(),
-                )?,
-                None => fetch_catalog_row_by_path(conn, candidate.source, &candidate.locator)?,
-            };
+            let cached = fetch_observed_candidate(conn, provider, candidate)?;
             if let Some(cached) =
                 cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
             {
@@ -2490,6 +2675,9 @@ pub fn discover_sessions_with_providers(
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
                     entry.skipped_unchanged += 1;
+                    summary.connectors[*provider_index]
+                        .summary
+                        .skipped_unchanged += 1;
                 }
                 potential += 1;
                 entries.push(WindowEntry::Cached(cached));
@@ -2498,11 +2686,20 @@ pub fn discover_sessions_with_providers(
             // A source already examined and found not to be a session (a codex
             // subagent thread, a claude sidecar) is remembered by its stamp, so a
             // rescan costs a PK lookup instead of a fresh read every single run.
-            if is_known_non_session(conn, candidate.source, &candidate.locator, &expected)? {
+            if is_known_non_session(
+                conn,
+                provider,
+                candidate.source,
+                &candidate.locator,
+                &expected,
+            )? {
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
                     entry.skipped_unchanged += 1;
+                    summary.connectors[*provider_index]
+                        .summary
+                        .skipped_unchanged += 1;
                 }
                 continue;
             }
@@ -2627,9 +2824,13 @@ pub fn discover_sessions_with_providers(
             let session = match read {
                 Ok(Some(session)) => session,
                 Ok(None) => {
-                    if let Err(error) =
-                        record_non_session(conn, candidate.source, &candidate.locator, &expected)
-                    {
+                    if let Err(error) = record_non_session(
+                        conn,
+                        provider,
+                        candidate.source,
+                        &candidate.locator,
+                        &expected,
+                    ) {
                         window_error = Some(error);
                         break 'apply;
                     }
@@ -2637,6 +2838,9 @@ pub fn discover_sessions_with_providers(
                 }
                 Err(error) => {
                     summary.diagnostics.push(DiscoveryDiagnostic {
+                        connector_id: Some(provider.connector_id().into()),
+                        connector_instance: Some(provider.connector_instance().into()),
+                        location: Some(provider.location()),
                         source: candidate.source.to_string(),
                         locator: Some(candidate.locator.clone()),
                         error: format!("{error:#}"),
@@ -2644,11 +2848,21 @@ pub fn discover_sessions_with_providers(
                     continue;
                 }
             };
-            if session.session_id.is_empty() {
+            if session.source != provider.source()
+                || session.session_id.is_empty()
+                || candidate
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|id| id != &session.session_id)
+            {
                 summary.diagnostics.push(DiscoveryDiagnostic {
+                    connector_id: Some(provider.connector_id().into()),
+                    connector_instance: Some(provider.connector_instance().into()),
+                    location: Some(provider.location()),
                     source: candidate.source.to_string(),
                     locator: Some(candidate.locator.clone()),
-                    error: "no session id in source".to_string(),
+                    error: "source connector returned an empty or mismatched session identity"
+                        .to_string(),
                 });
                 continue;
             }
@@ -2662,19 +2876,41 @@ pub fn discover_sessions_with_providers(
             {
                 Ok(row) => row,
                 Err(error) => {
-                    summary.diagnostics.push(DiscoveryDiagnostic {
-                        source: candidate.source.to_string(),
-                        locator: Some(candidate.locator.clone()),
-                        error: format!("{error:#}"),
-                    });
-                    continue;
+                    window_error = Some(error);
+                    break 'apply;
                 }
             };
-            // A file that used to be skipped as a non-session (or was never one)
-            // must not keep a stale marker once it resolves to a session.
-            if let Err(error) = clear_non_session(conn, candidate.source, &candidate.locator) {
+            if let Err(error) = ai_hist_core::observations::upsert(
+                conn,
+                &ai_hist_core::observations::SessionObservation {
+                    key: observation_key(provider, &session.source, &session.session_id),
+                    raw_locator: Some(candidate.locator.clone()),
+                    source_stamp: session.source_stamp.clone(),
+                    discovery_state: session.discovery_state.clone(),
+                    access_state: "available".into(),
+                    updated_ms: now_ms(),
+                },
+            ) {
                 window_error = Some(error);
                 break 'apply;
+            }
+            let mut row = fetch_catalog_row(conn, &row.source, &row.session_id)?.unwrap_or(row);
+            row.from_cache = false;
+            // A file that used to be skipped as a non-session (or was never one)
+            // must not keep a stale marker once it resolves to a session.
+            if let Err(error) =
+                clear_non_session(conn, provider, candidate.source, &candidate.locator)
+            {
+                window_error = Some(error);
+                break 'apply;
+            }
+            if let Some(summary) = summary.connectors.iter_mut().find(|entry| {
+                entry.source == provider.source()
+                    && entry.location == provider.location()
+                    && entry.connector_id == provider.connector_id()
+                    && entry.connector_instance == provider.connector_instance()
+            }) {
+                summary.summary.discovered += 1;
             }
             window_discovered += 1;
             *window_discovered_by_source
@@ -2691,7 +2927,17 @@ pub fn discover_sessions_with_providers(
                 }
             }
         }
+        if let Some(error) = window_error {
+            if has_writes {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            return Err(error);
+        }
         if has_writes {
+            if let Err(error) = crate::reconcile_claude_remote_relationships(conn) {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
             if let Err(error) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error.into());
@@ -2709,9 +2955,6 @@ pub fn discover_sessions_with_providers(
             emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
             emitted += 1;
             on_row(&row);
-        }
-        if let Some(error) = window_error {
-            return Err(error);
         }
     }
 

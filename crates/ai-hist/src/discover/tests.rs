@@ -439,7 +439,11 @@ fn a_non_session_source_is_remembered_so_rescans_do_not_reread_it() {
     let third = discover(&conn, home.path(), &only(&["codex"]));
     assert!(third.ids().contains(&"codex:codex-sub".to_string()));
     let markers: i64 = conn
-        .query_row("SELECT COUNT(*) FROM discovery_skips", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM observation_discovery_skips",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(markers, 0, "a stale non-session marker must be cleared");
 }
@@ -725,9 +729,9 @@ fn an_upgrade_re_reads_a_guardian_an_older_scanner_skipped() {
     let seed_skip = |stamp: String| {
         conn.execute("DELETE FROM sessions", []).unwrap();
         conn.execute(
-            "INSERT INTO discovery_skips (source, locator, stamp, reason, updated_ms) \
-             VALUES ('codex', ?, ?, 'not-a-session', 0) \
-             ON CONFLICT(source, locator) DO UPDATE SET stamp = excluded.stamp",
+            "INSERT INTO observation_discovery_skips (source, location, connector_id, connector_instance, locator, stamp, updated_ms) \
+             VALUES ('codex', 'local', 'codex', 'default', ?, ?, 0) \
+             ON CONFLICT(source, location, connector_id, connector_instance, locator) DO UPDATE SET stamp = excluded.stamp",
             params![locator, stamp],
         )
         .unwrap();
@@ -2318,7 +2322,7 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     discover(&conn, home.path(), &only(&["claude"]));
     // Simulate a database stamped by an older scanner generation.
     conn.execute(
-        "UPDATE session_presences SET source_stamp = 'v0:stale' \
+        "UPDATE session_observations SET source_stamp = 'v0:stale' \
          WHERE location = 'local' AND session_id = 'claude-1'",
         [],
     )

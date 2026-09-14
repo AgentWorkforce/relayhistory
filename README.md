@@ -56,19 +56,21 @@ ai-hist stats                                        # how much history is index
 npx -y ai-hist-mcp
 ```
 
-Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `get_session_thread`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
+Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-`get_session_thread` is the one cloud-backed tool. Given a `source` and a `session_id` it returns the commits that session shipped plus the pull requests, reviews, incidents, tickets, Slack threads, hotfixes and follow-up sessions linked to it — the *lifecycle* fan-out, complementing `get_session_tree`'s *subagent* fan-out. It fetches on every call and caches nothing, because a thread keeps growing as PRs and incidents land. Optional `kinds`, `since`, `limit` and `cursor` narrow and page the links. Tenancy comes from the stored cloud session's token, never from a parameter.
+The optional `@agent-relay/relayhistory` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
 
-It uses the Rust cloud layer's stage store (`$RELAYHISTORY_HOME/stages`, default `~/.agentworkforce/relayhistory/stages`), shared by both public SDK imports and the CLI. An expired session with a refresh token is rotated under the native stage lock and saved atomically. Without a usable cloud session it returns `UNSUPPORTED_OPERATION`, names the missing precondition, and makes no request.
+The optional plugin owns stage credentials and token rotation through its Rust
+helper. The default MCP server does not load that helper or read its auth store.
 
 ## Team + Cloud
 
-The search-style read commands — `search`, `recent`, `sessions list`, `sessions discover`, `sessions hydrate`, `resume`, `pack`, `stats` and `sync` — take a location scope: `--local` (the default), `--remote`, or `--all`.
+Cached reads such as `search`, `recent`, `sessions list`, `resume`, `pack`, and `stats`,
+and acquisition commands such as discovery, hydration, and sync, take a location scope: `--local` (the default), `--remote`, or `--all`.
 
 ```sh
-ai-hist sessions discover --remote     # pull in sessions your providers keep server-side
-ai-hist sync --all                     # ingest local and remote together
+ai-hist sessions discover --remote --config history.json  # explicitly installed source plugins
+ai-hist sync --all --config history.json                  # local history plus selected plugins
 ai-hist search "auth rewrite" --all    # search both at once
 ```
 
@@ -82,29 +84,31 @@ ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused 
 
 `sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
-Optional: `ai-hist enable-cloud` authenticates and syncs your sessions to RelayHistory Cloud. The npm package includes Agent Relay Cloud login, so npm users do not need a separate `agent-relay` CLI install; non-interactive runs fail promptly with token guidance instead of waiting for login. Threading commits to a PR is a separate opt-in hook install. See [cloud setup, Git hooks, and sharing](docs/enable-cloud.md).
+Optional: install `@agent-relay/relayhistory` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
 
-Remote acquisition runs through connectors that reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
+Install `@agent-relay/history-provider-sources` and configure it explicitly for
+remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
 
-Two commands read a session back out of the cloud once `enable-cloud` is set up:
+The optional compatibility CLI reads sessions available through the legacy cloud API:
 
 ```sh
-ai-hist replay <session-id>                 # print a cloud session's events, oldest first
-ai-hist replay <session-id> --out log.txt   # write that transcript to a file instead
-ai-hist token                               # print a cloud API token for your own tooling
+relayhistory-plugin replay <session-id>                 # print a cloud session's events, oldest first
+relayhistory-plugin replay <session-id> --out log.txt   # write that transcript to a file instead
+relayhistory-plugin token                               # print a cloud API token for your own tooling
 ```
 
 `replay` prints the whole transcript. `--limit` is the per-request page size, not a cap: `replay` follows the server's cursor until the session is exhausted, so a 5-event session under `--limit 1` still prints all 5, one request at a time. `--max-content` truncates long events, and truncated ones are marked in the output; `--json` emits the raw event array. (`events --limit N` does cap, because it prints one page and a `nextCursor`.) Without a stored cloud session it stops and names what is missing rather than printing a partial transcript, and `--out` is written atomically only after the whole fetch succeeds, so an interrupted replay never truncates a transcript you already had.
 
-`ai-hist token` prints a live credential to stdout — treat it like a password, and don't paste its output into a terminal you are sharing or a log.
+`relayhistory-plugin token` prints a live credential to stdout — treat it like a password, and don't paste its output into a terminal you are sharing or a log.
 
-A hosted layer for sharing sessions across a team — so every PR threads back to the session that produced it — is in progress at `history.agentrelay.com`; its connector is not yet wired into the npm CLI. Want early access, or to self-host it? Reach out at hello@agentrelay.com.
+RelayHistory is one optional cloud integration. See [cloud setup](docs/enable-cloud.md)
+for authentication, durable delivery, readback, and the legacy sharing API.
 
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
 - **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened.
-- **Local by default.** SQLite on your machine. Nothing leaves it unless you opt in to a remote scope.
+- **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.
 

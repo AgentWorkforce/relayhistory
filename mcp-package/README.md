@@ -1,71 +1,24 @@
 # ai-hist-mcp
 
-Thin `npx` wrapper for the MCP server shipped by the public `ai-hist` SDK:
+Thin `npx -y ai-hist-mcp` wrapper for the local `ai-hist` MCP server.
+It calls public SDK operations; it never opens SQLite or loads cloud auth.
 
-```bash
-npx -y ai-hist-mcp
-```
+Default tools cover cached search/recent/catalog/statistics, discovery/sync,
+identity-addressed events/tool calls/file edits/relationships/session trees, and
+generic durable delivery status/control. Cached scopes local/remote/all do not
+read credentials; acquisition defaults to local. Tool and file edit pages require
+both source and session ID and use bounded deterministic cursors.
 
-The server imports only `ai-hist` public functions. It never opens SQLite,
-loads the native addon directly, scans provider files, or invokes a CLI.
+Remote acquisition and commercial tools are optional. Install a source or
+destination package and set `AI_HIST_PLUGIN_CONFIG` to its explicit module config.
+Loading a configured plugin is inert. `source_connectors` selects configured
+source IDs; an empty array disables remote acquisition. Acquisition tools declare
+open-world writes. Arbitrary plugin callbacks receive conservative annotations,
+and duplicate/reserved tool names are rejected before registration.
 
-Tools: `search_history`, `recent_history`, `list_sessions`,
-`discover_sessions`, `hydrate_session`, `get_session`, `get_session_events`,
-`get_session_relationships`, `get_session_tree`, `get_session_thread`,
-`get_session_tool_calls`, `get_session_file_edits`, `history_stats`, and
-`sync`. Search, recent history, session listing, discovery, statistics, and sync accept a
-`scope` of `local`, `remote`, or `all`; scope defaults to `local`.
-`get_session`, `get_session_events`, `get_session_relationships`,
-`get_session_tree`, and `get_session_thread` address one session by identity
-and take no `scope`.
-`get_session_tool_calls` and `get_session_file_edits` are bounded, cursor-paged
-reads that require both a `source` and a `session_id`, because provider session
-IDs collide.
-
-Cached reads support all three scopes. Remote acquisition runs through
-provider connectors (claude.ai/code web sessions, Codex cloud tasks) that are
-configured by the provider CLI's own sign-in on the machine; explicit `remote`
-acquisition returns `UNSUPPORTED_OPERATION` when none is configured, while
-`all` runs local adapters plus every configured connector. The discovery and
-sync tools are therefore annotated as open-world writes.
-`hydrate_session` is an idempotent write that fully indexes one previously
-discovered identity and optionally its related provider-native sessions from
-local provider evidence, so it stays annotated as a local, closed-world write.
-
-`get_session_thread` is the *lifecycle* fan-out for one session: the commits it
-shipped plus the pull requests, reviews, incidents, tickets, Slack threads,
-hotfixes and follow-up sessions the cloud has stitched to it. It complements
-`get_session_tree` — that one is the *subagent* fan-out — and an agent may call
-both. It is cloud-only and never cached: a thread exists once the cloud has
-ingested lens events, and it changes as PRs and incidents land, so every call
-fetches. With no stored cloud session it returns `UNSUPPORTED_OPERATION` with
-the same `no remote provider connectors are configured` message the sibling
-connectors use, without making a request. Tenancy is derived from the token
-server-side; there is no org parameter. `kinds` filters `link_kind`, `since`
-bounds link event time, and `limit` (1-500, default 100) with `cursor` pages the
-links; outcomes come back whole on every page.
-
-Credentials come exclusively from the native stage store
-(`$RELAYHISTORY_HOME/stages`, default `~/.agentworkforce/relayhistory/stages`).
-`RELAYHISTORY_BASE_URL` takes precedence over `AI_HIST_BASE_URL`; with multiple
-stages and no selection, the tool refuses to guess. Use `ai-hist login` to
-create a session for the selected stage.
-
-A stored session must meet the same bar the engine's `cloud` connector
-applies to recall — an `rth_at_` access token, an expiry at least 60s away, and
-a recorded org for provenance. A session missing a token prefix or an org is one the
-connector itself reports as unconfigured, so the tool reports it the same way
-and names the missing precondition rather than issuing a request that would
-fail. `ai-hist login` restores them.
-
-Expiry is the exception, because rotation exists to repair it: a rejected
-session with a refresh token is rotated under the native stage lock and the
-new pair saved atomically, so the CLI and the MCP stay in step. A pair another process rotated first is adopted rather than spending
-the one-time refresh token again. Only a session with nothing left to rotate
-reports expiry as unconfigured.
-
-`get_session_relationships` and `get_session_tree` read the delegation topology
-recorded by hydration and sync: who delegated to whom, what evidence
-established the link, whether the child has a stable identity, and whether its
-events are independently addressable. Tree traversal is cycle-safe,
-deterministically ordered, and bounded by `max_depth` and `max_nodes`.
+The optional `@agent-relay/relayhistory` package registers `get_session_thread`
+and `read_delivered_history`. The former composes freshly delivered evidence
+with legacy lifecycle links under one pinned account and reports each outcome;
+the latter is an explicit live listing, not an incremental feed. Neither tool
+is shipped in the default inventory. See the repository's optional package README
+for auth, expected-account pinning and stage selection.

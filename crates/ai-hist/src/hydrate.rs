@@ -1,6 +1,7 @@
 //! Targeted, provider-bounded session evidence acquisition.
 
 use super::*;
+use ai_hist_core::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -89,15 +90,51 @@ pub fn hydrate_session_at(
     db_path: &Path,
     options: &HydrateSessionOptions,
 ) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_home(db_path, options, &home_dir())
+    hydrate_session_at_with_connectors(
+        db_path,
+        options,
+        &crate::remote::SourceConnectorSelection::default(),
+    )
 }
 
+pub fn hydrate_session_at_with_connectors(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    connectors: &crate::remote::SourceConnectorSelection,
+) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_home_and_connectors(db_path, options, &home_dir(), connectors)
+}
+
+#[cfg(test)]
 fn hydrate_session_at_with_home(
     db_path: &Path,
     options: &HydrateSessionOptions,
     home: &Path,
 ) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_home_and_connectors(
+        db_path,
+        options,
+        home,
+        &crate::remote::SourceConnectorSelection::default(),
+    )
+}
+
+fn hydrate_session_at_with_home_and_connectors(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    home: &Path,
+    connectors: &crate::remote::SourceConnectorSelection,
+) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    if options.scope == SessionScope::Remote {
+        crate::remote::ensure_selected_remote_connectors_configured_for_at(
+            "hydration",
+            home,
+            std::slice::from_ref(&options.source),
+            connectors,
+        )
+        .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
+    }
     let started = Instant::now();
     // Acquisition and replacement are one per-session critical section. The
     // provider call has to be inside it: otherwise an older response can wait
@@ -107,19 +144,44 @@ fn hydrate_session_at_with_home(
         .then(|| acquire_remote_hydration_lock(db_path, options))
         .transpose()?;
     let mut conn = open_db(db_path)?;
-    let target = catalog_target(&conn, options)?;
+    let mut target = catalog_target(&conn, options)?;
     if options.scope == SessionScope::Remote {
-        return hydrate_remote_session(&mut conn, options, home, started);
+        return hydrate_remote_session(&mut conn, options, home, connectors, started);
+    }
+    let local_key = ObservationKey {
+        source: options.source.clone(),
+        session_id: options.session_id.clone(),
+        location: SessionLocation::Local,
+        connector_id: options.source.clone(),
+        connector_instance: "default".into(),
+    };
+    let local_observation = observations::get(&conn, &local_key)?;
+    if let Some(observation) = &local_observation {
+        // OpenCode enumerates by session id, while its local parser needs the
+        // separately recorded provider database path from the catalog.
+        if options.source != "opencode" {
+            target.locator = observation.raw_locator.clone();
+        }
+        target.discovery_state = Some(observation.discovery_state.clone());
+    } else {
+        anyhow::ensure!(
+            !observations::list(&conn, &options.source, &options.session_id)?
+                .iter()
+                .any(
+                    |observation| observation.key.location == SessionLocation::Local
+                        && observation.key.connector_id != "legacy-unknown"
+                ),
+            "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
+        );
     }
     let snapshot = source_snapshot(options, &target, home)?;
-    let previous: Option<(Option<String>, i64, bool)> = conn
-        .query_row(
-            "SELECT source_stamp, parser_version, include_related FROM session_hydration_checkpoints \
-             WHERE source = ? AND session_id = ? AND location = 'local'",
-            params![options.source, options.session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
+        (
+            checkpoint.source_stamp,
+            checkpoint.parser_version,
+            checkpoint.include_related,
         )
-        .optional()?;
+    });
     let previous_stamp = previous.as_ref().and_then(|(stamp, _, _)| stamp.clone());
 
     if previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
@@ -187,6 +249,16 @@ fn hydrate_session_at_with_home(
             now_ms(),
         ],
     )?;
+    let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
+    save_observation_progress(
+        &tx,
+        &local_observation,
+        &snapshot.stamp,
+        snapshot.bytes,
+        snapshot.records,
+        options.include_related,
+        true,
+    )?;
     tx.commit()?;
 
     let status = if previous_stamp.is_some() {
@@ -253,41 +325,15 @@ fn acquire_remote_hydration_lock(
 }
 
 fn hydrate_remote_session(
-    conn: &mut Connection,
-    options: &HydrateSessionOptions,
-    home: &Path,
-    started: Instant,
+    _conn: &mut Connection,
+    _options: &HydrateSessionOptions,
+    _home: &Path,
+    _connectors: &crate::remote::SourceConnectorSelection,
+    _started: Instant,
 ) -> Result<HydrateSessionResult> {
-    if !matches!(options.source.as_str(), "claude" | "codex") {
-        return remote_limited_result(
-            conn,
-            options,
-            "CONNECTOR_NOT_CONFIGURED",
-            format!(
-                "no remote hydration connector exists for source '{}'",
-                options.source
-            ),
-            started,
-        );
-    }
-    let evidence =
-        crate::remote::acquire_remote_session_at(home, &options.source, &options.session_id)
-            .map_err(classify_remote_error)?;
-    match evidence {
-        crate::remote::RemoteSessionEvidence::CapabilityLimited { code, message } => {
-            remote_limited_result(conn, options, code, message, started)
-        }
-        crate::remote::RemoteSessionEvidence::ClaudeFull {
-            records,
-            source_stamp,
-            source_bytes,
-        } => hydrate_remote_claude(conn, options, records, source_stamp, source_bytes, started),
-        crate::remote::RemoteSessionEvidence::CodexDiff {
-            diff,
-            source_stamp,
-            source_bytes,
-        } => hydrate_remote_codex_diff(conn, options, &diff, source_stamp, source_bytes, started),
-    }
+    anyhow::bail!(
+        "CONNECTOR_NOT_CONFIGURED: install a source plugin and use the composed source registry"
+    )
 }
 
 fn classify_remote_error(error: anyhow::Error) -> anyhow::Error {
@@ -368,6 +414,7 @@ fn probable_secret(part: &str) -> bool {
         && value.bytes().any(|byte| byte.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn remote_limited_result(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
@@ -421,19 +468,52 @@ fn remote_limited_result(
     })
 }
 
+#[cfg(test)]
 fn hydrate_remote_claude(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    records: Vec<Value>,
+    source_stamp: String,
+    source_bytes: i64,
+    started: Instant,
+) -> Result<HydrateSessionResult> {
+    hydrate_remote_claude_observed(
+        conn,
+        options,
+        records,
+        source_stamp,
+        source_bytes,
+        started,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn hydrate_remote_claude_observed(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
     mut records: Vec<Value>,
     source_stamp: String,
     source_bytes: i64,
     started: Instant,
+    observation: Option<&SessionObservation>,
 ) -> Result<HydrateSessionResult> {
-    let previous = hydration_checkpoint(conn, options, "remote")?;
+    let previous = match observation {
+        Some(observation) => {
+            observations::checkpoint(conn, &observation.key)?.map(|value| HydrationCheckpoint {
+                source_stamp: value.source_stamp,
+                parser_version: value.parser_version,
+            })
+        }
+        None => hydration_checkpoint(conn, options, "remote")?,
+    };
     if previous.as_ref().is_some_and(|checkpoint| {
         checkpoint.source_stamp.as_deref() == Some(source_stamp.as_str())
             && checkpoint.parser_version == HYDRATION_PARSER_VERSION
     }) {
+        if let Some(observation) = observation {
+            observations::set_access(conn, &observation.key, "available")?;
+        }
         return build_remote_result(
             conn,
             options,
@@ -486,7 +566,10 @@ fn hydrate_remote_claude(
     // disappeared before inserting the new snapshot. When the canonical id
     // also has local evidence, do not erase rows whose provenance cannot be
     // distinguished from the remote copy.
-    if !had_local_presence {
+    let other_observation = observations::list(&tx, &options.source, &options.session_id)?
+        .iter()
+        .any(|other| observation.is_some_and(|current| other.key != current.key));
+    if !had_local_presence && !other_observation {
         for table in ["history", "session_events", "tool_calls", "file_edits"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE source = 'claude' AND session_id = ?"),
@@ -518,6 +601,22 @@ fn hydrate_remote_claude(
         source_bytes,
         records.len() as i64,
     )?;
+    if let Some(observation) = observation {
+        save_observation_progress(
+            &tx,
+            observation,
+            &source_stamp,
+            source_bytes,
+            records.len() as i64,
+            options.include_related,
+            true,
+        )?;
+        observations::save_evidence(
+            &tx,
+            &observation.key,
+            &json!({"format":"claude","records":records}),
+        )?;
+    }
     tx.commit()?;
     build_remote_result(
         conn,
@@ -538,6 +637,7 @@ fn hydrate_remote_claude(
     )
 }
 
+#[cfg(test)]
 fn hydrate_remote_codex_diff(
     conn: &mut Connection,
     options: &HydrateSessionOptions,
@@ -546,18 +646,66 @@ fn hydrate_remote_codex_diff(
     source_bytes: i64,
     started: Instant,
 ) -> Result<HydrateSessionResult> {
-    let previous = hydration_checkpoint(conn, options, "remote")?;
+    hydrate_remote_codex_diff_observed(
+        conn,
+        options,
+        diff,
+        source_stamp,
+        source_bytes,
+        started,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn hydrate_remote_codex_diff_observed(
+    conn: &mut Connection,
+    options: &HydrateSessionOptions,
+    diff: &str,
+    source_stamp: String,
+    source_bytes: i64,
+    started: Instant,
+    observation: Option<&SessionObservation>,
+) -> Result<HydrateSessionResult> {
+    let previous = match observation {
+        Some(observation) => {
+            observations::checkpoint(conn, &observation.key)?.map(|value| HydrationCheckpoint {
+                source_stamp: value.source_stamp,
+                parser_version: value.parser_version,
+            })
+        }
+        None => hydration_checkpoint(conn, options, "remote")?,
+    };
     let unchanged = previous.as_ref().is_some_and(|checkpoint| {
         checkpoint.source_stamp.as_deref() == Some(source_stamp.as_str())
             && checkpoint.parser_version == HYDRATION_PARSER_VERSION
     });
     if !unchanged {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM file_edits WHERE source = 'codex' AND session_id = ? AND tool_name = 'codex cloud diff'",
-            [&options.session_id],
-        )?;
+        let prefix = observation
+            .map(|observation| {
+                format!(
+                    "remote-diff:{:x}:",
+                    Sha256::digest(format!(
+                        "{}\0{}\0{}",
+                        observation.key.location.as_str(),
+                        observation.key.connector_id,
+                        observation.key.connector_instance
+                    ))
+                )
+            })
+            .unwrap_or_else(|| "remote-diff:".into());
+        tx.execute("DELETE FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND substr(tool_use_id,1,?)=?",params![options.session_id,prefix.len(),prefix])?;
         for (index, patch) in split_unified_diff(diff).into_iter().enumerate() {
+            // Old releases materialized the only remote diff under this bare
+            // provider key. Its overwritten presence cannot identify an owner.
+            // Retain that canonical projection instead of duplicating it under
+            // the new connector prefix; fresh bytes still enter own evidence.
+            let legacy_id = format!("remote-diff:{index}");
+            if observation.is_some() && tx.query_row("SELECT EXISTS(SELECT 1 FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND tool_use_id=?)",params![options.session_id,legacy_id],|row|row.get::<_,bool>(0))? {
+                continue;
+            }
+
             let (added, removed) = count_unified_diff_lines(&patch.text);
             tx.execute(
                 "INSERT INTO file_edits \
@@ -568,7 +716,7 @@ fn hydrate_remote_codex_diff(
                    structured_patch_json=excluded.structured_patch_json, ts_ms=excluded.ts_ms",
                 params![
                     options.session_id,
-                    format!("remote-diff:{index}"),
+                    format!("{prefix}{index}"),
                     patch.path,
                     added,
                     removed,
@@ -578,6 +726,22 @@ fn hydrate_remote_codex_diff(
             )?;
         }
         write_hydration_checkpoint(&tx, options, "remote", &source_stamp, source_bytes, 1)?;
+        if let Some(observation) = observation {
+            save_observation_progress(
+                &tx,
+                observation,
+                &source_stamp,
+                source_bytes,
+                1,
+                options.include_related,
+                false,
+            )?;
+            observations::save_evidence(
+                &tx,
+                &observation.key,
+                &json!({"format":"codex-diff","diff":diff}),
+            )?;
+        }
         tx.commit()?;
     }
     build_remote_result(
@@ -692,11 +856,13 @@ fn take_git_path(input: &mut &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 struct HydrationCheckpoint {
     source_stamp: Option<String>,
     parser_version: i64,
 }
 
+#[cfg(test)]
 fn hydration_checkpoint(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -711,6 +877,7 @@ fn hydration_checkpoint(
         .optional()?)
 }
 
+#[cfg(test)]
 fn write_hydration_checkpoint(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -744,7 +911,7 @@ fn write_hydration_checkpoint(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_remote_result(
+pub(crate) fn build_remote_result(
     conn: &Connection,
     options: &HydrateSessionOptions,
     status: &str,
@@ -771,7 +938,12 @@ fn build_remote_result(
         status: status.to_string(),
         capability: capability.to_string(),
         discovery_state: discovery_state.to_string(),
-        presence: "remote".to_string(),
+        presence: if options.scope == SessionScope::Local {
+            "local"
+        } else {
+            "remote"
+        }
+        .to_string(),
         indexed_through: HydrationIndexedThrough {
             source_stamp: Some(source_stamp),
             last_event_at_ms: max_event_time(conn, &options.source, &options.session_id)?,
@@ -820,7 +992,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
     };
     let row = conn
         .query_row(
-            "SELECT p.raw_locator, COALESCE(p.discovery_state, s.discovery_state) \
+            "SELECT CASE WHEN s.source='opencode' AND p.location='local' THEN s.raw_path ELSE p.raw_locator END, COALESCE(p.discovery_state, s.discovery_state) \
              FROM sessions s JOIN session_presences p \
                ON p.source = s.source AND p.session_id = s.session_id AND p.location = ? \
              WHERE s.source = ? AND s.session_id = ?",
@@ -1575,6 +1747,232 @@ fn max_event_time(conn: &Connection, source: &str, session_id: &str) -> Result<O
     )?)
 }
 
+pub(crate) fn hydrate_with_provider(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    provider: &dyn ShallowSessionProvider,
+) -> Result<HydrateSessionResult> {
+    validate_options(options)?;
+    // Keep transport response acquisition and replacement in the same critical section.
+    let _lock = acquire_remote_hydration_lock(db_path, options)?;
+    let started = Instant::now();
+    let mut conn = open_db(db_path)?;
+    let observation = crate::sources::observed(&conn, provider, &options.session_id)?;
+    anyhow::ensure!(
+        observation.access_state != "withdrawn",
+        "CONNECTOR_NOT_CONFIGURED: selected observation is withdrawn"
+    );
+    let revision =
+        observations::revision(&conn, &observation.key)?.context("missing observation revision")?;
+    let evidence = match provider.acquire(&home_dir(), &observation) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            observations::set_access(&conn, &observation.key, "unavailable")?;
+            return Err(classify_remote_error(error));
+        }
+    };
+    match evidence {
+        crate::sources::AcquiredEvidence::LocalFiles => {
+            anyhow::ensure!(
+                observation.key.location == SessionLocation::Local
+                    && observation.key.connector_id == options.source
+                    && observation.key.connector_instance == "default",
+                "CONNECTOR_FAILURE: local parser requires its built-in observation identity"
+            );
+            hydrate_session_at_with_home_and_connectors(
+                db_path,
+                options,
+                &home_dir(),
+                &crate::remote::SourceConnectorSelection::new(Vec::new())?,
+            )
+        }
+        evidence @ (crate::sources::AcquiredEvidence::Events(_)
+        | crate::sources::AcquiredEvidence::Normalized(_)
+        | crate::sources::AcquiredEvidence::ClaudeFull { .. }
+        | crate::sources::AcquiredEvidence::CodexDiff { .. }) => {
+            let evidence =
+                normalize_source_evidence(&options.source, &options.session_id, evidence)?;
+            crate::source_intake::apply_normalized(
+                &mut conn,
+                &observation.key,
+                &revision,
+                evidence,
+                started,
+            )
+        }
+        crate::sources::AcquiredEvidence::CapabilityLimited { code, message } => {
+            // A failed or listing-only adapter must not remove another connector's evidence.
+            build_remote_result(
+                &conn,
+                options,
+                "capability_limited",
+                "shallow_only",
+                &observation.discovery_state,
+                observation.source_stamp.clone().unwrap_or_default(),
+                0,
+                0,
+                code,
+                &message,
+                started,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_observation_progress(
+    conn: &Connection,
+    observation: &SessionObservation,
+    stamp: &str,
+    bytes: i64,
+    records: i64,
+    include_related: bool,
+    full: bool,
+) -> Result<()> {
+    let mut observation = observation.clone();
+    observation.updated_ms = now_ms();
+    observation.access_state = "available".into();
+    if full {
+        observation.discovery_state = "full".into();
+    }
+    observations::upsert(conn, &observation)?;
+    observations::write_checkpoint(
+        conn,
+        &observation.key,
+        &ObservationCheckpoint {
+            source_stamp: Some(stamp.into()),
+            parser_version: HYDRATION_PARSER_VERSION,
+            last_event_at_ms: max_event_time(
+                conn,
+                &observation.key.source,
+                &observation.key.session_id,
+            )?,
+            source_bytes: bytes,
+            records_parsed: records,
+            include_related,
+            updated_ms: now_ms(),
+        },
+    )
+}
+
+/// Parse provider wire evidence in an isolated database. No managed catalog,
+/// credentials or transports are accessed by this normalization operation.
+pub fn normalize_source_evidence(
+    source: &str,
+    session_id: &str,
+    evidence: crate::sources::AcquiredEvidence,
+) -> Result<crate::source_intake::NormalizedSourceEvidence> {
+    use crate::sources::AcquiredEvidence;
+    use ai_hist_core::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+    let (source_stamp, source_bytes, covered_kinds, records) = match evidence {
+        AcquiredEvidence::Events(evidence) => {
+            let records = evidence
+                .events
+                .into_iter()
+                .map(|event| {
+                    Ok(EvidenceRecord {
+                        kind: EvidenceKind::SessionEvent,
+                        payload: serde_json::to_value(event)?
+                            .as_object()
+                            .context("event object")?
+                            .clone(),
+                        record_id: None,
+                        revision_id: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (
+                evidence.source_stamp,
+                evidence.source_bytes,
+                vec![EvidenceKind::SessionEvent],
+                records,
+            )
+        }
+        AcquiredEvidence::ClaudeFull {
+            mut records,
+            source_stamp,
+            source_bytes,
+        } => {
+            anyhow::ensure!(
+                source == "claude",
+                "CONNECTOR_FAILURE: Claude evidence returned for another source"
+            );
+            let mut transcript = tempfile::NamedTempFile::new()?;
+            for record in &mut records {
+                let object = record
+                    .as_object_mut()
+                    .context("CONNECTOR_FAILURE: Claude record must be an object")?;
+                let id = object
+                    .get("sessionId")
+                    .or_else(|| object.get("session_id"))
+                    .and_then(Value::as_str);
+                anyhow::ensure!(
+                    id.is_none_or(|id| id == session_id),
+                    "CONNECTOR_FAILURE: Claude record identity does not match requested session"
+                );
+                object.insert("sessionId".into(), Value::String(session_id.into()));
+                serde_json::to_writer(&mut transcript, record)?;
+                transcript.write_all(b"\n")?;
+            }
+            transcript.flush()?;
+            let conn = Connection::open_in_memory()?;
+            ai_hist_core::init_db(&conn)?;
+            ingest_claude_transcript(&conn, transcript.path())?;
+            let records =
+                source_evidence::read_session(&conn, source, session_id, FULL_SESSION_KINDS)?;
+            (
+                source_stamp,
+                source_bytes,
+                FULL_SESSION_KINDS.to_vec(),
+                records,
+            )
+        }
+        AcquiredEvidence::CodexDiff {
+            diff,
+            source_stamp,
+            source_bytes,
+        } => {
+            anyhow::ensure!(
+                source == "codex",
+                "CONNECTOR_FAILURE: Codex evidence returned for another source"
+            );
+            let records=split_unified_diff(&diff).into_iter().enumerate().map(|(index,patch)| {
+                let (added,removed)=count_unified_diff_lines(&patch.text);
+                let payload=json!({"source":source,"session_id":session_id,"tool_use_id":format!("remote-diff:{index}"),"file_path":patch.path,"tool_name":"codex cloud diff","lines_added":added,"lines_removed":removed,"structured_patch_json":json!({"unified_diff":patch.text}).to_string()}).as_object().unwrap().clone();
+                EvidenceRecord{kind:EvidenceKind::FileEdit,payload,record_id:None,revision_id:None}
+            }).collect();
+            (
+                source_stamp,
+                source_bytes,
+                vec![EvidenceKind::FileEdit],
+                records,
+            )
+        }
+        AcquiredEvidence::Normalized(evidence) => return Ok(evidence),
+        AcquiredEvidence::LocalFiles | AcquiredEvidence::CapabilityLimited { .. } => {
+            anyhow::bail!("PROVIDER_CAPABILITY_LIMITED: no portable evidence snapshot")
+        }
+    };
+    let mut normalized = crate::source_intake::NormalizedSourceEvidence {
+        source_stamp,
+        source_bytes,
+        covered_kinds,
+        records,
+    };
+    source_evidence::validate_records(
+        &ObservationKey {
+            source: source.into(),
+            session_id: session_id.into(),
+            location: SessionLocation::Remote,
+            connector_id: "normalizer".into(),
+            connector_instance: "default".into(),
+        },
+        &normalized.covered_kinds,
+        &mut normalized.records,
+    )?;
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1764,7 +2162,7 @@ mod tests {
         open_db(&db)
             .unwrap()
             .execute(
-                "UPDATE session_hydration_checkpoints SET parser_version = 0 WHERE source='claude' AND session_id='session-1'",
+                "UPDATE observation_hydration_checkpoints SET parser_version = 0 WHERE source='claude' AND session_id='session-1'",
                 [],
             )
             .unwrap();
@@ -1850,7 +2248,24 @@ mod tests {
         drop(src);
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "opencode", "selected", Some(&source));
+        let env = DiscoveryEnv::with_roots(&conn, dir.path().into(), source.clone());
+        crate::discover::discover_sessions_with_env(
+            &env,
+            &DiscoverOptions {
+                scope: SessionScope::Local,
+                sources: vec!["opencode".into()],
+                limit: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            observations::list(&conn, "opencode", "selected").unwrap()[0]
+                .raw_locator
+                .as_deref(),
+            Some("selected")
+        );
+
         drop(conn);
         let result =
             hydrate_session_at_with_home(&db, &options("opencode", "selected"), dir.path())
@@ -2836,15 +3251,17 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let result = hydrate_session_at_with_home(
-            &db,
+        let result = remote_limited_result(
+            &mut open_db(&db).unwrap(),
             &HydrateSessionOptions {
                 source: "cursor".into(),
                 session_id: "remote-cursor".into(),
                 scope: SessionScope::Remote,
                 include_related: true,
             },
-            dir.path(),
+            "CONNECTOR_NOT_CONFIGURED",
+            "selected source provides discovery only".into(),
+            Instant::now(),
         )
         .unwrap();
         assert_eq!(result.status, "capability_limited");
@@ -2963,6 +3380,139 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn legacy_codex_diff_is_not_duplicated_or_claimed_by_a_new_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("history.db")).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_123");
+        conn.execute("INSERT INTO file_edits(source,session_id,tool_use_id,file_path,tool_name,structured_patch_json) VALUES('codex','task_e_123','remote-diff:0','a.txt','codex cloud diff','legacy patch')",[]).unwrap();
+        let observed = SessionObservation {
+            key: ObservationKey {
+                source: "codex".into(),
+                session_id: "task_e_123".into(),
+                location: SessionLocation::Remote,
+                connector_id: "codex-cloud".into(),
+                connector_instance: "default".into(),
+            },
+            raw_locator: Some("task_e_123".into()),
+            source_stamp: Some("listing".into()),
+            discovery_state: "shallow".into(),
+            access_state: "available".into(),
+            updated_ms: 1,
+        };
+        observations::upsert(&conn, &observed).unwrap();
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_123".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let diff =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n old\n+fresh\n";
+        hydrate_remote_codex_diff_observed(
+            &mut conn,
+            &options,
+            diff,
+            "new".into(),
+            100,
+            Instant::now(),
+            Some(&observed),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT structured_patch_json FROM file_edits", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "legacy patch"
+        );
+        assert_eq!(
+            observations::evidence(&conn, &observed.key)
+                .unwrap()
+                .unwrap()["diff"],
+            diff
+        );
+        assert_eq!(
+            observations::checkpoint(&conn, &observed.key)
+                .unwrap()
+                .unwrap()
+                .source_stamp
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn same_connector_instance_diff_locations_do_not_delete_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&dir.path().join("history.db")).unwrap();
+        remote_catalog_row(&conn, "codex", "task_e_123");
+        let options = HydrateSessionOptions {
+            source: "codex".into(),
+            session_id: "task_e_123".into(),
+            scope: SessionScope::Remote,
+            include_related: false,
+        };
+        let diff =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n old\n+new\n";
+        let observation = |location| SessionObservation {
+            key: ObservationKey {
+                source: "codex".into(),
+                session_id: "task_e_123".into(),
+                location,
+                connector_id: "same".into(),
+                connector_instance: "same".into(),
+            },
+            raw_locator: Some("diff".into()),
+            source_stamp: Some("1".into()),
+            discovery_state: "shallow".into(),
+            access_state: "available".into(),
+            updated_ms: 1,
+        };
+        for location in [SessionLocation::Local, SessionLocation::Remote] {
+            let observed = observation(location);
+            observations::upsert(&conn, &observed).unwrap();
+            hydrate_remote_codex_diff_observed(
+                &mut conn,
+                &options,
+                diff,
+                "1".into(),
+                100,
+                Instant::now(),
+                Some(&observed),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        hydrate_remote_codex_diff_observed(
+            &mut conn,
+            &options,
+            "",
+            "2".into(),
+            0,
+            Instant::now(),
+            Some(&observation(SessionLocation::Remote)),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM file_edits", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

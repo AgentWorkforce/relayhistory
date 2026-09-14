@@ -7,14 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// WS-9 cloud-sync: local recall store → WS-1 convergence envelope (Agent Relay Loop).
-pub mod convergence;
-/// WS-9 cloud-sync increment 2a: outbox builder (local rows → batch, sync logic only).
-pub mod outbox;
+/// Generic opt-in durable history export and delivery state.
+pub mod delivery;
+/// Connector-specific acquisition provenance and checkpoints.
+pub mod observations;
+pub mod privacy;
 /// Delegation topology: recorded parent/child relationships and bounded,
 /// cycle-safe traversal over them.
 pub mod relationships;
-pub mod turns;
+pub mod source_evidence;
+pub mod storage;
 
 pub use relationships::{
     relationship_capabilities, session_children, session_children_page, session_parents,
@@ -102,7 +104,7 @@ pub enum SessionLocation {
 }
 
 impl SessionLocation {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Remote => "remote",
@@ -431,6 +433,15 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_relationships",
     "schema_migrations",
     "discovery_skips",
+    "delivery_state",
+    "delivery_jobs",
+    "delivery_journal",
+    "delivery_shadow",
+    "delivery_batches",
+    "delivery_bootstrap_bounds",
+    "delivery_exclusions",
+    "history_exports",
+    "history_export_pages",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
@@ -543,6 +554,7 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    "delivery_v1",
 ];
 
 /// Whether this database already has everything [`init_db`] would add.
@@ -553,7 +565,9 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
-    schema_has_required_indexes(conn, REQUIRED_INDEXES)
+    Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
+        && delivery::schema_is_current(conn)?
+        && observations::schema_is_current(conn)?)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -685,6 +699,8 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
+    // REPLACE must fire delete triggers so enabled delivery retains preimages.
+    conn.pragma_update(None, "recursive_triggers", true)?;
     init_db_once(conn)
 }
 
@@ -998,6 +1014,8 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    observations::init_schema(conn)?;
+    delivery::init_schema(conn)?;
     Ok(())
 }
 
