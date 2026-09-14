@@ -13,6 +13,8 @@ import {
   hydrateSourcePlugin,
   discoverSourcePlugins,
   RelayHistoryError,
+  AuthenticationExpiredError,
+  SessionNotFoundError,
   type HistorySource,
   type SourceEvidenceSnapshot,
 } from './index.js';
@@ -257,7 +259,7 @@ test('failed source instances do not block healthy remote or local acquisition',
   const missing = join(dir, 'no-remote.db');
   await assert.rejects(
     discoverSessions({ scope: 'remote', plugins: onlyBroken, dbPath: missing }),
-    /No selected source plugin is available/,
+    /Source plugin acquisition failed/,
   );
   await assert.rejects(access(missing));
   assert.equal(
@@ -282,6 +284,8 @@ test('invalid runtime options are rejected before source callbacks or database c
     { scope: 'bogus' },
     { scope: 'remote', limit: -1 },
     { scope: 'remote', sources: ['unknown'] },
+    { scope: 'remote', acquisitionTimeoutMs: 0 },
+    { scope: 'remote', acquisitionTimeoutMs: 3_600_001 },
   ])
     await assert.rejects(
       discoverSessions({ ...options, plugins, dbPath } as never),
@@ -321,5 +325,98 @@ test('malformed observation response is isolated and shallow results cannot down
     assert.equal(result.capability, 'partial');
     assert.equal(result.evidence.events, 1);
     assert.ok(result.diagnostics.some((row) => row.code === 'SOURCE_CAPABILITY_LIMITED'));
+  }
+});
+
+test('typed acquisition failures survive public APIs without plugin secrets', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-source-errors-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'history.db');
+  const source = fixture('errors');
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [source] });
+  const options = { scope: 'remote' as const, plugins, dbPath };
+  await discoverSessions(options);
+  for (const [ErrorType, code] of [
+    [AuthenticationExpiredError, 'AUTHENTICATION_EXPIRED'],
+    [SessionNotFoundError, 'SESSION_NOT_FOUND'],
+  ] as const) {
+    const fail = async (): Promise<never> => { throw new ErrorType('private-token', code, { cause: new Error('secret cause') }); };
+    source.hydrate = fail;
+    for (const operation of [
+      () => hydrateSourcePlugin(source, { source: 'claude', sessionId: 'fixture-session' }, { dbPath }),
+      () => hydrateSession({ ...options, source: 'claude', sessionId: 'fixture-session' }),
+    ]) await assert.rejects(operation(), (error: unknown) => {
+      assert.ok(error instanceof ErrorType);
+      assert.equal(error.code, code);
+      assert.doesNotMatch(error.message, /private-token/);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+    source.discover = fail;
+    for (const operation of [() => discoverSessions(options), () => sync(options)])
+      await assert.rejects(operation(), (error: unknown) => error instanceof ErrorType && error.code === code && !error.message.includes('private-token'));
+  }
+  source.hydrate = async () => { throw new Error('private-token'); };
+  await assert.rejects(hydrateSourcePlugin(source, { source: 'claude', sessionId: 'fixture-session' }, { dbPath }),
+    (error: unknown) => error instanceof RelayHistoryError && error.code === 'CONNECTOR_FAILURE' && !error.message.includes('private-token'));
+});
+
+test('complete source snapshots can exceed thirty seconds and receive the configured budget', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-source-budget-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'history.db');
+  const source = fixture('budget');
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [source] });
+  await discoverSessions({ scope: 'remote', plugins, dbPath });
+  let ready!: () => void;
+  const started = new Promise<void>(resolve => { ready = resolve; });
+  source.hydrate = async (_observation, context) => {
+    assert.equal(context.acquisitionTimeoutMs, 120_000);
+    ready();
+    await new Promise(resolve => setTimeout(resolve, 45_000));
+    return source.snapshot;
+  };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = hydrateSourcePlugin(source, { source: 'claude', sessionId: 'fixture-session' }, { dbPath, acquisitionTimeoutMs: 120_000 });
+  await started;
+  t.mock.timers.tick(45_000);
+  await pending;
+  t.mock.timers.reset();
+  assert.equal((await getSessionEventsPage('fixture-session', { source: 'claude', dbPath })).events.length, 1);
+});
+
+test('source deadlines and explicit cancellation have distinct safe errors and do not commit', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-source-cancel-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'history.db');
+  const source = fixture('cancel');
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [source] });
+  await discoverSessions({ scope: 'remote', plugins, dbPath });
+  for (const cancel of [false, true]) {
+    let ready!: () => void;
+    const started = new Promise<void>(resolve => { ready = resolve; });
+    let signal: AbortSignal | undefined;
+    let finish!: (snapshot: SourceEvidenceSnapshot) => void;
+    source.hydrate = async (_observation, context) => {
+      signal = context.signal;
+      ready();
+      return new Promise(resolve => { finish = resolve; });
+    };
+    const controller = new AbortController();
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const pending = hydrateSourcePlugin(source, { source: 'claude', sessionId: 'fixture-session' }, { dbPath, acquisitionTimeoutMs: 100, signal: controller.signal });
+    const checked = assert.rejects(pending, (error: unknown) => error instanceof RelayHistoryError && error.code === (cancel ? 'SOURCE_ACQUISITION_CANCELLED' : 'SOURCE_ACQUISITION_TIMEOUT') && !error.message.includes('secret'));
+    await started;
+    if (cancel) controller.abort(new Error('secret cancel reason'));
+    else t.mock.timers.tick(100);
+    await checked;
+    assert.equal(signal?.aborted, true);
+    finish(source.snapshot);
+    t.mock.timers.reset();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await getSessionEventsPage('fixture-session', { source: 'claude', dbPath })).events.length, 0);
   }
 });

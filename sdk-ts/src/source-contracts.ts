@@ -56,10 +56,11 @@ export interface HistorySource {
     sessionId?: string;
     limit?: number;
     signal?: AbortSignal;
+    acquisitionTimeoutMs?: number;
   }): Promise<{ observations: ShallowSourceSession[] }>;
   /** Complete snapshot for every declared covered kind; omit unsupported kinds. */
   hydrate(
     observation: Readonly<SourceObservation>,
-    options: { signal?: AbortSignal },
+    options: { signal?: AbortSignal; acquisitionTimeoutMs?: number },
   ): Promise<SourceEvidenceSnapshot>;
 }

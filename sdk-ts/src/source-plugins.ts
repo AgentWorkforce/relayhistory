@@ -1,5 +1,11 @@
 import { nativeCall } from './native.js';
 import {
+  RelayHistoryError,
+  AuthenticationExpiredError,
+  SessionNotFoundError,
+  SessionSourceUnavailableError,
+  HydrationUnsupportedError,
+  InvalidArgumentError,
   ConnectorFailureError,
   ConnectorNotConfiguredError,
   type CatalogSource,
@@ -18,31 +24,60 @@ export interface SourcePluginOptions {
   sessionId?: string;
   limit?: number;
   signal?: AbortSignal;
-  onUnavailable?: (source: string) => void;
+  acquisitionTimeoutMs?: number;
+  onUnavailable?: (source: string, error: RelayHistoryError) => void;
+}
+// Reconstruct public errors with safe messages. Plugin messages/causes may
+// contain credentials; only these acquisition codes cross the boundary.
+export function sourceAcquisitionError(error: unknown): RelayHistoryError {
+  const code = error instanceof RelayHistoryError ? error.code : '';
+  switch (code) {
+    case 'AUTHENTICATION_EXPIRED': return new AuthenticationExpiredError('Source authentication expired', code);
+    case 'SESSION_NOT_FOUND': return new SessionNotFoundError('Source session was not found', code);
+    case 'SESSION_SOURCE_UNAVAILABLE': return new SessionSourceUnavailableError('Source session is unavailable', code);
+    case 'CONNECTOR_NOT_CONFIGURED': return new ConnectorNotConfiguredError('Source connector is not configured', code);
+    case 'HYDRATION_UNSUPPORTED': return new HydrationUnsupportedError('Source hydration is unsupported', code);
+    case 'SOURCE_ACQUISITION_TIMEOUT':
+    case 'HISTORY_PLUGIN_TIMEOUT': return new ConnectorFailureError('Source acquisition timed out', 'SOURCE_ACQUISITION_TIMEOUT');
+    case 'SOURCE_ACQUISITION_CANCELLED':
+    case 'HISTORY_PLUGIN_CANCELLED': return new ConnectorFailureError('Source acquisition cancelled', 'SOURCE_ACQUISITION_CANCELLED');
+    default: return new ConnectorFailureError('Source plugin acquisition failed', 'CONNECTOR_FAILURE');
+  }
+}
+export function sourceAcquisitionTimeout(value?: number): number {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 3_600_000))
+    throw new InvalidArgumentError('acquisitionTimeoutMs must be an integer from 1 to 3600000', 'INVALID_ARGUMENT');
+  return value ?? 300_000;
+}
+export function throwIfSourceAborted(signal?: AbortSignal): void {
+  if (signal?.aborted)
+    throw new ConnectorFailureError('Source acquisition cancelled', 'SOURCE_ACQUISITION_CANCELLED');
 }
 async function acquire<T>(
-  run: (signal: AbortSignal) => Promise<T>,
-  signal?: AbortSignal,
+  run: (signal: AbortSignal, timeoutMs: number) => Promise<T>,
+  options: { signal?: AbortSignal; acquisitionTimeoutMs?: number },
 ): Promise<T> {
-  signal?.throwIfAborted();
+  const timeoutMs = sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
+  const { signal } = options;
+  throwIfSourceAborted(signal);
   const controller = new AbortController();
   let rejectAborted!: (reason: unknown) => void;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    rejectAborted = reject;
-  });
-  const stop = () => {
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+  const stop = (code: string) => {
+    // Settle the boundary before notifying helper listeners so cancellation and
+    // timeout keep their distinct codes regardless of helper rejection order.
+    rejectAborted(new ConnectorFailureError(
+      code === 'SOURCE_ACQUISITION_TIMEOUT' ? 'Source acquisition timed out' : 'Source acquisition cancelled', code));
     controller.abort();
-    rejectAborted(
-      new ConnectorFailureError('Source acquisition cancelled or timed out', 'CONNECTOR_FAILURE'),
-    );
   };
-  signal?.addEventListener('abort', stop, { once: true });
-  const timer = setTimeout(stop, 30_000);
+  const cancel = () => stop('SOURCE_ACQUISITION_CANCELLED');
+  signal?.addEventListener('abort', cancel, { once: true });
+  const timer = setTimeout(() => stop('SOURCE_ACQUISITION_TIMEOUT'), timeoutMs);
   try {
-    return await Promise.race([run(controller.signal), aborted]);
+    return await Promise.race([run(controller.signal, timeoutMs), aborted]);
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener('abort', stop);
+    signal?.removeEventListener('abort', cancel);
   }
 }
 export function getSourceObservation(
@@ -60,7 +95,8 @@ export async function discoverSourcePlugins(
   registry: HistoryPluginRegistry,
   options: SourcePluginOptions = {},
 ) {
-  options.signal?.throwIfAborted();
+  throwIfSourceAborted(options.signal);
+  sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
   const selected = registry
     .sourceConnectors(options.sourceConnectors)
     .filter(
@@ -78,17 +114,20 @@ export async function discoverSourcePlugins(
     observations: ShallowSourceSession[];
     summary: Record<string, unknown>;
   }> = [];
+  let firstFailure: RelayHistoryError | undefined;
   for (const connector of selected) {
-    options.signal?.throwIfAborted();
+    throwIfSourceAborted(options.signal);
     let result: { observations: ShallowSourceSession[] };
     try {
       result = await acquire(
-        (signal) => connector.discover({ ...options, signal }),
-        options.signal,
+        (signal, acquisitionTimeoutMs) => connector.discover({ ...options, signal, acquisitionTimeoutMs }),
+        options,
       );
-    } catch {
-      options.signal?.throwIfAborted();
-      options.onUnavailable?.(`${connector.id}:${connector.instanceId}`);
+    } catch (error) {
+      throwIfSourceAborted(options.signal);
+      const failure = sourceAcquisitionError(error);
+      firstFailure ??= failure;
+      options.onUnavailable?.(`${connector.id}:${connector.instanceId}`, failure);
       continue;
     }
     if (
@@ -103,7 +142,9 @@ export async function discoverSourcePlugins(
           !row.session_id,
       )
     ) {
-      options.onUnavailable?.(`${connector.id}:${connector.instanceId}`);
+      const failure = sourceAcquisitionError(null);
+      firstFailure ??= failure;
+      options.onUnavailable?.(`${connector.id}:${connector.instanceId}`, failure);
       continue;
     }
     const observations = result.observations.filter(
@@ -111,7 +152,7 @@ export async function discoverSourcePlugins(
         (!options.sessionId || row.session_id === options.sessionId) &&
         (!options.sources || options.sources.includes(row.source)),
     );
-    options.signal?.throwIfAborted();
+    throwIfSourceAborted(options.signal);
     const summary = await nativeCall(
       async (native) =>
         JSON.parse(
@@ -129,7 +170,7 @@ export async function discoverSourcePlugins(
     discovered.push({ connector, observations, summary });
   }
   if (!discovered.length && !options.onUnavailable)
-    throw new ConnectorNotConfiguredError(
+    throw firstFailure ?? new ConnectorNotConfiguredError(
       'No selected source plugin is available',
       'CONNECTOR_NOT_CONFIGURED',
     );
@@ -138,8 +179,10 @@ export async function discoverSourcePlugins(
 export async function hydrateSourcePlugin(
   connector: HistorySource,
   identity: { source: CatalogSource; sessionId: string },
-  options: { dbPath?: string; signal?: AbortSignal } = {},
+  options: { dbPath?: string; signal?: AbortSignal; acquisitionTimeoutMs?: number } = {},
 ) {
+  sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
+  throwIfSourceAborted(options.signal);
   const key: SourceObservationKey = {
     source: identity.source,
     session_id: identity.sessionId,
@@ -153,17 +196,17 @@ export async function hydrateSourcePlugin(
       'Discover this source observation before hydration',
       'CONNECTOR_NOT_CONFIGURED',
     );
-  options.signal?.throwIfAborted();
+  throwIfSourceAborted(options.signal);
   let snapshot;
   try {
     snapshot = await acquire(
-      (signal) => connector.hydrate(state.observation!, { signal }),
-      options.signal,
+      (signal, acquisitionTimeoutMs) => connector.hydrate(state.observation!, { signal, acquisitionTimeoutMs }),
+      options,
     );
-  } catch {
-    throw new ConnectorFailureError('Source plugin acquisition failed', 'CONNECTOR_FAILURE');
+  } catch (error) {
+    throw sourceAcquisitionError(error);
   }
-  options.signal?.throwIfAborted();
+  throwIfSourceAborted(options.signal);
   if (
     Array.isArray(snapshot.covered_kinds) &&
     snapshot.covered_kinds.length === 0 &&

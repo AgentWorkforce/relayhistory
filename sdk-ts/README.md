@@ -222,3 +222,19 @@ delivery jobs use `createHistoryDelivery`, `HistoryPluginRegistry`, and
 `drainHistoryDelivery`/`runHistoryDelivery`. The same Rust queue handles one-shot
 and background runs, immutable retries, exact acknowledgments, and worker leases.
 Native contract 14 is required. See [delivery setup and contracts](../docs/history-delivery.md).
+
+Source discovery and hydration accept `acquisitionTimeoutMs` for each selected
+connector operation, including a complete paginated snapshot. The default is
+300,000 ms; choose an integer from 1 through 3,600,000 ms. CLI acquisitions accept
+`--acquisition-timeout-ms N`; MCP acquisitions accept `acquisition_timeout_ms`.
+The same budget and cancellation signal reach the optional source helper.
+Timeouts return `SOURCE_ACQUISITION_TIMEOUT`, cancellation returns
+`SOURCE_ACQUISITION_CANCELLED`, and neither commits a partial snapshot. Typed
+source failures such as `AUTHENTICATION_EXPIRED` and `SESSION_NOT_FOUND` retain
+their public classes/codes with sanitized messages.
+
+To remove a persistent delivery exclusion, cancel affected delivery jobs first,
+clear the exclusion, then create new jobs to backfill the skipped history. A
+running or paused generation cannot rewind revisions it already skipped;
+attempting this returns `DELIVERY_GENERATION_REQUIRED`. Jobs whose selection
+permanently excludes that session or cannot include it may continue.

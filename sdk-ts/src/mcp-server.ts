@@ -72,7 +72,8 @@ server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates o
   sources: z.array(CATALOG_SOURCE).optional(), limit: z.number().int().min(1).max(10000).optional(),
   scope: SESSION_SCOPE.optional().default('local'),
   source_connectors: SOURCE_CONNECTORS,
-}, ACQUIRE, ({ sources, scope, limit, source_connectors }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors, plugins: configuredSources })));
+  acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
+}, ACQUIRE, ({ sources, scope, limit, source_connectors, acquisition_timeout_ms }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
 server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
   source: CATALOG_SOURCE,
@@ -80,8 +81,9 @@ server.tool('hydrate_session', 'Fully index one cataloged session without global
   scope: SESSION_SCOPE.optional().default('local'),
   include_related: z.boolean().optional().default(true),
   source_connectors: SOURCE_CONNECTORS,
-}, ACQUIRE, ({ source, session_id, scope, include_related, source_connectors }) => call(() => hydrateSession({
-  source, sessionId: session_id, scope, includeRelated: include_related, sourceConnectors: source_connectors, plugins: configuredSources,
+  acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
+}, ACQUIRE, ({ source, session_id, scope, include_related, source_connectors, acquisition_timeout_ms }) => call(() => hydrateSession({
+  source, sessionId: session_id, scope, includeRelated: include_related, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources,
 })));
 
 server.tool('get_session', 'Get indexed prompts for one session.', {
@@ -131,7 +133,8 @@ server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.'
 server.tool('sync', 'Explicit full provider ingestion into RelayHistory.', {
   scope: SESSION_SCOPE.optional().default('local'),
   source_connectors: SOURCE_CONNECTORS,
-}, ACQUIRE, ({ scope, source_connectors }) => call(() => sync({ scope, sourceConnectors: source_connectors, plugins: configuredSources })));
+  acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
+}, ACQUIRE, ({ scope, source_connectors, acquisition_timeout_ms }) => call(() => sync({ scope, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
 server.tool('delivery_status', 'Read durable delivery progress, backlog, failures, and retention usage.', {
   job_id: z.string().optional(),

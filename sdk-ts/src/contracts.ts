@@ -105,6 +105,9 @@ export interface SourceExemption {
 
 /** Explicit remote acquisition selection; cached reads never consult connectors. */
 export interface SourceConnectorOptions {
+  /** Per-connector discovery or complete snapshot budget. Default 300000 ms;
+   * integer from 1 to 3600000. Cancellation stops the active helper as well. */
+  acquisitionTimeoutMs?: number;
   /** Explicitly configured source plugins. Installation alone never enables them. */
   plugins?: HistoryPluginRegistry;
   signal?: AbortSignal;

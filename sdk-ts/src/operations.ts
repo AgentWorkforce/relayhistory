@@ -4,6 +4,8 @@ import {
   hydrateSourcePlugin,
   getSourceObservation,
   camelSourceResult,
+  sourceAcquisitionTimeout,
+  throwIfSourceAborted,
 } from './source-plugins.js';
 /**
  * RelayHistory's public TypeScript API.
@@ -218,13 +220,16 @@ export async function discoverSessions(
         : null;
     if (!selected.length && local) return { ...local, scope: 'all' };
     const failures: DiscoveryDiagnostic[] = [];
+    let sourceFailure: RelayHistoryError | undefined;
     const runs = await discoverSourcePlugins(options.plugins, {
       ...options,
-      onUnavailable: (source) =>
-        failures.push({ source, locator: null, error: 'Source plugin discovery failed' }),
+      onUnavailable: (source, error) => {
+        sourceFailure ??= error;
+        failures.push({ source, locator: null, error: `${error.code}: ${error.message}` });
+      },
     });
     if (!runs.length && !local)
-      throw new ConnectorNotConfiguredError(
+      throw sourceFailure ?? new ConnectorNotConfiguredError(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
@@ -326,6 +331,7 @@ export async function hydrateSession(
       .sourceConnectors(sourceConnectors)
       .filter((source) => source.supportedSources.includes(options.source));
     const failures: HydrationDiagnostic[] = [];
+    let sourceFailure: RelayHistoryError | undefined;
     let result: HydrateSessionResult | undefined;
     if (options.scope === 'all') {
       try {
@@ -381,8 +387,9 @@ export async function hydrateSession(
             ),
           );
       } catch (error) {
-        options.signal?.throwIfAborted();
+        throwIfSourceAborted(options.signal);
         preserveStorageFailure(error);
+        if (error instanceof RelayHistoryError) sourceFailure ??= error;
         failures.push({
           code: error instanceof RelayHistoryError ? error.code : 'SOURCE_PLUGIN_UNAVAILABLE',
           message: `${connector.id}:${connector.instanceId}: source acquisition failed`,
@@ -393,7 +400,7 @@ export async function hydrateSession(
       }
     }
     if (!result)
-      throw new SessionSourceUnavailableError(
+      throw sourceFailure ?? new SessionSourceUnavailableError(
         'No selected plugin observed this session',
         'SESSION_SOURCE_UNAVAILABLE',
       );
@@ -605,15 +612,18 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
         ? await sync({ ...options, plugins: undefined, scope: 'local', sourceConnectors: [] })
         : null;
     const diagnostics: DiscoveryDiagnostic[] = [];
+    let sourceFailure: RelayHistoryError | undefined;
     const runs = selected.length
       ? await discoverSourcePlugins(options.plugins, {
           ...options,
-          onUnavailable: (source) =>
-            diagnostics.push({ source, locator: null, error: 'Source plugin discovery failed' }),
+          onUnavailable: (source, error) => {
+            sourceFailure ??= error;
+            diagnostics.push({ source, locator: null, error: `${error.code}: ${error.message}` });
+          },
         })
       : [];
     if (!runs.length && !local)
-      throw new ConnectorNotConfiguredError(
+      throw sourceFailure ?? new ConnectorNotConfiguredError(
         'No selected source plugin is available',
         'CONNECTOR_NOT_CONFIGURED',
       );
@@ -626,7 +636,7 @@ export async function sync(options: SyncOptions = {}): Promise<SyncResult> {
             options,
           );
         } catch (error) {
-          options.signal?.throwIfAborted();
+          throwIfSourceAborted(options.signal);
           preserveStorageFailure(error);
           diagnostics.push({
             source: `${run.connector.id}:${run.connector.instanceId}`,
@@ -902,9 +912,11 @@ function validateAcquisition(options: {
   scope?: SessionScope;
   sources?: CatalogSource[];
   limit?: number;
+  acquisitionTimeoutMs?: number;
 }): void {
   if (!options || typeof options !== 'object')
     throw new InvalidArgumentError('acquisition options are required', 'INVALID_ARGUMENT');
+  sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
   if (options.scope !== undefined && !['local', 'remote', 'all'].includes(options.scope))
     throw new InvalidArgumentError('scope must be local, remote, or all', 'INVALID_ARGUMENT');
   if (

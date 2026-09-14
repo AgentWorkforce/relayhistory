@@ -35,13 +35,13 @@ export function createHistoryPlugin(options: ProviderSourceOptions = {}): Histor
         helperRequest<{ observations: ShallowSourceSession[] }>(
           'discover',
           { connectorId, connectorInstance, source, limit: query.limit },
-          { ...options, signal: query.signal },
+          { ...options, signal: query.signal, timeoutMs: query.acquisitionTimeoutMs ?? options.timeoutMs },
         ),
       hydrate: async (observation, context) =>
         helperRequest<SourceEvidenceSnapshot>(
           'hydrate',
           { connectorId, connectorInstance, observation },
-          { ...options, signal: context.signal },
+          { ...options, signal: context.signal, timeoutMs: context.acquisitionTimeoutMs ?? options.timeoutMs },
         ),
     };
   });

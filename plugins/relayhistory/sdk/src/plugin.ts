@@ -356,7 +356,7 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
       for (const source of sources)
         for await (const record of deliveredHistory(
           { expectedAccount, source, sessionId: query.sessionId },
-          { ...options, signal: query.signal },
+          { ...options, signal: query.signal, timeoutMs: query.acquisitionTimeoutMs ?? options.timeoutMs },
         )) {
           if (!record.session_id || !isCatalogSource(record.source)) continue;
           const key = JSON.stringify([record.source, record.session_id]);
@@ -420,7 +420,7 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
           sessionId: observation.key.session_id,
           includeDeleted: true,
         },
-        { ...options, signal: context.signal },
+        { ...options, signal: context.signal, timeoutMs: context.acquisitionTimeoutMs ?? options.timeoutMs },
       ))
         rows.push(row);
       const allowed = [
