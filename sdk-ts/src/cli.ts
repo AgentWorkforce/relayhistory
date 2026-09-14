@@ -648,9 +648,9 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
 
 function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
   if (command === undefined) return 'invalid usage';
-  if (command === 'sessions') {
-    if (subcommand === undefined) return 'sessions requires a subcommand';
-    return `unknown sessions subcommand '${subcommand}'`;
+  if (command === 'sessions' || command === 'delivery') {
+    if (subcommand === undefined) return `${command} requires a subcommand`;
+    return `unknown ${command} subcommand '${subcommand}'`;
   }
   return `unknown command '${command}'`;
 }
@@ -703,7 +703,7 @@ async function main(): Promise<void> {
   if (command === 'help' && subcommand === undefined && rest.length === 0) {
     showHelp();
   }
-  if (command === 'sessions' && subcommand === undefined && args.flags.has('help')) {
+  if ((command === 'sessions' || command === 'delivery') && subcommand === undefined && args.flags.has('help')) {
     showHelp();
   }
 
