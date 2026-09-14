@@ -409,6 +409,9 @@ fn selected(selection: &ExportSelection, kind: &str, source: &str, session: Opti
 
 /// Exclusions are persistent and source-scoped. They are rechecked when a batch
 /// is claimed/prepared. This cannot revoke a request already sent to a server.
+/// Removing an existing exclusion requires cancelling affected jobs first and
+/// creating new generations afterward, so previously skipped history receives
+/// a fresh baseline. Jobs permanently excluding this session are unaffected.
 pub fn set_session_excluded(
     conn: &Connection,
     session: &SessionIdentity,
@@ -421,6 +424,32 @@ pub fn set_session_excluded(
             params![session.source, session.session_id],
         )?;
     } else {
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
+            params![session.source, session.session_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            let mut statement =
+                tx.prepare("SELECT config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
+            let configs = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for config in configs {
+                let config: DeliveryJobConfig = serde_json::from_str(&config?)?;
+                let selection = &config.selection;
+                // A child exclusion also suppresses relationship records selected
+                // through a parent. Conservatively include same-source parent
+                // selections even if that relationship has since been deleted.
+                let affected = !selection.excluded_sessions.contains(session)
+                    && (selection.all_sources
+                        || selection.sources.contains(&session.source)
+                        || selection.sessions.contains(session)
+                        || (selection.kinds.iter().any(|kind| kind == "relationship")
+                            && selection
+                                .sessions
+                                .iter()
+                                .any(|parent| parent.source == session.source)));
+                ensure!(!affected, "DELIVERY_GENERATION_REQUIRED: cancel affected delivery jobs before removing an exclusion, then create new jobs to backfill skipped history");
+            }
+        }
         tx.execute(
             "DELETE FROM delivery_exclusions WHERE source=? AND session_id=?",
             params![session.source, session.session_id],
