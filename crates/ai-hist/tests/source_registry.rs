@@ -582,3 +582,26 @@ fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_i
     );
     Ok(())
 }
+
+#[test]
+fn limited_discovery_defers_unknown_aliases_without_losing_existing_observations() -> Result<()> {
+    let a = Fixture::new("a", "one");
+    let mut b = Fixture::new("b", "two");
+    b.enumeration_knows_id = false;
+    let mut registry = SourceRegistry::new();
+    registry.register(Box::new(a.clone()))?;
+    registry.register(Box::new(b.clone()))?;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    let both = [a.identity(), b.identity()];
+    let limited = registry.discover_at(&db, &options(), &both, |_| {})?;
+    assert_eq!(limited.counters.shallow_reads, 1);
+    let conn = ai_hist_core::open_db(&db)?;
+    assert_eq!(observations::list(&conn, "claude", "session")?.len(), 1);
+    // Selecting the opaque connector directly gives it its own discovery budget.
+    registry.discover_at(&db, &options(), &[b.identity()], |_| {})?;
+    assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
+    registry.discover_at(&db, &options(), &both, |_| {})?;
+    assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
+    Ok(())
+}

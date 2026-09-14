@@ -671,3 +671,18 @@ PLAN), `the_catalog_query_reads_only_the_sessions_table`,
 See also: [`getting-started.md`](getting-started.md) (human setup) ·
 [`agent-integration.md`](agent-integration.md) (agent-facing surfaces) ·
 the `Schema` section of the top-level `README.md`.
+
+
+### Limited discovery and connector aliases
+
+A limited discovery run is a bounded preview, not a complete inventory of every
+connector observation. After its session budget is filled, it may reconcile
+additional candidates that explicitly identify an already emitted session. It
+does not read every remaining opaque path to discover whether it aliases that
+session: doing so would turn a small preview into a full archive scan. Unread
+candidates do not withdraw or delete observations from previous scans.
+
+To collect observations from another connector that enumerates opaque paths,
+select that connector in a separate discovery call, or run discovery without a
+limit. Its observation is then retained independently alongside existing
+connectors. The read-budget and source-registry tests cover both behaviors.
