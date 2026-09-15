@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { npmCli, plugins } from "./history-package-contract.mjs";
+import {
+  nativeContractVersion,
+  npmCli,
+  plugins,
+} from "./history-package-contract.mjs";
 
 export function peerMinimum(range) {
   const match = /^(?:\^)?(\d+\.\d+\.\d+)$/.exec(range ?? "");
@@ -15,7 +19,18 @@ export function peerMinimum(range) {
   );
   return match[1];
 }
-export function assertPublishedContract(sdk, native, actualVersion, minimum) {
+/**
+ * @param requiredContract the native contract the plugin sources require. Read
+ * from this checkout by default, so bumping the contract never leaves a stale
+ * literal admitting a published core the plugin can no longer talk to.
+ */
+export function assertPublishedContract(
+  sdk,
+  native,
+  actualVersion,
+  minimum,
+  requiredContract = nativeContractVersion(),
+) {
   assert.equal(
     actualVersion,
     minimum,
@@ -23,11 +38,12 @@ export function assertPublishedContract(sdk, native, actualVersion, minimum) {
   );
   assert.equal(
     native.nativeContractVersion?.(),
-    14,
-    "Published peer minimum must implement native contract 14",
+    requiredContract,
+    `Published peer minimum must implement native contract ${requiredContract}`,
   );
   for (const method of [
     "historyDelivery",
+    "historyDeliveryDrain",
     "applySourceEvidence",
     "getSourceObservation",
   ]) {

@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 14, catalog contract version 3, hydration contract version 2,
+version 15, catalog contract version 3, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -209,8 +209,12 @@ There is no alternate runtime after any native-load error.
 
 `ai-hist-core::delivery` owns opt-in journaling, bounded snapshots, immutable
 queue/payload persistence, exact acknowledgments, retention, and fenced leases.
-The SDK host registers explicitly selected destination modules and runs the same
-drain loop for foreground and background delivery. Native contract 14 includes a
+The drain loop itself - round-robin scheduling, leases and their keepalive,
+payload persistence, the eligibility recheck before transport, acknowledgment
+checking and failure classification - runs once, in the Rust core worker, for
+both foreground and background delivery. The SDK host is a thin adapter: it
+registers explicitly selected destination modules, describes them to the worker,
+and answers the worker's prepare/send calls. Native contract 15 includes a
 typed serialized delivery/export bridge to the existing addon. No TypeScript or
 plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
 selection, failure states, background operation, and the independent NDJSON path.
