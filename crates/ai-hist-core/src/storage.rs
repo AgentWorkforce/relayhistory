@@ -218,3 +218,74 @@ pub fn latest_history_for_session(
     })?;
     Ok(rows.next().transpose()?)
 }
+
+/// Bounded, deduplicated identities across catalog, prompts and events. Includes
+/// uncatalogued sessions so an export exclusion cannot miss partially read data.
+/// Continue with the last returned identity; hold a read transaction when a
+/// consistent multi-page baseline is required.
+pub fn session_identities_after(
+    conn: &Connection,
+    after: Option<&crate::delivery::SessionIdentity>,
+    limit: usize,
+) -> Result<Vec<crate::delivery::SessionIdentity>> {
+    let mut query = conn.prepare(
+        "SELECT source, session_id FROM (
+            SELECT source, session_id FROM sessions
+            UNION SELECT source, session_id FROM history WHERE session_id IS NOT NULL
+            UNION SELECT source, session_id FROM session_events
+        ) WHERE ?1 IS NULL OR (source, session_id) > (?1, ?2)
+        ORDER BY source, session_id LIMIT ?3",
+    )?;
+    let rows = query.query_map(
+        rusqlite::params![
+            after.map(|v| v.source.as_str()),
+            after.map(|v| v.session_id.as_str()),
+            bounded(limit)
+        ],
+        |row| {
+            Ok(crate::delivery::SessionIdentity {
+                source: row.get(0)?,
+                session_id: row.get(1)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn identity_pages_include_uncatalogued_data_without_duplicates_or_tie_skips() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source, session_id) VALUES ('claude','a'), ('codex','a')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO history(source, session_id, prompt, prompt_hash, timestamp_ms) VALUES ('claude','a','test','one',1), ('claude','b','second test','two',1)", []).unwrap();
+        conn.execute("INSERT INTO session_events(source, session_id, ts_ms, role, kind, text, event_uid) VALUES ('claude','c',1,'user','text','test','one')", []).unwrap();
+        let mut cursor = None;
+        let mut identities = vec![];
+        loop {
+            let page = session_identities_after(&conn, cursor.as_ref(), 1).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert_eq!(page.len(), 1);
+            cursor = page.last().cloned();
+            identities.extend(page.into_iter().map(|v| (v.source, v.session_id)));
+        }
+        assert_eq!(
+            identities,
+            [
+                ("claude", "a"),
+                ("claude", "b"),
+                ("claude", "c"),
+                ("codex", "a")
+            ]
+            .map(|(s, id)| (s.to_string(), id.to_string()))
+        );
+    }
+}

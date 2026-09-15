@@ -90,3 +90,12 @@ is not a complete normalized source snapshot. It does not advertise `covered_kin
 or participate in automatic discovery. New full snapshot support requires a
 separately verified Relaycast traversal/permission contract. The local packages
 contain no Relaycast transport or implicit credentials-driven acquisition.
+
+## Native Agent Relay Probe
+
+This package also builds the independent `agent-relay-probe` executable for the
+Cloud onboarding flow. It links the local capture engine, durable coordinator and
+optional RelayHistory transport directly; it does not load Node or invoke the
+JSON helper. The existing `relayhistory-plugin` remains Cargo's default executable.
+See [the probe guide](../../../docs/agent-relay-probe.md) for commands, state,
+local verification and companion-service requirements.

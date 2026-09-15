@@ -1,0 +1,433 @@
+//! Standalone Cloud collector. Reuses ai-hist capture/queue and the optional transport.
+mod auth;
+mod collector;
+
+use anyhow::{ensure, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use fs2::FileExt;
+use relayhistory_plugin::{cloud, destination, migration};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+};
+
+#[derive(Parser)]
+#[command(
+    name = "agent-relay-probe",
+    version,
+    about = "Connect coding sessions to Agent Relay Cloud"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+#[derive(Subcommand)]
+enum Commands {
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
+    #[command(hide = true)]
+    Run {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        startup_id: String,
+    },
+    Stop(Target),
+    Status(Target),
+}
+#[derive(Subcommand)]
+enum CloudCommands {
+    Install(Install),
+}
+#[derive(Args, Clone)]
+struct Target {
+    #[arg(long, default_value = "https://agentrelay.com")]
+    site_url: String,
+    #[arg(long)]
+    account: String,
+    #[arg(long)]
+    workspace: String,
+}
+#[derive(Args)]
+struct Install {
+    #[arg(long, default_value = "https://agentrelay.com")]
+    site_url: String,
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long, conflicts_with = "new_sessions_only")]
+    include_existing: bool,
+    #[arg(long)]
+    new_sessions_only: bool,
+    #[arg(long)]
+    force_login: bool,
+    #[arg(long)]
+    foreground: bool,
+    #[arg(long)]
+    once: bool,
+    #[arg(long)]
+    acknowledge_uninspected_schedules: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Config {
+    version: u32,
+    site_url: String,
+    account_id: String,
+    org_id: String,
+    workspace_id: String,
+    history_url: String,
+    delivery_account: String,
+    job_id: String,
+    include_existing: bool,
+    #[serde(default)]
+    acknowledge_uninspected_schedules: bool,
+}
+#[derive(Debug)]
+struct UserError(&'static str);
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for UserError {}
+fn user_error(message: &'static str) -> anyhow::Error {
+    UserError(message).into()
+}
+fn main() {
+    if let Err(error) = run(Cli::parse()) {
+        // Provider errors can contain bodies, credentials or history; never print them.
+        if let Some(safe) = error.downcast_ref::<UserError>() {
+            eprintln!("{safe}");
+        } else {
+            eprintln!("Probe could not finish. Check your connection and run setup again. Credentials and session content were not logged.");
+        }
+        std::process::exit(1);
+    }
+}
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Commands::Cloud {
+            command: CloudCommands::Install(options),
+        } => install(options),
+        Commands::Run {
+            directory,
+            startup_id,
+        } => collector::run_background(&directory, &startup_id),
+        Commands::Stop(target) => collector::stop(&target.directory()?),
+        Commands::Status(target) => collector::print_status(&target.directory()?),
+    }
+}
+impl Target {
+    fn directory(&self) -> Result<PathBuf> {
+        let site = auth::site_origin(&self.site_url)?;
+        validate_id(&self.account)?;
+        validate_id(&self.workspace)?;
+        directory(&site, &self.account, &self.workspace)
+    }
+}
+fn validate_id(value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+        "invalid identifier"
+    );
+    Ok(())
+}
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .context("HOME unavailable")
+}
+fn directory(site: &str, account: &str, workspace: &str) -> Result<PathBuf> {
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(site, account, workspace))?)
+    );
+    Ok(home()?.join(".agentworkforce/probe").join(key))
+}
+fn private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    private_directory(path.parent().context("missing parent")?)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer(&mut temporary, value)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+fn read_config(directory: &Path) -> Result<Config> {
+    let config: Config = serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
+    ensure!(
+        config.version == 1 && auth::site_origin(&config.site_url)? == config.site_url,
+        "invalid config"
+    );
+    auth::history_origin(&config.history_url, &config.site_url)?;
+    validate_id(&config.account_id)?;
+    validate_id(&config.workspace_id)?;
+    ensure!(
+        config.delivery_account
+            == destination::account_id(&config.org_id, Some(&config.workspace_id)),
+        "invalid account"
+    );
+    Ok(config)
+}
+fn lock(directory: &Path) -> Result<fs::File> {
+    private_directory(directory)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("collector.lock"))?;
+    file.try_lock_exclusive().map_err(|_| user_error("This workspace’s probe is already running. Use agent-relay-probe stop before reconnecting."))?;
+    Ok(file)
+}
+fn choose_import() -> Result<Option<bool>> {
+    if !io::stdin().is_terminal() {
+        return Err(user_error("Use an interactive terminal, or explicitly pass --include-existing or --new-sessions-only."));
+    }
+    println!("Share coding session content with this Cloud workspace:");
+    println!(
+        "  1. Existing and future sessions\n  2. Only sessions started after setup\n  3. Cancel"
+    );
+    print!("Choose 1, 2 or 3: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(match answer.trim() {
+        "1" => Some(true),
+        "2" => Some(false),
+        _ => None,
+    })
+}
+fn check_legacy_schedules(acknowledge_uninspected_schedules: bool) -> Result<()> {
+    let status = migration::status();
+    if status.state == "active" {
+        return Err(user_error("An older managed history uploader is active. Stop it explicitly before enabling this probe."));
+    }
+    if status.state == "unknown" && !acknowledge_uninspected_schedules {
+        return Err(user_error("Could not inspect older upload schedules. Check them, then retry with --acknowledge-uninspected-schedules."));
+    }
+    Ok(())
+}
+fn install(options: Install) -> Result<()> {
+    let site = auth::site_origin(&options.site_url)?;
+    for id in [options.account.as_deref(), options.workspace.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        validate_id(id)?;
+    }
+    check_legacy_schedules(options.acknowledge_uninspected_schedules)?;
+    println!("Connecting to Agent Relay Cloud…");
+    let authenticated = auth::connect(&site, options.force_login)?;
+    let who = auth::whoami(&site, &authenticated)?;
+    if options
+        .account
+        .as_ref()
+        .is_some_and(|id| id != &who.user.id)
+    {
+        return Err(user_error("This is a different Cloud account. Retry with --force-login and the account from your dashboard."));
+    }
+    let workspace = options
+        .workspace
+        .clone()
+        .or_else(|| who.current_workspace.as_ref().map(|w| w.id.clone()))
+        .ok_or_else(|| user_error("Create a workspace in your dashboard before connecting."))?;
+    validate_id(&who.user.id)?;
+    validate_id(&workspace)?;
+    let directory = directory(&site, &who.user.id, &workspace)?;
+    let guard = lock(&directory)?;
+    let existing = if directory.join("config.json").exists() {
+        Some(read_config(&directory)?)
+    } else {
+        None
+    };
+    let requested = if options.include_existing {
+        Some(true)
+    } else if options.new_sessions_only {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(previous) = &existing {
+        if requested.is_some_and(|choice| choice != previous.include_existing) {
+            return Err(user_error("A saved sharing choice exists. Changing selection requires explicitly replacing its delivery generation."));
+        }
+    }
+    let include_existing = match existing.as_ref().map(|v| v.include_existing).or(requested) {
+        Some(choice) => choice,
+        None => match choose_import()? {
+            Some(choice) => choice,
+            None => {
+                println!("Setup cancelled. No sessions shared.");
+                return Ok(());
+            }
+        },
+    };
+    let session = auth::history_session(&site, &authenticated, &workspace)?;
+    auth::history_origin(&session.base_url, &site)?;
+    ensure!(
+        session.workspace_id == workspace
+            && !session.org_id.is_empty()
+            && session.scopes.iter().any(|s| s == "rth:sync"),
+        "invalid scoped session"
+    );
+    let account = destination::account_id(&session.org_id, Some(&workspace));
+    if existing
+        .as_ref()
+        .is_some_and(|c| c.delivery_account != account || c.history_url != session.base_url)
+    {
+        return Err(user_error(
+            "Saved history belongs to a different destination. It was not replaced.",
+        ));
+    }
+    std::env::set_var("RELAYHISTORY_HOME", &directory);
+    cloud::save_auth(&cloud::StoredAuth {
+        base_url: session.base_url.clone(),
+        access_token: session.access_token,
+        access_token_expires_at: Some(session.access_token_expires_at),
+        refresh_token: Some(session.refresh_token),
+        org_id: Some(session.org_id.clone()),
+        workspace_id: Some(workspace.clone()),
+    })?;
+    let db_path = directory.join("history.db");
+    println!("Preparing local session capture…");
+    ensure!(
+        ai_hist_engine::sync_local_at(&db_path)?,
+        "capture did not complete"
+    );
+    let conn = ai_hist_core::open_db(&db_path)?;
+    let config = match existing {
+        Some(mut config) => {
+            config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
+            save_json(&directory.join("config.json"), &config)?;
+            let job = ai_hist_core::delivery::status(&conn, &config.job_id)?;
+            ensure!(
+                job.config.account_id == account,
+                "invalid saved delivery account"
+            );
+            if job.state == "blocked" && options.force_login {
+                ai_hist_core::delivery::retry_job(&conn, &config.job_id)?;
+            }
+            config
+        }
+        None => {
+            let selection = collector::selection(&conn, include_existing)?;
+            let job = ai_hist_core::delivery::create_job(
+                &conn,
+                &ai_hist_core::delivery::DeliveryJobConfig {
+                    destination_id: "relayhistory".into(),
+                    instance_id: "teams-probe".into(),
+                    account_id: account.clone(),
+                    mapping_version: destination::MAPPING_VERSION.into(),
+                    selection,
+                    limits: Default::default(),
+                },
+                collector::now(),
+            )?;
+            let config = Config {
+                version: 1,
+                site_url: site,
+                account_id: who.user.id,
+                org_id: session.org_id,
+                workspace_id: workspace,
+                history_url: session.base_url,
+                delivery_account: account,
+                job_id: job.job_id,
+                include_existing,
+                acknowledge_uninspected_schedules: options.acknowledge_uninspected_schedules,
+            };
+            save_json(&directory.join("config.json"), &config)?;
+            config
+        }
+    };
+    drop(conn);
+    collector::cycle(&directory, &config)?;
+    if options.once {
+        println!("One capture/delivery cycle completed.");
+        return Ok(());
+    }
+    drop(guard);
+    if options.foreground {
+        collector::run_background(
+            &directory,
+            &format!("{}-{}", std::process::id(), collector::now()),
+        )
+    } else {
+        collector::start_background(&directory)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn conflicting_sharing_choices_are_rejected() {
+        assert!(Cli::try_parse_from([
+            "probe",
+            "cloud",
+            "install",
+            "--include-existing",
+            "--new-sessions-only"
+        ])
+        .is_err());
+    }
+    #[test]
+    fn stop_requests_only_match_their_run_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        save_json(
+            &directory.path().join("stop.json"),
+            &serde_json::json!({"startup_id":"previous"}),
+        )
+        .unwrap();
+        assert!(!collector::stop_requested(directory.path(), "current"));
+        assert!(collector::stop_requested(directory.path(), "previous"));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn replacing_config_keeps_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        save_json(&path, &serde_json::json!({"version":1})).unwrap();
+        save_json(&path, &serde_json::json!({"version":2})).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
+                ["version"],
+            2
+        );
+    }
+}

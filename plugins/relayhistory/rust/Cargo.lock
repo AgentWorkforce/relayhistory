@@ -733,6 +733,7 @@ dependencies = [
  "clap",
  "fs2",
  "hostname",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
