@@ -384,6 +384,12 @@ fn install(options: Install) -> Result<()> {
                     if job.config.selection != job_config.selection {
                         return Err(user_error("A delivery generation with a different sharing choice already exists. Cancel it explicitly before reconnecting."));
                     }
+                    // Every field of a generation is immutable, not only the
+                    // identity: an older mapping version or different limits
+                    // would be rejected at dispatch, so refuse them up front.
+                    if job.config != job_config {
+                        return Err(user_error("A delivery generation with a different mapping version or limits already exists. Cancel it explicitly before reconnecting."));
+                    }
                     job.job_id
                 }
                 None => {

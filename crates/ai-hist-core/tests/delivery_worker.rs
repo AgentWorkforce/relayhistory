@@ -494,3 +494,27 @@ fn invalid_selections_and_bounds_are_invalid_arguments() {
         assert!(failure(invalid).starts_with("INVALID_ARGUMENT:"));
     }
 }
+
+#[test]
+fn a_panicking_receiver_is_a_transient_failure_and_releases_the_keepalive() {
+    let fixture = fixture();
+    create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let receiver = Fake {
+        send: Box::new(|_payload, _batch| panic!("receiver bug")),
+        ..Fake::default()
+    };
+    // A short lease so a keepalive thread that never saw `stop` would be
+    // caught renewing rather than merely idle when the deadline below fires.
+    let options = DrainOptions {
+        lease_ms: 100,
+        ..options()
+    };
+    let started = Instant::now();
+    let result = run(&fixture.path(), &one(&receiver), &options);
+    assert!(started.elapsed() < Duration::from_secs(10), "drain hung");
+    assert_eq!(result.attempts, 1);
+    assert_eq!(result.issues, vec![]);
+    assert_eq!(result.statuses[0].failure.as_deref(), Some("transient"));
+    assert_eq!(result.statuses[0].acknowledged_records, 0);
+    assert_eq!(result.statuses[0].pending_records, 3);
+}

@@ -46,7 +46,16 @@ export async function replay(sessionId: string, options: ReplayOptions = {}): Pr
   return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
 }
 
-export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
+export interface CloudOptions {
+  dbPath?: string;
+  baseUrl?: string;
+  relayAccessToken?: string;
+  label?: string;
+  /** Without a token, Rust may start the browser device flow only when this is true. */
+  interactive?: boolean;
+  /** Optional workspace selector for the Cloud sign-in Rust performs. */
+  workspace?: string;
+}
 export interface EnableCloudOptions extends CloudOptions {
   /** Keep syncing until stop() is called. Defaults to true. */
   watch?: boolean;

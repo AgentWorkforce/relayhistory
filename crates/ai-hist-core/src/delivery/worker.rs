@@ -418,8 +418,17 @@ impl Worker<'_> {
                         }
                     }
                 });
-                let result = self.dispatch(receiver, claim, config, &stopping);
-                stop.store(true, Ordering::SeqCst);
+                // The keepalive must stop even if the receiver panics: the
+                // scope joins every thread before unwinding, and a renewal loop
+                // that never sees `stop` would hold the lease and hang the
+                // drain. A receiver panic is contained as a transient failure
+                // so one misbehaving destination cannot take the host down.
+                let guard = StopOnDrop(&stop);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.dispatch(receiver, claim, config, &stopping)
+                }))
+                .unwrap_or_else(|_| Err(DeliveryFailure::Transient.into()));
+                drop(guard);
                 // A panicking keepalive thread must not take the drain with it.
                 let _ = renewals.join();
                 result
@@ -540,6 +549,14 @@ fn check_acknowledgment(
         }
     }
     Ok(())
+}
+
+/// Raises the keepalive stop flag when dropped, including during unwinding.
+struct StopOnDrop<'a>(&'a AtomicBool);
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Sleep in slices so a finished attempt joins the keepalive thread promptly.

@@ -2341,8 +2341,16 @@ pub fn login_for_sdk(
         Some(token) => login(&base, token, label, Some("sync"))?,
         None => {
             let mut announce = sdk_announcer(interactive)?;
+            // With a workspace, Cloud's bridge chooses the stage. Only a stage
+            // the caller or the environment actually selected is a requirement;
+            // the production default must not be forced onto that answer.
+            let selected = if workspace.is_some() {
+                resolve_stage(base_url)?
+            } else {
+                Some(base.clone())
+            };
             login_via_cloud(
-                Some(&base),
+                selected.as_deref(),
                 "sync",
                 workspace,
                 label,

@@ -33,7 +33,7 @@ async function main() {
     // attached, so a browser approval is never started where nobody sees it.
     const token=text('token');
     if(command==='login'){const auth=await login({baseUrl,relayAccessToken:token,label:text('label'),...(token?{}:{interactive:process.stdin.isTTY===true})});process.stdout.write(flags.has('json')?JSON.stringify({ok:true,base_url:auth.baseUrl})+'\n':`Logged in to ${auth.baseUrl} (session stored).\n`);return;}
-    const handle=await enableCloud({baseUrl,dbPath:text('db'),relayAccessToken:token,intervalMs:(number('interval')??60)*1000,watch:!flags.has('once'),onPush:result=>process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n')});
+    const handle=await enableCloud({baseUrl,dbPath:text('db'),relayAccessToken:token,...(token?{}:{interactive:process.stdin.isTTY===true}),intervalMs:(number('interval')??60)*1000,watch:!flags.has('once'),onPush:result=>process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n')});
     const {stop,...result}=handle;process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n');process.once('SIGINT',()=>void stop());process.once('SIGTERM',()=>void stop());return;
   }
   const operation=createHistoryPlugin({baseUrl}).commands?.find(item=>item.name===command);
