@@ -499,16 +499,14 @@ export function createHistoryPlugin(options: RelayHistoryPluginOptions = {}): Hi
           const baseUrl = String(
             f['base-url'] ?? options.baseUrl ?? 'https://history.agentrelay.com',
           );
-          const relayAccessToken =
-            typeof f.token === 'string'
-              ? f.token
-              : ((await (
-                  await import('./cloud-preflight.js')
-                ).prepareCloudSessionForEnableCloud('login', args)) ?? undefined);
+          // Without an explicit bearer, Agent Relay Cloud sign-in happens in the
+          // Rust helper; JavaScript only reports whether a terminal is attached.
+          const relayAccessToken = typeof f.token === 'string' ? f.token : undefined;
           const auth = await login({
             baseUrl,
             relayAccessToken,
             label: typeof f.label === 'string' ? f.label : undefined,
+            ...(relayAccessToken ? {} : { interactive: process.stdin.isTTY === true }),
           });
           return { ok: true, baseUrl: auth.baseUrl };
         },

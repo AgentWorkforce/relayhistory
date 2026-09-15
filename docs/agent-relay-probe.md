@@ -15,7 +15,11 @@ The core local SDK remains independent of the Cloud package.
 
 This binary is separate from `relayhistory-plugin`, whose JSON bridge, package
 name and Cargo default executable remain unchanged. The optional package's
-version currently supplies the probe's `--version` output.
+version currently supplies the probe's `--version` output. Agent Relay Cloud
+sign-in is not separate: the probe calls the plugin library's single
+implementation in `cloud.rs` — the same origin rules, credential reuse and
+device flow that back `relayhistory-plugin login` and the SDK helper's
+`cloudLogin`.
 
 ## Build and run
 
@@ -38,8 +42,11 @@ Setup prints the existing Cloud device-approval URL, waits for browser approval,
 then asks whether to share existing and future sessions or only new sessions.
 `--include-existing` and `--new-sessions-only` make that choice explicit in a
 noninteractive terminal. `--force-login` bypasses eligible existing CLI sign-in.
-The probe can reuse an unexpired official CLI credential only for the exact
-selected Cloud URL; it does not overwrite that CLI's auth file.
+The shared implementation reuses an unexpired official CLI credential only for
+the exact selected Cloud URL, and never writes or refreshes that CLI's auth
+file; `CLOUD_API_ACCESS_TOKEN` overrides both. Setup always prints the approval
+URL to stdout rather than requiring a terminal on stdin, because the composed
+local harness drives it through pipes.
 
 New-only mode snapshots existing identities across the catalog, prompts and
 events before creating its delivery generation. It sends session metadata and
@@ -131,12 +138,14 @@ installer. Production rollout must wait for companion services and a human relea
 
 ```sh
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
+cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --lib cloud:: --locked
 cargo test -p ai-hist-core identity_pages --locked
 ```
 
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,
-origin binding, sharing choices, complete exclusion pagination, private atomic
-state, collector locking and stale stop requests.
+origin binding, official-CLI credential reuse, sharing choices, complete exclusion
+pagination, private atomic state, collector locking and stale stop requests. The
+sign-in tests live with the shared implementation, in the library's `cloud` module.
 
 For a composed local test, start the companion marketing proxy on 3100, Cloud
 on 3101 with its development-only Teams login and a local DB, and the local

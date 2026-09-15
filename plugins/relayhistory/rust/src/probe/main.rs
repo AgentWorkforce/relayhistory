@@ -1,5 +1,4 @@
 //! Standalone Cloud collector. Reuses ai-hist capture/queue and the optional transport.
-mod auth;
 mod collector;
 
 use anyhow::{ensure, Context, Result};
@@ -104,6 +103,8 @@ fn main() {
         // Provider errors can contain bodies, credentials or history; never print them.
         if let Some(safe) = error.downcast_ref::<UserError>() {
             eprintln!("{safe}");
+        } else if let Some(safe) = error.downcast_ref::<cloud::CloudAuthError>() {
+            eprintln!("{safe}");
         } else {
             eprintln!("Probe could not finish. Check your connection and run setup again. Credentials and session content were not logged.");
         }
@@ -125,7 +126,7 @@ fn run(cli: Cli) -> Result<()> {
 }
 impl Target {
     fn directory(&self) -> Result<PathBuf> {
-        let site = auth::site_origin(&self.site_url)?;
+        let site = cloud::site_origin(&self.site_url)?;
         validate_id(&self.account)?;
         validate_id(&self.workspace)?;
         directory(&site, &self.account, &self.workspace)
@@ -182,11 +183,11 @@ fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn read_config(directory: &Path) -> Result<Config> {
     let config: Config = serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
     ensure!(
-        config.version == 1 && auth::site_origin(&config.site_url)? == config.site_url,
+        config.version == 1 && cloud::site_origin(&config.site_url)? == config.site_url,
         "invalid config"
     );
     ensure!(
-        auth::history_origin(&config.history_url, &config.site_url)? == config.history_url,
+        cloud::history_origin(&config.history_url, &config.site_url)? == config.history_url,
         "invalid history origin"
     );
     validate_id(&config.account_id)?;
@@ -241,7 +242,8 @@ fn check_legacy_schedules(acknowledge_uninspected_schedules: bool) -> Result<()>
     Ok(())
 }
 fn install(options: Install) -> Result<()> {
-    let site = auth::site_origin(&options.site_url)?;
+    let site = cloud::site_origin(&options.site_url)?;
+    let api_url = cloud::cloud_api_url(Some(&format!("{site}/cloud")))?;
     for id in [options.account.as_deref(), options.workspace.as_deref()]
         .into_iter()
         .flatten()
@@ -250,23 +252,42 @@ fn install(options: Install) -> Result<()> {
     }
     check_legacy_schedules(options.acknowledge_uninspected_schedules)?;
     println!("Connecting to Agent Relay Cloud…");
-    let authenticated = auth::connect(&site, options.force_login)?;
-    let who = auth::whoami(&site, &authenticated)?;
+    // Setup is always run by a person at a keyboard, but its stdin may be a
+    // pipe (the composed local harness runs it that way), so the approval URL
+    // is printed rather than gated on a terminal.
+    let authenticated = cloud::cloud_bearer(
+        &api_url,
+        cloud::CloudBearerOptions {
+            force_login: options.force_login,
+            interactive: true,
+            client_name: "Agent Relay Probe",
+            announce: &mut |approval: &cloud::DeviceApproval| {
+                println!(
+                    "Open this URL to authorize your computer:\n{}",
+                    approval.verification_uri
+                );
+                if let Some(code) = &approval.user_code {
+                    println!("Code: {code}");
+                }
+            },
+        },
+    )?;
+    let who = cloud::whoami(&api_url, &authenticated)?;
     if options
         .account
         .as_ref()
-        .is_some_and(|id| id != &who.user.id)
+        .is_some_and(|id| id != &who.user_id)
     {
         return Err(user_error("This is a different Cloud account. Retry with --force-login and the account from your dashboard."));
     }
     let workspace = options
         .workspace
         .clone()
-        .or_else(|| who.current_workspace.as_ref().map(|w| w.id.clone()))
+        .or(who.workspace_id)
         .ok_or_else(|| user_error("Create a workspace in your dashboard before connecting."))?;
-    validate_id(&who.user.id)?;
+    validate_id(&who.user_id)?;
     validate_id(&workspace)?;
-    let directory = directory(&site, &who.user.id, &workspace)?;
+    let directory = directory(&site, &who.user_id, &workspace)?;
     let guard = lock(&directory)?;
     let existing = if directory.join("config.json").exists() {
         Some(read_config(&directory)?)
@@ -295,15 +316,18 @@ fn install(options: Install) -> Result<()> {
             }
         },
     };
-    let session = auth::history_session(&site, &authenticated, &workspace)?;
-    let history_url = auth::history_origin(&session.base_url, &site)?;
-    ensure!(
-        session.workspace_id == workspace
-            && !session.org_id.is_empty()
-            && session.scopes.iter().any(|s| s == "rth:sync"),
-        "invalid scoped session"
-    );
-    let account = destination::account_id(&session.org_id, Some(&workspace));
+    // The workspace bridge, not this binary, selects the RelayHistory stage and
+    // the scope it grants; the shared implementation checks both.
+    let session = cloud::workspace_session(
+        &api_url,
+        &authenticated,
+        &workspace,
+        "sync",
+        "Probe setup pending",
+    )?;
+    let history_url = session.base_url.clone();
+    let org_id = session.org_id.clone().context("missing org")?;
+    let account = destination::account_id(&org_id, Some(&workspace));
     if existing
         .as_ref()
         .is_some_and(|c| c.delivery_account != account || c.history_url != history_url)
@@ -313,14 +337,7 @@ fn install(options: Install) -> Result<()> {
         ));
     }
     std::env::set_var("RELAYHISTORY_HOME", &directory);
-    cloud::save_auth(&cloud::StoredAuth {
-        base_url: history_url.clone(),
-        access_token: session.access_token,
-        access_token_expires_at: Some(session.access_token_expires_at),
-        refresh_token: Some(session.refresh_token),
-        org_id: Some(session.org_id.clone()),
-        workspace_id: Some(workspace.clone()),
-    })?;
+    cloud::save_auth(&session)?;
     let db_path = directory.join("history.db");
     println!("Preparing local session capture…");
     ensure!(
@@ -379,8 +396,8 @@ fn install(options: Install) -> Result<()> {
             let config = Config {
                 version: 1,
                 site_url: site,
-                account_id: who.user.id,
-                org_id: session.org_id,
+                account_id: who.user_id,
+                org_id,
                 workspace_id: workspace,
                 history_url,
                 delivery_account: account,

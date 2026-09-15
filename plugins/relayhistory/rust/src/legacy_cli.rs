@@ -18,9 +18,10 @@ struct Cli {
 enum Command {
     /// Authenticate to relayhistory-cloud (Agent Relay Loop).
     ///
-    /// Defaults to Agent Relay Cloud auth, matching relayfile/workforce. The CLI reads the
-    /// canonical `agent-relay` session and exchanges it for a relayhistory session. Pass
-    /// `--base-url` + `--token` only for manual/dev login.
+    /// Defaults to Agent Relay Cloud auth, matching relayfile/workforce. The CLI reuses the
+    /// official Agent Relay CLI's stored Cloud session or signs in with Cloud's device flow,
+    /// then exchanges that bearer for a relayhistory session. Pass `--base-url` + `--token`
+    /// only for manual/dev login.
     Login {
         /// Use Agent Relay Cloud auth. This is now the default and is kept for compatibility.
         #[arg(long)]
@@ -29,7 +30,8 @@ enum Command {
         /// the actual scope it grants. Cloud mode only.
         #[arg(long, default_value = "sync")]
         mode: String,
-        /// Reserved for future non-mutating workspace-scoped Cloud sessions.
+        /// Sign in through Cloud's workspace bridge, which selects the
+        /// RelayHistory stage itself. Cloud mode only.
         #[arg(long)]
         workspace: Option<String>,
         /// relayhistory-cloud base URL. Cloud login defaults to https://history.agentrelay.com;
@@ -216,8 +218,25 @@ pub fn run() -> Result<()> {
                     base_url.context("`--base-url` is required with manual `--token` login")?;
                 cloud::login(&base_url, &token, &label, None)?
             } else {
-                let base_url = base_url.unwrap_or_else(cloud::default_base_url);
-                cloud::login_via_cloud(&base_url, &mode, workspace.as_deref(), &label)?
+                // Cloud sign-in may need the device-approval URL shown; stdout
+                // can be JSON for a caller, so the prompt goes to stderr.
+                let mut announce = |approval: &cloud::DeviceApproval| {
+                    eprintln!(
+                        "Open this URL to authorize your computer:\n{}",
+                        approval.verification_uri
+                    );
+                    if let Some(code) = &approval.user_code {
+                        eprintln!("Code: {code}");
+                    }
+                };
+                cloud::login_via_cloud(
+                    base_url.as_deref(),
+                    &mode,
+                    workspace.as_deref(),
+                    &label,
+                    std::io::stdin().is_terminal(),
+                    &mut announce,
+                )?
             };
             cloud::save_auth(&auth)?;
             // Never print the session/token — only where it landed.

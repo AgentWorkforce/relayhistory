@@ -44,9 +44,11 @@ disables automatic refresh for isolated mocks or caller-managed credentials.
   requests. Thread reads can use an expired session when it has a refresh token;
   missing token or org metadata reports the connector as unconfigured.
 
-The npm CLI bundles Agent Relay Cloud sign-in. It obtains identity for the Rust
-RelayHistory exchange without requiring a separate Agent Relay CLI install.
-Non-interactive callers can supply `--token` or `CLOUD_API_ACCESS_TOKEN`.
+Agent Relay Cloud sign-in runs in the Rust helper. It obtains identity for the
+RelayHistory exchange without requiring a separate Agent Relay CLI install,
+reusing that CLI's stored session when one is present. Non-interactive callers
+can supply `--token` or `CLOUD_API_ACCESS_TOKEN`; with neither and no terminal
+attached, the helper fails fast instead of starting a browser approval.
 
 ## Operation coverage
 

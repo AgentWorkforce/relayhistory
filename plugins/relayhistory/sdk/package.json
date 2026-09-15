@@ -16,15 +16,13 @@
     "dist/helper.*",
     "dist/plugin.*",
     "dist/cloud-client.*",
-    "dist/cloud-preflight.*",
-    "dist/cloud-auth-bundle.*",
     "dist/cloud-auth-runtime.*",
     "dist/cli.*",
     "bin/",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/build-cloud-auth.mjs",
+    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/*.test.js"
   },
@@ -33,9 +31,7 @@
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",
-    "@agent-relay/cloud": "^11.8.1",
     "@types/node": "^22.18.0",
-    "esbuild": "^0.25.12",
     "typescript": "^5.9.2",
     "@modelcontextprotocol/sdk": "^1.29.0"
   },

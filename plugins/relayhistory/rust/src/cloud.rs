@@ -1086,113 +1086,535 @@ pub fn login(
     })
 }
 
-/// The canonical Agent Relay Cloud session returned by `agent-relay cloud session --json`.
-/// This is the same credential source used by relayfile/workforce. It is captured only long
-/// enough to exchange it for a service-local relayhistory session.
-#[derive(Debug, serde::Deserialize)]
-struct AgentRelayCloudSession {
-    #[serde(rename = "apiUrl")]
-    _api_url: Option<String>,
-    #[serde(rename = "accessToken")]
-    access_token: String,
+// ---------------------------------------------------------------------------
+// Agent Relay Cloud identity
+//
+// The single implementation of Agent Relay Cloud sign-in in this repository.
+// `agent-relay-probe`, `relayhistory-plugin login` and the JSON helper's
+// `cloudLogin` all obtain their Cloud bearer through `cloud_bearer` below, so
+// the trust rules (which origins are Cloud, which credential file may be
+// reused, what an approval link must match) exist once.
+//
+// Two different exchanges consume that bearer, and they are not
+// interchangeable:
+//
+//   * `/v1/cli/login` (`login`, above) is the RelayHistory-side exchange: the
+//     caller names the stage and RelayHistory issues an `rth_*` session for it.
+//     The stage is therefore gated by `validate_cloud_exchange_base_url`.
+//   * the Cloud workspace bridge (`workspace_session`) is the workspace-scoped
+//     exchange: Cloud authorizes workspace membership and returns both the
+//     stage and the `rth_*` session for it, so the caller never picks a stage —
+//     it only checks that what came back is a trusted history origin.
+//
+// Requests here are made with, and answered with, credentials, so this section
+// keeps its own HTTP helpers: `map_http_err` echoes response bodies and must
+// not be used below.
+// ---------------------------------------------------------------------------
+
+/// A Cloud sign-in outcome that is safe to show a person verbatim: a fixed
+/// sentence that never carries a response body, credential or URL. Hosts that
+/// otherwise reduce errors to a generic fallback may print this one.
+#[derive(Debug)]
+pub struct CloudAuthError(pub &'static str);
+impl std::fmt::Display for CloudAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for CloudAuthError {}
+fn auth_error(message: &'static str) -> anyhow::Error {
+    CloudAuthError(message).into()
 }
 
-fn env_agent_relay_session() -> Option<AgentRelayCloudSession> {
-    std::env::var("CLOUD_API_ACCESS_TOKEN")
+const DEFAULT_CLOUD_API_URL: &str = "https://agentrelay.com/cloud";
+
+const NON_INTERACTIVE_LOGIN: &str = "Agent Relay Cloud login requires an interactive terminal. Re-run in a terminal, or provide --token / CLOUD_API_ACCESS_TOKEN.";
+
+/// The documented development opt-in, shared with `validate_cloud_exchange_base_url`.
+fn untrusted_cloud_base_url_allowed() -> bool {
+    std::env::var("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn is_loopback_origin(url: &Url) -> bool {
+    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+}
+
+/// The Agent Relay Cloud site this process will talk to, as a normalized origin.
+///
+/// Production is `https://agentrelay.com` exactly; loopback over http is the
+/// documented local-development site. Any other https origin requires the same
+/// explicit opt-in that lets a Cloud bearer reach a non-default RelayHistory.
+pub fn site_origin(site: &str) -> Result<String> {
+    let url = Url::parse(site.trim())?;
+    let local = is_loopback_origin(&url);
+    anyhow::ensure!(
+        (local && url.scheme() == "http")
+            || (!local
+                && url.scheme() == "https"
+                && ((url.host_str() == Some("agentrelay.com") && url.port().is_none())
+                    || untrusted_cloud_base_url_allowed())),
+        "untrusted site"
+    );
+    anyhow::ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "site must be an origin"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Returns the normalized origin. Callers store and compare that, never the
+/// raw value: a trailing slash survives the checks below and would then be
+/// concatenated into request paths as `//v1/...`.
+pub fn history_origin(raw: &str, site: &str) -> Result<String> {
+    let url = Url::parse(raw.trim())?;
+    let local = is_loopback_origin(&Url::parse(site.trim())?);
+    anyhow::ensure!(
+        (local && is_loopback_origin(&url) && url.scheme() == "http")
+            || (!local
+                && url.scheme() == "https"
+                && url.host_str() == Some("history.agentrelay.com")
+                && url.port().is_none()),
+        "untrusted history origin"
+    );
+    anyhow::ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "invalid history URL"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+/// The Cloud API root: explicit selection, else `CLOUD_API_URL`, else production.
+/// Always `{trusted site origin}/cloud`, without a trailing slash.
+pub fn cloud_api_url(explicit: Option<&str>) -> Result<String> {
+    let selected = explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            std::env::var("CLOUD_API_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_CLOUD_API_URL.to_string());
+    Ok(format!("{}/cloud", cloud_site(&selected)?))
+}
+
+/// The site origin backing a Cloud API URL.
+pub fn cloud_site(api_url: &str) -> Result<String> {
+    let origin = api_url
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix("/cloud")
+        .context("Agent Relay Cloud API URL must be an origin followed by `/cloud`")?;
+    site_origin(origin)
+}
+
+fn cloud_json_response(response: ureq::Response) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(1_048_577)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 1_048_576, "response too large");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Bounded, redirect-free Cloud request. The status is returned rather than
+/// raised, and no response body ever reaches an error message.
+fn cloud_request(
+    method: &str,
+    url: &str,
+    bearer: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Result<(u16, serde_json::Value)> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let mut request = agent.request(method, url);
+    if let Some(bearer) = bearer {
+        request = request.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    let response = match if let Some(body) = body {
+        request.send_json(body)
+    } else {
+        request.call()
+    } {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(_) => {
+            return Err(auth_error(
+                "Could not reach Agent Relay Cloud. Check your connection and try again.",
+            ))
+        }
+    };
+    let status = response.status();
+    Ok((status, cloud_json_response(response)?))
+}
+
+/// What the user must open to approve this computer. `user_code` is present
+/// only when the approval URL does not already carry it.
+pub struct DeviceApproval {
+    pub verification_uri: String,
+    pub user_code: Option<String>,
+}
+
+/// How a caller wants `cloud_bearer` to behave when no credential is at hand.
+/// `announce` is how the approval link reaches the user: each front end owns
+/// its output channel (probe stdout, CLI stderr, the helper's terminal).
+pub struct CloudBearerOptions<'a> {
+    pub force_login: bool,
+    pub interactive: bool,
+    pub client_name: &'a str,
+    pub announce: &'a mut dyn FnMut(&DeviceApproval),
+}
+
+/// The official Agent Relay CLI's own session file. Read only: it belongs to
+/// that CLI, which owns writing and refreshing it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficialCliSession {
+    api_url: String,
+    access_token: String,
+    access_token_expires_at: String,
+}
+
+fn official_cli_session_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".agentworkforce/relay/cloud-auth.json"))
+}
+
+/// Reuse the official CLI's sign-in only for the exact same Cloud and only
+/// while it has real lifetime left; anything else falls through to a fresh
+/// device login rather than forwarding a credential to another host.
+fn official_cli_bearer(api_url: &str) -> Option<String> {
+    let raw = fs::read(official_cli_session_path()?).ok()?;
+    let session: OfficialCliSession = serde_json::from_slice(&raw).ok()?;
+    if session.api_url.trim().trim_end_matches('/') != api_url {
+        return None;
+    }
+    let expires_at = crate::parse_iso_ms(&session.access_token_expires_at)?;
+    (expires_at > chrono::Utc::now().timestamp_millis() + 60_000).then_some(session.access_token)
+}
+
+/// An Agent Relay Cloud bearer for `api_url`: the environment override, then
+/// the official CLI's eligible session, then the OAuth device flow.
+pub fn cloud_bearer(api_url: &str, options: CloudBearerOptions<'_>) -> Result<String> {
+    if let Some(token) = std::env::var("CLOUD_API_ACCESS_TOKEN")
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
-        .map(|access_token| AgentRelayCloudSession {
-            _api_url: std::env::var("CLOUD_API_URL").ok(),
-            access_token,
-        })
-}
-
-fn agent_relay_bin() -> String {
-    std::env::var("AGENT_RELAY_BIN").unwrap_or_else(|_| "agent-relay".to_string())
-}
-
-fn read_agent_relay_session(bin: &str) -> Result<AgentRelayCloudSession> {
-    // `--reveal-token` is REQUIRED. Without it `agent-relay cloud session --json` returns the
-    // access token *masked* (e.g. `cld_at_…Knv4`), which is not a usable bearer: relayhistory
-    // forwards it to Cloud `api/v1/auth/whoami`, which rejects it, and `ai-hist login` fails with
-    // `HTTP 401: {"error":"invalid Agent Relay Cloud token"}`. The masked form is still a
-    // syntactically plausible `cld_at_…` string, so nothing upstream catches it.
-    let output = std::process::Command::new(bin)
-        .args(["cloud", "session", "--json", "--reveal-token"])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to run `{bin} cloud session --json --reveal-token` — install Agent Relay and run `agent-relay login`"
-            )
-        })?;
-    if !output.status.success() {
-        // Surface stderr (user-facing auth prompts/errors) but NEVER stdout — stdout contains the
-        // bearer token when this command succeeds or partially succeeds.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Agent Relay Cloud session lookup failed ({}). {}",
-            output.status,
-            stderr.trim()
-        );
+    {
+        return Ok(token);
     }
-    serde_json::from_slice(&output.stdout).context(
-        "parsing Agent Relay Cloud session JSON from `agent-relay cloud session --json --reveal-token`",
-    )
-}
-
-fn ensure_agent_relay_session(
-    bin: &str,
-    workspace: Option<&str>,
-) -> Result<AgentRelayCloudSession> {
-    if let Some(ws) = workspace {
-        anyhow::bail!(
-            "`--workspace {ws}` is not supported for Cloud login yet because `agent-relay cloud session` has no non-mutating workspace-scoped mode; switch the active workspace with Agent Relay first, then rerun without `--workspace`"
-        );
-    }
-
-    if let Some(session) = env_agent_relay_session() {
-        return Ok(session);
-    }
-
-    match read_agent_relay_session(bin) {
-        Ok(session) => Ok(session),
-        Err(first_error) => {
-            eprintln!("Agent Relay Cloud login required; starting `agent-relay cloud login`.");
-            let status = std::process::Command::new(bin)
-                .args(["cloud", "login"])
-                .stdout(std::io::stderr())
-                .status()
-                .with_context(|| {
-                    format!(
-                        "failed to run `{bin} cloud login` — install Agent Relay and run `agent-relay login`"
-                    )
-                })?;
-            if !status.success() {
-                anyhow::bail!(
-                    "Agent Relay Cloud login failed ({status}). Previous session lookup error: {first_error}"
-                );
-            }
-            read_agent_relay_session(bin)
+    if !options.force_login {
+        if let Some(token) = official_cli_bearer(api_url) {
+            return Ok(token);
         }
     }
+    if !options.interactive {
+        return Err(auth_error(NON_INTERACTIVE_LOGIN));
+    }
+    device_login(api_url, options.client_name, options.announce)
 }
 
-/// Cloud login: use the canonical Agent Relay Cloud session, then exchange that bearer for a
-/// service-local `rth_*` relayhistory session via `/v1/cli/login`.
+fn device_login(
+    api_url: &str,
+    client_name: &str,
+    announce: &mut dyn FnMut(&DeviceApproval),
+) -> Result<String> {
+    let site = cloud_site(api_url)?;
+    let (status, grant) = cloud_request(
+        "POST",
+        &format!("{api_url}/api/v1/auth/device/start"),
+        None,
+        Some(serde_json::json!({ "client_name": client_name })),
+    )?;
+    anyhow::ensure!(matches!(status, 200 | 201), "device start rejected");
+    let device_code = grant["device_code"]
+        .as_str()
+        .ok_or_else(|| auth_error("Cloud did not start device sign-in."))?;
+    let complete = grant["verification_uri_complete"].as_str();
+    let verification = Url::parse(
+        complete
+            .or_else(|| grant["verification_uri"].as_str())
+            .context("Cloud did not return a sign-in URL.")?,
+    )?;
+    // Bind approval to the selected environment before anything is shown or
+    // polled: a link on another origin is a phishing target, not a sign-in.
+    anyhow::ensure!(
+        verification.origin().ascii_serialization() == site
+            && verification.username().is_empty()
+            && verification.password().is_none(),
+        "wrong sign-in origin"
+    );
+    announce(&DeviceApproval {
+        verification_uri: verification.to_string(),
+        user_code: complete
+            .is_none()
+            .then(|| grant["user_code"].as_str().unwrap_or("").to_string()),
+    });
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(grant["expires_in"].as_u64().unwrap_or(600).clamp(1, 900));
+    let mut interval = grant["interval"].as_u64().unwrap_or(5).clamp(1, 60);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+        let result = cloud_request(
+            "POST",
+            &format!("{api_url}/api/v1/auth/device/token"),
+            None,
+            Some(serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code
+            })),
+        );
+        let (status, token) = match result {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if status == 200 {
+            anyhow::ensure!(
+                token["api_url"]
+                    .as_str()
+                    .is_none_or(|url| url.trim_end_matches('/') == api_url),
+                "Cloud origin changed"
+            );
+            return token["access_token"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+                .context("Cloud sign-in did not return credentials.");
+        }
+        if status == 429 || token["error"] == "slow_down" {
+            interval = (interval + 5).min(60);
+            continue;
+        }
+        if status >= 500 || token["error"] == "authorization_pending" {
+            continue;
+        }
+        return Err(auth_error(
+            "Device sign-in was declined or expired. Run setup again.",
+        ));
+    }
+    Err(auth_error("Device sign-in expired. Run setup again."))
+}
+
+/// An owned `CloudBearerOptions::announce`.
+type Announcer = Box<dyn FnMut(&DeviceApproval)>;
+
+/// The JSON helper runs as a child with every stdio stream piped, and the host
+/// discards its stderr, so an approval URL printed there reaches nobody. Write
+/// it to the controlling terminal instead; no terminal means no way to approve.
+fn terminal_announcer() -> Result<Announcer> {
+    #[cfg(unix)]
+    const TERMINAL: &str = "/dev/tty";
+    #[cfg(windows)]
+    const TERMINAL: &str = "CONOUT$";
+    #[cfg(not(any(unix, windows)))]
+    return Err(auth_error(NON_INTERACTIVE_LOGIN));
+    #[cfg(any(unix, windows))]
+    {
+        let terminal = fs::OpenOptions::new()
+            .write(true)
+            .open(TERMINAL)
+            .map_err(|_| auth_error(NON_INTERACTIVE_LOGIN))?;
+        Ok(Box::new(move |approval: &DeviceApproval| {
+            let mut out = &terminal;
+            let _ = writeln!(
+                out,
+                "Open this URL to authorize your computer:\n{}",
+                approval.verification_uri
+            );
+            if let Some(code) = &approval.user_code {
+                let _ = writeln!(out, "Code: {code}");
+            }
+            let _ = out.flush();
+        }))
+    }
+}
+
+fn sdk_announcer(interactive: bool) -> Result<Announcer> {
+    if interactive {
+        terminal_announcer()
+    } else {
+        Ok(Box::new(|_: &DeviceApproval| {}))
+    }
+}
+
+/// Who the Cloud bearer belongs to. `workspace_id` is Cloud's current
+/// workspace, a default a caller may use, never an authorization.
+pub struct CloudIdentity {
+    pub user_id: String,
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WhoamiUser {
+    id: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WhoamiResponse {
+    user: WhoamiUser,
+    current_workspace: Option<WhoamiUser>,
+}
+
+/// `GET {api_url}/api/v1/auth/whoami` — identity only. `cloud_bearer` does not
+/// call this: callers that need an identity ask for one explicitly.
+pub fn whoami(api_url: &str, bearer: &str) -> Result<CloudIdentity> {
+    let (status, value) = cloud_request(
+        "GET",
+        &format!("{api_url}/api/v1/auth/whoami"),
+        Some(bearer),
+        None,
+    )?;
+    if status != 200 {
+        return Err(auth_error("Cloud authentication failed."));
+    }
+    let identity: WhoamiResponse = serde_json::from_value(value)?;
+    Ok(CloudIdentity {
+        user_id: identity.user.id,
+        workspace_id: identity.current_workspace.map(|workspace| workspace.id),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSessionResponse {
+    base_url: String,
+    org_id: String,
+    workspace_id: String,
+    access_token: String,
+    refresh_token: String,
+    access_token_expires_at: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// The Cloud workspace bridge: `POST
+/// {api_url}/api/v1/workspaces/{workspace}/relayhistory/session`. Cloud
+/// authorizes membership and returns the RelayHistory stage together with a
+/// workspace-scoped `rth_*` session for it.
+pub fn workspace_session(
+    api_url: &str,
+    bearer: &str,
+    workspace: &str,
+    mode: &str,
+    label: &str,
+) -> Result<StoredAuth> {
+    let required_scope = match mode {
+        "sync" => "rth:sync",
+        "read" => "rth:read",
+        other => anyhow::bail!("invalid mode '{other}' (expected `read` or `sync`)"),
+    };
+    anyhow::ensure!(
+        !workspace.is_empty()
+            && workspace.len() <= 128
+            && workspace
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid workspace identifier"
+    );
+    let site = cloud_site(api_url)?;
+    let (status, value) = cloud_request(
+        "POST",
+        &format!("{api_url}/api/v1/workspaces/{workspace}/relayhistory/session"),
+        Some(bearer),
+        Some(serde_json::json!({ "mode": mode, "label": label })),
+    )?;
+    if status != 200 {
+        return Err(auth_error(
+            "Cloud could not connect this workspace to RelayHistory.",
+        ));
+    }
+    let session: WorkspaceSessionResponse = serde_json::from_value(value)?;
+    let base_url = history_origin(&session.base_url, &site)?;
+    anyhow::ensure!(
+        session.workspace_id == workspace
+            && !session.org_id.is_empty()
+            && (session.scopes.is_empty()
+                || session.scopes.iter().any(|scope| scope == required_scope)),
+        "invalid scoped session"
+    );
+    Ok(StoredAuth {
+        base_url,
+        access_token: session.access_token,
+        access_token_expires_at: Some(session.access_token_expires_at),
+        refresh_token: Some(session.refresh_token),
+        org_id: Some(session.org_id),
+        workspace_id: Some(session.workspace_id),
+    })
+}
+
+/// Cloud login: obtain the Agent Relay Cloud bearer, then exchange it for a
+/// service-local `rth_*` relayhistory session.
+///
+/// With no `workspace` the exchange is RelayHistory's `/v1/cli/login` for the
+/// stage the caller selected, so that stage passes the bearer destination gate
+/// first. With a `workspace` the exchange is Cloud's workspace bridge, which
+/// chooses the stage itself; an explicitly selected stage must then agree with
+/// what Cloud issued rather than silently being ignored.
 pub fn login_via_cloud(
-    base_url: &str,
+    base_url: Option<&str>,
     mode: &str,
     workspace: Option<&str>,
     label: &str,
+    interactive: bool,
+    announce: &mut dyn FnMut(&DeviceApproval),
 ) -> Result<StoredAuth> {
     if mode != "read" && mode != "sync" {
         anyhow::bail!("invalid --mode '{mode}' (expected `read` or `sync`)");
     }
-    validate_cloud_exchange_base_url(base_url)?;
-    let bin = agent_relay_bin();
-    let session = ensure_agent_relay_session(&bin, workspace)?;
-    login(base_url, &session.access_token, label, Some(mode))
+    let api_url = cloud_api_url(None)?;
+    if let Some(workspace) = workspace {
+        let requested = base_url.map(normalized_stage).transpose()?;
+        let bearer = cloud_bearer(
+            &api_url,
+            CloudBearerOptions {
+                force_login: false,
+                interactive,
+                client_name: "relayhistory",
+                announce,
+            },
+        )?;
+        let auth = workspace_session(&api_url, &bearer, workspace, mode, label)?;
+        if let Some(requested) = requested {
+            anyhow::ensure!(
+                requested == auth.base_url,
+                "Cloud issued a workspace session for `{}`, not the selected `{requested}`; drop the explicit base URL to use the workspace's own stage",
+                auth.base_url
+            );
+        }
+        return Ok(auth);
+    }
+    let base_url = match base_url {
+        Some(explicit) => normalized_stage(explicit)?,
+        None => default_base_url(),
+    };
+    validate_cloud_exchange_base_url(&base_url)?;
+    let bearer = cloud_bearer(
+        &api_url,
+        CloudBearerOptions {
+            force_login: false,
+            interactive,
+            client_name: "relayhistory",
+            announce,
+        },
+    )?;
+    login(&base_url, &bearer, label, Some(mode))
 }
 
 fn validate_cloud_exchange_base_url(base_url: &str) -> Result<()> {
@@ -1200,10 +1622,7 @@ fn validate_cloud_exchange_base_url(base_url: &str) -> Result<()> {
     if normalized == DEFAULT_BASE_URL {
         return Ok(());
     }
-    let allowed = std::env::var("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    if allowed {
+    if untrusted_cloud_base_url_allowed() {
         return Ok(());
     }
     anyhow::bail!(
@@ -1902,10 +2321,14 @@ pub fn load_selected_auth(base_url: Option<&str>) -> Result<Option<StoredAuth>> 
 
 /// Exchange a caller-supplied Cloud bearer or run the existing Cloud device login.
 /// Both SDK and CLI persist credentials exclusively through the Rust stage store.
+/// `interactive` authorizes a device sign-in on the controlling terminal; a
+/// `workspace` switches the exchange to Cloud's workspace bridge.
 pub fn login_for_sdk(
     base_url: Option<&str>,
     token: Option<&str>,
     label: Option<&str>,
+    interactive: bool,
+    workspace: Option<&str>,
 ) -> Result<StoredAuth> {
     // resolve_base_url, not default_base_url: the latter ignores a malformed
     // RELAYHISTORY_BASE_URL/AI_HIST_BASE_URL and returns production, so a typo
@@ -1916,7 +2339,17 @@ pub fn login_for_sdk(
     let label = label.unwrap_or("ai-hist enable-cloud");
     let auth = match token {
         Some(token) => login(&base, token, label, Some("sync"))?,
-        None => login_via_cloud(&base, "sync", None, label)?,
+        None => {
+            let mut announce = sdk_announcer(interactive)?;
+            login_via_cloud(
+                Some(&base),
+                "sync",
+                workspace,
+                label,
+                interactive,
+                announce.as_mut(),
+            )?
+        }
     };
     anyhow::ensure!(
         auth.access_token.starts_with("rth_at_"),
@@ -1977,14 +2410,16 @@ pub fn enable_for_sdk(
     base_url: Option<&str>,
     token: Option<&str>,
     label: Option<&str>,
+    interactive: bool,
+    workspace: Option<&str>,
 ) -> Result<CloudPushOutcome> {
     // Explicit tokens request reauthentication; otherwise reuse stage credentials.
     let auth = if token.is_some() {
-        login_for_sdk(base_url, token, label)?
+        login_for_sdk(base_url, token, label, interactive, workspace)?
     } else {
         match load_selected_auth(base_url)? {
             Some(auth) => auth,
-            None => login_for_sdk(base_url, None, label)?,
+            None => login_for_sdk(base_url, None, label, interactive, workspace)?,
         }
     };
     push_for_sdk(db_path, Some(&auth.base_url))
@@ -3412,16 +3847,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn fake_agent_relay(script_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent-relay");
-        fs::write(&path, format!("#!/bin/sh\n{script_body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        (dir, path)
-    }
-
     fn one_shot_login_server(
         expected_agent_relay_token: &'static str,
         expected_mode: Option<&'static str>,
@@ -3473,34 +3898,22 @@ pub(crate) mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    #[cfg(unix)]
     #[test]
-    fn login_via_cloud_exchanges_agent_relay_session() {
+    fn login_via_cloud_exchanges_the_cloud_bearer_for_a_stage_session() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (base_url, server) = one_shot_login_server("relay_at_abc", Some("sync"));
-        // Models the real `agent-relay cloud session --json` contract: the access token comes
-        // back MASKED unless `--reveal-token` is passed. If ai-hist ever drops that flag it gets
-        // `relay_at_MASKED`, the login server below rejects the payload, and this test fails —
-        // which is exactly the production failure it stands in for.
-        let (_dir, bin) = fake_agent_relay(
-            r#"case " $* " in
-  *" --reveal-token "*)
-    echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
-    exit 0
-    ;;
-esac
-if [ "$1 $2 $3" = "cloud session --json" ]; then
-  echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_MASKED","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
-  exit 0
-fi
-echo "unexpected args: $*" 1>&2
-exit 42"#,
-        );
-        let _agent_relay_bin = EnvVarGuard::set("AGENT_RELAY_BIN", bin.as_os_str());
-        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let _cloud_token = EnvVarGuard::set("CLOUD_API_ACCESS_TOKEN", "relay_at_abc");
         let _allow_dev_base_url =
             EnvVarGuard::set("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL", "1");
-        let auth = login_via_cloud(&base_url, "sync", None, "test-label").unwrap();
+        let auth = login_via_cloud(
+            Some(&base_url),
+            "sync",
+            None,
+            "test-label",
+            false,
+            &mut |_| {},
+        )
+        .unwrap();
         server.join().unwrap();
 
         assert_eq!(auth.base_url, base_url);
@@ -3510,88 +3923,248 @@ exit 42"#,
         assert_eq!(auth.workspace_id.as_deref(), Some("ws_dev"));
     }
 
-    /// Guards the exact defect that made `ai-hist login` fail fleet-wide: the session lookup must
-    /// ask for the UNMASKED token. `agent-relay cloud session --json` masks it by default, and the
-    /// masked stub is a plausible-looking `cld_at_…` string that only fails later, at Cloud
-    /// `whoami`, as an opaque 401.
-    #[cfg(unix)]
-    #[test]
-    fn cloud_session_invocation_requests_unmasked_token() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let log_dir = tempfile::tempdir().unwrap();
-        let argv_log = log_dir.path().join("argv.log");
-        // Pass the capture path via env and expand it quoted — a temp dir containing spaces or
-        // shell metacharacters would otherwise break the fixture rather than the assertion.
-        let _argv_log_env = EnvVarGuard::set("AI_HIST_TEST_ARGV_LOG", argv_log.as_os_str());
-        let (_dir, bin) = fake_agent_relay(
-            r#"printf '%s\n' "$@" > "$AI_HIST_TEST_ARGV_LOG"
-echo '{"apiUrl":"https://agentrelay.com/cloud","accessToken":"relay_at_abc","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z"}'
-exit 0"#,
-        );
-        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
-
-        read_agent_relay_session(bin.to_str().unwrap()).unwrap();
-
-        let argv = fs::read_to_string(&argv_log).unwrap();
-        assert!(
-            argv.contains("--reveal-token"),
-            "ai-hist must request the unmasked token; without `--reveal-token` the CLI forwards a \
-             masked stub and login fails with `invalid Agent Relay Cloud token`. argv was: {argv}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cloud_session_failure_surfaces_stderr_never_stdout() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Failing exit: stdout carries a (would-be) secret; stderr carries the user-facing reason.
-        let (_dir, bin) = fake_agent_relay(
-            "echo 'rth_at_LEAKED_TOKEN_SHOULD_NOT_SURFACE'; echo 'not logged in: run agent-relay login' 1>&2; exit 1",
-        );
-        let err = read_agent_relay_session(bin.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err.contains("not logged in"),
-            "stderr should surface: {err}"
-        );
-        // The bug we guard against: stdout (token-bearing) must NEVER appear in the error.
-        assert!(
-            !err.contains("rth_at_LEAKED_TOKEN_SHOULD_NOT_SURFACE"),
-            "stdout leaked into error: {err}"
-        );
-    }
-
     #[test]
     fn login_via_cloud_rejects_invalid_mode() {
-        let err = login_via_cloud("https://history.agentrelay.com", "admin", None, "test")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid --mode"), "{err}");
-    }
-
-    #[test]
-    fn login_via_cloud_rejects_workspace_without_mutating_global_agent_relay_state() {
         let err = login_via_cloud(
-            "https://history.agentrelay.com",
-            "sync",
-            Some("workspace-a"),
+            Some("https://history.agentrelay.com"),
+            "admin",
+            None,
             "test",
+            false,
+            &mut |_| {},
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("not supported for Cloud login"), "{err}");
-        assert!(err.contains("non-mutating"), "{err}");
+        assert!(err.contains("invalid --mode"), "{err}");
+    }
+
+    /// Cloud sign-in cannot prompt where nobody can answer, and must say what
+    /// to do instead rather than hanging on an approval nobody will see.
+    #[test]
+    fn cloud_login_without_a_terminal_names_the_noninteractive_alternatives() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path());
+        let err = login_via_cloud(
+            Some("https://history.agentrelay.com"),
+            "sync",
+            None,
+            "test",
+            false,
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("interactive terminal"), "{err}");
+        assert!(err.contains("CLOUD_API_ACCESS_TOKEN"), "{err}");
+    }
+
+    /// The official Agent Relay CLI's file is another tool's credential: it is
+    /// reused only for the same Cloud, only while it is live, and never written.
+    #[test]
+    fn cloud_bearer_reuses_only_a_matching_unexpired_official_cli_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let _cloud_api_url = EnvVarGuard::remove("CLOUD_API_URL");
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path());
+        let path = home.path().join(".agentworkforce/relay/cloud-auth.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let write = |expires_at: &str| {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"apiUrl":"https://agentrelay.com/cloud/","accessToken":"cld_at_official","accessTokenExpiresAt":"{expires_at}"}}"#
+                ),
+            )
+            .unwrap()
+        };
+        let bearer = |api_url: &str, force_login: bool| {
+            cloud_bearer(
+                api_url,
+                CloudBearerOptions {
+                    force_login,
+                    // No terminal: every fall-through below must fail here
+                    // rather than reach the network.
+                    interactive: false,
+                    client_name: "test",
+                    announce: &mut |_| {},
+                },
+            )
+        };
+        let api_url = cloud_api_url(None).unwrap();
+        assert_eq!(api_url, "https://agentrelay.com/cloud");
+
+        write("2999-01-01T00:00:00.000Z");
+        // Reused without any HTTP request, and the file is left untouched.
+        assert_eq!(bearer(&api_url, false).unwrap(), "cld_at_official");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("cld_at_official"));
+        // A session for a different Cloud is never forwarded.
+        assert!(bearer("http://127.0.0.1:3100/cloud", false).is_err());
+        // `--force-login` ignores it entirely.
+        assert!(bearer(&api_url, true).is_err());
+
+        write("2000-01-01T00:00:00.000Z");
+        assert!(bearer(&api_url, false).is_err());
+    }
+
+    #[test]
+    fn origins_are_bound_to_the_selected_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _allow = EnvVarGuard::remove("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL");
+        assert_eq!(
+            site_origin("http://127.0.0.1:3100").unwrap(),
+            "http://127.0.0.1:3100"
+        );
+        for url in [
+            "https://evil.example",
+            "http://agentrelay.com",
+            "https://user:secret@agentrelay.com",
+            "http://localhost:3100/path",
+            "http://localhost:3100/?x=y",
+        ] {
+            assert!(site_origin(url).is_err());
+        }
+        assert!(history_origin("https://history.agentrelay.com", "http://127.0.0.1:3100").is_err());
+        assert!(history_origin("http://127.0.0.1:3102", "https://agentrelay.com").is_err());
+        assert_eq!(
+            history_origin("http://127.0.0.1:3102", "http://127.0.0.1:3100").unwrap(),
+            "http://127.0.0.1:3102"
+        );
+        // A trailing slash must not survive into request paths.
+        assert_eq!(
+            history_origin("http://127.0.0.1:3102/", "http://127.0.0.1:3100").unwrap(),
+            "http://127.0.0.1:3102"
+        );
+        assert_eq!(
+            cloud_api_url(Some("http://127.0.0.1:3100/cloud/")).unwrap(),
+            "http://127.0.0.1:3100/cloud"
+        );
+        // The API root is an origin plus `/cloud`, never a bare origin.
+        assert!(cloud_api_url(Some("http://127.0.0.1:3100")).is_err());
+        assert!(cloud_api_url(Some("https://cloud.example/cloud")).is_err());
+        let _allow_untrusted = EnvVarGuard::set("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL", "1");
+        assert_eq!(
+            cloud_api_url(Some("https://cloud.example/cloud")).unwrap(),
+            "https://cloud.example/cloud"
+        );
+    }
+
+    /// Serves the Cloud device grant, then one token response. `wrong_origin`
+    /// puts the approval link on another site: the client must stop there and
+    /// never poll, so only the first request is expected.
+    fn device_server(status: u16, wrong_origin: bool) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let site = format!("http://{}", listener.local_addr().unwrap());
+        let origin = site.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let count = if wrong_origin { 1 } else { 2 };
+            for index in 0..count {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(_) => panic!("device client did not complete expected request"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let len = stream.read(&mut buffer).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&buffer[..len]);
+                }
+                let headers = String::from_utf8_lossy(&request);
+                assert!(headers.starts_with(if index == 0 {
+                    "POST /cloud/api/v1/auth/device/start "
+                } else {
+                    "POST /cloud/api/v1/auth/device/token "
+                }));
+                assert!(!headers.to_lowercase().contains("authorization:"));
+                let body = if index == 0 {
+                    serde_json::json!({"device_code":"synthetic-device-code", "verification_uri_complete":format!("{}/cloud/device?user_code=synthetic-code", if wrong_origin { "https://other.invalid" } else { &origin }), "expires_in":10, "interval":1})
+                } else {
+                    serde_json::json!({"access_token":"synthetic-access-token", "api_url":format!("{origin}/cloud")})
+                }.to_string();
+                let response_status = if index == 0 { status } else { 200 };
+                write!(stream, "HTTP/1.1 {response_status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (site, server)
+    }
+
+    fn device_bearer(site: &str, announce: &mut dyn FnMut(&DeviceApproval)) -> Result<String> {
+        cloud_bearer(
+            &format!("{site}/cloud"),
+            CloudBearerOptions {
+                force_login: true,
+                interactive: true,
+                client_name: "Agent Relay Probe",
+                announce,
+            },
+        )
+    }
+
+    #[test]
+    fn device_auth_accepts_cloud_created_response_and_polls_without_bearer() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let (site, server) = device_server(201, false);
+        let mut announced = Vec::new();
+        assert_eq!(
+            device_bearer(&site, &mut |approval| announced
+                .push(approval.verification_uri.clone()))
+            .unwrap(),
+            "synthetic-access-token"
+        );
+        server.join().unwrap();
+        // The user is shown the complete approval link, so no separate code.
+        assert_eq!(
+            announced,
+            vec![format!("{site}/cloud/device?user_code=synthetic-code")]
+        );
+    }
+
+    #[test]
+    fn device_auth_rejects_cross_origin_approval_link_before_polling() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cloud_token = EnvVarGuard::remove("CLOUD_API_ACCESS_TOKEN");
+        let (site, server) = device_server(201, true);
+        let mut announced = 0;
+        assert!(device_bearer(&site, &mut |_| announced += 1).is_err());
+        server.join().unwrap();
+        assert_eq!(announced, 0);
     }
 
     #[test]
     fn login_via_cloud_rejects_non_default_base_url_without_explicit_dev_opt_in() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _allow = EnvVarGuard::remove("RELAYHISTORY_ALLOW_UNTRUSTED_CLOUD_BASE_URL");
-        let err = login_via_cloud("http://localhost:8787", "sync", None, "test")
-            .unwrap_err()
-            .to_string();
+        let err = login_via_cloud(
+            Some("http://localhost:8787"),
+            "sync",
+            None,
+            "test",
+            false,
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("refusing to send"), "{err}");
     }
 

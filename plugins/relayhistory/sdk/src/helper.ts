@@ -106,7 +106,6 @@ interface HelperBinding {
   cloudLoadAuth(baseUrl?: string): Promise<RelayhistoryAuth | null>;
   cloudResolveSession(baseUrl: string | undefined, now: number): Promise<{auth?:RelayhistoryAuth|null;detail?:string}>;
   cloudRefreshSession(baseUrl: string, rejectedToken: string): Promise<RelayhistoryAuth|null>;
-  cloudValidateExchangeBaseUrl(baseUrl?: string): Promise<void>;
   cloudLogin(options: object): Promise<RelayhistoryAuth>;
   enableCloud(options: object): Promise<CloudPushResult>;
   pushCloud(options: object): Promise<CloudPushResult>;
@@ -122,7 +121,6 @@ const bridge: HelperBinding = {
   cloudLoadAuth: baseUrl => helperRequest('cloudLoadAuth',{baseUrl}),
   cloudResolveSession: (baseUrl,now) => helperRequest('cloudResolveSession',{baseUrl,now}),
   cloudRefreshSession: (baseUrl,rejectedToken) => helperRequest('cloudRefreshSession',{baseUrl,rejectedToken}),
-  cloudValidateExchangeBaseUrl: baseUrl => helperRequest('cloudValidateExchangeBaseUrl',{baseUrl}),
   cloudLogin: options => helperRequest('cloudLogin',{...options},{timeoutMs:300_000}),
   enableCloud: options => helperRequest('enableCloud',cloudOptions(options),{timeoutMs:300_000}),
   pushCloud: options => helperRequest('pushCloud',cloudOptions(options),{timeoutMs:300_000}),

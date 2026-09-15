@@ -39,6 +39,9 @@ pub struct Arguments {
     pub max_content: Option<usize>,
     pub json: Option<bool>,
     pub out: Option<String>,
+    /// May a Cloud device sign-in prompt on the controlling terminal?
+    pub interactive: Option<bool>,
+    pub workspace: Option<String>,
 }
 fn auth_value(auth: cloud::StoredAuth) -> Value {
     json!({"baseUrl":auth.base_url,"accessToken":auth.access_token,
@@ -152,6 +155,8 @@ fn execute(request: Request) -> Result<Value> {
             base,
             a.relay_access_token.as_deref(),
             a.label.as_deref(),
+            a.interactive.unwrap_or(false),
+            a.workspace.as_deref(),
         )?),
         "enableCloud" | "pushCloud" => {
             let path = a
@@ -164,6 +169,8 @@ fn execute(request: Request) -> Result<Value> {
                     base,
                     a.relay_access_token.as_deref(),
                     a.label.as_deref(),
+                    a.interactive.unwrap_or(false),
+                    a.workspace.as_deref(),
                 )?
             } else {
                 cloud::push_for_sdk(&path, base)?
