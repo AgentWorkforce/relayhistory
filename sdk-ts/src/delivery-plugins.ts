@@ -75,6 +75,13 @@ export class HistoryPluginRegistry {
   destination(id: string, instanceId: string): HistoryDestination | undefined {
     return this.destinations.get(JSON.stringify([id, instanceId]));
   }
+  /** Every registered destination instance, for a drain to describe to core. */
+  registeredDestinations(): Array<{ destinationId: string; instanceId: string; destination: HistoryDestination }> {
+    return [...this.destinations].map(([key, destination]) => {
+      const [destinationId, instanceId] = JSON.parse(key) as [string, string];
+      return { destinationId, instanceId, destination };
+    });
+  }
   command(name: string) { return this.commands.get(name); }
   registeredTools() { return [...this.tools.values()]; }
 }

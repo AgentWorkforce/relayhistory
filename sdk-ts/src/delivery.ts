@@ -3,8 +3,8 @@ import { nativeCall } from './native.js';
 import { InvalidArgumentError, RelayHistoryError } from './sdk-common.js';
 import { HistoryPluginRegistry } from './delivery-plugins.js';
 import type {
-  ClaimedHistoryBatch, DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig, DeliveryLease,
-  DeliveryPrepareResult, DeliveryStatus, HistoryDestination, PreparedHistoryPayload,
+  DeliveryAcknowledgment, DeliveryFailure, DeliveryJobConfig, DeliveryStatus, HistoryDestination,
+  HistoryExportBatch, PreparedHistoryPayload,
 } from './delivery-contracts.js';
 export * from './delivery-contracts.js';
 export * from './delivery-plugins.js';
@@ -80,136 +80,80 @@ function frozen<T>(value: T): T {
   }
   return value;
 }
-function acknowledgment(value: DeliveryAcknowledgment, claim: ClaimedHistoryBatch): void {
-  const expected = new Set(claim.batch.records.map((record) => record.revision_id));
-  if (!value || value.batch_id !== claim.batch.batch_id || !['durable', 'indexed'].includes(value.acceptance_level)
-    || !Array.isArray(value.accepted_revision_ids) || !Array.isArray(value.unsupported_revision_ids)) {
-    throw new HistoryDeliveryError('invalid_payload');
-  }
-  const ids = [...value.accepted_revision_ids, ...value.unsupported_revision_ids];
-  if (new Set(ids).size !== ids.length || ids.some((id) => typeof id !== 'string' || !expected.has(id))) {
-    throw new HistoryDeliveryError('invalid_payload');
-  }
+/** One call into a registered JavaScript destination, as core's worker sees it. */
+interface ReceiverCall { destinationId: string; instanceId: string }
+interface PrepareCall extends ReceiverCall { batch: HistoryExportBatch }
+interface SendCall extends ReceiverCall { payload: PreparedHistoryPayload; batch: HistoryExportBatch; idempotencyKey: string }
+
+/** Safe classification only: arbitrary plugin errors never reach the worker. */
+function classified(error: unknown): string {
+  const failure = error instanceof HistoryDeliveryError ? error : new HistoryDeliveryError('transient');
+  return JSON.stringify({ ok: false, failure: failure.failure, retryAfterMs: failure.retryAfterMs });
 }
 
-async function attempt(claim: ClaimedHistoryBatch, destination: HistoryDestination, config: DeliveryJobConfig, options: DeliveryDrainOptions): Promise<void> {
-  const leaseMs = options.leaseMs!;
-  const abort = new AbortController();
-  const aborted = () => abort.abort();
-  options.signal?.addEventListener('abort', aborted, { once: true });
-  if (options.signal?.aborted) abort.abort();
-  const timeout = setTimeout(aborted, options.requestTimeoutMs);
-  let lease: DeliveryLease = claim.lease;
-  let renewing: Promise<void> = Promise.resolve();
-  let stopped = false;
-  let renewalTimer: ReturnType<typeof setTimeout> | undefined;
-  const renew = () => {
-    renewalTimer = setTimeout(() => {
-      renewing = deliveryRequest<DeliveryLease>({ operation: 'renew_lease', lease, lease_ms: leaseMs, now_ms: Date.now() }, options)
-        .then((value) => { lease = value; if (!stopped) renew(); })
-        .catch(() => abort.abort());
-    }, Math.max(1, Math.floor(leaseMs / 3)));
+/** Adapt one destination method into the reply envelope core's worker expects.
+ * The request deadline is armed here because only this side can abort the
+ * AbortSignal a destination observes while it is still running. */
+function receiver<Call extends ReceiverCall, Value>(
+  registry: HistoryPluginRegistry, options: DeliveryDrainOptions, requestTimeoutMs: number,
+  invoke: (destination: HistoryDestination, call: Call, signal: AbortSignal) => Promise<Value>,
+): (argumentJson: string) => Promise<string> {
+  return async (argumentJson) => {
+    const abort = new AbortController();
+    const stop = () => abort.abort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const call = JSON.parse(argumentJson) as Call;
+      const destination = registry.destination(call.destinationId, call.instanceId);
+      if (!destination) throw new HistoryDeliveryError('transient');
+      options.signal?.addEventListener('abort', stop, { once: true });
+      if (options.signal?.aborted) abort.abort();
+      timer = setTimeout(stop, requestTimeoutMs);
+      const deadline = new Promise<never>((_resolve, reject) => {
+        const fail = () => reject(new HistoryDeliveryError('transient'));
+        abort.signal.addEventListener('abort', fail, { once: true });
+        if (abort.signal.aborted) fail();
+      });
+      const value = await Promise.race([invoke(destination, call, abort.signal), deadline]);
+      if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
+      return JSON.stringify({ ok: true, value });
+    } catch (error) {
+      return classified(error);
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', stop);
+    }
   };
-  const stopRenewal = async () => { stopped = true; clearTimeout(renewalTimer); await renewing; };
-  renew();
-  let rejectAbort: (() => void) | undefined;
-  const interrupted = new Promise<never>((_resolve, reject) => {
-    rejectAbort = () => reject(new HistoryDeliveryError('transient'));
-    abort.signal.addEventListener('abort', rejectAbort, { once: true });
-    if (abort.signal.aborted) rejectAbort();
-  });
-  try {
-    const work = async (): Promise<DeliveryAcknowledgment> => {
-      if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
-      if (destination.mappingVersion !== claim.batch.mapping_version) throw new HistoryDeliveryError('mapping_version_mismatch');
-      if (claim.batch.records.some((record) => !destination.supportedKinds.includes(record.kind)
-        || (record.operation === 'delete' && !destination.supportsTombstones))) throw new HistoryDeliveryError('unsupported_evidence');
-      const batch = frozen(claim.batch);
-      if (!claim.prepared) {
-        const prepared = await destination.prepare(batch, { signal: abort.signal });
-        if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
-        if (!prepared || typeof prepared.body !== 'string' || typeof prepared.content_type !== 'string'
-          || Buffer.byteLength(prepared.body) > config.limits.max_prepared_bytes
-          || !prepared.content_type || prepared.content_type.length > 200 || /[\r\n]/.test(prepared.content_type)) throw new HistoryDeliveryError('invalid_payload');
-        await deliveryRequest<PreparedHistoryPayload>({ operation: 'store_prepared_payload', lease,
-          mapping_version: destination.mappingVersion, content_type: prepared.content_type, body: prepared.body, now_ms: Date.now() }, options);
-      }
-      if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
-      // Eligibility can change while a plugin prepares its payload. Recheck it
-      // in core immediately before transport and use the persisted bytes.
-      const payload = await deliveryRequest<PreparedHistoryPayload>({ operation: 'validate_dispatch', lease, now_ms: Date.now() }, options);
-      if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
-      const result = await destination.send(frozen(payload), { batch, signal: abort.signal, idempotencyKey: batch.batch_id });
-      acknowledgment(result, claim);
-      return result;
-    };
-    const ack = await Promise.race([work(), interrupted]);
-    await stopRenewal();
-    if (abort.signal.aborted) throw new HistoryDeliveryError('transient');
-    await deliveryRequest({ operation: 'acknowledge', lease, acknowledgment: ack, now_ms: Date.now() }, options);
-  } catch (error) {
-    await stopRenewal();
-    const failure = error instanceof HistoryDeliveryError ? error : new HistoryDeliveryError('transient');
-    // The core fences this write. If another worker owns the job, even failure
-    // recording must fail rather than modifying that worker's progress.
-    await deliveryRequest({ operation: 'record_failure', lease, failure: failure.failure,
-      retry_after_ms: failure.retryAfterMs, now_ms: Date.now() }, options);
-  } finally {
-    await stopRenewal();
-    clearTimeout(timeout);
-    options.signal?.removeEventListener('abort', aborted);
-    if (rejectAbort) abort.signal.removeEventListener('abort', rejectAbort);
-  }
 }
 
-/** One bounded drain. It never waits for a retry deadline or enables a job. */
+/** One bounded drain. It never waits for a retry deadline or enables a job.
+ *
+ * The drain loop itself - round-robin scheduling, leases and their keepalive,
+ * payload persistence, the eligibility recheck before transport, acknowledgment
+ * checking and failure classification - lives once, in Rust. This host only
+ * describes its registered destinations and answers the worker's calls. */
 export async function drainHistoryDelivery(registry: HistoryPluginRegistry, options: DeliveryDrainOptions = {}): Promise<DeliveryDrainResult> {
   const maxBatches = integer(options.maxBatches ?? 100, 'maxBatches', 1, 10_000);
   const maxPrepareSteps = integer(options.maxPrepareSteps ?? 100, 'maxPrepareSteps', 1, 10_000);
   const leaseMs = integer(options.leaseMs ?? 30_000, 'leaseMs', 30, 86_400_000);
   const requestTimeoutMs = integer(options.requestTimeoutMs ?? 30_000, 'requestTimeoutMs', 1, 3_600_000);
-  const workerId = options.workerId ?? randomUUID();
-  const selected = new Set(options.jobIds);
-  let attempts = 0;
-  let preparedSteps = 0;
-  const issues: DeliveryDrainResult['issues'] = [];
-  await compactHistoryDelivery(options);
-  const listed = await historyDeliveryStatus(undefined, options);
-  if ([...selected].some((id) => !listed.some((job) => job.job_id === id))) throw new InvalidArgumentError('unknown delivery job selection', 'INVALID_ARGUMENT');
-  const jobs = listed.filter((job) => !options.jobIds || selected.has(job.job_id));
-  // Round-robin jobs: one failed destination never consumes another's cursor.
-  let progressed = true;
-  while (progressed && attempts < maxBatches && preparedSteps < maxPrepareSteps && !options.signal?.aborted) {
-    progressed = false;
-    for (const entry of jobs) {
-      if (attempts >= maxBatches || preparedSteps >= maxPrepareSteps || options.signal?.aborted) break;
-      try {
-        const [job] = await historyDeliveryStatus(entry.job_id, options);
-        if (job.state !== 'active' || job.next_attempt_ms > Date.now()) continue;
-        const destination = registry.destination(job.config.destination_id, job.config.instance_id);
-        if (!destination) {
-          if (!issues.some((issue) => issue.jobId === job.job_id)) issues.push({ jobId: job.job_id, code: 'DESTINATION_NOT_REGISTERED' });
-          continue;
-        }
-        const prepared = await deliveryRequest<DeliveryPrepareResult>({ operation: 'prepare_batch', job_id: job.job_id, now_ms: Date.now() }, options);
-        preparedSteps++;
-        if (!prepared.batch_id) { progressed ||= !prepared.bootstrap_complete || prepared.scanned_records > 0; continue; }
-        const claim = await deliveryRequest<ClaimedHistoryBatch | null>({ operation: 'claim_batch', job_id: job.job_id,
-          worker_id: workerId, lease_ms: leaseMs, now_ms: Date.now() }, options);
-        if (!claim) continue;
-        attempts++;
-        await attempt(claim, destination, job.config, { ...options, leaseMs, requestTimeoutMs });
-        progressed = true;
-      } catch (error) {
-        const detail = error instanceof RelayHistoryError && ['HISTORY_DELIVERY_FAILED', 'DELIVERY_RETENTION_LIMIT'].includes(error.code)
-          ? error.message : 'delivery state operation failed';
-        if (!issues.some((issue) => issue.jobId === entry.job_id)) issues.push({ jobId: entry.job_id, code: error instanceof RelayHistoryError && error.code === 'DELIVERY_RETENTION_LIMIT' ? 'DELIVERY_RETENTION_LIMIT' : 'DELIVERY_STATE_FAILED', detail });
-      }
-    }
-  }
-  const statuses = (await historyDeliveryStatus(undefined, options)).filter((job) => !options.jobIds || selected.has(job.job_id));
-  await compactHistoryDelivery(options);
-  return { attempts, statuses, issues, retention: await historyDeliveryRetention(options) };
+  const request = JSON.stringify({
+    jobIds: options.jobIds ? [...options.jobIds] : undefined,
+    workerId: options.workerId ?? randomUUID(),
+    maxBatches, maxPrepareSteps, leaseMs, requestTimeoutMs,
+    destinations: registry.registeredDestinations().map(({ destinationId, instanceId, destination }) => ({
+      destinationId, instanceId, mappingVersion: destination.mappingVersion,
+      supportedKinds: [...destination.supportedKinds], supportsTombstones: destination.supportsTombstones,
+    })),
+  });
+  const prepare = receiver(registry, options, requestTimeoutMs,
+    (destination, call: PrepareCall, signal) => destination.prepare(frozen(call.batch), { signal }));
+  const send = receiver(registry, options, requestTimeoutMs,
+    (destination, call: SendCall, signal): Promise<DeliveryAcknowledgment> =>
+      destination.send(frozen(call.payload), { batch: frozen(call.batch), signal, idempotencyKey: call.idempotencyKey }));
+  const cancelled = async (): Promise<boolean> => options.signal?.aborted === true;
+  return nativeCall(async (native) => JSON.parse(
+    await native.historyDeliveryDrain(request, options.dbPath, prepare, send, cancelled)) as DeliveryDrainResult);
 }
 
 async function wait(ms: number, signal?: AbortSignal): Promise<void> {
