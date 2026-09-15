@@ -1,39 +1,70 @@
 # Release and platform validation
 
-All public packages use one version: `ai-hist`, `ai-hist-native`, each native
-platform package, and `ai-hist-mcp`. The SDK checks native contract version 15
-at initialization.
+One workflow releases everything: `Publish RelayHistory release`
+(`.github/workflows/publish-napi.yml`; the file name is bound to npm OIDC
+trusted publishing and must not change). All public packages share one version:
+`ai-hist`, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
+`@agent-relay/relayhistory`, `@agent-relay/history-provider-sources` and their
+seven platform helper packages each. The SDK checks the current native contract
+version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
+and `crates/ai-hist-napi/src/lib.rs`).
 
-The `Publish RelayHistory npm packages` workflow:
+## Inputs
 
-1. builds Rust and all seven native targets;
-2. executes the addon on native CI runners where the target matches;
-3. collects `.node` artifacts;
-4. creates and publishes per-platform packages;
-5. publishes `ai-hist-native` with exact optional dependencies;
-6. builds and publishes `ai-hist` (SDK + CLI);
-7. publishes `ai-hist-mcp` last;
-8. performs a clean registry install and CLI/MCP smoke test;
-9. creates the `sdk-ts-v<version>` tag and GitHub Release.
+| Input            | Default | Meaning                                                             |
+| ---------------- | ------- | ------------------------------------------------------------------- |
+| `version`        | `patch` | Bump type computed from the highest published core version on npm.  |
+| `custom_version` | empty   | Exact version; overrides the bump type.                             |
+| `dry_run`        | `false` | Build and validate everything, publish nothing, push nothing.       |
+| `plugins`        | `true`  | Also publish the optional history plugins at the same version.      |
+| `probe`          | `true`  | Also attach `agent-relay-probe` binaries to the GitHub Release.     |
+| `skip_core`      | `false` | Re-run only plugins/probe for an already published `custom_version`. |
 
-The SDK root is never published before required platform artifacts. This is
-important because npm multi-package publication is not atomic.
+## What happens, in order
 
-When manually dispatching the workflow, choose `patch`, `minor`, or `major`.
-The workflow computes the next version from the currently published `ai-hist`
-version on npm and applies that exact version to the native root, every platform
-package, the SDK/CLI, and the MCP wrapper. For example, from `0.6.0`, `patch`
-produces `0.6.1` and `minor` produces `0.7.0`. `custom_version` is available for
-an explicit version and overrides the selected bump type. Leave `dry_run`
-enabled to build and validate without publishing packages or creating a tag.
+1. `build` builds and tests the native addon on all seven targets, and
+   `helpers` builds the two Rust helpers for seven platforms — plus
+   `agent-relay-probe` on the four platforms it ships for — verifying each
+   executable and its glibc floor. Both jobs run in parallel and upload
+   binaries as artifacts.
+2. `publish` computes the release version, aligns every manifest and lockfile
+   (including the plugin manifests, via `scripts/set-release-version.mjs`),
+   prepares the version-only commit, then publishes the platform packages,
+   `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
+   never published before its platform artifacts, because npm multi-package
+   publication is not atomic.
+3. After the clean registry install and the older-glibc CLI smoke tests pass,
+   `publish` pushes the version commit — only if the branch has not advanced —
+   and creates the `sdk-ts-v<version>` tag and GitHub Release.
+4. `plugins` checks out that persisted commit, packages each helper binary at
+   the release version, verifies staged tarballs, verifies the *published* core
+   at each plugin's peer minimum, then publishes the seven helpers of each
+   plugin before its JavaScript package.
+5. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
+   the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
+   asset names the website mirrors.
 
-Before a non-dry release publishes any package, the workflow verifies that the
-selected branch has not advanced and pushes a version-only commit containing
-the updated package manifests and lockfiles. This makes partial publication
-recovery deterministic and prevents a late non-fast-forward push from leaving
-published packages without source metadata. Dry runs never change the checked-in
-version baseline. After registry validation, the workflow creates the GitHub tag
-and Release from the persisted version commit.
+`scripts/set-release-version.mjs <version>` is the only place that knows what a
+plugin release version touches (version, the seven helper pins, the `ai-hist`
+peer range `^<version>`, and the lockfile coordinates). It is idempotent, and
+both the version commit and the plugin job run it, so the committed manifests
+and the published ones cannot diverge.
+
+## Dry runs
+
+Leave `dry_run` enabled to build, verify and stage everything without
+publishing, pushing a commit, creating a Release or attaching assets. The
+plugin job applies the release version to its own checkout and prints the
+staged tarballs; the probe job prints the binary manifest with sizes and
+digests. Dry runs never change the checked-in version baseline.
+
+## Re-running plugins or probe alone
+
+Set `skip_core` with an explicit `custom_version` equal to an already published
+core version. `build` and `publish` are skipped; the plugin and probe jobs take
+the version from that input, so plugin manifests are re-derived and the assets
+are attached to the existing `sdk-ts-v<version>` Release. Turn off `plugins` or
+`probe` to narrow the re-run further.
 
 ## Supported matrix
 

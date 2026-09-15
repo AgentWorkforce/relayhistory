@@ -126,13 +126,29 @@ This PR supplies the binary, not a hosted release. It depends on:
 - **Official Relay CLI:** an optional `agent-relay cloud install` alias may delegate
   to the installed probe. The native onboarding path does not depend on it.
 
-The local companion installer uses
-`/downloads/agent-relay-probe/{darwin-arm64,darwin-x64,linux-arm64,linux-x64}/agent-relay-probe`
-and an adjacent `.sha256` file. Only a local macOS ARM64 artifact has been staged
-and tested. Linux artifacts, supported libc targets, macOS signing/notarization,
-versioned release manifests and distribution are release work. The CI job builds
-and tests on macOS/Linux but publishes nothing. Windows is not supported by this
-installer. Production rollout must wait for companion services and a human release.
+### Release assets and download names
+
+The `Publish RelayHistory release` workflow (see
+[releasing.md](releasing.md)) builds the probe from this crate on four
+platforms, applies the same glibc 2.28 floor as the helpers, and attaches the
+binaries to the `sdk-ts-v<version>` GitHub Release. Those assets are the source
+of truth; agentrelay.com mirrors them under the paths the installer requests.
+
+| Release asset (`sdk-ts-v<version>`)                                  | Site path                                                 |
+| -------------------------------------------------------------------- | --------------------------------------------------------- |
+| `agent-relay-probe-darwin-arm64` + `agent-relay-probe-darwin-arm64.sha256` | `/downloads/agent-relay-probe/darwin-arm64/agent-relay-probe{,.sha256}` |
+| `agent-relay-probe-darwin-x64` + `.sha256`                           | `/downloads/agent-relay-probe/darwin-x64/agent-relay-probe{,.sha256}`   |
+| `agent-relay-probe-linux-x64-gnu` + `.sha256`                        | `/downloads/agent-relay-probe/linux-x64/agent-relay-probe{,.sha256}`    |
+| `agent-relay-probe-linux-arm64-gnu` + `.sha256`                      | `/downloads/agent-relay-probe/linux-arm64/agent-relay-probe{,.sha256}`  |
+
+The asset names carry the build platform id used across this repository, so the
+Linux assets keep their `-gnu` suffix while the installer's paths do not; only
+glibc Linux is published. The `.sha256` files are `sha256sum` lines naming
+`agent-relay-probe`, so a mirrored file verifies with `sha256sum -c` next to the
+binary. A checksum from the same origin detects corruption; it is not a separate
+publisher signature. macOS signing/notarization and versioned release manifests
+are still outstanding release work, and Windows is not supported by this
+installer. The CI job builds and tests on macOS/Linux but publishes nothing.
 
 ## Verification
 
