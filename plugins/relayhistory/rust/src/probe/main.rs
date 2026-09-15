@@ -185,7 +185,10 @@ fn read_config(directory: &Path) -> Result<Config> {
         config.version == 1 && auth::site_origin(&config.site_url)? == config.site_url,
         "invalid config"
     );
-    auth::history_origin(&config.history_url, &config.site_url)?;
+    ensure!(
+        auth::history_origin(&config.history_url, &config.site_url)? == config.history_url,
+        "invalid history origin"
+    );
     validate_id(&config.account_id)?;
     validate_id(&config.workspace_id)?;
     ensure!(
@@ -290,7 +293,7 @@ fn install(options: Install) -> Result<()> {
         },
     };
     let session = auth::history_session(&site, &authenticated, &workspace)?;
-    auth::history_origin(&session.base_url, &site)?;
+    let history_url = auth::history_origin(&session.base_url, &site)?;
     ensure!(
         session.workspace_id == workspace
             && !session.org_id.is_empty()
@@ -300,7 +303,7 @@ fn install(options: Install) -> Result<()> {
     let account = destination::account_id(&session.org_id, Some(&workspace));
     if existing
         .as_ref()
-        .is_some_and(|c| c.delivery_account != account || c.history_url != session.base_url)
+        .is_some_and(|c| c.delivery_account != account || c.history_url != history_url)
     {
         return Err(user_error(
             "Saved history belongs to a different destination. It was not replaced.",
@@ -308,7 +311,7 @@ fn install(options: Install) -> Result<()> {
     }
     std::env::set_var("RELAYHISTORY_HOME", &directory);
     cloud::save_auth(&cloud::StoredAuth {
-        base_url: session.base_url.clone(),
+        base_url: history_url.clone(),
         access_token: session.access_token,
         access_token_expires_at: Some(session.access_token_expires_at),
         refresh_token: Some(session.refresh_token),
@@ -337,28 +340,46 @@ fn install(options: Install) -> Result<()> {
             config
         }
         None => {
-            let selection = collector::selection(&conn, include_existing)?;
-            let job = ai_hist_core::delivery::create_job(
-                &conn,
-                &ai_hist_core::delivery::DeliveryJobConfig {
-                    destination_id: "relayhistory".into(),
-                    instance_id: "teams-probe".into(),
-                    account_id: account.clone(),
-                    mapping_version: destination::MAPPING_VERSION.into(),
-                    selection,
-                    limits: Default::default(),
-                },
-                collector::now(),
-            )?;
+            let job_config = ai_hist_core::delivery::DeliveryJobConfig {
+                destination_id: "relayhistory".into(),
+                instance_id: "teams-probe".into(),
+                account_id: account.clone(),
+                mapping_version: destination::MAPPING_VERSION.into(),
+                selection: collector::selection(include_existing),
+                limits: Default::default(),
+            };
+            // A generation outlives an interrupted setup: create_job commits
+            // before config.json is written. Adopt that job instead of recording
+            // a second baseline behind a generation nothing can reach.
+            let adopted = ai_hist_core::delivery::list_jobs(&conn)?
+                .into_iter()
+                .find(|job| {
+                    job.state != "cancelled"
+                        && job.config.destination_id == job_config.destination_id
+                        && job.config.instance_id == job_config.instance_id
+                        && job.config.account_id == job_config.account_id
+                });
+            let job_id = match adopted {
+                Some(job) => {
+                    if job.config.selection != job_config.selection {
+                        return Err(user_error("A delivery generation with a different sharing choice already exists. Cancel it explicitly before reconnecting."));
+                    }
+                    job.job_id
+                }
+                None => {
+                    collector::record_baseline(&conn, include_existing)?;
+                    ai_hist_core::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                }
+            };
             let config = Config {
                 version: 1,
                 site_url: site,
                 account_id: who.user.id,
                 org_id: session.org_id,
                 workspace_id: workspace,
-                history_url: session.base_url,
+                history_url,
                 delivery_account: account,
-                job_id: job.job_id,
+                job_id,
                 include_existing,
                 acknowledge_uninspected_schedules: options.acknowledge_uninspected_schedules,
             };

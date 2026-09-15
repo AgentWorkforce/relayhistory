@@ -33,7 +33,10 @@ pub fn site_origin(raw: &str) -> Result<String> {
 fn is_local(url: &Url) -> bool {
     matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
 }
-pub fn history_origin(raw: &str, site: &str) -> Result<()> {
+/// Returns the normalized origin. Callers store and compare that, never the
+/// raw value: a trailing slash survives the checks below and would then be
+/// concatenated into request paths as `//v1/...`.
+pub fn history_origin(raw: &str, site: &str) -> Result<String> {
     let url = Url::parse(raw)?;
     let local = is_local(&Url::parse(site)?);
     ensure!(
@@ -52,7 +55,7 @@ pub fn history_origin(raw: &str, site: &str) -> Result<()> {
             && url.fragment().is_none(),
         "invalid history URL"
     );
-    Ok(())
+    Ok(url.origin().ascii_serialization())
 }
 fn json_response(response: ureq::Response) -> Result<Value> {
     let mut bytes = Vec::new();
@@ -256,7 +259,15 @@ mod tests {
         }
         assert!(history_origin("https://history.agentrelay.com", "http://127.0.0.1:3100").is_err());
         assert!(history_origin("http://127.0.0.1:3102", "https://agentrelay.com").is_err());
-        assert!(history_origin("http://127.0.0.1:3102", "http://127.0.0.1:3100").is_ok());
+        assert_eq!(
+            history_origin("http://127.0.0.1:3102", "http://127.0.0.1:3100").unwrap(),
+            "http://127.0.0.1:3102"
+        );
+        // A trailing slash must not survive into request paths.
+        assert_eq!(
+            history_origin("http://127.0.0.1:3102/", "http://127.0.0.1:3100").unwrap(),
+            "http://127.0.0.1:3102"
+        );
     }
     fn device_server(status: u16, wrong_origin: bool) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};

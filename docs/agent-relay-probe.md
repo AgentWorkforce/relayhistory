@@ -44,9 +44,12 @@ selected Cloud URL; it does not overwrite that CLI's auth file.
 New-only mode snapshots existing identities across the catalog, prompts and
 events before creating its delivery generation. It sends session metadata and
 session events, omitting the separate prompt-only records because some lack a
-session identity. Sessions discovered later are treated as new; this is a local
-capture baseline, not a guarantee about the actual creation time of files added
-later. The saved sharing choice is immutable on reconnect.
+session identity. The baseline is stored as durable delivery exclusions, which
+the coordinator rechecks whenever a batch is prepared, claimed and dispatched,
+so it does not grow the delivery configuration with local history. Sessions
+discovered later are treated as new; this is a local capture baseline, not a
+guarantee about the actual creation time of files added later. The saved sharing
+choice is immutable on reconnect.
 
 Default setup starts a detached process. `--foreground` keeps it in the terminal;
 `--once` captures and delivers one bounded cycle. To inspect or stop it:
