@@ -1,5 +1,5 @@
 use super::{lock, read_config, save_json, user_error, Config};
-use ai_hist_core::delivery::{self, DeliveryFailure, ExportSelection};
+use ai_hist_core::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
 use relayhistory_plugin::{cloud, destination};
 use rusqlite::Connection;
@@ -13,6 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The destination and generation this probe delivers as. Both are part of the
+/// saved job configuration, so they cannot change for an existing install.
+const DESTINATION: &str = "relayhistory";
+const INSTANCE: &str = "teams-probe";
 static STOP: AtomicBool = AtomicBool::new(false);
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -72,81 +76,52 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
         identities.len()
     })
 }
-/// Only the transport classifies the batch itself; `destination::prepare` and
-/// `send` report a mapping or payload verdict as a `TransportFailure`. Every
-/// other error on this path is a local condition that can clear — a lost lease,
-/// a storage error, or the consent recheck failing to inspect schedules — so it
-/// stays retryable. A nonretryable verdict blocks the job until an explicit
-/// retry, which no amount of waiting would resolve.
-fn failure_for(error: &anyhow::Error) -> DeliveryFailure {
-    error
-        .downcast_ref::<destination::TransportFailure>()
-        .map(|failure| failure.0)
-        .unwrap_or(DeliveryFailure::Transient)
-}
-fn drain(conn: &Connection, config: &Config) -> Result<()> {
-    super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-    let worker = format!("probe-{}", std::process::id());
-    let mut attempts = 0;
-    for _ in 0..100 {
-        if STOP.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let status = delivery::status(conn, &config.job_id)?;
-        ensure!(
-            status.config.account_id == config.delivery_account
-                && status.config.mapping_version == destination::MAPPING_VERSION,
-            "delivery config mismatch"
-        );
-        if status.state != "active" {
-            return Err(user_error("Delivery needs attention. Reconnect with --force-login if credentials have expired."));
-        }
-        if status.next_attempt_ms > now() {
-            return Err(user_error("Delivery is queued for retry."));
-        }
-        if attempts >= 8 {
-            break;
-        }
-        let prepared = delivery::prepare_batch(conn, &config.job_id, now())?;
-        if prepared.batch_id.is_none() {
-            if prepared.bootstrap_complete && prepared.scanned_records == 0 {
-                break;
-            }
-            continue;
-        }
-        let Some(claim) = delivery::claim_batch(conn, &config.job_id, &worker, 300_000, now())?
-        else {
-            break;
-        };
-        attempts += 1;
-        let result = (|| -> Result<()> {
-            if claim.prepared.is_none() {
-                let payload = destination::prepare(claim.batch.clone())?;
-                delivery::store_prepared_payload(
-                    conn,
-                    &claim.lease,
-                    &payload.mapping_version,
-                    &payload.content_type,
-                    &payload.body,
-                    now(),
-                )?;
-            }
-            // Recheck consent and the lease immediately before the network call.
-            super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-            let payload = delivery::validate_dispatch(conn, &claim.lease, now())?;
-            let receipt = destination::send(Some(&config.history_url), &payload)?;
-            delivery::acknowledge(conn, &claim.lease, &receipt, now())?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            delivery::record_failure(conn, &claim.lease, failure_for(&error), None, now())?;
-            return Err(user_error("Session delivery is queued or needs attention. No unacknowledged data was discarded."));
-        }
+/// One bounded delivery pass through the shared core delivery worker — the
+/// same loop the SDK drains with — carrying the RelayHistory receiver. The
+/// worker owns leases and their keepalive, prepared-payload persistence, the
+/// eligibility recheck before dispatch, retry classification and compaction;
+/// the receiver owns only the legacy-scheduler/account/instance guards and the
+/// transport. Returns the job status the drain left behind.
+fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> {
+    let receiver = destination::RelayHistoryReceiver {
+        base_url: Some(config.history_url.clone()),
+        expected_account: Some(config.delivery_account.clone()),
+        instance_id: Some(INSTANCE.into()),
+        acknowledge_uninspected_schedules: config.acknowledge_uninspected_schedules,
+    };
+    let options = worker::DrainOptions {
+        job_ids: Some(vec![config.job_id.clone()]),
+        // A cycle stays bounded so a stop request and the heartbeat are never
+        // starved by an unbounded backlog; the next cycle continues it.
+        max_batches: 8,
+        ..worker::DrainOptions::new(format!("probe-{}", std::process::id()))
+    };
+    let result = worker::drain(
+        db_path,
+        &worker::SingleReceiver::new(DESTINATION, INSTANCE, &receiver),
+        &options,
+        &worker::system_clock,
+        &|| STOP.load(Ordering::Relaxed),
+    )?;
+    let status = result
+        .statuses
+        .into_iter()
+        .find(|job| job.job_id == config.job_id)
+        .context("delivery job missing")?;
+    if status.state != "active" {
+        return Err(user_error(
+            "Delivery needs attention. Reconnect with --force-login if credentials have expired.",
+        ));
     }
-    delivery::expire_exports(conn, now(), 32)?;
-    delivery::compact_journal(conn, 1_000)?;
-    delivery::compact_receipts(conn, 1_000)?;
-    Ok(())
+    // A recorded transport failure is not an issue: the job stays active and
+    // the worker owns its backoff. Only an unusable local state is reported,
+    // and waiting for a retry deadline is normal operation, not a fault.
+    if !result.issues.is_empty() {
+        return Err(user_error(
+            "Session delivery is queued or needs attention. No unacknowledged data was discarded.",
+        ));
+    }
+    Ok(status)
 }
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     ensure!(
@@ -158,8 +133,23 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         ai_hist_engine::sync_local_at(&db_path)?,
         "capture not complete"
     );
-    let conn = ai_hist_core::open_db(&db_path)?;
-    drain(&conn, config)?;
+    // The receiver rejects a batch whose account or mapping does not match, but
+    // only once one exists. An idle generation pointed at another destination
+    // must not look healthy, so the saved configuration is checked outright.
+    {
+        let conn = ai_hist_core::open_db(&db_path)?;
+        let job = delivery::status(&conn, &config.job_id)?;
+        ensure!(
+            job.config.account_id == config.delivery_account
+                && job.config.mapping_version == destination::MAPPING_VERSION,
+            "delivery config mismatch"
+        );
+    }
+    // The receiver blocks the job when an older managed uploader appears, but
+    // its verdict is a generic permission refusal. Name the cause here first so
+    // the user sees which uploader to stop instead of a reconnect suggestion.
+    super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
+    let status = deliver(&db_path, config)?;
     let token = cloud::access_token(Some(&config.history_url))?;
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
@@ -170,7 +160,6 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|_| user_error("Could not confirm the connection with Cloud."))?;
-    let status = delivery::status(&conn, &config.job_id)?;
     println!(
         "Probe connected: {} records received, {} queued.",
         status.acknowledged_records, status.pending_records
@@ -350,8 +339,8 @@ mod tests {
     use super::*;
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
         delivery::DeliveryJobConfig {
-            destination_id: "relayhistory".into(),
-            instance_id: "teams-probe".into(),
+            destination_id: DESTINATION.into(),
+            instance_id: INSTANCE.into(),
             account_id: destination::account_id("org", Some("workspace")),
             mapping_version: destination::MAPPING_VERSION.into(),
             selection: selection(include_existing),
@@ -451,29 +440,6 @@ mod tests {
         assert_eq!(
             claim_sessions(&conn, &job.job_id),
             vec!["before".to_string()]
-        );
-    }
-    #[test]
-    fn only_a_transport_verdict_can_block_the_job() {
-        // A lease, storage or consent-recheck error must not be recorded as a
-        // nonretryable payload verdict: that blocks delivery until an explicit
-        // retry even after the condition clears.
-        assert_eq!(
-            failure_for(&user_error("Could not inspect older upload schedules.")),
-            DeliveryFailure::Transient
-        );
-        assert_eq!(
-            failure_for(&anyhow::anyhow!("delivery batch missing")),
-            DeliveryFailure::Transient
-        );
-        assert_eq!(
-            failure_for(
-                &anyhow::Error::from(destination::TransportFailure(
-                    DeliveryFailure::InvalidPayload
-                ))
-                .context("preparing batch")
-            ),
-            DeliveryFailure::InvalidPayload
         );
     }
     #[test]

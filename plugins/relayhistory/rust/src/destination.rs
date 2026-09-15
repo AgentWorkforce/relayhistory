@@ -1,6 +1,7 @@
 //! Versioned durable transport. The local coordinator persists prepared bytes and owns retries.
 use crate::cloud;
 use ai_hist_core::delivery::{
+    worker::{PreparedBody, Receiver, ReceiverContext, ReceiverFailure},
     AcceptanceLevel, DeliveryAcknowledgment, DeliveryFailure, HistoryExportBatch, PreparedPayload,
     SUPPORTED_KINDS,
 };
@@ -258,6 +259,108 @@ pub fn send(base_url: Option<&str>, prepared: &PreparedPayload) -> Result<Delive
     receipt(response_json(response)?, &request.batch)
 }
 
+/// Only the transport classifies the batch itself: `prepare` and `send` report
+/// a mapping or payload verdict as a `TransportFailure`. Every other error on
+/// this path is a local condition that can clear — a storage error, or the
+/// consent recheck failing to inspect schedules — so it stays retryable. A
+/// nonretryable verdict blocks the job until an explicit retry, which no amount
+/// of waiting would resolve.
+fn verdict(error: &anyhow::Error) -> ReceiverFailure {
+    error
+        .downcast_ref::<TransportFailure>()
+        .map(|failure| failure.0)
+        .unwrap_or(DeliveryFailure::Transient)
+        .into()
+}
+/// The RelayHistory destination as a core delivery receiver: mapping and
+/// transport only. Every host — the JSON helper for the SDK, and the probe —
+/// runs the same guards through this type instead of reimplementing them, and
+/// the core worker owns leases, retries, acknowledgment and compaction.
+///
+/// `expected_account` and `instance_id` are assertions about the generation a
+/// host configured: an unset field asserts nothing. `base_url` selects the
+/// stage whose stored auth is used; server authentication stays authoritative.
+#[derive(Debug, Clone, Default)]
+pub struct RelayHistoryReceiver {
+    pub base_url: Option<String>,
+    pub expected_account: Option<String>,
+    pub instance_id: Option<String>,
+    /// The user's explicit statement that they checked older upload schedules
+    /// themselves. It never counts as a successful inspection.
+    pub acknowledge_uninspected_schedules: bool,
+}
+impl RelayHistoryReceiver {
+    /// Consent and destination identity, rechecked before mapping and again
+    /// before transport: a legacy uploader can be installed, or a job's
+    /// endpoint changed, between a batch being prepared and being sent.
+    fn admit(&self, batch: &HistoryExportBatch) -> Result<(), ReceiverFailure> {
+        let status = crate::migration::status();
+        if status.state == "active"
+            || (status.state == "unknown" && !self.acknowledge_uninspected_schedules)
+        {
+            return Err(DeliveryFailure::PermissionDenied.into());
+        }
+        if self
+            .expected_account
+            .as_ref()
+            .is_some_and(|account| *account != batch.account_id)
+        {
+            return Err(DeliveryFailure::PermissionDenied.into());
+        }
+        if self
+            .instance_id
+            .as_ref()
+            .is_some_and(|instance| *instance != batch.instance_id)
+        {
+            return Err(DeliveryFailure::MappingVersionMismatch.into());
+        }
+        Ok(())
+    }
+}
+/// Reattach the mapping version and content hash a host must persist with a
+/// prepared body, so `send` re-verifies exactly the stored bytes. The core
+/// worker keeps that state itself; only the JSON helper needs this.
+pub fn seal(prepared: PreparedBody) -> PreparedPayload {
+    PreparedPayload {
+        mapping_version: MAPPING_VERSION.into(),
+        sha256: hash(prepared.body.as_bytes()),
+        content_type: prepared.content_type,
+        body: prepared.body,
+    }
+}
+impl Receiver for RelayHistoryReceiver {
+    fn mapping_version(&self) -> &str {
+        MAPPING_VERSION
+    }
+    fn supported_kinds(&self) -> &[&str] {
+        SUPPORTED_KINDS
+    }
+    fn supports_tombstones(&self) -> bool {
+        true
+    }
+    fn prepare(
+        &self,
+        batch: &HistoryExportBatch,
+        _context: &ReceiverContext<'_>,
+    ) -> Result<PreparedBody, ReceiverFailure> {
+        self.admit(batch)?;
+        let payload = prepare(batch.clone()).map_err(|error| verdict(&error))?;
+        Ok(PreparedBody {
+            content_type: payload.content_type,
+            body: payload.body,
+        })
+    }
+    fn send(
+        &self,
+        payload: &PreparedPayload,
+        batch: &HistoryExportBatch,
+        _context: &ReceiverContext<'_>,
+    ) -> Result<DeliveryAcknowledgment, ReceiverFailure> {
+        self.admit(batch)?;
+        send(self.base_url.as_deref(), payload).map_err(|error| verdict(&error))
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadOptions {
@@ -380,4 +483,32 @@ pub fn read_page(base_url: Option<&str>, options: &ReadOptions) -> Result<ReadPa
         )?;
     }
     Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_transport_verdict_can_block_the_job() {
+        // A lease, storage or consent-recheck error must not be recorded as a
+        // nonretryable payload verdict: that blocks delivery until an explicit
+        // retry even after the condition clears.
+        assert_eq!(
+            verdict(&anyhow::anyhow!(
+                "Could not inspect older upload schedules."
+            )),
+            DeliveryFailure::Transient.into()
+        );
+        assert_eq!(
+            verdict(&anyhow::anyhow!("delivery batch missing")),
+            DeliveryFailure::Transient.into()
+        );
+        assert_eq!(
+            verdict(
+                &anyhow::Error::from(TransportFailure(DeliveryFailure::InvalidPayload))
+                    .context("preparing batch")
+            ),
+            DeliveryFailure::InvalidPayload.into()
+        );
+    }
 }

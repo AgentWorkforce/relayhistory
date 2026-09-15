@@ -109,6 +109,13 @@ fn server(pages: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<(String, 
     });
     (base, handle)
 }
+/// Delivery arguments now carry the batch itself: the helper reruns the
+/// destination's consent, account and instance guards before every dispatch.
+/// A test host cannot inspect legacy schedules, so it acknowledges that
+/// explicitly exactly as an interactive user would.
+fn send_args(base: String, prepared: &PreparedPayload, batch: &HistoryExportBatch) -> Value {
+    json!({"baseUrl":base,"prepared":prepared,"batch":batch,"acknowledgeUninspectedSchedules":true})
+}
 fn accepted(batch: &HistoryExportBatch) -> Value {
     json!({"protocolVersion":1,"batchId":batch.batch_id,"acceptedRevisionIds":batch.records.iter().map(|r|&r.revision_id).collect::<Vec<_>>(),"unsupportedRevisionIds":[],"acceptanceLevel":"durable"})
 }
@@ -127,14 +134,14 @@ fn native_fixture_prepares_immutably_and_retry_sends_identical_bytes() {
     let first = invoke(
         home.path(),
         "deliverySend",
-        json!({"baseUrl":base,"prepared":prepared}),
+        send_args(base.clone(), &prepared, &batch),
     );
     assert_eq!(first["error"]["code"], "DELIVERY_TRANSIENT");
     assert!(!first.to_string().contains("rth_at_never_echo"));
     let retry = invoke(
         home.path(),
         "deliverySend",
-        json!({"baseUrl":base,"prepared":saved}),
+        send_args(base.clone(), &saved, &batch),
     );
     assert_eq!(retry["ok"], true);
     assert_eq!(
@@ -166,7 +173,7 @@ fn old_server_and_wrong_receipts_never_fall_back_or_acknowledge() {
         let result = invoke(
             home.path(),
             "deliverySend",
-            json!({"baseUrl":base,"prepared":prepared}),
+            send_args(base.clone(), &prepared, &batch),
         );
         assert_eq!(result["error"]["code"], code);
         assert_eq!(server.join().unwrap().len(), 1);
@@ -174,23 +181,65 @@ fn old_server_and_wrong_receipts_never_fall_back_or_acknowledge() {
 }
 #[test]
 fn account_mismatch_and_prepared_mutation_fail_before_transport() {
-    let mut prepared = prepare(batch()).unwrap();
+    let batch = batch();
+    let mut prepared = prepare(batch.clone()).unwrap();
     let home = tempfile::tempdir().unwrap();
-    let base = "http://127.0.0.1:1";
-    auth(home.path(), base, "other-org");
+    let base = "http://127.0.0.1:1".to_string();
+    auth(home.path(), &base, "other-org");
     let mismatch = invoke(
         home.path(),
         "deliverySend",
-        json!({"baseUrl":base,"prepared":prepared}),
+        send_args(base.clone(), &prepared, &batch),
     );
     assert_eq!(mismatch["error"]["code"], "DELIVERY_PERMISSION_DENIED");
     prepared.body.push(' ');
     let altered = invoke(
         home.path(),
         "deliverySend",
-        json!({"baseUrl":base,"prepared":prepared}),
+        send_args(base, &prepared, &batch),
     );
     assert_eq!(altered["error"]["code"], "DELIVERY_INVALID_PAYLOAD");
+}
+
+/// The receiver's own assertions about the generation a host configured are
+/// rechecked on every prepare and send, not only when a job is created.
+#[test]
+fn asserted_account_and_instance_are_rechecked_before_every_dispatch() {
+    let batch = batch();
+    let prepared = prepare(batch.clone()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = "http://127.0.0.1:1".to_string();
+    auth(home.path(), &base, "org-fixture");
+    for (extra, code) in [
+        (
+            json!({"expectedAccount": account_id("other-org", None)}),
+            "DELIVERY_PERMISSION_DENIED",
+        ),
+        (
+            json!({"instanceId": "another-generation"}),
+            "DELIVERY_MAPPING_VERSION_MISMATCH",
+        ),
+    ] {
+        for operation in ["deliveryPrepare", "deliverySend"] {
+            let mut args = send_args(base.clone(), &prepared, &batch);
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            assert_eq!(invoke(home.path(), operation, args)["error"]["code"], code);
+        }
+    }
+    // The same arguments matching the batch reach the transport instead.
+    let mut args = send_args(base, &prepared, &batch);
+    args["expectedAccount"] = json!(batch.account_id);
+    args["instanceId"] = json!(batch.instance_id);
+    assert_eq!(
+        invoke(home.path(), "deliveryPrepare", args.clone())["value"]["sha256"],
+        json!(prepared.sha256)
+    );
+    assert_eq!(
+        invoke(home.path(), "deliverySend", args)["error"]["code"],
+        "DELIVERY_TRANSIENT"
+    );
 }
 #[test]
 fn receipt_overlap_and_duplicate_revisions_are_rejected() {
@@ -206,7 +255,7 @@ fn receipt_overlap_and_duplicate_revisions_are_rejected() {
     let result = invoke(
         home.path(),
         "deliverySend",
-        json!({"baseUrl":base,"prepared":prepare(batch).unwrap()}),
+        send_args(base.clone(), &prepare(batch.clone()).unwrap(), &batch),
     );
     assert_eq!(result["error"]["code"], "DELIVERY_INVALID_PAYLOAD");
     server.join().unwrap();
@@ -242,7 +291,11 @@ fn default_size_payload_survives_helper_json_escaping() {
     batch.records.truncate(1);
     batch.records[0].payload = json!({"prompt":"\u{1}".repeat(150_000)});
     let home = tempfile::tempdir().unwrap();
-    let result = invoke(home.path(), "deliveryPrepare", json!({"batch":batch}));
+    let result = invoke(
+        home.path(),
+        "deliveryPrepare",
+        json!({"batch":batch,"acknowledgeUninspectedSchedules":true}),
+    );
     assert_eq!(result["ok"], true);
     let prepared: PreparedPayload = serde_json::from_value(result["value"].clone()).unwrap();
     assert!(prepared.body.len() > 900_000);

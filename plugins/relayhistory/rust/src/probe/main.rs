@@ -227,6 +227,9 @@ fn choose_import() -> Result<Option<bool>> {
         _ => None,
     })
 }
+/// Install-time user messaging only: the same rule is enforced per dispatch
+/// inside the receiver, where an actionable sentence would have nobody to read
+/// it. Both must agree, so neither is allowed to drift into a softer check.
 fn check_legacy_schedules(acknowledge_uninspected_schedules: bool) -> Result<()> {
     let status = migration::status();
     if status.state == "active" {

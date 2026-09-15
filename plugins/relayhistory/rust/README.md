@@ -28,7 +28,9 @@ Explicit legacy subcommands `login`, `admin-mint`, `token`, `replay`, `push`, `c
 
 `deliveryAccount` returns the expected account assertion `relayhistory:` plus SHA-256 of UTF-8 JSON `[orgId, workspaceId ?? ""]`. It reads only explicit plugin auth state. The server compares the immutable batch account assertion to authenticated tenancy before writing; cache labels cannot grant authority.
 
-`deliveryPrepare` takes `args.batch` and returns a core `PreparedPayload` using mapping version `relayhistory-delivery-v1`. Persist this exact result with the coordinator before transport. `deliverySend` accepts `args.baseUrl` and `args.prepared`, checks the hash/mapping and sends the body unchanged to `/v1/delivery/batches`. Authentication headers may rotate. It returns the core snake_case `DeliveryAcknowledgment`; it does not mutate local delivery progress. The host must validate its lease/eligibility immediately before calling, then pass the exact acknowledgment to the core. The service stores its documented scrubbed/minimized representation; durable acceptance does not promise indexing or retaining raw secrets.
+`deliveryPrepare` and `deliverySend` are the two calls of the `destination::RelayHistoryReceiver`, the core delivery worker's receiver for this destination. Both take `args.batch` and the assertions the host configured: `expectedAccount` (refused as `DELIVERY_PERMISSION_DENIED` when it differs from the batch account), `instanceId` (refused as `DELIVERY_MAPPING_VERSION_MISMATCH` when it differs from the batch generation) and `acknowledgeUninspectedSchedules`. An omitted assertion is not checked. Both first rerun the legacy scheduler guard below, so a host never reimplements it and an uploader installed between prepare and send still blocks the send.
+
+`deliveryPrepare` returns a core `PreparedPayload` using mapping version `relayhistory-delivery-v1`. Persist this exact result with the coordinator before transport. `deliverySend` additionally accepts `args.baseUrl` and `args.prepared`, checks the hash/mapping and sends the body unchanged to `/v1/delivery/batches`. Authentication headers may rotate. It returns the core snake_case `DeliveryAcknowledgment`; it does not mutate local delivery progress. The host must validate its lease/eligibility immediately before calling, then pass the exact acknowledgment to the core. The service stores its documented scrubbed/minimized representation; durable acceptance does not promise indexing or retaining raw secrets.
 
 Safe helper failures use `DELIVERY_TRANSIENT`, `DELIVERY_RATE_LIMITED`, `DELIVERY_AUTHENTICATION_REQUIRED`, `DELIVERY_PERMISSION_DENIED`, `DELIVERY_INVALID_PAYLOAD`, `DELIVERY_UNSUPPORTED_EVIDENCE`, or `DELIVERY_MAPPING_VERSION_MISMATCH`. Only transient/rate-limit errors are automatic retries. HTTP404 blocks rather than falling back to positional turns or last-write-wins ingest. Preparation rejects more than 100 records, matching the server; prepared bodies are capped at 2 MiB; HTTP deadlines are 30 seconds; redirects are disabled. The core's immutable generic batch remains available if an explicit limit needs changing.
 
@@ -48,8 +50,8 @@ it can restart at login. Command failures, timeouts, and oversized output produc
 positive evidence takes precedence as
 `active`. Each scheduler command has a two-second deadline and a 1 MiB output cap.
 
-The SDK must inspect status before enabling a new durable job and before prepare
-or send. `active` always blocks. `unknown` requires an explicit user acknowledgment
+The SDK must inspect status before enabling a new durable job; `deliveryPrepare`
+and `deliverySend` rerun the same check themselves. `active` always blocks. `unknown` requires an explicit user acknowledgment
 that inspection was unavailable and they have checked/stopped legacy scheduling;
 that acknowledgment must never be reported as a successful inspection. Platforms
 other than macOS/Linux return `clear` with `legacy-installer-unsupported` because
@@ -96,6 +98,8 @@ contain no Relaycast transport or implicit credentials-driven acquisition.
 This package also builds the independent `agent-relay-probe` executable for the
 Cloud onboarding flow. It links the local capture engine, durable coordinator and
 optional RelayHistory transport directly; it does not load Node or invoke the
-JSON helper. The existing `relayhistory-plugin` remains Cargo's default executable.
+JSON helper. Its delivery cycle is a bounded
+`ai_hist_core::delivery::worker::drain` over the same `RelayHistoryReceiver`, so
+the probe and the SDK share one drain loop rather than two. The existing `relayhistory-plugin` remains Cargo's default executable.
 See [the probe guide](../../../docs/agent-relay-probe.md) for commands, state,
 local verification and companion-service requirements.

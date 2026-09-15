@@ -188,6 +188,8 @@ export interface LegacyScheduleStatus {
 export function legacySchedules(options: HelperOptions = {}): Promise<LegacyScheduleStatus> {
   return helperRequest('deliveryMigrationStatus', {}, options);
 }
+/** Explicit command pre-check. Delivery itself rechecks this in the helper,
+ * per dispatch, where a later install cannot race the decision. */
 async function requireMigration(options: RelayHistoryPluginOptions): Promise<void> {
   const result = await legacySchedules(options);
   if (
@@ -228,6 +230,15 @@ export function relayHistoryInstance(options: RelayHistoryPluginOptions = {}): s
   const canonical = endpoint.toString().replace(/\/+$/, '');
   return `${options.instanceId ?? 'default'}:${createHash('sha256').update(canonical).digest('hex').slice(0, 32)}`;
 }
+/** What this configuration asserts about the generation it delivers to. The
+ * helper enforces them; an omitted assertion is not checked there either. */
+function guards(options: RelayHistoryPluginOptions) {
+  return {
+    expectedAccount: options.expectedAccount,
+    instanceId: relayHistoryInstance(options),
+    acknowledgeUninspectedSchedules: options.acknowledgeUninspectedLegacySchedules === true,
+  };
+}
 export function relayHistoryDestination(
   options: RelayHistoryPluginOptions = {},
 ): HistoryDestination {
@@ -251,16 +262,14 @@ export function relayHistoryDestination(
       'source_observation',
       'observation_evidence',
     ],
+    // The legacy-scheduler guard and the account/instance assertions live in
+    // the helper's receiver, so this plugin and the probe recheck them
+    // identically before mapping and again before transport.
     prepare: async (batch, { signal }) => {
       try {
-        await requireMigration(options);
-        if (options.expectedAccount && batch.account_id !== options.expectedAccount)
-          throw new HistoryDeliveryError('permission_denied');
-        if (batch.instance_id !== relayHistoryInstance(options))
-          throw new HistoryDeliveryError('mapping_version_mismatch');
         const value = await helperRequest<PreparedHistoryPayload>(
           'deliveryPrepare',
-          { batch },
+          { batch, ...guards(options) },
           { ...options, signal },
         );
         return { body: value.body, content_type: value.content_type };
@@ -270,14 +279,9 @@ export function relayHistoryDestination(
     },
     send: async (prepared, { signal, batch }) => {
       try {
-        await requireMigration(options);
-        if (options.expectedAccount && batch.account_id !== options.expectedAccount)
-          throw new HistoryDeliveryError('permission_denied');
-        if (batch.instance_id !== relayHistoryInstance(options))
-          throw new HistoryDeliveryError('mapping_version_mismatch');
         return await helperRequest<DeliveryAcknowledgment>(
           'deliverySend',
-          { baseUrl: options.baseUrl, prepared },
+          { baseUrl: options.baseUrl, prepared, batch, ...guards(options) },
           { ...options, signal },
         );
       } catch (error) {

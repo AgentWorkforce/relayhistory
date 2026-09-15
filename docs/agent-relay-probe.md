@@ -76,12 +76,16 @@ No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
 
-The existing coordinator owns immutable batches, leases, retry/backoff,
-acknowledgments and compaction. The probe persists prepared bytes, validates the
-lease immediately before dispatch, then advances progress only on the transport's
-validated receipt. Mapping/account mismatches block delivery. A failed attempt
-retains unacknowledged data. Transport credentials refresh through the existing
-RelayHistory auth implementation.
+Each cycle delivers through the shared core delivery worker — the same bounded
+drain the SDK uses — carrying the RelayHistory receiver. The worker owns
+immutable batches, leases and their keepalive, prepared-byte persistence, the
+eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
+and compaction; the receiver owns only the consent and destination guards and
+the transport, so progress advances only on a validated receipt. Mapping/account
+mismatches block delivery. A failed attempt retains unacknowledged data and the
+job waits out its own backoff, which is normal operation rather than a fault.
+Transport credentials refresh through the existing RelayHistory auth
+implementation.
 
 The probe sends the onboarding heartbeat only after a successful capture and
 delivery cycle. Cloud determines whether session data has actually arrived. A
@@ -92,11 +96,11 @@ carry the startup identity, so an old stop file cannot stop a new run. There is
 no signaling of arbitrary stored PIDs; startup timeout terminates only the child
 process launched by that setup invocation.
 
-Setup and each delivery cycle check legacy managed launchd/cron uploaders without
-changing them, including a recheck immediately before dispatch. An
-active old uploader blocks setup. An unavailable inspection requires the explicit
-`--acknowledge-uninspected-schedules` flag after the user has checked their older
-schedules. Arbitrarily named/manual uploaders are not discoverable by this check.
+Setup and every dispatch check legacy managed launchd/cron uploaders without
+changing them: the receiver rechecks them before mapping a batch and again
+immediately before sending it. An active old uploader blocks setup. An
+unavailable inspection requires the explicit `--acknowledge-uninspected-schedules`
+flag after the user has checked their older schedules. Arbitrarily named/manual uploaders are not discoverable by this check.
 
 ## Companion changes and distribution
 
