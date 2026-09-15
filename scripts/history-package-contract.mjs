@@ -1,7 +1,38 @@
 /** Shared release metadata and shell-free npm invocation for optional packages. */
 import assert from "node:assert/strict";
-import { existsSync, realpathSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Where each half of the native contract version is declared. Both halves are
+ * the checkout's own source of truth, so every gate reads the number from here
+ * instead of repeating a literal that a bump would have to chase.
+ */
+export const nativeContractSources = {
+  rust: [
+    "crates/ai-hist-napi/src/lib.rs",
+    /pub const NATIVE_CONTRACT_VERSION:\s*u32\s*=\s*(\d+)\s*;/,
+    "the Rust binding",
+  ],
+  sdk: [
+    "sdk-ts/src/native.ts",
+    /export const NATIVE_CONTRACT_VERSION\s*=\s*(\d+)\s*;/,
+    "the TypeScript SDK",
+  ],
+};
+
+/** The native contract version this checkout's sources require. */
+export function nativeContractVersion(half = "sdk", root = repositoryRoot) {
+  const entry = nativeContractSources[half];
+  assert.ok(entry, `Unknown native contract source: ${half}`);
+  const [relativePath, pattern, label] = entry;
+  const match = pattern.exec(readFileSync(resolve(root, relativePath), "utf8"));
+  assert.ok(match, `Could not read the native contract version from ${label}`);
+  return Number(match[1]);
+}
 
 export const plugins = {
   relayhistory: { name: "relayhistory", binary: "relayhistory-plugin" },

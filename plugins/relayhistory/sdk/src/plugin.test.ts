@@ -61,6 +61,10 @@ const records = [
   record('tool_call', 'tool', { args_json: '{"path":"fixture.ts"}' }),
   record('file_edit', 'edit', { patches: '[{"patch":"+fixture"}]' }),
 ];
+/** Answers the delivery operations the way the real Rust helper does: its
+ * receiver applies the legacy-scheduler, account and instance guards before it
+ * maps or sends anything, so these tests still assert user-visible behaviour.
+ * Nothing past those guards is emulated. */
 async function fixtureHelper(
   t: test.TestContext,
   state: 'clear' | 'active' | 'unknown' = 'clear',
@@ -71,7 +75,7 @@ async function fixtureHelper(
   const path = join(dir, 'helper');
   await writeFile(
     path,
-    `#!${process.execPath}\nlet input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);let value;switch(request.operation){case 'deliveryMigrationStatus':value={state:${JSON.stringify(state)},jobs:[]};break;case 'deliveryRead':if(request.args.readOptions.expectedAccount!==${JSON.stringify(account)}){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}value={protocolVersion:1,listing:'live',records:${recordsPath ? `JSON.parse(require('node:fs').readFileSync(${JSON.stringify(recordsPath)},'utf8'))` : JSON.stringify(records)},nextCursor:null};break;case 'cloudResolveSession':value={auth:{baseUrl:'https://fixture.invalid',accessToken:'fixture-token',orgId:'org-fixture',workspaceId:'workspace-fixture'}};break;default:process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:true,value}));});\n`,
+    `#!${process.execPath}\nlet input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);let value;switch(request.operation){case 'deliveryMigrationStatus':value={state:${JSON.stringify(state)},jobs:[]};break;case 'deliveryRead':if(request.args.readOptions.expectedAccount!==${JSON.stringify(account)}){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}value={protocolVersion:1,listing:'live',records:${recordsPath ? `JSON.parse(require('node:fs').readFileSync(${JSON.stringify(recordsPath)},'utf8'))` : JSON.stringify(records)},nextCursor:null};break;case 'deliveryPrepare':case 'deliverySend':{const state=${JSON.stringify(state)};if(state==='active'||(state==='unknown'&&request.args.acknowledgeUninspectedSchedules!==true)){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.expectedAccount&&request.args.batch.account_id!==request.args.expectedAccount){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_PERMISSION_DENIED'}}));return;}if(request.args.instanceId&&request.args.batch.instance_id!==request.args.instanceId){process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'DELIVERY_MAPPING_VERSION_MISMATCH'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}case 'cloudResolveSession':value={auth:{baseUrl:'https://fixture.invalid',accessToken:'fixture-token',orgId:'org-fixture',workspaceId:'workspace-fixture'}};break;default:process.stdout.write(JSON.stringify({version:1,ok:false,error:{code:'INVALID_ARGUMENT'}}));return;}process.stdout.write(JSON.stringify({version:1,ok:true,value}));});\n`,
   );
   await chmod(path, 0o700);
   return path;

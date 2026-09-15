@@ -24,7 +24,7 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "peerDependencies": {
-    "ai-hist": "^0.16.0"
+    "ai-hist": "^0.17.0"
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",

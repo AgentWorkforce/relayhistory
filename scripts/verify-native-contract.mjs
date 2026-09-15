@@ -1,29 +1,10 @@
-import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+import { nativeContractVersion } from './history-package-contract.mjs';
 
-function readVersion(relativePath, pattern, label) {
-  const source = readFileSync(resolve(repositoryRoot, relativePath), 'utf8');
-  const match = pattern.exec(source);
-  if (!match) {
-    throw new Error(`Could not read the native contract version from ${label}`);
-  }
-  return Number(match[1]);
-}
-
-const rustVersion = readVersion(
-  'crates/ai-hist-napi/src/lib.rs',
-  /pub const NATIVE_CONTRACT_VERSION:\s*u32\s*=\s*(\d+)\s*;/,
-  'the Rust binding',
-);
-const sdkVersion = readVersion(
-  'sdk-ts/src/native.ts',
-  /export const NATIVE_CONTRACT_VERSION\s*=\s*(\d+)\s*;/,
-  'the TypeScript SDK',
-);
+const rustVersion = nativeContractVersion('rust');
+const sdkVersion = nativeContractVersion('sdk');
 
 const versions = [
   ['Rust binding source', rustVersion],

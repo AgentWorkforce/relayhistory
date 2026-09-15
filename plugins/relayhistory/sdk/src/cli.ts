@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /** Optional compatibility CLI. Local history commands remain in ai-hist. */
-import { accessToken, enableCloud, loadStoredRelayhistoryAuth, login, replay, validateCloudExchangeBaseUrl } from './cloud-client.js';
+import { accessToken, enableCloud, login, replay } from './cloud-client.js';
 import { createHistoryPlugin } from './plugin.js';
-import { prepareCloudSessionForEnableCloud } from './cloud-preflight.js';
 async function main() {
   const [command,...args]=process.argv.slice(2).filter(arg=>arg!=='--no-warning');
   const flags=new Map<string,string|true>(); const positionals:string[]=[];
@@ -29,13 +28,12 @@ async function main() {
   if(command==='login'||command==='enable-cloud'){
     if(positionals.length)throw new Error(`${command} takes no positional arguments`);
     if(command==='login'&&text('token')&&!baseUrl)throw new Error('login requires --base-url with --token');
-    let token=text('token');
-    if(!token&&!(command==='enable-cloud'&&await loadStoredRelayhistoryAuth(baseUrl))){
-      token=await prepareCloudSessionForEnableCloud(command,args)??undefined;
-      if(token)await validateCloudExchangeBaseUrl(baseUrl);
-    }
-    if(command==='login'){const auth=await login({baseUrl,relayAccessToken:token,label:text('label')});process.stdout.write(flags.has('json')?JSON.stringify({ok:true,base_url:auth.baseUrl})+'\n':`Logged in to ${auth.baseUrl} (session stored).\n`);return;}
-    const handle=await enableCloud({baseUrl,dbPath:text('db'),relayAccessToken:token,intervalMs:(number('interval')??60)*1000,watch:!flags.has('once'),onPush:result=>process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n')});
+    // Agent Relay Cloud sign-in, its credential precedence and its destination
+    // gate all run in the Rust helper; this only reports whether a terminal is
+    // attached, so a browser approval is never started where nobody sees it.
+    const token=text('token');
+    if(command==='login'){const auth=await login({baseUrl,relayAccessToken:token,label:text('label'),...(token?{}:{interactive:process.stdin.isTTY===true})});process.stdout.write(flags.has('json')?JSON.stringify({ok:true,base_url:auth.baseUrl})+'\n':`Logged in to ${auth.baseUrl} (session stored).\n`);return;}
+    const handle=await enableCloud({baseUrl,dbPath:text('db'),relayAccessToken:token,...(token?{}:{interactive:process.stdin.isTTY===true}),intervalMs:(number('interval')??60)*1000,watch:!flags.has('once'),onPush:result=>process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n')});
     const {stop,...result}=handle;process.stdout.write(JSON.stringify({base_url:result.baseUrl,sent:result.sent,accepted:result.accepted,sync_skipped:result.syncSkipped})+'\n');process.once('SIGINT',()=>void stop());process.once('SIGTERM',()=>void stop());return;
   }
   const operation=createHistoryPlugin({baseUrl}).commands?.find(item=>item.name===command);

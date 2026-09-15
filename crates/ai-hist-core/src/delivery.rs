@@ -20,6 +20,7 @@
 
 mod schema;
 mod snapshot;
+pub mod worker;
 pub use snapshot::{
     close_export, create_export, expire_exports, export_page, ExportHandle, HistoryExportPage,
 };

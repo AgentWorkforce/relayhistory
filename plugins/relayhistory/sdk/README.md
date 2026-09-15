@@ -17,6 +17,14 @@ relayhistory-plugin login --base-url https://history.agentrelay.com
 relayhistory-plugin token --base-url https://history.agentrelay.com
 ```
 
+Agent Relay Cloud sign-in runs in that Rust helper, not in JavaScript: no Cloud
+SDK is bundled and no JavaScript code reads a Cloud credential. Without
+`--token`, the helper takes `CLOUD_API_ACCESS_TOKEN`, then an unexpired Agent
+Relay CLI session at `~/.agentworkforce/relay/cloud-auth.json` matching
+`CLOUD_API_URL`, and only with a terminal attached the browser/device flow,
+whose approval URL it writes to that terminal. A run with no terminal and no
+credential fails immediately rather than waiting for an approval nobody sees.
+
 These commands intentionally remain in the optional package. Replace imports
 from `ai-hist/cloud` with `@agent-relay/relayhistory`; local Git hook/commit-link
 functions stay in `ai-hist`.

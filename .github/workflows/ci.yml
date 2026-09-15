@@ -153,3 +153,19 @@ jobs:
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Verify installed local SDK on Windows
         run: node scripts/smoke-history-packages.mjs
+
+  native-cloud-probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Probe regression tests
+        run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
+      - name: Native release build
+        run: cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --release --bin agent-relay-probe --locked
+      - name: Executable smoke check
+        run: plugins/relayhistory/rust/target/release/agent-relay-probe --version

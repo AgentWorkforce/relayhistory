@@ -79,7 +79,7 @@ and `ai-hist delivery run` with explicit configuration and selection. Stop old
 managed push schedules before enabling a durable generation; existing positional
 cursors cannot be converted to acknowledgments. See [cloud setup](enable-cloud.md).
 
-Native contract 14 rejects older addons whose credential-driven source selection
+Native contract 15 rejects older addons whose credential-driven source selection
 or cloud exports would violate the new boundary. Optional source plugins use the
 fixed JSON observation/evidence intake; installing another source does not
 require rebuilding that addon. JavaScript and MCP hosts continue to use public

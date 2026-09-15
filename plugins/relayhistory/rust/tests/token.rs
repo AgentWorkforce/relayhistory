@@ -433,8 +433,9 @@ fn sdk_login_rejects_a_malformed_selector_instead_of_using_production() {
     std::env::set_var("RELAYHISTORY_HOME", home.path());
     std::env::set_var("RELAYHISTORY_BASE_URL", "not-a-url");
     std::env::remove_var("AI_HIST_BASE_URL");
-    let error = relayhistory_plugin::cloud::login_for_sdk(None, Some("relay-token"), None)
-        .expect_err("a malformed selector must not authenticate against production");
+    let error =
+        relayhistory_plugin::cloud::login_for_sdk(None, Some("relay-token"), None, false, None)
+            .expect_err("a malformed selector must not authenticate against production");
     let message = format!("{error:#}");
     for (key, value) in previous {
         match value {

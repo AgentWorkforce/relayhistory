@@ -13,7 +13,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { helperTarball, npmCli } from "./history-package-contract.mjs";
+import {
+  helperTarball,
+  nativeContractVersion,
+  npmCli,
+} from "./history-package-contract.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helperIndex = process.argv.indexOf("--helpers");
 const helpers = helperIndex < 0 ? null : resolve(process.argv[helperIndex + 1]);
@@ -152,7 +156,7 @@ try {
   const script = join(project, "verify.mjs");
   await writeFile(
     script,
-    `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import native from 'ai-hist-native';import {createRequire} from 'node:module';const require=createRequire(import.meta.url);\nassert.equal(sdk.login,undefined);assert.equal(sdk.pushCloud,undefined);assert.equal(native.cloudLoadAuth,undefined);assert.equal(native.nativeContractVersion(),14);assert.equal(typeof native.applySourceEvidence,'function');assert.throws(()=>require.resolve('ai-hist/cloud'));assert.throws(()=>require.resolve('@agent-relay/cloud'));assert.deepEqual(await sdk.recent({dbPath:${JSON.stringify(join(project, "missing.db"))},scope:'remote'}),[]);\n`,
+    `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import native from 'ai-hist-native';import {createRequire} from 'node:module';const require=createRequire(import.meta.url);\nassert.equal(sdk.login,undefined);assert.equal(sdk.pushCloud,undefined);assert.equal(native.cloudLoadAuth,undefined);assert.equal(native.nativeContractVersion(),${nativeContractVersion()});assert.equal(typeof native.applySourceEvidence,'function');assert.throws(()=>require.resolve('ai-hist/cloud'));assert.throws(()=>require.resolve('@agent-relay/cloud'));assert.deepEqual(await sdk.recent({dbPath:${JSON.stringify(join(project, "missing.db"))},scope:'remote'}),[]);\n`,
   );
   run(process.execPath, [script]);
   const login = spawnSync(

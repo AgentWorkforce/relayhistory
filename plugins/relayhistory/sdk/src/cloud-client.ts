@@ -46,7 +46,16 @@ export async function replay(sessionId: string, options: ReplayOptions = {}): Pr
   return { eventCount: result.eventCount, transcript: result.transcript ?? null, outputPath: result.outputPath ?? null };
 }
 
-export interface CloudOptions { dbPath?: string; baseUrl?: string; relayAccessToken?: string; label?: string }
+export interface CloudOptions {
+  dbPath?: string;
+  baseUrl?: string;
+  relayAccessToken?: string;
+  label?: string;
+  /** Without a token, Rust may start the browser device flow only when this is true. */
+  interactive?: boolean;
+  /** Optional workspace selector for the Cloud sign-in Rust performs. */
+  workspace?: string;
+}
 export interface EnableCloudOptions extends CloudOptions {
   /** Keep syncing until stop() is called. Defaults to true. */
   watch?: boolean;
@@ -82,23 +91,38 @@ export async function refreshCloudSession(baseUrl: string, rejectedToken: string
   return helperCall((native) => native.cloudRefreshSession(baseUrl, rejectedToken));
 }
 
-/** Refuse to forward an SDK-obtained Agent Relay bearer to an untrusted stage. */
-export async function validateCloudExchangeBaseUrl(baseUrl?: string): Promise<void> {
-  return helperCall((native) => native.cloudValidateExchangeBaseUrl(baseUrl));
-}
-
 export interface LoginOptions {
   baseUrl?: string;
+  /**
+   * An Agent Relay Cloud bearer to exchange. Omit it to let Rust resolve
+   * identity itself: `CLOUD_API_ACCESS_TOKEN`, then the Agent Relay CLI session
+   * file, then — only with {@link interactive} — the OAuth device flow.
+   */
   relayAccessToken?: string;
   label?: string;
+  /**
+   * Whether Rust may run the browser/device flow and write its approval URL to
+   * the controlling terminal. Without it a login that has no usable credential
+   * fails fast instead of waiting for an approval nobody can see.
+   */
+  interactive?: boolean;
+  /** Optional workspace selector for the Cloud sign-in Rust performs. */
+  workspace?: string;
 }
 
-/** Exchange a supplied Agent Relay Cloud bearer for a RelayHistory session. */
+/**
+ * Exchange an Agent Relay Cloud bearer for a RelayHistory session.
+ *
+ * Sign-in itself lives in the Rust helper: this passes the request through and
+ * never obtains, stores or inspects a Cloud credential in JavaScript.
+ */
 export async function login(options: LoginOptions = {}): Promise<RelayhistoryAuth> {
   return helperCall((native) => native.cloudLogin({
     baseUrl: options.baseUrl,
     relayAccessToken: options.relayAccessToken,
     label: options.label,
+    interactive: options.interactive,
+    workspace: options.workspace,
   }));
 }
 
