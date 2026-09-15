@@ -367,6 +367,8 @@ fn install(options: Install) -> Result<()> {
                     job.job_id
                 }
                 None => {
+                    // No generation to inherit a baseline from, so the exclusion
+                    // table has to be brought in line with this choice first.
                     collector::record_baseline(&conn, include_existing)?;
                     ai_hist_core::delivery::create_job(&conn, &job_config, collector::now())?.job_id
                 }

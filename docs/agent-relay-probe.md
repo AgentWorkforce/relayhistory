@@ -46,7 +46,10 @@ events before creating its delivery generation. It sends session metadata and
 session events, omitting the separate prompt-only records because some lack a
 session identity. The baseline is stored as durable delivery exclusions, which
 the coordinator rechecks whenever a batch is prepared, claimed and dispatched,
-so it does not grow the delivery configuration with local history. Sessions
+so it does not grow the delivery configuration with local history. A setup
+abandoned between that snapshot and its delivery generation leaves the baseline
+behind; a later setup that chooses to share existing sessions withdraws it, so
+the choice that takes effect is always the one just made. Sessions
 discovered later are treated as new; this is a local capture baseline, not a
 guarantee about the actual creation time of files added later. The saved sharing
 choice is immutable on reconnect.

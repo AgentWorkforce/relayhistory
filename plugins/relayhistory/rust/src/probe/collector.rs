@@ -37,14 +37,19 @@ pub fn selection(include_existing: bool) -> ExportSelection {
         excluded_sessions: vec![],
     }
 }
-/// Record the new-only baseline as durable exclusions, which delivery rechecks
-/// when a batch is prepared, claimed and dispatched. This must complete before
-/// the job exists: an exclusion added afterwards would race an already prepared
-/// batch, while a baseline written without a job only withholds more history.
+/// Converge the durable exclusion baseline on the requested sharing choice and
+/// report how many sessions it now withholds. Delivery rechecks exclusions when
+/// a batch is prepared, claimed and dispatched, so a new-only baseline has to be
+/// complete before the job exists: written afterwards it would race an already
+/// prepared batch, whereas written without a job it only withholds more history.
+///
+/// That ordering is also why the choice to share existing sessions must withdraw
+/// the baseline rather than ignore it. Exclusions outlive the generation they
+/// were recorded for, so a setup abandoned between the snapshot and its job
+/// would otherwise keep suppressing exactly the history the user has now opted
+/// in to send. Withdrawal is refused while a live job still selects a session,
+/// which this path cannot reach: it runs only when no generation was adopted.
 pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usize> {
-    if include_existing {
-        return Ok(0);
-    }
     let snapshot = conn.unchecked_transaction()?;
     let mut identities = Vec::new();
     loop {
@@ -56,12 +61,16 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
         identities.extend(page);
     }
     // Exclusions take their own short write transactions, so the consistent
-    // read has to end before any of them is recorded.
+    // read has to end before any of them is recorded or withdrawn.
     snapshot.commit()?;
     for identity in &identities {
-        delivery::set_session_excluded(conn, identity, true)?;
+        delivery::set_session_excluded(conn, identity, !include_existing)?;
     }
-    Ok(identities.len())
+    Ok(if include_existing {
+        0
+    } else {
+        identities.len()
+    })
 }
 /// Only the transport classifies the batch itself; `destination::prepare` and
 /// `send` report a mapping or payload verdict as a `TransportFailure`. Every
@@ -418,6 +427,25 @@ mod tests {
             [],
         )
         .unwrap();
+        assert_eq!(record_baseline(&conn, true).unwrap(), 0);
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        assert_eq!(
+            claim_sessions(&conn, &job.job_id),
+            vec!["before".to_string()]
+        );
+    }
+    #[test]
+    fn an_abandoned_baseline_does_not_outlive_a_later_include_existing_setup() {
+        let conn = Connection::open_in_memory().unwrap();
+        ai_hist_core::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
+            [],
+        )
+        .unwrap();
+        // Setup is interrupted after the snapshot, before any generation exists.
+        assert_eq!(record_baseline(&conn, false).unwrap(), 1);
+        // The next attempt chooses to share existing sessions instead.
         assert_eq!(record_baseline(&conn, true).unwrap(), 0);
         let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
         assert_eq!(
