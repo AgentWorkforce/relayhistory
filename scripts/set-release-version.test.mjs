@@ -91,7 +91,7 @@ dependencies = [
 }
 
 /** A throwaway checkout holding only the files a release version rewrites. */
-async function stagePlugins() {
+async function stagePlugins(crlf = false) {
   const root = await mkdtemp(join(tmpdir(), "set-release-version-"));
   for (const [plugin, info] of Object.entries(plugins)) {
     const directory = join(root, "plugins", plugin, "sdk");
@@ -108,8 +108,10 @@ async function stagePlugins() {
     const rust = join(root, "plugins", plugin, "rust");
     await mkdir(rust, { recursive: true });
     const crate = crateFixture(info);
-    await writeFile(join(rust, "Cargo.toml"), crate.manifest);
-    await writeFile(join(rust, "Cargo.lock"), crate.lock);
+    // Windows checkouts carry CRLF; the stamping must not depend on that.
+    const eol = (text) => (crlf ? text.replace(/\n/g, "\r\n") : text);
+    await writeFile(join(rust, "Cargo.toml"), eol(crate.manifest));
+    await writeFile(join(rust, "Cargo.lock"), eol(crate.lock));
   }
   return root;
 }
@@ -202,4 +204,16 @@ test("only a stable release version is accepted", async () => {
     await assert.rejects(() => setReleaseVersion(version, root));
   }
   assert.deepEqual(await files(root), before);
+});
+
+test("crate stamping survives CRLF checkouts", async () => {
+  const root = await stagePlugins(true);
+  await setReleaseVersion("1.2.3", root);
+  for (const plugin of Object.keys(plugins)) {
+    const manifest = await readCrate(root, plugin, "Cargo.toml");
+    const lock = await readCrate(root, plugin, "Cargo.lock");
+    assert.match(manifest, /\[package\]\r\nname = "[^"]+"\r\nversion = "1\.2\.3"/);
+    assert.match(lock, /\[\[package\]\]\r\nname = "[^"]+"\r\nversion = "1\.2\.3"/);
+    assert.doesNotMatch(manifest, /[^\r]\n/, "line endings must be preserved");
+  }
 });

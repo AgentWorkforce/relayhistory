@@ -27,17 +27,20 @@ export const releaseVersionPattern = /^\d+\.\d+\.\d+$/;
 export const localCoreDependency = "file:../../../sdk-ts";
 
 /** The `[package]` header of a crate manifest, so the crate names itself. */
-const crateNamePattern = /\[package\]\nname = "([^"]+)"\nversion = "/;
+// Windows runners check out with CRLF, so a line break is `\r?\n` here.
+const crateNamePattern = /\[package\]\r?\nname = "([^"]+)"\r?\nversion = "/;
 /** That same crate's version line, in the manifest and in its own lockfile. */
 const crateVersionPatterns = (crate) => [
   [
     "Cargo.toml",
-    new RegExp(`(\\[package\\]\\nname = "${crate}"\\nversion = ")[^"]+(")`),
+    new RegExp(
+      `(\\[package\\]\\r?\\nname = "${crate}"\\r?\\nversion = ")[^"]+(")`,
+    ),
   ],
   [
     "Cargo.lock",
     new RegExp(
-      `(\\[\\[package\\]\\]\\nname = "${crate}"\\nversion = ")[^"]+(")`,
+      `(\\[\\[package\\]\\]\\r?\\nname = "${crate}"\\r?\\nversion = ")[^"]+(")`,
     ),
   ],
 ];
