@@ -75,11 +75,10 @@ jobs:
         working-directory: .
     outputs:
       version: ${{ steps.version.outputs.version }}
+    # No checkout and no third-party action: the runner's own node, npm and gh
+    # are enough to read the registry and the tag list, so nothing untrusted
+    # runs before the version that every later job trusts is decided.
     steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22.14.0'
-          registry-url: 'https://registry.npmjs.org'
       - name: Resolve release version
         id: version
         env:
@@ -610,29 +609,24 @@ jobs:
       - name: Prepare release version commit
         if: ${{ !inputs.dry_run }}
         working-directory: .
-        env:
-          PLUGINS: ${{ inputs.plugins }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ "$PLUGINS" = "true" ]; then
-            # The plugin job re-applies this exact script on its own checkout,
-            # so the committed manifests and the published ones cannot diverge.
-            node scripts/set-release-version.mjs "$VERSION"
-            # The crates too: the helper matrix built its executables from this
-            # same script, so the committed sources match what was compiled.
-            git add \
-              plugins/relayhistory/sdk/package.json \
-              plugins/relayhistory/sdk/package-lock.json \
-              plugins/relayhistory/rust/Cargo.toml \
-              plugins/relayhistory/rust/Cargo.lock \
-              plugins/provider-sources/sdk/package.json \
-              plugins/provider-sources/sdk/package-lock.json \
-              plugins/provider-sources/rust/Cargo.toml \
-              plugins/provider-sources/rust/Cargo.lock
-          fi
+          # Always, whatever the plugins/probe inputs: the release tag must carry
+          # the same plugin manifests and crate versions the helper matrix built
+          # from, so a later skip_core re-run against this tag publishes exactly
+          # that, and the plugin job's re-application of this script is a no-op.
+          node scripts/set-release-version.mjs "$VERSION"
           git add \
+            plugins/relayhistory/sdk/package.json \
+            plugins/relayhistory/sdk/package-lock.json \
+            plugins/relayhistory/rust/Cargo.toml \
+            plugins/relayhistory/rust/Cargo.lock \
+            plugins/provider-sources/sdk/package.json \
+            plugins/provider-sources/sdk/package-lock.json \
+            plugins/provider-sources/rust/Cargo.toml \
+            plugins/provider-sources/rust/Cargo.lock \
             Cargo.lock \
             crates/ai-hist-napi/Cargo.toml \
             crates/ai-hist-napi/package.json \

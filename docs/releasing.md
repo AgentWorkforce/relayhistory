@@ -34,9 +34,11 @@ and `crates/ai-hist-napi/src/lib.rs`).
    release version (`agent-relay-probe --version` is asserted to print exactly
    `agent-relay-probe <version>` wherever the runner can execute it). Both jobs
    run in parallel and upload binaries as artifacts.
-3. `publish` applies that version to every manifest and lockfile (including
-   the plugin manifests and both plugin crates, via
-   `scripts/set-release-version.mjs`), prepares the version-only commit, then
+3. `publish` applies that version to every manifest and lockfile — the core
+   packages and, whatever the `plugins`/`probe` inputs, the plugin manifests
+   and both plugin crates via `scripts/set-release-version.mjs`, so the tag
+   always carries what the helper matrix built from — prepares the
+   version-only commit, then
    publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package

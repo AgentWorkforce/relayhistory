@@ -132,11 +132,17 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     assert.ok(rootEntry, `${lockPath} is missing its root package entry`);
     rootEntry.version = version;
     if (rootEntry.optionalDependencies) {
+      // Only the configured helper packages follow the release version; any
+      // other optional dependency keeps the version the manifest declares.
+      const helperNames = new Set(
+        Object.keys(platforms).map(
+          (platform) => `@agent-relay/${info.name}-${platform}`,
+        ),
+      );
       rootEntry.optionalDependencies = Object.fromEntries(
-        Object.keys(rootEntry.optionalDependencies).map((name) => [
-          name,
-          version,
-        ]),
+        Object.entries(rootEntry.optionalDependencies).map(
+          ([name, current]) => [name, helperNames.has(name) ? version : current],
+        ),
       );
     }
     if (rootEntry.peerDependencies?.["ai-hist"]) {
