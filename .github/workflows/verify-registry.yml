@@ -1,0 +1,31 @@
+name: Verify published packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Already published stable version to verify (for example 0.18.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Match release npm version
+        run: npm install -g npm@11.19.1
+      - name: Registry clean-install smoke test
+        env:
+          VERSION: ${{ inputs.version }}
+        run: node scripts/registry-clean-install-smoke.mjs
