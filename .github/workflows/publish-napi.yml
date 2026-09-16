@@ -61,8 +61,97 @@ defaults:
     working-directory: crates/ai-hist-napi
 
 jobs:
+  # The release version is resolved once, before anything is built, because the
+  # helper matrix stamps it into the Rust crates it compiles. A `skip_core`
+  # re-run names an already published version instead, and every job that builds
+  # then checks out that release's tag rather than the dispatch commit.
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Resolve release version
+        id: version
+        env:
+          VERSION_TYPE: ${{ inputs.version }}
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
+          SKIP_CORE: ${{ inputs.skip_core }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$SKIP_CORE" = "true" ]; then
+            # A plugin/probe-only re-run has no publish job to name the version,
+            # and it must rebuild the code that release actually shipped.
+            if [ -z "$CUSTOM_VERSION" ]; then
+              echo "skip_core needs custom_version: the already published core version the plugins and probe belong to" >&2
+              exit 1
+            fi
+            VERSION="$CUSTOM_VERSION"
+          elif [ -n "$CUSTOM_VERSION" ]; then
+            VERSION="$CUSTOM_VERSION"
+          else
+            # The registry determines the next version. A successful release
+            # persists that version back to the checked-in manifests in publish.
+            # Use the highest published semver across the public packages so a
+            # partial release (native only) cannot collide on the next patch.
+            CURRENT_VERSION=$(node -e '
+              const { execSync } = require("node:child_process");
+              const versions = ["ai-hist", "ai-hist-native"].map((pkg) =>
+                execSync(`npm view ${pkg} version`, { encoding: "utf8" }).trim(),
+              );
+              const key = (version) => version.split(".").map(Number);
+              versions.sort((left, right) => {
+                const [a, b] = [key(left), key(right)];
+                for (let index = 0; index < 3; index += 1) {
+                  if (a[index] !== b[index]) return a[index] - b[index];
+                }
+                return 0;
+              });
+              process.stdout.write(versions.at(-1));
+            ')
+            VERSION=$(node -e '
+              const [current, bump] = process.argv.slice(1);
+              const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(current);
+              if (!match) throw new Error("Expected a stable semver, received " + current);
+              let [, major, minor, patch] = match.map(Number);
+              if (bump === "major") [major, minor, patch] = [major + 1, 0, 0];
+              else if (bump === "minor") [minor, patch] = [minor + 1, 0];
+              else if (bump === "patch") patch += 1;
+              else throw new Error("Unsupported version bump: " + bump);
+              process.stdout.write([major, minor, patch].join("."));
+            ' "$CURRENT_VERSION" "$VERSION_TYPE")
+          fi
+          node -e '
+            const version = process.argv[1];
+            if (!/^\d+\.\d+\.\d+$/.test(version)) {
+              throw new Error("Version must be a stable semver: " + version);
+            }
+          ' "$VERSION"
+          if [ "$SKIP_CORE" = "true" ]; then
+            # The helper and plugin jobs build from this tag, so it has to exist
+            # before anything is compiled. `publish` creates it on a normal run.
+            if ! gh api "repos/${{ github.repository }}/git/ref/tags/sdk-ts-v$VERSION" >/dev/null 2>&1; then
+              echo "No release tag sdk-ts-v$VERSION; skip_core only re-runs a release this workflow already cut" >&2
+              exit 1
+            fi
+            echo "Re-running plugins/probe from the tag sdk-ts-v$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version $VERSION"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     if: ${{ !inputs.skip_core }}
     runs-on: ${{ matrix.os }}
     env:
@@ -212,6 +301,7 @@ jobs:
 
   helpers:
     name: Helper ${{ matrix.plugin }} ${{ matrix.platform }}
+    needs: version
     if: ${{ inputs.plugins || inputs.probe }}
     runs-on: ${{ matrix.os }}
     permissions:
@@ -222,6 +312,7 @@ jobs:
         working-directory: .
     env:
       MACOSX_DEPLOYMENT_TARGET: '12.0'
+      VERSION: ${{ needs.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -295,6 +386,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # A skip_core re-run must rebuild the code the named release shipped,
+          # never the newer dispatch commit. `format` is never empty, so the
+          # normal ref only applies when skip_core is off.
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -316,6 +411,15 @@ jobs:
         run: cargo install cargo-zigbuild --version 0.20.1 --locked
       - name: Test helper packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Stamp the release version into the plugin crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          # The executables report CARGO_PKG_VERSION, so the crate version has to
+          # be the release version before anything is compiled. The lock beside
+          # each crate is rewritten with it, so --locked still resolves.
+          node scripts/set-release-version.mjs "$VERSION"
       - name: Build and verify the helper executable
         id: helper
         shell: bash
@@ -353,7 +457,14 @@ jobs:
           fi
           if [ -n "$probe" ]; then
             test -s "$probe"
-            if [ "$PROBE_RUN" = true ]; then "$probe" --version; fi
+            if [ "$PROBE_RUN" = true ]; then
+              # The shipped binary must name the release it is attached to.
+              # Neither helper has a --version flag (one is a stdin JSON bridge,
+              # the other's compatibility CLI declares no version), so only the
+              # probe is asserted here.
+              printed=$("$probe" --version)
+              test "$printed" = "agent-relay-probe $VERSION"
+            fi
           fi
           if [ -n "$ABI" ]; then
             for elf in "$artifact" ${probe:+"$probe"}; do
@@ -361,8 +472,7 @@ jobs:
               ELF="$elf" python3 -c 'import os,re; versions=[tuple(map(int,v.split("."))) for v in re.findall(r"GLIBC_(\d+\.\d+(?:\.\d+)?)",open(os.environ["RUNNER_TEMP"]+"/versions.txt").read())]; assert versions and max(versions)<=(2,28), (os.environ["ELF"], versions)'
             done
           fi
-          # The raw binary travels; packaging needs the release version, which
-          # only the publish/resolve jobs know.
+          # The raw binary travels; the plugin job packages it at this version.
           echo "binary=$artifact" >> "$GITHUB_OUTPUT"
           echo "probe=$probe" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
@@ -379,15 +489,19 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: build
+    needs: [version, build]
     if: ${{ !inputs.skip_core }}
     runs-on: ubuntu-latest
     # Only the publish job mints OIDC tokens (npm provenance).
     permissions:
       contents: write
       id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      # Passed through so the plugin and probe jobs need only one dependency
+      # for the version, whether or not the core was published in this run.
+      version: ${{ needs.version.outputs.version }}
       release_sha: ${{ steps.persist-version.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
@@ -401,53 +515,11 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: Install deps
         run: npm ci
-      - name: Resolve release version
-        id: version
-        env:
-          VERSION_TYPE: ${{ inputs.version }}
-          CUSTOM_VERSION: ${{ inputs.custom_version }}
+      - name: Apply the release version to the core manifests
         run: |
           set -euo pipefail
-          if [ -n "$CUSTOM_VERSION" ]; then
-            VERSION="$CUSTOM_VERSION"
-          else
-            # The registry determines the next version. A successful release
-            # persists that version back to the checked-in manifests below.
-            # Use the highest published semver across the public packages so a
-            # partial release (native only) cannot collide on the next patch.
-            CURRENT_VERSION=$(node -e '
-              const { execSync } = require("node:child_process");
-              const versions = ["ai-hist", "ai-hist-native"].map((pkg) =>
-                execSync(`npm view ${pkg} version`, { encoding: "utf8" }).trim(),
-              );
-              const key = (version) => version.split(".").map(Number);
-              versions.sort((left, right) => {
-                const [a, b] = [key(left), key(right)];
-                for (let index = 0; index < 3; index += 1) {
-                  if (a[index] !== b[index]) return a[index] - b[index];
-                }
-                return 0;
-              });
-              process.stdout.write(versions.at(-1));
-            ')
-            VERSION=$(node -e '
-              const [current, bump] = process.argv.slice(1);
-              const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(current);
-              if (!match) throw new Error("Expected a stable semver, received " + current);
-              let [, major, minor, patch] = match.map(Number);
-              if (bump === "major") [major, minor, patch] = [major + 1, 0, 0];
-              else if (bump === "minor") [minor, patch] = [minor + 1, 0];
-              else if (bump === "patch") patch += 1;
-              else throw new Error("Unsupported version bump: " + bump);
-              process.stdout.write([major, minor, patch].join("."));
-            ' "$CURRENT_VERSION" "$VERSION_TYPE")
-          fi
-          node -e '
-            const version = process.argv[1];
-            if (!/^\d+\.\d+\.\d+$/.test(version)) {
-              throw new Error("Version must be a stable semver: " + version);
-            }
-          ' "$VERSION"
+          # The version job resolved this once, before anything was built.
+          test -n "$VERSION"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           (
             cd ../../sdk-ts
@@ -485,13 +557,10 @@ jobs:
             );
           }
           NODE
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version $VERSION"
 
       - name: Verify package versions are aligned
         working-directory: .
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           node -e '
             const fs = require("node:fs");
@@ -542,7 +611,6 @@ jobs:
         if: ${{ !inputs.dry_run }}
         working-directory: .
         env:
-          VERSION: ${{ steps.version.outputs.version }}
           PLUGINS: ${{ inputs.plugins }}
         run: |
           set -euo pipefail
@@ -552,11 +620,17 @@ jobs:
             # The plugin job re-applies this exact script on its own checkout,
             # so the committed manifests and the published ones cannot diverge.
             node scripts/set-release-version.mjs "$VERSION"
+            # The crates too: the helper matrix built its executables from this
+            # same script, so the committed sources match what was compiled.
             git add \
               plugins/relayhistory/sdk/package.json \
               plugins/relayhistory/sdk/package-lock.json \
+              plugins/relayhistory/rust/Cargo.toml \
+              plugins/relayhistory/rust/Cargo.lock \
               plugins/provider-sources/sdk/package.json \
-              plugins/provider-sources/sdk/package-lock.json
+              plugins/provider-sources/sdk/package-lock.json \
+              plugins/provider-sources/rust/Cargo.toml \
+              plugins/provider-sources/rust/Cargo.lock
           fi
           git add \
             Cargo.lock \
@@ -613,8 +687,6 @@ jobs:
 
       - name: Build SDK and CLI against the release contract
         working-directory: sdk-ts
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           npm install --ignore-scripts
@@ -669,7 +741,6 @@ jobs:
       - name: Registry clean-install smoke test
         if: ${{ !inputs.dry_run }}
         env:
-          VERSION: ${{ steps.version.outputs.version }}
           REGISTRY_VISIBILITY_ATTEMPTS: 36
           REGISTRY_VISIBILITY_DELAY_MS: 10000
           NPM_REGISTRY_RETRY_ATTEMPTS: 36
@@ -679,8 +750,6 @@ jobs:
       - name: Registry CLI smoke test on older glibc
         if: ${{ !inputs.dry_run }}
         working-directory: .
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           for image in node:22-bookworm-slim ubuntu:22.04; do
@@ -714,7 +783,6 @@ jobs:
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           gh release create "sdk-ts-v$VERSION" \
@@ -722,41 +790,12 @@ jobs:
             --title "ai-hist@$VERSION" \
             --generate-notes
 
-  resolve:
-    name: Resolve published core version
-    # A plugin/probe-only re-run has no publish job to name the version.
-    if: ${{ inputs.skip_core }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: .
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - name: Validate the requested version
-        id: version
-        env:
-          CUSTOM_VERSION: ${{ inputs.custom_version }}
-        run: |
-          set -euo pipefail
-          if [ -z "$CUSTOM_VERSION" ]; then
-            echo "skip_core needs custom_version: the already published core version the plugins and probe belong to" >&2
-            exit 1
-          fi
-          if ! printf '%s' "$CUSTOM_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Version must be a stable semver: $CUSTOM_VERSION" >&2
-            exit 1
-          fi
-          echo "version=$CUSTOM_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Re-running plugins/probe for the published core $CUSTOM_VERSION"
-
   plugins:
     name: Publish optional history plugins
-    needs: [publish, resolve, helpers]
-    # Exactly one of publish/resolve produces the version; the other is skipped.
-    if: ${{ !cancelled() && inputs.plugins && needs.helpers.result == 'success' && (needs.publish.result == 'success' || needs.resolve.result == 'success') }}
+    needs: [version, publish, helpers]
+    # `publish` is deliberately skipped by a skip_core re-run, so it is only
+    # required when this run is actually releasing the core.
+    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.helpers.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -765,13 +804,16 @@ jobs:
       run:
         working-directory: .
     env:
-      VERSION: ${{ needs.publish.outputs.version || needs.resolve.outputs.version }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           # A real core release already persisted the plugin manifests at this
-          # version; dry runs and skip_core re-runs apply them below instead.
-          ref: ${{ needs.publish.outputs.release_sha || github.sha }}
+          # version; a dry run applies them below instead. A skip_core re-run
+          # packages the code the named release shipped, from its tag, never the
+          # newer dispatch commit (`format` is never empty, so the release sha
+          # and the dispatch fallback only apply when skip_core is off).
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || needs.publish.outputs.release_sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -864,8 +906,8 @@ jobs:
 
   probe:
     name: Attach agent-relay-probe binaries
-    needs: [publish, resolve, helpers]
-    if: ${{ !cancelled() && inputs.probe && needs.helpers.result == 'success' && (needs.publish.result == 'success' || needs.resolve.result == 'success') }}
+    needs: [version, publish, helpers]
+    if: ${{ !cancelled() && inputs.probe && needs.version.result == 'success' && needs.helpers.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
     # Release assets only; no checkout and no registry credentials.
     permissions:
@@ -874,7 +916,7 @@ jobs:
       run:
         working-directory: .
     env:
-      VERSION: ${{ needs.publish.outputs.version || needs.resolve.outputs.version }}
+      VERSION: ${{ needs.version.outputs.version }}
       PROBE_PLATFORMS: darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu
     steps:
       - uses: actions/download-artifact@v4

@@ -22,33 +22,43 @@ and `crates/ai-hist-napi/src/lib.rs`).
 
 ## What happens, in order
 
-1. `build` builds and tests the native addon on all seven targets, and
+1. `version` resolves the release version once, before anything is built: the
+   bump type applied to the highest published core version on npm, or
+   `custom_version`. Every other job takes the version from here, because the
+   helper matrix has to stamp it into the Rust crates it compiles.
+2. `build` builds and tests the native addon on all seven targets, and
    `helpers` builds the two Rust helpers for seven platforms — plus
    `agent-relay-probe` on the four platforms it ships for — verifying each
-   executable and its glibc floor. Both jobs run in parallel and upload
-   binaries as artifacts.
-2. `publish` computes the release version, aligns every manifest and lockfile
-   (including the plugin manifests, via `scripts/set-release-version.mjs`),
-   prepares the version-only commit, then publishes the platform packages,
+   executable and its glibc floor. `helpers` applies
+   `scripts/set-release-version.mjs` first, so the executables report the
+   release version (`agent-relay-probe --version` is asserted to print exactly
+   `agent-relay-probe <version>` wherever the runner can execute it). Both jobs
+   run in parallel and upload binaries as artifacts.
+3. `publish` applies that version to every manifest and lockfile (including
+   the plugin manifests and both plugin crates, via
+   `scripts/set-release-version.mjs`), prepares the version-only commit, then
+   publishes the platform packages,
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
-3. After the clean registry install and the older-glibc CLI smoke tests pass,
+4. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
    and creates the `sdk-ts-v<version>` tag and GitHub Release.
-4. `plugins` checks out that persisted commit, packages each helper binary at
+5. `plugins` checks out that persisted commit, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
    plugin before its JavaScript package.
-5. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
+6. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
    the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
    asset names the website mirrors.
 
 `scripts/set-release-version.mjs <version>` is the only place that knows what a
 plugin release version touches (version, the seven helper pins, the `ai-hist`
-peer range `^<version>`, and the lockfile coordinates). It is idempotent, and
-both the version commit and the plugin job run it, so the committed manifests
-and the published ones cannot diverge.
+peer range `^<version>`, the lockfile coordinates, and the `[package]` version
+of each plugin's Rust crate plus that crate's own `Cargo.lock` entry — the
+helper and probe executables report `CARGO_PKG_VERSION`). It is idempotent, and
+the helper matrix, the version commit and the plugin job all run it, so what was
+compiled, what was committed and what is published cannot diverge.
 
 ## Dry runs
 
@@ -61,10 +71,18 @@ digests. Dry runs never change the checked-in version baseline.
 ## Re-running plugins or probe alone
 
 Set `skip_core` with an explicit `custom_version` equal to an already published
-core version. `build` and `publish` are skipped; the plugin and probe jobs take
-the version from that input, so plugin manifests are re-derived and the assets
-are attached to the existing `sdk-ts-v<version>` Release. Turn off `plugins` or
-`probe` to narrow the re-run further.
+core version. `build` and `publish` are skipped. `version` verifies that the
+`sdk-ts-v<version>` tag exists before anything builds, and every job that builds
+or packages (`helpers`, `plugins`) checks out **that tag**, not the commit the
+run was dispatched from — otherwise a re-run would publish newer code under an
+older version and clobber the Release's probe binaries with it. Plugin manifests
+are re-derived from the tag and the assets are attached to the existing
+`sdk-ts-v<version>` Release. Turn off `plugins` or `probe` to narrow the re-run
+further.
+
+Because the re-run builds from the tag, it only works for releases cut by this
+workflow: a tag whose tree predates these scripts fails loudly at checkout or
+build time rather than shipping something mismatched.
 
 ## Supported matrix
 

@@ -14,8 +14,11 @@ coordinate versions of these same components without adding a runtime boundary.
 The core local SDK remains independent of the Cloud package.
 
 This binary is separate from `relayhistory-plugin`, whose JSON bridge, package
-name and Cargo default executable remain unchanged. The optional package's
-version currently supplies the probe's `--version` output. Agent Relay Cloud
+name and Cargo default executable remain unchanged. The probe's `--version`
+output (and the `cli_version` it reports) is the crate's `CARGO_PKG_VERSION`,
+which the release workflow stamps with the release version before building, so
+a released binary names the release it is attached to. A locally built binary
+reports whatever the checked-in crate version is. Agent Relay Cloud
 sign-in is not separate: the probe calls the plugin library's single
 implementation in `cloud.rs` — the same origin rules, credential reuse and
 device flow that back `relayhistory-plugin login` and the SDK helper's
@@ -131,7 +134,12 @@ This PR supplies the binary, not a hosted release. It depends on:
 The `Publish RelayHistory release` workflow (see
 [releasing.md](releasing.md)) builds the probe from this crate on four
 platforms, applies the same glibc 2.28 floor as the helpers, and attaches the
-binaries to the `sdk-ts-v<version>` GitHub Release. Those assets are the source
+binaries to the `sdk-ts-v<version>` GitHub Release. The crate is stamped with
+that release version before it is compiled, and the workflow asserts that the
+built binary prints `agent-relay-probe <version>`, so `--version` matches the
+Release the asset hangs off. A `skip_core` re-run rebuilds from the
+`sdk-ts-v<version>` tag, so re-attached assets stay the code that release
+shipped. Those assets are the source
 of truth; agentrelay.com mirrors them under the paths the installer requests.
 
 | Release asset (`sdk-ts-v<version>`)                                  | Site path                                                 |

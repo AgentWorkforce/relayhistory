@@ -1,11 +1,13 @@
 /** Apply one release version to every optional plugin manifest and lockfile.
  *
- * The release workflow runs this twice: once in the publish job, so the version
- * commit carries the plugin manifests, and once in the plugin job on its own
- * checkout (dry runs included). Both runs must produce byte-identical files, so
- * this script is the single deterministic place that knows what a plugin release
- * version touches. Local helper coordinates come from the shared package
- * contract; the `ai-hist` devDependency stays a checkout link on purpose.
+ * The release workflow runs this three times: in the publish job, so the version
+ * commit carries the plugin manifests and crates; in the helper matrix, before
+ * the Rust executables are built, so `agent-relay-probe --version` reports the
+ * release it ships under; and in the plugin job on its own checkout (dry runs
+ * included). Every run must produce byte-identical files, so this script is the
+ * single deterministic place that knows what a plugin release version touches.
+ * Local helper coordinates come from the shared package contract; the `ai-hist`
+ * devDependency stays a checkout link on purpose.
  */
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
@@ -24,9 +26,61 @@ export const releaseVersionPattern = /^\d+\.\d+\.\d+$/;
 /** The checkout link every plugin keeps for local SDK development. */
 export const localCoreDependency = "file:../../../sdk-ts";
 
+/** The `[package]` header of a crate manifest, so the crate names itself. */
+const crateNamePattern = /\[package\]\nname = "([^"]+)"\nversion = "/;
+/** That same crate's version line, in the manifest and in its own lockfile. */
+const crateVersionPatterns = (crate) => [
+  [
+    "Cargo.toml",
+    new RegExp(`(\\[package\\]\\nname = "${crate}"\\nversion = ")[^"]+(")`),
+  ],
+  [
+    "Cargo.lock",
+    new RegExp(
+      `(\\[\\[package\\]\\]\\nname = "${crate}"\\nversion = ")[^"]+(")`,
+    ),
+  ],
+];
+
+/**
+ * Stamp `version` into one plugin crate: its `Cargo.toml` `[package]` version
+ * and the crate's own `[[package]]` entry in the lockfile beside it. Each
+ * plugin `rust` directory is its own Cargo workspace with its own lock, so the
+ * rewritten pair stays consistent and `cargo build --locked` still resolves.
+ *
+ * The binaries read `CARGO_PKG_VERSION` — that is what `agent-relay-probe
+ * --version` and the `cli_version` it reports print — so the release version
+ * has to reach the crate before anything is compiled. Idempotent.
+ *
+ * @returns the paths written, in order.
+ */
+async function setCrateVersion(directory, version) {
+  const written = [];
+  const manifestPath = resolve(directory, "Cargo.toml");
+  const crate = crateNamePattern.exec(
+    await readFile(manifestPath, "utf8"),
+  )?.[1];
+  assert.ok(crate, `${manifestPath} has no [package] name and version header`);
+  for (const [file, pattern] of crateVersionPatterns(crate)) {
+    const path = resolve(directory, file);
+    const contents = await readFile(path, "utf8");
+    assert.match(contents, pattern, `${path} has no ${crate} version to set`);
+    await writeFile(
+      path,
+      contents.replace(
+        pattern,
+        (_, prefix, suffix) => prefix + version + suffix,
+      ),
+    );
+    written.push(path);
+  }
+  return written;
+}
+
 /**
  * Set `version`, the seven optional helper pins, the public `ai-hist` peer range
- * and the matching lockfile coordinates for both optional plugins. Idempotent.
+ * and the matching lockfile coordinates for both optional plugins, plus the
+ * version of each plugin's Rust crate. Idempotent.
  *
  * @param version stable semver shared with the core release.
  * @param root repository root, so tests can run against a temporary copy.
@@ -90,6 +144,14 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     if (linkedCore) linkedCore.version = version;
     await writeFile(lockPath, JSON.stringify(lock, null, 2) + "\n");
     written.push(lockPath);
+
+    // The helper and probe executables ship under this same release version.
+    written.push(
+      ...(await setCrateVersion(
+        resolve(root, "plugins", plugin, "rust"),
+        version,
+      )),
+    );
   }
   // Optional helper entries are unpublished at this point; reuse the one
   // implementation that records their declared registry coordinates.
