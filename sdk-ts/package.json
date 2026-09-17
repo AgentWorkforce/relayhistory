@@ -20,6 +20,10 @@
       "types": "./dist/mcp-server.d.ts",
       "default": "./dist/mcp-server.js"
     },
+    "./relay-cli": {
+      "types": "./dist/relay-cli.d.ts",
+      "default": "./dist/relay-cli.js"
+    },
     "./package.json": "./package.json"
   },
   "keywords": [
@@ -48,6 +52,8 @@
     "dist/delivery-cli.*",
     "dist/history-export.*",
     "dist/cli.*",
+    "dist/relay-cli.*",
+    "dist/cloud-contract.*",
     "dist/mcp-server.*",
     "README.md",
     "package.json",
@@ -57,7 +63,8 @@
     "dist/git.*",
     "dist/operations.*",
     "dist/source-contracts.*",
-    "dist/source-plugins.*"
+    "dist/source-plugins.*",
+    "!dist/*.test.*"
   ],
   "repository": {
     "type": "git",
@@ -85,6 +92,8 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@agent-relay/cli-surface": "file:../../relay/packages/cli-surface",
+    "@relayhistory/cloud-client": "file:../../relayhistory-cloud/packages/cloud-client",
     "@types/node": "^22.18.0",
     "typescript": "^5.9.2"
   },

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add the `./relay-cli` subpath export: `createRelayCliSurface()` returns a
+  `RelayCliSurface` (contract v1, id `relayhistory`) that a host such as
+  `agent-relay sessions` mounts. Its command tree and its dispatch are both
+  derived from the same `COMMANDS` table the `ai-hist` bin uses, and a drift
+  test fails if either describes a command the other does not.
+- Compose cloud-backed commands into that one tree:
+  `createRelayCliSurface({ cloud })` takes a `@relayhistory/cloud-client` and
+  adds `cloud list|events|search|thread|turns|digest|coverage`. The client is
+  typed structurally, so `ai-hist` gains no runtime dependency on it; a
+  type-only test proves the real client still satisfies the declared shape.
+  Without a client those commands are absent from help, and running one names
+  `agent-relay login` rather than reporting an unknown command.
+- Extract `runCli(argv, io)` from the bin's private `main()`. It resolves to an
+  exit code and never calls `process.exit`, writes to `process.stdout`/
+  `process.stderr`, or installs signal handlers; `main()` is now a thin wrapper
+  that owns those. `ai-hist` itself behaves exactly as before.
+
+### Fixed
+
+- Accept `--acquisition-timeout-ms`. It was documented in the usage text, listed
+  by `sessions discover`, `sessions hydrate` and `sync`, and read by the
+  dispatcher, but missing from the parser's value-flag set, so passing it failed
+  with `unknown option '--acquisition-timeout-ms'`.
+- Stop publishing compiled test files: the `dist/delivery.*` entry in `files`
+  also matched `dist/delivery.test.*`.
+
 ### Breaking
 
 - Require native-addon contract 11 and session-catalog contract 3. Cloud auth
