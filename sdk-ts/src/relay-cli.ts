@@ -11,6 +11,7 @@
  * the `cloud` subcommands appear; leave it out and they do not.
  */
 import { createRequire } from 'node:module';
+import { Writable } from 'node:stream';
 
 import type {
   RelayCliCommandSpec,
@@ -398,6 +399,35 @@ function resolve(routes: ReadonlyMap<string, Route>, argv: readonly string[]): {
   return null;
 }
 
+/**
+ * A `Writable` that hands each chunk to the host's sink.
+ *
+ * `export` with no `--out` writes NDJSON to standard output, which under a
+ * mount means the host's `stdout`. It needs a real stream rather than the
+ * `io.stdout` callback because the export is unbounded, and only a stream
+ * applies backpressure to a producer that would otherwise outrun the sink.
+ *
+ * Chunks go through as the bytes Node hands us. `RelayCliIo` accepts
+ * `Uint8Array` precisely so streamed output survives the mount, and decoding
+ * each chunk to a string here would corrupt any multi-byte sequence that
+ * straddles a chunk boundary.
+ */
+function hostStdoutStream(hostIo: RelayCliIo): Writable {
+  return new Writable({
+    write(chunk: Uint8Array, _encoding, callback): void {
+      // A sink that throws must fail the export, not become an uncaught
+      // exception: reporting it through the callback makes it the write's
+      // rejection, which `runCli` turns into a nonzero exit.
+      try {
+        hostIo.stdout(chunk);
+        callback();
+      } catch (error: unknown) {
+        callback(error as Error);
+      }
+    },
+  });
+}
+
 export interface RelayhistorySurfaceOptions {
   /**
    * A `@relayhistory/cloud-client`. Supply it and the `cloud` subcommands are
@@ -405,12 +435,25 @@ export interface RelayhistorySurfaceOptions {
    * `run` still recognises them well enough to name the remedy.
    */
   cloud?: RelayhistoryCloudClient;
+  /**
+   * Cancels a mounted long-running command — `delivery run`, which by design
+   * loops until it is stopped.
+   *
+   * The contract forbids a surface from installing signal handlers, because
+   * the process's signals belong to the host. It also gives `run` no way to
+   * carry cancellation per invocation, so the host hands its own signal in
+   * here when it builds the surface, exactly as it does its cloud client.
+   * Nothing below installs a handler; this is the host's signal, passed
+   * through.
+   */
+  signal?: AbortSignal;
 }
 
 /**
  * Build the CLI surface a host mounts as `agent-relay sessions`.
  *
- * @param options - Optional cloud client to compose into the tree.
+ * @param options - Optional cloud client to compose into the tree, and the
+ *   host's cancellation signal for the long-running commands.
  * @returns A surface whose `commands` and `run` are both derived from the
  *   command tables, so neither can describe a command the other does not.
  */
@@ -436,9 +479,16 @@ export function createRelayCliSurface(options: RelayhistorySurfaceOptions = {}):
         return EXIT_UNKNOWN_COMMAND;
       }
       if (resolved.route.kind === 'local') {
-        // The bin's own options stay with the bin: no signal handlers, no
-        // registry check, and colour is the host's to decide.
-        return runCli([...resolved.route.words, ...resolved.rest], io);
+        // The bin's own options stay with the bin: no registry check, and
+        // colour is the host's to decide. What a mounted command genuinely
+        // needs does cross: somewhere to stream `export` to when no `--out`
+        // was given, and the host's cancellation for `delivery run`. Without
+        // both, a command that works as `ai-hist <cmd>` fails as
+        // `agent-relay sessions <cmd>`.
+        return runCli([...resolved.route.words, ...resolved.rest], io, {
+          stdoutStream: hostStdoutStream(hostIo),
+          signal: options.signal,
+        });
       }
       const spec = resolved.route.spec;
       if (!cloud) {

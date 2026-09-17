@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import { gunzipSync } from 'node:zlib';
 
 import { assertSurfaceConforms, walkCommands, type RelayCliIo } from '@agent-relay/cli-surface';
 
@@ -12,14 +13,38 @@ import { BOOLEAN_FLAGS, COMMANDS, FLAG_SPECS, HOST_OWNED_FLAGS, VALUE_FLAGS } fr
 import { createRelayCliSurface, __testing } from './relay-cli.js';
 import type { RelayhistoryCloudClient } from './cloud-contract.js';
 
-/** Collects what a run wrote, so nothing in a test reaches the real streams. */
-function capture(): RelayCliIo & { out: string; err: string } {
+/**
+ * Collects what a run wrote, so nothing in a test reaches the real streams.
+ *
+ * `RelayCliIo` carries `string | Uint8Array`, and a streamed command such as
+ * `export` writes bytes, so the sink decodes incrementally rather than
+ * stringifying each chunk: a multi-byte sequence split across two chunks is
+ * only recoverable if the decoder sees them in order. `bytes` counts the
+ * chunks that arrived as bytes, which is how a test tells a pass-through from
+ * a decode round trip.
+ */
+function capture(): RelayCliIo & { out: string; err: string; bytes: number } {
+  const decoder = new TextDecoder();
   const sink = {
-    out: '', err: '',
-    stdout(chunk: string) { sink.out += chunk; },
-    stderr(chunk: string) { sink.err += chunk; },
+    out: '', err: '', bytes: 0,
+    stdout(chunk: string | Uint8Array) {
+      if (typeof chunk === 'string') { sink.out += chunk; return; }
+      sink.bytes += 1;
+      sink.out += decoder.decode(chunk, { stream: true });
+    },
+    stderr(chunk: string | Uint8Array) {
+      sink.err += typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk);
+    },
   };
   return sink;
+}
+
+/** The offline fixture store the delivery tests index against, in a temp dir. */
+async function historyFixture(): Promise<{ root: string; db: string }> {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-surface-delivery-'));
+  const db = join(root, 'history.db');
+  await writeFile(db, gunzipSync(await readFile(new URL('../fixtures/offline-history.db.gz', import.meta.url))));
+  return { root, db };
 }
 
 /** Every routable path, as argv, from the dispatch side of the tables. */
@@ -336,4 +361,63 @@ test('importing the surface does not run the bin', async () => {
     ['--input-type=module', '-e', script, 'search', 'should-not-run']);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, '');
+});
+
+// ---------------------------------------------------------------------------
+// The mount must carry everything `runCli` needs, not just argv
+// ---------------------------------------------------------------------------
+
+test('mounted export with no --out streams NDJSON to the host, as bytes', async (t) => {
+  const { root, db } = await historyFixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const selectionPath = join(root, 'selection.json');
+  await writeFile(selectionPath, JSON.stringify({
+    all_sources: false, sources: ['claude'], sessions: [], kinds: ['history'], excluded_sessions: [],
+  }));
+
+  // Help describes --out as "Write to this file instead of standard output",
+  // so a mounted run without it must reach standard output — which under a
+  // mount is the host's sink — rather than be rejected for want of one.
+  const io = capture();
+  const code = await createRelayCliSurface().run(['export', '--selection', selectionPath, '--db', db], io);
+
+  assert.equal(code, 0, io.err);
+  assert.equal(io.err, '');
+  const records = io.out.trim().split('\n').map((line) => JSON.parse(line) as { revision_id: string });
+  assert.equal(records.length, 3, `every fixture record must reach the host: ${io.out}`);
+  assert.ok(records.every((record) => record.revision_id));
+  // The export reached the sink as the bytes it produced. Decoding to a string
+  // inside the surface would corrupt any chunk boundary falling mid-character,
+  // which is the whole reason `RelayCliIo` carries `string | Uint8Array`.
+  assert.ok(io.bytes > 0, 'streamed output must reach the host as Uint8Array chunks, not a decoded string');
+});
+
+test('mounted delivery run stops when the host cancels it', async (t) => {
+  const { root, db } = await historyFixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, 'config.json');
+  await writeFile(configPath, JSON.stringify({ plugins: [] }));
+
+  // Run in a child process so a regression fails on the deadline rather than
+  // hanging this runner: `delivery run` loops until it is cancelled, so a
+  // surface that drops the host's signal never returns at all.
+  //
+  // The signal is the host's own — it is handed to the factory, and nothing in
+  // the surface installs a handler for it. That is the only cancellation route
+  // contract v1 leaves open, since `run` takes argv and io and nothing else.
+  const script = `
+    const { createRelayCliSurface } = await import(${JSON.stringify(new URL('./relay-cli.js', import.meta.url).href)});
+    const controller = new AbortController();
+    const io = { stdout: () => {}, stderr: () => {} };
+    setTimeout(() => controller.abort(), 150);
+    const code = await createRelayCliSurface({ signal: controller.signal }).run(
+      ['delivery', 'run', '--db', ${JSON.stringify(db)}, '--config', ${JSON.stringify(configPath)},
+       '--poll-ms', '10'],
+      io);
+    process.stdout.write(String(code));
+  `;
+  const result = await promisify(execFile)(process.execPath,
+    ['--input-type=module', '-e', script], { timeout: 20_000 });
+  assert.equal(result.stderr, '');
+  assert.equal(result.stdout, '0', 'cancelling the host\'s signal must end the mounted delivery loop');
 });
