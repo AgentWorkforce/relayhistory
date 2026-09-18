@@ -881,6 +881,15 @@ jobs:
       - name: Verify actual published core compatibility before any publication
         if: ${{ !inputs.dry_run }}
         run: node scripts/verify-published-history-core.mjs all
+      # Same requirement, same pin as the core publish job: npm >= 11.5 mints
+      # the OIDC token, and the runner's bundled npm 10.x cannot, so without
+      # this the tokenless publish below fails ENEEDAUTH exactly as it did with
+      # the blank token. Pinned exactly because npm@latest (12+) raised its Node
+      # engine floor above the Node pinned here (EBADENGINE).
+      - name: Upgrade npm for OIDC
+        if: ${{ !inputs.dry_run }}
+        run: npm install -g npm@11.19.1
+
       - name: Publish platform helpers before JavaScript plugins
         if: ${{ !inputs.dry_run }}
         # No NODE_AUTH_TOKEN. This job has `id-token: write` and publishes the
