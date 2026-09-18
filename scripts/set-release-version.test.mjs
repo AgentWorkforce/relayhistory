@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { platforms, plugins } from "./history-package-contract.mjs";
+import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import {
   localCoreDependency,
   setReleaseVersion,
@@ -16,7 +16,7 @@ const scripts = dirname(fileURLToPath(import.meta.url));
 const stale = "0.1.0";
 
 function fixture(info) {
-  const name = `@agent-relay/${info.name}`;
+  const name = packageName(info);
   const optionalDependencies = Object.fromEntries(
     Object.keys(platforms).map((platform) => [`${name}-${platform}`, stale]),
   );
@@ -172,7 +172,7 @@ test("the release version reaches every manifest, peer range and lock coordinate
     assert.equal(lock.packages[""].peerDependencies["ai-hist"], `^${version}`);
     assert.equal(lock.packages["../../../sdk-ts"].version, version);
     for (const platform of Object.keys(platforms)) {
-      const name = `@agent-relay/${info.name}-${platform}`;
+      const name = packageName(info, platform);
       const [os, cpu, libc] = platforms[platform];
       assert.equal(manifest.optionalDependencies[name], version);
       assert.equal(lock.packages[""].optionalDependencies[name], version);

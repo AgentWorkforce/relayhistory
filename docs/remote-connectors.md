@@ -6,11 +6,11 @@ Neither commercial login nor installing a package changes local data sources.
 
 | Optional package | Connector IDs | Evidence |
 |---|---|---|
-| `@agent-relay/history-provider-sources` | `claude-web`, `codex-cloud` | Claude teleport events; Codex supported task diff |
-| `@agent-relay/relayhistory` | `cloud` | Fresh readback of durably delivered normalized evidence |
+| `@relayhistory/provider-sources` | `claude-web`, `codex-cloud` | Claude teleport events; Codex supported task diff |
+| `@relayhistory/capture` | `cloud` | Fresh readback of durably delivered normalized evidence |
 
 ```json
-{"plugins":[{"module":"@agent-relay/history-provider-sources","options":{"connectors":["claude-web"],"instanceId":"personal"}}]}
+{"plugins":[{"module":"@relayhistory/provider-sources","options":{"connectors":["claude-web"],"instanceId":"personal"}}]}
 ```
 
 ```sh

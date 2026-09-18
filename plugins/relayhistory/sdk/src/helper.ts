@@ -9,7 +9,7 @@ import type { CloudPushResult, RelayhistoryAuth, ReplayOptions, ReplayResult } f
 export interface HelperOptions { binaryPath?: string; signal?: AbortSignal; timeoutMs?: number }
 function packagedBinary(): string {
   const binary = 'relayhistory-plugin'+(process.platform==='win32'?'.exe':'');
-  try { return join(dirname(createRequire(import.meta.url).resolve('@agent-relay/relayhistory-'+runtimePlatform()+'/package.json')),binary); }
+  try { return join(dirname(createRequire(import.meta.url).resolve('@relayhistory/capture-'+runtimePlatform()+'/package.json')),binary); }
   catch { return fileURLToPath(new URL('../bin/'+runtimePlatform()+'/'+binary,import.meta.url)); }
 }
 /** Only terminate the process tree rooted at the helper we created. POSIX

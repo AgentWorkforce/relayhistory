@@ -919,11 +919,15 @@ jobs:
           # release instead of silently publishing a partial platform set.
           shopt -s nullglob
           for plugin in relayhistory provider-sources; do
-            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@agent-relay/', '')")
+            # Derive the tarball basename from the package name rather than
+            # repeating the scope: npm packs `@scope/name` as `scope-name-...`.
+            # The previous form stripped a hardcoded `@agent-relay/`, which
+            # silently stopped matching the moment the scope changed.
+            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@', '').replace('/', '-')")
             helpers=(
-              ./artifacts/agent-relay-"$prefix"-darwin-*-"$VERSION".tgz
-              ./artifacts/agent-relay-"$prefix"-linux-*-"$VERSION".tgz
-              ./artifacts/agent-relay-"$prefix"-win32-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-darwin-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-linux-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-win32-*-"$VERSION".tgz
             )
             if [ "${#helpers[@]}" -eq 0 ]; then
               echo "no platform helpers staged for $plugin at $VERSION" >&2
@@ -932,7 +936,7 @@ jobs:
             for package in "${helpers[@]}"; do
               npm publish "$package" --access public --provenance
             done
-            npm publish "./artifacts/agent-relay-$prefix-$VERSION.tgz" --access public --provenance
+            npm publish "./artifacts/$prefix-$VERSION.tgz" --access public --provenance
           done
       - name: List the staged tarballs
         if: ${{ inputs.dry_run }}

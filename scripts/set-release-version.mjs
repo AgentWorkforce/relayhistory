@@ -14,6 +14,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  packageName,
   platforms,
   plugins,
   validatePluginManifest,
@@ -107,7 +108,7 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     };
     assert.ok(manifest.optionalDependencies, "Helper pins are required");
     for (const platform of Object.keys(platforms)) {
-      const name = `@agent-relay/${info.name}-${platform}`;
+      const name = packageName(info, platform);
       assert.ok(
         name in manifest.optionalDependencies,
         `${manifest.name} is missing its ${platform} helper`,
@@ -136,7 +137,7 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
       // other optional dependency keeps the version the manifest declares.
       const helperNames = new Set(
         Object.keys(platforms).map(
-          (platform) => `@agent-relay/${info.name}-${platform}`,
+          (platform) => packageName(info, platform),
         ),
       );
       rootEntry.optionalDependencies = Object.fromEntries(

@@ -1,6 +1,6 @@
 # Optional provider source plugins
 
-`npm install ai-hist @agent-relay/history-provider-sources`
+`npm install ai-hist @relayhistory/provider-sources`
 
 This optional package registers `claude-web` and `codex-cloud` source adapters.
 It uses the provider CLI's existing sign-in only when an acquisition is selected.
@@ -8,7 +8,7 @@ Installation and registration do not probe credentials. Local operations remain
 in the local SDK and do not invoke these adapters.
 
 ```json
-{"plugins":[{"module":"@agent-relay/history-provider-sources","options":{"connectors":["claude-web","codex-cloud"],"instanceId":"personal"}}]}
+{"plugins":[{"module":"@relayhistory/provider-sources","options":{"connectors":["claude-web","codex-cloud"],"instanceId":"personal"}}]}
 ```
 
 ```sh
