@@ -92,7 +92,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@agent-relay/cli-surface": "^12.2.2",
+    "@agent-relay/cli-surface": "^12.2.4",
     "@relayhistory/cloud-client": "file:../../relayhistory-cloud/packages/cloud-client",
     "@types/node": "^22.18.0",
     "typescript": "^5.9.2"
