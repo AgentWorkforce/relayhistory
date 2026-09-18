@@ -92,20 +92,44 @@ function published(name) {
   }
 }
 
-function claim(entry) {
+function claim(entry, otp) {
   const directory = mkdtempSync(join(tmpdir(), "relayhistory-claim-"));
   writeFileSync(
     join(directory, "package.json"),
     `${JSON.stringify(placeholderManifest(entry), null, 2)}\n`,
   );
-  execFileSync("npm", ["publish", "--access", "public"], {
-    cwd: directory,
-    stdio: "pipe",
-  });
+  // stdio is inherited, not piped. An account with 2FA on publish makes npm run
+  // an interactive re-auth; piping it hides the prompt and the URL, so every
+  // publish fails on a flow nobody could answer. Inheriting costs the captured
+  // error text, so success is confirmed against the registry instead.
+  execFileSync(
+    "npm",
+    ["publish", "--access", "public", ...(otp ? [`--otp=${otp}`] : [])],
+    { cwd: directory, stdio: "inherit" },
+  );
+}
+
+/** Read `--otp=<code>`, so a 2FA account can claim without a prompt per package. */
+function otpFromArgv(argv) {
+  const flag = argv.find((argument) => argument.startsWith("--otp="));
+  return flag ? flag.slice("--otp=".length) : undefined;
 }
 
 async function main() {
   const dryRun = process.argv.includes("--dry-run");
+
+  // Fail once, before touching the registry, rather than fifteen times.
+  if (!dryRun) {
+    try {
+      const who = execFileSync("npm", ["whoami"], { stdio: "pipe" }).toString().trim();
+      console.log(`npm user: ${who}\n`);
+    } catch {
+      console.error("Not logged in to npm. Run `npm login`, then re-run this.");
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   const all = publishedNames();
 
   console.log(`Checking ${all.length} names on the registry...\n`);
@@ -129,25 +153,31 @@ async function main() {
     return;
   }
 
+  const otp = otpFromArgv(process.argv);
   const failures = [];
   for (const entry of missing) {
-    process.stdout.write(`claiming ${entry.name} ... `);
+    console.log(`\nclaiming ${entry.name}`);
     try {
-      claim(entry);
-      console.log("ok");
-    } catch (error) {
-      console.log("FAILED");
-      const detail = `${error.stdout ?? ""}${error.stderr ?? ""}`.trim();
-      failures.push({ name: entry.name, detail: detail.split("\n").slice(-6).join("\n") });
+      claim(entry, otp);
+    } catch {
+      // npm has already printed why, to the inherited stderr.
+    }
+    // The registry is the authority: an interactive auth can succeed after npm
+    // exits non-zero, and a zero exit is not proof the name was created.
+    if (published(entry.name)) {
+      console.log(`  claimed ${entry.name}`);
+    } else {
+      console.log(`  FAILED ${entry.name}`);
+      failures.push(entry.name);
     }
   }
 
   if (failures.length > 0) {
-    console.error(`\n${failures.length} failed:\n`);
-    for (const failure of failures) {
-      console.error(`--- ${failure.name} ---\n${failure.detail}\n`);
-    }
-    console.error("Re-run to retry only what is still missing.");
+    console.error(`\n${failures.length} still missing:`);
+    for (const name of failures) console.error(`  ${name}`);
+    console.error("\nnpm printed the reason above each failure.");
+    console.error("If it asked you to authenticate, finish that once and re-run:");
+    console.error("only the names still missing are retried.");
     process.exitCode = 1;
     return;
   }
