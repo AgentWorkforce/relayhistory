@@ -4,7 +4,7 @@ One workflow releases everything: `Publish RelayHistory release`
 (`.github/workflows/publish-napi.yml`; the file name is bound to npm OIDC
 trusted publishing and must not change). All public packages share one version:
 `ai-hist`, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
-`@agent-relay/relayhistory`, `@agent-relay/history-provider-sources` and their
+`@relayhistory/capture`, `@relayhistory/provider-sources` and their
 seven platform helper packages each. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).

@@ -2,7 +2,7 @@
 
 This records the earlier contract-11 implementation and its validation. It is
 not the current installation or package boundary. Cloud APIs now live in
-`@agent-relay/relayhistory`; the local native contract is 14. See
+`@relayhistory/capture`; the local native contract is 14. See
 [optional cloud setup](enable-cloud.md) and [architecture](architecture.md) for
 the current interfaces.
 

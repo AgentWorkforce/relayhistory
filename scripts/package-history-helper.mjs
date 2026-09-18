@@ -2,6 +2,7 @@
 import { copyFile, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import {
+  packageName,
   plugins as packages,
   platforms,
   validatePluginManifest,
@@ -36,7 +37,7 @@ await writeFile(
   join(output, "package.json"),
   JSON.stringify(
     {
-      name: `@agent-relay/${info.name}-${platform}`,
+      name: packageName(info, platform),
       version,
       license: "MIT",
       description: `Optional ${info.name} helper for ${platform}`,

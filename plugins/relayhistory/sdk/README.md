@@ -1,6 +1,6 @@
 # Optional RelayHistory plugin
 
-Install alongside the local SDK: `npm install ai-hist @agent-relay/relayhistory`.
+Install alongside the local SDK: `npm install ai-hist @relayhistory/capture`.
 This package owns RelayHistory authentication, legacy sharing/replay, a durable
 destination, and explicit readback/source adapters. It depends on the public
 local SDK; installing or configuring it does not log in, read credentials, or
@@ -26,13 +26,13 @@ whose approval URL it writes to that terminal. A run with no terminal and no
 credential fails immediately rather than waiting for an approval nobody sees.
 
 These commands intentionally remain in the optional package. Replace imports
-from `ai-hist/cloud` with `@agent-relay/relayhistory`; local Git hook/commit-link
+from `ai-hist/cloud` with `@relayhistory/capture`; local Git hook/commit-link
 functions stay in `ai-hist`.
 
 Create an explicit plugin config, located beside the application's node_modules:
 
 ```json
-{"plugins":[{"module":"@agent-relay/relayhistory","options":{"baseUrl":"https://history.agentrelay.com","instanceId":"personal"}}]}
+{"plugins":[{"module":"@relayhistory/capture","options":{"baseUrl":"https://history.agentrelay.com","instanceId":"personal"}}]}
 ```
 
 Create a selection file before enabling delivery:
@@ -76,7 +76,7 @@ engine through revision-fenced public source APIs, with independent connector
 provenance and per-kind snapshots.
 
 ```ts
-import { getDeliveredSession, getSessionThreadWithHistory } from '@agent-relay/relayhistory';
+import { getDeliveredSession, getSessionThreadWithHistory } from '@relayhistory/capture';
 const evidence = await getDeliveredSession({source:'claude',sessionId:'session-id'}, options);
 const thread = await getSessionThreadWithHistory({source:'claude',sessionId:'session-id'}, options);
 ```

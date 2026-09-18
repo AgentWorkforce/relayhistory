@@ -58,7 +58,7 @@ npx -y ai-hist-mcp
 
 Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-The optional `@agent-relay/relayhistory` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
+The optional `@relayhistory/capture` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
 
 The optional plugin owns stage credentials and token rotation through its Rust
 helper. The default MCP server does not load that helper or read its auth store.
@@ -84,9 +84,9 @@ ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused 
 
 `sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
-Optional: install `@agent-relay/relayhistory` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
+Optional: install `@relayhistory/capture` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
 
-Install `@agent-relay/history-provider-sources` and configure it explicitly for
+Install `@relayhistory/provider-sources` and configure it explicitly for
 remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
 
 The optional compatibility CLI reads sessions available through the legacy cloud API:

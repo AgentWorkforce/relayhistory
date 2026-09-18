@@ -1,5 +1,5 @@
 {
-  "name": "@agent-relay/history-provider-sources",
+  "name": "@relayhistory/provider-sources",
   "version": "0.18.2",
   "description": "Optional Claude web and Codex cloud source adapters for local ai-hist.",
   "license": "MIT",
@@ -35,13 +35,13 @@
     "node": ">=20"
   },
   "optionalDependencies": {
-    "@agent-relay/history-provider-sources-darwin-arm64": "0.18.2",
-    "@agent-relay/history-provider-sources-darwin-x64": "0.18.2",
-    "@agent-relay/history-provider-sources-linux-x64-gnu": "0.18.2",
-    "@agent-relay/history-provider-sources-linux-arm64-gnu": "0.18.2",
-    "@agent-relay/history-provider-sources-linux-x64-musl": "0.18.2",
-    "@agent-relay/history-provider-sources-linux-arm64-musl": "0.18.2",
-    "@agent-relay/history-provider-sources-win32-x64-msvc": "0.18.2"
+    "@relayhistory/provider-sources-darwin-arm64": "0.18.2",
+    "@relayhistory/provider-sources-darwin-x64": "0.18.2",
+    "@relayhistory/provider-sources-linux-x64-gnu": "0.18.2",
+    "@relayhistory/provider-sources-linux-arm64-gnu": "0.18.2",
+    "@relayhistory/provider-sources-linux-x64-musl": "0.18.2",
+    "@relayhistory/provider-sources-linux-arm64-musl": "0.18.2",
+    "@relayhistory/provider-sources-win32-x64-msvc": "0.18.2"
   },
   "publishConfig": {
     "access": "public"

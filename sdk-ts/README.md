@@ -75,13 +75,13 @@ is equivalent to `--local`.
 Cached reads preserve the requested scope and never consult commercial auth.
 Stored remote history can be queried with absent, malformed, expired, or
 ambiguous credentials. Remote acquisition requires an explicitly loaded plugin
-registry. Install `@agent-relay/history-provider-sources` for Claude web/Codex
-cloud, or `@agent-relay/relayhistory` for RelayHistory. Installing a package does
+registry. Install `@relayhistory/provider-sources` for Claude web/Codex
+cloud, or `@relayhistory/capture` for RelayHistory. Installing a package does
 not register it, inspect auth or start delivery.
 
 ```ts
 import { HistoryPluginRegistry } from 'ai-hist';
-import { createHistoryPlugin } from '@agent-relay/history-provider-sources';
+import { createHistoryPlugin } from '@relayhistory/provider-sources';
 const plugins = new HistoryPluginRegistry();
 plugins.register(createHistoryPlugin({connectors:['claude-web']}));
 await discoverSessions({ scope:'remote', plugins, sourceConnectors:['claude-web'] });
@@ -210,7 +210,7 @@ See [the migration guide](https://github.com/AgentWorkforce/relayhistory/blob/ma
 Use a `HistoryDestination` plugin for any service or pipe the public NDJSON
 export to your own program. The local package has no cloud exports, login CLI,
 or default cloud MCP tool. RelayHistory's auth, sharing, replay, durable upload
-and readback live in [`@agent-relay/relayhistory`](../plugins/relayhistory/sdk/README.md).
+and readback live in [`@relayhistory/capture`](../plugins/relayhistory/sdk/README.md).
 Move imports from `ai-hist/cloud` to that package. Git hooks and commit linking
 remain local SDK operations.
 

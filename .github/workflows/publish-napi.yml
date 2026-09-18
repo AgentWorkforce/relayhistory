@@ -818,6 +818,37 @@ jobs:
         with:
           pattern: helper-*
           path: helpers
+      # A skip_core retry takes its whole tree from the release tag, including
+      # the plugin manifests and the package contract that every later step
+      # derives coordinates from. Tags cut before the @relayhistory rename
+      # still name their plugins @agent-relay/*, and those names still produce
+      # valid tarballs — so such a retry would publish the obsolete packages
+      # and report success, leaving @relayhistory/* absent.
+      #
+      # This step is the one place the scope must NOT come from the checkout:
+      # a workflow_dispatch run reads this file from the dispatch ref, not
+      # from `ref:` above, so this literal is the only thing in the job that a
+      # stale tag cannot rewrite.
+      #
+      # There is no correct way to publish @relayhistory/* from a tag that does
+      # not contain those names — doing so would mix post-rename code into an
+      # older release, which is exactly what skip_core exists to avoid. So this
+      # refuses rather than repairs: cut a normal release instead.
+      - name: Refuse a plugin-only retry from a pre-rename release
+        if: ${{ inputs.skip_core }}
+        run: |
+          set -euo pipefail
+          for plugin in relayhistory provider-sources; do
+            name=$(node -p "require('./plugins/$plugin/sdk/package.json').name")
+            case "$name" in
+              @relayhistory/*) ;;
+              *)
+                echo "release tag sdk-ts-v${VERSION} predates the @relayhistory rename ($plugin is still $name)." >&2
+                echo "A plugin-only retry cannot publish @relayhistory/* from it; cut a normal release instead." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: Apply the release version
         run: |
           set -euo pipefail
@@ -881,10 +912,31 @@ jobs:
       - name: Verify actual published core compatibility before any publication
         if: ${{ !inputs.dry_run }}
         run: node scripts/verify-published-history-core.mjs all
+      # Same requirement, same pin as the core publish job: npm >= 11.5 mints
+      # the OIDC token, and the runner's bundled npm 10.x cannot, so without
+      # this the tokenless publish below fails ENEEDAUTH exactly as it did with
+      # the blank token. Pinned exactly because npm@latest (12+) raised its Node
+      # engine floor above the Node pinned here (EBADENGINE).
+      - name: Upgrade npm for OIDC
+        if: ${{ !inputs.dry_run }}
+        run: npm install -g npm@11.19.1
+
       - name: Publish platform helpers before JavaScript plugins
         if: ${{ !inputs.dry_run }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No NODE_AUTH_TOKEN. This job has `id-token: write` and publishes the
+        # same way the core job does: npm OIDC trusted publishing, bound to
+        # this repository plus this workflow file name.
+        #
+        # It used to set `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`. That
+        # secret does not exist in this repository, and setup-node writes
+        # `_authToken=${NODE_AUTH_TOKEN}` into .npmrc unconditionally, so the
+        # empty value produced a blank credential that suppressed OIDC:
+        #
+        #   npm error code ENEEDAUTH
+        #   npm error need auth This command requires you to be logged in
+        #
+        # That error was invisible until the file-spec fix (#152) let npm get
+        # far enough to contact the registry at all.
         run: |
           set -euo pipefail
           # Every tarball path is written `./artifacts/...`. npm-package-arg
@@ -898,11 +950,15 @@ jobs:
           # release instead of silently publishing a partial platform set.
           shopt -s nullglob
           for plugin in relayhistory provider-sources; do
-            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@agent-relay/', '')")
+            # Derive the tarball basename from the package name rather than
+            # repeating the scope: npm packs `@scope/name` as `scope-name-...`.
+            # The previous form stripped a hardcoded `@agent-relay/`, which
+            # silently stopped matching the moment the scope changed.
+            prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@', '').replace('/', '-')")
             helpers=(
-              ./artifacts/agent-relay-"$prefix"-darwin-*-"$VERSION".tgz
-              ./artifacts/agent-relay-"$prefix"-linux-*-"$VERSION".tgz
-              ./artifacts/agent-relay-"$prefix"-win32-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-darwin-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-linux-*-"$VERSION".tgz
+              ./artifacts/"$prefix"-win32-*-"$VERSION".tgz
             )
             if [ "${#helpers[@]}" -eq 0 ]; then
               echo "no platform helpers staged for $plugin at $VERSION" >&2
@@ -911,7 +967,7 @@ jobs:
             for package in "${helpers[@]}"; do
               npm publish "$package" --access public --provenance
             done
-            npm publish "./artifacts/agent-relay-$prefix-$VERSION.tgz" --access public --provenance
+            npm publish "./artifacts/$prefix-$VERSION.tgz" --access public --provenance
           done
       - name: List the staged tarballs
         if: ${{ inputs.dry_run }}

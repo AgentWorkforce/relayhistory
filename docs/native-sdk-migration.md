@@ -69,7 +69,7 @@ for await (const event of sessionEvents(id, { limit: 200 })) consume(event);
 The local npm CLI covers sessions, search, recent, events, statistics, sync,
 export, and generic delivery/plugin operations. Cloud auth, sharing, and replay
 moved out of the mandatory native binding and SDK into the optional
-`@agent-relay/relayhistory` package. Replace imports of `accessToken`, `replay`,
+`@relayhistory/capture` package. Replace imports of `accessToken`, `replay`,
 `enableCloud`, and other cloud functions from `ai-hist` or `ai-hist/cloud` with
 imports from that package. Local Git linkage remains in `ai-hist`.
 

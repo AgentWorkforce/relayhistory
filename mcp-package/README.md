@@ -16,7 +16,7 @@ source IDs; an empty array disables remote acquisition. Acquisition tools declar
 open-world writes. Arbitrary plugin callbacks receive conservative annotations,
 and duplicate/reserved tool names are rejected before registration.
 
-The optional `@agent-relay/relayhistory` package registers `get_session_thread`
+The optional `@relayhistory/capture` package registers `get_session_thread`
 and `read_delivered_history`. The former composes freshly delivered evidence
 with legacy lifecycle links under one pinned account and reports each outcome;
 the latter is an explicit live listing, not an incremental feed. Neither tool

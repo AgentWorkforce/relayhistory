@@ -8,7 +8,7 @@ import { RelayHistoryError, InvalidArgumentError, UnsupportedOperationError, Aut
 export interface HelperOptions { binaryPath?: string; signal?: AbortSignal; timeoutMs?: number }
 function packagedBinary(): string {
   const binary = 'history-provider-sources'+(process.platform==='win32'?'.exe':'');
-  try { return join(dirname(createRequire(import.meta.url).resolve('@agent-relay/history-provider-sources-'+runtimePlatform()+'/package.json')),binary); }
+  try { return join(dirname(createRequire(import.meta.url).resolve('@relayhistory/provider-sources-'+runtimePlatform()+'/package.json')),binary); }
   catch { return fileURLToPath(new URL('../bin/'+runtimePlatform()+'/'+binary,import.meta.url)); }
 }
 /** Only terminate the process tree rooted at the helper we created. POSIX

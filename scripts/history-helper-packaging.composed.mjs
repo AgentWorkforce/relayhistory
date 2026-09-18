@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   helperTarball,
   npmCli,
+  packageName,
   platforms,
   plugins,
   validatePluginManifest,
@@ -33,12 +34,12 @@ test("valid JSON cannot conceal helper failure, signal, or diagnostics", () => {
 });
 function manifest(plugin, version) {
   return {
-    name: `@agent-relay/${plugins[plugin].name}`,
+    name: packageName(plugins[plugin]),
     version,
     peerDependencies: { "ai-hist": "^0.16.0" },
     optionalDependencies: Object.fromEntries(
       Object.keys(platforms).map((platform) => [
-        `@agent-relay/${plugins[plugin].name}-${platform}`,
+        packageName(plugins[plugin], platform),
         version,
       ]),
     ),
@@ -49,14 +50,14 @@ test("independent optional versions choose their own artifacts and require match
   const provider = manifest("provider-sources", "0.17.0");
   assert.equal(
     helperTarball("relayhistory", "linux-x64-gnu", relay),
-    "agent-relay-relayhistory-linux-x64-gnu-0.16.2.tgz",
+    "relayhistory-capture-linux-x64-gnu-0.16.2.tgz",
   );
   assert.equal(
     helperTarball("provider-sources", "linux-x64-gnu", provider),
-    "agent-relay-history-provider-sources-linux-x64-gnu-0.17.0.tgz",
+    "relayhistory-provider-sources-linux-x64-gnu-0.17.0.tgz",
   );
   provider.optionalDependencies[
-    "@agent-relay/history-provider-sources-win32-x64-msvc"
+    "@relayhistory/provider-sources-win32-x64-msvc"
   ] = "0.16.0";
   assert.throws(
     () => validatePluginManifest("provider-sources", provider),
