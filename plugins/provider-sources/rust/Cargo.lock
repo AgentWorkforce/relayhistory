@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "history-provider-sources"
-version = "0.18.3"
+version = "0.18.4"
 dependencies = [
  "ai-hist-core",
  "ai-hist-engine",

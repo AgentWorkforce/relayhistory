@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist-napi"
-version = "0.18.3"
+version = "0.18.4"
 dependencies = [
  "ai-hist-core",
  "ai-hist-engine",
