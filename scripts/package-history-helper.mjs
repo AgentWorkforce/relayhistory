@@ -5,6 +5,7 @@ import {
   packageName,
   plugins as packages,
   platforms,
+  repositoryField,
   validatePluginManifest,
 } from "./history-package-contract.mjs";
 const [plugin, platform, version, input, output] = process.argv.slice(2);
@@ -41,6 +42,10 @@ await writeFile(
       version,
       license: "MIT",
       description: `Optional ${info.name} helper for ${platform}`,
+      // Required by `npm publish --provenance`: the registry verifies this
+      // against the repository in the sigstore bundle and rejects E422 when it
+      // is absent or different.
+      repository: repositoryField(`plugins/${plugin}/rust`),
       files: [binary],
       os: [os],
       cpu: [cpu],

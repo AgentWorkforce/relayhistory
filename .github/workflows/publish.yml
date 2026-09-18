@@ -976,6 +976,16 @@ jobs:
             done
             npm publish "./artifacts/$prefix-$VERSION.tgz" --access public --provenance
           done
+      # Nothing used to run after the publish above, so a publish that failed —
+      # or succeeded into names nobody checked — ended this job quietly. Six
+      # separate faults shipped that way, each only discoverable by cutting
+      # another release. This installs what was just published, from the
+      # registry, and imports it, so a broken publish fails the release that
+      # caused it.
+      - name: Verify the published plugins install from the registry
+        if: ${{ !inputs.dry_run }}
+        run: node scripts/verify-published-plugins.mjs "$VERSION"
+
       - name: List the staged tarballs
         if: ${{ inputs.dry_run }}
         run: ls -1 artifacts

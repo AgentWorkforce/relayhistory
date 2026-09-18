@@ -2,6 +2,11 @@
   "name": "@relayhistory/capture",
   "version": "0.18.6",
   "description": "Optional RelayHistory destination, auth, sharing and recall plugin for ai-hist.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgentWorkforce/relayhistory",
+    "directory": "plugins/relayhistory/sdk"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

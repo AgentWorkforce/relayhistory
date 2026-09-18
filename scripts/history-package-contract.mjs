@@ -46,6 +46,29 @@ export function nativeContractVersion(half = "sdk", root = repositoryRoot) {
  * The core packages (`ai-hist`, `ai-hist-native`, `ai-hist-mcp`) deliberately
  * keep their unscoped names: they are published and depended on.
  */
+/**
+ * Repository every published package must declare.
+ *
+ * `npm publish --provenance` verifies the manifest's `repository.url` against
+ * the repository recorded in the sigstore provenance bundle, and rejects a
+ * mismatch — an absent field included:
+ *
+ *   npm error code E422
+ *   npm error 422 Unprocessable Entity - Error verifying sigstore provenance
+ *     bundle: package.json: "repository.url" is "", expected to match
+ *     "https://github.com/AgentWorkforce/relayhistory" from provenance
+ *
+ * The core packages declare it in their checked-in manifests. The plugin
+ * packages did not, and the platform helpers are generated, so the value lives
+ * here and both paths read it.
+ */
+export const REPOSITORY_URL = "https://github.com/AgentWorkforce/relayhistory";
+
+/** The `repository` field for a package whose source lives at `directory`. */
+export function repositoryField(directory) {
+  return { type: "git", url: REPOSITORY_URL, directory };
+}
+
 export const SCOPE = "@relayhistory";
 
 /** Tarball filename prefix npm derives from SCOPE (`@x/y` packs as `x-y-...`). */
@@ -76,6 +99,14 @@ export function validatePluginManifest(plugin, manifest) {
   const info = plugins[plugin];
   assert.ok(info, `Unknown history plugin: ${plugin}`);
   assert.equal(manifest.name, packageName(info));
+  // Publishing uses --provenance, which rejects a manifest whose repository
+  // does not match the one in the sigstore bundle. Checked here so a missing
+  // field fails the packaging gate rather than the publish.
+  assert.equal(
+    manifest.repository?.url,
+    REPOSITORY_URL,
+    `${manifest.name} must declare repository.url ${REPOSITORY_URL}`,
+  );
   assert.match(manifest.version, /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/);
   assert.ok(
     manifest.peerDependencies?.["ai-hist"],
