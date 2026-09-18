@@ -5,7 +5,12 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { packageName, platforms, plugins } from "./history-package-contract.mjs";
+import {
+  packageName,
+  platforms,
+  plugins,
+  repositoryField,
+} from "./history-package-contract.mjs";
 import {
   localCoreDependency,
   setReleaseVersion,
@@ -27,6 +32,9 @@ function fixture(info) {
       name,
       version: stale,
       license: "MIT",
+      // Real manifests must declare this or `npm publish --provenance` fails
+      // E422; the contract asserts it, so the fixture carries it too.
+      repository: repositoryField("plugins/fixture/sdk"),
       peerDependencies,
       devDependencies,
       optionalDependencies,

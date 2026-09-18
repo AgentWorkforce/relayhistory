@@ -2,6 +2,11 @@
   "name": "@relayhistory/provider-sources",
   "version": "0.18.6",
   "description": "Optional Claude web and Codex cloud source adapters for local ai-hist.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgentWorkforce/relayhistory",
+    "directory": "plugins/provider-sources/sdk"
+  },
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
