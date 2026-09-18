@@ -93,7 +93,7 @@
   },
   "devDependencies": {
     "@agent-relay/cli-surface": "^12.2.4",
-    "@relayhistory/cloud-client": "file:../../relayhistory-cloud/packages/cloud-client",
+    "@relayhistory/cloud-client": "^0.1.1",
     "@types/node": "^22.18.0",
     "typescript": "^5.9.2"
   },
