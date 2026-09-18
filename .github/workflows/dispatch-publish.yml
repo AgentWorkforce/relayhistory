@@ -30,11 +30,11 @@ jobs:
               .at(-1);
             const body = marker ? fs.readFileSync(`.release/${marker}`, 'utf8').trim() : '';
             const customVersion = /^\\d+\\.\\d+\\.\\d+$/.test(body.split(/\r?\n/, 1)[0]) ? body.split(/\r?\n/, 1)[0] : '';
-            core.info(`Dispatching publish-napi from ${context.sha}${customVersion ? ` as ${customVersion}` : ' (patch bump)'}`);
+            core.info(`Dispatching publish from ${context.sha}${customVersion ? ` as ${customVersion}` : ' (patch bump)'}`);
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'publish-napi.yml',
+              workflow_id: 'publish.yml',
               ref: 'main',
               inputs: {
                 version: 'patch',

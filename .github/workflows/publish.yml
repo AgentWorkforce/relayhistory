@@ -7,8 +7,15 @@ name: Publish RelayHistory release
 # history plugins and the agent-relay-probe binaries follow at the very same
 # version, once the core release exists and its registry gates have passed.
 #
-# The file name is load-bearing: npm OIDC trusted publishing for the core
-# packages is bound to this repository plus this workflow file name.
+# The file name is load-bearing: npm OIDC trusted publishing binds each package
+# to this repository plus this workflow file name, so renaming this file breaks
+# every package's publish until its trusted publisher is repointed on npmjs.
+#
+# It was `publish-napi.yml` until the optional plugins were first published.
+# Every other AgentWorkforce repository publishes from `publish.yml`, and that
+# mismatch cost a release cycle: the plugins' trusted publishers were set to
+# `publish.yml` by analogy with the sibling repos, and npm rejected the publish
+# as E404 -- which reads as "no such package", not "wrong workflow".
 
 on:
   workflow_dispatch:
