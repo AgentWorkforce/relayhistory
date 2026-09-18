@@ -86,6 +86,44 @@ Because the re-run builds from the tag, it only works for releases cut by this
 workflow: a tag whose tree predates these scripts fails loudly at checkout or
 build time rather than shipping something mismatched.
 
+## Claiming a new package name
+
+npm OIDC trusted publishing can publish a new *version* of a package that
+already exists, but it cannot *create* a name. This workflow is tokenless, so a
+name's very first publish fails:
+
+```
+npm error code E404
+npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fcapture-darwin-arm64
+npm error 404 The requested resource '@relayhistory/capture-darwin-arm64@0.18.3'
+              could not be found or you do not have permission to access it.
+```
+
+The name must exist once, published from a human npm account; CI owns it after
+that. This applies to every name a release publishes — each plugin and each of
+its per-platform helpers — so **adding a plugin or a supported platform means
+claiming its names before the next release**.
+
+From the repository root, signed in to npm:
+
+```bash
+node scripts/claim-plugin-package-names.mjs --dry-run   # what is missing
+node scripts/claim-plugin-package-names.mjs             # claim it
+```
+
+It publishes a placeholder, not the real package: the platform helpers each
+carry a cross-compiled binary for their target, so no one machine can build them
+all. The real artifacts come from the release that follows.
+
+Placeholders are published at `0.0.0`. A version publishes exactly once, so
+claiming a name at a release version would fail the next release with
+`EPUBLISHCONFLICT`. `0.0.0` is below every release, is transparently not a real
+build, and never resolves — each plugin pins its helpers to its own exact
+version, so nothing asks for `0.0.0`.
+
+The script reads names from `scripts/history-package-contract.mjs`, skips
+anything already on the registry, and is safe to re-run.
+
 ## Renaming this workflow
 
 Don't, unless you are prepared to repoint every package. npm OIDC trusted
