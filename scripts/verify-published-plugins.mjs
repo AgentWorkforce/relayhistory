@@ -28,6 +28,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry } from "./npm-install-with-registry-retry.mjs";
@@ -38,6 +39,20 @@ assert.match(
   /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/,
   "Usage: verify-published-plugins.mjs <version>",
 );
+
+/** This machine's platform key, to check the helper that should have installed. */
+function currentPlatform() {
+  const libc =
+    process.platform === "linux"
+      ? (process.report?.getReport()?.header?.glibcVersionRuntime ? "gnu" : "musl")
+      : undefined;
+  const key = [process.platform, process.arch, libc].filter(Boolean).join("-");
+  const known = Object.keys(platforms);
+  const match = known.find((candidate) => candidate === key)
+    ?? known.find((candidate) => candidate.startsWith(`${process.platform}-${process.arch}`));
+  assert.ok(match, `no platform entry for ${key}; known: ${known.join(", ")}`);
+  return match;
+}
 
 /** Every name this release published, JavaScript package and platform helper. */
 function expectedNames() {
@@ -86,16 +101,18 @@ async function main() {
       (info) => `${packageName(info)}@${version}`,
     );
     console.log(`installing ${jsPackages.join(" ")}`);
-    const install = await installWithRegistryRetry([
-      "--prefix",
-      project,
-      "--no-save",
-      ...jsPackages,
-    ]);
-    assert.equal(
-      install.status,
-      0,
-      `install failed:\n${install.stdout}\n${install.stderr}`,
+    // 5 minutes, not the helper's 90s default. A newly created name took ~120s
+    // to become readable when these were first published, so the default budget
+    // failed the very release this step exists to protect (0.18.7: every
+    // package published correctly, this step reported ETARGET and failed the
+    // run). The cost of waiting is a slow release; the cost of giving up early
+    // is a false alarm on a good one.
+    // Resolves on success and throws on exhaustion — it returns no result to
+    // inspect. Reading a `.status` off it crashed this step even when the
+    // install had worked.
+    await installWithRegistryRetry(
+      ["--prefix", project, "--no-save", ...jsPackages],
+      { attempts: 60, delayMs: 5_000 },
     );
 
     // Present at the right version, and pointing at this repository: an absent
@@ -112,6 +129,22 @@ async function main() {
       if (!repository) missing.push(`${name}: published without repository.url`);
     }
     assert.equal(missing.length, 0, `\n  ${missing.join("\n  ")}`);
+
+    // npm skips an optionalDependency it cannot resolve and still exits 0, so a
+    // helper missing from the registry produces a silent half-install rather
+    // than a failure. Check this machine's helper actually landed.
+    const require_ = createRequire(join(project, "noop.js"));
+    for (const info of Object.values(plugins)) {
+      const helper = packageName(info, currentPlatform());
+      try {
+        require_.resolve(`${helper}/package.json`);
+        console.log(`  installed ${helper}`);
+      } catch {
+        assert.fail(
+          `${helper} did not install: npm skips an unresolvable optional dependency silently`,
+        );
+      }
+    }
 
     // Installable is not the same as loadable. Import each package and confirm
     // it exposes the plugin factory the SDK registers.
