@@ -883,8 +883,20 @@ jobs:
         run: node scripts/verify-published-history-core.mjs all
       - name: Publish platform helpers before JavaScript plugins
         if: ${{ !inputs.dry_run }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No NODE_AUTH_TOKEN. This job has `id-token: write` and publishes the
+        # same way the core job does: npm OIDC trusted publishing, bound to
+        # this repository plus this workflow file name.
+        #
+        # It used to set `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`. That
+        # secret does not exist in this repository, and setup-node writes
+        # `_authToken=${NODE_AUTH_TOKEN}` into .npmrc unconditionally, so the
+        # empty value produced a blank credential that suppressed OIDC:
+        #
+        #   npm error code ENEEDAUTH
+        #   npm error need auth This command requires you to be logged in
+        #
+        # That error was invisible until the file-spec fix (#152) let npm get
+        # far enough to contact the registry at all.
         run: |
           set -euo pipefail
           # Every tarball path is written `./artifacts/...`. npm-package-arg
