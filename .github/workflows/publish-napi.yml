@@ -887,12 +887,31 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
+          # Every tarball path is written `./artifacts/...`. npm-package-arg
+          # reads a bare `dir/file.tgz` as GitHub `owner/repo` shorthand, so a
+          # path without the leading `./` is resolved as a git remote:
+          #   npm error command git ls-remote ssh://git@github.com/artifacts/...
+          # That is why these helpers had never published on any release.
+          #
+          # nullglob turns a pattern that matches nothing into no words at all
+          # rather than the literal pattern, and the counter below fails the
+          # release instead of silently publishing a partial platform set.
+          shopt -s nullglob
           for plugin in relayhistory provider-sources; do
             prefix=$(node -p "require('./plugins/$plugin/sdk/package.json').name.replace('@agent-relay/', '')")
-            for package in artifacts/agent-relay-$prefix-darwin-*-$VERSION.tgz artifacts/agent-relay-$prefix-linux-*-$VERSION.tgz artifacts/agent-relay-$prefix-win32-*-$VERSION.tgz; do
+            helpers=(
+              ./artifacts/agent-relay-"$prefix"-darwin-*-"$VERSION".tgz
+              ./artifacts/agent-relay-"$prefix"-linux-*-"$VERSION".tgz
+              ./artifacts/agent-relay-"$prefix"-win32-*-"$VERSION".tgz
+            )
+            if [ "${#helpers[@]}" -eq 0 ]; then
+              echo "no platform helpers staged for $plugin at $VERSION" >&2
+              exit 1
+            fi
+            for package in "${helpers[@]}"; do
               npm publish "$package" --access public --provenance
             done
-            npm publish "artifacts/agent-relay-$prefix-$VERSION.tgz" --access public --provenance
+            npm publish "./artifacts/agent-relay-$prefix-$VERSION.tgz" --access public --provenance
           done
       - name: List the staged tarballs
         if: ${{ inputs.dry_run }}
