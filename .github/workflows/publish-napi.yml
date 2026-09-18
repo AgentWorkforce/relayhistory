@@ -818,6 +818,37 @@ jobs:
         with:
           pattern: helper-*
           path: helpers
+      # A skip_core retry takes its whole tree from the release tag, including
+      # the plugin manifests and the package contract that every later step
+      # derives coordinates from. Tags cut before the @relayhistory rename
+      # still name their plugins @agent-relay/*, and those names still produce
+      # valid tarballs — so such a retry would publish the obsolete packages
+      # and report success, leaving @relayhistory/* absent.
+      #
+      # This step is the one place the scope must NOT come from the checkout:
+      # a workflow_dispatch run reads this file from the dispatch ref, not
+      # from `ref:` above, so this literal is the only thing in the job that a
+      # stale tag cannot rewrite.
+      #
+      # There is no correct way to publish @relayhistory/* from a tag that does
+      # not contain those names — doing so would mix post-rename code into an
+      # older release, which is exactly what skip_core exists to avoid. So this
+      # refuses rather than repairs: cut a normal release instead.
+      - name: Refuse a plugin-only retry from a pre-rename release
+        if: ${{ inputs.skip_core }}
+        run: |
+          set -euo pipefail
+          for plugin in relayhistory provider-sources; do
+            name=$(node -p "require('./plugins/$plugin/sdk/package.json').name")
+            case "$name" in
+              @relayhistory/*) ;;
+              *)
+                echo "release tag sdk-ts-v${VERSION} predates the @relayhistory rename ($plugin is still $name)." >&2
+                echo "A plugin-only retry cannot publish @relayhistory/* from it; cut a normal release instead." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: Apply the release version
         run: |
           set -euo pipefail
