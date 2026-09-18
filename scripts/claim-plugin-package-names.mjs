@@ -158,29 +158,34 @@ async function main() {
   for (const entry of missing) {
     console.log(`\nclaiming ${entry.name}`);
     try {
+      // npm's exit status is the authority on whether the PUT succeeded.
+      //
+      // Do NOT confirm by reading the registry back here. A newly created name
+      // serves 404 for roughly two minutes, so an immediate read reports every
+      // successful claim as a failure — which it did, for all fifteen, while
+      // npm had printed `+ name@0.0.0` for each one.
       claim(entry, otp);
-    } catch {
-      // npm has already printed why, to the inherited stderr.
-    }
-    // The registry is the authority: an interactive auth can succeed after npm
-    // exits non-zero, and a zero exit is not proof the name was created.
-    if (published(entry.name)) {
       console.log(`  claimed ${entry.name}`);
-    } else {
+    } catch {
+      // npm has already explained itself on the inherited stderr.
       console.log(`  FAILED ${entry.name}`);
       failures.push(entry.name);
     }
   }
 
   if (failures.length > 0) {
-    console.error(`\n${failures.length} still missing:`);
+    console.error(`\n${failures.length} failed:`);
     for (const name of failures) console.error(`  ${name}`);
     console.error("\nnpm printed the reason above each failure.");
-    console.error("If it asked you to authenticate, finish that once and re-run:");
-    console.error("only the names still missing are retried.");
+    console.error("If it asked you to authenticate, finish that once and re-run.");
     process.exitCode = 1;
     return;
   }
+
+  console.log(
+    "\nNote: a new name serves 404 for a couple of minutes before the registry" +
+      "\nreturns it. A --dry-run straight after this may still report them missing.",
+  );
 
   console.log(`\nClaimed ${missing.length}. Now run the release:`);
   console.log(
