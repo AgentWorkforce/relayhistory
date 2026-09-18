@@ -1,6 +1,6 @@
 {
   "name": "@agent-relay/relayhistory",
-  "version": "0.16.0",
+  "version": "0.18.1",
   "description": "Optional RelayHistory destination, auth, sharing and recall plugin for ai-hist.",
   "type": "module",
   "main": "dist/index.js",
@@ -27,7 +27,7 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "peerDependencies": {
-    "ai-hist": "^0.17.0"
+    "ai-hist": "^0.18.1"
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",
@@ -42,13 +42,13 @@
     "relayhistory-plugin": "./dist/cli.js"
   },
   "optionalDependencies": {
-    "@agent-relay/relayhistory-darwin-arm64": "0.16.0",
-    "@agent-relay/relayhistory-darwin-x64": "0.16.0",
-    "@agent-relay/relayhistory-linux-x64-gnu": "0.16.0",
-    "@agent-relay/relayhistory-linux-arm64-gnu": "0.16.0",
-    "@agent-relay/relayhistory-linux-x64-musl": "0.16.0",
-    "@agent-relay/relayhistory-linux-arm64-musl": "0.16.0",
-    "@agent-relay/relayhistory-win32-x64-msvc": "0.16.0"
+    "@agent-relay/relayhistory-darwin-arm64": "0.18.1",
+    "@agent-relay/relayhistory-darwin-x64": "0.18.1",
+    "@agent-relay/relayhistory-linux-x64-gnu": "0.18.1",
+    "@agent-relay/relayhistory-linux-arm64-gnu": "0.18.1",
+    "@agent-relay/relayhistory-linux-x64-musl": "0.18.1",
+    "@agent-relay/relayhistory-linux-arm64-musl": "0.18.1",
+    "@agent-relay/relayhistory-win32-x64-msvc": "0.18.1"
   },
   "publishConfig": {
     "access": "public"
