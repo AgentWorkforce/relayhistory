@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
+import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import type { Writable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
 
 import {
   discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
@@ -13,12 +16,43 @@ import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConf
 
 type Parsed = { positional: string[]; flags: Map<string, Array<string | true>> };
 
+/**
+ * Where a run's output goes.
+ *
+ * The bin writes to the real streams; a host that mounts this CLI (see
+ * `relay-cli.ts`) supplies its own sink. Nothing below `runCli` touches
+ * `process.stdout`/`process.stderr` directly, so the same dispatch serves both.
+ */
+export interface CliIo {
+  stdout(chunk: string): void;
+  stderr(chunk: string): void;
+}
+
+/**
+ * A run that is over: usage errors and `--help`, which used to call
+ * `process.exit`.
+ *
+ * `usage()` is reached from argument parsing several frames down and is typed
+ * `never`, so returning a code from it is not available. Carrying the text on
+ * the throw keeps those call sites unchanged and leaves `runCli` the only place
+ * that decides what reaches `io`.
+ */
+class CliExit extends Error {
+  constructor(readonly exitCode: number, readonly stdout: string, readonly stderr: string) {
+    super(`ai-hist exited with ${exitCode}`);
+    this.name = 'CliExit';
+  }
+}
+
 type PackageMetadata = { version?: string };
 
-const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
-const VALUE_FLAGS = new Set([
+export const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+export const VALUE_FLAGS = new Set([
   'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
+  // Documented in the usage text and read by `sessions discover`, `sessions
+  // hydrate` and `sync`, but absent here, so `parse` rejected it as unknown.
+  'acquisition-timeout-ms',
 ]);
 const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
 
@@ -37,12 +71,28 @@ function newerVersion(current: string, latest: string): boolean {
   return false;
 }
 
+/**
+ * True when this module was started as the `ai-hist` program.
+ *
+ * `relay-cli.ts` imports this file for `runCli`; without this guard that import
+ * would run `main()` against the host's own `process.argv`.
+ */
+function isBinEntrypoint(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return pathToFileURL(realpathSync(entry)).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
 async function packageVersion(): Promise<string> {
   const contents = await readFile(new URL('../package.json', import.meta.url), 'utf8');
   return (JSON.parse(contents) as PackageMetadata).version ?? 'unknown';
 }
 
-async function maybePrintUpdateNotice(current: string, args: string[]): Promise<void> {
+async function maybePrintUpdateNotice(io: CliIo, current: string, args: string[]): Promise<void> {
   const optOut = process.env.RELAYHISTORY_NO_UPDATE_CHECK;
   if (!process.stderr.isTTY || args.includes('--no-warning') || (optOut && optOut !== '0')) return;
   try {
@@ -53,7 +103,7 @@ async function maybePrintUpdateNotice(current: string, args: string[]): Promise<
     if (!response.ok) return;
     const latest = (await response.json()) as PackageMetadata;
     if (!latest.version || !newerVersion(current, latest.version)) return;
-    process.stderr.write(
+    io.stderr(
       `\nA new version of ai-hist is available: ${current} -> ${latest.version}\n` +
       'Update with:\n  npm install --global ai-hist@latest\n' +
       '(pass --no-warning or set RELAYHISTORY_NO_UPDATE_CHECK=1 to hide this notice)\n',
@@ -174,7 +224,7 @@ function wireValue(value: unknown): unknown {
     .map(([key, item]) => [snakeCase(key), OPAQUE_JSON_KEYS.has(key) ? item : wireValue(item)]));
 }
 
-function humanLine(value: unknown): string {
+export function humanLine(value: unknown): string {
   if (!value || typeof value !== 'object') return String(value);
   const row = value as Record<string, unknown>;
   const locations = Array.isArray(row.locations) ? `[${row.locations.join(',')}]` : '';
@@ -183,26 +233,26 @@ function humanLine(value: unknown): string {
     .join('  ');
 }
 
-function output(value: unknown, json: boolean): void {
+export function output(io: CliIo, value: unknown, json: boolean): void {
   if (json) {
-    process.stdout.write(`${JSON.stringify(wireValue(value))}\n`);
+    io.stdout(`${JSON.stringify(wireValue(value))}\n`);
   } else if (Array.isArray(value)) {
-    process.stdout.write(value.length ? `${value.map(humanLine).join('\n')}\n` : 'No results.\n');
+    io.stdout(value.length ? `${value.map(humanLine).join('\n')}\n` : 'No results.\n');
   } else if (typeof value === 'object' && value !== null) {
     const record = value as Record<string, unknown>;
     if (Array.isArray(record.sessions)) {
-      process.stdout.write(record.sessions.length ? `${record.sessions.map(humanLine).join('\n')}\n` : 'No sessions in the catalog.\n');
-      if (record.nextCursor) process.stdout.write(`more available: --after '${JSON.stringify(record.nextCursor)}'\n`);
+      io.stdout(record.sessions.length ? `${record.sessions.map(humanLine).join('\n')}\n` : 'No sessions in the catalog.\n');
+      if (record.nextCursor) io.stdout(`more available: --after '${JSON.stringify(record.nextCursor)}'\n`);
     } else {
-      process.stdout.write(`${Object.entries(record).map(([key, item]) => `${key}: ${typeof item === 'object' ? JSON.stringify(item) : String(item)}`).join('\n')}\n`);
+      io.stdout(`${Object.entries(record).map(([key, item]) => `${key}: ${typeof item === 'object' ? JSON.stringify(item) : String(item)}`).join('\n')}\n`);
     }
   } else {
-    process.stdout.write(`${String(value)}\n`);
+    io.stdout(`${String(value)}\n`);
   }
 }
 
-function showHelp(): never {
-  process.stdout.write(`Usage:
+/** The one usage text. It was duplicated verbatim in `showHelp` and `usage`. */
+const USAGE_TEXT = `Usage:
   ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
   ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
   ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--source SOURCE] [--limit N] [--json]
@@ -226,38 +276,14 @@ function showHelp(): never {
 
 Every command that reads local history indexes it on first use; pass
 --no-bootstrap to answer from the store exactly as it stands.
-`);
-  process.exit(0);
+`;
+
+function showHelp(): never {
+  throw new CliExit(0, USAGE_TEXT, '');
 }
 
 function usage(message?: string): never {
-  if (message) process.stderr.write(`ai-hist: ${message}\n\n`);
-  process.stderr.write(`Usage:
-  ai-hist [--no-bootstrap] [--db PATH] [--json] [--help]
-  ai-hist sessions list [--pretty] [--local | --remote | --all] [--source SOURCE]... [--limit N] [--before-ms MS] [--after JSON | --after-source SOURCE --after-session-id ID [--after-ms MS]] [--json]
-  ai-hist sessions discover [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--source SOURCE] [--limit N] [--json]
-  ai-hist sessions hydrate SOURCE SESSION_ID [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--no-related] [--db PATH] [--json]
-  ai-hist sessions relationships SOURCE SESSION_ID [--db PATH] [--json]
-  ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
-  ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
-  ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
-  ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
-  ai-hist session SESSION_ID [--source SOURCE] [--json]
-  ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
-  ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
-  ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
-  ai-hist stats [--local | --remote | --all] [--json]
-  ai-hist export --selection FILE [--out FILE] [--db PATH]
-  ai-hist delivery enable|drain|run --config FILE [--job ID] [--db PATH]
-  ai-hist delivery status|pause|resume|retry|cancel [--job ID] [--db PATH]
-  ai-hist plugin COMMAND --config FILE -- [ARGS...]
-  ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
-
-Every command that reads local history indexes it on first use; pass
---no-bootstrap to answer from the store exactly as it stands.
-`);
-  process.exit(2);
+  throw new CliExit(2, '', `${message ? `ai-hist: ${message}\n\n` : ''}${USAGE_TEXT}`);
 }
 
 function cursorFlag<T>(args: Parsed): T | undefined {
@@ -295,81 +321,81 @@ function evidenceCursorFlag(args: Parsed): EvidenceCursor | undefined {
   return { tsMs: tsMs as number | null, id: raw.id as number };
 }
 
-function outputDiscovery(value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {
+function outputDiscovery(io: CliIo, value: Awaited<ReturnType<typeof discoverSessions>>, json: boolean): void {
   if (!json) {
-    for (const session of value.sessions) process.stdout.write(`${humanLine(session)}\n`);
-    process.stdout.write(
+    for (const session of value.sessions) io.stdout(`${humanLine(session)}\n`);
+    io.stdout(
       `${value.sessions.length} session(s): ${value.discovered} discovered, ${value.skippedUnchanged} unchanged ` +
       `(${value.counters.filesOpened} file(s) opened, ${value.counters.shallowReads} shallow read(s)); ` +
       `requested scope: ${value.scope}, connector locations run: ${value.locationsRun.length > 0 ? value.locationsRun.join(', ') : 'none'}\n`,
     );
     return;
   }
-  for (const session of value.sessions) output({ type: 'session', ...session }, true);
-  for (const diagnostic of value.diagnostics) output({ type: 'diagnostic', ...diagnostic }, true);
+  for (const session of value.sessions) output(io, { type: 'session', ...session }, true);
+  for (const diagnostic of value.diagnostics) output(io, { type: 'diagnostic', ...diagnostic }, true);
   const { sessions: _sessions, diagnostics: _diagnostics, ...summary } = value;
   const providers = Object.fromEntries(summary.providers.map(({ source, ...provider }) => [source, provider]));
-  output({ type: 'summary', ...summary, providers }, true);
+  output(io, { type: 'summary', ...summary, providers }, true);
 }
 
-function continuationNotice(cursor: EvidenceCursor | null): void {
-  if (cursor) process.stdout.write(`more available: --after '${JSON.stringify(cursor)}'\n`);
+function continuationNotice(io: CliIo, cursor: EvidenceCursor | null): void {
+  if (cursor) io.stdout(`more available: --after '${JSON.stringify(cursor)}'\n`);
 }
 
 // Human rows are positional, so every column is always printed: an absent
 // value is `-` rather than a dropped field that would shift the columns after
 // it, and an uncounted line delta is `?` rather than a fabricated 0.
-function outputToolCalls(page: SessionToolCallsPage, json: boolean): void {
+function outputToolCalls(io: CliIo, page: SessionToolCallsPage, json: boolean): void {
   if (json) {
-    output(page, true);
+    output(io, page, true);
     return;
   }
   if (page.toolCalls.length === 0) {
-    process.stdout.write('No tool calls.\n');
+    io.stdout('No tool calls.\n');
     return;
   }
   for (const call of page.toolCalls) {
-    process.stdout.write([
+    io.stdout([
       call.tsMs ?? '-', call.source, call.toolUseId, call.name,
       call.target ?? '-', call.isError === true ? '(error)' : '-',
     ].join('  ').concat('\n'));
   }
-  continuationNotice(page.nextCursor);
+  continuationNotice(io, page.nextCursor);
 }
 
-function outputFileEdits(page: SessionFileEditsPage, json: boolean): void {
+function outputFileEdits(io: CliIo, page: SessionFileEditsPage, json: boolean): void {
   if (json) {
-    output(page, true);
+    output(io, page, true);
     return;
   }
   if (page.fileEdits.length === 0) {
-    process.stdout.write('No file edits.\n');
+    io.stdout('No file edits.\n');
     return;
   }
   for (const edit of page.fileEdits) {
-    process.stdout.write([
+    io.stdout([
       edit.tsMs ?? '-', edit.source, edit.toolUseId, edit.toolName ?? '-', edit.filePath,
       `+${edit.linesAdded ?? '?'}/-${edit.linesRemoved ?? '?'}`,
     ].join('  ').concat('\n'));
   }
-  continuationNotice(page.nextCursor);
+  continuationNotice(io, page.nextCursor);
 }
 
-function outputHydration(value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
+function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
   if (json) {
-    output(value, true);
+    output(io, value, true);
     return;
   }
-  process.stdout.write(`${value.source}/${value.sessionId}: ${value.status}\n`);
-  process.stdout.write(
+  io.stdout(`${value.source}/${value.sessionId}: ${value.status}\n`);
+  io.stdout(
     `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
     `${value.evidence.toolCalls} tool call(s), ${value.evidence.fileEdits} file edit(s)\n`,
   );
   if (value.relatedSessionIds.length) {
-    process.stdout.write(`related sessions: ${value.relatedSessionIds.join(', ')}\n`);
+    io.stdout(`related sessions: ${value.relatedSessionIds.join(', ')}\n`);
   }
   for (const diagnostic of value.diagnostics) {
-    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+    io.stdout(`${diagnostic.code}: ${diagnostic.message}\n`);
   }
 }
 
@@ -382,21 +408,21 @@ function relationshipLine(direction: 'child' | 'parent', row: SessionRelationshi
   ].join('  ');
 }
 
-function outputRelationships(value: Awaited<ReturnType<typeof getSessionRelationships>>, json: boolean): void {
+function outputRelationships(io: CliIo, value: Awaited<ReturnType<typeof getSessionRelationships>>, json: boolean): void {
   if (json) {
-    output(value, true);
+    output(io, value, true);
     return;
   }
   const total = value.asParent.length + value.asChild.length;
-  process.stdout.write(total === 0
+  io.stdout(total === 0
     ? `${value.source}/${value.sessionId}: no delegation relationships.\n`
     : `${value.source}/${value.sessionId}: ${value.asParent.length} child relationship(s), ` +
       `${value.asChild.length} parent relationship(s)\n`);
-  for (const row of value.asParent) process.stdout.write(`${relationshipLine('child', row)}\n`);
-  for (const row of value.asChild) process.stdout.write(`${relationshipLine('parent', row)}\n`);
-  process.stdout.write(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);
+  for (const row of value.asParent) io.stdout(`${relationshipLine('child', row)}\n`);
+  for (const row of value.asChild) io.stdout(`${relationshipLine('parent', row)}\n`);
+  io.stdout(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);
   for (const diagnostic of value.diagnostics) {
-    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+    io.stdout(`${diagnostic.code}: ${diagnostic.message}\n`);
   }
 }
 
@@ -414,7 +440,7 @@ function queryPositionals(subcommand: string | undefined, rest: string[], comman
   return query;
 }
 
-async function runResume(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
+async function runResume(io: CliIo, args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<number> {
   const query = queryPositionals(subcommand, rest, 'resume');
   // Matches the Rust CLI: search is capped to the single best match, then that
   // one row is checked for a usable session id rather than scanning further.
@@ -429,7 +455,7 @@ async function runResume(args: Parsed, subcommand: string | undefined, rest: str
   // field rather than failing, matching that contract here.
   const locallyAvailable = entry.locations.length === 0 || entry.locations.includes('local');
   if (json) {
-    output({
+    output(io, {
       ...entry,
       resumeCmd: cmd,
       scope: scopeFlag(args),
@@ -437,11 +463,11 @@ async function runResume(args: Parsed, subcommand: string | undefined, rest: str
         resumeUnavailableReason: 'session is remote-only; materialize it locally before resuming',
       }),
     }, true);
-    return;
+    return 0;
   }
   if (cmd) {
-    process.stdout.write(`${cmd}\n`);
-    return;
+    io.stdout(`${cmd}\n`);
+    return 0;
   }
   if (!locallyAvailable) {
     throw new Error(
@@ -468,7 +494,7 @@ function takeCodePoints(text: string, limit: number): { truncated: boolean; text
   return { truncated: true, text: points.slice(0, limit).join('') };
 }
 
-async function runPack(args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<void> {
+async function runPack(io: CliIo, args: Parsed, subcommand: string | undefined, rest: string[], json: boolean): Promise<number> {
   const query = queryPositionals(subcommand, rest, 'pack');
   const queryStr = query.join(' ');
   const tokens = nonNegativeIntFlag(args, 'tokens') ?? 0;
@@ -479,12 +505,11 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
   });
   if (rows.length === 0) {
     if (json) {
-      output({ query: queryStr, entries: [] }, true);
+      output(io, { query: queryStr, entries: [] }, true);
     } else {
-      process.stdout.write('No results.\n');
+      io.stdout('No results.\n');
     }
-    process.exitCode = 1;
-    return;
+    return 1;
   }
   const charsBudget = tokens > 0 ? tokens * 4 : undefined;
   const generatedMs = Date.now();
@@ -493,10 +518,10 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
       const prompt = charsBudget ? takeCodePoints(entry.prompt, charsBudget).text : entry.prompt;
       return { ...entry, prompt, resumeCmd: resumeCommand(entry) };
     });
-    output({ query: queryStr, generatedMs, tokenBudget: tokens, entries }, true);
-    return;
+    output(io, { query: queryStr, generatedMs, tokenBudget: tokens, entries }, true);
+    return 0;
   }
-  process.stdout.write(`=== ai-hist pack: "${queryStr}" | ${formatLocalMinute(generatedMs)} | ${rows.length} entries ===\n\n`);
+  io.stdout(`=== ai-hist pack: "${queryStr}" | ${formatLocalMinute(generatedMs)} | ${rows.length} entries ===\n\n`);
   rows.forEach((entry: HistoryEntry, index: number) => {
     const project = entry.project ? `  ${entry.project}` : '';
     let text = entry.prompt.replace(/\n/g, ' ');
@@ -504,26 +529,27 @@ async function runPack(args: Parsed, subcommand: string | undefined, rest: strin
       const capped = takeCodePoints(text, charsBudget);
       if (capped.truncated) text = `${capped.text}...`;
     }
-    process.stdout.write(
+    io.stdout(
       `[${index + 1}/${rows.length}] #${entry.id}  ${formatLocalMinute(entry.timestampMs)}  ${entry.source}${project}\n`,
     );
-    process.stdout.write(`      ${text}\n`);
+    io.stdout(`      ${text}\n`);
     if (entry.sessionId) {
       const cmd = resumeCommand(entry);
       if (cmd) {
-        process.stdout.write(`      Resume: ${cmd}\n`);
+        io.stdout(`      Resume: ${cmd}\n`);
       } else {
         const short = entry.sessionId.length > 16 ? `${entry.sessionId.slice(0, 16)}...` : entry.sessionId;
-        process.stdout.write(`      Session: ${short}\n`);
+        io.stdout(`      Session: ${short}\n`);
       }
     }
-    process.stdout.write('\n');
+    io.stdout('\n');
   });
+  return 0;
 }
 
-function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boolean): void {
+function outputTree(io: CliIo, value: Awaited<ReturnType<typeof getSessionTree>>, json: boolean): void {
   if (json) {
-    output(value, true);
+    output(io, value, true);
     return;
   }
   for (const node of value.nodes) {
@@ -531,23 +557,52 @@ function outputTree(value: Awaited<ReturnType<typeof getSessionTree>>, json: boo
       ? `  [${[node.relationship.relationship, node.relationship.childAgentType].filter(Boolean).join(' ')}]` +
         `  events=${node.hasEvents ? 'yes' : 'no'}`
       : '';
-    process.stdout.write(`${'  '.repeat(node.depth)}${node.sessionId}${edge}${node.truncated ? '  …' : ''}\n`);
+    io.stdout(`${'  '.repeat(node.depth)}${node.sessionId}${edge}${node.truncated ? '  …' : ''}\n`);
   }
-  process.stdout.write(
+  io.stdout(
     `${Math.max(value.nodes.length - 1, 0)} descendant(s), max depth ${value.maxDepthReached}\n`,
   );
   for (const row of value.unlinked) {
-    process.stdout.write(`unlinked evidence: ${row.evidenceKind} ${row.evidenceLocator ?? ''}`.trimEnd() + '\n');
+    io.stdout(`unlinked evidence: ${row.evidenceKind} ${row.evidenceLocator ?? ''}`.trimEnd() + '\n');
   }
   for (const diagnostic of value.diagnostics) {
-    process.stdout.write(`${diagnostic.code}: ${diagnostic.message}\n`);
+    io.stdout(`${diagnostic.code}: ${diagnostic.message}\n`);
   }
-  if (value.truncated) process.stdout.write('truncated: node/depth budget reached\n');
+  if (value.truncated) io.stdout('truncated: node/depth budget reached\n');
 }
 
-interface CommandSpec {
+/** One positional argument, as the mounted help renders it. */
+export interface CommandArgSpec {
+  name: string;
+  description: string;
+  required: boolean;
+  variadic?: boolean;
+}
+
+export interface CommandSpec {
   /** Name used in flag- and argument-rejection messages. */
   name: string;
+  /**
+   * One line for the mounted help.
+   *
+   * A host renders its own help from this table rather than forwarding
+   * `--help`, so an empty description is a user-visible hole, not an internal
+   * detail.
+   */
+  description: string;
+  /**
+   * Path under the mounted group, or `null` for a command the group does not
+   * expose. `['sessions', 'list']` here is `ai-hist sessions list`, reached as
+   * `agent-relay sessions list`.
+   */
+  surface: readonly string[] | null;
+  /** Extra spellings the mounted group accepts for `surface`. */
+  surfaceAliases?: readonly string[];
+  /**
+   * The positionals named for help. `positionals` below stays the authority on
+   * how many are accepted; the drift test asserts the two agree.
+   */
+  args?: readonly CommandArgSpec[];
   allowed: readonly string[];
   /** Positional arguments after the command words: [minimum, maximum]. */
   positionals: readonly [number, number | null];
@@ -559,6 +614,13 @@ interface CommandSpec {
   rejectsScope?: boolean;
   /** Remaining command-line checks, run before any store work. */
   validate?: (args: Parsed) => void;
+  /**
+   * Reads `RunCliOptions.signal`, so the bin claims the process's signals for
+   * it. Left off, the bin leaves `SIGINT`/`SIGTERM` at their default: a
+   * listener suppresses Node's own termination, so claiming them for a command
+   * that never looks at the signal swallows the user's first Ctrl-C.
+   */
+  cancellable?: true;
 }
 
 function validateInterval(args: Parsed): void {
@@ -570,17 +632,80 @@ function validateInterval(args: Parsed): void {
   }
 }
 
+/**
+ * Every option a command may list in `allowed`, spelled the way help shows it.
+ *
+ * This is the only place a flag's user-facing text lives. The drift test
+ * asserts it covers exactly the flags the command table allows, and that each
+ * one's arity matches `BOOLEAN_FLAGS`/`VALUE_FLAGS` — so a flag that `parse`
+ * cannot accept can never reach the mounted help.
+ */
+export const FLAG_SPECS: Record<string, { flags: string; description: string }> = {
+  'acquisition-timeout-ms': { flags: '--acquisition-timeout-ms <ms>', description: 'Budget for remote acquisition, in milliseconds.' },
+  after: { flags: '--after <json>', description: 'Continue from a printed cursor.' },
+  'after-ms': { flags: '--after-ms <ms>', description: 'Cursor timestamp, with --after-source and --after-session-id.' },
+  'after-session-id': { flags: '--after-session-id <id>', description: 'Cursor session id, with --after-source.' },
+  'after-source': { flags: '--after-source <source>', description: 'Cursor source, with --after-session-id.' },
+  all: { flags: '--all', description: 'Read local and remote history.' },
+  'before-ms': { flags: '--before-ms <ms>', description: 'Only entries older than this epoch-millisecond timestamp.' },
+  config: { flags: '--config <file>', description: 'History application config file.' },
+  db: { flags: '--db <path>', description: 'History database to read or write.' },
+  fts: { flags: '--fts', description: 'Treat the query as raw SQLite full-text syntax.' },
+  job: { flags: '--job <id>', description: 'Act on one delivery job.' },
+  json: { flags: '--json', description: 'Emit JSON instead of human-readable text.' },
+  limit: { flags: '--limit <n>', description: 'Maximum rows to return.' },
+  local: { flags: '--local', description: 'Read only local history (the default).' },
+  'max-depth': { flags: '--max-depth <n>', description: 'Stop walking below this depth.' },
+  'max-nodes': { flags: '--max-nodes <n>', description: 'Stop after this many nodes.' },
+  'no-bootstrap': { flags: '--no-bootstrap', description: 'Answer from the store as it stands, without first-use indexing.' },
+  'no-related': { flags: '--no-related', description: 'Do not hydrate related sessions.' },
+  'no-source-connectors': { flags: '--no-source-connectors', description: 'Disable remote acquisition entirely.' },
+  out: { flags: '--out <file>', description: 'Write to this file instead of standard output.' },
+  'poll-ms': { flags: '--poll-ms <ms>', description: 'Delivery poll interval, in milliseconds.' },
+  pretty: { flags: '--pretty', description: 'Render aligned, colourized rows.' },
+  project: { flags: '--project <path>', description: 'Only sessions from this project directory.' },
+  remote: { flags: '--remote', description: 'Read only remote history.' },
+  selection: { flags: '--selection <file>', description: 'Export selection file.' },
+  source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
+  'source-connector': { flags: '--source-connector <id>', description: 'Run this remote connector; repeatable.' },
+  tag: { flags: '--tag <tag>', description: 'Restrict to entries carrying this tag.' },
+  'timeout-ms': { flags: '--timeout-ms <ms>', description: 'Per-request delivery timeout, in milliseconds.' },
+  tokens: { flags: '--tokens <n>', description: 'Approximate token budget for the packed output.' },
+};
+
+/** Options the host owns, so they never reach a mounted command's help. */
+export const HOST_OWNED_FLAGS = new Set(['help', 'no-warning']);
+
 // The whole dispatch surface in one table. `readsLocalStore` is the decision
 // that used to live only in the bare-invocation branch: keeping it here is what
 // stops `search` and `ai-hist` disagreeing about whether a store exists.
-const COMMANDS = new Map<string, CommandSpec>([
-  ['', { name: 'ai-hist', positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
-  ['export', { name: 'export', positionals: [0, 0], allowed: ['db', 'selection', 'out'] }],
-  ['plugin', { name: 'plugin', positionals: [1, null], allowed: ['config'], requires: 'plugin requires a command name' }],
-  ...(['enable', 'status', 'drain', 'run', 'pause', 'resume', 'retry', 'cancel'] as const).map((action): [string, CommandSpec] => [`delivery ${action}`, {
-    name: `delivery ${action}`, positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
+export const COMMANDS = new Map<string, CommandSpec>([
+  // The bare invocation reports the store's condition; a mounted group shows
+  // help instead, so `list` is its explicit equivalent there.
+  ['', { name: 'ai-hist', description: 'Report local history readiness and list the catalogue.', surface: null,
+    positionals: [0, 0], allowed: ['db', 'json', 'help'], readsLocalStore: true }],
+  ['export', { name: 'export', description: 'Export selected history as NDJSON.', surface: ['export'],
+    positionals: [0, 0], allowed: ['db', 'selection', 'out'] }],
+  // A config-driven extension hook that needs `-- ARGS` passthrough, not a
+  // user-facing verb: it stays on the bin and off the mounted tree.
+  ['plugin', { name: 'plugin', description: 'Run a configured history plugin command.', surface: null,
+    positionals: [1, null], allowed: ['config'], requires: 'plugin requires a command name' }],
+  ...(Object.entries({
+    enable: 'Create the delivery job declared in the config file.',
+    status: 'Report delivery job status and retention.',
+    drain: 'Deliver everything currently queued, then stop.',
+    run: 'Run the delivery loop until it is cancelled.',
+    pause: 'Stop a delivery job from making progress.',
+    resume: 'Let a paused delivery job make progress again.',
+    retry: 'Clear a delivery job\'s failure and try it again.',
+    cancel: 'Abandon a delivery job.',
+  }) as Array<[string, string]>).map(([action, description]): [string, CommandSpec] => [`delivery ${action}`, {
+    name: `delivery ${action}`, description, surface: ['delivery', action],
+    positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
+    cancellable: true,
   }]),
-  ['sessions list', { name: 'sessions list', positionals: [0, 0], readsLocalStore: true,
+  ['sessions list', { name: 'sessions list', description: 'List indexed sessions from the catalogue.',
+    surface: ['list'], positionals: [0, 0], readsLocalStore: true,
     validate: (args) => {
       if (args.flags.has('json') && args.flags.has('pretty')) usage('--pretty and --json are mutually exclusive');
     },
@@ -588,26 +713,36 @@ const COMMANDS = new Map<string, CommandSpec>([
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
       'json', 'limit', 'local', 'pretty', 'remote', 'source',
     ] }],
-  ['sessions discover', { name: 'sessions discover', positionals: [0, 0],
+  ['sessions discover', { name: 'sessions discover', description: 'Find coding-agent sessions and index the new ones.',
+    surface: ['discover'], positionals: [0, 0],
     validate: (args) => { sourceConnectorFlags(args); },
     allowed: ['all', 'db', 'json', 'limit', 'local', 'remote', 'source', 'config', 'source-connector', 'no-source-connectors', 'acquisition-timeout-ms'] }],
-  ['sessions hydrate', { name: 'sessions hydrate', positionals: [2, 2],
+  ['sessions hydrate', { name: 'sessions hydrate', description: 'Index one session\'s full evidence.',
+    surface: ['hydrate'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }],
     requires: 'sessions hydrate requires SOURCE and SESSION_ID',
     validate: (args) => { sourceConnectorFlags(args); },
     allowed: ['all', 'db', 'json', 'local', 'no-bootstrap', 'no-related', 'remote', 'config', 'source-connector', 'no-source-connectors', 'acquisition-timeout-ms'] }],
-  ['sessions relationships', { name: 'sessions relationships', positionals: [2, 2], readsLocalStore: true,
+  ['sessions relationships', { name: 'sessions relationships', description: 'Show a session\'s parent and child delegations.',
+    surface: ['relationships'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     rejectsScope: true, requires: 'sessions relationships requires SOURCE and SESSION_ID',
     allowed: ['all', 'db', 'json', 'local', 'remote'] }],
-  ['sessions tree', { name: 'sessions tree', positionals: [2, 2], readsLocalStore: true, rejectsScope: true,
+  ['sessions tree', { name: 'sessions tree', description: 'Print a session\'s delegation tree.',
+    surface: ['tree'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true, rejectsScope: true,
     requires: 'sessions tree requires SOURCE and SESSION_ID',
     allowed: ['all', 'db', 'json', 'local', 'max-depth', 'max-nodes', 'remote'] }],
-  ['sessions tools', { name: 'sessions tools', positionals: [2, 2], readsLocalStore: true,
+  ['sessions tools', { name: 'sessions tools', description: 'Page through a session\'s tool calls.',
+    surface: ['tools'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions tools requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
-  ['sessions edits', { name: 'sessions edits', positionals: [2, 2], readsLocalStore: true,
+  ['sessions edits', { name: 'sessions edits', description: 'Page through a session\'s file edits.',
+    surface: ['edits'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions edits requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
-  ['search', { name: 'search', positionals: [1, null], requires: 'search requires a query', readsLocalStore: true,
+  ['search', { name: 'search', description: 'Search indexed prompts.', surface: ['search'],
+    positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
+    requires: 'search requires a query', readsLocalStore: true,
     allowed: ['all', 'before-ms', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
-  ['recent', { name: 'recent', positionals: [0, 1], readsLocalStore: true,
+  ['recent', { name: 'recent', description: 'Show the most recent prompts.', surface: ['recent'],
+    positionals: [0, 1], args: [{ name: 'count', description: 'How many to show.', required: false }],
+    readsLocalStore: true,
     validate: (args) => {
       const count = args.positional[1];
       if (count !== undefined && !Number.isFinite(Number(count))) {
@@ -615,22 +750,33 @@ const COMMANDS = new Map<string, CommandSpec>([
       }
     },
     allowed: ['all', 'before-ms', 'db', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag'] }],
-  ['session', { name: 'session', positionals: [1, 1], requires: 'session requires SESSION_ID',
+  // `agent-relay sessions session ID` reads badly, so the mounted spelling is
+  // `show`; the original name stays as an alias for existing muscle memory.
+  ['session', { name: 'session', description: 'Show one session.', surface: ['show'], surfaceAliases: ['session'],
+    positionals: [1, 1], args: [{ name: 'session-id', description: 'Session identifier.', required: true }], requires: 'session requires SESSION_ID',
     readsLocalStore: true, rejectsScope: true,
     allowed: ['all', 'db', 'json', 'local', 'remote', 'source', 'tag'] }],
-  ['events', { name: 'events', positionals: [1, 1], requires: 'events requires SESSION_ID',
+  ['events', { name: 'events', description: 'Page through one session\'s events.', surface: ['events'],
+    positionals: [1, 1], args: [{ name: 'session-id', description: 'Session identifier.', required: true }], requires: 'events requires SESSION_ID',
     readsLocalStore: true, rejectsScope: true,
     allowed: ['after', 'all', 'db', 'json', 'limit', 'local', 'remote', 'source'] }],
-  ['resume', { name: 'resume', positionals: [1, null], requires: 'resume requires a query', readsLocalStore: true,
+  ['resume', { name: 'resume', description: 'Print the command that resumes the best-matching session.',
+    surface: ['resume'], positionals: [1, null],
+    args: [{ name: 'query', description: 'Search terms identifying the session.', required: true, variadic: true }],
+    requires: 'resume requires a query', readsLocalStore: true,
     allowed: ['all', 'db', 'fts', 'json', 'local', 'remote'] }],
-  ['pack', { name: 'pack', positionals: [1, null], requires: 'pack requires a query', readsLocalStore: true,
+  ['pack', { name: 'pack', description: 'Pack matching history into a context block.', surface: ['pack'],
+    positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
+    requires: 'pack requires a query', readsLocalStore: true,
     validate: (args) => { nonNegativeIntFlag(args, 'tokens'); },
     allowed: ['all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens'] }],
-  ['stats', { name: 'stats', positionals: [0, 0], readsLocalStore: true,
+  ['stats', { name: 'stats', description: 'Summarize what the history store holds.', surface: ['stats'],
+    positionals: [0, 0], readsLocalStore: true,
     allowed: ['all', 'db', 'json', 'local', 'remote', 'tag'] }],
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
-  ['sync', { name: 'sync', positionals: [0, 0], validate: (args) => { sourceConnectorFlags(args); },
+  ['sync', { name: 'sync', description: 'Index new sessions from every configured source.', surface: ['sync'],
+    positionals: [0, 0], validate: (args) => { sourceConnectorFlags(args); },
     allowed: ['all', 'db', 'json', 'local', 'remote', 'config', 'source-connector', 'no-source-connectors', 'acquisition-timeout-ms'] }],
 ]);
 
@@ -644,6 +790,32 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
   if (command === undefined) return COMMANDS.get('');
   if (command === 'sessions' || command === 'delivery') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
   return COMMANDS.get(command);
+}
+
+/**
+ * Whether this command line routes to a command that reads the cancellation
+ * signal.
+ *
+ * The bin asks before installing a `SIGINT`/`SIGTERM` handler. A listener
+ * replaces Node's default termination, so a handler on an invocation that
+ * never reads the signal swallows the first shutdown request: the user presses
+ * Ctrl-C, nothing happens, and they press it again. Resolved from the same
+ * `COMMANDS` table `dispatch` resolves against, so the two cannot disagree
+ * about which commands those are.
+ */
+export function usesCancellation(argv: readonly string[]): boolean {
+  // `plugin -- ARGS` passes its tail to a plugin verbatim, and `plugin` is not
+  // cancellable, so stopping at the separator can only ever read less.
+  const boundary = argv.indexOf('--');
+  const core = [...(boundary < 0 ? argv : argv.slice(0, boundary))];
+  try {
+    const { positional } = parse(core.map((arg) => arg === '-h' ? '--help' : arg));
+    return commandSpec(positional[0], positional[1])?.cancellable === true;
+  } catch {
+    // An argv `parse` refuses is a usage error `dispatch` is about to report.
+    // It runs no command, so it reads no signal.
+    return false;
+  }
 }
 
 function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
@@ -667,25 +839,33 @@ function skipUnusableStoreGate(spec: CommandSpec, scope: SessionScope): boolean 
     || spec.name === 'recent';
 }
 
-function reportUnusableStore(readiness: LocalStoreReadiness, json: boolean): boolean {
+function reportUnusableStore(io: CliIo, readiness: LocalStoreReadiness, json: boolean): boolean {
   if (readiness.status === 'ready' || readiness.status === 'skipped') return false;
   const message = readiness.status === 'unbuilt'
     ? 'No local index yet: run ai-hist (or ai-hist sync) to build one.'
     : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.';
-  if (json) output({ status: readiness.status, indexedPrompts: readiness.indexedPrompts, message }, true);
-  else process.stdout.write(`${message}\n`);
-  process.exitCode = 1;
+  if (json) output(io, { status: readiness.status, indexedPrompts: readiness.indexedPrompts, message }, true);
+  else io.stdout(`${message}\n`);
   return true;
 }
 
-async function main(): Promise<void> {
-  const rawArgs = process.argv.slice(2);
+/**
+ * One invocation, start to finish, with no process state touched.
+ *
+ * This is the whole of what `main()` used to be. Every exit that was a
+ * `process.exit`/`process.exitCode` is now a returned code, and every write is
+ * routed through `io`, so a host can mount the same dispatch.
+ */
+async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptions): Promise<number> {
+  const rawArgs = [...argv];
   const versionArgs = rawArgs.filter((arg) => arg !== '--no-warning');
   if (versionArgs.length === 1 && (versionArgs[0] === '--version' || versionArgs[0] === '-V')) {
     const version = await packageVersion();
-    process.stdout.write(`ai-hist ${version}\n`);
-    await maybePrintUpdateNotice(version, rawArgs);
-    return;
+    io.stdout(`ai-hist ${version}\n`);
+    // A mounted host prints its own version and must not make a network call
+    // on the user's behalf, so the registry check is the bin's alone.
+    if (options.updateNotice) await maybePrintUpdateNotice(io, version, rawArgs);
+    return 0;
   }
   const boundary = rawArgs.indexOf('--');
   const beforeBoundary = boundary < 0 ? rawArgs : rawArgs.slice(0, boundary);
@@ -729,15 +909,16 @@ async function main(): Promise<void> {
   const recentFallback = command === 'recent' && tail.length > 0 ? Number(tail[0]) : undefined;
   const scope = scopeFlag(args);
   if (command === 'delivery') {
-    await runDeliveryCommand(subcommand!, { dbPath: textFlag(args, 'db'), configPath: textFlag(args, 'config'),
-      jobId: textFlag(args, 'job'), pollIntervalMs: numberFlag(args, 'poll-ms'), requestTimeoutMs: numberFlag(args, 'timeout-ms') });
-    return;
+    return runDeliveryCommand(subcommand!, io, { dbPath: textFlag(args, 'db'), configPath: textFlag(args, 'config'),
+      jobId: textFlag(args, 'job'), pollIntervalMs: numberFlag(args, 'poll-ms'), requestTimeoutMs: numberFlag(args, 'timeout-ms'),
+      signal: options.signal });
   }
   if (command === 'export') {
     const selectionPath = textFlag(args, 'selection');
     if (!selectionPath) usage('export requires --selection FILE');
-    await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') });
-    return;
+    await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
+      options.stdoutStream);
+    return 0;
   }
   if (command === 'plugin') {
     const configPath = textFlag(args, 'config');
@@ -745,8 +926,8 @@ async function main(): Promise<void> {
     const { registry } = await loadHistoryApplicationConfig(configPath);
     const operation = registry.command(tail[0]);
     if (!operation) usage('configured plugin command not found');
-    output(await operation.run([...tail.slice(1), ...pluginArgs]), true);
-    return;
+    output(io, await operation.run([...tail.slice(1), ...pluginArgs]), true);
+    return 0;
   }
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;
   let readiness: LocalStoreReadiness | null = null;
@@ -755,28 +936,28 @@ async function main(): Promise<void> {
       dbPath: textFlag(args, 'db'), scope, bootstrap: !args.flags.has('no-bootstrap'),
     });
     if (readiness.bootstrap?.status === 'partial') {
-      process.stderr.write('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
+      io.stderr('Some local sessions could not be fully indexed; run ai-hist --json for diagnostics.\n');
     }
     // The bare invocation reports the store's condition as its result and
     // succeeds either way. Every command that asks the store a question refuses
     // to answer out of one that cannot hold an answer.
-    if (command !== undefined && !skipUnusableStoreGate(spec, scope) && reportUnusableStore(readiness, json)) return;
+    if (command !== undefined && !skipUnusableStoreGate(spec, scope) && reportUnusableStore(io, readiness, json)) return 1;
   }
 
   if (command === undefined) {
     // --no-bootstrap answers from the catalog as it stands; the bootstrap path
     // reports what it just indexed.
     if (!readiness?.bootstrap) {
-      output(await listSessionCatalogPage({ dbPath: textFlag(args, 'db') }), json);
-      return;
+      output(io, await listSessionCatalogPage({ dbPath: textFlag(args, 'db') }), json);
+      return 0;
     }
-    if (json) output(readiness.bootstrap, true);
+    if (json) output(io, readiness.bootstrap, true);
     else {
-      process.stdout.write(readiness.indexedPrompts > 0
+      io.stdout(readiness.indexedPrompts > 0
         ? `Ready: ${readiness.indexedPrompts} indexed prompt(s). Search with: ai-hist search "your query"\n`
         : 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.\n');
     }
-    return;
+    return 0;
   }
   if (command === 'sessions' && subcommand === 'list') {
     const sources = textFlags(args, 'source');
@@ -786,25 +967,25 @@ async function main(): Promise<void> {
       after: catalogCursorFlag(args),
     });
     if (args.flags.has('pretty')) {
-      const color = Boolean(process.stdout.isTTY) && process.env.NO_COLOR === undefined;
-      process.stdout.write(page.sessions.length
+      const color = options.color && process.env.NO_COLOR === undefined;
+      io.stdout(page.sessions.length
         ? `${page.sessions.map((session) => formatSessionRow(session, { color })).join('\n')}\n`
         : 'No sessions in the catalog.\n');
-      if (page.nextCursor) process.stdout.write(`more available: --after '${JSON.stringify(page.nextCursor)}'\n`);
-    } else output(page, json);
-    return;
+      if (page.nextCursor) io.stdout(`more available: --after '${JSON.stringify(page.nextCursor)}'\n`);
+    } else output(io, page, json);
+    return 0;
   }
   if (command === 'sessions' && subcommand === 'discover') {
     const sources = textFlags(args, 'source');
-    outputDiscovery(await discoverSessions({
+    outputDiscovery(io, await discoverSessions({
       sourceConnectors: sourceConnectorFlags(args), acquisitionTimeoutMs: numberFlag(args, 'acquisition-timeout-ms'), plugins: acquisitionPlugins,
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'),
     }), json);
-    return;
+    return 0;
   }
   if (command === 'sessions' && subcommand === 'hydrate') {
-    outputHydration(await hydrateSession({
+    outputHydration(io, await hydrateSession({
       sourceConnectors: sourceConnectorFlags(args), acquisitionTimeoutMs: numberFlag(args, 'acquisition-timeout-ms'), plugins: acquisitionPlugins,
       source: sessionSource as never,
       sessionId: sessionId!,
@@ -812,20 +993,20 @@ async function main(): Promise<void> {
       dbPath: textFlag(args, 'db'),
       includeRelated: !args.flags.has('no-related'),
     }), json);
-    return;
+    return 0;
   }
   if (command === 'sessions' && subcommand === 'relationships') {
-    outputRelationships(await getSessionRelationships({
+    outputRelationships(io, await getSessionRelationships({
       source: sessionSource as never, sessionId: sessionId!, dbPath: textFlag(args, 'db'),
     }), json);
-    return;
+    return 0;
   }
   if (command === 'sessions' && subcommand === 'tree') {
-    outputTree(await getSessionTree({
+    outputTree(io, await getSessionTree({
       source: sessionSource as never, sessionId: sessionId!, dbPath: textFlag(args, 'db'),
       maxDepth: numberFlag(args, 'max-depth'), maxNodes: numberFlag(args, 'max-nodes'),
     }), json);
-    return;
+    return 0;
   }
   if (command === 'sessions' && (subcommand === 'tools' || subcommand === 'edits')) {
     const name = `sessions ${subcommand}`;
@@ -835,52 +1016,127 @@ async function main(): Promise<void> {
       after: evidenceCursorFlag(args),
     };
     if (subcommand === 'tools') {
-      outputToolCalls(await getSessionToolCallsPage(sessionSource as never, sessionId!, options), json);
+      outputToolCalls(io, await getSessionToolCallsPage(sessionSource as never, sessionId!, options), json);
     } else {
-      outputFileEdits(await getSessionFileEditsPage(sessionSource as never, sessionId!, options), json);
+      outputFileEdits(io, await getSessionFileEditsPage(sessionSource as never, sessionId!, options), json);
     }
-    return;
+    return 0;
   }
   if (command === 'search') {
-    output(await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
-    return;
+    output(io, await search([subcommand, ...rest].join(' '), { ...common(args), rawFts: args.flags.has('fts') }), json);
+    return 0;
   }
   if (command === 'recent') {
-    output(await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback }), json);
-    return;
+    output(io, await recent({ ...common(args), limit: numberFlag(args, 'limit') ?? recentFallback }), json);
+    return 0;
   }
   if (command === 'session') {
-    output(await getSession(subcommand, { dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never, tag: textFlag(args, 'tag') }), json);
-    return;
+    output(io, await getSession(subcommand, { dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never, tag: textFlag(args, 'tag') }), json);
+    return 0;
   }
   if (command === 'events') {
-    output(await getSessionEventsPage(subcommand, {
+    output(io, await getSessionEventsPage(subcommand, {
       dbPath: textFlag(args, 'db'), source: textFlag(args, 'source') as never,
       limit: numberFlag(args, 'limit'), after: cursorFlag(args),
     }), json);
-    return;
+    return 0;
   }
   if (command === 'resume') {
-    await runResume(args, subcommand, rest, json);
-    return;
+    return runResume(io, args, subcommand, rest, json);
   }
   if (command === 'pack') {
-    await runPack(args, subcommand, rest, json);
-    return;
+    return runPack(io, args, subcommand, rest, json);
   }
   if (command === 'stats') {
-    output(await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
-    return;
+    output(io, await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
+    return 0;
   }
   if (command === 'sync') {
-    output(await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sourceConnectors: sourceConnectorFlags(args), acquisitionTimeoutMs: numberFlag(args, 'acquisition-timeout-ms'), plugins: acquisitionPlugins }), json);
-    return;
+    output(io, await sync({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sourceConnectors: sourceConnectorFlags(args), acquisitionTimeoutMs: numberFlag(args, 'acquisition-timeout-ms'), plugins: acquisitionPlugins }), json);
+    return 0;
   }
   usage();
 }
 
-main().catch((error: unknown) => {
-  const value = error as { code?: string; message?: string };
-  process.stderr.write(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
-  process.exitCode = 1;
-});
+/** Knobs the bin owns and a mounted host does not. */
+export interface RunCliOptions {
+  /**
+   * Cancels a long-running `delivery drain`/`delivery run`.
+   *
+   * The signal handlers that produce it belong to whoever owns the process:
+   * the bin installs them, a host passes its own, and `dispatch` installs none.
+   */
+  signal?: AbortSignal;
+  /** Check npm for a newer release on `--version`. The bin only. */
+  updateNotice?: boolean;
+  /** Colourize `sessions list --pretty`. Defaults to stdout being a TTY. */
+  color?: boolean;
+  /**
+   * Where `export` writes when no `--out` is given.
+   *
+   * NDJSON export is unbounded, so it needs a real stream with backpressure
+   * rather than the unbuffered `io.stdout` callback.
+   */
+  stdoutStream?: Writable;
+}
+
+/**
+ * Run one `ai-hist` command line and resolve to its exit code.
+ *
+ * Never calls `process.exit`, never writes to `process.stdout`/`process.stderr`
+ * and never installs a signal handler: the caller owns all three. `argv` is the
+ * arguments after the program name.
+ */
+export async function runCli(argv: readonly string[], io: CliIo, options: RunCliOptions = {}): Promise<number> {
+  try {
+    return await dispatch(argv, io, options);
+  } catch (error: unknown) {
+    if (error instanceof CliExit) {
+      if (error.stdout) io.stdout(error.stdout);
+      if (error.stderr) io.stderr(error.stderr);
+      return error.exitCode;
+    }
+    const value = error as { code?: string; message?: string };
+    io.stderr(`ai-hist: ${value.code ? `${value.code}: ` : ''}${value.message ?? String(error)}\n`);
+    return 1;
+  }
+}
+
+/**
+ * The `ai-hist` binary: the only place that owns process state.
+ *
+ * Signal handling lives here rather than in the delivery command so that
+ * `runCli` stays free of global handlers for hosts that mount it. It is also
+ * claimed only for the commands that read it: every other invocation keeps
+ * Node's default `SIGINT`/`SIGTERM` behaviour, so Ctrl-C ends it the first
+ * time it is pressed.
+ */
+async function main(): Promise<void> {
+  const io: CliIo = {
+    stdout: (chunk) => void process.stdout.write(chunk),
+    stderr: (chunk) => void process.stderr.write(chunk),
+  };
+  const argv = process.argv.slice(2);
+  const cancellable = usesCancellation(argv);
+  const abort = new AbortController();
+  const stop = (): void => abort.abort();
+  if (cancellable) {
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  }
+  try {
+    process.exitCode = await runCli(argv, io, {
+      signal: cancellable ? abort.signal : undefined,
+      updateNotice: true,
+      color: Boolean(process.stdout.isTTY),
+      stdoutStream: process.stdout,
+    });
+  } finally {
+    if (cancellable) {
+      process.removeListener('SIGINT', stop);
+      process.removeListener('SIGTERM', stop);
+    }
+  }
+}
+
+if (isBinEntrypoint()) void main();
