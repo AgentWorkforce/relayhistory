@@ -1,6 +1,6 @@
 {
   "name": "@relayhistory/provider-sources",
-  "version": "0.18.4",
+  "version": "0.18.5",
   "description": "Optional Claude web and Codex cloud source adapters for local ai-hist.",
   "license": "MIT",
   "type": "module",
@@ -24,7 +24,7 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "peerDependencies": {
-    "ai-hist": "^0.18.4"
+    "ai-hist": "^0.18.5"
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",
@@ -35,13 +35,13 @@
     "node": ">=20"
   },
   "optionalDependencies": {
-    "@relayhistory/provider-sources-darwin-arm64": "0.18.4",
-    "@relayhistory/provider-sources-darwin-x64": "0.18.4",
-    "@relayhistory/provider-sources-linux-x64-gnu": "0.18.4",
-    "@relayhistory/provider-sources-linux-arm64-gnu": "0.18.4",
-    "@relayhistory/provider-sources-linux-x64-musl": "0.18.4",
-    "@relayhistory/provider-sources-linux-arm64-musl": "0.18.4",
-    "@relayhistory/provider-sources-win32-x64-msvc": "0.18.4"
+    "@relayhistory/provider-sources-darwin-arm64": "0.18.5",
+    "@relayhistory/provider-sources-darwin-x64": "0.18.5",
+    "@relayhistory/provider-sources-linux-x64-gnu": "0.18.5",
+    "@relayhistory/provider-sources-linux-arm64-gnu": "0.18.5",
+    "@relayhistory/provider-sources-linux-x64-musl": "0.18.5",
+    "@relayhistory/provider-sources-linux-arm64-musl": "0.18.5",
+    "@relayhistory/provider-sources-win32-x64-msvc": "0.18.5"
   },
   "publishConfig": {
     "access": "public"
