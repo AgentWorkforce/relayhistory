@@ -1,8 +1,8 @@
 # Release and platform validation
 
 One workflow releases everything: `Publish RelayHistory release`
-(`.github/workflows/publish-napi.yml`; the file name is bound to npm OIDC
-trusted publishing and must not change). All public packages share one version:
+(`.github/workflows/publish.yml`; the file name is bound to npm OIDC
+trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
 `ai-hist`, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
 `@relayhistory/capture`, `@relayhistory/provider-sources` and their
 seven platform helper packages each. The SDK checks the current native contract
@@ -85,6 +85,39 @@ further.
 Because the re-run builds from the tag, it only works for releases cut by this
 workflow: a tag whose tree predates these scripts fails loudly at checkout or
 build time rather than shipping something mismatched.
+
+## Renaming this workflow
+
+Don't, unless you are prepared to repoint every package. npm OIDC trusted
+publishing binds a package to a repository **and a workflow file name**. Rename
+the file and every package whose trusted publisher still names the old file
+fails its next publish with:
+
+```
+npm error code E404
+npm error 404 The requested resource '<package>@<version>' could not be found
+              or you do not have permission to access it.
+```
+
+That message reads as "no such package". It is npm declining to say whether a
+package exists, and the real cause is authorization. **A name that plainly
+exists, failing with E404, means the trusted publisher does not match the
+workflow that is asking.**
+
+This file was `publish-napi.yml` until the optional plugins were first
+published. Every other AgentWorkforce repository publishes from `publish.yml`,
+and the mismatch cost a release cycle: the plugins' trusted publishers were set
+to `publish.yml` by analogy with the sibling repos, and the E404 that followed
+was read as a missing package rather than a wrong workflow name.
+
+If it has to change again, the cutover is not atomic, and the order is:
+
+1. Rename the file and merge, with no release in flight.
+2. Repoint every package's trusted publisher to the new file name.
+3. Release.
+
+Between 1 and 2 nothing can publish, so keep the gap short. Every package this
+workflow publishes is listed at the top of this document.
 
 ## Supported matrix
 

@@ -40,7 +40,7 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
 - Per-platform **`ai-hist-native-<platform>-<arch>`** packages carry the
   prebuilt `.node`; the loader picks the right one. Same distribution model as
   `@agent-relay/broker-*`, except the addon is *loaded in-process*, not spawned.
-- `.github/workflows/publish-napi.yml` builds the six targets — darwin
+- `.github/workflows/publish.yml` builds the six targets — darwin
   arm64/x64 and linux x64/arm64 in **both** glibc (gnu) and musl — and publishes
   via napi's tooling. (Linux needs both: the loader resolves `-gnu` on
   Ubuntu/Debian and `-musl` on Alpine.)
@@ -49,7 +49,7 @@ agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  requ
 
 1. **One-time — register OIDC trusted publishers** on npmjs for `ai-hist-native`
    and the six `ai-hist-native-*-*` package names (repo
-   `AgentWorkforce/relayhistory` + `publish-napi.yml`). (First publish may need
+   `AgentWorkforce/relayhistory` + `publish.yml`). (First publish may need
    an `NPM_TOKEN` if npm won't pre-configure a nonexistent package.)
 
 2. **Per release — publish the addon.** Run the **Publish ai-hist-native (napi)**
