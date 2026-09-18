@@ -614,6 +614,13 @@ export interface CommandSpec {
   rejectsScope?: boolean;
   /** Remaining command-line checks, run before any store work. */
   validate?: (args: Parsed) => void;
+  /**
+   * Reads `RunCliOptions.signal`, so the bin claims the process's signals for
+   * it. Left off, the bin leaves `SIGINT`/`SIGTERM` at their default: a
+   * listener suppresses Node's own termination, so claiming them for a command
+   * that never looks at the signal swallows the user's first Ctrl-C.
+   */
+  cancellable?: true;
 }
 
 function validateInterval(args: Parsed): void {
@@ -695,6 +702,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
   }) as Array<[string, string]>).map(([action, description]): [string, CommandSpec] => [`delivery ${action}`, {
     name: `delivery ${action}`, description, surface: ['delivery', action],
     positionals: [0, 0], allowed: ['db', 'config', 'job', 'poll-ms', 'timeout-ms'],
+    cancellable: true,
   }]),
   ['sessions list', { name: 'sessions list', description: 'List indexed sessions from the catalogue.',
     surface: ['list'], positionals: [0, 0], readsLocalStore: true,
@@ -782,6 +790,32 @@ function commandSpec(command: string | undefined, subcommand: string | undefined
   if (command === undefined) return COMMANDS.get('');
   if (command === 'sessions' || command === 'delivery') return subcommand ? COMMANDS.get(`${command} ${subcommand}`) : undefined;
   return COMMANDS.get(command);
+}
+
+/**
+ * Whether this command line routes to a command that reads the cancellation
+ * signal.
+ *
+ * The bin asks before installing a `SIGINT`/`SIGTERM` handler. A listener
+ * replaces Node's default termination, so a handler on an invocation that
+ * never reads the signal swallows the first shutdown request: the user presses
+ * Ctrl-C, nothing happens, and they press it again. Resolved from the same
+ * `COMMANDS` table `dispatch` resolves against, so the two cannot disagree
+ * about which commands those are.
+ */
+export function usesCancellation(argv: readonly string[]): boolean {
+  // `plugin -- ARGS` passes its tail to a plugin verbatim, and `plugin` is not
+  // cancellable, so stopping at the separator can only ever read less.
+  const boundary = argv.indexOf('--');
+  const core = [...(boundary < 0 ? argv : argv.slice(0, boundary))];
+  try {
+    const { positional } = parse(core.map((arg) => arg === '-h' ? '--help' : arg));
+    return commandSpec(positional[0], positional[1])?.cancellable === true;
+  } catch {
+    // An argv `parse` refuses is a usage error `dispatch` is about to report.
+    // It runs no command, so it reads no signal.
+    return false;
+  }
 }
 
 function unknownCommandMessage(command: string | undefined, subcommand: string | undefined): string {
@@ -1072,27 +1106,36 @@ export async function runCli(argv: readonly string[], io: CliIo, options: RunCli
  * The `ai-hist` binary: the only place that owns process state.
  *
  * Signal handling lives here rather than in the delivery command so that
- * `runCli` stays free of global handlers for hosts that mount it.
+ * `runCli` stays free of global handlers for hosts that mount it. It is also
+ * claimed only for the commands that read it: every other invocation keeps
+ * Node's default `SIGINT`/`SIGTERM` behaviour, so Ctrl-C ends it the first
+ * time it is pressed.
  */
 async function main(): Promise<void> {
   const io: CliIo = {
     stdout: (chunk) => void process.stdout.write(chunk),
     stderr: (chunk) => void process.stderr.write(chunk),
   };
+  const argv = process.argv.slice(2);
+  const cancellable = usesCancellation(argv);
   const abort = new AbortController();
   const stop = (): void => abort.abort();
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  if (cancellable) {
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  }
   try {
-    process.exitCode = await runCli(process.argv.slice(2), io, {
-      signal: abort.signal,
+    process.exitCode = await runCli(argv, io, {
+      signal: cancellable ? abort.signal : undefined,
       updateNotice: true,
       color: Boolean(process.stdout.isTTY),
       stdoutStream: process.stdout,
     });
   } finally {
-    process.removeListener('SIGINT', stop);
-    process.removeListener('SIGTERM', stop);
+    if (cancellable) {
+      process.removeListener('SIGINT', stop);
+      process.removeListener('SIGTERM', stop);
+    }
   }
 }
 

@@ -34,6 +34,30 @@ export type { RelayhistoryCloudClient } from './cloud-contract.js';
 /** Exit code the contract reserves for an unroutable command line. */
 const EXIT_UNKNOWN_COMMAND = 2;
 
+/**
+ * Exit code for a command line that routed but was refused.
+ *
+ * `runCli` answers the local tree's usage errors with 2, so the cloud half
+ * answers the same mistake with the same code: an undeclared option or a
+ * miscounted argument must not exit 2 on one branch of `agent-relay sessions`
+ * and 1 on the other, or a script cannot tell a user's typo from a failure
+ * the cloud reported.
+ */
+const EXIT_USAGE = 2;
+
+/**
+ * A cloud command line the surface refuses before it reaches the client.
+ *
+ * Distinct from an error the cloud itself reports, because only this class
+ * leaves with `EXIT_USAGE`; a failed request keeps exiting 1.
+ */
+class CloudUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CloudUsageError';
+  }
+}
+
 /** Headings for the two-level groups, which have no row of their own in `COMMANDS`. */
 const GROUP_DESCRIPTIONS: Record<string, string> = {
   cloud: 'Read session history from Relayhistory cloud.',
@@ -190,7 +214,7 @@ const CLOUD_COMMANDS: readonly CloudCommandSpec[] = [
     options: ['source', 'since', 'kinds', 'limit', 'cursor', 'json'],
     run: async (client, args, io) => {
       const source = text(args, 'source');
-      if (!source) throw new Error('cloud thread requires --source');
+      if (!source) throw new CloudUsageError('cloud thread requires --source');
       // The flag is comma-separated for the command line; the client takes a list.
       const kinds = text(args, 'kinds')?.split(',').map((kind) => kind.trim()).filter(Boolean);
       output(io, await client.getSessionThread(args.positional[0]!, {
@@ -240,10 +264,14 @@ const CLOUD_COMMANDS: readonly CloudCommandSpec[] = [
 ];
 
 /**
- * Parse a cloud command's argv against its declared options.
+ * Parse a cloud command's argv against its declared options and arguments.
  *
- * Declared-only: an option this command does not list is an error rather than a
- * silently ignored token, matching how `runCli` treats the local tree.
+ * Declared-only in both directions: an option this command does not list is an
+ * error rather than a silently ignored token, and so is an argument past the
+ * last one it declares. `runCli` rejects both for the local tree, and the two
+ * halves of `agent-relay sessions` have to answer a mistyped line the same
+ * way — silence on one of them is how a typo becomes an empty result set the
+ * user believes.
  */
 function parseCloud(argv: readonly string[], spec: CloudCommandSpec): CloudArgs {
   const positional: string[] = [];
@@ -253,21 +281,28 @@ function parseCloud(argv: readonly string[], spec: CloudCommandSpec): CloudArgs 
     const token = argv[index]!;
     if (!token.startsWith('--')) { positional.push(token); continue; }
     const [name, inline] = token.slice(2).split('=', 2);
-    if (!allowed.has(name!)) throw new Error(`${spec.path.join(' ')} does not accept --${name}`);
+    if (!allowed.has(name!)) throw new CloudUsageError(`${spec.path.join(' ')} does not accept --${name}`);
     if (CLOUD_FLAG_SPECS[name!]?.boolean) {
-      if (inline !== undefined) throw new Error(`--${name} does not take a value`);
+      if (inline !== undefined) throw new CloudUsageError(`--${name} does not take a value`);
       flags.set(name!, true);
       continue;
     }
     if (inline !== undefined) { flags.set(name!, inline); continue; }
     const next = argv[index + 1];
-    if (next === undefined || next.startsWith('-')) throw new Error(`--${name} requires a value`);
+    if (next === undefined || next.startsWith('-')) throw new CloudUsageError(`--${name} requires a value`);
     flags.set(name!, next);
     index += 1;
   }
-  const required = (spec.args ?? []).filter((arg) => arg.required).length;
+  const declared = spec.args ?? [];
+  const required = declared.filter((arg) => arg.required).length;
   if (positional.length < required) {
-    throw new Error(`${spec.path.join(' ')} requires ${(spec.args ?? []).map((arg) => arg.name).join(' and ')}`);
+    throw new CloudUsageError(`${spec.path.join(' ')} requires ${declared.map((arg) => arg.name).join(' and ')}`);
+  }
+  // A variadic last argument is the only unbounded arity; everything else takes
+  // exactly what it declares, in the wording `rejectSurplusPositionals` uses.
+  const most = declared.some((arg) => arg.variadic) ? null : declared.length;
+  if (most !== null && positional.length > most) {
+    throw new CloudUsageError(`${spec.path.join(' ')} does not accept positional argument '${positional[most]}'`);
   }
   return { positional, flags };
 }
@@ -498,6 +533,13 @@ export function createRelayCliSurface(options: RelayhistorySurfaceOptions = {}):
       try {
         return await spec.run(cloud, parseCloud(resolved.rest, spec), io);
       } catch (error: unknown) {
+        // A refused command line is the same mistake whichever half of the tree
+        // it was typed against, so it leaves with the code `runCli` gives the
+        // local half rather than the one a failed request would.
+        if (error instanceof CloudUsageError) {
+          io.stderr(`ai-hist: ${error.message}\n`);
+          return EXIT_USAGE;
+        }
         const status = cloudErrorStatus(error);
         if (status === 401 || status === 403) {
           io.stderr('ai-hist: cloud access was refused: run `agent-relay login`\n');

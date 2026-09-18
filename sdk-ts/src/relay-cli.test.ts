@@ -248,6 +248,93 @@ test('a cloud 401 is answered with the login remedy', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Usage errors: one tree, one answer to a mistyped command line
+// ---------------------------------------------------------------------------
+
+test('an undeclared option exits 2 on every command, local and cloud alike', async () => {
+  const calls: string[] = [];
+  const surface = createRelayCliSurface({ cloud: stubCloud(calls) });
+  for (const path of declaredPaths(surface)) {
+    const io = capture();
+    const code = await surface.run([...path.split(' '), '--not-a-real-flag'], io);
+    assert.equal(code, 2,
+      `${path} --not-a-real-flag exited ${code}, not the 2 a usage error owes: ${io.out}${io.err}`);
+    assert.equal(io.out, '', `${path} produced output for a command line it refused: ${io.out}`);
+    assert.match(io.err, /not-a-real-flag/);
+  }
+  assert.deepEqual(calls, [], 'a refused command line must never reach the cloud client');
+});
+
+test('cloud commands reject a surplus argument rather than discarding it', async () => {
+  const calls: string[] = [];
+  const surface = createRelayCliSurface({ cloud: stubCloud(calls) });
+  const fixed = __testing.CLOUD_COMMANDS.filter((spec) => !(spec.args ?? []).some((arg) => arg.variadic));
+  assert.ok(fixed.length > 0, 'there must be fixed-arity cloud commands for this to mean anything');
+  for (const spec of fixed) {
+    const declared = spec.args ?? [];
+    const io = capture();
+    const code = await surface.run(
+      [...spec.path, ...declared.map((_, index) => `arg${index}`), 'surplus'], io);
+    assert.equal(code, 2,
+      `${spec.path.join(' ')} took a surplus argument instead of rejecting it: ${io.out}${io.err}`);
+    assert.match(io.err, /does not accept positional argument 'surplus'/);
+  }
+  assert.deepEqual(calls, [], 'a surplus argument must be refused before the client is called');
+});
+
+test('a variadic cloud command still takes every argument it is given', async () => {
+  const calls: string[] = [];
+  const io = capture();
+  const code = await createRelayCliSurface({ cloud: stubCloud(calls) })
+    .run(['cloud', 'search', 'one', 'two', 'three'], io);
+  assert.equal(code, 0, io.err);
+  assert.deepEqual(calls, ['searchEvents'], 'the surplus check must not clip a variadic argument');
+});
+
+test('the same mistake exits 2 whichever half of the tree it is typed against', async () => {
+  // The halves are parsed by different code — `runCli` for the local tree,
+  // `parseCloud` for the cloud one — so the codes they answer with can drift
+  // apart silently. Pair them here: a mistake listed on one side must be
+  // listed on the other, and both must be 2.
+  const pairs = [
+    { mistake: 'an option the command does not accept',
+      local: ['list', '--config', 'x'], cloud: ['cloud', 'list', '--refresh'] },
+    { mistake: 'a missing required argument',
+      local: ['hydrate'], cloud: ['cloud', 'events'] },
+    { mistake: 'an argument the command does not take',
+      local: ['list', 'surplus'], cloud: ['cloud', 'digest', 'surplus'] },
+    { mistake: 'an option given no value',
+      local: ['list', '--limit'], cloud: ['cloud', 'list', '--limit'] },
+  ] as const;
+
+  const surface = createRelayCliSurface({ cloud: stubCloud() });
+  for (const { mistake, local, cloud } of pairs) {
+    const localIo = capture();
+    const cloudIo = capture();
+    const localCode = await surface.run([...local], localIo);
+    const cloudCode = await surface.run([...cloud], cloudIo);
+    assert.equal(localCode, 2, `${mistake}: '${local.join(' ')}' exited ${localCode}: ${localIo.err}`);
+    assert.equal(cloudCode, 2, `${mistake}: '${cloud.join(' ')}' exited ${cloudCode}: ${cloudIo.err}`);
+    assert.equal(localCode, cloudCode,
+      `${mistake} exits ${localCode} as '${local.join(' ')}' and ${cloudCode} as '${cloud.join(' ')}'`);
+    assert.notEqual(cloudIo.err, '', `${mistake}: the cloud half must say what it refused`);
+  }
+});
+
+test('a failure the cloud reported still exits 1, not the usage code', async () => {
+  // The consistency fix must not flatten every cloud error into 2: a request
+  // that reached the cloud and failed is not a mistyped command line.
+  const cloud = stubCloud();
+  const failing: RelayhistoryCloudClient = {
+    ...cloud,
+    listSessions: () => Promise.reject(Object.assign(new Error('upstream exploded'), { status: 500 })),
+  };
+  const io = capture();
+  assert.equal(await createRelayCliSurface({ cloud: failing }).run(['cloud', 'list'], io), 1);
+  assert.match(io.err, /upstream exploded/);
+});
+
+// ---------------------------------------------------------------------------
 // Contract behaviour
 // ---------------------------------------------------------------------------
 
