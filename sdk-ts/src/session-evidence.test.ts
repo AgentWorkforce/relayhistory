@@ -371,6 +371,32 @@ test('a native full capability unsupported by its coverage is a contract mismatc
     normalizeHydration({ ...base, capability: 'shallow_only', coverage: [] }).coverage,
     [],
   );
+
+  // The mirror-image defects are rejected too. They read as harmless
+  // understatements, but `combineHydration` ranks the parts of a merge by the
+  // reported capability before recomputing, so an under-reported result loses
+  // the `best` selection and the top-level fields that come with it.
+  for (const [capability, coverage, expected] of [
+    ['partial', [...FULL_SESSION_KINDS], 'full'],
+    ['shallow_only', ['history'], 'partial'],
+    ['shallow_only', [...FULL_SESSION_KINDS], 'full'],
+    ['full', [], 'shallow_only'],
+  ] as const) {
+    assert.throws(
+      () => normalizeHydration({ ...base, capability, coverage: [...coverage] }),
+      (error: unknown) => error instanceof NativeContractMismatchError
+        && error.code === 'NATIVE_CONTRACT_MISMATCH'
+        && error.message.includes('inconsistent with its coverage')
+        && error.message.includes(`expected ${expected}`),
+      `${capability} over [${coverage.join(', ')}] is rejected`,
+    );
+  }
+  // A genuine partial -- some kinds covered, not all -- still normalizes.
+  assert.equal(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history', 'tool_call'] })
+      .capability,
+    'partial',
+  );
 });
 
 function diagnostic(code: string, message: string): Record<string, unknown> {

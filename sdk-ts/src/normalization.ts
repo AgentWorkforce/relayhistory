@@ -497,6 +497,22 @@ export function missingHydrationCoverage(coverage: readonly EvidenceKind[]): Evi
 }
 
 /**
+ * The capability a coverage set entitles a single result to claim — the same
+ * rule the Rust producer applies (`capability_for` in `hydrate.rs`). Covering
+ * nothing is `shallow_only`, not `partial`: `partial` implies some kind was
+ * indexed.
+ *
+ * A *merge* is a different question and uses {@link mergedHydrationCapability},
+ * which additionally keeps `shallow_only` only when every input claimed it.
+ */
+export function expectedHydrationCapability(
+  coverage: readonly EvidenceKind[],
+): HydrateSessionResult['capability'] {
+  if (missingHydrationCoverage(coverage).length === 0) return 'full';
+  return coverage.length === 0 ? 'shallow_only' : 'partial';
+}
+
+/**
  * Fold one more presence's hydration result into the running one.
  *
  * Evidence counts take the maximum and coverage takes the union, because the
@@ -579,14 +595,19 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   const indexed = (value.indexedThrough ?? {}) as UnknownRecord;
   const evidence = (value.evidence ?? {}) as UnknownRecord;
   const coverage = hydrationCoverage(value.coverage);
-  // A `full` capability the coverage does not support is the exact defect
-  // contract 3 exists to remove; surface it as a mismatch rather than pass it on.
-  if (
-    String(value.capability) === 'full' &&
-    !FULL_SESSION_KINDS.every((kind) => coverage.includes(kind))
-  ) {
+  // Contract 3 *defines* `capability` from `coverage`, so it is re-derived and
+  // compared rather than spot-checked. Only rejecting an unsupported `full`
+  // would still admit the mirror-image defects -- a `partial` that covers
+  // everything, or a `shallow_only` that covered something -- and those are
+  // not harmless understatements: `combineHydration` ranks the parts of a
+  // merge by their reported capability before recomputing, so an under-reported
+  // result loses the `best` selection and with it the top-level fields the
+  // merge carries over.
+  const expected = expectedHydrationCapability(coverage);
+  if (String(value.capability) !== expected) {
     throw new NativeContractMismatchError(
-      'ai-hist-native reported full hydration capability without full evidence coverage.',
+      `ai-hist-native reported hydration capability ${String(value.capability)}, `
+        + `which is inconsistent with its coverage [${coverage.join(', ')}] (expected ${expected}).`,
       'NATIVE_CONTRACT_MISMATCH',
     );
   }

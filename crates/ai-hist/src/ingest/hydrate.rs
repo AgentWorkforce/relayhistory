@@ -1689,12 +1689,7 @@ fn build_result(
         source: options.source.clone(),
         session_id: options.session_id.clone(),
         status: status.to_string(),
-        capability: if missing.is_empty() {
-            "full"
-        } else {
-            "partial"
-        }
-        .to_string(),
+        capability: capability_for(&coverage).to_string(),
         // The catalog row's own value, so the reported state cannot disagree
         // with the one the unchanged short-circuit reads back.
         discovery_state: stored_discovery_state(conn, &options.source, &options.session_id)?,
@@ -1725,6 +1720,31 @@ fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
         .copied()
         .filter(|kind| options.include_related || *kind != EvidenceKind::Relationship)
         .collect()
+}
+
+/// The capability a coverage set entitles a result to claim.
+///
+/// One rule, so the two sides of the contract cannot drift: `full` when
+/// nothing is missing, `shallow_only` when nothing at all was covered --
+/// `partial` there would imply some kind was indexed -- and `partial`
+/// otherwise. The SDK derives the same expectation from `coverage` and rejects
+/// a result that disagrees, so a producer that broke this would surface as a
+/// native contract mismatch rather than as a quiet overstatement.
+///
+/// The empty case is not reachable through the public path today: every source
+/// `ingest_selected` supports declares at least `History`, and `relay` (which
+/// declares nothing) fails `validate_provider_path` long before here. It is
+/// written down because `ShallowSessionProvider::evidence_kinds` defaults to
+/// `&[]`, so a new adapter that has not declared its kinds yet would otherwise
+/// reach the SDK as `partial` over nothing.
+fn capability_for(coverage: &[EvidenceKind]) -> &'static str {
+    if missing_from(coverage).is_empty() {
+        "full"
+    } else if coverage.is_empty() {
+        "shallow_only"
+    } else {
+        "partial"
+    }
 }
 
 /// The `FULL_SESSION_KINDS` a coverage set leaves out, in canonical order.
@@ -2553,6 +2573,39 @@ mod tests {
         let alone = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(alone.capability, "partial");
         assert_eq!(alone.coverage, vec![EvidenceKind::History]);
+    }
+
+    /// The rule the SDK re-derives from `coverage` to validate a result. All
+    /// three branches are asserted here because the empty one is unreachable
+    /// through the public path, so nothing else would catch it changing.
+    #[test]
+    fn capability_is_one_rule_over_the_covered_kinds() {
+        assert_eq!(capability_for(FULL_SESSION_KINDS), "full");
+        assert_eq!(capability_for(&[EvidenceKind::History]), "partial");
+        assert_eq!(
+            capability_for(&[
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+            ]),
+            "partial"
+        );
+        // Covering nothing is shallow, not partial: `partial` would imply some
+        // evidence kind was indexed.
+        assert_eq!(capability_for(&[]), "shallow_only");
+        // An extra kind beyond the full set does not stop it being full.
+        assert_eq!(
+            capability_for(&[
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+                EvidenceKind::Relationship,
+                EvidenceKind::CommitLink,
+            ]),
+            "full"
+        );
     }
 
     /// The declared table is what `build_result` computes from, so it is

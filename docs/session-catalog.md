@@ -34,13 +34,18 @@ const sessions = await listSessionCatalog({ limit: 100 });
 await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
 ```
 
-Hydration requires the catalog row, never invokes discovery or global sync,
-and upgrades `discoveryState` to `full` only when the connector returned all
-available evidence. Here `full` means indexed through the returned source
-stamp, not that a live coding session has ended. Partial remote connectors
-remain `shallow` and report their capability explicitly. File providers
-validate the saved locator against the expected provider root; OpenCode uses
-session-keyed queries against its live read-only database.
+Hydration requires the catalog row and never invokes discovery or global sync.
+It upgrades `discoveryState` to `full` when the acquisition it was asked for
+was indexed through its recorded source stamp. `full` is therefore a statement
+about discovery being complete for that request, not that a live coding
+session has ended, and not that every evidence kind exists: kinds the request
+never acquired -- including ones declined by an option such as
+`includeRelated: false` -- are described by `coverage` and `capability` below,
+which is where a consumer looks to find out what was left out. A remote
+connector that could not return its evidence at all stays `shallow` and reports
+its capability explicitly. File providers validate the saved locator against
+the expected provider root; OpenCode uses session-keyed queries against its
+live read-only database.
 
 `capability` and `coverage` answer a different question from `discoveryState`,
 and hydration contract 3 made the local path compute both rather than assert

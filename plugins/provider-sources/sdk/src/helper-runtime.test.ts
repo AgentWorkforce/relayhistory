@@ -8,6 +8,23 @@ import { helperRequest, terminateHelperTree } from './helper.js';
 import { createHistoryPlugin } from './index.js';
 
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+/**
+ * Wait for a pid to stop existing.
+ *
+ * A signalled process is not gone the instant the kill returns -- it lingers
+ * until its parent (init, once the helper it belonged to died) reaps it, and a
+ * zombie still answers `kill(pid, 0)`. Polling proves death without putting a
+ * fixed budget on the reaper. It throws rather than returning false, so a
+ * descendant that never dies fails loudly here instead of silently.
+ */
+async function reaped(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (!alive(pid)) return;
+    await pause(25);
+  }
+  throw new Error(`descendant ${pid} outlived tree cleanup`);
+}
 /**
  * A helper whose descendant records that it was still alive.
  *
@@ -78,9 +95,20 @@ test('tree cleanup terminates a real descendant using the platform implementatio
   const unrelated=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore'});
   let closed=false;const childClosed=new Promise<void>(resolve=>child.once('close',()=>{closed=true;resolve();}));
   try {
-    await files.pid();await control.pid();
+    const target=await files.pid();const controlPid=await control.pid();
     await terminateHelperTree(child,childClosed,()=>closed);
     assert.equal(closed,true);
+
+    // The descendant is dead, not merely quiet. An absent marker alone cannot
+    // tell a killed process from a live one whose event loop never got
+    // scheduled, so death is asserted directly and the marker is the second,
+    // independent signal.
+    await reaped(target);
+    // Positive control for that probe in the same breath: an identical
+    // descendant nobody cleaned up is still there, so `reaped` is reading
+    // real liveness rather than always reporting gone.
+    assert.equal(alive(controlPid),true,'the uncleaned descendant is still running');
+
     // Released only now, so a descendant can act solely by having outlived a
     // completed cleanup. A slow platform kill can no longer read as survival.
     await files.release();await control.release();
