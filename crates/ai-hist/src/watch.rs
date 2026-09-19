@@ -34,7 +34,7 @@
 //! runtime and this does not need one: a tick is a blocking sweep, and the
 //! watcher backend already runs on its own thread.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -144,6 +144,30 @@ pub type ErrorSink = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
 /// Sink called whenever what drives the loop changes — at startup, and again
 /// when a root that did not exist appears and is picked up.
 pub type DriverSink = Arc<dyn Fn(&DriverStatus) + Send + Sync>;
+/// Re-derives the roots that should be watched. Called on backstop ticks, so a
+/// root that did not exist as a *name* at startup — a project's
+/// `.trajectories` directory created later — can still be picked up.
+pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
+
+/// Whether an event on `path` belongs to one of `roots`.
+///
+/// Depth has to be enforced here, not left to the backend. The macOS FSEvents
+/// backend has no non-recursive mode at all: asking for one still delivers the
+/// whole subtree. A `WatchRoot::directory(~/.claude)` would therefore see
+/// every todo file and shell snapshot an active session rewrites, and each of
+/// those would become a *forced* sweep — the expensive kind that bypasses the
+/// fingerprint. Filtering by the depth the root asked for makes the two
+/// backends agree, and on inotify it is simply a no-op the kernel already did.
+fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
+    roots.iter().any(|root| {
+        if root.recursive {
+            path.starts_with(&root.path)
+        } else {
+            // The root's own entries, and the root itself — nothing below.
+            path == root.path || path.parent() == Some(root.path.as_path())
+        }
+    })
+}
 
 #[derive(Default)]
 struct WakeState {
@@ -358,6 +382,7 @@ pub struct WatchLoop {
     pub roots: Vec<WatchRoot>,
     /// Run one sweep before parking.
     pub immediate: bool,
+    roots_refresh: Option<RootsFn>,
     on_driver: Option<DriverSink>,
     inner: Arc<WatchInner>,
 }
@@ -374,6 +399,7 @@ impl WatchLoop {
             use_fs_events: true,
             roots: Vec::new(),
             immediate: true,
+            roots_refresh: None,
             on_driver: None,
             inner: Arc::new(WatchInner {
                 tick,
@@ -434,6 +460,18 @@ impl WatchLoop {
 
     pub fn on_driver(mut self, sink: DriverSink) -> Self {
         self.on_driver = Some(sink);
+        self
+    }
+
+    /// Re-derive the root set on every backstop tick.
+    ///
+    /// [`with_roots`](WatchLoop::with_roots) fixes the names to watch at
+    /// startup, and the loop already retries the ones that did not exist. This
+    /// covers the other case: a root whose *name* could not have been known
+    /// yet, because the directory it is discovered from did not contain it.
+    /// Roots already known are ignored, so this is idempotent.
+    pub fn with_roots_refresh(mut self, refresh: RootsFn) -> Self {
+        self.roots_refresh = Some(refresh);
         self
     }
 
@@ -507,6 +545,13 @@ impl WatchLoop {
             // not something an event on another root tells us about.
             if trigger == TickTrigger::Poll {
                 if let Some(watch) = watcher.as_mut() {
+                    // Re-derive first, then attach: a root can be new as a
+                    // *name* (a project that grew a `.trajectories` directory)
+                    // rather than merely new on disk, and only the caller
+                    // knows how to look for those.
+                    if let Some(refresh) = &self.roots_refresh {
+                        watch.adopt(refresh());
+                    }
                     if watch.retry_pending() > 0 {
                         self.publish_status(Some(&*watch));
                     }
@@ -576,6 +621,9 @@ mod fs_events {
         watcher: notify::RecommendedWatcher,
         watched: Vec<PathBuf>,
         pending: Vec<WatchRoot>,
+        /// Every root and the depth it asked for, shared with the event
+        /// callback so it can drop what the backend over-delivered.
+        depth: Arc<Mutex<Vec<WatchRoot>>>,
     }
 
     impl FsWatch {
@@ -585,6 +633,23 @@ mod fs_events {
 
         pub(super) fn pending(&self) -> Vec<PathBuf> {
             self.pending.iter().map(|root| root.path.clone()).collect()
+        }
+
+        /// Take on roots that were not known at startup — a `.trajectories`
+        /// directory created in a project an hour into the run. Returns how
+        /// many are new, so the caller knows whether to retry attaching.
+        pub(super) fn adopt(&mut self, roots: Vec<WatchRoot>) -> usize {
+            let mut known = self.depth.lock().expect("watch roots");
+            let mut added = 0usize;
+            for root in roots {
+                if known.iter().any(|seen| seen.path == root.path) {
+                    continue;
+                }
+                known.push(root.clone());
+                self.pending.push(root);
+                added += 1;
+            }
+            added
         }
 
         /// Try the roots that were not there before. Returns how many were
@@ -619,6 +684,11 @@ mod fs_events {
         roots: &[WatchRoot],
         on_change: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
+        // The callback has to be able to see the roots to enforce their depth,
+        // and `retry_pending` adds to that set later, so it is shared rather
+        // than captured by value.
+        let depth: Arc<Mutex<Vec<WatchRoot>>> = Arc::new(Mutex::new(roots.to_vec()));
+        let depth_for_events = depth.clone();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else {
                 return;
@@ -626,10 +696,19 @@ mod fs_events {
             // Metadata churn — an atime bump from a backup or an antivirus
             // scan — does not change the bytes a sweep would read. Filtering
             // here keeps wakeups honest on a noisy home directory.
-            if matches!(
+            if !matches!(
                 event.kind,
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
             ) {
+                return;
+            }
+            let roots = depth_for_events.lock().expect("watch roots");
+            if event
+                .paths
+                .iter()
+                .any(|path| event_matches_roots(path, &roots))
+            {
+                drop(roots);
                 on_change();
             }
         })?;
@@ -646,6 +725,7 @@ mod fs_events {
             watcher,
             watched,
             pending,
+            depth,
         })
     }
 
@@ -677,6 +757,10 @@ mod fs_events {
             Vec::new()
         }
 
+        pub(super) fn adopt(&mut self, _roots: Vec<WatchRoot>) -> usize {
+            0
+        }
+
         pub(super) fn retry_pending(&mut self) -> usize {
             0
         }
@@ -690,5 +774,74 @@ mod fs_events {
         _on_change: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
         anyhow::bail!("ai-hist was built without the fs-events feature")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The depth filter is what makes `WatchRoot::directory` mean the same
+    /// thing on every platform. It is unit-tested rather than only exercised
+    /// end to end because the backend it defends against is macOS FSEvents,
+    /// which has no non-recursive mode — on Linux the kernel filters first, so
+    /// an integration test there would pass with the filter removed.
+    #[test]
+    fn a_non_recursive_root_covers_its_own_entries_only() {
+        let roots = vec![WatchRoot::directory("/home/u/.claude")];
+
+        assert!(event_matches_roots(
+            Path::new("/home/u/.claude/history.jsonl"),
+            &roots
+        ));
+        assert!(event_matches_roots(Path::new("/home/u/.claude"), &roots));
+
+        for buried in [
+            "/home/u/.claude/todos/task-1.json",
+            "/home/u/.claude/shell-snapshots/snapshot-1.sh",
+            "/home/u/.claude/projects/app/session.jsonl",
+        ] {
+            assert!(
+                !event_matches_roots(Path::new(buried), &roots),
+                "{buried} is below a non-recursive root and must not wake a forced sweep"
+            );
+        }
+        assert!(!event_matches_roots(Path::new("/home/u/.codex"), &roots));
+    }
+
+    #[test]
+    fn a_recursive_root_covers_its_whole_subtree() {
+        let roots = vec![WatchRoot::tree("/home/u/.claude/projects")];
+
+        for inside in [
+            "/home/u/.claude/projects",
+            "/home/u/.claude/projects/app/session.jsonl",
+            "/home/u/.claude/projects/app/session/subagents/agent-a.jsonl",
+        ] {
+            assert!(event_matches_roots(Path::new(inside), &roots), "{inside}");
+        }
+        assert!(!event_matches_roots(
+            Path::new("/home/u/.claude/todos/task-1.json"),
+            &roots
+        ));
+    }
+
+    /// The two depths coexist: a path below a non-recursive root is still
+    /// covered when some other root is recursive over it.
+    #[test]
+    fn the_widest_matching_root_decides() {
+        let roots = vec![
+            WatchRoot::directory("/home/u/.claude"),
+            WatchRoot::tree("/home/u/.claude/projects"),
+        ];
+
+        assert!(event_matches_roots(
+            Path::new("/home/u/.claude/projects/app/session.jsonl"),
+            &roots
+        ));
+        assert!(!event_matches_roots(
+            Path::new("/home/u/.claude/todos/task-1.json"),
+            &roots
+        ));
     }
 }

@@ -90,7 +90,17 @@ Startup reports which driver it took **and which roots are not covered yet**. A
 root that does not exist cannot be watched, so a provider installed after
 `watch` started would otherwise be silently missed; those roots are retried on
 every backstop tick, and a loop that started with nothing to watch promotes
-itself to filesystem events as soon as one appears.
+itself to filesystem events as soon as one appears. The backstop also
+re-derives the root set, so a project that grows a `.trajectories` directory
+mid-run — a root whose *name* could not have been known at startup — is picked
+up too.
+
+A root is watched at the depth it asks for: transcript trees recursively,
+because a new session is a new file somewhere inside; the directories holding
+the flat logs shallowly, so the todo files and shell snapshots an active
+session rewrites constantly do not each wake a sweep. That depth is enforced
+on the events themselves rather than left to the OS, because the macOS backend
+has no shallow mode and delivers the whole subtree regardless.
 
 `watch --remote` installs no local roots at all. Local provider writes are not
 what a remote-only run collects, and letting them drive the loop would fire the
@@ -100,14 +110,17 @@ Two things make this cheap enough to leave running:
 
 - A tick first folds a **stat-only fingerprint** over everything the sweep
   reads — the transcripts discovery enumerates, the Claude subagent
-  `agent-*.meta.json` sidecars beside them, the two flat logs, and the
-  trajectory records. If it matches the previous sweep's, the tick returns
+  `agent-*.meta.json` sidecars beside them, the two flat logs, the trajectory
+  records, and a generation for the imported Relay rows, which have no file to
+  stat but still change. If it matches the previous sweep's, the tick returns
   without opening a single file. Anything the sweep reads has to be in that
   fold: a source left out would sit behind an unchanged fingerprint and never
   be read again. The value is recorded in `.sync-state.json` beside the
-  database, after the sweep's cursors and only when every source read
-  successfully — a source that failed is retried next tick rather than being
-  cached over.
+  database, after the sweep's cursors, and only when every source was read —
+  including the per-file failures a provider absorbs on its way to a
+  successful partial run. A file that could not be read this tick keeps the
+  fingerprint stale so the next tick retries it, rather than caching the
+  failure in place.
 - A tick woken by a filesystem event **forces** the sweep past that
   fingerprint. An event can arrive before the write is flushed, so the size and
   mtime it would be compared against are not yet trustworthy. The polling

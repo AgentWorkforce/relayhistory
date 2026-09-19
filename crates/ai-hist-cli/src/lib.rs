@@ -2142,7 +2142,7 @@ fn watch_loop_with_connectors(
             skipped_unchanged: tick.skipped_unchanged(),
         })
     });
-    let watch = ai_hist::watch::WatchLoop::new(tick)
+    let mut watch = ai_hist::watch::WatchLoop::new(tick)
         .with_roots(roots)
         .with_fs_events(drivers.use_fs_events)
         .with_debounce_ms(drivers.debounce_ms)
@@ -2180,6 +2180,12 @@ fn watch_loop_with_connectors(
                 );
             }
         }));
+    if !remote_only {
+        // A project that grows a `.trajectories` directory after the run
+        // started is a root whose name could not have been known at startup,
+        // so the pending-retry path alone would never reach it.
+        watch = watch.with_roots_refresh(Arc::new(|| watch_roots_for_scope(SessionScope::Local)));
+    }
     watch.run().map(|_| ())
 }
 

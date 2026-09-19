@@ -1931,14 +1931,39 @@ impl ShallowSessionProvider for RelayProvider {
         "relay"
     }
 
-    /// Relay rows are derived from RelayHistory's own `history` table, so the
-    /// only thing that can move them is a write we just made. Folding them
-    /// into the fingerprint would invalidate it on our own sweep and cost an
-    /// extra no-op pass every time; folding them in *and* short-circuiting on
-    /// them would be worse, because a relay row can change without any
-    /// upstream provider having moved.
-    fn fingerprint_inputs(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        Ok(Vec::new())
+    /// Relay rows come from RelayHistory's own `history` table, so there is no
+    /// file to stat — but "no file" is not "cannot change". `ai-hist import`
+    /// writes relay history straight into that table without going through a
+    /// sweep, and nothing else in the fingerprint moves when it does. Left out
+    /// of the fold entirely, an import would land rows that discovery then
+    /// declined to look at, and the imported sessions would never reach the
+    /// catalog.
+    ///
+    /// So the signal is a generation for the relay slice: how many rows there
+    /// are and the highest one. Both move on an insert, and the count alone
+    /// moves on a delete. It is one range scan of `idx_history_session`, whose
+    /// leading column is `source`, so the cost is proportional to the relay
+    /// rows rather than the table.
+    ///
+    /// This does not invalidate itself: no local sweep source writes
+    /// `source = 'relay'`, so a tick that folds this value cannot be the
+    /// reason it changed next time.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let (rows, highest) = env.conn().query_row(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM history WHERE source = 'relay'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Candidate {
+            source: "relay",
+            locator: "history:relay".into(),
+            session_id: None,
+            recency_hint_ms: None,
+            stamp: format!("{rows}:{highest}"),
+        }])
     }
 
     fn enumerate(

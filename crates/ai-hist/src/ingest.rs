@@ -491,9 +491,18 @@ fn sweep_only_fingerprint_inputs(home: &Path) -> Vec<Candidate> {
 /// active session rewrites constantly, each one waking a full fingerprint
 /// walk.
 ///
-/// A `.trajectories` directory created after the loop started is not here —
-/// the alternative is watching every project tree — but the fingerprint
-/// re-enumerates them every tick, so the backstop still picks one up.
+/// Trajectory roots come from [`trajectory_roots`], not from the parents of
+/// the files found inside them. Deriving a watch from an existing file's
+/// parent covers only the shape the tree happens to have right now: an empty
+/// root, a root that does not exist yet, and the next `completed/<month>/`
+/// directory to be created would all go unwatched. The roots themselves are
+/// watched recursively, and a root that does not exist is kept — the loop
+/// retries it, so the first trajectory written there wakes live capture rather
+/// than waiting for the backstop.
+///
+/// Call this again to pick up a `.trajectories` directory created after the
+/// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
+/// that on each backstop tick.
 pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
     let mut roots = discover::watch_roots(
         &shallow_providers(),
@@ -501,10 +510,16 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
     );
     roots.push(discover::WatchRoot::directory(home.join(".claude")));
     roots.push(discover::WatchRoot::directory(home.join(".codex")));
-    for file in trajectory_files(home).unwrap_or_default() {
-        if let Some(parent) = file.parent() {
-            roots.push(discover::WatchRoot::tree(parent));
+    for root in trajectory_roots(home).unwrap_or_default() {
+        // A `TRAJECTORY_ROOT` entry may name a single JSON file rather than a
+        // directory; watch what contains it.
+        if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            if let Some(parent) = root.parent() {
+                roots.push(discover::WatchRoot::tree(parent));
+            }
+            continue;
         }
+        roots.push(discover::WatchRoot::tree(root));
     }
     roots.sort();
     roots.dedup_by(|later, first| {
@@ -515,6 +530,41 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
         true
     });
     roots
+}
+
+/// Whether a sweep read everything the fingerprint counted.
+///
+/// This is deliberately a different question from whether the sweep
+/// *succeeded*. A provider that hits a per-file failure absorbs it, records
+/// the count, leaves that file's stamp unrecorded so the next sweep retries
+/// it, and returns `Ok` — correct partial-success behaviour, and the whole
+/// source never appears in `SyncSourceReport::failures`. But that file was
+/// already folded into the fingerprint, so caching the fingerprint would mean
+/// the next tick matches, returns early, and the retry never happens: one
+/// transient read error becomes permanent, and every symptom of it is
+/// "nothing new".
+///
+/// So partial success and fingerprint eligibility are tracked separately. A
+/// run may make progress and still be ineligible to arm the fast path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SweepCoverage {
+    /// Sources counted into the fingerprint that this sweep could not read.
+    unread: u64,
+}
+
+impl SweepCoverage {
+    /// A source was statted into the fingerprint but not read. Not for a
+    /// source deliberately classified as ignorable — an unparseable line in a
+    /// file that was read, or a file the parser decided is not a session —
+    /// because re-reading those produces the same answer forever, and
+    /// blocking the fast path on them would disable it permanently.
+    fn note_unread(&mut self) {
+        self.unread = self.unread.saturating_add(1);
+    }
+
+    fn complete(self) -> bool {
+        self.unread == 0
+    }
 }
 
 /// Whether the stat-only fingerprint says this sweep has nothing to do.
@@ -569,6 +619,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let mut coverage = SweepCoverage::default();
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
@@ -637,20 +688,32 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     }
     if let Some(inserted) = report.capture(
         "cursor",
-        sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
+        sync_cursor(
+            conn,
+            &mut state,
+            &home.join(".cursor/projects"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok(conn, &mut state, &home.join(".grok/sessions")),
+        sync_grok(
+            conn,
+            &mut state,
+            &home.join(".grok/sessions"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
-    {
+    if let Some(inserted) = report.capture(
+        "trajectory",
+        sync_trajectories(conn, &mut state, home, &mut coverage),
+    ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -668,7 +731,12 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // before retrying. Leave the stored fingerprint stale instead. The cost is
     // one full re-walk per tick until the source reads again, which is the
     // conservative side of the trade.
-    let all_sources_read = report.failures.is_empty();
+    //
+    // Both halves are needed. `failures` catches a source that failed
+    // outright; `coverage` catches the per-file failures a source absorbs on
+    // its way to a successful partial run, which never reach `failures` at
+    // all.
+    let all_sources_read = report.failures.is_empty() && coverage.complete();
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
@@ -3930,8 +3998,13 @@ pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64
     Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
-fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
-    sync_cursor_with_scan_hook(conn, state, root, &mut |_| {})
+fn sync_cursor(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    sync_cursor_with_scan_hook(conn, state, root, coverage, &mut |_| {})
 }
 
 struct PreparedCursorTranscript {
@@ -3953,13 +4026,14 @@ fn sync_cursor_with_scan_hook(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
     // Finish provider I/O and parsing before taking the destination writer lock.
-    let prepared = prepare_cursor_sync(state, root, before_transcript)
+    let prepared = prepare_cursor_sync(state, root, coverage, before_transcript)
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
@@ -4059,6 +4133,7 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
 fn prepare_cursor_sync(
     state: &Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
@@ -4103,6 +4178,7 @@ fn prepare_cursor_sync(
                 Err(error) => {
                     sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
                     errors += 1;
+                    coverage.note_unread();
                     continue;
                 }
             };
@@ -4188,7 +4264,12 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
 }
 
-fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+fn sync_grok(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
     if !root.exists() {
         sync_note!("  [grok] not found: {} (skipped)", root.display());
         return Ok(0);
@@ -4219,7 +4300,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             Ok(None) => {
                 grok_state.insert(key, json!(stamp));
             }
-            Err(_) => errors += 1,
+            // Read failure: the stamp is deliberately not recorded so the next
+            // sweep retries this file, which only helps if a next sweep runs.
+            Err(_) => {
+                errors += 1;
+                coverage.note_unread();
+            }
         }
     }
     state.insert("grok_sessions".to_string(), Value::Object(grok_state));
@@ -4443,6 +4529,7 @@ fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
     home: &Path,
+    coverage: &mut SweepCoverage,
 ) -> Result<usize> {
     let files = trajectory_files(home)?;
     if files.is_empty() {
@@ -4462,6 +4549,7 @@ fn sync_trajectories(
             Ok(metadata) => metadata,
             Err(_) => {
                 errors += 1;
+                coverage.note_unread();
                 continue;
             }
         };
@@ -4494,6 +4582,7 @@ fn sync_trajectories(
                 return Err(error);
             }
             errors += 1;
+            coverage.note_unread();
             continue;
         }
         trajectory_state.insert(key, json!(stamp));
@@ -4537,7 +4626,15 @@ struct TrajectoryRow {
     timestamp_ms: i64,
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+/// The trajectory roots this machine is configured for, whether or not
+/// anything exists inside them yet.
+///
+/// Split out from [`trajectory_files`] because the watcher and the file walk
+/// need different answers. A root that is empty, or that does not exist at
+/// all, contributes no files — but it is exactly what has to be watched, so
+/// the first trajectory written into it wakes live capture instead of waiting
+/// for the backstop.
+pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
         for part in std::env::split_paths(&raw) {
@@ -4551,8 +4648,14 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
             collect_named_dirs(&projects, ".trajectories", &mut roots)?;
         }
     }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in roots {
+    for root in trajectory_roots(home)? {
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
             continue;
@@ -4569,18 +4672,42 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Directory names never worth descending into when looking for a project's
+/// `.trajectories`, and expensive enough to matter: a dependency tree or an
+/// object store can be most of the files on the disk.
+const SKIP_PROJECT_SCAN_DIRS: &[&str] = &["node_modules", "target", "vendor"];
+
+/// Find directories named `name` under `root`.
+///
+/// The pruning is load-bearing, not a micro-optimisation. This runs once per
+/// watch tick as part of the stat-only fingerprint, and an unpruned walk of
+/// `~/Projects` means walking every dependency tree and every `.git` object
+/// store on the machine before deciding that nothing has changed — which is
+/// the opposite of what a fast path is for.
+///
+/// Pruned: the names above, and any hidden directory that is not the one being
+/// looked for. A match is not descended into either; nothing nests a
+/// `.trajectories` inside another one.
 fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|s| s.to_str()) == Some(name) {
-                out.push(path.clone());
-            }
-            collect_named_dirs(&path, name, out)?;
+        if !path.is_dir() {
+            continue;
         }
+        let Some(entry_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if entry_name == name {
+            out.push(path);
+            continue;
+        }
+        if entry_name.starts_with('.') || SKIP_PROJECT_SCAN_DIRS.contains(&entry_name) {
+            continue;
+        }
+        collect_named_dirs(&path, name, out)?;
     }
     Ok(())
 }
