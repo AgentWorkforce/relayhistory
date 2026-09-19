@@ -617,33 +617,66 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
     })
 }
 
-/// Whether this lease still owns its batch.
+/// What a lease check has to prove before a write may proceed.
 ///
-/// Ownership, deliberately, and not recency. `claim_batch` bumps `fence` and
-/// rewrites `worker_id` on every claim, so a takeover is always visible here
-/// as a fence or worker mismatch; the job state and the batch's `leased` state
-/// close the rest. A `lease_until_ms > now` term would add nothing to that
-/// proof, because an expired lease that nobody has taken still carries this
-/// worker's fence.
-///
-/// What it would add is a way to refuse a worker's own writes for no reason.
-/// Expiry is a signal to *other* workers that an abandoned batch may be
-/// stolen, and `claim_batch` enforces that itself. Reading it here as "the
-/// claim is gone" meant a drain whose 100 ms lease lapsed while its receiver
+/// `claim_batch` bumps `fence` and rewrites `worker_id` on every claim, so a
+/// takeover is always visible as a fence or worker mismatch; the job state and
+/// the batch's `leased` state close the rest. That is *ownership*, and it is
+/// all a write made **after** transport needs: `acknowledge` and
+/// `record_failure` report an outcome that already happened, and refusing
+/// them because the deadline passed while the receiver ran does not undo the
+/// send. It only loses the record of it — before this distinction, "the claim
+/// is gone" meant a drain whose 100 ms lease lapsed while its receiver
 /// panicked could not even record the resulting transient failure: the write
 /// was refused with "lease expired or was fenced" when nothing had been
 /// fenced, the retry backoff was never applied, and a clean retryable outcome
-/// was escalated into a job-level state error. The same refusal hit
-/// `acknowledge`, discarding sends that had already succeeded.
+/// was escalated into a job-level state error.
 ///
-/// This is safe precisely because every caller runs it inside the same write
-/// transaction as the write it guards. SQLite serializes those transactions,
-/// so a fence that still matches at this moment means no other worker holds
-/// the batch at this moment, and there is no window between the check and the
-/// write for one to appear.
-fn check_lease(conn: &Connection, lease: &DeliveryLease, _now: i64) -> Result<()> {
-    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs j JOIN delivery_batches b ON b.job_id=j.id WHERE j.id=? AND j.state='active' AND j.worker_id=? AND j.fence=? AND b.id=? AND b.state='leased')",params![lease.job_id,lease.worker_id,lease.fence,lease.batch_id],|row| row.get(0))?;
-    ensure!(valid, "delivery lease was fenced by another worker");
+/// A write made **before** transport is different. The fence proves nobody
+/// else held the batch when the check ran, but that proof expires with the
+/// transaction: `validate_dispatch` commits and only then does the receiver
+/// send, and an expired lease that was still unclaimed at validation is
+/// claimable by another worker in that gap, so both would send. The
+/// pre-transport gates therefore also require the lease to be live —
+/// `lease_until_ms > now` — which is the promise that no other worker can
+/// claim until the send is past the point of `claim_batch` letting them.
+///
+/// Renewal is [`Owned`](LeaseCheck::Owned) on purpose: a keepalive that was
+/// blocked past the deadline finds its lease expired but, by the fence,
+/// unclaimed, and renewing it inside one write transaction makes it live
+/// again before any other worker can act on the expiry. Refusing that would
+/// turn a slow lock into a lost batch. Every caller runs the check inside the
+/// same write transaction as the write it guards, which is what makes either
+/// form a proof rather than a race.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseCheck {
+    /// Ownership only: the fence and worker still match. Enough for a write
+    /// that reports an outcome already produced, and for renewal.
+    Owned,
+    /// Ownership and a deadline still in the future. Required before any
+    /// step that commits and then hands the batch to transport.
+    Live,
+}
+
+fn check_lease(
+    conn: &Connection,
+    lease: &DeliveryLease,
+    now_ms: i64,
+    check: LeaseCheck,
+) -> Result<()> {
+    let owned: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs j JOIN delivery_batches b ON b.job_id=j.id WHERE j.id=? AND j.state='active' AND j.worker_id=? AND j.fence=? AND b.id=? AND b.state='leased')",params![lease.job_id,lease.worker_id,lease.fence,lease.batch_id],|row| row.get(0))?;
+    ensure!(owned, "delivery lease was fenced by another worker");
+    if check == LeaseCheck::Live {
+        let live: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=? AND lease_until_ms>?)",
+            params![lease.job_id, now_ms],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            live,
+            "delivery lease expired before dispatch; another worker may claim the batch"
+        );
+    }
     Ok(())
 }
 fn pending_batch(
@@ -770,7 +803,7 @@ pub fn renew_lease(
     let expires_at_ms = now_ms
         .checked_add(lease_ms)
         .context("delivery clock overflow")?;
-    check_lease(&tx, lease, now_ms)?;
+    check_lease(&tx, lease, now_ms, LeaseCheck::Owned)?;
     tx.execute(
         "UPDATE delivery_jobs SET lease_until_ms=? WHERE id=?",
         params![expires_at_ms, lease.job_id],
@@ -800,7 +833,7 @@ pub fn store_prepared_payload(
         "invalid content type"
     );
     let tx = write_transaction(conn)?;
-    check_lease(&tx, lease, now_ms)?;
+    check_lease(&tx, lease, now_ms, LeaseCheck::Live)?;
     let job = job(&tx, &lease.job_id)?;
     ensure!(
         mapping_version == job.config.mapping_version,
@@ -851,7 +884,7 @@ pub fn acknowledge(
     now_ms: i64,
 ) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
-    check_lease(&tx, lease, now_ms)?;
+    check_lease(&tx, lease, now_ms, LeaseCheck::Owned)?;
     ensure!(
         ack.batch_id == lease.batch_id,
         "acknowledgment batch mismatch"
@@ -952,7 +985,7 @@ pub fn record_failure(
     now_ms: i64,
 ) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
-    check_lease(&tx, lease, now_ms)?;
+    check_lease(&tx, lease, now_ms, LeaseCheck::Owned)?;
     apply_failure(&tx, lease, failure, retry_after_ms, now_ms)?;
     tx.commit()?;
     status(conn, &lease.job_id)
@@ -1139,7 +1172,7 @@ pub fn validate_dispatch(
     now_ms: i64,
 ) -> Result<PreparedPayload> {
     let tx = write_transaction(conn)?;
-    check_lease(&tx, lease, now_ms)?;
+    check_lease(&tx, lease, now_ms, LeaseCheck::Live)?;
     let job = job(&tx, &lease.job_id)?;
     let (batch, prepared, _) =
         pending_batch(&tx, &lease.job_id)?.context("delivery batch missing")?;
