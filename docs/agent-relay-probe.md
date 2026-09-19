@@ -163,7 +163,7 @@ installer. The CI job builds and tests on macOS/Linux but publishes nothing.
 ```sh
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --lib cloud:: --locked
-cargo test -p ai-hist identity_pages --locked
+cargo test -p ai-hist --features delivery identity_pages --locked
 ```
 
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,

@@ -820,7 +820,6 @@ jobs:
         working-directory: .
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -849,13 +848,17 @@ jobs:
         run: cargo publish --dry-run -p ai-hist --allow-dirty --locked
       - name: Publish to crates.io
         if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           if curl -sf "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
             echo "ai-hist ${VERSION} already exists on crates.io; skip"
             exit 0
           fi
-          cargo publish -p ai-hist --allow-dirty --locked
+          # Dry-run already compiled the package. Skip verify so the registry
+          # token is not present while Cargo runs repository-controlled scripts.
+          cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
   plugins:
     name: Publish optional history plugins
