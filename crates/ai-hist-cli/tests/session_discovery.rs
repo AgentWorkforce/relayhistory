@@ -4,7 +4,7 @@
 //! `sync_resilience.rs` established) so the CLI output contract — the JSON
 //! shapes a desktop app parses — is asserted from outside the library.
 
-use ai_hist_core::open_db;
+use ai_hist::open_db;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;

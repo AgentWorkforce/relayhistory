@@ -1,9 +1,9 @@
-use ai_hist_core::{
+use ai_hist::{
     observations::ObservationKey,
     source_evidence::{EvidenceKind, EvidenceRecord},
     SessionLocation,
 };
-use ai_hist_engine::{source_intake::*, ShallowSession};
+use ai_hist::{source_intake::*, ShallowSession};
 use anyhow::Result;
 use serde_json::json;
 fn key(instance: &str) -> ObservationKey {
@@ -47,7 +47,7 @@ fn apply(
     revision: String,
     covered: Vec<EvidenceKind>,
     records: Vec<EvidenceRecord>,
-) -> Result<ai_hist_engine::HydrateSessionResult> {
+) -> Result<ai_hist::HydrateSessionResult> {
     apply_source_evidence(ApplyEvidenceRequest {
         db_path: Some(path.into()),
         key: key(instance),
@@ -96,7 +96,7 @@ fn revisions_fence_stale_results_and_instances_are_independent() -> Result<()> {
         vec![EvidenceKind::SessionEvent],
         vec![event("shared", "b"), event("only-b", "b")],
     )?;
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     let text: String = conn.query_row(
         "SELECT text FROM session_events WHERE event_uid='shared'",
         [],
@@ -146,7 +146,7 @@ fn partial_kind_update_preserves_tools_and_atomic_failure_preserves_revision() -
         vec![EvidenceKind::SessionEvent],
         vec![],
     )?;
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     assert_eq!(
         conn.query_row("SELECT count(*) FROM tool_calls", [], |r| r
             .get::<_, i64>(0))?,
@@ -213,7 +213,7 @@ fn malformed_complete_batch_never_creates_database() -> Result<()> {
 }
 #[test]
 fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()> {
-    use ai_hist_engine::sources::{normalize_source_evidence, AcquiredEvidence};
+    use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
     for order in [["a", "b"], ["b", "a"]] {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("history.db");
@@ -243,7 +243,7 @@ fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()>
                 evidence,
             })?;
         }
-        let conn = ai_hist_core::open_db(&path)?;
+        let conn = ai_hist::open_db(&path)?;
         let text: String = conn.query_row(
             "SELECT text FROM session_events WHERE kind='text'",
             [],
@@ -304,7 +304,7 @@ fn local_acquisition_after_remote_protects_changed_and_identical_canonical_recor
             vec![EvidenceKind::SessionEvent],
             vec![event("shared", "remote")],
         )?;
-        let conn = ai_hist_core::open_db(&path)?;
+        let conn = ai_hist::open_db(&path)?;
         let local = if changed { "local" } else { "remote" };
         conn.execute(
             "UPDATE session_events SET text=? WHERE event_uid='shared'",
@@ -312,9 +312,9 @@ fn local_acquisition_after_remote_protects_changed_and_identical_canonical_recor
         )?;
         // Ordinary local acquisition establishes its executing connector identity,
         // but a pre-existing canonical row alone cannot prove per-record ownership.
-        ai_hist_core::observations::upsert(
+        ai_hist::observations::upsert(
             &conn,
-            &ai_hist_core::observations::SessionObservation {
+            &ai_hist::observations::SessionObservation {
                 key: ObservationKey {
                     location: SessionLocation::Local,
                     connector_id: "claude".into(),
@@ -367,20 +367,20 @@ fn observation_revision_is_monotonic_even_on_same_timestamp_and_recreation() -> 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("history.db");
     observe(&path, "a")?;
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     let mut observation = state(&path, "a")?.observation.unwrap();
     observation.updated_ms = 7;
-    ai_hist_core::observations::upsert(&conn, &observation)?;
+    ai_hist::observations::upsert(&conn, &observation)?;
     let first = state(&path, "a")?.revision.unwrap();
     observation.raw_locator = Some("updated".into());
-    ai_hist_core::observations::upsert(&conn, &observation)?;
+    ai_hist::observations::upsert(&conn, &observation)?;
     let second = state(&path, "a")?.revision.unwrap();
     assert_ne!(first, second);
     conn.execute(
         "DELETE FROM session_observations WHERE source='claude' AND session_id='s'",
         [],
     )?;
-    ai_hist_core::observations::upsert(&conn, &observation)?;
+    ai_hist::observations::upsert(&conn, &observation)?;
     let third = state(&path, "a")?.revision.unwrap();
     assert_ne!(first, third);
     assert_ne!(second, third);
@@ -403,7 +403,7 @@ fn external_observation_preserves_opaque_locator_separately_from_display_path() 
             .as_deref(),
         Some("opaque-handle")
     );
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     assert_eq!(
         conn.query_row("SELECT raw_path FROM sessions", [], |row| row
             .get::<_, String>(0))?,
@@ -464,7 +464,7 @@ fn complete_normalized_snapshot_round_trips_all_six_kinds_and_removes_only_owned
         records,
     )?;
     assert_eq!(result.capability, "full");
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     for table in [
         "history",
         "session_events",
@@ -480,7 +480,7 @@ fn complete_normalized_snapshot_round_trips_all_six_kinds_and_removes_only_owned
         );
     }
     let hash: String = conn.query_row("SELECT prompt_hash FROM history", [], |r| r.get(0))?;
-    assert_eq!(hash, ai_hist_core::prompt_hash("hello"));
+    assert_eq!(hash, ai_hist::prompt_hash("hello"));
     let id: i64 = conn.query_row("SELECT id FROM history", [], |r| r.get(0))?;
     assert_ne!(id, 12345);
     apply(
@@ -513,9 +513,9 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("history.db");
     {
-        let conn = ai_hist_core::open_db(&path)?;
+        let conn = ai_hist::open_db(&path)?;
         conn.execute("INSERT INTO sessions(source,session_id,raw_path,discovery_state) VALUES('claude','s','legacy-display','full')",[])?;
-        ai_hist_core::upsert_session_presence(
+        ai_hist::upsert_session_presence(
             &conn,
             "claude",
             "s",
@@ -531,11 +531,11 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
         )?;
     }
     {
-        let conn = ai_hist_core::open_db(&path)?;
-        let legacy = ai_hist_core::observations::list(&conn, "claude", "s")?;
+        let conn = ai_hist::open_db(&path)?;
+        let legacy = ai_hist::observations::list(&conn, "claude", "s")?;
         assert_eq!(legacy.len(), 1);
         assert_eq!(legacy[0].key.connector_id, "legacy-unknown");
-        assert!(ai_hist_core::observations::checkpoint(&conn, &legacy[0].key)?.is_none());
+        assert!(ai_hist::observations::checkpoint(&conn, &legacy[0].key)?.is_none());
     }
     observe(&path, "a")?;
     apply(
@@ -545,7 +545,7 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
         vec![EvidenceKind::SessionEvent],
         vec![event("shared", "fresh connector"), event("new", "owned")],
     )?;
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     assert_eq!(
         conn.query_row(
             "SELECT text FROM session_events WHERE event_uid='shared'",
@@ -554,7 +554,7 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
         )?,
         "legacy content"
     );
-    let snapshot = ai_hist_core::observations::evidence(&conn, &key("a"))?.unwrap();
+    let snapshot = ai_hist::observations::evidence(&conn, &key("a"))?.unwrap();
     assert!(snapshot.to_string().contains("fresh connector"));
     apply(
         &path,
@@ -569,11 +569,8 @@ fn legacy_migration_retains_unknown_canonical_evidence_without_claiming_connecto
         2
     );
     drop(conn);
-    let conn = ai_hist_core::open_db(&path)?;
-    assert_eq!(
-        ai_hist_core::observations::list(&conn, "claude", "s")?.len(),
-        2
-    );
+    let conn = ai_hist::open_db(&path)?;
+    assert_eq!(ai_hist::observations::list(&conn, "claude", "s")?.len(), 2);
     Ok(())
 }
 
@@ -591,12 +588,12 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
             vec![event("shared", "remote")],
         )?;
     }
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     let sibling_revision = state(&path, "b")?.revision.unwrap();
-    let sibling_evidence = ai_hist_core::observations::evidence(&conn, &key("b"))?;
-    ai_hist_core::observations::upsert(
+    let sibling_evidence = ai_hist::observations::evidence(&conn, &key("b"))?;
+    ai_hist::observations::upsert(
         &conn,
-        &ai_hist_core::observations::SessionObservation {
+        &ai_hist::observations::SessionObservation {
             key: ObservationKey {
                 location: SessionLocation::Local,
                 connector_id: "claude".into(),
@@ -623,7 +620,7 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
         Some(sibling_revision.as_str())
     );
     assert_eq!(
-        ai_hist_core::observations::evidence(&conn, &key("b"))?,
+        ai_hist::observations::evidence(&conn, &key("b"))?,
         sibling_evidence
     );
     conn.execute_batch("DROP TRIGGER reject_sibling_evidence; DELETE FROM session_observations WHERE location='local';")?;
@@ -636,7 +633,7 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
         vec![EvidenceKind::SessionEvent],
         vec![],
     )?;
-    let conn = ai_hist_core::open_db(&path)?;
+    let conn = ai_hist::open_db(&path)?;
     assert_eq!(
         conn.query_row(
             "SELECT text FROM session_events WHERE event_uid='shared'",

@@ -1,8 +1,8 @@
 //! Typed service-independent delivery/export boundary. No SQL or transport.
-use ai_hist_core::delivery::worker::{
+use ai_hist::delivery::worker::{
     self, DrainOptions, PreparedBody, Receiver, ReceiverContext, ReceiverFailure, Receivers,
 };
-use ai_hist_core::{delivery as core, open_db};
+use ai_hist::{delivery as core, open_db};
 use napi::bindgen_prelude::Promise;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::tokio::runtime::Handle;
@@ -272,7 +272,7 @@ pub async fn history_delivery(
 // ---------------------------------------------------------------------------
 // Generic drain adapter: JavaScript destinations as core delivery receivers.
 //
-// The bounded drain loop itself lives once, in `ai_hist_core::delivery::worker`.
+// The bounded drain loop itself lives once, in `ai_hist::delivery::worker`.
 // This adapter only bridges that worker's `Receiver` trait to a pair of
 // JavaScript callbacks, so a Node host never reimplements leases, retries,
 // acknowledgment checking or round-robin scheduling.

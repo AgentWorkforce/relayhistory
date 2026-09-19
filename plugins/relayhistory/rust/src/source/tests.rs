@@ -1,6 +1,6 @@
 use super::*;
-use ai_hist_core::{init_db, SessionScope};
-use ai_hist_engine::discover::{
+use ai_hist::{init_db, SessionScope};
+use ai_hist::discover::{
     discover_sessions_with_providers, list_session_catalog, CatalogListOptions, DiscoverOptions,
 };
 use std::io::Read;
@@ -207,7 +207,7 @@ fn cloud_teleport_adds_second_presence_and_keeps_local_evidence() {
     let (base, server) = cloud_http(vec![(200, cloud_listing("codex", "teleport-1"))]);
     crate::cloud::save_auth(&cloud_auth(&base)).unwrap();
     let conn = catalog();
-    ai_hist_engine::discover::upsert_shallow_session(
+    ai_hist::discover::upsert_shallow_session(
         &conn,
         &ShallowSession {
             source: "codex".into(),
@@ -268,7 +268,7 @@ fn cloud_teleport_adds_second_presence_and_keeps_local_evidence() {
     )
     .unwrap();
     assert!(
-        ai_hist_core::session_locations(&conn, "codex", "teleport-1")
+        ai_hist::session_locations(&conn, "codex", "teleport-1")
             .unwrap()
             .is_empty()
     );
@@ -476,11 +476,11 @@ fn cloud_repeated_cursor_is_a_diagnostic_and_does_not_cache_partial_listing() {
     };
     let error = discover_with_cloud(&env_at(&conn, home.path()), &options, |_| {}).unwrap_err();
     let summary = &error
-        .downcast_ref::<ai_hist_engine::discover::AllProvidersFailed>()
+        .downcast_ref::<ai_hist::discover::AllProvidersFailed>()
         .unwrap()
         .summary;
     assert!(summary.diagnostics[0].error.contains("repeated nextCursor"));
-    assert!(ai_hist_core::session_locations(&conn, "cursor", "one")
+    assert!(ai_hist::session_locations(&conn, "cursor", "one")
         .unwrap()
         .is_empty());
     server.join().unwrap();
@@ -769,7 +769,7 @@ fn discover_with_cloud(
     env: &DiscoveryEnv<'_>,
     options: &DiscoverOptions,
     on_row: impl FnMut(&ShallowSession),
-) -> Result<ai_hist_engine::DiscoverySummary> {
+) -> Result<ai_hist::DiscoverySummary> {
     ensure_cloud_configured_for_at("discovery", &env.home, &options.sources)?;
     let providers = selected_remote_providers(
         &env.home,

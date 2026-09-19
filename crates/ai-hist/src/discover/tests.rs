@@ -11,7 +11,7 @@
 //! listing performs no file I/O at all.
 
 use super::*;
-use ai_hist_core::{init_db, mark_session_presence, upsert_session_presence};
+use crate::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -1401,9 +1401,9 @@ fn relay_discovers_from_already_synced_rows_and_never_touches_the_network() {
         ("ch:general", "[ana] deploy is red", 1_750_000_800_000_i64),
         ("ch:general", "[bo] rolling back", 1_750_000_900_000),
     ] {
-        ai_hist_core::insert_history(
+        crate::insert_history(
             &conn,
-            &ai_hist_core::HistoryEntry {
+            &crate::HistoryEntry {
                 id: 0,
                 source: "relay".into(),
                 session_id: Some(id.into()),

@@ -1,27 +1,76 @@
 [package]
-name = "ai-hist-engine"
-version = "0.2.0"
+name = "ai-hist"
+version = "0.18.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+description = "Local coding-agent session history: ingest, store, and query Claude, Codex, Cursor, Grok, OpenCode, and Agent Relay sessions."
+readme = "README.md"
+keywords = ["ai", "history", "claude", "codex", "session"]
+categories = ["development-tools", "database"]
+include = ["src/**/*", "README.md"]
 
 [lib]
-name = "ai_hist_engine"
+name = "ai_hist"
 path = "src/lib.rs"
 
+[features]
+default = []
+delivery = []
+opencode-backup = ["dep:tempfile", "rusqlite/backup"]
+git-hooks = ["dep:url"]
+unstable-internal = []
+
 [dependencies]
-ai-hist-core = { path = "../ai-hist-core" }
 anyhow = "1"
-atomicwrites = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-fs2 = "0.4"
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["backup", "bundled", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
-url = "2"
+tempfile = { version = "3", optional = true }
+url = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "delivery_worker"
+required-features = ["delivery", "unstable-internal"]
+
+[[test]]
+name = "durable_delivery"
+required-features = ["delivery", "unstable-internal"]
+
+[[test]]
+name = "delivery_capture"
+required-features = ["delivery", "unstable-internal"]
+
+[[test]]
+name = "local_history_boundary"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "hydration_preflight"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "session_relationships"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "source_intake"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "source_registry"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "sync_silence"
+required-features = ["unstable-internal"]

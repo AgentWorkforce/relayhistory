@@ -4,6 +4,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Rust API
+
+- Publish `ai-hist` as one crate (the former `ai-hist-core` and
+  `ai-hist-engine` packages). Default features expose `SessionStore`, evidence
+  structs, `Source`, and `Error`. Optional features: `delivery`,
+  `opencode-backup`, `git-hooks`. Workspace crates enable `unstable-internal`
+  for connection-level maintenance APIs. Cargo semver is the Rust contract;
+  the crate version matches the npm release line.
+
 - Add `ai-hist resume <query>` (prints the native resume command for the
   best-matching session) and `ai-hist pack <query>` (a compact, token-budgeted
   context block for handing a session to a different agent/tool) to the

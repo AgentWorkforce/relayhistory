@@ -142,7 +142,7 @@ fn authority_is_loopback(rest: &str) -> bool {
 }
 
 fn stage_key(base_url: &str) -> Result<String> {
-    Ok(ai_hist_core::prompt_hash(&normalized_stage(base_url)?))
+    Ok(ai_hist::prompt_hash(&normalized_stage(base_url)?))
 }
 
 fn stage_dir() -> PathBuf {
@@ -447,7 +447,7 @@ pub fn machine_id() -> Result<String> {
         .unwrap_or(0);
     let id = format!(
         "m_{}",
-        ai_hist_core::prompt_hash(&format!("{host}:{nanos}"))
+        ai_hist::prompt_hash(&format!("{host}:{nanos}"))
     );
     write_private(&path, &id)?;
     Ok(id)
@@ -487,7 +487,7 @@ fn hostname() -> String {
 pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize) -> String {
     format!(
         "b_{}",
-        ai_hist_core::prompt_hash(&format!(
+        ai_hist::prompt_hash(&format!(
             "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
             from.history_id,
             from.trajectory_rowid,
@@ -2418,7 +2418,7 @@ pub struct CloudPushOutcome {
 pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
     let auth =
         load_selected_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
-    let (conn, sync_skipped) = ai_hist_engine::prepare_local_sync_snapshot(db_path)?;
+    let (conn, sync_skipped) = ai_hist::prepare_local_sync_snapshot(db_path)?;
     let machine = MachineIdentity {
         id: machine_id()?,
         hostname: machine_hostname(),
@@ -2522,7 +2522,7 @@ pub fn create_share(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history, HistoryEntry};
+    use ai_hist::{init_db, insert_history, HistoryEntry};
     use std::cell::RefCell;
 
     fn mem() -> Connection {
@@ -2544,7 +2544,7 @@ pub(crate) mod tests {
                 session_id: Some(session.into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )

@@ -12,8 +12,7 @@ path = "src/probe/main.rs"
 [workspace]
 
 [dependencies]
-ai-hist-core = { path = "../../../crates/ai-hist-core" }
-ai-hist-engine = { path = "../../../crates/ai-hist" }
+ai-hist = { path = "../../../crates/ai-hist", features = ["delivery", "opencode-backup", "git-hooks", "unstable-internal"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 atomicwrites = "0.4"

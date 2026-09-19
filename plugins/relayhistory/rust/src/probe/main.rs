@@ -341,26 +341,26 @@ fn install(options: Install) -> Result<()> {
     let db_path = directory.join("history.db");
     println!("Preparing local session capture…");
     ensure!(
-        ai_hist_engine::sync_local_at(&db_path)?,
+        ai_hist::sync_local_at(&db_path)?,
         "capture did not complete"
     );
-    let conn = ai_hist_core::open_db(&db_path)?;
+    let conn = ai_hist::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
             config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
             save_json(&directory.join("config.json"), &config)?;
-            let job = ai_hist_core::delivery::status(&conn, &config.job_id)?;
+            let job = ai_hist::delivery::status(&conn, &config.job_id)?;
             ensure!(
                 job.config.account_id == account,
                 "invalid saved delivery account"
             );
             if job.state == "blocked" && options.force_login {
-                ai_hist_core::delivery::retry_job(&conn, &config.job_id)?;
+                ai_hist::delivery::retry_job(&conn, &config.job_id)?;
             }
             config
         }
         None => {
-            let job_config = ai_hist_core::delivery::DeliveryJobConfig {
+            let job_config = ai_hist::delivery::DeliveryJobConfig {
                 destination_id: "relayhistory".into(),
                 instance_id: "teams-probe".into(),
                 account_id: account.clone(),
@@ -371,7 +371,7 @@ fn install(options: Install) -> Result<()> {
             // A generation outlives an interrupted setup: create_job commits
             // before config.json is written. Adopt that job instead of recording
             // a second baseline behind a generation nothing can reach.
-            let adopted = ai_hist_core::delivery::list_jobs(&conn)?
+            let adopted = ai_hist::delivery::list_jobs(&conn)?
                 .into_iter()
                 .find(|job| {
                     job.state != "cancelled"
@@ -396,7 +396,7 @@ fn install(options: Install) -> Result<()> {
                     // No generation to inherit a baseline from, so the exclusion
                     // table has to be brought in line with this choice first.
                     collector::record_baseline(&conn, include_existing)?;
-                    ai_hist_core::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                    ai_hist::delivery::create_job(&conn, &job_config, collector::now())?.job_id
                 }
             };
             let config = Config {

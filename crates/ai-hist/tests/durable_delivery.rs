@@ -1,4 +1,4 @@
-use ai_hist_core::{delivery::*, init_db, open_db};
+use ai_hist::{delivery::*, init_db, open_db};
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 
@@ -592,9 +592,9 @@ fn a_missing_capture_trigger_is_repaired_before_more_ingestion() {
     let conn = db();
     conn.execute_batch("DROP TRIGGER delivery_session_events_update")
         .unwrap();
-    assert!(!ai_hist_core::schema_is_current(&conn).unwrap());
+    assert!(!ai_hist::schema_is_current(&conn).unwrap());
     init_db(&conn).unwrap();
-    assert!(ai_hist_core::schema_is_current(&conn).unwrap());
+    assert!(ai_hist::schema_is_current(&conn).unwrap());
     event(&conn, "a", "before");
     let job = create_job(&conn, &config("one"), 0).unwrap();
     drain(&conn, &job.job_id);

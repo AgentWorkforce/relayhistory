@@ -9,7 +9,7 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist_core::{
+use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
     schema_is_read_current, schema_is_relationship_read_current, search as core_search,
@@ -136,10 +136,10 @@ fn ensure_acquisition_scope_supported(
     scope: SessionScope,
     operation: &str,
     sources: &[String],
-    connectors: &ai_hist_engine::remote::SourceConnectorSelection,
+    connectors: &ai_hist::remote::SourceConnectorSelection,
 ) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        ai_hist_engine::remote::ensure_selected_remote_connectors_configured_for(
+        ai_hist::remote::ensure_selected_remote_connectors_configured_for(
             operation, sources, connectors,
         )
         .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
@@ -149,8 +149,8 @@ fn ensure_acquisition_scope_supported(
 
 fn source_connector_selection(
     ids: Option<Vec<String>>,
-) -> napi::Result<ai_hist_engine::remote::SourceConnectorSelection> {
-    ids.map(ai_hist_engine::remote::SourceConnectorSelection::new)
+) -> napi::Result<ai_hist::remote::SourceConnectorSelection> {
+    ids.map(ai_hist::remote::SourceConnectorSelection::new)
         .transpose()
         .map(|selection| selection.unwrap_or_default())
         .map_err(|error| native_error("INVALID_ARGUMENT", error.to_string()))
@@ -640,7 +640,7 @@ pub async fn get_session_tool_calls_page(
     let (page_source, page_session_id) = (source.clone(), session_id.clone());
     read_database_with_schema(
         path,
-        ai_hist_core::SessionToolCallPage {
+        ai_hist::SessionToolCallPage {
             tool_calls: Vec::new(),
             next_cursor: None,
         },
@@ -681,7 +681,7 @@ pub async fn get_session_file_edits_page(
     let (page_source, page_session_id) = (source.clone(), session_id.clone());
     read_database_with_schema(
         path,
-        ai_hist_core::SessionFileEditPage {
+        ai_hist::SessionFileEditPage {
             file_edits: Vec::new(),
             next_cursor: None,
         },
@@ -768,8 +768,8 @@ pub struct CatalogSession {
     pub from_cache: bool,
 }
 
-impl From<ai_hist_engine::ShallowSession> for CatalogSession {
-    fn from(session: ai_hist_engine::ShallowSession) -> Self {
+impl From<ai_hist::ShallowSession> for CatalogSession {
+    fn from(session: ai_hist::ShallowSession) -> Self {
         Self {
             source: session.source,
             session_id: session.session_id,
@@ -835,12 +835,12 @@ pub async fn list_session_catalog_page(
     validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::CatalogListOptions {
+    let request = ai_hist::CatalogListOptions {
         scope,
         sources: options.sources.unwrap_or_default(),
         limit: options.limit,
         before_ms: options.before_ms,
-        after: options.after.map(|cursor| ai_hist_engine::CatalogCursor {
+        after: options.after.map(|cursor| ai_hist::CatalogCursor {
             last_activity_ms: cursor.last_activity_ms,
             source: cursor.source,
             session_id: cursor.session_id,
@@ -848,16 +848,16 @@ pub async fn list_session_catalog_page(
     };
     read_database_with_schema(
         path,
-        ai_hist_engine::SessionCatalogPage {
+        ai_hist::SessionCatalogPage {
             scope,
             ..Default::default()
         },
         schema_is_catalog_read_current,
-        move |conn| ai_hist_engine::list_session_catalog_page(conn, &request),
+        move |conn| ai_hist::list_session_catalog_page(conn, &request),
     )
     .await
     .map(|page| SessionCatalogPage {
-        contract_version: ai_hist_engine::SESSION_CATALOG_CONTRACT_VERSION,
+        contract_version: ai_hist::SESSION_CATALOG_CONTRACT_VERSION,
         scope: scope_name(page.scope),
         sessions: page
             .sessions
@@ -951,13 +951,13 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     let connectors = source_connector_selection(options.source_connectors)?;
     ensure_acquisition_scope_supported(scope, "discovery", &sources, &connectors)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::DiscoverOptions {
+    let request = ai_hist::DiscoverOptions {
         scope,
         sources,
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
+        ai_hist::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1084,14 +1084,14 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
     let connectors = source_connector_selection(options.source_connectors)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::HydrateSessionOptions {
+    let request = ai_hist::HydrateSessionOptions {
         source: options.source,
         session_id: options.session_id,
         scope,
         include_related: options.include_related.unwrap_or(true),
     };
     let result = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::hydrate_session_at_with_connectors(&path, &request, &connectors)
+        ai_hist::hydrate_session_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1552,7 +1552,7 @@ pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
     let completed = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::sync_scoped_at_with_connectors(&path, scope, &connectors)
+        ai_hist::sync_scoped_at_with_connectors(&path, scope, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1578,7 +1578,7 @@ pub async fn install_git_hooks(
 ) -> napi::Result<String> {
     napi::tokio::task::spawn_blocking(move || {
         let options = serde_json::from_str(&options_json)?;
-        ai_hist_engine::git_sdk::install(options, &node, &sdk_url)
+        ai_hist::git_sdk::install(options, &node, &sdk_url)
     })
     .await
     .map_err(worker_error)?
@@ -1589,7 +1589,7 @@ pub async fn install_git_hooks(
 pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
     napi::tokio::task::spawn_blocking(move || {
         let options = serde_json::from_str(&options_json)?;
-        ai_hist_engine::git_sdk::link(options)
+        ai_hist::git_sdk::link(options)
     })
     .await
     .map_err(worker_error)?

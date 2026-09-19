@@ -2,7 +2,7 @@
 //! The caller owns durable state persistence. This is not a complete source snapshot:
 //! channel-only keys can lack DM permission, and old cursors retain their original meaning.
 use crate::parse_iso_ms;
-use ai_hist_core::{prompt_hash, HistoryEntry, SessionLocation};
+use ai_hist::{prompt_hash, HistoryEntry, SessionLocation};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
@@ -118,7 +118,7 @@ fn sync_relay_messages(
                 .and_then(Value::as_str)
                 .and_then(parse_iso_ms)
                 .unwrap_or(0);
-            inserted += ai_hist_core::insert_history_at_location(
+            inserted += ai_hist::insert_history_at_location(
                 conn,
                 &HistoryEntry {
                     id: 0,

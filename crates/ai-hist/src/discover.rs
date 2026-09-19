@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use ai_hist_core::{
+use crate::{
     open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
@@ -395,7 +395,7 @@ pub trait ShallowSessionProvider: Sync {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::CapabilityLimited {
             code: "PROVIDER_CAPABILITY_LIMITED",
@@ -701,7 +701,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
@@ -871,7 +871,7 @@ impl ShallowSessionProvider for CodexProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
@@ -1022,7 +1022,7 @@ impl ShallowSessionProvider for CursorProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
@@ -1077,7 +1077,7 @@ impl ShallowSessionProvider for CursorProvider {
             .head_records()
             .filter_map(|line| {
                 let line = String::from_utf8_lossy(line);
-                ai_hist_core::parse_cursor_text(&line).ok().flatten()
+                crate::parse_cursor_text(&line).ok().flatten()
             })
             .map(|prompt| excerpt(&prompt))
             .find(|prompt| !prompt.is_empty());
@@ -1115,7 +1115,7 @@ impl ShallowSessionProvider for GrokProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
@@ -1381,7 +1381,7 @@ impl ShallowSessionProvider for OpencodeProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
@@ -2022,8 +2022,8 @@ fn observation_key(
     provider: &dyn ShallowSessionProvider,
     source: &str,
     session_id: &str,
-) -> ai_hist_core::observations::ObservationKey {
-    ai_hist_core::observations::ObservationKey {
+) -> crate::observations::ObservationKey {
+    crate::observations::ObservationKey {
         source: source.into(),
         session_id: session_id.into(),
         location: provider.location(),
@@ -2043,7 +2043,7 @@ fn fetch_observed_candidate(
     };
     let Some(id) = id else { return Ok(None) };
     let Some(observation) =
-        ai_hist_core::observations::get(conn, &observation_key(provider, candidate.source, &id))?
+        crate::observations::get(conn, &observation_key(provider, candidate.source, &id))?
     else {
         return Ok(None);
     };
@@ -2880,9 +2880,9 @@ pub fn discover_sessions_with_provider_refs(
                     break 'apply;
                 }
             };
-            if let Err(error) = ai_hist_core::observations::upsert(
+            if let Err(error) = crate::observations::upsert(
                 conn,
-                &ai_hist_core::observations::SessionObservation {
+                &crate::observations::SessionObservation {
                     key: observation_key(provider, &session.source, &session.session_id),
                     raw_locator: Some(candidate.locator.clone()),
                     source_stamp: session.source_stamp.clone(),

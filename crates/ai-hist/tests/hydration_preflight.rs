@@ -1,6 +1,6 @@
 //! Native callers must get a capability error before creating the ledger or
 //! consulting credentials for an adapter that cannot hydrate.
-use ai_hist_engine::{
+use ai_hist::{
     hydrate_session_at_with_connectors, remote::SourceConnectorSelection, HydrateSessionOptions,
     SessionScope,
 };

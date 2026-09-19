@@ -23,7 +23,7 @@ impl Drop for EnvVarGuard {
 }
 fn fresh_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    ai_hist_core::init_db(&conn).unwrap();
+    ai_hist::init_db(&conn).unwrap();
     conn
 }
 fn history_count(conn: &Connection) -> i64 {
@@ -129,7 +129,7 @@ fn relaycast_sync_pages_through_a_channel_and_saves_the_high_water_mark() {
 
     assert_eq!(inserted, 102);
     assert_eq!(history_count(&conn), 102);
-    let locations = ai_hist_core::session_locations(&conn, "relay", "#general").unwrap();
+    let locations = ai_hist::session_locations(&conn, "relay", "#general").unwrap();
     assert_eq!(locations, vec!["remote"]);
     assert!(
         requests[2].contains("after=m099"),

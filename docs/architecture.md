@@ -6,7 +6,7 @@ The local history packages have this production call graph:
 provider files / SQLite
         │
         ▼
-ai-hist-core + Rust ingestion engine
+ai-hist (published Rust crate)
         │ typed Rust functions
         ▼
 ai-hist-native (Node-API, async worker tasks)
@@ -31,9 +31,10 @@ open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
 ## Optional services and package boundaries
 
-The local Rust workspace contains storage, identity, observations, evidence,
-relationships, local parsing and generic durable delivery. CLI parsing and
-presentation live in `ai-hist-cli`; reusable ingestion remains in the engine.
+The local Rust workspace publishes one crate, `ai-hist`, containing storage,
+identity, observations, evidence, relationships, local parsing and generic
+durable delivery. CLI parsing and presentation live in unpublished
+`ai-hist-cli`; the N-API addon is unpublished `ai-hist-napi`.
 The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
@@ -207,7 +208,7 @@ There is no alternate runtime after any native-load error.
 
 ## Durable delivery and snapshot export
 
-`ai-hist-core::delivery` owns opt-in journaling, bounded snapshots, immutable
+`ai-hist::delivery` owns opt-in journaling, bounded snapshots, immutable
 queue/payload persistence, exact acknowledgments, retention, and fenced leases.
 The drain loop itself - round-robin scheduling, leases and their keepalive,
 payload persistence, the eligibility recheck before transport, acknowledgment

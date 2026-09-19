@@ -1,6 +1,6 @@
 //! Versioned one-request bridge. Errors never serialize remote bodies or credentials.
 use crate::{cloud, replay};
-use ai_hist_core::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
+use ai_hist::delivery::worker::{Receiver, ReceiverContext, ReceiverFailure};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,8 +21,8 @@ pub struct Arguments {
     pub connector_instance: Option<String>,
     pub state: Option<serde_json::Map<String, Value>>,
     pub read_options: Option<crate::destination::ReadOptions>,
-    pub batch: Option<ai_hist_core::delivery::HistoryExportBatch>,
-    pub prepared: Option<ai_hist_core::delivery::PreparedPayload>,
+    pub batch: Option<ai_hist::delivery::HistoryExportBatch>,
+    pub prepared: Option<ai_hist::delivery::PreparedPayload>,
     pub expected_account: Option<String>,
     pub instance_id: Option<String>,
     pub acknowledge_uninspected_schedules: Option<bool>,
@@ -81,7 +81,7 @@ fn execute(request: Request) -> Result<Value> {
             );
             let path = a.db_path.context("dbPath required")?;
             let conn = rusqlite::Connection::open(path)?;
-            ai_hist_core::init_db(&conn)?;
+            ai_hist::init_db(&conn)?;
             let mut state = a
                 .state
                 .context("state required; preserve the previous relay cursor map")?;
@@ -162,7 +162,7 @@ fn execute(request: Request) -> Result<Value> {
             let path = a
                 .db_path
                 .map(Into::into)
-                .unwrap_or_else(ai_hist_core::default_db_path);
+                .unwrap_or_else(ai_hist::default_db_path);
             let outcome = if request.operation == "enableCloud" {
                 cloud::enable_for_sdk(
                     &path,

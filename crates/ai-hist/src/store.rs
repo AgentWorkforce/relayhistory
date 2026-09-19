@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, DatabaseName, OpenFlags, Transaction, TransactionBehavior};
+#[cfg(feature = "opencode-backup")]
+use rusqlite::DatabaseName;
+use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -7,18 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Generic opt-in durable history export and delivery state.
-pub mod delivery;
-/// Connector-specific acquisition provenance and checkpoints.
-pub mod observations;
-pub mod privacy;
-/// Delegation topology: recorded parent/child relationships and bounded,
-/// cycle-safe traversal over them.
-pub mod relationships;
-pub mod source_evidence;
-pub mod storage;
-
-pub use relationships::{
+pub use crate::relationship_graph::{
     relationship_capabilities, session_children, session_children_page, session_parents,
     session_relationships, session_tree, RelationshipCapabilities, RelationshipCursor,
     RelationshipDiagnostic, SessionChildrenPage, SessionRelationship, SessionRelationships,
@@ -566,8 +557,18 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
-        && delivery::schema_is_current(conn)?
-        && observations::schema_is_current(conn)?)
+        && delivery_schema_is_current(conn)?
+        && crate::observations::schema_is_current(conn)?)
+}
+
+#[cfg(feature = "delivery")]
+fn delivery_schema_is_current(conn: &Connection) -> Result<bool> {
+    crate::delivery::schema_is_current(conn)
+}
+
+#[cfg(not(feature = "delivery"))]
+fn delivery_schema_is_current(_conn: &Connection) -> Result<bool> {
+    Ok(true)
 }
 
 /// Whether read-only APIs can safely and efficiently query this database.
@@ -1014,8 +1015,18 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
-    observations::init_schema(conn)?;
-    delivery::init_schema(conn)?;
+    crate::observations::init_schema(conn)?;
+    init_delivery_schema(conn)?;
+    Ok(())
+}
+
+#[cfg(feature = "delivery")]
+fn init_delivery_schema(conn: &Connection) -> Result<()> {
+    crate::delivery::init_schema(conn)
+}
+
+#[cfg(not(feature = "delivery"))]
+fn init_delivery_schema(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -2125,25 +2136,47 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     if !opencode_db.exists() {
         return Ok(0);
     }
-    let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
-    let src_live = Connection::open_with_flags(
-        opencode_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("opening {}", opencode_db.display()))?;
-    src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-    src_live
-        .backup(DatabaseName::Main, &tmp, None)
-        .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
-    let src = Connection::open(&tmp)?;
-    src.execute_batch("CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);")?;
+    #[cfg(feature = "opencode-backup")]
+    {
+        let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
+        let src_live = Connection::open_with_flags(
+            opencode_db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("opening {}", opencode_db.display()))?;
+        src_live.busy_timeout(std::time::Duration::from_secs(5))?;
+        src_live
+            .backup(DatabaseName::Main, &tmp, None)
+            .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
+        let src = Connection::open(&tmp)?;
+        src.execute_batch(
+            "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
+        )?;
+        sync_opencode_sessions_from_source(conn, &src)
+    }
+    #[cfg(not(feature = "opencode-backup"))]
+    {
+        let src = Connection::open_with_flags(
+            opencode_db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("opening {}", opencode_db.display()))?;
+        src.busy_timeout(std::time::Duration::from_secs(5))?;
+        src.execute_batch("BEGIN")?;
+        let result = sync_opencode_sessions_from_source(conn, &src);
+        let _ = src.execute_batch("ROLLBACK");
+        result
+    }
+}
+
+fn sync_opencode_sessions_from_source(conn: &Connection, src: &Connection) -> Result<usize> {
     let session_ids = src
         .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut inserted = 0;
     for session_id in session_ids {
-        inserted += sync_opencode_session_from_connection(conn, &src, &session_id)?;
+        inserted += sync_opencode_session_from_connection(conn, src, &session_id)?;
     }
     Ok(inserted)
 }

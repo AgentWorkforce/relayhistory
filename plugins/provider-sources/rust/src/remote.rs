@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
-use ai_hist_core::{SessionLocation, SOURCE_CHOICES};
+use ai_hist::{SessionLocation, SOURCE_CHOICES};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -692,7 +692,7 @@ impl ShallowSessionProvider for ClaudeWebProvider {
     fn acquire(
         &self,
         home: &Path,
-        observation: &ai_hist_core::observations::SessionObservation,
+        observation: &ai_hist::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         acquire_claude_remote_session_at(
             home,
@@ -1083,7 +1083,7 @@ impl ShallowSessionProvider for CodexCloudProvider {
     fn acquire(
         &self,
         _home: &Path,
-        observation: &ai_hist_core::observations::SessionObservation,
+        observation: &ai_hist::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         acquire_codex_remote_session(&observation.key.session_id)
     }
@@ -1210,7 +1210,7 @@ impl ShallowSessionProvider for InstanceProvider {
     fn acquire(
         &self,
         home: &Path,
-        observation: &ai_hist_core::observations::SessionObservation,
+        observation: &ai_hist::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         self.inner.acquire(home, observation)
     }

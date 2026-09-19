@@ -1,6 +1,6 @@
 # Optional RelayHistory Rust integration
 
-This standalone Cargo workspace owns RelayHistory authentication, legacy convergence/turn mapping, replay, sharing and the `relayhistory-plugin` helper. The local workspace does not list this package as a member or dependency. Local readers in `ai-hist-core::storage` provide typed scans; this package contains no production SQL queries.
+This standalone Cargo workspace owns RelayHistory authentication, legacy convergence/turn mapping, replay, sharing and the `relayhistory-plugin` helper. The local workspace does not list this package as a member or dependency. Local readers in `ai-hist::storage` provide typed scans; this package contains no production SQL queries.
 
 Build with `cargo build --manifest-path plugins/relayhistory/rust/Cargo.toml --release`. The SDK plugin distributes the resulting helper separately from the local native addon. An explicit `RELAYHISTORY_PLUGIN_BIN` override can select a development build.
 
@@ -99,7 +99,7 @@ This package also builds the independent `agent-relay-probe` executable for the
 Cloud onboarding flow. It links the local capture engine, durable coordinator and
 optional RelayHistory transport directly; it does not load Node or invoke the
 JSON helper. Its delivery cycle is a bounded
-`ai_hist_core::delivery::worker::drain` over the same `RelayHistoryReceiver`, so
+`ai_hist::delivery::worker::drain` over the same `RelayHistoryReceiver`, so
 the probe and the SDK share one drain loop rather than two. The existing `relayhistory-plugin` remains Cargo's default executable.
 See [the probe guide](../../../docs/agent-relay-probe.md) for commands, state,
 local verification and companion-service requirements.

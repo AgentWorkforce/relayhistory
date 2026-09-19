@@ -21,24 +21,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-hist-core"
-version = "0.1.0"
+name = "ai-hist"
+version = "0.18.7"
 dependencies = [
  "anyhow",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "ai-hist-engine"
-version = "0.2.0"
-dependencies = [
- "ai-hist-core",
- "anyhow",
- "atomicwrites",
  "chrono",
  "fs2",
  "libc",
@@ -725,8 +711,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "relayhistory-plugin"
 version = "0.18.7"
 dependencies = [
- "ai-hist-core",
- "ai-hist-engine",
+ "ai-hist",
  "anyhow",
  "atomicwrites",
  "chrono",

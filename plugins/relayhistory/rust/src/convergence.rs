@@ -12,7 +12,7 @@
 //! store only. The raw chapter-event stream (`trajevent:*`) is the WS-6/Pair (b) delta and
 //! requires re-parsing the source file via the `path` column — out of scope here.
 
-use ai_hist_core::HistoryEntry;
+use ai_hist::HistoryEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -343,7 +343,7 @@ pub fn map_history_entry_with(
     let hash = entry
         .prompt_hash
         .clone()
-        .unwrap_or_else(|| ai_hist_core::prompt_hash(&entry.prompt));
+        .unwrap_or_else(|| ai_hist::prompt_hash(&entry.prompt));
     ConvergenceEnvelope {
         v: 1,
         kind: "prompt".to_string(),
@@ -1098,7 +1098,7 @@ fn string_array(v: &Value, key: &str) -> Vec<String> {
 /// Client-side defense-in-depth preflight; server-side WS-3 scrub remains the boundary.
 ///   `/Users/<name>/…` → `/Users/~/…`, `/home/<name>/…` → `/home/~/…`,
 ///   `C:\Users\<name>\…` → `C:\Users\~\…`
-pub use ai_hist_core::privacy::normalize_home_path;
+pub use ai_hist::privacy::normalize_home_path;
 
 /// Epoch milliseconds (UTC) → ISO-8601 `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 /// Self-contained (no chrono): civil-from-days per Howard Hinnant.

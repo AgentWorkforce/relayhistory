@@ -1,5 +1,5 @@
-use ai_hist_core::{observations, SessionEvent};
-use ai_hist_engine::{
+use ai_hist::{observations, SessionEvent};
+use ai_hist::{
     sources::{AcquiredEvidence, ConnectorEvidence, ConnectorIdentity, SourceRegistry},
     Candidate, DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, ScanEnv, SessionLocation,
     SessionScope, ShallowSession, ShallowSessionProvider,
@@ -252,7 +252,7 @@ fn independent_connector_snapshots_are_canonical_in_both_scan_and_hydration_orde
                 "unchanged"
             );
         }
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         let observations = observations::list(&conn, "claude", "session")?;
         assert_eq!(observations.len(), 2);
         for observation in &observations {
@@ -352,7 +352,7 @@ fn independent_connector_snapshots_are_canonical_in_both_scan_and_hydration_orde
             .hydrate_at(&db, &hydration(), &b.identity())
             .is_err());
         drop(conn);
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
     }
     Ok(())
@@ -368,7 +368,7 @@ fn connector_instances_and_failed_capture_keep_independent_retry_state() -> Resu
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     registry.sync_at(&db, SessionScope::Remote, &[a.identity(), b.identity()])?;
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     conn.execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON observation_hydration_checkpoints BEGIN SELECT RAISE(ABORT,'delivery capture full'); END;")?;
     assert!(registry
         .hydrate_at(&db, &hydration(), &a.identity())
@@ -441,7 +441,7 @@ fn local_and_remote_observations_keep_the_local_projection_in_either_order() -> 
         local_options.scope = SessionScope::Local;
         registry.hydrate_at(&db, &local_options, &local.identity())?;
         registry.hydrate_at(&db, &hydration(), &remote.identity())?;
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
         assert_eq!(
             conn.query_row("SELECT raw_path FROM sessions", [], |row| row
@@ -476,7 +476,7 @@ fn one_connectors_non_session_skip_cannot_hide_another_connectors_same_locator()
     registry.discover_at(&db, &options(), &[a.identity()], |_| {})?;
     let result = registry.discover_at(&db, &options(), &[b.identity()], |_| {})?;
     assert_eq!(result.discovered, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(observations::list(&conn, "claude", "session")?.len(), 1);
     assert_eq!(
         conn.query_row(
@@ -528,7 +528,7 @@ fn provider_and_two_recall_instances_keep_four_observations_one_session_two_loca
             let result = registry.hydrate_at(&db, &options, &adapter.identity())?;
             assert_eq!(result.capability, "partial");
         }
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 4);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
@@ -566,7 +566,7 @@ fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_i
     assert_eq!(first.discovered, 1);
     let second = registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
     assert_eq!(second.skipped_unchanged, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(
         observations::list(&conn, "claude", "session")?[0]
             .raw_locator
@@ -643,7 +643,7 @@ fn limited_discovery_defers_unknown_aliases_without_losing_existing_observations
     let both = [a.identity(), b.identity()];
     let limited = registry.discover_at(&db, &options(), &both, |_| {})?;
     assert_eq!(limited.counters.shallow_reads, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(observations::list(&conn, "claude", "session")?.len(), 1);
     // Selecting the opaque connector directly gives it its own discovery budget.
     registry.discover_at(&db, &options(), &[b.identity()], |_| {})?;

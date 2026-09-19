@@ -31,9 +31,9 @@ pub struct ObservedRelationship<'a> {
 impl ObservedRelationship<'_> {
     pub fn identity_status(&self) -> &'static str {
         if self.child_session_id.is_some() {
-            ai_hist_core::relationships::IDENTITY_OBSERVED
+            crate::relationships::IDENTITY_OBSERVED
         } else {
-            ai_hist_core::relationships::IDENTITY_UNLINKED
+            crate::relationships::IDENTITY_UNLINKED
         }
     }
 
@@ -73,7 +73,7 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
                 observed.source,
                 observed.parent_session_id,
                 locator,
-                ai_hist_core::relationships::IDENTITY_UNLINKED,
+                crate::relationships::IDENTITY_UNLINKED,
             ],
         )?;
     }
@@ -131,7 +131,7 @@ pub(crate) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{open_db, session_children};
+    use crate::{open_db, session_children};
 
     fn observed<'a>(
         parent: &'a str,

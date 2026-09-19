@@ -223,6 +223,7 @@ pub fn latest_history_for_session(
 /// uncatalogued sessions so an export exclusion cannot miss partially read data.
 /// Continue with the last returned identity; hold a read transaction when a
 /// consistent multi-page baseline is required.
+#[cfg(feature = "delivery")]
 pub fn session_identities_after(
     conn: &Connection,
     after: Option<&crate::delivery::SessionIdentity>,
@@ -252,7 +253,7 @@ pub fn session_identities_after(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "delivery"))]
 mod identity_tests {
     use super::*;
     #[test]

@@ -1,10 +1,10 @@
-use ai_hist_core::{
+use ai_hist::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
     session_file_edits, session_tool_calls, untag_session, HistoryEntry, QueryFilter,
     SOURCE_CHOICES,
 };
-pub use ai_hist_core::{SessionLocation, SessionScope};
+pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
@@ -18,11 +18,11 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ai_hist_engine::diagnostics::{doctor_report, human_bytes, DoctorReport};
-use ai_hist_engine::git_helpers::*;
-use ai_hist_engine::history_search::{search_all, SearchRole, SearchRow};
-use ai_hist_engine::paths::{default_opencode_db_path, home_dir};
-use ai_hist_engine::{discover, remote, *};
+use ai_hist::diagnostics::{doctor_report, human_bytes, DoctorReport};
+use ai_hist::git_helpers::*;
+use ai_hist::history_search::{search_all, SearchRole, SearchRow};
+use ai_hist::paths::{default_opencode_db_path, home_dir};
+use ai_hist::{discover, remote, *};
 mod learn;
 #[derive(Args, Debug, Clone, Copy, Default)]
 #[group(id = "session_scope", multiple = false)]
@@ -1311,9 +1311,9 @@ fn fmt_search_row(row: &SearchRow) -> String {
 
 fn print_session_events(
     session_id: &str,
-    events: Vec<ai_hist_core::SessionEvent>,
-    tool_calls: Vec<ai_hist_core::SessionToolCall>,
-    file_edits: Vec<ai_hist_core::SessionFileEdit>,
+    events: Vec<ai_hist::SessionEvent>,
+    tool_calls: Vec<ai_hist::SessionToolCall>,
+    file_edits: Vec<ai_hist::SessionFileEdit>,
     width: usize,
     json: bool,
 ) -> Result<()> {
@@ -1323,9 +1323,9 @@ fn print_session_events(
         // references and serializing at write time keeps peak memory at the
         // fetched rows themselves, not a second serialized copy.
         enum ReplayRecord<'a> {
-            Event(&'a ai_hist_core::SessionEvent),
-            ToolCall(&'a ai_hist_core::SessionToolCall),
-            FileEdit(&'a ai_hist_core::SessionFileEdit),
+            Event(&'a ai_hist::SessionEvent),
+            ToolCall(&'a ai_hist::SessionToolCall),
+            FileEdit(&'a ai_hist::SessionFileEdit),
         }
         let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
         for event in &events {
@@ -1885,7 +1885,7 @@ fn export_history(
         );
         let _ = fs::remove_file(dest);
         let dst = Connection::open(dest)?;
-        ai_hist_core::init_db(&dst)?;
+        ai_hist::init_db(&dst)?;
         let mut inserted = 0;
         for entry in &rows {
             inserted += insert_history(&dst, entry)?;
@@ -2522,7 +2522,7 @@ fn link_git_commit(
             Err(_) => {}
         }
     }
-    ai_hist_core::mark_session_presence(
+    ai_hist::mark_session_presence(
         conn,
         &candidate.source,
         &candidate.session_id,
@@ -2888,7 +2888,7 @@ fn tag_session_with_count(
     source: Option<&str>,
     color: Option<&str>,
 ) -> Result<(Vec<serde_json::Value>, usize)> {
-    let sessions = ai_hist_core::matching_sessions(conn, session_id, source)?;
+    let sessions = ai_hist::matching_sessions(conn, session_id, source)?;
     if sessions.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -3071,7 +3071,7 @@ fn format_datetime(ts_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history, open_db, prompt_hash, HistoryEntry};
+    use ai_hist::{init_db, insert_history, open_db, prompt_hash, HistoryEntry};
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
@@ -3147,7 +3147,7 @@ mod tests {
         assert!(locations.is_empty());
         assert!(command.is_some());
 
-        ai_hist_core::mark_session_presence(
+        ai_hist::mark_session_presence(
             &conn,
             "codex",
             "cloud-session",
@@ -3158,7 +3158,7 @@ mod tests {
         assert_eq!(locations, vec!["remote"]);
         assert!(command.is_none());
 
-        ai_hist_core::mark_session_presence(
+        ai_hist::mark_session_presence(
             &conn,
             "codex",
             "cloud-session",
