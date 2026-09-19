@@ -42,7 +42,7 @@ impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
         Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt"},
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id"},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},
@@ -63,10 +63,16 @@ fn numeric(field: &str) -> bool {
             | "updated_ms"
             | "created_at_ms"
             | "confidence"
+            | "payload_bytes"
+            | "call_index"
+            | "event_index"
     )
 }
 fn boolean(field: &str) -> bool {
-    matches!(field, "is_error" | "user_modified" | "child_has_events")
+    matches!(
+        field,
+        "is_error" | "user_modified" | "child_has_events" | "payload_truncated"
+    )
 }
 
 /// Validate the complete response before opening a database or mutating history.

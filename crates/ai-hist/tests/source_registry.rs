@@ -81,6 +81,19 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         model: None,
         token_json: None,
         event_uid: uid.into(),
+        // A synthetic assistant text event: none of the tool-result fidelity
+        // facts apply to it, and the absence is the honest answer.
+        tool_use_id: None,
+        payload_bytes: None,
+        payload_truncated: None,
+        payload_hash: None,
+        call_index: None,
+        event_index: None,
+        result_status: None,
+        event_source: None,
+        error_signal: None,
+        subagent_session_id: None,
+        agent_id: None,
     }
 }
 impl ShallowSessionProvider for Fixture {

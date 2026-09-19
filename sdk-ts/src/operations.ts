@@ -95,6 +95,8 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  UserTurnsPageOptions,
+  SessionUserTurnsPage,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -123,6 +125,7 @@ import {
   nullableBoolean,
   sessionToolCall,
   sessionFileEdit,
+  sessionUserTurn,
   evidenceCursor,
   nativeEvidenceCursor,
   assertEvidenceContract,
@@ -492,6 +495,41 @@ export async function getSessionToolCallsPage(
         ? (page.toolCalls as UnknownRecord[]).map(sessionToolCall)
         : [],
       nextCursor: evidenceCursor(page.nextCursor),
+    };
+  });
+}
+
+/**
+ * One bounded page of user turns for one session, oldest first.
+ *
+ * Each turn carries the ordered blocks a provider attached to one user
+ * message — the human's own text and the tool results that came back with it,
+ * each with its measured payload size. Derived from the indexed events, so it
+ * cannot disagree with the transcript it came from.
+ */
+export async function getSessionUserTurnsPage(
+  source: Source,
+  sessionId: string,
+  options: UserTurnsPageOptions = {},
+): Promise<SessionUserTurnsPage> {
+  evidenceIdentity(source, sessionId, 'getSessionUserTurnsPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionUserTurnsPage(source, sessionId, options);
+    assertEvidenceContract(Number(page.contractVersion));
+    return {
+      contractVersion: Number(page.contractVersion),
+      source: String(page.source) as Source,
+      sessionId: String(page.sessionId),
+      userTurns: Array.isArray(page.userTurns)
+        ? (page.userTurns as UnknownRecord[]).map(sessionUserTurn)
+        : [],
+      nextCursor:
+        page.nextCursor && typeof page.nextCursor === 'object'
+          ? {
+              tsMs: Number((page.nextCursor as UnknownRecord).tsMs),
+              id: Number((page.nextCursor as UnknownRecord).id),
+            }
+          : null,
     };
   });
 }

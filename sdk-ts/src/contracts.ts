@@ -198,7 +198,40 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   eventUid: string;
+  /**
+   * Per-tool-result fidelity. Null on every row that is not a tool result,
+   * and on a tool-result row whose provider does not record that fact — the
+   * absence is the answer, never a stand-in zero or a guessed status.
+   */
+  toolUseId: string | null;
+  /** Raw UTF-8 byte length of the provider's result payload. */
+  payloadBytes: number | null;
+  /** True when the harness had already truncated the payload. */
+  payloadTruncated: boolean | null;
+  /** First 16 hex characters of the payload's sha256. */
+  payloadHash: string | null;
+  /** n-th result recorded for this `toolUseId`, from zero. */
+  callIndex: number | null;
+  /** Position of this result in the transcript's tool-result order. */
+  eventIndex: number | null;
+  resultStatus: ToolResultStatus | null;
+  eventSource: ToolResultEventSource | null;
+  /** Which provider signal set the error, when one did. */
+  errorSignal: ToolResultErrorSignal | null;
+  subagentSessionId: string | null;
+  agentId: string | null;
 }
+
+export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
+
+export type ToolResultEventSource = 'tool_result' | 'subagent_notification' | 'function_call_output';
+
+export type ToolResultErrorSignal =
+  | 'tool_result.is_error'
+  | 'exit_code'
+  | 'patch_apply'
+  | 'mcp_err'
+  | 'subagent_status';
 
 export interface EventCursor {
   tsMs: number;
@@ -431,6 +464,45 @@ export interface SessionFileEditsPage {
   sessionId: string;
   fileEdits: SessionFileEdit[];
   nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * One block inside a user turn. `approxTokens` is deliberately absent: every
+ * estimate available here is a bytes-per-token heuristic, and a heuristic
+ * served alongside measured values is indistinguishable from one at the call
+ * site. Bring a tokenizer and apply it to `byteLen`.
+ */
+export interface SessionUserTurnBlock {
+  kind: 'text' | 'tool_result';
+  toolUseId: string | null;
+  /** Measured payload bytes when recorded, else the stored text's UTF-8 length. */
+  byteLen: number;
+  isError: boolean | null;
+}
+
+/** One user-side message and the ordered blocks it carried. */
+export interface SessionUserTurn {
+  /** Row id of the turn's first event; the cursor's tiebreaker. */
+  id: number;
+  source: Source;
+  sessionId: string;
+  messageId: string | null;
+  tsMs: number;
+  blocks: SessionUserTurnBlock[];
+}
+
+export interface UserTurnsPageOptions {
+  dbPath?: string;
+  limit?: number;
+  after?: EventCursor;
+}
+
+export interface SessionUserTurnsPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  userTurns: SessionUserTurn[];
+  nextCursor: EventCursor | null;
 }
 
 export interface Stats {

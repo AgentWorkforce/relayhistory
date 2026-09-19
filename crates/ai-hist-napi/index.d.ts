@@ -69,6 +69,29 @@ export interface NativeSessionEvent {
   model?: string
   tokenJson?: string
   eventUid: string
+  /**
+   * Per-tool-result fidelity. Null on every row that is not a tool result,
+   * and on a tool-result row whose provider does not record the fact.
+   */
+  toolUseId?: string
+  /** Raw UTF-8 byte length of the provider's result payload. */
+  payloadBytes?: number
+  /** True when the harness had already truncated the payload. */
+  payloadTruncated?: boolean
+  /** First 16 hex characters of the payload's sha256. */
+  payloadHash?: string
+  /** n-th result recorded for this `toolUseId`, from zero. */
+  callIndex?: number
+  /** Position of this result in the transcript's tool-result order. */
+  eventIndex?: number
+  /** `running` / `completed` / `errored` / `cancelled` / `unknown`. */
+  resultStatus?: string
+  /** `tool_result` / `subagent_notification` / `function_call_output`. */
+  eventSource?: string
+  /** Which provider signal set the error. */
+  errorSignal?: string
+  subagentSessionId?: string
+  agentId?: string
 }
 export interface EventCursor {
   tsMs: number
@@ -134,6 +157,41 @@ export interface EvidencePageOptions {
   limit?: number
   after?: EvidenceCursor
 }
+export interface NativeSessionUserTurnBlock {
+  /** `text` or `tool_result`. */
+  kind: string
+  toolUseId?: string
+  /**
+   * Measured payload bytes when the parser recorded them, otherwise the
+   * UTF-8 length of the stored text.
+   */
+  byteLen: number
+  /**
+   * True when the result is known to have failed, false when it is known
+   * to have succeeded, null when the provider has not said.
+   */
+  isError?: boolean
+}
+export interface NativeSessionUserTurn {
+  id: number
+  source: string
+  sessionId: string
+  messageId?: string
+  tsMs: number
+  blocks: Array<NativeSessionUserTurnBlock>
+}
+export interface UserTurnsPageOptions {
+  dbPath?: string
+  limit?: number
+  after?: EventCursor
+}
+export interface SessionUserTurnsPage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  userTurns: Array<NativeSessionUserTurn>
+  nextCursor?: EventCursor
+}
 export interface SessionToolCallsPage {
   contractVersion: number
   source: string
@@ -184,6 +242,15 @@ export declare function getSessionEventsPage(sessionId: string, options?: Events
  * globally unique, so an id-only lookup could interleave two sessions.
  */
 export declare function getSessionToolCallsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionToolCallsPage>
+/**
+ * One bounded page of user turns for one session, oldest first.
+ *
+ * Each turn carries the ordered blocks the provider attached to one user
+ * message: the human's own text and the tool results that came back with it,
+ * with the measured payload size of each. Computed from `session_events`
+ * rather than a table of its own, so it cannot disagree with the transcript.
+ */
+export declare function getSessionUserTurnsPage(source: string, sessionId: string, options?: UserTurnsPageOptions | undefined | null): Promise<SessionUserTurnsPage>
 /** One bounded page of recorded file edits for one session. */
 export declare function getSessionFileEditsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionFileEditsPage>
 /** Database statistics over already-indexed data. */

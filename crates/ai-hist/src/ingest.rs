@@ -16,6 +16,7 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod hydrate;
+pub(crate) mod tool_result_facts;
 
 use crate::diagnostics::*;
 use crate::discover;
@@ -38,6 +39,13 @@ pub use hydrate::{
     hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
     HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
     SESSION_HYDRATION_CONTRACT_VERSION,
+};
+pub use tool_result_facts::{
+    content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
+    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
+    ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
+    EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
+    STATUS_UNKNOWN,
 };
 
 fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
@@ -2115,6 +2123,13 @@ fn ingest_codex_rollout(
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
+    // Codex reports how a call ended out of band — `exec_command_end`,
+    // `patch_apply_end`, `mcp_tool_call_end` — and only guarantees they have
+    // all arrived by `task_complete`. Results are recorded with an `unknown`
+    // status and the turn's error signals are applied to them when it closes.
+    let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    let mut turn_error_signals: HashMap<String, &'static str> = HashMap::new();
+    let mut pending_results: Vec<(String, String)> = Vec::new();
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut line_index = 0usize;
@@ -2171,6 +2186,7 @@ fn ingest_codex_rollout(
                 message_id,
                 None,
                 None,
+                None,
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2219,6 +2235,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             token_json.as_deref(),
+                            None,
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2242,6 +2259,7 @@ fn ingest_codex_rollout(
                             &uid,
                             &uid,
                             model.as_deref(),
+                            None,
                             None,
                         )?;
                         outcome.events += 1;
@@ -2295,6 +2313,12 @@ fn ingest_codex_rollout(
                         outcome.last_assistant_text =
                             Some(message.trim().chars().take(4096).collect());
                     }
+                    resolve_codex_tool_results(
+                        conn,
+                        session_id,
+                        &mut pending_results,
+                        &mut turn_error_signals,
+                    )?;
                 }
                 "thread_settings_applied" => {
                     if let Some(m) = payload
@@ -2326,6 +2350,10 @@ fn ingest_codex_rollout(
                         .get("result")
                         .and_then(Value::as_object)
                         .map(|r| r.contains_key("Err"));
+                    if is_error == Some(true) {
+                        turn_error_signals
+                            .insert(call_id.to_string(), tool_result_facts::ERROR_SIGNAL_MCP_ERR);
+                    }
                     insert_tool_call(
                         conn,
                         "codex",
@@ -2363,6 +2391,12 @@ fn ingest_codex_rollout(
                     let success = payload.get("success").and_then(Value::as_bool);
                     if let Some(success) = success {
                         set_tool_call_error(conn, "codex", session_id, call_id, !success)?;
+                        if !success {
+                            turn_error_signals.insert(
+                                call_id.to_string(),
+                                tool_result_facts::ERROR_SIGNAL_PATCH_APPLY,
+                            );
+                        }
                     }
                     let Some(changes) = payload.get("changes").and_then(Value::as_object) else {
                         continue;
@@ -2411,6 +2445,12 @@ fn ingest_codex_rollout(
                                 call_id,
                                 exit_code != 0,
                             )?;
+                            if exit_code != 0 {
+                                turn_error_signals.insert(
+                                    call_id.to_string(),
+                                    tool_result_facts::ERROR_SIGNAL_EXIT_CODE,
+                                );
+                            }
                         }
                     }
                 }
@@ -2449,6 +2489,7 @@ fn ingest_codex_rollout(
                         &message_id,
                         model.as_deref(),
                         token_json.as_deref(),
+                        None,
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2471,11 +2512,18 @@ fn ingest_codex_rollout(
                     }
                 }
                 "function_call_output" | "custom_tool_call_output" => {
-                    if let Some(output_text) =
-                        materialize_codex_output_text(payload.get("output").unwrap_or(&Value::Null))
-                    {
+                    let output = payload.get("output").unwrap_or(&Value::Null);
+                    if let Some(output_text) = materialize_codex_output_text(output) {
                         let uid = format!("{index}:{payload_type}");
                         let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
+                        let call_id = payload_str("call_id").unwrap_or("");
+                        let (call_index, event_index) = indexer.next(call_id);
+                        // Measured over the provider's raw `output`, not the
+                        // flattened text below: a payload that arrives as
+                        // structured blocks is bigger on the wire than the
+                        // joined string this row stores.
+                        let facts = tool_result_facts::codex_output_facts(output, call_id)
+                            .with_ordering(call_index, event_index);
                         insert_codex_event(
                             conn,
                             session_id,
@@ -2489,8 +2537,12 @@ fn ingest_codex_rollout(
                             &message_id,
                             None,
                             None,
+                            Some(&facts),
                         )?;
                         outcome.events += 1;
+                        if !call_id.is_empty() {
+                            pending_results.push((uid, call_id.to_string()));
+                        }
                     }
                 }
                 // Readable reasoning arrives as event_msg/agent_reasoning;
@@ -2505,7 +2557,41 @@ fn ingest_codex_rollout(
             _ => {}
         }
     }
+    // A live session's last turn has no `task_complete` yet. Applying the
+    // signals seen so far is strictly better than leaving the rows `unknown`,
+    // and the next sync re-reads the file and resolves them again.
+    resolve_codex_tool_results(
+        conn,
+        session_id,
+        &mut pending_results,
+        &mut turn_error_signals,
+    )?;
     Ok(outcome)
+}
+
+/// Apply a finished Codex turn's out-of-band error signals to the tool-result
+/// rows it buffered, and settle the rest as completed.
+fn resolve_codex_tool_results(
+    conn: &Connection,
+    session_id: &str,
+    pending: &mut Vec<(String, String)>,
+    signals: &mut HashMap<String, &'static str>,
+) -> Result<()> {
+    for (uid, call_id) in pending.drain(..) {
+        let signal = signals.get(call_id.as_str()).copied();
+        let status = if signal.is_some() {
+            tool_result_facts::STATUS_ERRORED
+        } else {
+            tool_result_facts::STATUS_COMPLETED
+        };
+        conn.execute(
+            "UPDATE session_events SET result_status = ?, error_signal = ? \
+             WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
+            params![status, signal, session_id, uid],
+        )?;
+    }
+    signals.clear();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2522,6 +2608,7 @@ fn insert_codex_event(
     message_id: &str,
     model: Option<&str>,
     token_json: Option<&str>,
+    facts: Option<&ToolResultFacts>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -2539,6 +2626,7 @@ fn insert_codex_event(
         model,
         token_json,
         uid,
+        facts,
     )
 }
 
@@ -3003,6 +3091,10 @@ fn ingest_claude_transcript_as(
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
+    // Ordering is assigned over the whole transcript, and this parser always
+    // re-reads the file from the start, so a re-sync reproduces the same
+    // indexes instead of advancing them.
+    let mut indexer = tool_result_facts::ToolResultIndexer::default();
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -3071,6 +3163,40 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        // Claude reports a finished subagent as a `type: "system"` line with
+        // no message body, so the block walk below never sees it. It is the
+        // only record that ties a delegated child back to the Agent call that
+        // spawned it, which makes it a tool result in everything but shape.
+        if obj.get("type").and_then(Value::as_str) == Some("system") {
+            if let Some(facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
+                let tool_use_id = facts.tool_use_id.clone().unwrap_or_default();
+                let (call_index, event_index) = indexer.next(&tool_use_id);
+                let facts = facts.with_ordering(call_index, event_index);
+                let notification_text = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                insert_session_event(
+                    conn,
+                    "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    "tool_result",
+                    "tool_result",
+                    notification_text,
+                    None,
+                    None,
+                    &format!("{message_uuid}:subagent_notification"),
+                    Some(&facts),
+                )?;
+            }
+            continue;
+        }
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
@@ -3130,6 +3256,7 @@ fn ingest_claude_transcript_as(
                     model,
                     token_json.as_deref(),
                     &format!("{message_uuid}:0"),
+                    None,
                 )?;
             }
             continue;
@@ -3165,6 +3292,7 @@ fn ingest_claude_transcript_as(
                                 model,
                                 token_json.as_deref(),
                                 &event_uid,
+                                None,
                             )?;
                         }
                     }
@@ -3191,6 +3319,7 @@ fn ingest_claude_transcript_as(
                             model,
                             token_json.as_deref(),
                             &event_uid,
+                            None,
                         )?;
                     }
                 }
@@ -3216,6 +3345,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        None,
                     )?;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -3257,6 +3387,14 @@ fn ingest_claude_transcript_as(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let content = block.get("content").unwrap_or(&Value::Null);
+                    // Measured over the provider's raw content, before
+                    // `materialize_tool_result_text` reshapes it: the whole
+                    // point of `payload_bytes` is to say what the harness
+                    // actually returned, which a post-processed string can no
+                    // longer answer.
+                    let (call_index, event_index) = indexer.next(tool_use_id);
+                    let facts = tool_result_facts::claude_tool_result_facts(block)
+                        .with_ordering(call_index, event_index);
                     let text = materialize_tool_result_text(content);
                     insert_session_event(
                         conn,
@@ -3274,6 +3412,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        Some(&facts),
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
@@ -3319,16 +3458,30 @@ fn insert_session_event(
     model: Option<&str>,
     token_json: Option<&str>,
     event_uid: &str,
+    // Carried as one struct rather than ten more positional arguments: the
+    // fidelity columns are only meaningful together, and a tenth `None` in a
+    // call list is how a fact silently ends up in the wrong column.
+    facts: Option<&ToolResultFacts>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    let blank = ToolResultFacts::default();
+    let facts = facts.unwrap_or(&blank);
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+          tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
+          error_signal, subagent_session_id, agent_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, \
+         tool_use_id=excluded.tool_use_id, payload_bytes=excluded.payload_bytes, \
+         payload_truncated=excluded.payload_truncated, payload_hash=excluded.payload_hash, \
+         call_index=excluded.call_index, event_index=excluded.event_index, \
+         result_status=excluded.result_status, event_source=excluded.event_source, \
+         error_signal=excluded.error_signal, subagent_session_id=excluded.subagent_session_id, \
+         agent_id=excluded.agent_id",
         params![
             source,
             session_id,
@@ -3344,6 +3497,17 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            facts.tool_use_id,
+            facts.payload_bytes,
+            facts.payload_truncated.map(i64::from),
+            facts.payload_hash,
+            facts.call_index,
+            facts.event_index,
+            facts.result_status,
+            facts.event_source,
+            facts.error_signal,
+            facts.subagent_session_id,
+            facts.agent_id,
         ],
     )?;
     Ok(())
@@ -5135,6 +5299,7 @@ mod tests {
             None,
             None,
             "event-1",
+            None,
         )
         .unwrap();
         super::insert_tool_call(
@@ -6905,6 +7070,408 @@ mod tests {
         super::read_codex_session_meta(path).unwrap().unwrap()
     }
 
+    /// Tool-result rows for one session, in transcript order.
+    fn tool_results(conn: &Connection, source: &str, session_id: &str) -> Vec<crate::SessionEvent> {
+        crate::session_events(conn, session_id, Some(source))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "tool_result")
+            .collect()
+    }
+
+    fn claude_line(value: Value) -> String {
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn claude_tool_results_measure_the_raw_payload_not_the_stored_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloat-session.jsonl");
+        // Shaped after relayburn's `claude/oversized-bash-output` fixture: a
+        // single Bash call whose result is exactly 80 000 bytes. The assertion
+        // below is that number rather than "something large", so a payload
+        // measured here and one measured there can be compared directly
+        // instead of merely looking similar.
+        let oversized = "x".repeat(80_000);
+        let marked = "partial output\n<system-truncated>\n";
+        let structured = json!([{ "type": "text", "text": "ok" }]);
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "bloat-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "cat huge.log" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "bloat-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_bash_big", "name": "Bash",
+                      "input": { "command": "cat huge.log" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "bloat-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_bash_big", "content": oversized },
+                    { "type": "tool_result", "tool_use_id": "tu_grep", "content": marked,
+                      "is_error": true },
+                    { "type": "tool_result", "tool_use_id": "tu_read", "content": structured },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let rows = tool_results(&conn, "claude", "bloat-session");
+        assert_eq!(rows.len(), 3);
+
+        let big = &rows[0];
+        assert_eq!(big.payload_bytes, Some(80_000));
+        assert_eq!(big.payload_truncated, Some(0));
+        assert_eq!(
+            big.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(oversized.as_bytes()).as_str()),
+        );
+        assert_eq!(big.tool_use_id.as_deref(), Some("tu_bash_big"));
+        assert_eq!(big.event_source.as_deref(), Some("tool_result"));
+        assert_eq!(big.result_status.as_deref(), Some("completed"));
+        assert_eq!(big.error_signal, None);
+        assert_eq!((big.call_index, big.event_index), (Some(0), Some(0)));
+
+        // The harness marker is the difference between "this tool returned
+        // 34 bytes" and "this tool returned far more and the harness cut it".
+        let marked_row = &rows[1];
+        assert_eq!(marked_row.payload_truncated, Some(1));
+        assert_eq!(marked_row.payload_bytes, Some(marked.len() as i64));
+        assert_eq!(marked_row.result_status.as_deref(), Some("errored"));
+        assert_eq!(
+            marked_row.error_signal.as_deref(),
+            Some("tool_result.is_error")
+        );
+        assert_eq!(
+            (marked_row.call_index, marked_row.event_index),
+            (Some(0), Some(1))
+        );
+
+        // A structured payload is measured over its stable stringification,
+        // which is what the provider actually sent, not over the flattened
+        // text this row stores.
+        let structured_row = &rows[2];
+        let expected = tool_result_facts::stable_stringify(&structured);
+        assert_eq!(structured_row.payload_bytes, Some(expected.len() as i64));
+        assert_eq!(
+            structured_row.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(expected.as_bytes()).as_str()),
+        );
+        assert_eq!(structured_row.event_index, Some(2));
+    }
+
+    #[test]
+    fn claude_call_index_counts_per_tool_use_id_and_event_index_counts_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeat-session.jsonl");
+        let result = |uuid: &str, parent: &str, ts: &str, blocks: Value| {
+            claude_line(json!({
+                "type": "user", "uuid": uuid, "parentUuid": parent,
+                "sessionId": "repeat-session", "cwd": "/tmp/project", "timestamp": ts,
+                "message": { "role": "user", "content": blocks },
+            }))
+        };
+        let lines = [
+            result(
+                "u1",
+                "root",
+                "2026-04-20T00:00:01.000Z",
+                json!([
+                    { "type": "tool_result", "tool_use_id": "tu_a", "content": "first" },
+                    { "type": "tool_result", "tool_use_id": "tu_b", "content": "second" },
+                ]),
+            ),
+            result(
+                "u2",
+                "u1",
+                "2026-04-20T00:00:02.000Z",
+                json!([
+                    { "type": "tool_result", "tool_use_id": "tu_a", "content": "again" },
+                ]),
+            ),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let ordering: Vec<(Option<String>, Option<i64>, Option<i64>)> =
+            tool_results(&conn, "claude", "repeat-session")
+                .into_iter()
+                .map(|event| (event.tool_use_id, event.call_index, event.event_index))
+                .collect();
+        assert_eq!(
+            ordering,
+            vec![
+                (Some("tu_a".into()), Some(0), Some(0)),
+                (Some("tu_b".into()), Some(0), Some(1)),
+                (Some("tu_a".into()), Some(1), Some(2)),
+            ],
+        );
+
+        // Re-reading the same transcript must reproduce the indexes rather
+        // than advance them: the parser starts from the top every time, and a
+        // sequence that grew on every sync would make `event_index` useless
+        // as an order.
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let after: Vec<Option<i64>> = tool_results(&conn, "claude", "repeat-session")
+            .into_iter()
+            .map(|event| event.event_index)
+            .collect();
+        assert_eq!(after, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn claude_subagent_notifications_are_recorded_as_linked_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent-session.jsonl");
+        // Shaped after relayburn's `claude/system-subagent-notification`
+        // fixture. The notification is the only record that ties the child
+        // session back to the Agent call that spawned it.
+        let lines = [
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "subagent-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-24T01:00:00.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_system", "name": "Agent",
+                      "input": { "subagent_type": "Explore" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "system", "subtype": "subagent_completed",
+                "sessionId": "subagent-session", "timestamp": "2026-04-24T01:00:01.000Z",
+                "parent_tool_use_id": "toolu_system", "agent_id": "agent-system-1",
+                "subagent_session_id": "session-system-child", "status": "completed",
+                "content": "subagent completed",
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let rows = tool_results(&conn, "claude", "subagent-session");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.event_source.as_deref(), Some("subagent_notification"));
+        assert_eq!(
+            row.subagent_session_id.as_deref(),
+            Some("session-system-child")
+        );
+        assert_eq!(row.agent_id.as_deref(), Some("agent-system-1"));
+        assert_eq!(row.tool_use_id.as_deref(), Some("toolu_system"));
+        assert_eq!(row.result_status.as_deref(), Some("completed"));
+        assert_eq!(row.text.as_deref(), Some("subagent completed"));
+        assert_eq!(row.payload_bytes, Some("subagent completed".len() as i64));
+
+        // A system line that names no child is harness chatter, not a tool
+        // result, and must not manufacture one.
+        let noise = dir.path().join("noise.jsonl");
+        fs::write(
+            &noise,
+            format!(
+                "{}\n",
+                claude_line(json!({
+                    "type": "system", "subtype": "hook_ran", "sessionId": "noise-session",
+                    "timestamp": "2026-04-24T01:00:02.000Z", "content": "hook ran",
+                })),
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &noise).unwrap();
+        assert!(tool_results(&conn, "claude", "noise-session").is_empty());
+    }
+
+    #[test]
+    fn codex_tool_results_take_their_status_from_the_turns_out_of_band_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T01-00-00-sess_tools_1.jsonl");
+        // Shaped after relayburn's `codex/with-tool-call` and
+        // `codex/oversized-shell-output` fixtures, with the exit code and the
+        // patch outcome flipped to failures: Codex reports both out of band,
+        // and neither is visible on the `function_call_output` row itself.
+        let lines = [
+            r#"{"timestamp":"2026-04-20T01:00:00.000Z","type":"session_meta","payload":{"id":"sess_tools_1","cwd":"/tmp/project","timestamp":"2026-04-20T01:00:00.000Z"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_tools_1","cwd":"/tmp/project","model":"gpt-5.3-codex"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"cat huge.log\"}","call_id":"call_shell_1"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.500Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_shell_1","turn_id":"turn_tools_1","exit_code":2}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_shell_1","output":"boom"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_patch_1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /tmp/project/README.md\n@@\n+banner\n*** End Patch\n"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.500Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_1","turn_id":"turn_tools_1","success":false,"changes":{}}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_patch_1","output":"patch failed"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/project/a.ts\"}","call_id":"call_read_1"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:03.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_read_1","output":"contents"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:04.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_tools_1"}}"#.to_string(),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_tools_1");
+        let seen: Vec<String> = rows
+            .iter()
+            .map(|event| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    event.tool_use_id.as_deref().unwrap_or("-"),
+                    event.result_status.as_deref().unwrap_or("-"),
+                    event.error_signal.as_deref().unwrap_or("-"),
+                    event.event_source.as_deref().unwrap_or("-"),
+                    event
+                        .event_index
+                        .map_or_else(|| "-".to_string(), |index| index.to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                "call_shell_1|errored|exit_code|function_call_output|0",
+                "call_patch_1|errored|patch_apply|function_call_output|1",
+                "call_read_1|completed|-|function_call_output|2",
+            ],
+        );
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(
+            rows[0].payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(b"boom").as_str()),
+        );
+    }
+
+    #[test]
+    fn codex_results_of_an_unfinished_turn_still_carry_the_signals_seen_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T02-00-00-sess_live_1.jsonl");
+        // A live session has no `task_complete` yet. Leaving its rows
+        // `unknown` would report "we do not know" about a failure the
+        // transcript already states.
+        let lines = [
+            r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess_live_1","cwd":"/tmp/project","timestamp":"2026-04-20T02:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"false\"}","call_id":"call_live_1"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.500Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_live_1","exit_code":1}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_live_1","output":"nope"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_live_1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result_status.as_deref(), Some("errored"));
+        assert_eq!(rows[0].error_signal.as_deref(), Some("exit_code"));
+    }
+
+    #[test]
+    fn user_turn_blocks_are_derived_from_the_indexed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utb-session.jsonl");
+        // Shaped after relayburn's `claude/user-turn-blocks` fixture: one
+        // human turn, then one user message carrying two tool results.
+        let big = "A".repeat(100);
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "utb-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "please fix the build" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "utb-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_bash_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                    { "type": "tool_use", "id": "tu_read_1", "name": "Read",
+                      "input": { "file_path": "/src/app.ts" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "utb-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_bash_1", "content": "a\nb\n",
+                      "is_error": true },
+                    { "type": "tool_result", "tool_use_id": "tu_read_1", "content": big },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 100, None).unwrap();
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.user_turns.len(), 2);
+
+        let first = &page.user_turns[0];
+        assert_eq!(first.blocks.len(), 1);
+        assert_eq!(first.blocks[0].kind, "text");
+        assert_eq!(first.blocks[0].tool_use_id, None);
+        assert_eq!(
+            first.blocks[0].byte_len,
+            "please fix the build".len() as i64
+        );
+
+        let second = &page.user_turns[1];
+        let shape: Vec<(&str, Option<&str>, i64, Option<i64>)> = second
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.kind.as_str(),
+                    block.tool_use_id.as_deref(),
+                    block.byte_len,
+                    block.is_error,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("tool_result", Some("tu_bash_1"), 4, Some(1)),
+                ("tool_result", Some("tu_read_1"), 100, Some(0)),
+            ],
+        );
+
+        // The page is keyset-ordered on the turn's first event, so a limit of
+        // one hands back a cursor that resumes exactly at the second turn.
+        let bounded =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 1, None).unwrap();
+        assert_eq!(bounded.user_turns.len(), 1);
+        let cursor = bounded.next_cursor.expect("a second turn remains");
+        let rest =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 100, Some(&cursor))
+                .unwrap();
+        assert_eq!(rest.user_turns.len(), 1);
+        assert_eq!(rest.user_turns[0].id, second.id);
+    }
+
     #[test]
     fn codex_parent_resolution_supports_current_structured_and_legacy_metadata() {
         let cases = [
@@ -7331,6 +7898,7 @@ mod tests {
             None,
             None,
             "3:agent_message",
+            None,
         )
         .unwrap();
         super::insert_tool_call(

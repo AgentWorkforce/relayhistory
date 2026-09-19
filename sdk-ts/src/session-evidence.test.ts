@@ -6,7 +6,8 @@ import test from 'node:test';
 
 import {
   InvalidArgumentError, SESSION_EVIDENCE_CONTRACT_VERSION,
-  getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls, getSessionToolCallsPage,
+  getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
+  getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
   parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
@@ -292,4 +293,67 @@ test('unparseable stored JSON yields null without discarding the raw string', ()
   assert.equal(parseStoredJson(null), null);
   assert.equal(parseStoredJson(undefined), null);
   assert.equal(parseStoredJson('null'), null);
+});
+
+test('tool result events carry measured payload facts across the native boundary', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const events = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'claude' });
+    const results = events.filter((event) => event.kind === 'tool_result');
+    assert.deepEqual(results.map((event) => event.toolUseId), ['toolu_1', 'toolu_2', 'toolu_3']);
+    // Byte counts are measurements of the raw payload: 'ok' is two bytes and
+    // 'failed' is six, asserted as those numbers rather than as "non-zero",
+    // which a fabricated default would also satisfy.
+    assert.deepEqual(results.map((event) => event.payloadBytes), [2, 2, 6]);
+    assert.deepEqual(results.map((event) => event.payloadTruncated), [false, false, false]);
+    assert.deepEqual(results.map((event) => event.eventIndex), [0, 1, 2]);
+    assert.deepEqual(results.map((event) => event.callIndex), [0, 0, 0]);
+    assert.deepEqual(results.map((event) => event.eventSource), ['tool_result', 'tool_result', 'tool_result']);
+    assert.deepEqual(results.map((event) => event.resultStatus), ['completed', 'completed', 'errored']);
+    assert.deepEqual(results.map((event) => event.errorSignal), [null, null, 'tool_result.is_error']);
+    for (const event of results) assert.match(String(event.payloadHash), /^[0-9a-f]{16}$/);
+
+    // Rows that are not tool results report nothing rather than a zero that
+    // would read like a measured empty payload.
+    for (const event of events.filter((candidate) => candidate.kind !== 'tool_result')) {
+      assert.equal(event.payloadBytes, null);
+      assert.equal(event.eventSource, null);
+      assert.equal(event.resultStatus, null);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('user turn pages group each message with its blocks and page by keyset', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const turns = await getSessionUserTurns('claude', SHARED_SESSION, { dbPath });
+    assert.deepEqual(
+      turns.map((turn) => turn.blocks.map((block) => [block.kind, block.toolUseId, block.byteLen, block.isError])),
+      [
+        [['text', null, 'update auth'.length, null]],
+        [['tool_result', 'toolu_1', 2, false]],
+        [['tool_result', 'toolu_2', 2, false]],
+        [['tool_result', 'toolu_3', 6, true]],
+      ],
+    );
+
+    const first = await getSessionUserTurnsPage('claude', SHARED_SESSION, { dbPath, limit: 1 });
+    assert.equal(first.contractVersion, SESSION_EVIDENCE_CONTRACT_VERSION);
+    assert.equal(first.userTurns.length, 1);
+    assert.notEqual(first.nextCursor, null);
+    const rest = await getSessionUserTurnsPage('claude', SHARED_SESSION, {
+      dbPath,
+      after: first.nextCursor ?? undefined,
+    });
+    assert.deepEqual(rest.userTurns.map((turn) => turn.id), turns.slice(1).map((turn) => turn.id));
+
+    await assert.rejects(
+      getSessionUserTurnsPage('claude', '', { dbPath }),
+      (error: unknown) => error instanceof InvalidArgumentError,
+    );
+  } finally {
+    await cleanup();
+  }
 });
