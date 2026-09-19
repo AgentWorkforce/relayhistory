@@ -550,6 +550,42 @@ fn cloud_recall_adopts_tenancy_for_a_legacy_session_before_provenance_check() {
 }
 
 #[test]
+fn cloud_recall_rechecks_replaced_session_after_refresh_lock() {
+    let _isolated = without_credentials_override();
+    let base = "https://history.agentrelay.com";
+    let mut stale = cloud_auth(base);
+    stale.org_id = None;
+    stale.refresh_token = Some("rth_rt_stale".into());
+    crate::cloud::save_auth(&stale).unwrap();
+
+    // Hold the stage lock after the resolver's initial load, then replace the
+    // session as a concurrent writer would. The resolver must use this current
+    // session after lock acquisition and must not rotate it again.
+    let lock = crate::cloud::acquire_refresh_lock(base).unwrap();
+    let resolver = std::thread::spawn(move || {
+        crate::cloud::resolve_recall_auth(
+            Some(base),
+            chrono::Utc::now().timestamp_millis(),
+            true,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let replacement = crate::cloud::StoredAuth {
+        base_url: base.into(),
+        access_token: "rth_at_replacement".into(),
+        access_token_expires_at: Some("2100-01-01T00:00:00Z".into()),
+        org_id: Some("org-replacement".into()),
+        refresh_token: None,
+        ..Default::default()
+    };
+    crate::cloud::save_auth(&replacement).unwrap();
+    drop(lock);
+    let resolved = resolver.join().unwrap().unwrap();
+    assert_eq!(resolved.access_token, "rth_at_replacement");
+    assert_eq!(resolved.org_id.as_deref(), Some("org-replacement"));
+}
+
+#[test]
 fn cloud_status_requires_sixty_seconds_and_honors_stage_precedence() {
     let _isolated = without_credentials_override();
     let mut auth = cloud_auth("https://history.agentrelay.com");
