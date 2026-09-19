@@ -105,19 +105,30 @@ relationship, not ask the consumer to redo the reconciliation.
 
 ## 5. Tool results — `ToolResultEventRecord`
 
-The largest single gap. The ledger stores the materialized result text on a
-`session_events` row and an `is_error` boolean on `tool_calls`. burn needs:
+The largest single gap, and larger than it looks: the tool-result **event**
+carries no tool identity at all. `session_events` has `message_id`, `ts_ms`,
+`role`, `kind` and `text` — and no `tool_use_id` column
+(`crates/ai-hist/src/store.rs`). Claude ingestion reads the result block's
+`tool_use_id` only to call `set_tool_call_error` and
+`update_file_edit_from_tool_result`, then drops it; Codex ingestion does the
+same with the output record's `call_id` (`crates/ai-hist/src/ingest.rs`). The
+`is_error` that survives is a per-_call_ boolean on `tool_calls`, not a
+per-result one, and with several calls or several results in one turn there is
+no key to join a stored result event back to the call it belongs to.
 
-| burn field                                                           | Status                                                                                               |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `tool_use_id`, `message_id`, `ts`                                    | present                                                                                              |
-| `is_error`                                                           | present (`tool_calls.is_error`)                                                                      |
-| `status`, `event_source`                                             | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                           |
-| `call_index`, `event_index`                                          | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — ordering must be stable |
-| `content_length`, `output_bytes`, `output_truncated`, `content_hash` | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                           |
-| `usage`, `usage_attribution`                                         | **TODO** [#172](https://github.com/AgentWorkforce/relayhistory/issues/172)                           |
-| `subagent_session_id`, `agent_id`                                    | **TODO** [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                           |
-| `replaced_tools`, `collapsed_calls`                                  | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                           |
+burn needs:
+
+| burn field                                                           | Status                                                                                                         |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `message_id`, `ts`                                                   | present                                                                                                        |
+| `tool_use_id`                                                        | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — parsed, then discarded; no column |
+| `is_error` (result-level)                                            | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — only a per-call boolean exists    |
+| `status`, `event_source`                                             | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
+| `call_index`, `event_index`                                          | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — ordering must be stable           |
+| `content_length`, `output_bytes`, `output_truncated`, `content_hash` | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
+| `usage`, `usage_attribution`                                         | **TODO** [#172](https://github.com/AgentWorkforce/relayhistory/issues/172)                                     |
+| `subagent_session_id`, `agent_id`                                    | **TODO** [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                     |
+| `replaced_tools`, `collapsed_calls`                                  | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
 
 `output_bytes` and `output_truncated` must be measured at parse time. They
 cannot be recovered afterwards from a truncated stored string, and a measurement

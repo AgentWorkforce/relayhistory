@@ -18,8 +18,16 @@ evidence for every harness.** Providers are added here and nowhere else.
 Downstream consumers — including
 [`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
 pricing, cost, activity classification and analytics — read that evidence
-through the `ai-hist` crate's `SessionStore` facade and never write
-`ai-history.db`.
+through the `ai-hist` crate's `SessionStore` facade instead of writing a second
+parser or a second schema.
+
+`ai-hist` is an **in-process** crate, so this is one writer _implementation_,
+not one writer process: a consumer that calls `sync`, `hydrate` or `watch`
+opens `ai-history.db` read-write in its own process, and only a handle opened
+with `StoreOptions { read_only: true }` truly adds no writer. Every mutation
+still goes through the crate's own schema, migrations, `SyncRunLock`, hydration
+locks and WAL busy handler. See the ADR's [store-shape
+section](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md#store-shape-one-writer-implementation-not-one-writer-process).
 
 - [ADR: relayhistory owns session sourcing; burn consumes evidence through a
   Rust SDK](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md) —

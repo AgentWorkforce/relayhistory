@@ -577,10 +577,10 @@ Providers are added **here and nowhere else**. RelayHistory is the single owner
 of acquiring, parsing and storing session evidence for every harness;
 downstream consumers read it through the `ai-hist` crate's `SessionStore`
 facade rather than writing a second parser. See [ADR: relayhistory owns session
-sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). A new or
-extended provider must also move its row in that ADR's capture matrix in the
-same change, and satisfy the record types in
-[`sourcing-contract.md`](sourcing-contract.md).
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). That
+matrix has record types as rows and sources as columns, so a new or extended
+provider must add or update its source column in the same change, and satisfy
+the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
 Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
 

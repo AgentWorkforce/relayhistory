@@ -35,8 +35,14 @@ RelayHistory is the single owner of acquiring, parsing and storing session
 evidence for every harness. Downstream consumers — including
 [`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
 pricing, cost and analytics — read that evidence through the `ai-hist` crate's
-`SessionStore` facade and never write `ai-history.db` themselves. New harnesses
+`SessionStore` facade rather than parsing harness logs themselves. New harnesses
 are added here and nowhere else.
+
+`ai-hist` is an in-process crate, so that buys one writer *implementation*, not
+one writer process: a consumer that calls `sync`, `hydrate` or `watch` holds a
+read-write connection in its own process, while every mutation still goes
+through this crate's schema, migrations, sync lock, hydration locks and WAL busy
+handler.
 
 See [ADR: relayhistory owns session
 sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
