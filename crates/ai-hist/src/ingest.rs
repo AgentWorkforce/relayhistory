@@ -799,8 +799,12 @@ fn fidelity_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
     state.get(key).and_then(Value::as_i64).unwrap_or(0) < TOOL_RESULT_FIDELITY_GENERATION
 }
 
-/// Record that the pass finished. Only reached when the walk completed, so an
-/// interrupted sync retries the backfill rather than skipping it.
+/// Record that the pass finished.
+///
+/// Callers reach this only after a walk that both completed and covered every
+/// location it has indexed from: an interrupted sync, or one that could not
+/// reach a root it has rows under, retries the backfill rather than retiring
+/// it over evidence it never looked at.
 fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
     state.insert(key.to_string(), json!(TOOL_RESULT_FIDELITY_GENERATION));
 }
@@ -1599,6 +1603,14 @@ fn sync_codex_rollouts(
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
     let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
+    // A backfill pass that could not reach every place it has indexed from is
+    // not a finished pass. Recording the generation anyway would retire the
+    // work permanently while the rows under the unreachable root keep their
+    // null fidelity -- and those rows are already stamped, so nothing would
+    // ever bring them back. The Claude walk gets this for free by returning
+    // early when its root is gone; this walk visits two roots and skips past a
+    // missing one, so it has to say so explicitly.
+    let mut unreached_indexed_root = false;
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1607,6 +1619,12 @@ fn sync_codex_rollouts(
         home.join(".codex/archived_sessions"),
     ] {
         if !root.exists() {
+            // Only a root this database has actually indexed from holds the
+            // pass open. A root that has never existed here -- most installs
+            // have no archive -- has nothing to backfill, and waiting for it
+            // would leave the pass pending forever.
+            let prefix = format!("{}{}", root.display(), std::path::MAIN_SEPARATOR);
+            unreached_indexed_root |= seen.keys().any(|key| key.starts_with(&prefix));
             continue;
         }
         for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
@@ -1764,7 +1782,9 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
-    record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
+    if !unreached_indexed_root {
+        record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
+    }
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -6843,6 +6863,121 @@ mod tests {
                 .text
                 .as_deref(),
             Some("sentinel"),
+        );
+    }
+
+    #[test]
+    fn an_unreachable_codex_archive_keeps_the_backfill_pass_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let live_day = home.join(".codex/sessions/2026/04/20");
+        let archive_day = home.join(".codex/archived_sessions/2026/01/02");
+        fs::create_dir_all(&live_day).unwrap();
+        fs::create_dir_all(&archive_day).unwrap();
+
+        let rollout = |id: &str, ts: &str| {
+            [
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"id":"{id}","cwd":"/tmp/project"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{{\"command\":\"ls\"}}","call_id":"c_{id}"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"function_call_output","call_id":"c_{id}","output":"out"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1"}}}}"#
+                ),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let live = live_day.join("rollout-2026-04-20T00-00-00-sess_live.jsonl");
+        let archived = archive_day.join("rollout-2026-01-02T00-00-00-sess_archived.jsonl");
+        fs::write(&live, rollout("sess_live", "2026-04-20T00:00:00.000Z")).unwrap();
+        fs::write(
+            &archived,
+            rollout("sess_archived", "2026-01-02T00:00:00.000Z"),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            Some(3)
+        );
+
+        // The state an upgrade leaves behind: rows and stamps for both roots,
+        // fidelity null, no backfill generation recorded.
+        blank_tool_result_fidelity(&conn, "codex");
+        blank_tool_result_fidelity_state(&mut state);
+
+        // The archive is not mounted on this run.
+        let stowed = home.join("archived_sessions.away");
+        fs::rename(home.join(".codex/archived_sessions"), &stowed).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+
+        // The reachable root was backfilled, but the pass is still owed: the
+        // archived rows are stamped, so retiring the generation here would
+        // strand them null for good.
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_live")[0].payload_bytes,
+            Some(3)
+        );
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            None
+        );
+        assert!(
+            state.get(super::CODEX_FIDELITY_GENERATION_KEY).is_none(),
+            "a walk that could not reach an indexed root must not retire the pass"
+        );
+
+        // The archive comes back.
+        fs::rename(&stowed, home.join(".codex/archived_sessions")).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            Some(3)
+        );
+        assert_eq!(
+            state
+                .get(super::CODEX_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+        );
+    }
+
+    #[test]
+    fn a_codex_root_this_database_never_indexed_does_not_hold_the_pass_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        // Most installs have no archive directory at all. Waiting for one that
+        // has never existed would leave the pass pending on every sync
+        // forever, which is the same bug pointed the other way.
+        let path = day.join("rollout-2026-04-20T00-00-00-sess_only.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-04-20T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sess_only\",\"cwd\":\"/tmp/project\"}}\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert!(!home.join(".codex/archived_sessions").exists());
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            state
+                .get(super::CODEX_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
         );
     }
 
