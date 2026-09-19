@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use crate::project_identity::ProjectKeyMethod;
 use crate::{
     open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
 };
@@ -71,7 +72,9 @@ use serde_json::Value;
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
 /// payloads changes in a way a consumer must notice.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
+/// 4 adds `project_key` / `project_key_method` to every catalog row and the
+/// `project_key` filter to the listing.
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -157,6 +160,15 @@ pub struct ShallowSession {
     pub initial_commit: Option<String>,
     /// Extra workspace roots, when the provider records them. Observed.
     pub workspace_roots: Vec<String>,
+    /// Canonical project identity: the `origin` remote canonicalized to
+    /// `host/owner/repo`, or the working directory when no remote resolves.
+    /// **Derived** — see [`crate::project_identity`]. `None` only while the
+    /// row has neither a `cwd` nor a `repo_url` to derive one from.
+    pub project_key: Option<String>,
+    /// How [`ShallowSession::project_key`] was arrived at: `remote`, `path`,
+    /// or `inherited` from a delegating parent. Read this rather than
+    /// guessing from whether the key looks like a path.
+    pub project_key_method: Option<String>,
     /// Path of the provider file or database this row came from, when local.
     pub raw_path: Option<String>,
     /// Change stamp of the raw source at scan time, `v{scanner}:{provider stamp}`.
@@ -1757,7 +1769,7 @@ fn file_candidates(
 const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, \
+     discovery_state, project_key, project_key_method, \
      CASE \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
         AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
@@ -1795,7 +1807,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
         discovery_state: row
             .get::<_, Option<String>>(16)?
             .unwrap_or_else(|| "full".to_string()),
-        locations: json_string_list(row.get(17)?),
+        project_key: row.get(17)?,
+        project_key_method: row.get(18)?,
+        locations: json_string_list(row.get(19)?),
         from_cache: true,
     })
 }
@@ -1834,6 +1848,12 @@ pub struct CatalogListOptions {
     pub before_ms: Option<i64>,
     /// Precise continuation from the previous page's `next_cursor`.
     pub after: Option<CatalogCursor>,
+    /// Restrict to one canonical project identity, as
+    /// [`ShallowSession::project_key`] spells it (`host/owner/repo`, or the
+    /// working directory for a checkout with no remote). Exact match, not a
+    /// prefix: `github.com/org/repo` and `github.com/org/repo-fork` are
+    /// different projects.
+    pub project_key: Option<String>,
 }
 
 /// One page of the catalog plus the cursor that continues it.
@@ -1878,6 +1898,10 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
         for source in &options.sources {
             args.push(Box::new(source.clone()));
         }
+    }
+    if let Some(project_key) = options.project_key.as_ref() {
+        sql.push_str(" AND project_key = ?");
+        args.push(Box::new(project_key.clone()));
     }
     match options.after.as_ref() {
         // Everything strictly after the cursor in the catalog's total order.
@@ -2103,14 +2127,17 @@ fn now_ms() -> i64 {
 }
 
 static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
+    let project_key_merge = crate::store::project_key_merge_sql();
     format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
+          project_key, project_key_method, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
+         {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = CASE \
@@ -2225,6 +2252,28 @@ fn upsert_shallow_session_in_transaction(
         session.source_stamp.as_deref(),
         Some(&session.discovery_state),
     )?;
+    // One resolution per upsert, from the shallow row's own observations. A
+    // provider-recorded remote (codex's `session_meta.payload.git`) is
+    // preferred over walking the working directory, which may no longer exist
+    // by the time the transcript is read. Resolving here rather than in each
+    // provider's shallow reader keeps every source on one code path.
+    let resolved = session.project_key.clone().map(|key| {
+        (
+            key,
+            session
+                .project_key_method
+                .clone()
+                .unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().to_string()),
+        )
+    });
+    let resolved = resolved.or_else(|| {
+        crate::project_identity::identity_for(session.cwd.as_deref(), session.repo_url.as_deref())
+            .map(|(key, method)| (key, method.as_str().to_string()))
+    });
+    let (project_key, project_key_method) = match resolved {
+        Some((key, method)) => (Some(key), Some(method)),
+        None => (None, None),
+    };
     let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
@@ -2249,6 +2298,8 @@ fn upsert_shallow_session_in_transaction(
                 SessionLocation::Local => "local",
                 SessionLocation::Remote => "remote",
             },
+            project_key,
+            project_key_method,
         ],
         row_to_session,
     )?;

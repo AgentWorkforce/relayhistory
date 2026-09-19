@@ -49,7 +49,7 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
     assert.deepEqual(sessions.map((line) => line.source).sort(), ['claude', 'codex']);
     assert.ok(sessions.every((line) => JSON.stringify(line.locations) === '["local"]'));
     assert.equal(lines.at(-1)?.type, 'summary');
-    assert.equal(lines.at(-1)?.contract_version, 3);
+    assert.equal(lines.at(-1)?.contract_version, 4);
     assert.equal(lines.at(-1)?.scope, 'local');
     assert.equal('sessions' in (lines.at(-1) ?? {}), false);
 
@@ -412,7 +412,7 @@ test('scope flags are boolean, default to local, and are mutually exclusive', as
     assert.deepEqual(JSON.parse(implicit.stdout), JSON.parse(explicit.stdout));
     const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env });
     assert.deepEqual(JSON.parse(remote.stdout), {
-      contract_version: 3, scope: 'remote', sessions: [], next_cursor: null,
+      contract_version: 4, scope: 'remote', sessions: [], next_cursor: null,
     });
 
     await assert.rejects(

@@ -64,6 +64,10 @@ name = "session_relationships"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "project_identity"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "source_intake"
 required-features = ["unstable-internal"]
 
