@@ -493,7 +493,7 @@ fn cloud_recall_refresh_reuses_rotated_credentials_and_persists_expiry() {
         (401, serde_json::json!({"error": "expired"})),
         (
             200,
-            serde_json::json!({"accessToken": "rth_at_rotated", "refreshToken": "rth_rt_rotated", "accessTokenExpiresAt": "2100-02-01T00:00:00Z"}),
+            serde_json::json!({"accessToken": "rth_at_rotated", "refreshToken": "rth_rt_rotated", "accessTokenExpiresAt": "2100-02-01T00:00:00Z", "orgId": "org-rotated", "workspaceId": "ws-rotated"}),
         ),
         (200, cloud_listing("cursor", "one")),
     ]);
@@ -507,9 +507,82 @@ fn cloud_recall_refresh_reuses_rotated_credentials_and_persists_expiry() {
         stored.access_token_expires_at.as_deref(),
         Some("2100-02-01T00:00:00Z")
     );
+    assert_eq!(stored.org_id.as_deref(), Some("org-rotated"));
+    assert_eq!(stored.workspace_id.as_deref(), Some("ws-rotated"));
     let requests = server.join().unwrap();
     assert!(requests[1].starts_with("POST /v1/auth/token/refresh "));
     assert!(requests[2].contains("Authorization: Bearer rth_at_rotated"));
+}
+
+#[test]
+fn cloud_recall_adopts_tenancy_for_a_legacy_session_before_provenance_check() {
+    let _isolated = without_credentials_override();
+    let (base, server) = cloud_http(vec![
+        (
+            200,
+            serde_json::json!({"accessToken": "rth_at_adopted", "refreshToken": "rth_rt_adopted", "accessTokenExpiresAt": "2100-02-01T00:00:00Z", "orgId": "org-adopted", "workspaceId": "ws-adopted"}),
+        ),
+        (200, cloud_listing("cursor", "legacy-session")),
+    ]);
+    let mut auth = cloud_auth(&base);
+    auth.org_id = None;
+    auth.workspace_id = None;
+    auth.refresh_token = Some("rth_rt_legacy".into());
+    crate::cloud::save_auth(&auth).unwrap();
+
+    let resolved = crate::cloud::resolve_recall_auth(
+        Some(&base),
+        chrono::Utc::now().timestamp_millis(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(resolved.org_id.as_deref(), Some("org-adopted"));
+    assert_eq!(resolved.workspace_id.as_deref(), Some("ws-adopted"));
+    let page = crate::cloud::recall_page(&resolved, crate::cloud::RecallResource::Sessions, &[])
+        .unwrap();
+    assert_eq!(page["sessions"][0]["sessionId"], "legacy-session");
+    let stored = crate::cloud::load_auth(Some(&base)).unwrap().unwrap();
+    assert_eq!(stored.org_id.as_deref(), Some("org-adopted"));
+    assert_eq!(stored.workspace_id.as_deref(), Some("ws-adopted"));
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/auth/token/refresh "));
+    assert!(requests[1].contains("Authorization: Bearer rth_at_adopted"));
+}
+
+#[test]
+fn cloud_recall_rechecks_replaced_session_after_refresh_lock() {
+    let _isolated = without_credentials_override();
+    let base = "https://history.agentrelay.com";
+    let mut stale = cloud_auth(base);
+    stale.org_id = None;
+    stale.refresh_token = Some("rth_rt_stale".into());
+    crate::cloud::save_auth(&stale).unwrap();
+
+    // Hold the stage lock after the resolver's initial load, then replace the
+    // session as a concurrent writer would. The resolver must use this current
+    // session after lock acquisition and must not rotate it again.
+    let lock = crate::cloud::acquire_refresh_lock(base).unwrap();
+    let resolver = std::thread::spawn(move || {
+        crate::cloud::resolve_recall_auth(
+            Some(base),
+            chrono::Utc::now().timestamp_millis(),
+            true,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let replacement = crate::cloud::StoredAuth {
+        base_url: base.into(),
+        access_token: "rth_at_replacement".into(),
+        access_token_expires_at: Some("2100-01-01T00:00:00Z".into()),
+        org_id: Some("org-replacement".into()),
+        refresh_token: None,
+        ..Default::default()
+    };
+    crate::cloud::save_auth(&replacement).unwrap();
+    drop(lock);
+    let resolved = resolver.join().unwrap().unwrap();
+    assert_eq!(resolved.access_token, "rth_at_replacement");
+    assert_eq!(resolved.org_id.as_deref(), Some("org-replacement"));
 }
 
 #[test]
