@@ -1678,6 +1678,17 @@ fn build_result(
     })
 }
 
+/// The delegated threads whose evidence this hydration also acquired.
+///
+/// Delegation only, on both the seed and the recursive step. A continuation or
+/// a fork is a *different conversation* that this one carried on from, not
+/// work this session delegated: counting it here would put a separate
+/// session's events into this hydration's evidence totals and hand the caller
+/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
+/// `getSessionRelationships`'s `continuity` array instead. This mirrors
+/// `RelationshipKinds::delegation()` — everything that is not a continuity
+/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
+/// being related exactly as before.
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(
@@ -1685,11 +1696,13 @@ fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<
                SELECT child_session_id FROM session_relationships \
                WHERE source = ?1 AND parent_session_id = ?2 \
                  AND child_session_id IS NOT NULL AND child_session_id != ?2 \
+                 AND relationship NOT IN ('continuation', 'fork', 'resume') \
                UNION \
                SELECT relationship.child_session_id FROM session_relationships relationship \
                JOIN descendants ON relationship.parent_session_id = descendants.child_session_id \
                WHERE relationship.source = ?1 AND relationship.child_session_id IS NOT NULL \
                  AND relationship.child_session_id != ?2 \
+                 AND relationship.relationship NOT IN ('continuation', 'fork', 'resume') \
              ) \
              SELECT child_session_id FROM descendants ORDER BY child_session_id",
         )?
@@ -3852,5 +3865,67 @@ mod tests {
         assert_eq!(edge.child_session_id.as_deref(), Some(resumed));
         assert_eq!(edge.origin_session_id.as_deref(), Some(prior));
         assert!(edge.child_has_events);
+    }
+
+    #[test]
+    fn a_continued_session_is_not_a_related_session_of_its_origin() {
+        // `relatedSessionIds` is what this hydration also acquired evidence
+        // for. A continuation is a different conversation that carried on from
+        // this one, not work it delegated — counting it would put a separate
+        // session's events into this hydration's totals and hand the caller
+        // sessions it never asked to acquire.
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join(".claude/projects/app");
+        fs::create_dir_all(&projects).unwrap();
+        let origin = projects.join("origin.jsonl");
+        fs::write(
+            &origin,
+            concat!(
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"start\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-a\",\"parentUuid\":\"origin-u\",",
+                "\"type\":\"assistant\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"assistant\",",
+                "\"content\":\"ok\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let follower = projects.join("follower.jsonl");
+        fs::write(
+            &follower,
+            concat!(
+                "{\"sessionId\":\"follower\",\"uuid\":\"follow-u\",\"parentUuid\":\"origin-a\",",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"carry on\"},\"timestamp\":\"2026-08-31T11:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "origin", Some(&origin));
+        catalog_row(&conn, "claude", "follower", Some(&follower));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "follower"), dir.path()).unwrap();
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "origin"), dir.path()).unwrap();
+
+        // The positive control: the continuation really was recorded, so this
+        // is not an assertion over an empty relationship table.
+        let conn = open_db(&db).unwrap();
+        let continuation: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE relationship = 'continuation' AND parent_session_id = 'origin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(continuation, 1);
+        assert!(
+            result.related_session_ids.is_empty(),
+            "a continuation is not a delegated thread: {:?}",
+            result.related_session_ids
+        );
     }
 }

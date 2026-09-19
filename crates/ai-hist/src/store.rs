@@ -566,6 +566,10 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    // `delete_session_hydration_state` gained a step, and `CREATE TRIGGER IF
+    // NOT EXISTS` would otherwise leave an existing database on the old body
+    // forever. The marker is what makes the rebuild happen exactly once.
+    "session_delete_continuity_reopen_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -824,6 +828,12 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
     conn.execute_batch(SESSION_CONTINUITY_EVIDENCE_DDL)?;
+    // A trigger created by an earlier release keeps its old body through every
+    // `CREATE TRIGGER IF NOT EXISTS`, so a changed body has to drop the old
+    // one first. Behind a marker, so it happens once rather than on every open.
+    if !migration_applied(conn, "session_delete_continuity_reopen_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS delete_session_hydration_state;")?;
+    }
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -900,6 +910,22 @@ AFTER DELETE ON sessions
 BEGIN
     DELETE FROM session_hydration_checkpoints
     WHERE source = OLD.source AND session_id = OLD.session_id;
+    -- Before the DELETE below, not after: those rows are the only record of
+    -- which transcripts depend on this session, and reconciliation finds a
+    -- dependent by reading the edge that points at it. Deleting the edges
+    -- first would leave every dependent resolved, with nothing left to
+    -- rediscover it by, so rehydrating this session would never rebuild the
+    -- continuation it used to carry.
+    UPDATE session_continuity_evidence
+    SET pending_reason = 'unreconciled'
+    WHERE source = OLD.source
+      AND locator IN (
+        SELECT evidence_locator FROM session_relationships
+        WHERE source = OLD.source
+          AND relationship IN ('continuation', 'fork', 'resume')
+          AND evidence_locator IS NOT NULL
+          AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id)
+      );
     DELETE FROM session_relationships
     WHERE source = OLD.source
       AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id);
@@ -926,6 +952,11 @@ END;
     // three declarations of the same nine names (CREATE TABLE, this loop, the
     // read-only guard) is two chances to drift, and every catalog column is
     // TEXT, so the guard list is the migration list.
+    // The triggers above are current now, including the rebuilt one.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) \
+         VALUES ('session_delete_continuity_reopen_v1');",
+    )?;
     migrate_session_relationships_v2(conn)?;
     // Additive: a v2 table predating continuity gains the one column the
     // continuity kinds need, and a fresh database already has it from the DDL
@@ -1116,6 +1147,25 @@ fn init_delivery_schema(conn: &Connection) -> Result<()> {
 #[cfg(not(feature = "delivery"))]
 fn init_delivery_schema(_conn: &Connection) -> Result<()> {
     Ok(())
+}
+
+/// Whether a named migration has already run, on a database that may predate
+/// the `schema_migrations` table itself.
+fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
+    let table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?)",
+        [name],
+        |row| row.get(0),
+    )?)
 }
 
 /// Rebuild `session_relationships` into its v2 shape once.

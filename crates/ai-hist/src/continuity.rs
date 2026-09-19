@@ -487,6 +487,8 @@ pub fn reconcile(conn: &Connection, source: &str) -> Result<ContinuityReconcilia
         resolve_explicit(conn, evidence, &mut written)?;
         resolve_resume(conn, evidence, &mut reasons, &mut written)?;
         resolve_cross_file_parent(conn, evidence, &mut reasons, &mut written)?;
+        // Last of the explicit signals: only when none of the above applied.
+        resolve_explicit_source(conn, evidence, &mut written)?;
         let lineage = written.len();
         resolve_fork_group(conn, evidence, lineage > 0, &mut reasons, &mut written)?;
         report.edges_written += written.len();
@@ -610,29 +612,48 @@ fn resolve_explicit(
             Some(origin),
         )?);
     }
-    // An explicit `sourceSessionId` names the origin outright, and that is
-    // lineage on its own. Leaving it to the fork-group fallback made a
-    // transcript that *says* where it came from wait for a sibling to prove
-    // it — so a provider naming only this field produced a permanently
-    // pending row and no edge at all. Skipped when `forkSessionId` is also
-    // present, which already uses this value as its origin.
-    if evidence.explicit_fork_targets.is_empty() {
-        if let Some(origin) = evidence
-            .explicit_source_session_id
-            .as_deref()
-            .filter(|id| !id.is_empty() && *id != evidence.session_id)
-        {
-            written.push(write_edge(
-                conn,
-                evidence,
-                RELATIONSHIP_FORK,
-                origin,
-                Some(evidence.session_id.as_str()),
-                REF_SOURCE_SESSION,
-                Some(origin),
-            )?);
-        }
+    Ok(())
+}
+
+/// An explicit `sourceSessionId`, when nothing else has said where this
+/// transcript came from.
+///
+/// The field names the origin outright, which is lineage on its own — leaving
+/// it to the fork-group fallback made a transcript that *says* where it came
+/// from wait for a sibling to prove it. But it is the weakest of the explicit
+/// signals, and on its own it does not say *how* the conversation carried on.
+/// A file that also carries `continuedFromSessionId`, a resume marker or a
+/// resolvable `parentUuid` has already been explained by a signal that does,
+/// so emitting this as well would give one transcript two parents — or a
+/// `fork` and a `continuation` to the same session. Those signals run first
+/// and this runs only if they wrote nothing.
+///
+/// `sourceSessionId` is still recorded as `origin_session_id` on whichever
+/// edge they did write, so the origin is never lost by being skipped here.
+fn resolve_explicit_source(
+    conn: &Connection,
+    evidence: &ContinuityEvidence,
+    written: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if !written.is_empty() {
+        return Ok(());
     }
+    let Some(origin) = evidence
+        .explicit_source_session_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != evidence.session_id)
+    else {
+        return Ok(());
+    };
+    written.push(write_edge(
+        conn,
+        evidence,
+        RELATIONSHIP_FORK,
+        origin,
+        Some(evidence.session_id.as_str()),
+        REF_SOURCE_SESSION,
+        Some(origin),
+    )?);
     Ok(())
 }
 
@@ -668,7 +689,13 @@ fn resolve_resume(
         target,
         Some(evidence.session_id.as_str()),
         REF_RESUME_MARKER,
-        Some(target),
+        // The explicit origin when the file names one, so skipping the
+        // source-only fork never loses it.
+        evidence
+            .explicit_source_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && *id != evidence.session_id)
+            .or(Some(target)),
     )?);
     Ok(())
 }
@@ -1969,5 +1996,213 @@ mod tests {
         let pending = pending_reasons(&conn, "claude", "shared").unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].1.contains("a fork needs a sibling"));
+    }
+
+    #[test]
+    fn a_transcript_with_stronger_lineage_gets_one_parent_not_two() {
+        // `sourceSessionId` names the origin but not how the conversation
+        // carried on, so it is the weakest explicit signal. Emitting it beside
+        // `continuedFromSessionId` gave one transcript two parents — and when
+        // both fields name the same session, a `fork` and a `continuation` to
+        // the same place.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continued.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"continued\",\"uuid\":\"c-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"continuedFromSessionId\":\"prior\",",
+                "\"sourceSessionId\":\"origin\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"carry on\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+
+        let parents: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT relationship, parent_session_id, origin_session_id \
+                 FROM session_relationships WHERE child_session_id = 'continued' \
+                 ORDER BY parent_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            parents,
+            vec![(
+                RELATIONSHIP_CONTINUATION.to_string(),
+                "prior".to_string(),
+                // The origin is kept on the edge that was written, so
+                // skipping the source-only fork loses nothing.
+                Some("origin".to_string())
+            )],
+            "exactly one parent, from the signal that says how it carried on"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_parent_uuid_also_outranks_a_source_fork() {
+        // The same rule for the inferred-but-resolvable signal: a transcript
+        // whose first record answers an indexed record has been explained by
+        // something that names the relationship, so the source is recorded as
+        // the origin rather than as a second parent.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, _) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        let follower = dir.path().join("follower.jsonl");
+        std::fs::write(
+            &follower,
+            concat!(
+                "{\"sessionId\":\"follower\",\"uuid\":\"follow-u\",",
+                "\"parentUuid\":\"origin-a\",\"type\":\"user\",",
+                "\"sourceSessionId\":\"elsewhere\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"carry on\"},",
+                "\"timestamp\":\"2026-08-31T11:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &follower);
+
+        let parents: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT relationship, parent_session_id, origin_session_id \
+                 FROM session_relationships WHERE child_session_id = 'follower' \
+                 ORDER BY parent_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            parents,
+            vec![(
+                RELATIONSHIP_CONTINUATION.to_string(),
+                "origin".to_string(),
+                Some("elsewhere".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_resume_marker_also_outranks_a_source_fork() {
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resumer.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"resumer\",\"uuid\":\"r-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"sourceSessionId\":\"origin\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"/resume prior\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+
+        let parents: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT relationship, parent_session_id, origin_session_id \
+                 FROM session_relationships WHERE child_session_id = 'resumer' \
+                 ORDER BY parent_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            parents,
+            vec![(
+                RELATIONSHIP_RESUME.to_string(),
+                "prior".to_string(),
+                Some("origin".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn deleting_an_origin_leaves_its_continuation_recoverable() {
+        // Deleting a session removes every relationship touching it, and the
+        // dependent transcript's evidence row was left resolved — with the
+        // edge that was the only way to rediscover that dependent now gone.
+        // Rehydrating the origin would never rebuild the continuation.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, follower) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        ingest_file(&conn, &follower);
+        assert_eq!(edges(&conn, "origin").len(), 1);
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (source, session_id) VALUES ('claude', 'origin')",
+            [],
+        )
+        .unwrap();
+
+        // The origin is deleted: its events and its edges go with it.
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'claude' AND session_id = 'origin'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'origin'",
+            [],
+        )
+        .unwrap();
+        assert!(edges(&conn, "origin").is_empty());
+
+        // Rehydrating it brings the continuation back, because the dependent
+        // was marked unreconciled before its edge was removed.
+        ingest_file(&conn, &origin);
+        assert_eq!(
+            edges(&conn, "origin")
+                .into_iter()
+                .map(|edge| (edge.0, edge.1))
+                .collect::<Vec<_>>(),
+            vec![(
+                RELATIONSHIP_CONTINUATION.to_string(),
+                Some("follower".to_string())
+            )],
+            "the continuation is rebuilt from the dependent's banked evidence"
+        );
+    }
+
+    #[test]
+    fn deleting_an_unrelated_session_reopens_nothing() {
+        // The positive control: the deletion trigger reopens the dependents of
+        // the session that went away, not every row in the table.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, follower) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        ingest_file(&conn, &follower);
+        assert_eq!(reconcile(&conn, "claude").unwrap().considered, 0);
+
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (source, session_id) VALUES ('claude', 'stranger')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'claude' AND session_id = 'stranger'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile(&conn, "claude").unwrap().considered,
+            0,
+            "nothing depended on the deleted session"
+        );
+        assert_eq!(edges(&conn, "origin").len(), 1);
     }
 }
