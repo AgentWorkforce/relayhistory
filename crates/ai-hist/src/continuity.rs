@@ -39,6 +39,7 @@ const REF_CONTINUED_FROM: &str = "continuedFromSessionId";
 const REF_FORK_SESSION: &str = "forkSessionId";
 const REF_RESUME_MARKER: &str = "resume-marker";
 const REF_SHARED_SESSION_ID: &str = "sharedSessionId";
+const REF_SOURCE_SESSION: &str = "sourceSessionId";
 
 /// What one transcript says about where its conversation came from.
 ///
@@ -609,6 +610,29 @@ fn resolve_explicit(
             Some(origin),
         )?);
     }
+    // An explicit `sourceSessionId` names the origin outright, and that is
+    // lineage on its own. Leaving it to the fork-group fallback made a
+    // transcript that *says* where it came from wait for a sibling to prove
+    // it — so a provider naming only this field produced a permanently
+    // pending row and no edge at all. Skipped when `forkSessionId` is also
+    // present, which already uses this value as its origin.
+    if evidence.explicit_fork_targets.is_empty() {
+        if let Some(origin) = evidence
+            .explicit_source_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && *id != evidence.session_id)
+        {
+            written.push(write_edge(
+                conn,
+                evidence,
+                RELATIONSHIP_FORK,
+                origin,
+                Some(evidence.session_id.as_str()),
+                REF_SOURCE_SESSION,
+                Some(origin),
+            )?);
+        }
+    }
     Ok(())
 }
 
@@ -718,8 +742,15 @@ fn resolve_fork_group(
     let Some(origin) = evidence.origin_session_id() else {
         return Ok(());
     };
-    // An explicit fork field already established the branch.
-    if !evidence.explicit_fork_targets.is_empty() {
+    // An explicit field already established the branch — `forkSessionId`, or
+    // a `sourceSessionId` naming an origin of its own. The group inference is
+    // only ever the fallback for a transcript with no explicit lineage.
+    if !evidence.explicit_fork_targets.is_empty()
+        || evidence
+            .explicit_source_session_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != evidence.session_id)
+    {
         return Ok(());
     }
     let group = fork_group(conn, &evidence.source, &origin)?;
@@ -1836,5 +1867,107 @@ mod tests {
             report.considered, 1,
             "only the recaptured transcript, which nothing else depends on"
         );
+    }
+
+    #[test]
+    fn a_claude_transcript_naming_only_a_source_session_is_a_branch_of_it() {
+        // A provider that writes `sourceSessionId` and nothing else has said
+        // where the conversation came from. Leaving that to the fork-group
+        // fallback made it wait for a sibling to prove what it already
+        // stated, so it stayed pending forever and produced no edge.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branch.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"branch\",\"uuid\":\"b-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"sourceSessionId\":\"origin\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"branched\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+
+        let rows = edges(&conn, "origin");
+        assert_eq!(
+            rows,
+            vec![(
+                RELATIONSHIP_FORK.to_string(),
+                Some("branch".to_string()),
+                "fork:branch".to_string(),
+                REF_SOURCE_SESSION.to_string(),
+            )]
+        );
+        assert!(
+            pending_reasons(&conn, "claude", "branch").unwrap().is_empty(),
+            "a transcript that names its origin is not waiting on a sibling"
+        );
+    }
+
+    #[test]
+    fn a_codex_rollout_naming_only_a_source_session_is_a_branch_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-branch.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"thread-b\",\"cwd\":\"/tmp/proj\",",
+                "\"cli_version\":\"0.148.0\",\"sourceSessionId\":\"thread-a\"}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        capture_codex_rollout(&conn, &rollout).unwrap();
+        reconcile(&conn, "codex").unwrap();
+
+        let row: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT relationship, parent_session_id, child_session_id, origin_session_id \
+                 FROM session_relationships WHERE source = 'codex'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                RELATIONSHIP_FORK.to_string(),
+                "thread-a".to_string(),
+                Some("thread-b".to_string()),
+                Some("thread-a".to_string())
+            )
+        );
+        assert!(pending_reasons(&conn, "codex", "thread-b")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_transcript_with_no_explicit_lineage_still_waits_for_a_sibling() {
+        // The positive control for the two above: the same shape *without*
+        // the explicit field is exactly the case the fork-group fallback is
+        // for, and it is still reported as pending rather than guessed at.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-the-session-id.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"shared\",\"uuid\":\"s-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert!(edges(&conn, "shared").is_empty());
+        let pending = pending_reasons(&conn, "claude", "shared").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].1.contains("a fork needs a sibling"));
     }
 }
