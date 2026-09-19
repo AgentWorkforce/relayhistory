@@ -30,7 +30,21 @@ export const localCoreDependency = "file:../../../sdk-ts";
 /** The `[package]` header of a crate manifest, so the crate names itself. */
 // Windows runners check out with CRLF, so a line break is `\r?\n` here.
 const crateNamePattern = /\[package\]\r?\nname = "([^"]+)"\r?\nversion = "/;
-/** That same crate's version line, in the manifest and in its own lockfile. */
+/** The published core crate every plugin crate depends on by path. */
+export const coreCrate = "ai-hist";
+/** One `[[package]]` version line in a lockfile. */
+const lockVersionPattern = (crate) =>
+  new RegExp(
+    `(\\[\\[package\\]\\]\\r?\\nname = "${crate}"\\r?\\nversion = ")[^"]+(")`,
+  );
+/**
+ * That same crate's version line in the manifest and in its own lockfile,
+ * plus the lockfile's entry for the core crate. `ai-hist` is a path dependency
+ * (`crates/ai-hist`) whose `Cargo.toml` the core release bumps in the same
+ * commit, so the plugin lock has to name the new version too or every
+ * `cargo … --locked` in CI fails with "cannot update the lock file". That is
+ * exactly what took `main` red after 0.18.8.
+ */
 const crateVersionPatterns = (crate) => [
   [
     "Cargo.toml",
@@ -38,12 +52,8 @@ const crateVersionPatterns = (crate) => [
       `(\\[package\\]\\r?\\nname = "${crate}"\\r?\\nversion = ")[^"]+(")`,
     ),
   ],
-  [
-    "Cargo.lock",
-    new RegExp(
-      `(\\[\\[package\\]\\]\\r?\\nname = "${crate}"\\r?\\nversion = ")[^"]+(")`,
-    ),
-  ],
+  ["Cargo.lock", lockVersionPattern(crate)],
+  ["Cargo.lock", lockVersionPattern(coreCrate)],
 ];
 
 /**
@@ -68,7 +78,7 @@ async function setCrateVersion(directory, version) {
   for (const [file, pattern] of crateVersionPatterns(crate)) {
     const path = resolve(directory, file);
     const contents = await readFile(path, "utf8");
-    assert.match(contents, pattern, `${path} has no ${crate} version to set`);
+    assert.match(contents, pattern, `${path} has no version to set for ${pattern}`);
     await writeFile(
       path,
       contents.replace(
@@ -76,7 +86,7 @@ async function setCrateVersion(directory, version) {
         (_, prefix, suffix) => prefix + version + suffix,
       ),
     );
-    written.push(path);
+    if (!written.includes(path)) written.push(path);
   }
   return written;
 }

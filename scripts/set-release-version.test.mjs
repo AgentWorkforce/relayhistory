@@ -89,9 +89,17 @@ name = "anyhow"
 version = "1.0.99"
 
 [[package]]
+name = "ai-hist"
+version = "${stale}"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "${info.binary}"
 version = "${stale}"
 dependencies = [
+ "ai-hist",
  "anyhow",
 ]
 `,
@@ -164,6 +172,14 @@ test("the release version reaches every manifest, peer range and lock coordinate
     assert.ok(
       crateLock.includes(
         `[[package]]\nname = "${info.binary}"\nversion = "${version}"\n`,
+      ),
+      crateLock,
+    );
+    // The core crate is a path dependency whose version the same release
+    // bumps; a stale entry fails every `--locked` build in CI (0.18.8).
+    assert.ok(
+      crateLock.includes(
+        `[[package]]\nname = "ai-hist"\nversion = "${version}"\n`,
       ),
       crateLock,
     );
