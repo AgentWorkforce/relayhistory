@@ -224,14 +224,24 @@ claude `sometimes`, and cursor/grok/opencode/relay `never`. Fork, resume and
 continuation are not written by any path.
 
 **Session metadata.** The `sessions` table has `originator`, `agent_version`,
-`repo_url`, `initial_commit`, `workspace_roots_json` and `models_json`, but
-`upsert_session` — the full-ingest path — writes none of them. They are
-populated only by the shallow discovery path, and only where the provider
-exposes them cheaply: codex is the one complete row (`session_meta` gives
-originator, `cli_version`, git remote, initial commit and workspace roots);
-claude gets the record `version` and cwd/branch; cursor gets a cwd decoded from
-the directory name; grok and opencode get cwd and (for grok) branch; relay has
-none. See the per-provider matrix in
+`repo_url`, `initial_commit`, `workspace_roots_json` and `models_json`.
+`upsert_session` — the parser-side write — sets none of them; they are written
+by the shallow discovery upsert. **That is not a second call the consumer has
+to make**: `sync_basic` ends by running
+`discover::discover_sessions_with_providers` over every shallow provider
+(`crates/ai-hist/src/ingest.rs`), so one `sync` populates them, which is what
+`docs/architecture.md` means by "sync ends by running shallow discovery". A
+single `SessionStore::sync` against a fresh database leaves a Codex row with
+`cwd`, `git_branch`, `agent_version`, `repo_url`, `initial_commit` and
+`workspace_roots_json` all set and `discovery_state = 'full'` — verified
+empirically, not inferred.
+
+The cells therefore track what the _provider_ exposes, not which internal pass
+writes it: codex is the one complete row (`session_meta` gives originator,
+`cli_version`, git remote, initial commit and workspace roots); claude gets the
+record `version` and cwd/branch; cursor gets a cwd decoded from the directory
+name; grok and opencode get cwd and (for grok) branch; relay has none. See the
+per-provider matrix in
 [`docs/session-catalog.md`](../session-catalog.md#per-provider-capability-matrix),
 which this table must stay consistent with.
 
