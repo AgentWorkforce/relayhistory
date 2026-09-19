@@ -848,16 +848,15 @@ jobs:
         run: cargo publish --dry-run -p ai-hist --allow-dirty --locked
       - name: Publish to crates.io
         if: ${{ !inputs.dry_run }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           if curl -sf "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
             echo "ai-hist ${VERSION} already exists on crates.io; skip"
             exit 0
           fi
-          # Dry-run already compiled the package. Skip verify so the registry
-          # token is not present while Cargo runs repository-controlled scripts.
+          # Trusted publishing (GitHub OIDC). Do not set CARGO_REGISTRY_TOKEN:
+          # an empty token makes Cargo skip OIDC and fail with
+          # "please provide a non-empty token".
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
   plugins:

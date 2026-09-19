@@ -44,8 +44,9 @@ and `crates/ai-hist-napi/src/lib.rs`).
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
 4. `publish-crate` publishes the `ai-hist` crate to crates.io at that same
-   version (OIDC trusted publishing, or `CARGO_REGISTRY_TOKEN`). If the version
-   already exists, the job skips rather than failing. `dry_run` runs
+   version via GitHub OIDC trusted publishing. Do not set `CARGO_REGISTRY_TOKEN`
+   in this job: an empty token makes Cargo skip OIDC. If the version already
+   exists, the job skips rather than failing. `dry_run` runs
    `cargo publish --dry-run -p ai-hist` and publishes nothing. A crates.io-only
    retry uses `skip_core` with the already-published `custom_version`; the job
    checks out `sdk-ts-v<version>` and publishes the crate from that tag.
