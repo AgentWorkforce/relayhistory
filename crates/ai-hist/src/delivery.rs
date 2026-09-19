@@ -617,9 +617,33 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
     })
 }
 
-fn check_lease(conn: &Connection, lease: &DeliveryLease, now: i64) -> Result<()> {
-    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs j JOIN delivery_batches b ON b.job_id=j.id WHERE j.id=? AND j.state='active' AND j.worker_id=? AND j.fence=? AND j.lease_until_ms>? AND b.id=? AND b.state='leased')",params![lease.job_id,lease.worker_id,lease.fence,now,lease.batch_id],|row| row.get(0))?;
-    ensure!(valid, "delivery lease expired or was fenced");
+/// Whether this lease still owns its batch.
+///
+/// Ownership, deliberately, and not recency. `claim_batch` bumps `fence` and
+/// rewrites `worker_id` on every claim, so a takeover is always visible here
+/// as a fence or worker mismatch; the job state and the batch's `leased` state
+/// close the rest. A `lease_until_ms > now` term would add nothing to that
+/// proof, because an expired lease that nobody has taken still carries this
+/// worker's fence.
+///
+/// What it would add is a way to refuse a worker's own writes for no reason.
+/// Expiry is a signal to *other* workers that an abandoned batch may be
+/// stolen, and `claim_batch` enforces that itself. Reading it here as "the
+/// claim is gone" meant a drain whose 100 ms lease lapsed while its receiver
+/// panicked could not even record the resulting transient failure: the write
+/// was refused with "lease expired or was fenced" when nothing had been
+/// fenced, the retry backoff was never applied, and a clean retryable outcome
+/// was escalated into a job-level state error. The same refusal hit
+/// `acknowledge`, discarding sends that had already succeeded.
+///
+/// This is safe precisely because every caller runs it inside the same write
+/// transaction as the write it guards. SQLite serializes those transactions,
+/// so a fence that still matches at this moment means no other worker holds
+/// the batch at this moment, and there is no window between the check and the
+/// write for one to appear.
+fn check_lease(conn: &Connection, lease: &DeliveryLease, _now: i64) -> Result<()> {
+    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs j JOIN delivery_batches b ON b.job_id=j.id WHERE j.id=? AND j.state='active' AND j.worker_id=? AND j.fence=? AND b.id=? AND b.state='leased')",params![lease.job_id,lease.worker_id,lease.fence,lease.batch_id],|row| row.get(0))?;
+    ensure!(valid, "delivery lease was fenced by another worker");
     Ok(())
 }
 fn pending_batch(
@@ -720,20 +744,32 @@ pub fn claim_batch(
     }))
 }
 
+/// Extend a claim, dating the extension from *inside* the write transaction.
+///
+/// `clock` is read after the lock is acquired, not before the call. Acquiring
+/// the write lock can block for as long as the connection's busy policy
+/// allows, and a timestamp taken beforehand is stale by exactly that much: the
+/// renewal would then commit `stale_now + lease_ms`, which for any wait longer
+/// than the lease is a deadline already in the past. The call returns `Ok`, the
+/// keepalive records a renewed lease it does not have, and another worker is
+/// free to reclaim and dispatch the same batch while this one is still
+/// sending. Reading the clock after the lock makes the extension mean what it
+/// says.
 pub fn renew_lease(
     conn: &Connection,
     lease: &DeliveryLease,
     lease_ms: i64,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<DeliveryLease> {
     ensure!(
         (1..=86_400_000).contains(&lease_ms),
         "invalid lease duration"
     );
+    let tx = write_transaction(conn)?;
+    let now_ms = clock();
     let expires_at_ms = now_ms
         .checked_add(lease_ms)
         .context("delivery clock overflow")?;
-    let tx = write_transaction(conn)?;
     check_lease(&tx, lease, now_ms)?;
     tx.execute(
         "UPDATE delivery_jobs SET lease_until_ms=? WHERE id=?",
