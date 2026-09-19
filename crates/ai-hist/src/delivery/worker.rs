@@ -597,7 +597,7 @@ impl Worker<'_> {
                 receiver.mapping_version(),
                 &prepared.content_type,
                 &prepared.body,
-                (self.clock)(),
+                self.clock,
             )
             .map_err(|_| transient())?;
         }
@@ -607,7 +607,7 @@ impl Worker<'_> {
         // Eligibility can change while a receiver maps its payload. Recheck it
         // in core immediately before transport and send the persisted bytes.
         let payload =
-            validate_dispatch(&self.conn, &claim.lease, (self.clock)()).map_err(|_| transient())?;
+            validate_dispatch(&self.conn, &claim.lease, self.clock).map_err(|_| transient())?;
         if stopping() {
             return Err(transient());
         }
