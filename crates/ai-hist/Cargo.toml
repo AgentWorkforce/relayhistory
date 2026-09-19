@@ -38,6 +38,11 @@ fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: `progress_handler` is the only way to commit a write from a
+# second connection *between* the two reads `session_user_turns_page` makes,
+# which is the race the single-snapshot transaction exists to close. The
+# feature adds no dependencies and is not enabled for the published library.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 
 [[test]]
 name = "delivery_worker"

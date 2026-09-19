@@ -329,6 +329,59 @@ read.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+Tool-result fidelity is a separate capability. The columns live on the
+`session_events` rows whose `kind` is `tool_result`, and every one of them is
+null when the provider does not record it — never a stand-in zero or a guessed
+status, because a fabricated measurement reads exactly like a real one:
+
+| Source | `payload_bytes` / `payload_hash` | `payload_truncated` | `call_index` / `event_index` | `result_status` | `event_source` | `error_signal` | `subagent_session_id` / `agent_id` |
+|---|---|---|---|---|---|---|---|
+| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
+| **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
+| **cursor**, **grok**, **opencode**, **relay** | – | – | – | – | – | – | – |
+
+`payload_bytes` is the raw UTF-8 length of what the provider handed back —
+a string payload as-is, any other JSON payload stable-stringified with sorted
+keys — measured before the `text` column is materialized, and `payload_hash`
+is the first 16 hex characters of that payload's sha256. Both match
+relayburn's `stable_stringify` / `content_hash`, so a value measured on either
+side compares equal rather than merely looking alike. `payload_truncated`
+records that the *harness* had already cut the output, which is the difference
+between "this tool returned 8 KB" and "this tool returned far more and 8 KB is
+a floor".
+
+Codex reports how a call ended out of band (`exec_command_end`,
+`patch_apply_end`, `mcp_tool_call_end`), so its result rows are written with
+`result_status = 'unknown'` and settled when the turn closes at
+`task_complete`. End of file is **not** a turn boundary: a live rollout's last
+turn can still receive the `exec_command_end` that fails one of its calls after
+the bytes a sync read, so a partial read records the failures it saw and leaves
+anything else `unknown`. Only `task_complete` can call a result a success. The
+remaining providers land with their parity issues; they share the
+`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
+for them.
+
+A result with nothing displayable in it — a silent command's empty string, a
+structured payload carrying no text — is still recorded. `payload_bytes = 0` is
+a measurement; dropping the row would lose the call's linkage and its place in
+the ordering too.
+
+Because the columns are nullable and the schema migration marks itself
+complete, an upgraded install would otherwise keep skipping unchanged
+transcripts on the sync fast path and leave every historical tool result null.
+Plain `sync` therefore runs one backfill pass per provider, recorded in the
+sync state, during which a transcript whose indexed tool results have no
+`event_index` is re-read. Selecting files that way is narrower than
+invalidating the whole stamp map, which would re-read the entire archive.
+
+The pass is bounded by a recorded generation rather than by "some row is still
+null", and that distinction matters: `session_events` is keyed by
+`(source, session_id)`, local and remote observations of one session share
+that identity, and an adapter may contribute a tool result with no fidelity at
+all. Re-reading the local transcript never populates a row that came from
+somewhere else, so a null-row condition could stay true forever and re-read an
+unchanged file on every sync without ever repairing it.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
@@ -545,6 +598,18 @@ are backfilled with a local presence during migration. Scope queries use this
 table to select sessions and aggregate their `locations`; they do not duplicate
 the session or its events.
 
+`session_events` carries the per-tool-result fidelity columns `tool_use_id`,
+`payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
+`event_index`, `result_status`, `event_source`, `error_signal`,
+`subagent_session_id` and `agent_id`, and `session_hydration_checkpoints`
+carries `last_tool_result_index`. They are not all TEXT, so they are added by
+the `session_events_tool_result_fidelity_v1` marker migration rather than by
+the missing-column check that serves the catalog's TEXT columns. The marker is
+required, so a database written before this shape is routed through the
+writable open instead of being read as current and failing with
+`no such column`. Rows indexed before the migration keep their text and report
+no measurement.
+
 `session_relationships` is the delegation table, keyed by
 `(source, parent_session_id, relationship_uid)`. `relationship_uid` is
 `child:<child_session_id>` for an observed child and
@@ -597,6 +662,22 @@ discoverable".
   result as JSONL when line-oriented records are more convenient. Both run on
   a blocking worker thread and accept `scope` / `sources` / `limit`, with `beforeMs` and
   `after` (the previous page's `nextCursor`) on the listing.
+- **Native (napi), tool-result fidelity** — `getSessionEventsPage(...)` carries
+  the columns above on every event; `getSessionUserTurnsPage(source,
+  sessionId, options?)` returns one keyset page of user turns, each with the
+  ordered `[{kind, toolUseId, byteLen, isError}]` blocks its message carried.
+  Both are cache-only and derived from `session_events`, so they cannot
+  disagree with the transcript. Both reads a page makes — the turn headers and
+  each turn's blocks — run inside one deferred read transaction, so a sync
+  writing concurrently cannot hand back a header whose blocks have moved or
+  vanished behind a cursor that already advanced past it.
+  A turn is what arrived on one user message;
+  harness lines stored as tool results — Claude subagent notifications — are
+  not turns and are excluded, because grouping on `role` alone would invent a
+  turn that is neither human text nor an in-message result. `approxTokens` is deliberately absent: every
+  estimate available here is a bytes-per-token heuristic, and a heuristic
+  served beside measured values is indistinguishable from a measurement at the
+  call site.
 - **Native (napi), delegation** — `getSessionRelationships(options)` returns one
   session's edges in both directions plus the provider's capabilities;
   `getSessionTree(options)` returns the pre-order descendant tree bounded by
@@ -606,7 +687,9 @@ discoverable".
   session with no recorded delegation also returns.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
   same contract for Node consumers, as do `getSessionRelationships()`,
-  `getSessionTree()`, `getSessionChildrenPage()`, and the `sessionDescendants()`
+  `getSessionTree()`, `getSessionChildrenPage()`,
+  `getSessionUserTurnsPage()` / `getSessionUserTurns()` / `sessionUserTurns()`,
+  and the `sessionDescendants()`
   / `sessionEventsIncludingDescendants()` iterators; see the SDK's own
   documentation for the exact signatures.
 - **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`

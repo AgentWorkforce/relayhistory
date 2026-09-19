@@ -18,8 +18,8 @@ use ai_hist::{
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
     session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
-    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter,
-    RelationshipCapabilities as CoreRelationshipCapabilities,
+    session_user_turns_page as core_session_user_turns_page, stats_scoped as core_stats_scoped,
+    HistoryEntry, QueryFilter, RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
     RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
@@ -27,6 +27,7 @@ use ai_hist::{
     SessionRelationships as CoreSessionRelationships, SessionScope,
     SessionToolCall as CoreSessionToolCall, SessionTree as CoreSessionTree,
     SessionTreeNode as CoreSessionTreeNode, SessionTreeOptions as CoreSessionTreeOptions,
+    SessionUserTurn as CoreSessionUserTurn, SessionUserTurnBlock as CoreSessionUserTurnBlock,
     DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
@@ -34,7 +35,7 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -262,6 +263,27 @@ pub struct NativeSessionEvent {
     pub model: Option<String>,
     pub token_json: Option<String>,
     pub event_uid: String,
+    /// Per-tool-result fidelity. Null on every row that is not a tool result,
+    /// and on a tool-result row whose provider does not record the fact.
+    pub tool_use_id: Option<String>,
+    /// Raw UTF-8 byte length of the provider's result payload.
+    pub payload_bytes: Option<i64>,
+    /// True when the harness had already truncated the payload.
+    pub payload_truncated: Option<bool>,
+    /// First 16 hex characters of the payload's sha256.
+    pub payload_hash: Option<String>,
+    /// n-th result recorded for this `toolUseId`, from zero.
+    pub call_index: Option<i64>,
+    /// Position of this result in the transcript's tool-result order.
+    pub event_index: Option<i64>,
+    /// `running` / `completed` / `errored` / `cancelled` / `unknown`.
+    pub result_status: Option<String>,
+    /// `tool_result` / `subagent_notification` / `function_call_output`.
+    pub event_source: Option<String>,
+    /// Which provider signal set the error.
+    pub error_signal: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub agent_id: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -282,6 +304,17 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             model: event.model,
             token_json: event.token_json,
             event_uid: event.event_uid,
+            tool_use_id: event.tool_use_id,
+            payload_bytes: event.payload_bytes,
+            payload_truncated: event.payload_truncated.map(|value| value != 0),
+            payload_hash: event.payload_hash,
+            call_index: event.call_index,
+            event_index: event.event_index,
+            result_status: event.result_status,
+            event_source: event.event_source,
+            error_signal: event.error_signal,
+            subagent_session_id: event.subagent_session_id,
+            agent_id: event.agent_id,
         }
     }
 }
@@ -396,6 +429,73 @@ pub struct EvidencePageOptions {
     pub db_path: Option<String>,
     pub limit: Option<i64>,
     pub after: Option<EvidenceCursor>,
+}
+
+#[napi(object)]
+pub struct NativeSessionUserTurnBlock {
+    /// `text` or `tool_result`.
+    pub kind: String,
+    pub tool_use_id: Option<String>,
+    /// Measured payload bytes when the parser recorded them, otherwise the
+    /// UTF-8 length of the stored text.
+    pub byte_len: i64,
+    /// True when the result is known to have failed, false when it is known
+    /// to have succeeded, null when the provider has not said.
+    pub is_error: Option<bool>,
+}
+
+impl From<CoreSessionUserTurnBlock> for NativeSessionUserTurnBlock {
+    fn from(block: CoreSessionUserTurnBlock) -> Self {
+        Self {
+            kind: block.kind,
+            tool_use_id: block.tool_use_id,
+            byte_len: block.byte_len,
+            is_error: block.is_error.map(|value| value != 0),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionUserTurn {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub ts_ms: i64,
+    pub blocks: Vec<NativeSessionUserTurnBlock>,
+}
+
+impl From<CoreSessionUserTurn> for NativeSessionUserTurn {
+    fn from(turn: CoreSessionUserTurn) -> Self {
+        Self {
+            id: turn.id,
+            source: turn.source,
+            session_id: turn.session_id,
+            message_id: turn.message_id,
+            ts_ms: turn.ts_ms,
+            blocks: turn
+                .blocks
+                .into_iter()
+                .map(NativeSessionUserTurnBlock::from)
+                .collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct UserTurnsPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUserTurnsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub user_turns: Vec<NativeSessionUserTurn>,
+    pub next_cursor: Option<EventCursor>,
 }
 
 #[napi(object)]
@@ -658,6 +758,58 @@ pub async fn get_session_tool_calls_page(
             .map(NativeSessionToolCall::from)
             .collect(),
         next_cursor: page.next_cursor.map(evidence_cursor),
+    })
+}
+
+/// One bounded page of user turns for one session, oldest first.
+///
+/// Each turn carries the ordered blocks the provider attached to one user
+/// message: the human's own text and the tool results that came back with it,
+/// with the measured payload size of each. Computed from `session_events`
+/// rather than a table of its own, so it cannot disagree with the transcript.
+#[napi]
+pub async fn get_session_user_turns_page(
+    source: String,
+    session_id: String,
+    options: Option<UserTurnsPageOptions>,
+) -> napi::Result<SessionUserTurnsPage> {
+    let options = options.unwrap_or(UserTurnsPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreEventCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionUserTurnPage {
+            user_turns: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_event_read_current,
+        move |conn| core_session_user_turns_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionUserTurnsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        user_turns: page
+            .user_turns
+            .into_iter()
+            .map(NativeSessionUserTurn::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| EventCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
     })
 }
 

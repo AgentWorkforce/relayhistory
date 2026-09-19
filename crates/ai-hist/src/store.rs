@@ -142,6 +142,17 @@ CREATE TABLE IF NOT EXISTS session_events (
     model TEXT,
     token_json TEXT,
     event_uid TEXT NOT NULL,
+    tool_use_id TEXT,
+    payload_bytes INTEGER,
+    payload_truncated INTEGER,
+    payload_hash TEXT,
+    call_index INTEGER,
+    event_index INTEGER,
+    result_status TEXT,
+    event_source TEXT,
+    error_signal TEXT,
+    subagent_session_id TEXT,
+    agent_id TEXT,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -550,6 +561,7 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    "session_events_tool_result_fidelity_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -831,6 +843,7 @@ CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
     source_bytes INTEGER NOT NULL DEFAULT 0,
     records_parsed INTEGER NOT NULL DEFAULT 0,
     include_related INTEGER NOT NULL DEFAULT 1,
+    last_tool_result_index INTEGER,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (source, session_id, location)
 );
@@ -875,6 +888,7 @@ END;
     // read-only guard) is two chances to drift, and every catalog column is
     // TEXT, so the guard list is the migration list.
     migrate_session_relationships_v2(conn)?;
+    migrate_tool_result_fidelity_v1(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
@@ -1107,6 +1121,69 @@ DROP TABLE session_relationships_v1;
     }
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_relationships_v2');",
+    )?;
+    Ok(())
+}
+
+/// Per-tool-result fidelity columns, added in place for existing databases.
+///
+/// These are not all TEXT, so they cannot ride along on
+/// [`ensure_text_columns`]: `payload_bytes`, `payload_truncated`,
+/// `call_index`, `event_index` and the checkpoint's `last_tool_result_index`
+/// are integers, and storing a byte count as TEXT would sort
+/// lexicographically the moment anything ranked by it. The marker is part of
+/// [`REQUIRED_SCHEMA_MIGRATIONS`], so a database written before this shape is
+/// routed through the writable open instead of being read as current and
+/// failing with `no such column`.
+///
+/// The caller holds the immediate migration transaction, which makes this
+/// crash-atomic and safe against concurrent first opens.
+const TOOL_RESULT_FIDELITY_COLUMNS: &[(&str, &str, &str)] = &[
+    ("session_events", "tool_use_id", "TEXT"),
+    ("session_events", "payload_bytes", "INTEGER"),
+    ("session_events", "payload_truncated", "INTEGER"),
+    ("session_events", "payload_hash", "TEXT"),
+    ("session_events", "call_index", "INTEGER"),
+    ("session_events", "event_index", "INTEGER"),
+    ("session_events", "result_status", "TEXT"),
+    ("session_events", "event_source", "TEXT"),
+    ("session_events", "error_signal", "TEXT"),
+    ("session_events", "subagent_session_id", "TEXT"),
+    ("session_events", "agent_id", "TEXT"),
+    (
+        "session_hydration_checkpoints",
+        "last_tool_result_index",
+        "INTEGER",
+    ),
+];
+
+fn migrate_tool_result_fidelity_v1(conn: &Connection) -> Result<()> {
+    let migrated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_events_tool_result_fidelity_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    for (table, column, kind) in TOOL_RESULT_FIDELITY_COLUMNS {
+        let present: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"),
+            [column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            // `table`, `column` and `kind` come exclusively from the constant
+            // list above, never from user input.
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                [],
+            )
+            .with_context(|| format!("adding column {table}.{column}"))?;
+        }
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_events_tool_result_fidelity_v1');",
     )?;
     Ok(())
 }
@@ -1550,6 +1627,73 @@ pub struct SessionEvent {
     pub model: Option<String>,
     pub token_json: Option<String>,
     pub event_uid: String,
+    /// Per-tool-result fidelity. Every field below is `None` on a row that is
+    /// not a tool result, and on a tool-result row whose provider does not
+    /// record that fact — never a stand-in value, because a fabricated zero
+    /// byte count or a guessed status reads exactly like a measured one.
+    pub tool_use_id: Option<String>,
+    /// Raw UTF-8 byte length of the provider's result payload, measured
+    /// before `text` is materialized.
+    pub payload_bytes: Option<i64>,
+    /// 1 when the harness had already truncated the payload it handed back.
+    pub payload_truncated: Option<i64>,
+    /// First 16 hex characters of the payload's sha256.
+    pub payload_hash: Option<String>,
+    /// n-th result recorded for this `tool_use_id`, from zero.
+    pub call_index: Option<i64>,
+    /// Position of this result in the transcript's tool-result order.
+    pub event_index: Option<i64>,
+    /// `running` / `completed` / `errored` / `cancelled` / `unknown`.
+    pub result_status: Option<String>,
+    /// `tool_result` / `subagent_notification` / `function_call_output`.
+    pub event_source: Option<String>,
+    /// Which provider signal set the error: `tool_result.is_error`,
+    /// `exit_code`, `patch_apply`, `mcp_err`, or `subagent_status`.
+    pub error_signal: Option<String>,
+    /// Delegated child session this result reports on.
+    pub subagent_session_id: Option<String>,
+    /// Delegated child agent this result reports on.
+    pub agent_id: Option<String>,
+}
+
+/// Every `session_events` column a [`SessionEvent`] carries, in the order
+/// [`row_to_session_event`] reads them. One list, so a reader and a page
+/// query cannot drift apart.
+const SESSION_EVENT_COLUMNS: &str =
+    "id, source, session_id, project, cwd, git_branch, message_id, \
+     parent_id, ts_ms, role, kind, text, model, token_json, event_uid, tool_use_id, payload_bytes, \
+     payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
+     error_signal, subagent_session_id, agent_id";
+
+fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        project: row.get(3)?,
+        cwd: row.get(4)?,
+        git_branch: row.get(5)?,
+        message_id: row.get(6)?,
+        parent_id: row.get(7)?,
+        ts_ms: row.get(8)?,
+        role: row.get(9)?,
+        kind: row.get(10)?,
+        text: row.get(11)?,
+        model: row.get(12)?,
+        token_json: row.get(13)?,
+        event_uid: row.get(14)?,
+        tool_use_id: row.get(15)?,
+        payload_bytes: row.get(16)?,
+        payload_truncated: row.get(17)?,
+        payload_hash: row.get(18)?,
+        call_index: row.get(19)?,
+        event_index: row.get(20)?,
+        result_status: row.get(21)?,
+        event_source: row.get(22)?,
+        error_signal: row.get(23)?,
+        subagent_session_id: row.get(24)?,
+        agent_id: row.get(25)?,
+    })
 }
 
 /// Stable continuation for normalized session events.
@@ -1601,9 +1745,9 @@ pub struct SessionFileEdit {
     pub cwd: Option<String>,
 }
 
-/// Bump whenever the tool call / file edit page row shapes, ordering, or
-/// cursor semantics require an SDK change.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 1;
+/// Bump whenever the tool call / file edit / user turn page row shapes,
+/// ordering, or cursor semantics require an SDK change.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 2;
 
 /// Stable continuation for tool calls and file edits.
 ///
@@ -1636,8 +1780,8 @@ pub fn session_events(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionEvent>> {
-    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
-        .to_string();
+    let mut sql =
+        format!("SELECT {SESSION_EVENT_COLUMNS} FROM session_events WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1645,25 +1789,7 @@ pub fn session_events(
     }
     sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionEvent {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            project: row.get(3)?,
-            cwd: row.get(4)?,
-            git_branch: row.get(5)?,
-            message_id: row.get(6)?,
-            parent_id: row.get(7)?,
-            ts_ms: row.get(8)?,
-            role: row.get(9)?,
-            kind: row.get(10)?,
-            text: row.get(11)?,
-            model: row.get(12)?,
-            token_json: row.get(13)?,
-            event_uid: row.get(14)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1677,10 +1803,7 @@ pub fn session_events_page(
 ) -> Result<SessionEventPage> {
     let limit = limit.clamp(1, 1_000);
     let mut sql =
-        "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
-                          ts_ms, role, kind, text, model, token_json, event_uid \
-                   FROM session_events WHERE session_id = ?"
-            .to_string();
+        format!("SELECT {SESSION_EVENT_COLUMNS} FROM session_events WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1696,25 +1819,7 @@ pub fn session_events_page(
     params_vec.push((limit + 1).to_string());
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionEvent {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            project: row.get(3)?,
-            cwd: row.get(4)?,
-            git_branch: row.get(5)?,
-            message_id: row.get(6)?,
-            parent_id: row.get(7)?,
-            ts_ms: row.get(8)?,
-            role: row.get(9)?,
-            kind: row.get(10)?,
-            text: row.get(11)?,
-            model: row.get(12)?,
-            token_json: row.get(13)?,
-            event_uid: row.get(14)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let has_more = events.len() > limit as usize;
     if has_more {
@@ -1938,6 +2043,203 @@ pub fn session_file_edits_page(
     });
     Ok(SessionFileEditPage {
         file_edits,
+        next_cursor,
+    })
+}
+
+/// One block inside a user turn: either the human's own text or one tool
+/// result the harness attached to the same message.
+///
+/// `approx_tokens` is deliberately absent. Every estimate available here is a
+/// bytes-per-token heuristic, and a heuristic served from a store that also
+/// serves measured values is indistinguishable from a measurement at the call
+/// site. Consumers that want a token count bring their own tokenizer and
+/// apply it to `byte_len`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionUserTurnBlock {
+    /// `text` or `tool_result`.
+    pub kind: String,
+    /// The call this block answers; `None` on a text block and on a tool
+    /// result whose provider recorded no call id.
+    pub tool_use_id: Option<String>,
+    /// Raw payload bytes when the parser measured them, otherwise the UTF-8
+    /// length of the stored text.
+    pub byte_len: i64,
+    /// 1 when the result is known to have failed, 0 when it is known to have
+    /// succeeded, `None` when the provider has not said.
+    pub is_error: Option<i64>,
+}
+
+/// One user-side message and the ordered blocks it carried.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionUserTurn {
+    /// Row id of the turn's first event; the cursor's tiebreaker.
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    /// Provider message id the blocks share, when there is one.
+    pub message_id: Option<String>,
+    pub ts_ms: i64,
+    pub blocks: Vec<SessionUserTurnBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionUserTurnPage {
+    pub user_turns: Vec<SessionUserTurn>,
+    pub next_cursor: Option<SessionEventCursor>,
+}
+
+/// Byte length of a stored `text` column, counted in bytes rather than
+/// characters so it is comparable with a measured `payload_bytes`.
+const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, LENGTH(CAST(text AS BLOB)), 0)";
+
+/// The grouping key for a user turn: a provider message id when the row has
+/// one, otherwise the row's own identity, so an unattributed event becomes a
+/// turn of its own instead of merging with every other unattributed event.
+const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
+
+/// Which rows are blocks on a user message.
+///
+/// `role` alone is not the discriminator. A Claude subagent notification is a
+/// harness line reporting on a delegated child; it is stored with
+/// `role = 'tool_result'` because that is what it is evidence of, but it never
+/// arrived on a user message and carries its own `message_id`. Grouping by role
+/// alone would turn every one of them into a user turn that is neither human
+/// text nor an in-message tool result. `event_source` is the field that
+/// separates the two, and a row indexed before that column existed is null, so
+/// the test excludes the one source that does not qualify rather than naming
+/// the ones that do.
+const USER_TURN_ROW_FILTER: &str = "role IN ('user', 'tool_result') \
+     AND COALESCE(event_source, '') <> 'subagent_notification'";
+
+/// One bounded page of user turns for one session, oldest first.
+///
+/// Derived from `session_events` rather than a table of its own: the blocks
+/// are exactly the user-side rows the parsers already wrote, and a second
+/// copy of them would be a second thing to keep true. Computing it here
+/// instead of in each consumer is what makes every consumer agree on where a
+/// turn starts and how its bytes are counted.
+///
+/// A turn is the set of rows that arrived on one user message, selected by
+/// [`USER_TURN_ROW_FILTER`] and grouped by provider message id. That is exactly
+/// a Claude user message, whose text and tool-result blocks arrive together.
+/// Codex records each output as its own response item, so a Codex turn is one
+/// block wide; the per-block facts are the same either way. Harness lines
+/// stored as tool results that never arrived on a user message -- Claude
+/// subagent notifications -- are not turns and are excluded.
+pub fn session_user_turns_page(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEventCursor>,
+) -> Result<SessionUserTurnPage> {
+    let limit = limit.clamp(1, 1_000);
+    // The turn headers and each turn's blocks are separate statements, and a
+    // sync writing to this database between them would hand back a header
+    // whose blocks had moved or vanished -- an empty `blocks` array on a turn
+    // that has them, and a cursor that has already advanced past it. One
+    // deferred read transaction puts every statement on one SQLite snapshot.
+    // WAL readers do not block the writer, so this costs nothing but keeps
+    // the page internally consistent.
+    //
+    // A caller that already holds a transaction supplies the snapshot itself;
+    // opening a nested one would fail outright.
+    let snapshot = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let mut sql = format!(
+        "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
+         MIN(NULLIF(message_id, '')) AS turn_message_id \
+         FROM session_events \
+         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+         GROUP BY turn_key"
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> =
+        vec![source.to_string().into(), session_id.to_string().into()];
+    if let Some(cursor) = after {
+        sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
+        params_vec.push(cursor.ts_ms.into());
+        params_vec.push(cursor.ts_ms.into());
+        params_vec.push(cursor.id.into());
+    }
+    sql.push_str(" ORDER BY turn_ts ASC, turn_id ASC LIMIT ?");
+    params_vec.push((limit + 1).into());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut turns = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = turns.len() > limit as usize;
+    if has_more {
+        turns.truncate(limit as usize);
+    }
+
+    let mut user_turns = Vec::with_capacity(turns.len());
+    for (turn_key, ts_ms, id, message_id) in turns {
+        let mut block_stmt = conn.prepare(&format!(
+            "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
+             FROM session_events \
+             WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+               AND {USER_TURN_KEY} = ? \
+             ORDER BY ts_ms ASC, id ASC"
+        ))?;
+        let blocks = block_stmt
+            .query_map(params![source, session_id, turn_key], |row| {
+                let role: String = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let tool_use_id: Option<String> = row.get(2)?;
+                let byte_len: i64 = row.get(3)?;
+                let result_status: Option<String> = row.get(4)?;
+                let is_tool_result = role == "tool_result" || kind == "tool_result";
+                Ok(SessionUserTurnBlock {
+                    kind: if is_tool_result {
+                        "tool_result"
+                    } else {
+                        "text"
+                    }
+                    .to_string(),
+                    tool_use_id: is_tool_result.then_some(tool_use_id).flatten(),
+                    byte_len,
+                    is_error: match result_status.as_deref() {
+                        Some("errored") => Some(1),
+                        Some("completed") => Some(0),
+                        _ => None,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        user_turns.push(SessionUserTurn {
+            id,
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            message_id,
+            ts_ms,
+            blocks,
+        });
+    }
+
+    let next_cursor = has_more.then(|| {
+        let last = user_turns.last().expect("non-empty page");
+        SessionEventCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    // Read-only: nothing to commit, and an explicit rollback releases the
+    // snapshot rather than leaving it to drop order.
+    if let Some(snapshot) = snapshot {
+        snapshot.rollback()?;
+    }
+    Ok(SessionUserTurnPage {
+        user_turns,
         next_cursor,
     })
 }
@@ -2307,6 +2609,220 @@ mod tests {
         assert!(schema_is_current(&current).unwrap());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_database_without_the_tool_result_columns_is_migrated_not_read_as_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-fidelity.db");
+        {
+            let conn = open_db(&path).unwrap();
+            // Rewind the marker and drop the columns the way an older
+            // release's database looks: the table is rebuilt without them,
+            // because SQLite cannot drop a column a trigger references.
+            conn.execute_batch(
+                "DELETE FROM schema_migrations WHERE name = 'session_events_tool_result_fidelity_v1';
+                 DROP TABLE session_events;
+                 CREATE TABLE session_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     project TEXT, cwd TEXT, git_branch TEXT,
+                     message_id TEXT, parent_id TEXT,
+                     ts_ms INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     text TEXT, model TEXT, token_json TEXT,
+                     event_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, event_uid)
+                 );
+                 INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid)
+                 VALUES ('claude', 'legacy', 1, 'tool_result', 'tool_result', 'old output', 'e1');",
+            )
+            .unwrap();
+            // A read-only handle skips init_db, so the guard has to say the
+            // schema is not current or the next page read fails with
+            // `no such column` instead of migrating.
+            assert!(!schema_is_current(&conn).unwrap());
+            assert!(!schema_is_event_read_current(&conn).unwrap());
+        }
+
+        let migrated = open_db(&path).unwrap();
+        assert!(schema_is_current(&migrated).unwrap());
+        let events = session_events(&migrated, "legacy", Some("claude")).unwrap();
+        assert_eq!(events.len(), 1);
+        // A row indexed before the columns existed keeps its text and reports
+        // no measurement, rather than a fabricated zero.
+        assert_eq!(events[0].text.as_deref(), Some("old output"));
+        assert_eq!(events[0].payload_bytes, None);
+        assert_eq!(events[0].event_source, None);
+        let checkpoint_columns: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_hydration_checkpoints') \
+                 WHERE name = 'last_tool_result_index'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_columns, 1);
+    }
+
+    /// Seed two user turns, each with one tool-result block, in a file
+    /// database so a second connection can write to it concurrently.
+    fn seed_two_user_turns(path: &std::path::Path) {
+        let conn = open_db(path).unwrap();
+        for (index, message) in ["m1", "m2"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                  tool_use_id, payload_bytes, event_index, result_status, event_source) \
+                 VALUES ('claude', 's1', ?, ?, 'tool_result', 'tool_result', 'out', ?, \
+                  ?, 3, ?, 'completed', 'tool_result')",
+                rusqlite::params![
+                    message,
+                    (index as i64) + 1,
+                    format!("uid-{message}"),
+                    format!("tu-{message}"),
+                    index as i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_user_turn_page_reads_one_snapshot_even_while_a_sync_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.db");
+        seed_two_user_turns(&path);
+
+        let conn = open_db(&path).unwrap();
+        // Commit a delete from a second connection in the middle of the page
+        // read -- exactly between the header pass and the per-turn block
+        // reads. WAL lets that writer through without blocking the reader, so
+        // without a single snapshot the second turn comes back as a header
+        // with an empty `blocks` array and a cursor already past it.
+        // The write has to land in the window between the header pass and the
+        // per-turn block reads, or it proves nothing: a delete that commits
+        // before the first read is simply an earlier snapshot, which every
+        // implementation reports consistently. So first measure what the
+        // header pass costs in progress ticks, by running that exact query
+        // standalone against the same data.
+        let header_ticks = {
+            let probe = open_db(&path).unwrap();
+            let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let seen = std::rc::Rc::clone(&counter);
+            // `progress_handler` wants a 'static closure; count through a
+            // channel instead of borrowing the local.
+            let (tx, rx) = std::sync::mpsc::channel();
+            probe.progress_handler(
+                1,
+                Some(move || {
+                    let _ = tx.send(());
+                    false
+                }),
+            );
+            let sql = format!(
+                "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
+                 MIN(NULLIF(message_id, '')) AS turn_message_id \
+                 FROM session_events \
+                 WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+                 GROUP BY turn_key ORDER BY turn_ts ASC, turn_id ASC LIMIT ?"
+            );
+            let mut stmt = probe.prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params!["claude", "s1", 101], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            drop(stmt);
+            probe.progress_handler(0, None::<fn() -> bool>);
+            while rx.try_recv().is_ok() {
+                seen.set(seen.get() + 1);
+            }
+            counter.get()
+        };
+        assert!(header_ticks > 0, "the header pass must cost some ticks");
+
+        // Delete on every tick from just past the header pass onwards (the
+        // statement is idempotent). Without a shared snapshot the first of
+        // those ticks falls between the header read and the block reads,
+        // which is precisely the race.
+        let writer_path = path.clone();
+        let tick = std::sync::atomic::AtomicU32::new(0);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                if tick.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= header_ticks {
+                    let writer = Connection::open(&writer_path).unwrap();
+                    writer
+                        .execute("DELETE FROM session_events WHERE message_id = 'm2'", [])
+                        .unwrap();
+                }
+                false
+            }),
+        );
+
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+
+        // Which snapshot the page lands on depends on whether the delete beat
+        // the first read, and either is correct: both turns, or only the one
+        // that survived. What must never happen is the mixture -- a header
+        // built from the old snapshot with blocks read from the new one, which
+        // is a turn reporting itself as having no content at all, behind a
+        // cursor that has already advanced past it.
+        assert!(
+            matches!(page.user_turns.len(), 1 | 2),
+            "unexpected page size: {:?}",
+            page.user_turns,
+        );
+        for turn in &page.user_turns {
+            assert_eq!(
+                turn.blocks.len(),
+                1,
+                "a header must keep the blocks it was built from: {turn:?}"
+            );
+        }
+
+        // The delete really did land, so the assertion above is about the
+        // snapshot and not about a write that never happened.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE message_id = 'm2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn a_user_turn_page_uses_a_callers_transaction_instead_of_nesting_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns-nested.db");
+        seed_two_user_turns(&path);
+
+        let mut conn = open_db(&path).unwrap();
+        // SQLite has no nested transactions, so opening one unconditionally
+        // would turn every call from inside a caller's transaction into an
+        // error. The caller's transaction is already the snapshot.
+        let tx = conn.transaction().unwrap();
+        let page = session_user_turns_page(&tx, "claude", "s1", 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2);
+        tx.rollback().unwrap();
+
+        // A plain call leaves the connection as it found it.
+        assert!(conn.is_autocommit());
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2);
+        assert!(
+            conn.is_autocommit(),
+            "the read snapshot must be released before returning"
+        );
     }
 
     #[test]

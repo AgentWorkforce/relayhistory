@@ -6,7 +6,8 @@ import test from 'node:test';
 
 import {
   InvalidArgumentError, SESSION_EVIDENCE_CONTRACT_VERSION,
-  getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls, getSessionToolCallsPage,
+  getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
+  getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
   parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
@@ -29,6 +30,10 @@ const CLAUDE_TRANSCRIPT = [
   { type: 'user', uuid: 'r2', parentUuid: 'a2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:04.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'ok', toolUseResult: { filePath: '/work/app/notes.md', structuredPatch: [{ oldStart: 1, newStart: 1, lines: ['+notes'] }], userModified: false } }] } },
   { type: 'assistant', uuid: 'a3', parentUuid: 'r2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:05.000Z', message: { role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'cargo test' } }] } },
   { type: 'user', uuid: 'r3', parentUuid: 'a3', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:06.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_3', is_error: true, content: 'failed' }] } },
+  // A harness line, not a block on a user message. It is stored as a tool
+  // result because that is what it is evidence of, so anything that groups on
+  // role alone turns it into a user turn that never happened.
+  { type: 'system', subtype: 'subagent_completed', sessionId: SHARED_SESSION, timestamp: '2026-08-30T10:00:07.000Z', parent_tool_use_id: 'toolu_3', agent_id: 'agent-1', subagent_session_id: 'child-1', status: 'completed', content: 'subagent completed' },
 ];
 
 const CODEX_ROLLOUT = [
@@ -292,4 +297,77 @@ test('unparseable stored JSON yields null without discarding the raw string', ()
   assert.equal(parseStoredJson(null), null);
   assert.equal(parseStoredJson(undefined), null);
   assert.equal(parseStoredJson('null'), null);
+});
+
+test('tool result events carry measured payload facts across the native boundary', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const events = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'claude' });
+    const results = events.filter((event) => event.kind === 'tool_result');
+    assert.deepEqual(results.map((event) => event.toolUseId), ['toolu_1', 'toolu_2', 'toolu_3', 'toolu_3']);
+    // The notification is a tool result on a different rail, with the child
+    // identity that is the only reason it exists.
+    const notification = results[3];
+    assert.equal(notification.eventSource, 'subagent_notification');
+    assert.equal(notification.subagentSessionId, 'child-1');
+    assert.equal(notification.agentId, 'agent-1');
+    // Byte counts are measurements of the raw payload: 'ok' is two bytes and
+    // 'failed' is six, asserted as those numbers rather than as "non-zero",
+    // which a fabricated default would also satisfy.
+    assert.deepEqual(results.map((event) => event.payloadBytes), [2, 2, 6, 'subagent completed'.length]);
+    assert.deepEqual(results.map((event) => event.payloadTruncated), [false, false, false, false]);
+    assert.deepEqual(results.map((event) => event.eventIndex), [0, 1, 2, 3]);
+    // `toolu_3` answers twice: once as the tool result, once as the
+    // notification that the delegated agent finished.
+    assert.deepEqual(results.map((event) => event.callIndex), [0, 0, 0, 1]);
+    assert.deepEqual(results.map((event) => event.resultStatus), ['completed', 'completed', 'errored', 'completed']);
+    assert.deepEqual(results.map((event) => event.errorSignal), [null, null, 'tool_result.is_error', null]);
+    for (const event of results) assert.match(String(event.payloadHash), /^[0-9a-f]{16}$/);
+
+    // Rows that are not tool results report nothing rather than a zero that
+    // would read like a measured empty payload.
+    for (const event of events.filter((candidate) => candidate.kind !== 'tool_result')) {
+      assert.equal(event.payloadBytes, null);
+      assert.equal(event.eventSource, null);
+      assert.equal(event.resultStatus, null);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('user turn pages group each message with its blocks and page by keyset', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const turns = await getSessionUserTurns('claude', SHARED_SESSION, { dbPath });
+    // Four turns, not five: the subagent notification is a harness line and
+    // never arrived on a user message, so it is not a turn.
+    assert.equal(turns.length, 4);
+    assert.deepEqual(
+      turns.map((turn) => turn.blocks.map((block) => [block.kind, block.toolUseId, block.byteLen, block.isError])),
+      [
+        [['text', null, 'update auth'.length, null]],
+        [['tool_result', 'toolu_1', 2, false]],
+        [['tool_result', 'toolu_2', 2, false]],
+        [['tool_result', 'toolu_3', 6, true]],
+      ],
+    );
+
+    const first = await getSessionUserTurnsPage('claude', SHARED_SESSION, { dbPath, limit: 1 });
+    assert.equal(first.contractVersion, SESSION_EVIDENCE_CONTRACT_VERSION);
+    assert.equal(first.userTurns.length, 1);
+    assert.notEqual(first.nextCursor, null);
+    const rest = await getSessionUserTurnsPage('claude', SHARED_SESSION, {
+      dbPath,
+      after: first.nextCursor ?? undefined,
+    });
+    assert.deepEqual(rest.userTurns.map((turn) => turn.id), turns.slice(1).map((turn) => turn.id));
+
+    await assert.rejects(
+      getSessionUserTurnsPage('claude', '', { dbPath }),
+      (error: unknown) => error instanceof InvalidArgumentError,
+    );
+  } finally {
+    await cleanup();
+  }
 });

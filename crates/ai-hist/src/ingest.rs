@@ -16,6 +16,7 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod hydrate;
+pub(crate) mod tool_result_facts;
 
 use crate::diagnostics::*;
 use crate::discover;
@@ -38,6 +39,13 @@ pub use hydrate::{
     hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
     HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
     SESSION_HYDRATION_CONTRACT_VERSION,
+};
+pub use tool_result_facts::{
+    content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
+    ERROR_SIGNAL_MCP_ERR, ERROR_SIGNAL_PATCH_APPLY, ERROR_SIGNAL_SUBAGENT_STATUS,
+    ERROR_SIGNAL_TOOL_RESULT, EVENT_SOURCE_FUNCTION_CALL_OUTPUT,
+    EVENT_SOURCE_SUBAGENT_NOTIFICATION, EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED,
+    STATUS_UNKNOWN,
 };
 
 fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
@@ -768,6 +776,39 @@ impl Drop for SyncStateLock {
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
+/// Bump when a parser change needs transcripts an earlier release already
+/// indexed to be re-read once.
+///
+/// The per-session "does this look unparsed?" probes below decide *which*
+/// files a backfill pass re-reads. They cannot decide *whether* a pass is
+/// still owed, because a row they can see may not be a row the local
+/// transcript owns: `session_events` is keyed by `(source, session_id)`, and
+/// local and remote observations of one session share that identity. An
+/// adapter is allowed to contribute a tool result with no fidelity at all, and
+/// re-reading the local transcript never repairs a row that came from
+/// somewhere else -- so "any canonical row is null" is a condition that can
+/// stay true forever, re-reading an unchanged file on every sync.
+///
+/// Recording the generation per provider makes the pass happen exactly once.
+const TOOL_RESULT_FIDELITY_GENERATION: i64 = 1;
+const CLAUDE_FIDELITY_GENERATION_KEY: &str = "claude_tool_result_fidelity";
+const CODEX_FIDELITY_GENERATION_KEY: &str = "codex_tool_result_fidelity";
+
+/// Whether this provider still owes a one-time fidelity backfill pass.
+fn fidelity_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
+    state.get(key).and_then(Value::as_i64).unwrap_or(0) < TOOL_RESULT_FIDELITY_GENERATION
+}
+
+/// Record that the pass finished.
+///
+/// Callers reach this only after a walk that both completed and covered every
+/// location it has indexed from: an interrupted sync, or one that could not
+/// reach a root it has rows under, retries the backfill rather than retiring
+/// it over evidence it never looked at.
+fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
+    state.insert(key.to_string(), json!(TOOL_RESULT_FIDELITY_GENERATION));
+}
+
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts", "codex_rollouts_v5"),
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
@@ -1561,6 +1602,15 @@ fn sync_codex_rollouts(
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
+    // A backfill pass that could not reach every place it has indexed from is
+    // not a finished pass. Recording the generation anyway would retire the
+    // work permanently while the rows under the unreachable root keep their
+    // null fidelity -- and those rows are already stamped, so nothing would
+    // ever bring them back. The Claude walk gets this for free by returning
+    // early when its root is gone; this walk visits two roots and skips past a
+    // missing one, so it has to say so explicitly.
+    let mut unreached_indexed_root = false;
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1569,6 +1619,12 @@ fn sync_codex_rollouts(
         home.join(".codex/archived_sessions"),
     ] {
         if !root.exists() {
+            // Only a root this database has actually indexed from holds the
+            // pass open. A root that has never existed here -- most installs
+            // have no archive -- has nothing to backfill, and waiting for it
+            // would leave the pass pending forever.
+            let prefix = format!("{}{}", root.display(), std::path::MAIN_SEPARATOR);
+            unreached_indexed_root |= seen.keys().any(|key| key.starts_with(&prefix));
             continue;
         }
         for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
@@ -1613,7 +1669,13 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
-                    Some(id) if codex_session_events_exist(conn, id)? => continue,
+                    Some(id)
+                        if codex_session_events_exist(conn, id)?
+                            && !(backfill_fidelity
+                                && tool_results_lack_fidelity(conn, "codex", id)?) =>
+                    {
+                        continue
+                    }
                     // Stamp matches but the events are gone (wiped or rebuilt
                     // database): fall through and re-ingest.
                     _ => {}
@@ -1720,6 +1782,9 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    if !unreached_indexed_root {
+        record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
+    }
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2115,6 +2180,13 @@ fn ingest_codex_rollout(
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
+    // Codex reports how a call ended out of band — `exec_command_end`,
+    // `patch_apply_end`, `mcp_tool_call_end` — and only guarantees they have
+    // all arrived by `task_complete`. Results are recorded with an `unknown`
+    // status and the turn's error signals are applied to them when it closes.
+    let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    let mut turn_error_signals: HashMap<String, &'static str> = HashMap::new();
+    let mut pending_results: Vec<(String, String)> = Vec::new();
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut line_index = 0usize;
@@ -2171,6 +2243,7 @@ fn ingest_codex_rollout(
                 message_id,
                 None,
                 None,
+                None,
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2219,6 +2292,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             token_json.as_deref(),
+                            None,
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2242,6 +2316,7 @@ fn ingest_codex_rollout(
                             &uid,
                             &uid,
                             model.as_deref(),
+                            None,
                             None,
                         )?;
                         outcome.events += 1;
@@ -2295,6 +2370,13 @@ fn ingest_codex_rollout(
                         outcome.last_assistant_text =
                             Some(message.trim().chars().take(4096).collect());
                     }
+                    resolve_codex_tool_results(
+                        conn,
+                        session_id,
+                        &mut pending_results,
+                        &mut turn_error_signals,
+                        Settle::TurnComplete,
+                    )?;
                 }
                 "thread_settings_applied" => {
                     if let Some(m) = payload
@@ -2326,6 +2408,10 @@ fn ingest_codex_rollout(
                         .get("result")
                         .and_then(Value::as_object)
                         .map(|r| r.contains_key("Err"));
+                    if is_error == Some(true) {
+                        turn_error_signals
+                            .insert(call_id.to_string(), tool_result_facts::ERROR_SIGNAL_MCP_ERR);
+                    }
                     insert_tool_call(
                         conn,
                         "codex",
@@ -2363,6 +2449,12 @@ fn ingest_codex_rollout(
                     let success = payload.get("success").and_then(Value::as_bool);
                     if let Some(success) = success {
                         set_tool_call_error(conn, "codex", session_id, call_id, !success)?;
+                        if !success {
+                            turn_error_signals.insert(
+                                call_id.to_string(),
+                                tool_result_facts::ERROR_SIGNAL_PATCH_APPLY,
+                            );
+                        }
                     }
                     let Some(changes) = payload.get("changes").and_then(Value::as_object) else {
                         continue;
@@ -2411,6 +2503,12 @@ fn ingest_codex_rollout(
                                 call_id,
                                 exit_code != 0,
                             )?;
+                            if exit_code != 0 {
+                                turn_error_signals.insert(
+                                    call_id.to_string(),
+                                    tool_result_facts::ERROR_SIGNAL_EXIT_CODE,
+                                );
+                            }
                         }
                     }
                 }
@@ -2449,6 +2547,7 @@ fn ingest_codex_rollout(
                         &message_id,
                         model.as_deref(),
                         token_json.as_deref(),
+                        None,
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2471,26 +2570,44 @@ fn ingest_codex_rollout(
                     }
                 }
                 "function_call_output" | "custom_tool_call_output" => {
-                    if let Some(output_text) =
-                        materialize_codex_output_text(payload.get("output").unwrap_or(&Value::Null))
-                    {
-                        let uid = format!("{index}:{payload_type}");
-                        let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
-                        insert_codex_event(
-                            conn,
-                            session_id,
-                            cwd,
-                            branch,
-                            ts_ms,
-                            "tool_result",
-                            "tool_result",
-                            &output_text,
-                            &uid,
-                            &message_id,
-                            None,
-                            None,
-                        )?;
-                        outcome.events += 1;
+                    let output = payload.get("output").unwrap_or(&Value::Null);
+                    // An output with nothing displayable in it -- a silent
+                    // command's empty string, a structured array carrying no
+                    // `text` member -- is still a result the tool returned.
+                    // Dropping it because a transcript view would render
+                    // nothing also drops the call's linkage, its measured size
+                    // (an empty payload is zero bytes, not an unknown number)
+                    // and its place in the ordering, which is exactly what a
+                    // span tree needs when a tool answers with silence.
+                    let output_text = materialize_codex_output_text(output).unwrap_or_default();
+                    let uid = format!("{index}:{payload_type}");
+                    let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
+                    let call_id = payload_str("call_id").unwrap_or("");
+                    let (call_index, event_index) = indexer.next(call_id);
+                    // Measured over the provider's raw `output`, not the
+                    // flattened text below: a payload that arrives as
+                    // structured blocks is bigger on the wire than the
+                    // joined string this row stores.
+                    let facts = tool_result_facts::codex_output_facts(output, call_id)
+                        .with_ordering(call_index, event_index);
+                    insert_codex_event(
+                        conn,
+                        session_id,
+                        cwd,
+                        branch,
+                        ts_ms,
+                        "tool_result",
+                        "tool_result",
+                        &output_text,
+                        &uid,
+                        &message_id,
+                        None,
+                        None,
+                        Some(&facts),
+                    )?;
+                    outcome.events += 1;
+                    if !call_id.is_empty() {
+                        pending_results.push((uid, call_id.to_string()));
                     }
                 }
                 // Readable reasoning arrives as event_msg/agent_reasoning;
@@ -2505,7 +2622,59 @@ fn ingest_codex_rollout(
             _ => {}
         }
     }
+    // End of file is not a turn boundary. A live rollout's last turn has no
+    // `task_complete` yet, and the `exec_command_end` that fails one of its
+    // calls can still be written after the bytes this pass read. Failures
+    // already observed are recorded; a result with no signal yet stays
+    // `unknown`, because "not known to have failed" is not "succeeded". The
+    // next sync re-reads the file and settles it.
+    resolve_codex_tool_results(
+        conn,
+        session_id,
+        &mut pending_results,
+        &mut turn_error_signals,
+        Settle::EndOfFile,
+    )?;
     Ok(outcome)
+}
+
+/// Whether the pass that is resolving buffered results knows the turn is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// `task_complete` was read: every out-of-band signal for the turn has
+    /// arrived, so a result with none of them succeeded.
+    TurnComplete,
+    /// The readable transcript ended mid-turn: record the failures seen, and
+    /// leave everything else undecided.
+    EndOfFile,
+}
+
+/// Apply a Codex turn's out-of-band error signals to the tool-result rows it
+/// buffered.
+fn resolve_codex_tool_results(
+    conn: &Connection,
+    session_id: &str,
+    pending: &mut Vec<(String, String)>,
+    signals: &mut HashMap<String, &'static str>,
+    settle: Settle,
+) -> Result<()> {
+    for (uid, call_id) in pending.drain(..) {
+        let signal = signals.get(call_id.as_str()).copied();
+        let status = match (signal, settle) {
+            (Some(_), _) => tool_result_facts::STATUS_ERRORED,
+            (None, Settle::TurnComplete) => tool_result_facts::STATUS_COMPLETED,
+            // Left as inserted, so a later pass over a completed turn is the
+            // only thing that can call it a success.
+            (None, Settle::EndOfFile) => continue,
+        };
+        conn.execute(
+            "UPDATE session_events SET result_status = ?, error_signal = ? \
+             WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
+            params![status, signal, session_id, uid],
+        )?;
+    }
+    signals.clear();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2522,6 +2691,7 @@ fn insert_codex_event(
     message_id: &str,
     model: Option<&str>,
     token_json: Option<&str>,
+    facts: Option<&ToolResultFacts>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -2539,6 +2709,7 @@ fn insert_codex_event(
         model,
         token_json,
         uid,
+        facts,
     )
 }
 
@@ -2649,6 +2820,7 @@ fn sync_claude_session_metadata(
         .unwrap_or_default();
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2657,6 +2829,12 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
+            // During the one-time backfill pass, an unchanged transcript
+            // whose tool results predate the fidelity columns is re-read to
+            // populate them. Outside that pass the stamp alone decides, so a
+            // row this transcript does not own -- an adapter's contribution to
+            // the same session -- cannot pin the file off the fast path.
+            && !(backfill_fidelity && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
         {
             continue;
         }
@@ -2699,6 +2877,7 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
+    record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2749,6 +2928,62 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether a session's indexed tool results predate the fidelity columns.
+///
+/// A schema migration adds nullable columns and declares itself done; the sync
+/// stamp maps are what decide whether a transcript is opened at all. Without
+/// this, a database that migrated cleanly skips every unchanged transcript and
+/// plain `sync` leaves their `payload_bytes`, `event_index` and the rest null
+/// indefinitely -- while reporting a perfectly successful sync. Only explicit
+/// hydration or an unrelated edit to the file would ever repair them.
+///
+/// `event_index` is the field to test: every tool-result row the current
+/// parsers write has one, whatever the payload was. A session with no tool
+/// results has nothing to backfill and stays on the fast path.
+///
+/// This only selects which files a backfill pass re-reads; it is not what
+/// ends the pass. `session_events` is keyed by `(source, session_id)` and
+/// local and remote observations of one session share that identity, so a row
+/// this probe sees may be an adapter's contribution that re-reading the local
+/// transcript will never touch. `TOOL_RESULT_FIDELITY_GENERATION` is what
+/// guarantees the work happens once.
+///
+/// Selecting files this way is narrower than bumping the stamp-map
+/// generation, which would re-read every transcript in the archive, including
+/// the ones with nothing to gain, and would discard the selective-repair state
+/// the codex generations carry.
+fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_events
+            WHERE source = ? AND session_id = ? AND kind = 'tool_result'
+              AND event_index IS NULL
+            LIMIT 1
+        )",
+        params![source, session_id],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// The same question for a Claude transcript, which the walk knows by path.
+fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+              AND e.kind = 'tool_result' AND e.event_index IS NULL
+            LIMIT 1
+        )",
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -3003,6 +3238,10 @@ fn ingest_claude_transcript_as(
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
+    // Ordering is assigned over the whole transcript, and this parser always
+    // re-reads the file from the start, so a re-sync reproduces the same
+    // indexes instead of advancing them.
+    let mut indexer = tool_result_facts::ToolResultIndexer::default();
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -3071,6 +3310,40 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        // Claude reports a finished subagent as a `type: "system"` line with
+        // no message body, so the block walk below never sees it. It is the
+        // only record that ties a delegated child back to the Agent call that
+        // spawned it, which makes it a tool result in everything but shape.
+        if obj.get("type").and_then(Value::as_str) == Some("system") {
+            if let Some(facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
+                let tool_use_id = facts.tool_use_id.clone().unwrap_or_default();
+                let (call_index, event_index) = indexer.next(&tool_use_id);
+                let facts = facts.with_ordering(call_index, event_index);
+                let notification_text = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                insert_session_event(
+                    conn,
+                    "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    "tool_result",
+                    "tool_result",
+                    notification_text,
+                    None,
+                    None,
+                    &format!("{message_uuid}:subagent_notification"),
+                    Some(&facts),
+                )?;
+            }
+            continue;
+        }
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
@@ -3130,6 +3403,7 @@ fn ingest_claude_transcript_as(
                     model,
                     token_json.as_deref(),
                     &format!("{message_uuid}:0"),
+                    None,
                 )?;
             }
             continue;
@@ -3165,6 +3439,7 @@ fn ingest_claude_transcript_as(
                                 model,
                                 token_json.as_deref(),
                                 &event_uid,
+                                None,
                             )?;
                         }
                     }
@@ -3191,6 +3466,7 @@ fn ingest_claude_transcript_as(
                             model,
                             token_json.as_deref(),
                             &event_uid,
+                            None,
                         )?;
                     }
                 }
@@ -3216,6 +3492,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        None,
                     )?;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -3257,6 +3534,14 @@ fn ingest_claude_transcript_as(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let content = block.get("content").unwrap_or(&Value::Null);
+                    // Measured over the provider's raw content, before
+                    // `materialize_tool_result_text` reshapes it: the whole
+                    // point of `payload_bytes` is to say what the harness
+                    // actually returned, which a post-processed string can no
+                    // longer answer.
+                    let (call_index, event_index) = indexer.next(tool_use_id);
+                    let facts = tool_result_facts::claude_tool_result_facts(block)
+                        .with_ordering(call_index, event_index);
                     let text = materialize_tool_result_text(content);
                     insert_session_event(
                         conn,
@@ -3274,6 +3559,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        Some(&facts),
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
@@ -3319,16 +3605,30 @@ fn insert_session_event(
     model: Option<&str>,
     token_json: Option<&str>,
     event_uid: &str,
+    // Carried as one struct rather than ten more positional arguments: the
+    // fidelity columns are only meaningful together, and a tenth `None` in a
+    // call list is how a fact silently ends up in the wrong column.
+    facts: Option<&ToolResultFacts>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    let blank = ToolResultFacts::default();
+    let facts = facts.unwrap_or(&blank);
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+          tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
+          error_signal, subagent_session_id, agent_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, \
+         tool_use_id=excluded.tool_use_id, payload_bytes=excluded.payload_bytes, \
+         payload_truncated=excluded.payload_truncated, payload_hash=excluded.payload_hash, \
+         call_index=excluded.call_index, event_index=excluded.event_index, \
+         result_status=excluded.result_status, event_source=excluded.event_source, \
+         error_signal=excluded.error_signal, subagent_session_id=excluded.subagent_session_id, \
+         agent_id=excluded.agent_id",
         params![
             source,
             session_id,
@@ -3344,6 +3644,17 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            facts.tool_use_id,
+            facts.payload_bytes,
+            facts.payload_truncated.map(i64::from),
+            facts.payload_hash,
+            facts.call_index,
+            facts.event_index,
+            facts.result_status,
+            facts.event_source,
+            facts.error_signal,
+            facts.subagent_session_id,
+            facts.agent_id,
         ],
     )?;
     Ok(())
@@ -5135,6 +5446,7 @@ mod tests {
             None,
             None,
             "event-1",
+            None,
         )
         .unwrap();
         super::insert_tool_call(
@@ -6414,6 +6726,333 @@ mod tests {
         assert_eq!(event_count, 4);
     }
 
+    /// Simulate a database that was synced by a release without the fidelity
+    /// columns: the rows and the sync stamps are there, the columns the
+    /// migration added are null, and the sync state carries no backfill
+    /// generation because that release never wrote one. This is exactly the
+    /// state an upgraded install is in on its first `sync`.
+    fn blank_tool_result_fidelity_state(state: &mut Map<String, Value>) {
+        state.remove(super::CLAUDE_FIDELITY_GENERATION_KEY);
+        state.remove(super::CODEX_FIDELITY_GENERATION_KEY);
+    }
+
+    fn blank_tool_result_fidelity(conn: &Connection, source: &str) {
+        conn.execute(
+            "UPDATE session_events SET tool_use_id = NULL, payload_bytes = NULL, \
+             payload_truncated = NULL, payload_hash = NULL, call_index = NULL, \
+             event_index = NULL, result_status = NULL, event_source = NULL, \
+             error_signal = NULL WHERE source = ?",
+            [source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plain_claude_sync_backfills_fidelity_for_transcripts_indexed_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-fidelity.jsonl");
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "sess-fidelity",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "run it" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "sess-fidelity", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "sess-fidelity", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "a\nb\n" },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-fidelity")[0].payload_bytes,
+            Some(4)
+        );
+
+        blank_tool_result_fidelity(&conn, "claude");
+        blank_tool_result_fidelity_state(&mut state);
+        // The stamp is unchanged and the events exist, so every other
+        // condition on the fast path says "skip". Without the fidelity check
+        // this sync is a no-op and the columns stay null indefinitely while
+        // the run still reports success.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let rows = tool_results(&conn, "claude", "sess-fidelity");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("tu_1"));
+        assert_eq!(rows[0].event_index, Some(0));
+        assert_eq!(rows[0].event_source.as_deref(), Some("tool_result"));
+
+        // Repaired once, back on the fast path: a sentinel a re-read would
+        // overwrite has to survive, or the transcript is being re-read on
+        // every sync forever.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source = 'claude' AND kind = 'tool_result'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-fidelity")[0]
+                .text
+                .as_deref(),
+            Some("sentinel"),
+        );
+    }
+
+    #[test]
+    fn plain_codex_sync_backfills_fidelity_for_rollouts_indexed_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_backfill.jsonl");
+        let lines = [
+            r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_backfill","cwd":"/tmp/project"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"call_1"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"a\nb\n"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        fs::write(&rollout, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_backfill")[0].payload_bytes,
+            Some(4)
+        );
+
+        blank_tool_result_fidelity(&conn, "codex");
+        blank_tool_result_fidelity_state(&mut state);
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let rows = tool_results(&conn, "codex", "sess_backfill");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("call_1"));
+        assert_eq!(rows[0].event_index, Some(0));
+        assert_eq!(rows[0].result_status.as_deref(), Some("completed"));
+
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source = 'codex' AND kind = 'tool_result'",
+            [],
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_backfill")[0]
+                .text
+                .as_deref(),
+            Some("sentinel"),
+        );
+    }
+
+    #[test]
+    fn an_unreachable_codex_archive_keeps_the_backfill_pass_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let live_day = home.join(".codex/sessions/2026/04/20");
+        let archive_day = home.join(".codex/archived_sessions/2026/01/02");
+        fs::create_dir_all(&live_day).unwrap();
+        fs::create_dir_all(&archive_day).unwrap();
+
+        let rollout = |id: &str, ts: &str| {
+            [
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"id":"{id}","cwd":"/tmp/project"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{{\"command\":\"ls\"}}","call_id":"c_{id}"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"function_call_output","call_id":"c_{id}","output":"out"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1"}}}}"#
+                ),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let live = live_day.join("rollout-2026-04-20T00-00-00-sess_live.jsonl");
+        let archived = archive_day.join("rollout-2026-01-02T00-00-00-sess_archived.jsonl");
+        fs::write(&live, rollout("sess_live", "2026-04-20T00:00:00.000Z")).unwrap();
+        fs::write(
+            &archived,
+            rollout("sess_archived", "2026-01-02T00:00:00.000Z"),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            Some(3)
+        );
+
+        // The state an upgrade leaves behind: rows and stamps for both roots,
+        // fidelity null, no backfill generation recorded.
+        blank_tool_result_fidelity(&conn, "codex");
+        blank_tool_result_fidelity_state(&mut state);
+
+        // The archive is not mounted on this run.
+        let stowed = home.join("archived_sessions.away");
+        fs::rename(home.join(".codex/archived_sessions"), &stowed).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+
+        // The reachable root was backfilled, but the pass is still owed: the
+        // archived rows are stamped, so retiring the generation here would
+        // strand them null for good.
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_live")[0].payload_bytes,
+            Some(3)
+        );
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            None
+        );
+        assert!(
+            state.get(super::CODEX_FIDELITY_GENERATION_KEY).is_none(),
+            "a walk that could not reach an indexed root must not retire the pass"
+        );
+
+        // The archive comes back.
+        fs::rename(&stowed, home.join(".codex/archived_sessions")).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_archived")[0].payload_bytes,
+            Some(3)
+        );
+        assert_eq!(
+            state
+                .get(super::CODEX_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+        );
+    }
+
+    #[test]
+    fn a_codex_root_this_database_never_indexed_does_not_hold_the_pass_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        // Most installs have no archive directory at all. Waiting for one that
+        // has never existed would leave the pass pending on every sync
+        // forever, which is the same bug pointed the other way.
+        let path = day.join("rollout-2026-04-20T00-00-00-sess_only.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-04-20T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sess_only\",\"cwd\":\"/tmp/project\"}}\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert!(!home.join(".codex/archived_sessions").exists());
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            state
+                .get(super::CODEX_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+        );
+    }
+
+    #[test]
+    fn a_contributed_row_without_fidelity_does_not_re_read_the_local_transcript_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-shared.jsonl");
+        let lines = [
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "sess-shared",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "sess-shared", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "ok" },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-shared")[0].payload_bytes,
+            Some(2)
+        );
+
+        // A remote observation of the same session, contributed through the
+        // source-adapter boundary. `session_events` is keyed by
+        // `(source, session_id)`, so it lands beside the local rows -- and the
+        // adapter contract lets it record no fidelity at all. Re-reading the
+        // local transcript can never populate this row, because the local
+        // transcript does not contain it.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sess-shared', 3, 'tool_result', 'tool_result', \
+                     'remote output', 'remote-uid-1')",
+            [],
+        )
+        .unwrap();
+
+        // A sentinel a re-read would overwrite. If the null remote row put the
+        // file back in the backfill set, this sync re-reads it -- and so would
+        // every sync after it, forever, while never repairing the remote row.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source = 'claude' AND event_uid = 'u2:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let local = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='u2:0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, "sentinel",
+            "an unchanged transcript must stay on the fast path even when another \
+             observation of the same session has no fidelity"
+        );
+    }
+
     /// One Claude project tree as the provider writes it: a parent transcript,
     /// a subagent sidecar the provider named with an in-record `agentId` (with
     /// its `meta.json` beside it), and a sidechain sidecar from a provider
@@ -6905,6 +7544,512 @@ mod tests {
         super::read_codex_session_meta(path).unwrap().unwrap()
     }
 
+    /// Tool-result rows for one session, in transcript order.
+    fn tool_results(conn: &Connection, source: &str, session_id: &str) -> Vec<crate::SessionEvent> {
+        crate::session_events(conn, session_id, Some(source))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "tool_result")
+            .collect()
+    }
+
+    fn claude_line(value: Value) -> String {
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn claude_tool_results_measure_the_raw_payload_not_the_stored_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloat-session.jsonl");
+        // Shaped after relayburn's `claude/oversized-bash-output` fixture: a
+        // single Bash call whose result is exactly 80 000 bytes. The assertion
+        // below is that number rather than "something large", so a payload
+        // measured here and one measured there can be compared directly
+        // instead of merely looking similar.
+        let oversized = "x".repeat(80_000);
+        let marked = "partial output\n<system-truncated>\n";
+        let structured = json!([{ "type": "text", "text": "ok" }]);
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "bloat-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "cat huge.log" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "bloat-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_bash_big", "name": "Bash",
+                      "input": { "command": "cat huge.log" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "bloat-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_bash_big", "content": oversized },
+                    { "type": "tool_result", "tool_use_id": "tu_grep", "content": marked,
+                      "is_error": true },
+                    { "type": "tool_result", "tool_use_id": "tu_read", "content": structured },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let rows = tool_results(&conn, "claude", "bloat-session");
+        assert_eq!(rows.len(), 3);
+
+        let big = &rows[0];
+        assert_eq!(big.payload_bytes, Some(80_000));
+        assert_eq!(big.payload_truncated, Some(0));
+        assert_eq!(
+            big.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(oversized.as_bytes()).as_str()),
+        );
+        assert_eq!(big.tool_use_id.as_deref(), Some("tu_bash_big"));
+        assert_eq!(big.event_source.as_deref(), Some("tool_result"));
+        assert_eq!(big.result_status.as_deref(), Some("completed"));
+        assert_eq!(big.error_signal, None);
+        assert_eq!((big.call_index, big.event_index), (Some(0), Some(0)));
+
+        // The harness marker is the difference between "this tool returned
+        // 34 bytes" and "this tool returned far more and the harness cut it".
+        let marked_row = &rows[1];
+        assert_eq!(marked_row.payload_truncated, Some(1));
+        assert_eq!(marked_row.payload_bytes, Some(marked.len() as i64));
+        assert_eq!(marked_row.result_status.as_deref(), Some("errored"));
+        assert_eq!(
+            marked_row.error_signal.as_deref(),
+            Some("tool_result.is_error")
+        );
+        assert_eq!(
+            (marked_row.call_index, marked_row.event_index),
+            (Some(0), Some(1))
+        );
+
+        // A structured payload is measured over its stable stringification,
+        // which is what the provider actually sent, not over the flattened
+        // text this row stores.
+        let structured_row = &rows[2];
+        let expected = tool_result_facts::stable_stringify(&structured);
+        assert_eq!(structured_row.payload_bytes, Some(expected.len() as i64));
+        assert_eq!(
+            structured_row.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(expected.as_bytes()).as_str()),
+        );
+        assert_eq!(structured_row.event_index, Some(2));
+    }
+
+    #[test]
+    fn claude_call_index_counts_per_tool_use_id_and_event_index_counts_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeat-session.jsonl");
+        let result = |uuid: &str, parent: &str, ts: &str, blocks: Value| {
+            claude_line(json!({
+                "type": "user", "uuid": uuid, "parentUuid": parent,
+                "sessionId": "repeat-session", "cwd": "/tmp/project", "timestamp": ts,
+                "message": { "role": "user", "content": blocks },
+            }))
+        };
+        let lines = [
+            result(
+                "u1",
+                "root",
+                "2026-04-20T00:00:01.000Z",
+                json!([
+                    { "type": "tool_result", "tool_use_id": "tu_a", "content": "first" },
+                    { "type": "tool_result", "tool_use_id": "tu_b", "content": "second" },
+                ]),
+            ),
+            result(
+                "u2",
+                "u1",
+                "2026-04-20T00:00:02.000Z",
+                json!([
+                    { "type": "tool_result", "tool_use_id": "tu_a", "content": "again" },
+                ]),
+            ),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let ordering: Vec<(Option<String>, Option<i64>, Option<i64>)> =
+            tool_results(&conn, "claude", "repeat-session")
+                .into_iter()
+                .map(|event| (event.tool_use_id, event.call_index, event.event_index))
+                .collect();
+        assert_eq!(
+            ordering,
+            vec![
+                (Some("tu_a".into()), Some(0), Some(0)),
+                (Some("tu_b".into()), Some(0), Some(1)),
+                (Some("tu_a".into()), Some(1), Some(2)),
+            ],
+        );
+
+        // Re-reading the same transcript must reproduce the indexes rather
+        // than advance them: the parser starts from the top every time, and a
+        // sequence that grew on every sync would make `event_index` useless
+        // as an order.
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let after: Vec<Option<i64>> = tool_results(&conn, "claude", "repeat-session")
+            .into_iter()
+            .map(|event| event.event_index)
+            .collect();
+        assert_eq!(after, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn claude_subagent_notifications_are_recorded_as_linked_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent-session.jsonl");
+        // Shaped after relayburn's `claude/system-subagent-notification`
+        // fixture. The notification is the only record that ties the child
+        // session back to the Agent call that spawned it.
+        let lines = [
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "subagent-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-24T01:00:00.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_system", "name": "Agent",
+                      "input": { "subagent_type": "Explore" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "system", "subtype": "subagent_completed",
+                "sessionId": "subagent-session", "timestamp": "2026-04-24T01:00:01.000Z",
+                "parent_tool_use_id": "toolu_system", "agent_id": "agent-system-1",
+                "subagent_session_id": "session-system-child", "status": "completed",
+                "content": "subagent completed",
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let rows = tool_results(&conn, "claude", "subagent-session");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.event_source.as_deref(), Some("subagent_notification"));
+        assert_eq!(
+            row.subagent_session_id.as_deref(),
+            Some("session-system-child")
+        );
+        assert_eq!(row.agent_id.as_deref(), Some("agent-system-1"));
+        assert_eq!(row.tool_use_id.as_deref(), Some("toolu_system"));
+        assert_eq!(row.result_status.as_deref(), Some("completed"));
+        assert_eq!(row.text.as_deref(), Some("subagent completed"));
+        assert_eq!(row.payload_bytes, Some("subagent completed".len() as i64));
+
+        // A subagent notification is stored as a tool result because that is
+        // what it is evidence of, but it never arrived on a user message. It
+        // is not a user turn, and grouping on `role` alone would make it one.
+        let turns =
+            crate::session_user_turns_page(&conn, "claude", "subagent-session", 100, None).unwrap();
+        assert!(
+            turns.user_turns.is_empty(),
+            "a harness notification is not a user turn: {:?}",
+            turns.user_turns,
+        );
+
+        // A system line that names no child is harness chatter, not a tool
+        // result, and must not manufacture one.
+        let noise = dir.path().join("noise.jsonl");
+        fs::write(
+            &noise,
+            format!(
+                "{}\n",
+                claude_line(json!({
+                    "type": "system", "subtype": "hook_ran", "sessionId": "noise-session",
+                    "timestamp": "2026-04-24T01:00:02.000Z", "content": "hook ran",
+                })),
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &noise).unwrap();
+        assert!(tool_results(&conn, "claude", "noise-session").is_empty());
+    }
+
+    #[test]
+    fn codex_tool_results_take_their_status_from_the_turns_out_of_band_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T01-00-00-sess_tools_1.jsonl");
+        // Shaped after relayburn's `codex/with-tool-call` and
+        // `codex/oversized-shell-output` fixtures, with the exit code and the
+        // patch outcome flipped to failures: Codex reports both out of band,
+        // and neither is visible on the `function_call_output` row itself.
+        let lines = [
+            r#"{"timestamp":"2026-04-20T01:00:00.000Z","type":"session_meta","payload":{"id":"sess_tools_1","cwd":"/tmp/project","timestamp":"2026-04-20T01:00:00.000Z"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_tools_1","cwd":"/tmp/project","model":"gpt-5.3-codex"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"cat huge.log\"}","call_id":"call_shell_1"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.500Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_shell_1","turn_id":"turn_tools_1","exit_code":2}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_shell_1","output":"boom"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_patch_1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /tmp/project/README.md\n@@\n+banner\n*** End Patch\n"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.500Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_patch_1","turn_id":"turn_tools_1","success":false,"changes":{}}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:02.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_patch_1","output":"patch failed"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/project/a.ts\"}","call_id":"call_read_1"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:03.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_read_1","output":"contents"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-20T01:00:04.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_tools_1"}}"#.to_string(),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_tools_1");
+        let seen: Vec<String> = rows
+            .iter()
+            .map(|event| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    event.tool_use_id.as_deref().unwrap_or("-"),
+                    event.result_status.as_deref().unwrap_or("-"),
+                    event.error_signal.as_deref().unwrap_or("-"),
+                    event.event_source.as_deref().unwrap_or("-"),
+                    event
+                        .event_index
+                        .map_or_else(|| "-".to_string(), |index| index.to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                "call_shell_1|errored|exit_code|function_call_output|0",
+                "call_patch_1|errored|patch_apply|function_call_output|1",
+                "call_read_1|completed|-|function_call_output|2",
+            ],
+        );
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(
+            rows[0].payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(b"boom").as_str()),
+        );
+    }
+
+    #[test]
+    fn codex_results_of_an_unfinished_turn_still_carry_the_signals_seen_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T02-00-00-sess_live_1.jsonl");
+        // A live session has no `task_complete` yet. A failure the transcript
+        // already states is recorded; a result that has simply not been
+        // reported on yet stays `unknown`, because end of file is not a turn
+        // boundary and "no failure seen" is not "succeeded".
+        let lines = [
+            r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess_live_1","cwd":"/tmp/project","timestamp":"2026-04-20T02:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"false\"}","call_id":"call_live_1"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.500Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_live_1","exit_code":1}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_live_1","output":"nope"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/a.ts\"}","call_id":"call_live_2"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:02.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_live_2","output":"contents"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_live_1");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].result_status.as_deref(), Some("errored"));
+        assert_eq!(rows[0].error_signal.as_deref(), Some("exit_code"));
+        assert_eq!(rows[1].result_status.as_deref(), Some("unknown"));
+        assert_eq!(rows[1].error_signal, None);
+    }
+
+    #[test]
+    fn a_codex_failure_reported_after_the_output_is_not_pre_empted_by_a_partial_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T03-00-00-sess_late_1.jsonl");
+        // The exact ordering that makes end-of-file unsafe to settle on:
+        // the output is written, the sync reads the file, and only then does
+        // the `exec_command_end` that failed the call arrive. Calling it
+        // `completed` on the first pass would be a well-formed lie that the
+        // second pass has to retract.
+        let head = [
+            r#"{"timestamp":"2026-04-20T03:00:00.000Z","type":"session_meta","payload":{"id":"sess_late_1","cwd":"/tmp/project","timestamp":"2026-04-20T03:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"make\"}","call_id":"call_late_1"}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_late_1","output":"building"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", head.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        let rows = tool_results(&conn, "codex", "sess_late_1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result_status.as_deref(), Some("unknown"));
+
+        // The rest of the turn lands, and the next sync re-reads the file.
+        let tail = [
+            r#"{"timestamp":"2026-04-20T03:00:02.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_late_1","turn_id":"t1","exit_code":1}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:02.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        let mut grown = head.to_vec();
+        grown.extend_from_slice(&tail);
+        fs::write(&path, format!("{}\n", grown.join("\n"))).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_late_1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result_status.as_deref(), Some("errored"));
+        assert_eq!(rows[0].error_signal.as_deref(), Some("exit_code"));
+    }
+
+    #[test]
+    fn a_codex_result_with_no_displayable_text_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T04-00-00-sess_silent_1.jsonl");
+        // A silent command answers with an empty string, and a structured
+        // output can carry no `text` member at all. Both are results; a row
+        // that reports zero bytes is a measurement, and dropping the row
+        // would lose the call linkage and the ordering as well.
+        let lines = [
+            r#"{"timestamp":"2026-04-20T04:00:00.000Z","type":"session_meta","payload":{"id":"sess_silent_1","cwd":"/tmp/project","timestamp":"2026-04-20T04:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"true\"}","call_id":"c1"}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:01.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":""}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":[{"type":"image","data":"zz"}]}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_silent_1");
+        assert_eq!(rows.len(), 2);
+        let empty = &rows[0];
+        assert_eq!(empty.tool_use_id.as_deref(), Some("c1"));
+        assert_eq!(empty.payload_bytes, Some(0));
+        assert_eq!(
+            empty.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(b"").as_str()),
+        );
+        assert_eq!(empty.payload_truncated, Some(0));
+        assert_eq!(empty.result_status.as_deref(), Some("completed"));
+        assert_eq!(empty.event_index, Some(0));
+        assert_eq!(empty.text.as_deref(), Some(""));
+
+        // The structured payload has no text to show but is far from empty on
+        // the wire, and its ordering continues the sequence.
+        let structured = &rows[1];
+        assert_eq!(structured.tool_use_id.as_deref(), Some("c2"));
+        let expected =
+            tool_result_facts::stable_stringify(&json!([{ "type": "image", "data": "zz" }]));
+        assert_eq!(structured.payload_bytes, Some(expected.len() as i64));
+        assert_eq!(structured.event_index, Some(1));
+    }
+
+    #[test]
+    fn user_turn_blocks_are_derived_from_the_indexed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utb-session.jsonl");
+        // Shaped after relayburn's `claude/user-turn-blocks` fixture: one
+        // human turn, then one user message carrying two tool results.
+        let big = "A".repeat(100);
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "utb-session",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "please fix the build" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "utb-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_bash_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                    { "type": "tool_use", "id": "tu_read_1", "name": "Read",
+                      "input": { "file_path": "/src/app.ts" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "utb-session", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_bash_1", "content": "a\nb\n",
+                      "is_error": true },
+                    { "type": "tool_result", "tool_use_id": "tu_read_1", "content": big },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 100, None).unwrap();
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.user_turns.len(), 2);
+
+        let first = &page.user_turns[0];
+        assert_eq!(first.blocks.len(), 1);
+        assert_eq!(first.blocks[0].kind, "text");
+        assert_eq!(first.blocks[0].tool_use_id, None);
+        assert_eq!(
+            first.blocks[0].byte_len,
+            "please fix the build".len() as i64
+        );
+
+        let second = &page.user_turns[1];
+        let shape: Vec<(&str, Option<&str>, i64, Option<i64>)> = second
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.kind.as_str(),
+                    block.tool_use_id.as_deref(),
+                    block.byte_len,
+                    block.is_error,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("tool_result", Some("tu_bash_1"), 4, Some(1)),
+                ("tool_result", Some("tu_read_1"), 100, Some(0)),
+            ],
+        );
+
+        // The page is keyset-ordered on the turn's first event, so a limit of
+        // one hands back a cursor that resumes exactly at the second turn.
+        let bounded =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 1, None).unwrap();
+        assert_eq!(bounded.user_turns.len(), 1);
+        let cursor = bounded.next_cursor.expect("a second turn remains");
+        let rest =
+            crate::session_user_turns_page(&conn, "claude", "utb-session", 100, Some(&cursor))
+                .unwrap();
+        assert_eq!(rest.user_turns.len(), 1);
+        assert_eq!(rest.user_turns[0].id, second.id);
+    }
+
     #[test]
     fn codex_parent_resolution_supports_current_structured_and_legacy_metadata() {
         let cases = [
@@ -7331,6 +8476,7 @@ mod tests {
             None,
             None,
             "3:agent_message",
+            None,
         )
         .unwrap();
         super::insert_tool_call(

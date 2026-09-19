@@ -6,6 +6,59 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Record per-tool-result fidelity on `session_events`: `tool_use_id`,
+  `payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
+  `event_index`, `result_status`, `event_source`, `error_signal`,
+  `subagent_session_id`, `agent_id`. Bytes and hash are measured over the
+  provider's **raw** payload before the `text` column is materialized — a
+  string as-is, any other JSON stable-stringified with sorted keys — so a
+  measurement here and one taken by relayburn's `stable_stringify` /
+  `content_hash` compare equal. `payload_truncated` records that the harness
+  had already cut the output. Every column is null when the provider does not
+  record it, never a stand-in zero. Claude also indexes `type: "system"`
+  subagent notifications as tool results carrying the delegated child's
+  `subagent_session_id` / `agent_id`; Codex writes results with
+  `result_status = 'unknown'` and settles them from the turn's out-of-band
+  signals (`exit_code`, `patch_apply`, `mcp_err`) at `task_complete`. End of
+  file is not a turn boundary — a live rollout can still report a failure after
+  the bytes a sync read — so a partial read records the failures it saw and
+  leaves the rest `unknown`. A result with no displayable text (a silent
+  command, a structured payload with no text member) is recorded too, with its
+  measured zero-byte payload, rather than dropped. Added by the
+  `session_events_tool_result_fidelity_v1` marker migration, which also adds
+  `session_hydration_checkpoints.last_tool_result_index`; a database written
+  before this shape is routed through the writable open rather than read as
+  current. Plain `sync` runs one recorded backfill pass per provider, re-reading
+  a transcript whose indexed tool results have no `event_index`, so an upgraded
+  install backfills them instead of skipping every unchanged file on the stamp
+  fast path and reporting a successful sync over permanently null columns. The
+  pass is bounded by a recorded generation rather than by "a null row exists",
+  because local and remote observations share `(source, session_id)` and an
+  adapter may contribute a tool result with no fidelity that re-reading the
+  local transcript can never repair.
+  `HYDRATION_PARSER_VERSION` 2 -> 3.
+
+- Validate submitted `session_events` fidelity on the source-adapter boundary:
+  `payload_bytes`, `call_index` and `event_index` must be non-negative,
+  `result_status`, `event_source` and `error_signal` must come from the
+  documented vocabularies, and all of them must be null on a row that is not a
+  tool result. The TypeScript SDK types these as closed unions and casts
+  without re-checking, so an unvalidated synonym would reach consumers looking
+  exactly like a value they were told to expect.
+
+- Add `session_user_turns_page(conn, source, session_id, limit, after)`:
+  one keyset page of user turns, each with the ordered
+  `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
+  derived from `session_events` rather than a second table. A turn is what
+  arrived on one user message, so harness lines stored as tool results (Claude
+  subagent notifications) are excluded. The turn headers and the per-turn block
+  reads share one deferred read transaction, so a concurrent sync cannot
+  produce a page whose headers and blocks come from different snapshots. `approx_tokens` is
+  deliberately not computed — every estimate available here is a
+  bytes-per-token heuristic, and one served beside measured values is
+  indistinguishable from a measurement at the call site.
+  `SESSION_EVIDENCE_CONTRACT_VERSION` 1 -> 2.
+
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and
   `ai-hist-engine` packages). Default features expose `SessionStore`, evidence
   structs, `Source`, and `Error`. Optional features: `delivery`,
@@ -38,6 +91,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
 - Relate a Claude remote session to its materialized local continuation only
   when the local provider record contains the exact `remoteSessionId`; title or
   repository similarity never creates a canonical relationship.
+
+- Expose per-tool-result fidelity across the Node boundary. `SessionEvent`
+  gains `toolUseId`, `payloadBytes`, `payloadTruncated`, `payloadHash`,
+  `callIndex`, `eventIndex`, `resultStatus`, `eventSource`, `errorSignal`,
+  `subagentSessionId` and `agentId`, and the new
+  `getSessionUserTurnsPage(source, sessionId, options?)` —
+  with `getSessionUserTurns()` and the `sessionUserTurns()` iterator in the
+  TypeScript SDK — returns one keyset page of user turns and their ordered
+  blocks. Native contract 15 -> 16; session-evidence contract 1 -> 2.
 
 ### Breaking
 
