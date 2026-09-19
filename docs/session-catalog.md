@@ -320,6 +320,12 @@ What each adapter can actually extract from a cheap read. `✓` = populated when
 the provider recorded it; `–` = the provider does not expose it to a shallow
 read.
 
+This table covers *shallow discovery only*. The full-evidence picture — which
+record types each source captures, stores and exposes after `ai-hist sync` —
+is the capture matrix in [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix),
+which this table must stay consistent with.
+
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
@@ -566,6 +572,15 @@ as current.
 ---
 
 ## Adding a provider
+
+Providers are added **here and nowhere else**. RelayHistory is the single owner
+of acquiring, parsing and storing session evidence for every harness;
+downstream consumers read it through the `ai-hist` crate's `SessionStore`
+facade rather than writing a second parser. See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). A new or
+extended provider must also move its row in that ADR's capture matrix in the
+same change, and satisfy the record types in
+[`sourcing-contract.md`](sourcing-contract.md).
 
 Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
 

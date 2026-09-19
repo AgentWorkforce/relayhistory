@@ -29,6 +29,21 @@ helpers.
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
+## Session sourcing ownership
+
+RelayHistory is the single owner of acquiring, parsing and storing session
+evidence for every harness. Downstream consumers — including
+[`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
+pricing, cost and analytics — read that evidence through the `ai-hist` crate's
+`SessionStore` facade and never write `ai-history.db` themselves. New harnesses
+are added here and nowhere else.
+
+See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
+decision, the rejected alternatives and the per-source capture matrix, and
+[`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
+must expose.
+
 ## Optional services and package boundaries
 
 The local Rust workspace publishes one crate, `ai-hist`, containing storage,
