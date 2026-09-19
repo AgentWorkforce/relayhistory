@@ -3,9 +3,9 @@
 One workflow releases everything: `Publish RelayHistory release`
 (`.github/workflows/publish.yml`; the file name is bound to npm OIDC
 trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
-`ai-hist`, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
+the `ai-hist` npm package, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
 `@relayhistory/capture`, `@relayhistory/provider-sources` and their
-seven platform helper packages each. The SDK checks the current native contract
+seven platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).
 
@@ -43,14 +43,20 @@ and `crates/ai-hist-napi/src/lib.rs`).
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
-4. After the clean registry install and the older-glibc CLI smoke tests pass,
+4. `publish-crate` publishes the `ai-hist` crate to crates.io at that same
+   version (OIDC trusted publishing, or `CARGO_REGISTRY_TOKEN`). If the version
+   already exists, the job skips rather than failing. `dry_run` runs
+   `cargo publish --dry-run -p ai-hist` and publishes nothing. A crates.io-only
+   retry uses `skip_core` with the already-published `custom_version`; the job
+   checks out `sdk-ts-v<version>` and publishes the crate from that tag.
+5. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
    and creates the `sdk-ts-v<version>` tag and GitHub Release.
-5. `plugins` checks out that persisted commit, packages each helper binary at
+6. `plugins` checks out that persisted commit, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
    plugin before its JavaScript package.
-6. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
+7. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
    the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
    asset names the website mirrors.
 
@@ -61,6 +67,29 @@ of each plugin's Rust crate plus that crate's own `Cargo.lock` entry — the
 helper and probe executables report `CARGO_PKG_VERSION`). It is idempotent, and
 the helper matrix, the version commit and the plugin job all run it, so what was
 compiled, what was committed and what is published cannot diverge.
+
+## Rust crate
+
+The published crate is `ai-hist` on crates.io. It shares the npm version line,
+so `sdk-ts-v0.18.8` is also `ai-hist@0.18.8` on crates.io. `ai-hist-cli` and
+`ai-hist-napi` stay unpublished workspace members (`publish = false`).
+
+Cargo semver is the Rust contract — there is no separate Rust contract-version
+constant. Any change to a public struct field, enum variant, or behaviour a
+consumer observes is a minor bump pre-1.0 and gets a `### Rust API` entry in
+`CHANGELOG.md`. Default features expose `SessionStore`, evidence structs,
+`Source`, and `Error`. Optional features (`delivery`, `opencode-backup`,
+`git-hooks`, `unstable-internal`) stay off for embedders.
+
+```bash
+cargo add ai-hist
+```
+
+```rust
+use ai_hist::SessionStore;
+let store = SessionStore::open(Default::default())?;
+store.sync(Default::default())?;
+```
 
 ## Dry runs
 

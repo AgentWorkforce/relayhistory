@@ -17,7 +17,7 @@ use crate::convergence::{
     resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TokenUsage, TrajectoryRow,
     UNKNOWN_PROJECT,
 };
-use ai_hist_core::{
+use ai_hist::{
     session_events, session_file_edits, session_file_edits_page, HistoryEntry, SessionEvent,
     SessionEvidenceCursor, SessionFileEdit,
 };
@@ -165,7 +165,7 @@ pub fn build_outbox_batch(
     limit: usize,
     incognito: &HashSet<String>,
 ) -> Result<OutboxBatch> {
-    let limit = limit.clamp(1, ai_hist_core::storage::MAX_SCAN_LIMIT);
+    let limit = limit.clamp(1, ai_hist::storage::MAX_SCAN_LIMIT);
     // The server caps an ingest batch at 1000 records. A single trajectory row — especially
     // a compacted roll-up — expands to many convergence events (decisions + findings +
     // reflections), so the batch must be bounded on EMITTED records, not rows scanned, or a
@@ -182,7 +182,7 @@ pub fn build_outbox_batch(
 
     // --- history (prompts) — append-only, watermark on id ---
     {
-        for entry in ai_hist_core::storage::history_after(conn, cursor.history_id, limit)? {
+        for entry in ai_hist::storage::history_after(conn, cursor.history_id, limit)? {
             // Stop before consuming this row if the batch is full, so the cursor does not
             // advance past an un-emitted row (the next batch resumes from here).
             if records.len() >= MAX_RECORDS {
@@ -217,7 +217,7 @@ pub fn build_outbox_batch(
 
     // --- trajectories (decisions/retro) — keyset on (updated_ms, rowid) ---
     {
-        for t in ai_hist_core::storage::trajectories_after(
+        for t in ai_hist::storage::trajectories_after(
             conn,
             cursor.trajectory_updated_ms,
             cursor.trajectory_rowid,
@@ -258,7 +258,7 @@ pub fn build_outbox_batch(
 
     // --- session_commit_links → kind=session_outcome (one envelope per link row) ---
     {
-        for link in ai_hist_core::storage::commit_links_after(conn, cursor.commit_link_id, limit)? {
+        for link in ai_hist::storage::commit_links_after(conn, cursor.commit_link_id, limit)? {
             if records.len() + 2 > MAX_RECORDS {
                 break;
             }
@@ -312,7 +312,7 @@ pub fn build_outbox_batch(
     // --- file_edits that grew after the last prompt envelope for a session ---
     {
         for hit in
-            ai_hist_core::storage::changed_file_sessions_after(conn, cursor.file_edit_id, limit)?
+            ai_hist::storage::changed_file_sessions_after(conn, cursor.file_edit_id, limit)?
         {
             if records.len() >= MAX_RECORDS {
                 break;
@@ -349,7 +349,7 @@ pub fn build_outbox_batch(
     })
 }
 
-use ai_hist_core::storage::latest_history_for_session;
+use ai_hist::storage::latest_history_for_session;
 
 type PromptKey = (i64, String);
 type UsageCache = HashMap<(String, String), HashMap<PromptKey, TokenUsage>>;
@@ -587,7 +587,7 @@ fn session_branch_for_entry(
     branches
         .entry(key)
         .or_insert_with(|| {
-            ai_hist_core::storage::session_metadata(conn, &entry.source, sid)
+            ai_hist::storage::session_metadata(conn, &entry.source, sid)
                 .ok()
                 .flatten()
                 .and_then(|metadata| metadata.git_branch)
@@ -622,7 +622,7 @@ fn git_remote_for_entry(
 }
 
 fn session_cwd(conn: &Connection, source: &str, session_id: &str) -> Option<String> {
-    ai_hist_core::storage::session_metadata(conn, source, session_id)
+    ai_hist::storage::session_metadata(conn, source, session_id)
         .ok()
         .flatten()
         .and_then(|metadata| metadata.cwd)
@@ -652,7 +652,7 @@ fn session_project_id(
     repo: Option<&str>,
     remotes: &mut HashMap<String, Option<String>>,
 ) -> String {
-    let project = ai_hist_core::storage::session_project(conn, source, session_id)
+    let project = ai_hist::storage::session_project(conn, source, session_id)
         .ok()
         .flatten();
     let remote = session_cwd(conn, source, session_id).and_then(|cwd| {
@@ -745,7 +745,7 @@ fn learn_origin_session(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history};
+    use ai_hist::{init_db, insert_history};
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -772,7 +772,7 @@ mod tests {
                 session_id: Some(session.into()),
                 project: project.map(str::to_string),
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )
@@ -809,7 +809,7 @@ mod tests {
                 session_id: Some("usage-session".into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )
@@ -1128,7 +1128,7 @@ mod tests {
                 session_id: Some(sid.into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             };
             assert_eq!(
@@ -1173,7 +1173,7 @@ mod tests {
             session_id: Some(sid.into()),
             project: None,
             prompt: "ask".into(),
-            prompt_hash: Some(ai_hist_core::prompt_hash("ask")),
+            prompt_hash: Some(ai_hist::prompt_hash("ask")),
             timestamp_ms: 100,
         };
         let usage = session_usage_for_entry(&conn, &entry, &mut HashMap::new()).unwrap();
@@ -1539,7 +1539,7 @@ mod tests {
     fn unacknowledged_outbox_rebuilds_identically_after_reopening_unchanged_storage() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("history.db");
-        let conn = ai_hist_core::open_db(&db).unwrap();
+        let conn = ai_hist::open_db(&db).unwrap();
         add_history(&conn, "retry-session", "first prompt", 1);
         add_history(&conn, "retry-session", "second prompt", 2);
         // A transcript checkpoint is independent of convergence delivery.
@@ -1555,7 +1555,7 @@ mod tests {
         drop(conn);
 
         // Simulate a lost response: the caller persisted no acknowledgment.
-        let conn = ai_hist_core::open_db(&db).unwrap();
+        let conn = ai_hist::open_db(&db).unwrap();
         let resumed: SyncCursor = serde_json::from_str(&stored_cursor).unwrap();
         let retry = build_outbox_batch(&conn, &resumed, 1, &HashSet::new()).unwrap();
         assert_eq!(retry, first);

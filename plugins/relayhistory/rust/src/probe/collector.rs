@@ -1,5 +1,5 @@
 use super::{lock, read_config, save_json, user_error, Config};
-use ai_hist_core::delivery::{self, worker, ExportSelection};
+use ai_hist::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
 use relayhistory_plugin::{cloud, destination};
 use rusqlite::Connection;
@@ -58,7 +58,7 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
     let mut identities = Vec::new();
     loop {
         let page =
-            ai_hist_core::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
+            ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
         if page.is_empty() {
             break;
         }
@@ -130,14 +130,14 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     );
     let db_path = directory.join("history.db");
     ensure!(
-        ai_hist_engine::sync_local_at(&db_path)?,
+        ai_hist::sync_local_at(&db_path)?,
         "capture not complete"
     );
     // The receiver rejects a batch whose account or mapping does not match, but
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
     {
-        let conn = ai_hist_core::open_db(&db_path)?;
+        let conn = ai_hist::open_db(&db_path)?;
         let job = delivery::status(&conn, &config.job_id)?;
         ensure!(
             job.config.account_id == config.delivery_account
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn new_only_baseline_is_durable_and_independent_of_history_size() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist_core::init_db(&conn).unwrap();
+        ai_hist::init_db(&conn).unwrap();
         for index in 0..1200 {
             conn.execute(
                 "INSERT INTO sessions(source, session_id) VALUES ('claude', ?1)",
@@ -381,7 +381,7 @@ mod tests {
             .unwrap();
         }
         let baseline =
-            ai_hist_core::storage::session_identities_after(&conn, None, 10_000).unwrap();
+            ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
         // The same identities carried inline would exceed the 64 KiB cap that
         // create_job enforces on a delivery configuration.
         assert!(serde_json::to_vec(&baseline).unwrap().len() > 65_536);
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn include_existing_records_no_baseline() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist_core::init_db(&conn).unwrap();
+        ai_hist::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn an_abandoned_baseline_does_not_outlive_a_later_include_existing_setup() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist_core::init_db(&conn).unwrap();
+        ai_hist::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],

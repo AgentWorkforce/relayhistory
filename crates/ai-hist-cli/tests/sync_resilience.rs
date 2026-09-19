@@ -1,4 +1,4 @@
-use ai_hist_core::open_db;
+use ai_hist::open_db;
 use std::fs;
 use std::process::Command;
 

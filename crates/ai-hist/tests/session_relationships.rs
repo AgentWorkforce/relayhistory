@@ -5,11 +5,11 @@
 //! taken through the acquisition path a host actually uses (sync, discovery,
 //! targeted hydration) and then queried through the public relationship API.
 
-use ai_hist_core::{open_db, session_relationships, session_tree, SessionTreeOptions};
-use ai_hist_engine::{
+use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, sync_scoped_at, DiscoverOptions,
     HydrateSessionOptions, SessionScope,
 };
+use ai_hist::{open_db, session_relationships, session_tree, SessionTreeOptions};
 use std::fs;
 use std::path::Path;
 

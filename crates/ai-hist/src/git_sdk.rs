@@ -3,7 +3,7 @@ use crate::git_helpers::{
     git_branch, git_commit_files, git_commit_numstat, git_commit_time_ms, git_path, git_repo_root,
     git_stdout, sh_single_quote,
 };
-use ai_hist_core::open_db;
+use crate::open_db;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

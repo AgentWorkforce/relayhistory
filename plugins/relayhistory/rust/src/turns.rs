@@ -139,14 +139,14 @@ fn build_turns_batch_in_snapshot(
     session_budget: usize,
     incognito: &HashSet<String>,
 ) -> Result<TurnsBatch> {
-    let budget = session_budget.clamp(1, ai_hist_core::storage::MAX_SCAN_LIMIT - 1);
+    let budget = session_budget.clamp(1, ai_hist::storage::MAX_SCAN_LIMIT - 1);
     let lookahead = budget + 1;
 
     // Which sessions have anything new, oldest change first so the backlog drains in a
     // predictable order rather than jumping around. One extra session identifies
     // the first event this batch cannot acknowledge.
     let mut pending =
-        ai_hist_core::storage::pending_event_sessions(conn, session_event_id, lookahead)?;
+        ai_hist::storage::pending_event_sessions(conn, session_event_id, lookahead)?;
 
     if pending.is_empty() {
         return Ok(TurnsBatch {
@@ -169,7 +169,7 @@ fn build_turns_batch_in_snapshot(
     let mut sessions = Vec::new();
 
     for (session_id, source, _) in pending {
-        let rows = ai_hist_core::session_events(conn, &session_id, Some(&source))?;
+        let rows = ai_hist::session_events(conn, &session_id, Some(&source))?;
 
         let mut turns: Vec<ConversationTurn> = Vec::new();
         for event in rows {
@@ -572,9 +572,9 @@ mod tests {
     fn concurrent_appends_remain_pending_beyond_the_read_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("history.db");
-        let mut reader = ai_hist_core::open_db(&path).unwrap();
+        let mut reader = ai_hist::open_db(&path).unwrap();
         insert(&reader, "a", 1, "user", "text", "a first");
-        let writer = ai_hist_core::open_db(&path).unwrap();
+        let writer = ai_hist::open_db(&path).unwrap();
         let snapshot = reader.transaction().unwrap();
         let count: i64 = snapshot
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))

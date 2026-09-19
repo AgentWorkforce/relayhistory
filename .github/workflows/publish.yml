@@ -49,7 +49,7 @@ on:
         default: true
         type: boolean
       skip_core:
-        description: 'Re-run only plugins/probe for an already published core version; requires custom_version'
+        description: 'Re-run plugins/probe/crates.io for an already published core version; requires custom_version'
         required: false
         default: false
         type: boolean
@@ -550,7 +550,9 @@ jobs:
 
           const files = [
             ["../../crates/ai-hist-napi/Cargo.toml", /(\[package\]\nname = "ai-hist-napi"\nversion = ")[^"]+("\n)/],
+            ["../../crates/ai-hist/Cargo.toml", /(\[package\]\nname = "ai-hist"\nversion = ")[^"]+("\n)/],
             ["../../Cargo.lock", /(\[\[package\]\]\nname = "ai-hist-napi"\nversion = ")[^"]+("\n)/],
+            ["../../Cargo.lock", /(\[\[package\]\]\nname = "ai-hist"\nversion = ")[^"]+("\n)/],
           ];
           for (const [path, pattern] of files) {
             const contents = fs.readFileSync(path, "utf8");
@@ -601,14 +603,25 @@ jobs:
                 }
               }
             }
-            for (const path of ["crates/ai-hist-napi/Cargo.toml", "Cargo.lock"]) {
+            for (const [path, name] of [
+              ["crates/ai-hist-napi/Cargo.toml", "ai-hist-napi"],
+              ["crates/ai-hist/Cargo.toml", "ai-hist"],
+            ]) {
               const contents = fs.readFileSync(path, "utf8");
               const pattern = path.endsWith("Cargo.toml")
-                ? /\[package\]\nname = "ai-hist-napi"\nversion = "([^"]+)"/
-                : /\[\[package\]\]\nname = "ai-hist-napi"\nversion = "([^"]+)"/;
+                ? new RegExp("\\[package\\]\\nname = \"" + name + "\"\\nversion = \"([^\"]+)\"")
+                : null;
               const version = pattern.exec(contents)?.[1];
               if (version !== process.env.VERSION) {
-                throw new Error(path + " has ai-hist-napi version " + version);
+                throw new Error(path + " has " + name + " version " + version);
+              }
+            }
+            const lock = fs.readFileSync("Cargo.lock", "utf8");
+            for (const name of ["ai-hist-napi", "ai-hist"]) {
+              const pattern = new RegExp("\\[\\[package\\]\\]\\nname = \"" + name + "\"\\nversion = \"([^\"]+)\"");
+              const version = pattern.exec(lock)?.[1];
+              if (version !== process.env.VERSION) {
+                throw new Error("Cargo.lock has " + name + " version " + version);
               }
             }
             console.log("All packages aligned at " + process.env.VERSION);
@@ -635,6 +648,7 @@ jobs:
             plugins/provider-sources/rust/Cargo.toml \
             plugins/provider-sources/rust/Cargo.lock \
             Cargo.lock \
+            crates/ai-hist/Cargo.toml \
             crates/ai-hist-napi/Cargo.toml \
             crates/ai-hist-napi/package.json \
             crates/ai-hist-napi/package-lock.json \
@@ -790,6 +804,61 @@ jobs:
             --target "${{ steps.persist-version.outputs.sha }}" \
             --title "ai-hist@$VERSION" \
             --generate-notes
+
+  publish-crate:
+    name: Publish crate to crates.io
+    needs: [version, publish]
+    # skip_core is the crates.io-only retry: npm already published this version
+    # and tagged it, so this job checks out that tag instead of the dispatch SHA.
+    if: ${{ !cancelled() && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stamp the crate at the release version
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          python3 - <<'PY'
+          import os, pathlib, re
+          version = os.environ["VERSION"]
+          root = pathlib.Path(".")
+          files = [
+              (root / "crates/ai-hist/Cargo.toml", r'(\[package\]\nname = "ai-hist"\nversion = ")[^"]+(")'),
+              (root / "Cargo.lock", r'(\[\[package\]\]\nname = "ai-hist"\nversion = ")[^"]+(")'),
+          ]
+          for path, pattern in files:
+              text = path.read_text()
+              updated, n = re.subn(pattern, rf"\g<1>{version}\g<2>", text, count=1)
+              if n != 1:
+                  raise SystemExit(f"could not stamp ai-hist version in {path}")
+              path.write_text(updated)
+          PY
+      - name: cargo publish dry-run
+        run: cargo publish --dry-run -p ai-hist --allow-dirty --locked
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if curl -sf "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
+            echo "ai-hist ${VERSION} already exists on crates.io; skip"
+            exit 0
+          fi
+          # Dry-run already compiled the package. Skip verify so the registry
+          # token is not present while Cargo runs repository-controlled scripts.
+          cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
   plugins:
     name: Publish optional history plugins

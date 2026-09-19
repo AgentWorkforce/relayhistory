@@ -1,14 +1,17 @@
 //! Transport-free source plugin intake. Each complete snapshot is fenced by the
 //! observation revision acquired before external I/O, then reconciled atomically.
 use crate::{discover::*, *};
-use ai_hist_core::{
+use crate::{
     observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation},
     source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS},
 };
-use anyhow::ensure;
-use rusqlite::TransactionBehavior;
+use anyhow::{ensure, Context, Result};
+use rusqlite::{Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,7 +434,7 @@ pub fn apply_source_observations(request: ApplyObservationsRequest) -> Result<Di
         row.discovery_state = "shallow".into();
         row.locations = vec![request.location.as_str().into()];
         row.from_cache = false;
-        let source = *ai_hist_core::SOURCE_CHOICES
+        let source = *crate::SOURCE_CHOICES
             .iter()
             .find(|source| **source == row.source)
             .context("INVALID_ARGUMENT: unknown source")?;

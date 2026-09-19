@@ -13,14 +13,14 @@ calls the **`ai-hist-native`** napi addon's `syncAndPush()`:
 agent-relay up  ──(every few minutes, if reflex.json.enabled)──▶  require('ai-hist-native').syncAndPush()
                                                                         │  (in-process, worker thread)
                                                                         ▼
-                                              ai_hist_engine::sync_and_push()  (Rust)
+                                              ai_hist::sync_and_push()  (Rust)
                                                 sync local history → push new records → POST /v1/ingest
 ```
 
 - **No subprocess:** `ai-hist-native` is a native (napi) Node addon. Relay loads
   it and calls the Rust `sync_and_push` directly via FFI; the blocking work runs
   on a worker thread so the event loop isn't blocked.
-- **Single source of truth:** the Rust `ai_hist_engine` library does the sync +
+- **Single source of truth:** the Rust `ai_hist` library does the sync +
   push. The CLI binary and the addon call the same code.
 - **Auth:** the `rth_at_` token written by `reflex on` (in the stage-scoped
   `~/.agentworkforce/relayhistory/stages/` store). `syncAndPush()` returns

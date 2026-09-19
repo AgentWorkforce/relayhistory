@@ -11,7 +11,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use crate::discover::{
     discover_sessions_with_providers, list_session_catalog, CatalogListOptions, DiscoverOptions,
 };
-use ai_hist_core::{init_db, SessionScope};
+use ai_hist::{init_db, SessionScope};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 

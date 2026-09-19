@@ -33,6 +33,8 @@ The bare `ai-hist` command bootstraps a searchable database on first use: it dis
 
 Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows x64 — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
 
+Rust embedders depend on the `ai-hist` crate (`SessionStore::open` / `sync`). See [crates/ai-hist/README.md](crates/ai-hist/README.md).
+
 ## Every command
 
 ```sh

@@ -1,11 +1,10 @@
 //! Targeted, provider-bounded session evidence acquisition.
 
 use super::*;
-use ai_hist_core::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
+use crate::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::time::Instant;
 
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
@@ -281,7 +280,7 @@ struct RemoteHydrationLock {
 
 impl Drop for RemoteHydrationLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = crate::file_lock::unlock(&self.file);
     }
 }
 
@@ -319,7 +318,7 @@ fn acquire_remote_hydration_lock(
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening hydration lock {}", lock_path.display()))?;
-    fs2::FileExt::lock_exclusive(&file)
+    crate::file_lock::lock_exclusive(&file)
         .with_context(|| format!("locking hydration target {}", lock_path.display()))?;
     Ok(RemoteHydrationLock { file })
 }
@@ -550,12 +549,7 @@ fn hydrate_remote_claude_observed(
             Value::String(options.session_id.clone()),
         );
     }
-    let mut transcript = tempfile::NamedTempFile::new()?;
-    for record in &records {
-        serde_json::to_writer(&mut transcript, record)?;
-        transcript.write_all(b"\n")?;
-    }
-    transcript.flush()?;
+    let transcript = crate::jsonl_temp::JsonlTemp::write(records.iter())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let had_local_presence: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_presences WHERE source = ? AND session_id = ? AND location = 'local')",
@@ -1862,8 +1856,8 @@ pub fn normalize_source_evidence(
     session_id: &str,
     evidence: crate::sources::AcquiredEvidence,
 ) -> Result<crate::source_intake::NormalizedSourceEvidence> {
+    use crate::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
     use crate::sources::AcquiredEvidence;
-    use ai_hist_core::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
     let (source_stamp, source_bytes, covered_kinds, records) = match evidence {
         AcquiredEvidence::Events(evidence) => {
             let records = evidence
@@ -1897,7 +1891,6 @@ pub fn normalize_source_evidence(
                 source == "claude",
                 "CONNECTOR_FAILURE: Claude evidence returned for another source"
             );
-            let mut transcript = tempfile::NamedTempFile::new()?;
             for record in &mut records {
                 let object = record
                     .as_object_mut()
@@ -1911,12 +1904,10 @@ pub fn normalize_source_evidence(
                     "CONNECTOR_FAILURE: Claude record identity does not match requested session"
                 );
                 object.insert("sessionId".into(), Value::String(session_id.into()));
-                serde_json::to_writer(&mut transcript, record)?;
-                transcript.write_all(b"\n")?;
             }
-            transcript.flush()?;
+            let transcript = crate::jsonl_temp::JsonlTemp::write(records.iter())?;
             let conn = Connection::open_in_memory()?;
-            ai_hist_core::init_db(&conn)?;
+            crate::init_db(&conn)?;
             ingest_claude_transcript(&conn, transcript.path())?;
             let records =
                 source_evidence::read_session(&conn, source, session_id, FULL_SESSION_KINDS)?;

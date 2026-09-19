@@ -1,9 +1,9 @@
 //! The generic drain loop: one worker, receiver-agnostic, ported from the
 //! behaviours the TypeScript host tests already pin down.
 
-use ai_hist_core::delivery::worker::*;
-use ai_hist_core::delivery::*;
-use ai_hist_core::open_db;
+use ai_hist::delivery::worker::*;
+use ai_hist::delivery::*;
+use ai_hist::open_db;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

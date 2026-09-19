@@ -1,6 +1,6 @@
 //! Bounded one-request bridge for explicitly selected provider-native adapters.
-use ai_hist_core::{observations::SessionObservation, SessionLocation};
-use ai_hist_engine::discover::DiscoveryEnv;
+use ai_hist::{observations::SessionObservation, SessionLocation};
+use ai_hist::discover::DiscoveryEnv;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -127,7 +127,7 @@ fn execute(request: Request) -> Result<Value> {
         );
         provider.check_available(home)?;
         let evidence = provider.acquire(home, &observation)?;
-        let normalized = ai_hist_engine::sources::normalize_source_evidence(
+        let normalized = ai_hist::sources::normalize_source_evidence(
             provider.source(),
             &observation.key.session_id,
             evidence,

@@ -3,7 +3,7 @@
 //! The collision test deliberately records a known limitation of the current
 //! schema. Stage 3 must replace it with independent connector observations.
 
-use ai_hist_core::{init_db, session_locations, upsert_session_presence, SessionLocation};
+use ai_hist::{init_db, session_locations, upsert_session_presence, SessionLocation};
 use rusqlite::Connection;
 
 #[test]

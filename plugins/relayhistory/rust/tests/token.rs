@@ -15,7 +15,7 @@ const REFRESH: &str = "rth_rt_old_fixture";
 fn save(home: &Path, base: &str, token: &str, expiry: Option<&str>) -> PathBuf {
     let stages = home.join("stages");
     std::fs::create_dir_all(&stages).unwrap();
-    let path = stages.join(format!("{}.auth.json", ai_hist_core::prompt_hash(base)));
+    let path = stages.join(format!("{}.auth.json", ai_hist::prompt_hash(base)));
     std::fs::write(
         &path,
         json!({"base_url": base, "access_token": token,

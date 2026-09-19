@@ -2,7 +2,7 @@
 //! in optional packages and are composed through [`crate::sources::SourceRegistry`]
 //! or the generic source intake API. This module never reads credentials.
 use crate::ShallowSessionProvider;
-use ai_hist_core::SOURCE_CHOICES;
+use crate::SOURCE_CHOICES;
 use anyhow::Result;
 use std::path::Path;
 

@@ -2,10 +2,15 @@
 //!
 //! Registration never probes credentials or calls a transport. The caller chooses
 //! connector instances first; only those adapters receive acquisition calls.
-use crate::{discover::discover_sessions_with_provider_refs, *};
-use ai_hist_core::observations::{self, ObservationKey, SessionObservation};
-use anyhow::ensure;
+use crate::discover::discover_sessions_with_provider_refs;
+use crate::observations::{self, ObservationKey, SessionObservation};
+use crate::*;
+use anyhow::{ensure, Context, Result};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConnectorIdentity {
@@ -29,7 +34,7 @@ impl ConnectorIdentity {
 pub struct ConnectorEvidence {
     pub source_stamp: String,
     pub source_bytes: i64,
-    pub events: Vec<ai_hist_core::SessionEvent>,
+    pub events: Vec<crate::SessionEvent>,
 }
 
 /// Provider wire formats can use existing parsers; independent adapters can
@@ -118,7 +123,7 @@ impl SourceRegistry {
         }
         for source in sources {
             ensure!(
-                ai_hist_core::SOURCE_CHOICES.contains(&source.as_str()),
+                crate::SOURCE_CHOICES.contains(&source.as_str()),
                 "INVALID_ARGUMENT: unknown history source {source}"
             );
         }

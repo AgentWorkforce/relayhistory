@@ -9,7 +9,7 @@ use std::{
 };
 #[derive(Parser)]
 struct Cli {
-    #[arg(long, default_value_os_t = ai_hist_core::default_db_path())]
+    #[arg(long, default_value_os_t = ai_hist::default_db_path())]
     db: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -274,7 +274,7 @@ pub fn run() -> Result<()> {
         } => {
             anyhow::ensure!(!install_service && !uninstall_service, "Legacy push service management moved to the optional SDK destination scheduler; migrate the installed job explicitly");
             let _ = interval;
-            let conn = ai_hist_core::open_db(&cli.db)?;
+            let conn = ai_hist::open_db(&cli.db)?;
             let auth = cloud::load_auth(base_url.as_deref())?
                 .context("not authenticated — run `ai-hist login` or `ai-hist admin-mint` first")?;
             let machine = MachineIdentity {

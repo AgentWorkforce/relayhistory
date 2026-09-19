@@ -1,4 +1,4 @@
-use ai_hist_core::delivery::{HistoryExportBatch, PreparedPayload};
+use ai_hist::delivery::{HistoryExportBatch, PreparedPayload};
 use relayhistory_plugin::destination::{account_id, prepare, MAPPING_VERSION};
 use serde_json::{json, Value};
 use std::{
@@ -55,7 +55,7 @@ fn auth(home: &Path, base: &str, org: &str) {
     let stages = home.join("stages");
     std::fs::create_dir_all(&stages).unwrap();
     std::fs::write(
-        stages.join(format!("{}.auth.json", ai_hist_core::prompt_hash(base))),
+        stages.join(format!("{}.auth.json", ai_hist::prompt_hash(base))),
         json!({"base_url":base,"access_token":"rth_at_fixture","org_id":org}).to_string(),
     )
     .unwrap();

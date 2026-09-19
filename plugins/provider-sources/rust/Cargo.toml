@@ -7,8 +7,7 @@ license = "MIT"
 [workspace]
 
 [dependencies]
-ai-hist-core = { path = "../../../crates/ai-hist-core" }
-ai-hist-engine = { path = "../../../crates/ai-hist" }
+ai-hist = { path = "../../../crates/ai-hist", features = ["unstable-internal"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

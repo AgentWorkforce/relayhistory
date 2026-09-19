@@ -8,7 +8,7 @@ Node.js, npm, NAPI addon or separately installed Agent Relay CLI.
 ## Source ownership
 
 Keep the binary in `plugins/relayhistory/rust/src/probe/` in this repository. It
-links the existing `ai-hist-engine` capture engine, `ai-hist-core` delivery queue
+links the existing `ai-hist` capture engine, `ai-hist` delivery queue
 and optional `relayhistory-plugin` transport. A separate repository would need to
 coordinate versions of these same components without adding a runtime boundary.
 The core local SDK remains independent of the Cloud package.
@@ -163,7 +163,7 @@ installer. The CI job builds and tests on macOS/Linux but publishes nothing.
 ```sh
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --lib cloud:: --locked
-cargo test -p ai-hist-core identity_pages --locked
+cargo test -p ai-hist --features delivery identity_pages --locked
 ```
 
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,

@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/ai-hist-core",
     "crates/ai-hist",
     "crates/ai-hist-cli",
     "crates/ai-hist-napi",
@@ -11,4 +10,4 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/AgentWorkforce/relayhistory"
-
+rust-version = "1.88"
