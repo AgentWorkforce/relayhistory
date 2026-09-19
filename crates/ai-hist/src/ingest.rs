@@ -768,6 +768,68 @@ impl Drop for SyncStateLock {
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
+/// Bump when a parser change needs transcripts an earlier release already
+/// indexed to be re-read once.
+///
+/// The per-session "does this look unparsed?" probes below decide *which*
+/// files a backfill pass re-reads. They cannot decide *whether* a pass is
+/// still owed, because a row they can see may not be a row the local
+/// transcript owns: `session_events` is keyed by `(source, session_id)`, and
+/// local and remote observations of one session share that identity. An
+/// installed source adapter contributes rows through the evidence path, which
+/// does not carry `raw_facts_version`, and re-reading the local transcript
+/// never repairs a row that came from somewhere else -- so "some row for this
+/// session is unstamped" is a condition that can stay true forever, re-reading
+/// an unchanged file on every sync while never repairing anything.
+///
+/// Recording the generation per provider makes the pass happen exactly once.
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 1;
+const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
+const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
+
+/// Whether this provider still owes a one-time raw-facts backfill pass.
+fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
+    state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
+}
+
+/// Record that the pass finished. Only reached when the walk completed, so an
+/// interrupted sync retires the backfill rather than skipping it.
+///
+/// `walked_every_known_root` is the other half of that: a walk that completed
+/// without being able to open the files it was meant to repair has not done
+/// the pass, and recording the generation there retires it for good. The facts
+/// then stay null on every row for the life of the install while `sync` goes
+/// on reporting success -- the same shape of failure the pass exists to undo,
+/// one level up.
+fn record_raw_facts_backfill(
+    state: &mut Map<String, Value>,
+    key: &str,
+    walked_every_known_root: bool,
+) {
+    if !walked_every_known_root {
+        return;
+    }
+    state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
+}
+
+/// Whether the sync state already names transcripts under `root`.
+///
+/// This is what distinguishes an archive that is *unavailable* on this run --
+/// an unmounted home, a profile directory that has not been created yet, an
+/// external drive -- from one that simply does not exist for this install. The
+/// first makes the walk complete over nothing while the rows it should have
+/// repaired are still there; the second has nothing to repair. Only the first
+/// may hold the generation back, or an install that never had an
+/// `archived_sessions` tree would keep re-probing forever.
+fn state_names_files_under(known: &Map<String, Value>, root: &Path) -> bool {
+    let prefix = root.to_string_lossy();
+    known.keys().any(|key| {
+        key.len() > prefix.len()
+            && key.starts_with(prefix.as_ref())
+            && key[prefix.len()..].starts_with(std::path::MAIN_SEPARATOR)
+    })
+}
+
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts", "codex_rollouts_v5"),
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
@@ -1561,6 +1623,12 @@ fn sync_codex_rollouts(
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
+    // A root the stamp map has entries for but that is not on disk this run is
+    // an archive we could not read, not an archive that is gone. Walking it
+    // vacuously and then recording the generation would retire the one-time
+    // backfill over rollouts nothing ever looked at.
+    let mut walked_every_known_root = true;
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1569,6 +1637,9 @@ fn sync_codex_rollouts(
         home.join(".codex/archived_sessions"),
     ] {
         if !root.exists() {
+            if state_names_files_under(&seen, &root) {
+                walked_every_known_root = false;
+            }
             continue;
         }
         for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
@@ -1613,7 +1684,13 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
-                    Some(id) if codex_session_events_exist(conn, id)? => continue,
+                    Some(id)
+                        if codex_session_events_exist(conn, id)?
+                            && !(backfill_raw_facts
+                                && events_lack_raw_facts(conn, "codex", id)?) =>
+                    {
+                        continue
+                    }
                     // Stamp matches but the events are gone (wiped or rebuilt
                     // database): fall through and re-ingest.
                     _ => {}
@@ -1720,6 +1797,7 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2113,6 +2191,11 @@ fn ingest_codex_rollout(
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut pending_delta: Option<CodexTokenTotals> = None;
     let mut untokened_assistant_uid: Option<String> = None;
+    // The turn a record falls inside, stamped from the last `turn_context`
+    // until the next one names a different turn. Codex writes it once per turn
+    // rather than on every record, so carrying it forward is what makes turn
+    // boundaries recoverable downstream.
+    let mut turn_id: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
     let mut reader = BufReader::new(file);
@@ -2171,6 +2254,7 @@ fn ingest_codex_rollout(
                 message_id,
                 None,
                 None,
+                turn_id.as_deref(),
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2199,6 +2283,10 @@ fn ingest_codex_rollout(
                 if let Some(m) = payload_str("model") {
                     model = Some(m.to_string());
                 }
+                // A turn_context without a turn_id closes the previous turn
+                // rather than extending it: stamping the stale id onto the new
+                // turn's records would fabricate a boundary that is not there.
+                turn_id = payload_str("turn_id").map(str::to_string);
             }
             "event_msg" => match payload_type {
                 "user_message" => {}
@@ -2219,6 +2307,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             token_json.as_deref(),
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2243,6 +2332,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             None,
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -2449,6 +2539,7 @@ fn ingest_codex_rollout(
                         &message_id,
                         model.as_deref(),
                         token_json.as_deref(),
+                        turn_id.as_deref(),
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2489,6 +2580,7 @@ fn ingest_codex_rollout(
                             &message_id,
                             None,
                             None,
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                     }
@@ -2522,6 +2614,7 @@ fn insert_codex_event(
     message_id: &str,
     model: Option<&str>,
     token_json: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -2539,6 +2632,10 @@ fn insert_codex_event(
         model,
         token_json,
         uid,
+        RawMessageFacts {
+            turn_id,
+            ..RawMessageFacts::default()
+        },
     )
 }
 
@@ -2636,6 +2733,9 @@ fn sync_claude_session_metadata(
     state: &mut Map<String, Value>,
     root: &Path,
 ) -> Result<()> {
+    // Load-bearing for the raw-facts generation below: an absent root returns
+    // before anything is recorded, so a run that could not see the archive
+    // does not retire the one-time backfill pass over it.
     if !root.exists() {
         return Ok(());
     }
@@ -2649,6 +2749,7 @@ fn sync_claude_session_metadata(
         .unwrap_or_default();
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2657,6 +2758,12 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
+            // During the one-time backfill pass, an unchanged transcript
+            // whose rows predate the per-message raw facts is re-read to
+            // populate them. Outside that pass the stamp alone decides, so a
+            // row this transcript does not own -- an adapter's contribution to
+            // the same session -- cannot pin the file off the fast path.
+            && !(backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
         {
             continue;
         }
@@ -2699,6 +2806,8 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
+    // The one root this walk has was present, or the function returned above.
+    record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, true);
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2749,6 +2858,88 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether a session still holds locally parsed rows indexed before the
+/// per-message raw provider facts existed.
+///
+/// A schema migration adds the nullable columns and writes its marker; the
+/// sync stamp maps are what decide whether a provider transcript is opened at
+/// all. Without this probe a database that migrated cleanly skips every
+/// unchanged transcript, and plain `sync` leaves `request_id`, `stop_reason`,
+/// `agent_version`, `is_sidechain`, `is_meta` and `turn_id` null on every row
+/// that was already indexed -- while reporting a perfectly successful sync.
+/// Only explicit hydration, which `HYDRATION_PARSER_VERSION` covers, or an
+/// unrelated edit to the file would ever repair them.
+///
+/// `raw_facts_version` is the field to test, and it is the reason that column
+/// exists: the parser stamps it on every event it writes whatever the record
+/// contained. None of the six facts can play that role -- a real record
+/// legitimately has no `request_id`, no `stop_reason` and no `turn_id`, and
+/// Codex sets none of the other three -- so a probe on any of them would
+/// select transcripts that have nothing to gain.
+///
+/// This only selects which files a backfill pass re-reads; it is not what ends
+/// the pass. `session_events` is keyed by `(source, session_id)` and local and
+/// remote observations of one session share that identity, so a row this probe
+/// sees may be an adapter's contribution that re-reading the local transcript
+/// will never stamp. `RAW_MESSAGE_FACTS_GENERATION` is what guarantees the
+/// work happens once.
+///
+/// Selecting files this way is narrower than bumping the stamp-map generation,
+/// which would re-read every transcript in the archive, including the ones
+/// with nothing to gain, and would discard the selective-repair state the
+/// codex generations carry.
+fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_events e
+            WHERE e.source = ? AND e.session_id = ?
+              AND COALESCE(e.raw_facts_version, 0) < ?
+            LIMIT 1
+        )",
+        params![source, session_id, RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// The same question for a Claude transcript, which the walk knows by path.
+///
+/// A file reaches its rows by one of two routes, matching the two ways the
+/// walk already decides a transcript is indexed. A session transcript owns the
+/// `sessions` row carrying its `raw_path`. A subagent sidecar never gets one:
+/// the walk hands it to `ingest_claude_subagent` and skips the catalog upsert
+/// entirely, so its rows are reachable only through the relationship whose
+/// `evidence_locator` is the sidecar's own path. Asking through `raw_path`
+/// alone left every sidecar out of the backfill -- unchanged on disk, never
+/// re-read, its events keeping null facts for good.
+fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                JOIN session_events e
+                  ON e.source = 'claude'
+                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )",
+        params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -3020,10 +3211,8 @@ fn ingest_claude_transcript_as(
         // activity (text and token spend), but its user-role rows are the
         // parent agent's own prompts and tool results — ingesting those
         // manufactures fake human turns.
-        let sidechain = obj
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
+        let sidechain = is_sidechain.unwrap_or(false);
         let skipped_sidechain = sidechain
             && obj
                 .get("message")
@@ -3071,13 +3260,30 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        let is_meta = obj.get("isMeta").and_then(Value::as_bool);
+        // Verbatim envelope facts. `stop_reason` is deliberately not mapped to
+        // an enum: a JSON null means the turn is still in flight, and that is
+        // exactly the distinction a normalizing parser would erase.
+        let facts = RawMessageFacts {
+            request_id: obj
+                .get("requestId")
+                .or_else(|| obj.get("request_id"))
+                .and_then(Value::as_str),
+            stop_reason: message
+                .and_then(|m| m.get("stop_reason"))
+                .and_then(Value::as_str),
+            agent_version: obj
+                .get("version")
+                .or_else(|| obj.get("sourceVersion"))
+                .and_then(Value::as_str),
+            is_sidechain,
+            is_meta,
+            turn_id: None,
+        };
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
-        if !sidechain
-            && message_role == "user"
-            && obj.get("isMeta").and_then(Value::as_bool) != Some(true)
-        {
+        if !sidechain && message_role == "user" && is_meta != Some(true) {
             let prompt = if let Some(text) = content.as_str() {
                 text.trim().to_string()
             } else {
@@ -3130,6 +3336,7 @@ fn ingest_claude_transcript_as(
                     model,
                     token_json.as_deref(),
                     &format!("{message_uuid}:0"),
+                    facts,
                 )?;
             }
             continue;
@@ -3165,6 +3372,7 @@ fn ingest_claude_transcript_as(
                                 model,
                                 token_json.as_deref(),
                                 &event_uid,
+                                facts,
                             )?;
                         }
                     }
@@ -3191,6 +3399,7 @@ fn ingest_claude_transcript_as(
                             model,
                             token_json.as_deref(),
                             &event_uid,
+                            facts,
                         )?;
                     }
                 }
@@ -3216,6 +3425,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        facts,
                     )?;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -3274,6 +3484,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        facts,
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
@@ -3302,6 +3513,57 @@ fn ingest_claude_transcript_as(
     Ok(())
 }
 
+/// The verbatim stop reason an OpenCode `step-finish` part carries, if this is
+/// one.
+///
+/// OpenCode does not put a stop reason on the message: it writes a trailing
+/// `step-finish` part whose `reason` is the wire string (`tool-calls`,
+/// `stop`, `length`, …). Stored as written, exactly like Claude's
+/// `message.stop_reason`; consumers map it to their own enum.
+///
+/// The OpenCode adapter currently ingests prompt history only, so nothing calls
+/// this yet — the event-level parity work (#168) is what wires it into the
+/// assistant rows. It is landed with the column so that work is a call site
+/// rather than a schema change.
+#[allow(dead_code)]
+fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
+    (part.get("type").and_then(Value::as_str) == Some("step-finish"))
+        .then(|| part.get("reason").and_then(Value::as_str))
+        .flatten()
+}
+
+/// The per-message facts a provider records on the envelope rather than in the
+/// message body, carried verbatim from the parser to the row.
+///
+/// These are the facts consumers need and normalization would otherwise read
+/// past: which API request a turn belongs to (`request_id`), why the model
+/// stopped — and, by its absence, that it has not yet (`stop_reason`), which
+/// harness build produced it (`agent_version`), whether the row is delegated or
+/// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
+/// turn it falls inside (`turn_id`). Every field is optional and stored as the
+/// provider wrote it: relayhistory preserves, consumers map.
+/// The generation of raw-fact parsing the local parser stamps on every event
+/// it writes.
+///
+/// Unlike the facts themselves this is not a provider value and is never null
+/// on a row the current parser wrote: `request_id`, `stop_reason` and
+/// `turn_id` are legitimately absent on real records, and `is_sidechain` /
+/// `is_meta` are absent on any record whose envelope omits the flag, so none
+/// of them can answer "was this row indexed before the facts existed?".
+/// This can, which is what the full-sync backfill probes read. Bump it when a
+/// later change adds facts that existing rows should be re-read for.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 1;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RawMessageFacts<'a> {
+    request_id: Option<&'a str>,
+    stop_reason: Option<&'a str>,
+    agent_version: Option<&'a str>,
+    is_sidechain: Option<bool>,
+    is_meta: Option<bool>,
+    turn_id: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
@@ -3319,16 +3581,21 @@ fn insert_session_event(
     model: Option<&str>,
     token_json: Option<&str>,
     event_uid: &str,
+    facts: RawMessageFacts<'_>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+          request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, raw_facts_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, request_id=excluded.request_id, \
+         stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
+         is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
+         raw_facts_version=excluded.raw_facts_version",
         params![
             source,
             session_id,
@@ -3344,6 +3611,13 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            facts.request_id,
+            facts.stop_reason,
+            facts.agent_version,
+            facts.is_sidechain,
+            facts.is_meta,
+            facts.turn_id,
+            RAW_MESSAGE_FACTS_VERSION,
         ],
     )?;
     Ok(())
@@ -5135,6 +5409,7 @@ mod tests {
             None,
             None,
             "event-1",
+            super::RawMessageFacts::default(),
         )
         .unwrap();
         super::insert_tool_call(
@@ -6699,6 +6974,397 @@ mod tests {
         assert_eq!(child_events, 1);
     }
 
+    /// Reproduce what a release without the per-message raw facts left behind:
+    /// the rows and the sync stamps are there, the columns the migration added
+    /// are null, and the sync state carries no backfill generation because that
+    /// release never wrote one. This is exactly the state an upgraded install
+    /// is in on its first `sync`.
+    fn blank_raw_message_facts_state(state: &mut Map<String, Value>) {
+        state.remove(super::CLAUDE_RAW_MESSAGE_FACTS_KEY);
+        state.remove(super::CODEX_RAW_MESSAGE_FACTS_KEY);
+    }
+
+    fn blank_raw_message_facts(conn: &Connection, source: &str) {
+        conn.execute(
+            "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
+             agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
+             raw_facts_version = NULL WHERE source = ?",
+            [source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plain_claude_sync_backfills_raw_facts_for_transcripts_indexed_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-facts.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-facts","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-facts","cwd":"/tmp/project","isSidechain":false,"requestId":"req_1","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let facts =
+            |conn: &Connection| -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+                conn.query_row(
+                    "SELECT request_id, stop_reason, agent_version, is_sidechain \
+                 FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+            };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            facts(&conn),
+            (
+                Some("req_1".into()),
+                Some("end_turn".into()),
+                Some("2.1.96".into()),
+                Some(0)
+            )
+        );
+
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        // The stamp is unchanged and the events exist, so every other
+        // condition on the fast path says "skip". Without the raw-facts check
+        // this sync is a no-op and the columns stay null indefinitely while
+        // the run still reports success.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            facts(&conn),
+            (
+                Some("req_1".into()),
+                Some("end_turn".into()),
+                Some("2.1.96".into()),
+                Some(0)
+            )
+        );
+
+        // Repaired once, back on the fast path: a sentinel a re-read would
+        // overwrite has to survive, or the transcript is being re-read on
+        // every sync forever.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source='claude' AND event_uid='a1:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("sentinel"));
+    }
+
+    /// A subagent sidecar has no `sessions` row of its own: the walk hands it
+    /// to `ingest_claude_subagent` before the catalog upsert. A backfill that
+    /// asks only `sessions.raw_path` therefore never selects one, and every
+    /// sidecar's events keep null facts however many times `sync` runs.
+    #[test]
+    fn plain_claude_sync_backfills_raw_facts_for_subagent_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // The sidecar's assistant output lives under the child id the provider
+        // named, which no `sessions.raw_path` points at.
+        let child = |conn: &Connection| -> (Option<i64>, Option<i64>, Option<String>) {
+            conn.query_row(
+                "SELECT is_sidechain, raw_facts_version, text FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            child(&conn),
+            (
+                Some(1),
+                Some(super::RAW_MESSAGE_FACTS_VERSION),
+                Some("child result".into())
+            )
+        );
+
+        // The state an upgraded install is in: rows and stamps intact, facts
+        // null, no backfill generation recorded. Neither file changes on disk.
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            child(&conn),
+            (
+                Some(1),
+                Some(super::RAW_MESSAGE_FACTS_VERSION),
+                Some("child result".into())
+            ),
+            "an unchanged sidecar must be re-read by the one-time backfill pass"
+        );
+
+        // Marker recorded: the pass is over and the sidecar is back on the
+        // fast path, so a sentinel a re-read would overwrite survives.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child(&conn).2.as_deref(), Some("sentinel"));
+    }
+
+    #[test]
+    fn a_contributed_row_without_raw_facts_does_not_re_read_the_local_transcript_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-shared.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-shared","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-shared","cwd":"/tmp/project","isSidechain":false,"requestId":"req_1","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // A remote observation of the same session, contributed through the
+        // source-adapter boundary. `session_events` is keyed by
+        // `(source, session_id)`, so it lands beside the local rows -- and the
+        // evidence spec does not carry `raw_facts_version`, so it is
+        // permanently unstamped. Re-reading the local transcript can never
+        // stamp this row, because the local transcript does not contain it.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sess-shared', 3, 'assistant', 'text', \
+                     'remote output', 'remote-uid-1')",
+            [],
+        )
+        .unwrap();
+
+        // A sentinel a re-read would overwrite. If the unstamped remote row put
+        // the file back in the backfill set, this sync re-reads it -- and so
+        // would every sync after it, forever, while never stamping the remote
+        // row.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source = 'claude' AND event_uid = 'a1:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let local: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, "sentinel",
+            "an unchanged transcript must stay on the fast path even when another \
+             observation of the same session carries no raw facts"
+        );
+    }
+
+    /// An archive root the stamp map knows about but that is not on disk this
+    /// run is one the walk could not read, not one that is gone. Recording the
+    /// generation there would retire the one-time pass over rollouts nothing
+    /// ever opened, and the facts would stay null for the life of the install
+    /// while `sync` went on reporting success.
+    #[test]
+    fn an_unavailable_codex_archive_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let archived = home.join(".codex/archived_sessions/2026/04/20");
+        fs::create_dir_all(&archived).unwrap();
+        let rollout = archived.join("rollout-2026-04-20T05-00-00-sess_archived.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_archived","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let turn_id = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT turn_id FROM session_events \
+                 WHERE source='codex' AND event_uid='3:agent_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn), Some("turn_1".into()));
+
+        // The upgraded-install state, with the archive unavailable: an
+        // unmounted home, an external drive, a profile not yet materialized.
+        blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
+        fs::remove_dir_all(home.join(".codex/archived_sessions")).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_id(&conn),
+            None,
+            "nothing could be repaired while the archive was unavailable"
+        );
+        assert!(
+            state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a walk that could not open the archive has not done the pass"
+        );
+
+        // Back on disk, unchanged: the pass is still owed, so it runs now.
+        fs::create_dir_all(&archived).unwrap();
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_archived","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn), Some("turn_1".into()));
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// The other side of that guard: a root this install never had is not an
+    /// archive we failed to read, and must not hold the generation back
+    /// forever. Only `.codex/sessions` exists here and `archived_sessions`
+    /// never did.
+    #[test]
+    fn a_root_the_state_never_knew_does_not_hold_the_backfill_pass_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-2026-04-20T05-00-00-sess_only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_only","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert!(!home.join(".codex/archived_sessions").exists());
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    #[test]
+    fn plain_codex_sync_backfills_raw_facts_for_rollouts_indexed_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_backfill.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_backfill","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let turn_ids = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, turn_id FROM session_events \
+                 WHERE source='codex' AND session_id='sess_backfill' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_ids(&conn),
+            vec![
+                ("2:user_message".into(), Some("turn_1".into())),
+                ("3:agent_message".into(), Some("turn_1".into())),
+            ]
+        );
+
+        blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_ids(&conn),
+            vec![
+                ("2:user_message".into(), Some("turn_1".into())),
+                ("3:agent_message".into(), Some("turn_1".into())),
+            ]
+        );
+
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source='codex' AND event_uid='3:agent_message'",
+            [],
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='codex' AND event_uid='3:agent_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("sentinel"));
+    }
+
     #[test]
     fn an_unchanged_subagent_sidecar_is_not_re_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -6781,7 +7447,8 @@ mod tests {
         init_db(&conn).unwrap();
         // A database synced before delegation was recorded: the parent is
         // registered and indexed, so its stamp fast path skips it entirely,
-        // and no topology exists at all.
+        // and no topology exists at all. The row carries the current raw-facts
+        // generation; what is missing here is topology, not the facts.
         super::upsert_session(
             &conn,
             "claude-root",
@@ -6796,9 +7463,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('claude', 'claude-root', 2, 'assistant', 'text', 'kept event', 'a1:0')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('claude', 'claude-root', 2, 'assistant', 'text', 'kept event', 'a1:0', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         let mut claude_sessions = Map::new();
@@ -7331,6 +7998,7 @@ mod tests {
             None,
             None,
             "3:agent_message",
+            super::RawMessageFacts::default(),
         )
         .unwrap();
         super::insert_tool_call(
@@ -7526,9 +8194,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
 
@@ -7612,9 +8280,9 @@ mod tests {
         // already there, so the rollout is never re-read for its own sake.
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
@@ -7669,9 +8337,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         conn.execute(
@@ -7724,6 +8392,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         // Existing events make the old v4 entries eligible for the fast path.
+        // They carry the current raw-facts generation so this test exercises the
+        // guardian reclassification and not the raw-facts backfill.
         for session_id in [
             "sess-top",
             "sess-standalone-guardian",
@@ -7731,9 +8401,13 @@ mod tests {
         ] {
             conn.execute(
                 "INSERT INTO session_events \
-                 (source, session_id, ts_ms, role, kind, text, event_uid) \
-                 VALUES ('codex', ?, 2, 'assistant', 'text', 'retained event', ?)",
-                rusqlite::params![session_id, format!("retained-{session_id}")],
+                 (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+                 VALUES ('codex', ?, 2, 'assistant', 'text', 'retained event', ?, ?)",
+                rusqlite::params![
+                    session_id,
+                    format!("retained-{session_id}"),
+                    super::RAW_MESSAGE_FACTS_VERSION
+                ],
             )
             .unwrap();
         }
@@ -8092,5 +8766,329 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
+    }
+
+    /// Envelope facts burn needs per message: which API request a turn belongs
+    /// to, which harness build wrote it, whether the row is delegated, and why
+    /// the model stopped. Shapes follow a real Claude transcript: one request
+    /// id spans several `uuid`s that share a `message.id`, and only the block
+    /// that ends the turn carries a `stop_reason`.
+    #[test]
+    fn claude_records_carry_request_id_stop_reason_agent_version_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-facts.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"check the repo"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_multi_1","role":"assistant","content":[{"type":"text","text":"Let me check."}],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":43}},"requestId":"req_1","type":"assistant","uuid":"u-asst-1b","timestamp":"2026-04-20T00:00:01.500Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1b","isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_multi_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash_1","name":"Bash","input":{"command":"ls -la"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":43}},"requestId":"req_1","type":"assistant","uuid":"u-asst-1c","timestamp":"2026-04-20T00:00:02.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1c","isSidechain":false,"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash_1","content":"a.txt"}]},"requestId":"req_2","uuid":"u-result-1","timestamp":"2026-04-20T00:00:03.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.97"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        type FactRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<FactRow> = conn
+            .prepare(
+                "SELECT event_uid, request_id, stop_reason, agent_version, is_sidechain, is_meta \
+                 FROM session_events ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                // The opening human turn predates the first API request.
+                (
+                    "u-user-1:0".into(),
+                    None,
+                    None,
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                // Both blocks of the same request share `req_1`; only the one
+                // that ended the turn carries a stop reason. A JSON null must
+                // stay null -- burn reads its absence as "still in flight".
+                (
+                    "u-asst-1b:0".into(),
+                    Some("req_1".into()),
+                    None,
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                (
+                    "u-asst-1c:0".into(),
+                    Some("req_1".into()),
+                    Some("tool_use".into()),
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                (
+                    "u-result-1:0".into(),
+                    Some("req_2".into()),
+                    None,
+                    Some("2.1.97".into()),
+                    Some(0),
+                    Some(1)
+                ),
+            ]
+        );
+    }
+
+    /// `sourceVersion` is the older spelling of the harness build, and a
+    /// sidechain record's assistant output is the one row a delegated
+    /// transcript contributes: it must be marked as delegated, not as the
+    /// parent's own work.
+    #[test]
+    fn claude_sidechain_rows_are_flagged_and_source_version_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-side.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s-side","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:01:00.000Z","sourceVersion":"1.0.88","requestId":"req_side","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Here is the report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT request_id, stop_reason, agent_version, is_sidechain FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("req_side".into()),
+                Some("end_turn".into()),
+                Some("1.0.88".into()),
+                Some(1)
+            )
+        );
+    }
+
+    /// `token_json` is the provider's `message.usage` object stored verbatim,
+    /// so the nested ephemeral cache buckets pricing depends on survive a round
+    /// trip. A usage shape flattened to the fields this crate happens to name
+    /// would silently lose them.
+    #[test]
+    fn claude_usage_round_trips_nested_ephemeral_cache_creation_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-usage.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_usage","role":"assistant","content":[{"type":"text","text":"Let me check."}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_creation_input_tokens":4773,"cache_read_input_tokens":11496,"cache_creation":{"ephemeral_5m_input_tokens":771,"ephemeral_1h_input_tokens":4002},"output_tokens":43,"service_tier":"standard"}},"requestId":"req_1","type":"assistant","uuid":"u-asst-usage","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"s-usage","version":"2.1.96"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let token_json: String = conn
+            .query_row("SELECT token_json FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let usage: Value = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 771);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 4002);
+        assert_eq!(usage["cache_creation_input_tokens"], 4773);
+        assert_eq!(usage["output_tokens"], 43);
+        // The same values are reachable through SQL, which is how a consumer
+        // that does not deserialize the whole object reads them.
+        let ephemeral_1h: i64 = conn
+            .query_row(
+                "SELECT json_extract(token_json, '$.cache_creation.ephemeral_1h_input_tokens') \
+                 FROM session_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ephemeral_1h, 4002);
+    }
+
+    /// Codex names a turn once, in `turn_context`, and every later record
+    /// belongs to it until the next one. Carrying it forward is what makes the
+    /// turn boundary recoverable from the stored events.
+    #[test]
+    fn codex_turn_ids_are_stamped_until_the_next_turn_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-turns.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess-turns","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_multi_1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"first task"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"On it."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:10.000Z","type":"turn_context","payload":{"turn_id":"turn_multi_2","cwd":"/tmp/proj","model":"gpt-5.3-codex"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:11.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Considering."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:12.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":\"ls\"}"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:13.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"a.txt"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT event_uid, turn_id FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("2:user_message".into(), Some("turn_multi_1".into())),
+                ("3:agent_message".into(), Some("turn_multi_1".into())),
+                ("5:agent_reasoning".into(), Some("turn_multi_2".into())),
+                ("6:function_call".into(), Some("turn_multi_2".into())),
+                ("7:function_call_output".into(), Some("turn_multi_2".into())),
+            ]
+        );
+    }
+
+    /// Records before any `turn_context`, and after one that names no turn,
+    /// have no turn to belong to. Stamping the last seen id onto them would
+    /// invent a boundary the provider never recorded.
+    #[test]
+    fn codex_events_outside_a_named_turn_have_no_turn_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-unnamed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess-unnamed","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Before any turn."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Inside turn one."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:04.000Z","type":"turn_context","payload":{"cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"After an unnamed turn."}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT text, turn_id FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Before any turn.".into(), None),
+                ("Inside turn one.".into(), Some("turn_1".into())),
+                ("After an unnamed turn.".into(), None),
+            ]
+        );
+    }
+
+    /// OpenCode records the stop reason on a `step-finish` part rather than on
+    /// the message, and writes it as its own wire string. The mapping hook is
+    /// landed here; wiring it to real OpenCode events waits on the OpenCode
+    /// parity work (#168), which is why the end-to-end assertion below is
+    /// ignored rather than absent.
+    #[test]
+    fn opencode_step_finish_reason_is_read_verbatim() {
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(
+                &json!({"type": "step-finish", "reason": "tool-calls"})
+            ),
+            Some("tool-calls")
+        );
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(&json!({"type": "step-finish"})),
+            None
+        );
+        // Another part type never contributes a stop reason, whatever it
+        // happens to carry under that key.
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(
+                &json!({"type": "text", "reason": "not-a-stop-reason"})
+            ),
+            None
+        );
+    }
+
+    /// The end-to-end half of the OpenCode stop-reason contract. OpenCode sync
+    /// ingests prompt history only today, so no assistant event exists to carry
+    /// a stop reason and this cannot pass yet; the OpenCode event parity work
+    /// (#168) is what makes it green. It is written now so that work has a
+    /// failing test to satisfy rather than a field to remember.
+    #[test]
+    #[ignore = "OpenCode assistant events land with the OpenCode parity work (#168)"]
+    fn opencode_assistant_events_carry_step_finish_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("opencode.db");
+        let src = Connection::open(&source_path).unwrap();
+        src.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER);
+             INSERT INTO session VALUES ('s-oc', '/tmp/proj', 1);
+             INSERT INTO message VALUES ('m-user', 's-oc', '{\"role\":\"user\"}', 1);
+             INSERT INTO part VALUES ('p-user', 's-oc', 'm-user', '{\"type\":\"text\",\"text\":\"do the thing\"}', 1);
+             INSERT INTO message VALUES ('m-asst', 's-oc', '{\"role\":\"assistant\"}', 2);
+             INSERT INTO part VALUES ('p-asst', 's-oc', 'm-asst', '{\"type\":\"text\",\"text\":\"doing it\"}', 2);
+             INSERT INTO part VALUES ('p-step', 's-oc', 'm-asst', '{\"type\":\"step-finish\",\"reason\":\"tool-calls\"}', 3);",
+        )
+        .unwrap();
+        drop(src);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::sync_opencode_session(&conn, &source_path, "s-oc").unwrap();
+
+        let stop_reason: Option<String> = conn
+            .query_row(
+                "SELECT stop_reason FROM session_events \
+                 WHERE source = 'opencode' AND role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stop_reason.as_deref(), Some("tool-calls"));
     }
 }

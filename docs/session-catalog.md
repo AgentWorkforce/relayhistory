@@ -329,6 +329,48 @@ read.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+### Per-message raw facts on `session_events`
+
+The envelope facts a harness records per message or per API request, kept
+verbatim on every event so a consumer can group, price and time turns without
+re-reading the transcript. `stop_reason` is the provider's own wire string,
+never a normalized enum, and its *absence* is the signal that a turn is still
+in flight.
+
+| Source | `request_id` | `stop_reason` | `agent_version` | `is_sidechain` | `is_meta` | `turn_id` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
+| **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
+| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+
+A null is "the provider did not record it", which is not the same as `false`
+or as an empty string: a Claude record with no `isSidechain` key stores null,
+while `"isSidechain": false` stores `0`.
+
+Because of that, none of the six can answer "was this row indexed before the
+facts existed?" -- a real record legitimately has no `request_id`, no
+`stop_reason` and no `turn_id`, and Codex records none of the other three.
+`raw_facts_version` answers it instead: the local parser stamps it on every
+event it writes, so a full sync can pick out the transcripts whose rows predate
+the facts and re-read them. It is bookkeeping rather than a provider fact and is
+not part of the session-event evidence spec, so a row an installed source
+adapter contributed is permanently unstamped.
+
+That is why the column selects files but does not bound the work. Local and
+remote observations of one session share `(source, session_id)`, so a contributed
+row would otherwise hold an unchanged local transcript off the stamp fast path on
+every sync while never being stamped itself. What ends the work is a per-provider
+generation recorded in the sync state (`claude_raw_message_facts`,
+`codex_raw_message_facts`), written only after a walk completes **and only when
+every archive root the state already names was present on that run**, so the
+backfill runs exactly once, an interrupted sync retries it, and a walk over an
+unmounted or not-yet-created root does not retire it having read nothing. A root
+the state never knew about — an install with no `.codex/archived_sessions` — is
+not a missing archive and does not hold the pass open. Claude reaches a subagent
+sidecar's rows through `session_relationships.evidence_locator`, because a
+sidecar never gets a `sessions` row of its own.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
