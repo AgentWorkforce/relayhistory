@@ -3,6 +3,7 @@ import {
   SESSION_HYDRATION_CONTRACT_VERSION,
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
+  SESSION_USAGE_CONTRACT_VERSION,
   SOURCES,
   Source,
   CatalogSource,
@@ -65,6 +66,12 @@ import type {
   EvidenceCursorInput,
   EvidencePageOptions,
   SessionToolCallsPage,
+  NormalizedUsage,
+  UsageAccounting,
+  UsageDiagnostic,
+  RequestKeySource,
+  SessionRequest,
+  RequestCursor,
   SessionFileEditsPage,
   Stats,
   StatsOptions,
@@ -275,6 +282,111 @@ export function evidenceCursor(value: unknown): EvidenceCursor | null {
  */
 export function nativeEvidenceCursor(after: EvidenceCursorInput | undefined): object | undefined {
   return after ? { ...after, tsMs: after.tsMs ?? undefined } : undefined;
+}
+
+const USAGE_ACCOUNTING: readonly string[] = [
+  'per-request', 'per-message', 'cumulative-delta', 'context-proxy', 'mixed',
+];
+const USAGE_DIAGNOSTICS: readonly string[] = [
+  'ambiguous-usage-copies', 'unnormalizable-usage', 'ambiguous-model',
+  'unresolved-request-identity', 'partial-cache-write-split',
+  'partial-reported-cost', 'count-not-representable',
+];
+
+export function assertUsageContract(value: number): void {
+  if (value !== SESSION_USAGE_CONTRACT_VERSION) {
+    throw new NativeContractMismatchError(
+      `ai-hist expects session usage contract ${SESSION_USAGE_CONTRACT_VERSION}, but native returned ${value}.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+}
+
+/**
+ * An out-of-contract label reaches the caller as a contract mismatch rather
+ * than as a lie about the shape of the typed API — the same rule the
+ * relationship enums follow.
+ */
+export function usageAccounting(value: unknown): UsageAccounting {
+  if (typeof value === 'string' && USAGE_ACCOUNTING.includes(value)) return value as UsageAccounting;
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid usage accounting mode: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+export function requestKeySource(value: unknown): RequestKeySource {
+  if (value === 'request-id' || value === 'provider-message-id' || value === 'record-id') {
+    return value;
+  }
+  throw new NativeContractMismatchError(
+    `ai-hist-native returned an invalid request key source: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
+    'NATIVE_CONTRACT_MISMATCH',
+  );
+}
+
+export function usageDiagnostics(value: unknown): UsageDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    if (typeof entry === 'string' && USAGE_DIAGNOSTICS.includes(entry)) return entry as UsageDiagnostic;
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an invalid usage diagnostic: ${JSON.stringify(entry)}. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  });
+}
+
+export function normalizedUsage(value: unknown): NormalizedUsage | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  return {
+    inputTokens: Number(row.inputTokens),
+    outputTokens: Number(row.outputTokens),
+    reasoningTokens: nullableNumber(row.reasoningTokens),
+    cacheReadTokens: Number(row.cacheReadTokens),
+    cacheWriteTokens: Number(row.cacheWriteTokens),
+    cacheWrite5mTokens: nullableNumber(row.cacheWrite5mTokens),
+    cacheWrite1hTokens: nullableNumber(row.cacheWrite1hTokens),
+    providerTotalTokens: nullableNumber(row.providerTotalTokens),
+    reportedCostUsd: nullableNumber(row.reportedCostUsd),
+    accounting: usageAccounting(row.accounting),
+    hasInputTokens: Boolean(row.hasInputTokens),
+    hasOutputTokens: Boolean(row.hasOutputTokens),
+    hasReasoningTokens: Boolean(row.hasReasoningTokens),
+    hasCacheReadTokens: Boolean(row.hasCacheReadTokens),
+    hasCacheWriteTokens: Boolean(row.hasCacheWriteTokens),
+  };
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+export function sessionRequest(value: UnknownRecord): SessionRequest {
+  return {
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    requestKey: String(value.requestKey),
+    requestKeySource: requestKeySource(value.requestKeySource),
+    messageIds: stringList(value.messageIds),
+    model: nullableString(value.model),
+    provider: nullableString(value.provider),
+    firstTsMs: Number(value.firstTsMs),
+    lastTsMs: Number(value.lastTsMs),
+    usage: normalizedUsage(value.usage),
+    usageError: nullableString(value.usageError),
+    toolUseIds: stringList(value.toolUseIds),
+    hasThinking: Boolean(value.hasThinking),
+    eventCount: Number(value.eventCount),
+    diagnostics: usageDiagnostics(value.diagnostics),
+  };
+}
+
+export function requestCursor(value: unknown): RequestCursor | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as UnknownRecord;
+  return { tsMs: Number(row.tsMs), id: Number(row.id) };
 }
 
 export function assertEvidenceContract(value: number): void {

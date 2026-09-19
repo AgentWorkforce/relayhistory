@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS session_events (
     text TEXT,
     model TEXT,
     token_json TEXT,
+    request_id TEXT,
+    provider_message_id TEXT,
     event_uid TEXT NOT NULL,
     UNIQUE(source, session_id, event_uid)
 );
@@ -455,6 +457,20 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "source_stamp",
     "discovery_state",
 ];
+/// Columns [`init_db`] adds to `session_events` after the original DDL.
+///
+/// These are the provider's own identities for the request a row belongs to,
+/// stored verbatim: `request_id` is Claude's `requestId` and
+/// `provider_message_id` is `message.id`. The pre-existing `message_id`
+/// column is *not* either of these — it holds the JSONL record's `uuid`, and
+/// one Claude request spans several records with different uuids, which is
+/// why grouping usage on it counts one API call once per content block.
+///
+/// `request_id` is deliberately the same name, type and verbatim semantics as
+/// the column the raw-facts change (#190 / #164) adds, so whichever of the two
+/// merges second drops its copy rather than reconciling two spellings of one
+/// fact. `provider_message_id` is only here.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["request_id", "provider_message_id"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
@@ -605,6 +621,13 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
 
+/// Whether per-request usage reads can be served: the `session_requests` view
+/// has to exist, and the grouped scan behind it rides the same session-scoped
+/// event indexes as the event page.
+pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES
@@ -619,6 +642,12 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         if !table.exists([name])? {
             return Ok(false);
         }
+    }
+    // A view is a query shape, not a row set: it can be present and still be
+    // derived from a column set the table no longer has, which is why this
+    // asks whether it is *current* rather than whether it exists.
+    if !crate::session_usage::session_requests_view_is_current(conn)? {
+        return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_SCHEMA_MIGRATIONS
@@ -646,6 +675,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSIONS_COLUMNS
         .iter()
         .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|needed| event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -877,6 +916,11 @@ END;
     migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    // Added before the view below, which groups on them. Existing rows keep
+    // NULL until their transcript is re-parsed; until then the request key
+    // falls back to the record id and the rollup says so rather than
+    // presenting a per-record total as a per-request one.
+    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
@@ -1029,6 +1073,10 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    // Derived from `session_events`, so it must come after the DDL and the
+    // column migrations above, and needs no backfill: the first query over an
+    // upgraded database already sees every request its events describe.
+    crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
     Ok(())

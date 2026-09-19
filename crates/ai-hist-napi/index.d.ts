@@ -148,6 +148,101 @@ export interface SessionFileEditsPage {
   fileEdits: Array<NativeSessionFileEdit>
   nextCursor?: EvidenceCursor
 }
+/**
+ * Normalized usage for one request or one session.
+ *
+ * The optional fields stay optional across the boundary: `null` means the
+ * provider did not report that counter, which is a different fact from a
+ * reported zero and the only thing that makes `coverage` interpretable.
+ */
+export interface NativeNormalizedUsage {
+  inputTokens: number
+  outputTokens: number
+  reasoningTokens?: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  cacheWrite5mTokens?: number
+  cacheWrite1hTokens?: number
+  providerTotalTokens?: number
+  reportedCostUsd?: number
+  /**
+   * `per-request`, `per-message`, `cumulative-delta`, `context-proxy`, or
+   * `mixed` on a summary spanning more than one.
+   */
+  accounting: string
+  hasInputTokens: boolean
+  hasOutputTokens: boolean
+  hasReasoningTokens: boolean
+  hasCacheReadTokens: boolean
+  hasCacheWriteTokens: boolean
+}
+export interface NativeSessionRequest {
+  id: number
+  source: string
+  sessionId: string
+  requestKey: string
+  /** `request-id`, `provider-message-id` or `record-id`. */
+  requestKeySource: string
+  messageIds: Array<string>
+  model?: string
+  provider?: string
+  firstTsMs: number
+  lastTsMs: number
+  /**
+   * Absent when the request carried no usage evidence, or when the
+   * evidence could not be trusted — `diagnostics` says which.
+   */
+  usage?: NativeNormalizedUsage
+  usageError?: string
+  toolUseIds: Array<string>
+  hasThinking: boolean
+  eventCount: number
+  diagnostics: Array<string>
+}
+export interface RequestCursor {
+  tsMs: number
+  id: number
+}
+export interface RequestPageOptions {
+  dbPath?: string
+  limit?: number
+  after?: RequestCursor
+}
+export interface SessionRequestsPage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  requests: Array<NativeSessionRequest>
+  nextCursor?: RequestCursor
+}
+export interface SessionUsageOptions {
+  dbPath?: string
+}
+/**
+ * One session's usage rollup. `usage` is absent when the session has no
+ * usage evidence at all — not zeroed, because zero is a claim.
+ */
+export interface SessionUsage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  usage?: NativeNormalizedUsage
+  /** Requests that contributed to `usage`. */
+  requestCount: number
+  /** Requests seen, including ones with no usage. */
+  totalRequestCount: number
+  /**
+   * Every accounting mode present. More than one means the totals mix
+   * units and should be read per mode.
+   */
+  accounting: Array<string>
+  models: Array<string>
+  firstTsMs?: number
+  lastTsMs?: number
+  diagnostics: Array<string>
+  /** The totals exceeded what can be represented and must not be used. */
+  overflowed: boolean
+}
 export interface SourceCount {
   source: string
   count: number
@@ -186,6 +281,15 @@ export declare function getSessionEventsPage(sessionId: string, options?: Events
 export declare function getSessionToolCallsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionToolCallsPage>
 /** One bounded page of recorded file edits for one session. */
 export declare function getSessionFileEditsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionFileEditsPage>
+/**
+ * One bounded page of a session's model requests, oldest first.
+ *
+ * Both halves of the identity are required for the same reason the evidence
+ * pages require them: provider session ids collide across providers.
+ */
+export declare function getSessionRequestsPage(source: string, sessionId: string, options?: RequestPageOptions | undefined | null): Promise<SessionRequestsPage>
+/** Provider-neutral usage rollup for one session. */
+export declare function getSessionUsage(source: string, sessionId: string, options?: SessionUsageOptions | undefined | null): Promise<SessionUsage>
 /** Database statistics over already-indexed data. */
 export declare function stats(options?: StatsOptions | undefined | null): Promise<NativeStats>
 export interface CatalogSession {

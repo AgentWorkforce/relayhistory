@@ -7,7 +7,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
+  getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage, getSessionTree,
+  getSessionUsage, hydrateSession,
   listSessionCatalogPage, recent, search, stats, sync,
   historyDeliveryStatus, historyDeliveryRetention, controlHistoryDelivery,
 } from './index.js';
@@ -124,6 +125,18 @@ server.tool('get_session_file_edits', 'Get one bounded page of recorded file edi
   limit: z.number().int().min(1).max(1000).optional().default(200),
   after: EVIDENCE_CURSOR.optional(),
 }, READ, ({ source, session_id, limit, after }) => call(() => getSessionFileEditsPage(source, session_id, { limit, after })));
+
+const REQUEST_CURSOR = z.object({ tsMs: z.number().int(), id: z.number().int() });
+
+server.tool('get_session_requests', 'Get one bounded page of a session\'s model requests, with usage normalized. One row per API request: Claude\'s per-content-block copies of message.usage are collapsed, so these can be summed where raw events cannot.', {
+  source: SOURCE, session_id: z.string().min(1),
+  limit: z.number().int().min(1).max(1000).optional().default(200),
+  after: REQUEST_CURSOR.optional(),
+}, READ, ({ source, session_id, limit, after }) => call(() => getSessionRequestsPage(source, session_id, { limit, after })));
+
+server.tool('get_session_usage', 'Provider-neutral token usage rollup for one session. Null usage means no usage evidence, never an assumed zero; cost appears only when the source data carried one.', {
+  source: SOURCE, session_id: z.string().min(1),
+}, READ, ({ source, session_id }) => call(() => getSessionUsage(source, session_id)));
 
 server.tool('history_stats', 'Statistics for already-indexed RelayHistory data.', {
   scope: SESSION_SCOPE.optional().default('local'),

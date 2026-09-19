@@ -95,6 +95,14 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  NormalizedUsage,
+  UsageAccounting,
+  SessionRequest,
+  RequestCursor,
+  RequestPageOptions,
+  SessionRequestsPage,
+  SessionUsage,
+  SessionUsageOptions,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -126,6 +134,12 @@ import {
   evidenceCursor,
   nativeEvidenceCursor,
   assertEvidenceContract,
+  assertUsageContract,
+  normalizedUsage,
+  usageAccounting,
+  usageDiagnostics,
+  sessionRequest,
+  requestCursor,
   catalogSource,
   relationshipType,
   identityStatus,
@@ -492,6 +506,67 @@ export async function getSessionToolCallsPage(
         ? (page.toolCalls as UnknownRecord[]).map(sessionToolCall)
         : [],
       nextCursor: evidenceCursor(page.nextCursor),
+    };
+  });
+}
+
+/**
+ * One bounded page of a session's model requests, oldest first.
+ *
+ * A request is one API call: Claude's per-content-block copies of
+ * `message.usage` are collapsed into it, so summing these pages counts each
+ * call once where summing raw events would not.
+ */
+export async function getSessionRequestsPage(
+  source: Source,
+  sessionId: string,
+  options: RequestPageOptions = {},
+): Promise<SessionRequestsPage> {
+  evidenceIdentity(source, sessionId, 'getSessionRequestsPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionRequestsPage(source, sessionId, options);
+    assertUsageContract(Number(page.contractVersion));
+    return {
+      contractVersion: Number(page.contractVersion),
+      source: String(page.source) as Source,
+      sessionId: String(page.sessionId),
+      requests: Array.isArray(page.requests)
+        ? (page.requests as UnknownRecord[]).map(sessionRequest)
+        : [],
+      nextCursor: requestCursor(page.nextCursor),
+    };
+  });
+}
+
+/**
+ * Provider-neutral usage rollup for one session.
+ *
+ * `usage` is null when the session carries no usage evidence at all. Cost is
+ * never estimated here; `reportedCostUsd` is populated only when the source
+ * data itself carried one.
+ */
+export async function getSessionUsage(
+  source: Source,
+  sessionId: string,
+  options: SessionUsageOptions = {},
+): Promise<SessionUsage> {
+  evidenceIdentity(source, sessionId, 'getSessionUsage');
+  return nativeCall(async (native) => {
+    const value = await native.getSessionUsage(source, sessionId, options);
+    assertUsageContract(Number(value.contractVersion));
+    return {
+      contractVersion: Number(value.contractVersion),
+      source: String(value.source) as Source,
+      sessionId: String(value.sessionId),
+      usage: normalizedUsage(value.usage),
+      requestCount: Number(value.requestCount),
+      totalRequestCount: Number(value.totalRequestCount),
+      accounting: Array.isArray(value.accounting) ? value.accounting.map(usageAccounting) : [],
+      models: Array.isArray(value.models) ? value.models.map(String) : [],
+      firstTsMs: nullableNumber(value.firstTsMs),
+      lastTsMs: nullableNumber(value.lastTsMs),
+      diagnostics: usageDiagnostics(value.diagnostics),
+      overflowed: Boolean(value.overflowed),
     };
   });
 }
