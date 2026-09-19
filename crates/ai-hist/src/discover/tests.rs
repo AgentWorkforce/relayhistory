@@ -794,10 +794,43 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     let row = found.row("cursor-1");
     assert_eq!(row.first_prompt.as_deref(), Some("fix the flaky test"));
     assert_eq!(row.cwd.as_deref(), Some("/work/app"));
-    // Cursor records no per-message timestamps, so mtime is the only signal
-    // and it is reported as last activity only.
+    // This transcript's turns carry no readable time, so mtime is the only
+    // signal and it is reported as last activity only — never as a first
+    // activity the provider did not record.
     assert_eq!(row.last_activity_ms, Some(1_750_000_400_000));
     assert_eq!(row.first_activity_ms, None);
+    assert!(row.models.is_empty());
+}
+
+#[test]
+fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-2",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Reading the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp>\n<user_query>now ship it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-2");
+    // The injected tag is a real recorded time, so it is preferred over mtime
+    // at both ends.
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_587_660_000));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
 }
 
 #[test]

@@ -109,7 +109,7 @@ for authentication, durable delivery, readback, and the legacy sharing API.
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
-- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened.
+- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Cursor is the clearest example of the difference: its transcripts do carry the assistant's prose and every tool call it made, all of which are indexed, but they carry no tool *output*, no model id, no token usage and no timestamp field — so those are reported as unavailable rather than missing, and a turn whose injected `<timestamp>` tag cannot be read is stamped from the file mtime with a `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic saying so. The per-field detail is in [the session catalog](docs/session-catalog.md#cursor).
 - **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.

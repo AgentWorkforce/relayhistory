@@ -1081,6 +1081,27 @@ impl ShallowSessionProvider for CursorProvider {
             })
             .map(|prompt| excerpt(&prompt))
             .find(|prompt| !prompt.is_empty());
+        // Cursor writes no timestamp field and no model on its records. The
+        // only time signal in the file is the localized `<timestamp>` tag its
+        // client injects into a human turn, so the head read looks for that
+        // and reports nothing when the build did not write one. `models` is
+        // read from `message.model` for the builds that write it; an empty
+        // list means "not seen", never "no model".
+        let first_activity_ms = bounded.head_records().find_map(cursor_record_time);
+        let last_activity_ms = bounded
+            .tail_records_rev()
+            .find_map(cursor_record_time)
+            .or_else(|| crate::file_modified_ms(&path));
+        let mut models = Vec::new();
+        for model in bounded.head_records().filter_map(cursor_record_model) {
+            if !models.contains(&model) {
+                models.push(model);
+            }
+        }
+        let last_assistant_text = bounded
+            .tail_records_rev()
+            .find_map(cursor_assistant_text)
+            .map(|text| excerpt(&text));
         let cwd = path
             .parent()
             .and_then(Path::parent)
@@ -1092,17 +1113,56 @@ impl ShallowSessionProvider for CursorProvider {
             source: "cursor".into(),
             session_id,
             cwd,
-            // Cursor transcripts carry no per-message timestamps at all. The
-            // file mtime is the only time signal, so it is reported as
-            // last_activity (filesystem-derived) and first_activity stays
-            // NULL rather than being invented.
-            first_activity_ms: None,
-            last_activity_ms: crate::file_modified_ms(&path),
+            first_activity_ms,
+            last_activity_ms,
             first_prompt,
+            last_assistant_text,
+            models,
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
         }))
     }
+}
+
+/// Epoch milliseconds for one Cursor record, from the injected `<timestamp>`
+/// tag or from a record `timestamp` field if a build writes one.
+fn cursor_record_time(line: &[u8]) -> Option<i64> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if let Some(ts) = obj.get("timestamp").and_then(|v| {
+        v.as_str()
+            .and_then(crate::parse_iso_ms)
+            .or_else(|| v.as_i64())
+    }) {
+        return Some(ts);
+    }
+    crate::ingest::cursor::record_blocks(obj)
+        .iter()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .find_map(crate::ingest::cursor::timestamp_from_text)
+}
+
+/// `message.model` for the Cursor builds that record one.
+fn cursor_record_model(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let model = value.get("message")?.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// The assistant prose in one Cursor record, ignoring tool and marker blocks.
+fn cursor_assistant_text(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if crate::ingest::cursor::record_role(obj) != Some("assistant") {
+        return None;
+    }
+    crate::ingest::cursor::record_blocks(obj)
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

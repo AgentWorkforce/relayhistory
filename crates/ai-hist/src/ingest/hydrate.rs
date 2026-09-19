@@ -11,7 +11,14 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 when Cursor transcripts stopped being prompt-only: already
+/// indexed Cursor sessions re-parse once and gain `session_events`,
+/// `tool_calls`, `file_edits` and real turn timestamps. Plain `sync` needs the
+/// same push, which is why `CURSOR_SYNC_STATE_KEY` was retired in the same
+/// change — a parser version alone only reaches sessions somebody hydrates by
+/// name.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -204,7 +211,7 @@ fn hydrate_session_at_with_home_and_connectors(
     // has a provider-native uniqueness key, so interruption followed by retry is
     // safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ingest_selected(
+    let source_diagnostics = ingest_selected(
         &tx,
         options,
         &target,
@@ -265,12 +272,13 @@ fn hydrate_session_at_with_home_and_connectors(
     } else {
         "hydrated"
     };
-    build_result(
+    build_result_with(
         &conn,
         options,
         status,
         snapshot,
         started.elapsed().as_millis() as i64,
+        source_diagnostics,
     )
 }
 
@@ -1195,21 +1203,25 @@ fn complete_jsonl_records(path: &Path) -> Result<i64> {
     Ok(records)
 }
 
+/// Index the selected session and hand back whatever the provider's own
+/// records could not establish, as diagnostics the caller reports verbatim.
 fn ingest_selected(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
-) -> Result<()> {
+) -> Result<Vec<HydrationDiagnostic>> {
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
-        "codex" => ingest_codex(conn, options, path.unwrap()),
+        "claude" => {
+            ingest_claude(conn, options, path.unwrap(), claude_subagents).map(|()| Vec::new())
+        }
+        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| Vec::new()),
         "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
-        "grok" => ingest_grok(conn, options, path.unwrap()),
+        "grok" => ingest_grok(conn, options, path.unwrap()).map(|()| Vec::new()),
         "opencode" => {
             sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
-            Ok(())
+            Ok(Vec::new())
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
@@ -1542,7 +1554,7 @@ fn ingest_cursor(
     options: &HydrateSessionOptions,
     _target: &CatalogTarget,
     path: &Path,
-) -> Result<()> {
+) -> Result<Vec<HydrationDiagnostic>> {
     let project = path
         .ancestors()
         .find(|ancestor| {
@@ -1555,24 +1567,77 @@ fn ingest_cursor(
         .and_then(Path::file_name)
         .and_then(|s| s.to_str())
         .map(decode_cursor_project);
-    let ts_ms = file_modified_ms(path).unwrap_or(0);
-    let reader = BufReader::new(fs::File::open(path)?);
-    for line in reader.lines().map_while(std::result::Result::ok) {
-        if let Some(project) = project.as_deref() {
-            ingest_cursor_line(conn, &line, &options.session_id, project, ts_ms)?;
-        }
-    }
-    upsert_session(
+    let mtime_ms = file_modified_ms(path).unwrap_or(0);
+    // Targeted hydration always re-reads the whole transcript, so it is a
+    // rebuild: clear every row a previous read left before writing the new
+    // one. Upserting on top is not enough. Cursor evidence is keyed on the
+    // record's byte offset, and a rewritten transcript reuses those offsets
+    // for different records, so the rows an earlier generation wrote past the
+    // new end of the file would survive as tool calls and edits this session
+    // never made. `history` cannot be upserted at all, because a prompt's
+    // identity includes a timestamp an earlier parser took from the mtime.
+    //
+    // The read happens inside the caller's transaction, and it propagates its
+    // error, so a transcript that has vanished or turned unreadable since the
+    // snapshot rolls this delete back rather than committing an empty session.
+    clear_cursor_session_evidence(conn, &options.session_id)?;
+    let outcome = ingest_cursor_transcript(
+        conn,
+        path,
+        &options.session_id,
+        project.as_deref(),
+        mtime_ms,
+        0,
+    )?;
+    // Authoritative about both ends of the window, having just read the whole
+    // file: an expanding merge would keep a mtime endpoint an earlier parser
+    // wrote, which MAX() can never retract.
+    upsert_session_rebuilt(
         conn,
         &options.session_id,
         "cursor",
         project.as_deref(),
         None,
-        ts_ms,
-        ts_ms,
-        None,
+        outcome.first_ts_ms.unwrap_or(mtime_ms),
+        outcome.last_ts_ms.unwrap_or(mtime_ms),
+        outcome.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
-    )
+    )?;
+    Ok(cursor_diagnostics(&outcome))
+}
+
+/// What a Cursor transcript could not establish on its own.
+///
+/// Both codes describe an absence in the provider's records, not a failure of
+/// this run: reporting them is the difference between "Cursor does not write
+/// this" and "RelayHistory did not read it".
+fn cursor_diagnostics(outcome: &CursorTranscriptOutcome) -> Vec<HydrationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if outcome.used_mtime_fallback {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_TIMESTAMP_FROM_MTIME".to_string(),
+            message: "cursor records carry no timestamp field; events in turns with no readable \
+                      <timestamp> tag are stamped with the transcript file mtime"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    if outcome.subagent_calls > 0 {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_SUBAGENT_SPAWN_UNLINKED".to_string(),
+            message: format!(
+                "cursor recorded {} subagent spawn call(s) but writes no child transcript id; \
+                 the delegation is visible as a tool call and the child is not addressable",
+                outcome.subagent_calls
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    diagnostics
 }
 
 fn ingest_grok(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
@@ -1598,6 +1663,18 @@ fn build_result(
     status: &str,
     snapshot: SourceSnapshot,
     duration_ms: i64,
+) -> Result<HydrateSessionResult> {
+    build_result_with(conn, options, status, snapshot, duration_ms, Vec::new())
+}
+
+/// [`build_result`] plus the diagnostics this run's provider parser produced.
+fn build_result_with(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    status: &str,
+    snapshot: SourceSnapshot,
+    duration_ms: i64,
+    source_diagnostics: Vec<HydrationDiagnostic>,
 ) -> Result<HydrateSessionResult> {
     let related_session_ids = if options.include_related {
         related_ids(conn, &options.source, &options.session_id)?
@@ -1626,6 +1703,7 @@ fn build_result(
         source_bytes: Some(snapshot.bytes),
         records_parsed: Some(snapshot.records),
     }];
+    diagnostics.extend(source_diagnostics);
     if options.include_related {
         diagnostics.extend(unlinked_diagnostics(
             conn,
@@ -2100,6 +2178,128 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Copy a checked-in Cursor fixture to where a real install would put it.
+    fn cursor_fixture_home(home: &Path, fixture: &str, session_id: &str) -> PathBuf {
+        let transcript = home
+            .join(".cursor/projects/home-dev-demo/agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/cursor")
+                .join(fixture),
+            &transcript,
+        )
+        .unwrap();
+        transcript
+    }
+
+    #[test]
+    fn cursor_hydration_indexes_events_tools_and_edits_with_recorded_turn_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_fixture_home(dir.path(), "observed-3.13.25.jsonl", "cur-1");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-1"), dir.path()).unwrap();
+        assert_eq!(result.status, "hydrated");
+        assert!(result.evidence.events > 0, "{:?}", result.evidence);
+        assert!(result.evidence.tool_calls > 0, "{:?}", result.evidence);
+        assert!(result.evidence.file_edits > 0, "{:?}", result.evidence);
+        // Every turn here carries a readable `<timestamp>`, so nothing fell
+        // back to the file mtime and the diagnostic must stay silent.
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME"),
+            "{:?}",
+            result.diagnostics
+        );
+
+        let conn = open_db(&db).unwrap();
+        let session: (Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms, last_assistant_text \
+                 FROM sessions WHERE source = 'cursor' AND session_id = 'cur-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session.0, Some(1_789_587_420_000));
+        assert_eq!(session.1, Some(1_789_587_660_000));
+        assert_eq!(session.2.as_deref(), Some("Fixed the failing assertion."));
+
+        // Re-hydrating the same unchanged file neither duplicates evidence nor
+        // duplicates the prompts it rebuilds.
+        let again =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-1"), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
+        assert_eq!(again.evidence.events, result.evidence.events);
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn cursor_hydration_reports_the_mtime_fallback_and_unlinked_subagent_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = cursor_fixture_home(dir.path(), "legacy-string-content.jsonl", "cur-legacy");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-legacy", Some(&legacy));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-legacy"), dir.path())
+                .unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME"),
+            "a transcript with no readable turn time must say that it used the mtime: {:?}",
+            result.diagnostics
+        );
+
+        let extended = cursor_fixture_home(dir.path(), "extended-unverified.jsonl", "cur-ext");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-ext", Some(&extended));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-ext"), dir.path()).unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CURSOR_SUBAGENT_SPAWN_UNLINKED"),
+            "a recorded spawn with no child id must be reported, not silently dropped: {:?}",
+            result.diagnostics
+        );
+        // Cursor never names the child, so no relationship row is invented.
+        let conn = open_db(&db).unwrap();
+        let relationships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relationships, 0);
+        assert_eq!(
+            crate::relationships::relationship_capabilities("cursor").stable_child_identity,
+            "never"
+        );
     }
 
     #[test]
