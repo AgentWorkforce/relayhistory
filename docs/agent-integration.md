@@ -59,3 +59,157 @@ and [Architecture](architecture.md) for the process boundary.
 The old cloud push, login, Pair, hook installer, tag, and trajectory convenience
 commands were removed in 1.0. They are not available through subprocess or
 JavaScript fallbacks; see the [migration guide](native-sdk-migration.md).
+
+## Live capture
+
+Provider transcripts do not live forever. Claude Code cleans up its JSONL
+files, so the window in which a session can still be captured losslessly is
+bounded — and anything that only learns about a session from a later sweep can
+miss that window entirely. Two surfaces close it, and they are complementary:
+watch mode notices writes, hooks are told about them.
+
+### `ai-hist watch`
+
+```bash
+ai-hist watch                       # fs events, 200ms debounce, 30s backstop
+ai-hist watch --debounce-ms 500     # collapse bursts over a longer window
+ai-hist watch --interval 30         # polling cadence when fs events are off
+ai-hist watch --no-fsevents         # poll only
+```
+
+Watch attaches a filesystem watcher to everything a local sweep reads: the
+providers' session roots (`~/.claude/projects`, `~/.codex/sessions`,
+`~/.codex/archived_sessions`, `~/.cursor/projects`, `~/.grok/sessions`, and the
+directory holding the OpenCode database) plus the flat per-harness logs
+`~/.claude/history.jsonl` and `~/.codex/history.jsonl` and any `.trajectories`
+directory. It then runs one sweep per burst of writes, with a slow poll behind
+it. When no root can be watched — a network mount, a container without inotify,
+`--no-fsevents` — it falls back to polling at `--interval`.
+
+Startup reports which driver it took **and which roots are not covered yet**. A
+root that does not exist cannot be watched, so a provider installed after
+`watch` started would otherwise be silently missed; those roots are retried on
+every backstop tick, and a loop that started with nothing to watch promotes
+itself to filesystem events as soon as one appears. The backstop also
+re-derives the root set, so a project that grows a `.trajectories` directory
+mid-run — a root whose *name* could not have been known at startup — is picked
+up too.
+
+A root is watched at the depth it asks for: transcript trees recursively,
+because a new session is a new file somewhere inside; the directories holding
+the flat logs shallowly, so the todo files and shell snapshots an active
+session rewrites constantly do not each wake a sweep. That depth is enforced
+on the events themselves rather than left to the OS, because the macOS backend
+has no shallow mode and delivers the whole subtree regardless.
+
+`watch --remote` installs no local roots at all. Local provider writes are not
+what a remote-only run collects, and letting them drive the loop would fire the
+remote connectors on every local keystroke instead of at `--interval`.
+
+Two things make this cheap enough to leave running:
+
+- A tick first folds a **stat-only fingerprint** over everything the sweep
+  reads — the transcripts discovery enumerates, the Claude subagent
+  `agent-*.meta.json` sidecars beside them, the two flat logs, the trajectory
+  records, and a generation for the imported Relay rows, which have no file to
+  stat but still change. If it matches the previous sweep's, the tick returns
+  without opening a single file. Anything the sweep reads has to be in that
+  fold: a source left out would sit behind an unchanged fingerprint and never
+  be read again. The value is recorded in `.sync-state.json` beside the
+  database, after the sweep's cursors, and only when every source was read —
+  including the per-file failures a provider absorbs on its way to a
+  successful partial run. A file that could not be read this tick keeps the
+  fingerprint stale so the next tick retries it, rather than caching the
+  failure in place.
+- A tick woken by a filesystem event **forces** the sweep past that
+  fingerprint. An event can arrive before the write is flushed, so the size and
+  mtime it would be compared against are not yet trustworthy. The polling
+  backstop does not force, so a quiet machine keeps paying only the fingerprint
+  walk.
+
+`ai-hist import --watch` remains an alias for the same loop with the defaults.
+
+### `ai-hist ingest --hook claude`
+
+```bash
+echo '{"session_id":"…","transcript_path":"/path/to/session.jsonl"}' \
+  | ai-hist ingest --hook claude --quiet
+```
+
+Reads one Claude Code hook payload from stdin and hydrates exactly the
+transcript it names, instead of sweeping every provider root. The path is
+checked against Claude's own root before it is read — a hook payload comes from
+another process, and an arbitrary path must never become an ingest target.
+
+**The command always exits 0.** A hook runs inside the agent's tool call, and a
+non-zero exit there fails that tool call. A missing or rotated transcript, an
+unparseable payload, a locked database: all are reported on stderr and shrugged
+off. `--quiet` silences the reporting, not the shrug. A payload without
+`transcript_path` (some releases elide it) falls back to a forced full sweep.
+
+Pass `--json` for a machine-readable report on stdout. **`--quiet` outranks
+`--json`**: given both, the command prints nothing at all. A hook told to stay
+out of the way must not write a JSON document into the stdout of every tool
+call; use `--json` on its own when you want to read the report.
+
+### Wiring the Claude Code hooks
+
+In `~/.claude/settings.json`, or a project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "ai-hist ingest --hook claude --quiet" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "ai-hist ingest --hook claude --quiet" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "ai-hist ingest --hook claude --quiet" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "ai-hist ingest --hook claude --quiet" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`PreCompact` is the one that watch mode cannot replace. Compaction **rewrites
+the transcript in place**, and the hook fires *before* that rewrite — it is the
+last moment the pre-compaction records still exist on disk. A sweep arriving
+afterwards sees only the compacted file, and the earlier evidence is gone for
+good. Keep that entry even if you drop the others.
+
+`SessionStart` and `Stop` bracket the session; `PostToolUse` captures tool
+errors as they happen rather than after the fact. Re-running any of them over
+an untouched transcript is free: hydration compares the source stamp first and
+reports `unchanged` without re-reading.
+
+### Codex, OpenCode, Cursor and Grok
+
+Only Claude Code exposes a transcript lifecycle hook to attach to. Codex writes
+`~/.codex/sessions/**/rollout-*.jsonl` with no hook surface; OpenCode writes a
+SQLite database and exposes none either; Cursor and Grok likewise. For those
+providers watch mode *is* the live-capture path — their roots are watched, and
+an append wakes the same sweep. `ai-hist ingest --hook <other>` reports the
+harness as unsupported and exits 0 rather than pretending. When any of them
+grows a lifecycle hook, the payload shape is the only new part: the
+single-transcript ingest underneath is provider-agnostic.

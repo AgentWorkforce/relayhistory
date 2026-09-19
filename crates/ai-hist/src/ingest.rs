@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod hook;
 pub(crate) mod hydrate;
 
 use crate::diagnostics::*;
@@ -34,10 +35,14 @@ pub use crate::discover::{
     DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
+pub use hook::{
+    ingest_transcript_at, ingest_transcript_at_with_home, TranscriptIngest, TranscriptStatus,
+    HOOK_HARNESSES,
+};
 pub use hydrate::{
-    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
-    HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
-    SESSION_HYDRATION_CONTRACT_VERSION,
+    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors,
+    hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic,
+    HydrationEvidence, HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
 };
 
 fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
@@ -88,7 +93,57 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
 /// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home)
+    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+}
+
+/// One live-capture tick against an explicit provider home.
+///
+/// `force` bypasses the stat-only source fingerprint. The watch loop sets it
+/// for filesystem-event ticks, where the event can arrive before the write
+/// flushes and the fingerprint is therefore not yet trustworthy.
+pub fn sync_tick_at_with_home(
+    db_path: &Path,
+    home: &Path,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    sync_exclusive_with_home(db_path, home, force)
+}
+
+/// One live-capture tick. Local scope only: remote connectors are not driven
+/// from watch mode, and a `remote`-only request is rejected the same way
+/// [`sync_scoped_at_with_connectors`] rejects it.
+pub fn sync_tick_at(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    if scope == SessionScope::Remote {
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "sync",
+            &home_dir(),
+            &[],
+            connectors,
+        )?;
+    }
+    let mut tick = SyncTick::default();
+    if matches!(scope, SessionScope::Local | SessionScope::All) {
+        tick = sync_exclusive_with_home(db_path, &home_dir(), force)?;
+    }
+    if matches!(scope, SessionScope::Remote | SessionScope::All) {
+        tick.attempted |= sync_remote_connectors(db_path, scope, connectors)?;
+    }
+    Ok(tick)
 }
 
 /// Full ingestion for a selected scope into the default database.
@@ -383,7 +438,159 @@ impl SyncSourceReport {
     }
 }
 
-fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
+/// Where [`discover::source_fingerprint`] is remembered between sweeps, inside
+/// the sync state file that already holds every per-source cursor.
+const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
+
+/// The sources a sweep reads that discovery never enumerates.
+///
+/// Discovery is about *sessions*, so its adapters walk the transcript trees.
+/// The sweep also reads two flat per-harness logs and the trajectory records,
+/// and `trajectory` is a declared [`discover::DISCOVERY_EXEMPTIONS`] entry
+/// precisely because it is not a provider session. Folding only the adapters
+/// into the fingerprint would leave these three outside it: after one
+/// successful sweep, a change confined to them would match the stored value
+/// and the sweep would return before ever reaching
+/// `sync_jsonl_incremental` / `sync_trajectories`. The records would then wait
+/// for an unrelated transcript to move — indefinitely, on a machine that only
+/// uses the flat log.
+///
+/// Stat-only, like the adapters' own inputs: enumerating trajectory files is a
+/// directory walk, and the two logs are one stat each.
+fn sweep_only_fingerprint_inputs(home: &Path) -> Vec<Candidate> {
+    let mut paths = vec![
+        home.join(".claude/history.jsonl"),
+        home.join(".codex/history.jsonl"),
+    ];
+    // Errors here mean an unreadable directory, not "no trajectories". The
+    // fold simply omits what it could not enumerate, which can only cause an
+    // extra sweep, never a skipped one.
+    paths.extend(trajectory_files(home).unwrap_or_default());
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path).ok()?;
+            Some(Candidate {
+                source: "sweep",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            })
+        })
+        .collect()
+}
+
+/// Every path live capture watches for a local sweep: the providers' own roots
+/// plus the sweep-only sources above.
+///
+/// The flat logs are watched through their parent directory rather than
+/// directly. A watch on a file follows that file's inode, so it stops firing
+/// the moment the log is replaced instead of appended to; and `~/.claude`
+/// watched recursively would pull in the todo files and shell snapshots an
+/// active session rewrites constantly, each one waking a full fingerprint
+/// walk.
+///
+/// Trajectory roots come from [`trajectory_roots`], not from the parents of
+/// the files found inside them. Deriving a watch from an existing file's
+/// parent covers only the shape the tree happens to have right now: an empty
+/// root, a root that does not exist yet, and the next `completed/<month>/`
+/// directory to be created would all go unwatched. The roots themselves are
+/// watched recursively, and a root that does not exist is kept — the loop
+/// retries it, so the first trajectory written there wakes live capture rather
+/// than waiting for the backstop.
+///
+/// Call this again to pick up a `.trajectories` directory created after the
+/// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
+/// that on each backstop tick.
+pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
+    let mut roots = discover::watch_roots(
+        &shallow_providers(),
+        &discover::ProviderRoots { home, opencode_db },
+    );
+    roots.push(discover::WatchRoot::directory(home.join(".claude")));
+    roots.push(discover::WatchRoot::directory(home.join(".codex")));
+    for root in trajectory_roots(home).unwrap_or_default() {
+        // A `TRAJECTORY_ROOT` entry may name a single JSON file rather than a
+        // directory; watch what contains it.
+        if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            if let Some(parent) = root.parent() {
+                roots.push(discover::WatchRoot::tree(parent));
+            }
+            continue;
+        }
+        roots.push(discover::WatchRoot::tree(root));
+    }
+    roots.sort();
+    roots.dedup_by(|later, first| {
+        if later.path != first.path {
+            return false;
+        }
+        first.recursive |= later.recursive;
+        true
+    });
+    roots
+}
+
+/// Whether a sweep read everything the fingerprint counted.
+///
+/// This is deliberately a different question from whether the sweep
+/// *succeeded*. A provider that hits a per-file failure absorbs it, records
+/// the count, leaves that file's stamp unrecorded so the next sweep retries
+/// it, and returns `Ok` — correct partial-success behaviour, and the whole
+/// source never appears in `SyncSourceReport::failures`. But that file was
+/// already folded into the fingerprint, so caching the fingerprint would mean
+/// the next tick matches, returns early, and the retry never happens: one
+/// transient read error becomes permanent, and every symptom of it is
+/// "nothing new".
+///
+/// So partial success and fingerprint eligibility are tracked separately. A
+/// run may make progress and still be ineligible to arm the fast path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SweepCoverage {
+    /// Sources counted into the fingerprint that this sweep could not read.
+    unread: u64,
+}
+
+impl SweepCoverage {
+    /// A source was statted into the fingerprint but not read. Not for a
+    /// source deliberately classified as ignorable — an unparseable line in a
+    /// file that was read, or a file the parser decided is not a session —
+    /// because re-reading those produces the same answer forever, and
+    /// blocking the fast path on them would disable it permanently.
+    fn note_unread(&mut self) {
+        self.unread = self.unread.saturating_add(1);
+    }
+
+    fn complete(self) -> bool {
+        self.unread == 0
+    }
+}
+
+/// Whether the stat-only fingerprint says this sweep has nothing to do.
+///
+/// The catalog check is the guard that keeps the fast path honest across a
+/// database that went away: `.sync-state.json` lives beside the database but
+/// outlives it, so a fingerprint recorded against a catalog that has since been
+/// deleted must not skip the sweep that would rebuild it. An empty catalog also
+/// means an empty fingerprint walk, so the sweep it forces is the cheap one.
+fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &str) -> bool {
+    let Some(stored) = state.get(SOURCE_FINGERPRINT_KEY).and_then(Value::as_str) else {
+        return false;
+    };
+    if stored.is_empty() || stored != current {
+        return false;
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
+        == 1
+}
+
+/// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
+/// matched the last sweep's and nothing was walked.
+fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Result<bool> {
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -412,6 +619,39 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let mut coverage = SweepCoverage::default();
+    let opencode = std::env::var_os("OPENCODE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+    let providers = shallow_providers();
+    // Captured before the sweep, not after. Anything that changes while the
+    // sweep runs yields a different fingerprint next time and forces one more
+    // pass — cheap, because the per-session stamps then skip what already
+    // landed. A fingerprint recorded ahead of the work it describes would lose
+    // that append instead.
+    let fingerprint = {
+        let env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode.clone());
+        let taken = discover::source_fingerprint_with(
+            &env,
+            &providers
+                .iter()
+                .map(|provider| provider.as_ref())
+                .collect::<Vec<_>>(),
+            &sweep_only_fingerprint_inputs(home),
+        );
+        if let Err(error) = &taken {
+            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
+        }
+        taken.ok()
+    };
+    if !force {
+        if let Some(current) = fingerprint.as_deref() {
+            if sources_unchanged(conn, &state, current) {
+                sync_note!("  [sync] sources unchanged since the last sweep; skipped");
+                return Ok(false);
+            }
+        }
+    }
     // Checkpoint after every source that advances `state`, rather than once at
     // the end. A run can die partway through -- killed process, locked database,
     // full disk -- and state written only at the end discards every source that
@@ -448,26 +688,35 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     }
     if let Some(inserted) = report.capture(
         "cursor",
-        sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
+        sync_cursor(
+            conn,
+            &mut state,
+            &home.join(".cursor/projects"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok(conn, &mut state, &home.join(".grok/sessions")),
+        sync_grok(
+            conn,
+            &mut state,
+            &home.join(".grok/sessions"),
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
-    {
+    if let Some(inserted) = report.capture(
+        "trajectory",
+        sync_trajectories(conn, &mut state, home, &mut coverage),
+    ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    let opencode = std::env::var_os("OPENCODE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
         if opencode.exists() {
             sync_note!("  [opencode] +{open_inserted} rows");
@@ -476,6 +725,18 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         }
         total_inserted += open_inserted;
     }
+    // A source that was statted into the fingerprint but could not be read is
+    // the one case where caching the fingerprint would make a transient
+    // failure permanent: the next sweep would match the stored value and skip
+    // before retrying. Leave the stored fingerprint stale instead. The cost is
+    // one full re-walk per tick until the source reads again, which is the
+    // conservative side of the trade.
+    //
+    // Both halves are needed. `failures` catches a source that failed
+    // outright; `coverage` catches the per-file failures a source absorbs on
+    // its way to a successful partial run, which never reach `failures` at
+    // all.
+    let all_sources_read = report.failures.is_empty() && coverage.complete();
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
@@ -484,9 +745,19 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
-        &shallow_providers(),
+        &providers,
         |_| {},
     )?;
+    // Written after every cursor this sweep advanced, and in its own
+    // checkpoint. A crash between them leaves cursors ahead of a stale
+    // fingerprint, which costs one extra full walk that then finds nothing —
+    // never a missed append. The reverse order would lose one.
+    if all_sources_read {
+        if let Some(fingerprint) = fingerprint {
+            state.insert(SOURCE_FINGERPRINT_KEY.to_string(), Value::from(fingerprint));
+            checkpoint_sync_state(&state_path, &state);
+        }
+    }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -519,7 +790,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
-    Ok(())
+    Ok(true)
 }
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
@@ -578,17 +849,43 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
 }
 
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
-    sync_exclusive_with_home(db_path, &home_dir())
+    sync_exclusive_with_home(db_path, &home_dir(), false).map(|tick| tick.attempted)
 }
 
-fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+/// What one local sweep did, for callers that need to tell "no provider source
+/// moved" apart from "another process holds the sync lock".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SyncTick {
+    /// This process took the sync lock and entered the sweep path.
+    pub attempted: bool,
+    /// A full walk ran. False when the stat-only source fingerprint matched
+    /// the previous sweep's, and false when the lock was held elsewhere.
+    pub swept: bool,
+}
+
+impl SyncTick {
+    /// The sweep was skipped because no provider source had moved.
+    pub fn skipped_unchanged(&self) -> bool {
+        self.attempted && !self.swept
+    }
+}
+
+pub(crate) fn sync_exclusive_with_home(
+    db_path: &Path,
+    home: &Path,
+    force: bool,
+) -> Result<SyncTick> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
-        return Ok(false);
+        return Ok(SyncTick::default());
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, home).map_err(|error| enrich_sync_error(db_path, error))?;
-    Ok(true)
+    let swept = sync_basic(&conn, db_path, home, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    Ok(SyncTick {
+        attempted: true,
+        swept,
+    })
 }
 
 fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
@@ -630,7 +927,8 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
         return Ok((conn, true));
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, &home_dir()).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &home_dir(), false)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -3700,8 +3998,13 @@ pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64
     Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
-fn sync_cursor(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
-    sync_cursor_with_scan_hook(conn, state, root, &mut |_| {})
+fn sync_cursor(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    sync_cursor_with_scan_hook(conn, state, root, coverage, &mut |_| {})
 }
 
 struct PreparedCursorTranscript {
@@ -3723,13 +4026,14 @@ fn sync_cursor_with_scan_hook(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
     // Finish provider I/O and parsing before taking the destination writer lock.
-    let prepared = prepare_cursor_sync(state, root, before_transcript)
+    let prepared = prepare_cursor_sync(state, root, coverage, before_transcript)
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
@@ -3829,6 +4133,7 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
 fn prepare_cursor_sync(
     state: &Map<String, Value>,
     root: &Path,
+    coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
@@ -3873,6 +4178,7 @@ fn prepare_cursor_sync(
                 Err(error) => {
                     sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
                     errors += 1;
+                    coverage.note_unread();
                     continue;
                 }
             };
@@ -3958,7 +4264,12 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
     format!("/{}", name.replace('-', "/"))
 }
 
-fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+fn sync_grok(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
     if !root.exists() {
         sync_note!("  [grok] not found: {} (skipped)", root.display());
         return Ok(0);
@@ -3989,7 +4300,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             Ok(None) => {
                 grok_state.insert(key, json!(stamp));
             }
-            Err(_) => errors += 1,
+            // Read failure: the stamp is deliberately not recorded so the next
+            // sweep retries this file, which only helps if a next sweep runs.
+            Err(_) => {
+                errors += 1;
+                coverage.note_unread();
+            }
         }
     }
     state.insert("grok_sessions".to_string(), Value::Object(grok_state));
@@ -4213,6 +4529,7 @@ fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
     home: &Path,
+    coverage: &mut SweepCoverage,
 ) -> Result<usize> {
     let files = trajectory_files(home)?;
     if files.is_empty() {
@@ -4232,6 +4549,7 @@ fn sync_trajectories(
             Ok(metadata) => metadata,
             Err(_) => {
                 errors += 1;
+                coverage.note_unread();
                 continue;
             }
         };
@@ -4264,6 +4582,7 @@ fn sync_trajectories(
                 return Err(error);
             }
             errors += 1;
+            coverage.note_unread();
             continue;
         }
         trajectory_state.insert(key, json!(stamp));
@@ -4307,7 +4626,15 @@ struct TrajectoryRow {
     timestamp_ms: i64,
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+/// The trajectory roots this machine is configured for, whether or not
+/// anything exists inside them yet.
+///
+/// Split out from [`trajectory_files`] because the watcher and the file walk
+/// need different answers. A root that is empty, or that does not exist at
+/// all, contributes no files — but it is exactly what has to be watched, so
+/// the first trajectory written into it wakes live capture instead of waiting
+/// for the backstop.
+pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
         for part in std::env::split_paths(&raw) {
@@ -4321,8 +4648,14 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
             collect_named_dirs(&projects, ".trajectories", &mut roots)?;
         }
     }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in roots {
+    for root in trajectory_roots(home)? {
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);
             continue;
@@ -4339,18 +4672,42 @@ fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Directory names never worth descending into when looking for a project's
+/// `.trajectories`, and expensive enough to matter: a dependency tree or an
+/// object store can be most of the files on the disk.
+const SKIP_PROJECT_SCAN_DIRS: &[&str] = &["node_modules", "target", "vendor"];
+
+/// Find directories named `name` under `root`.
+///
+/// The pruning is load-bearing, not a micro-optimisation. This runs once per
+/// watch tick as part of the stat-only fingerprint, and an unpruned walk of
+/// `~/Projects` means walking every dependency tree and every `.git` object
+/// store on the machine before deciding that nothing has changed — which is
+/// the opposite of what a fast path is for.
+///
+/// Pruned: the names above, and any hidden directory that is not the one being
+/// looked for. A match is not descended into either; nothing nests a
+/// `.trajectories` inside another one.
 fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|s| s.to_str()) == Some(name) {
-                out.push(path.clone());
-            }
-            collect_named_dirs(&path, name, out)?;
+        if !path.is_dir() {
+            continue;
         }
+        let Some(entry_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if entry_name == name {
+            out.push(path);
+            continue;
+        }
+        if entry_name.starts_with('.') || SKIP_PROJECT_SCAN_DIRS.contains(&entry_name) {
+            continue;
+        }
+        collect_named_dirs(&path, name, out)?;
     }
     Ok(())
 }
@@ -5679,13 +6036,19 @@ mod tests {
         let mut competing_write = None;
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
-                visited.push(path.to_path_buf());
-                if path == second {
-                    competing_write =
-                        Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+            super::sync_cursor_with_scan_hook(
+                &conn,
+                &mut state,
+                dir.path(),
+                &mut SweepCoverage::default(),
+                &mut |path| {
+                    visited.push(path.to_path_buf());
+                    if path == second {
+                        competing_write =
+                            Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+                    }
                 }
-            })
+            )
             .unwrap(),
             2
         );
@@ -5726,7 +6089,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         let saved = state.clone();
@@ -5751,8 +6115,12 @@ mod tests {
         )
         .unwrap();
         let mut visited = Vec::new();
-        let inserted =
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+        let inserted = super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            dir.path(),
+            &mut SweepCoverage::default(),
+            &mut |path| {
                 visited.push(path.to_path_buf());
                 if path == second {
                     assert_eq!(
@@ -5765,8 +6133,9 @@ mod tests {
                     // The hook runs after the existence check, forcing open to fail.
                     fs::remove_file(path).unwrap();
                 }
-            })
-            .expect("one vanished transcript must not abort the whole Cursor source");
+            },
+        )
+        .expect("one vanished transcript must not abort the whole Cursor source");
         assert_eq!(visited, vec![first.clone(), second.clone()]);
         assert_eq!(
             inserted, 1,
@@ -5810,7 +6179,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -5836,8 +6206,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("a failed database write must fail Cursor sync");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("a failed database write must fail Cursor sync");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(
             state, saved,
@@ -5873,7 +6244,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             4
         );
         assert_eq!(
@@ -5881,7 +6253,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -5936,8 +6309,9 @@ mod tests {
         .unwrap();
         let mut state = Map::new();
         let saved = state.clone();
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("the later file must fail the entire source");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("the later file must fail the entire source");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(state, saved, "first failed sync must not publish any state");
         assert_eq!(
@@ -5978,7 +6352,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             6
         );
         for path in [&first, &second] {
@@ -5988,7 +6363,8 @@ mod tests {
             );
         }
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -6035,7 +6411,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             2
         );
         assert_eq!(
@@ -6043,7 +6420,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
 
@@ -6055,7 +6433,8 @@ mod tests {
         .unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -6063,7 +6442,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<String> = conn
@@ -6100,7 +6480,13 @@ mod tests {
         fs::create_dir_all(cursor.parent().unwrap()).unwrap();
         fs::write(&cursor, r#"{"role":"user","message":{"content":"cursor"#).unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -6112,11 +6498,23 @@ mod tests {
         file.write_all(b"\n").unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             1
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(

@@ -104,8 +104,10 @@ pub fn hydrate_session_at_with_connectors(
     hydrate_session_at_with_home_and_connectors(db_path, options, &home_dir(), connectors)
 }
 
-#[cfg(test)]
-fn hydrate_session_at_with_home(
+/// Hydrate against an explicit provider home instead of the process `HOME`.
+/// The provider-root check that guards every locator resolves against it, so
+/// a host (or a test) with its own layout never has to mutate process state.
+pub fn hydrate_session_at_with_home(
     db_path: &Path,
     options: &HydrateSessionOptions,
     home: &Path,
@@ -118,7 +120,7 @@ fn hydrate_session_at_with_home(
     )
 }
 
-fn hydrate_session_at_with_home_and_connectors(
+pub(crate) fn hydrate_session_at_with_home_and_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
     home: &Path,
@@ -1150,7 +1152,7 @@ fn source_snapshot(
     })
 }
 
-fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> {
+pub(crate) fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> {
     let roots = match source {
         "claude" => vec![home.join(".claude/projects")],
         "codex" => vec![

@@ -356,6 +356,183 @@ impl ScanEnv<'_> {
     }
 }
 
+/// Where the local providers' evidence lives, without the catalog connection
+/// a [`DiscoveryEnv`] carries. What [`ShallowSessionProvider::watch_roots`]
+/// resolves its directories against.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRoots<'a> {
+    /// Home directory the file-backed providers are rooted at.
+    pub home: &'a Path,
+    /// Path to the opencode database.
+    pub opencode_db: &'a Path,
+}
+
+/// One path the live-capture watcher monitors, and how deeply.
+///
+/// Depth is not a detail. A transcript root has to be watched recursively,
+/// because a new session is a new file inside a directory that may not exist
+/// yet. A flat log such as `~/.claude/history.jsonl` is watched through its
+/// *parent*, non-recursively: watching the file itself stops firing the moment
+/// the file is replaced rather than appended to, and watching the parent
+/// recursively would pull in everything else under `~/.claude` — the todo
+/// files and shell snapshots a busy session rewrites constantly — so every one
+/// of those would wake a full fingerprint walk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WatchRoot {
+    pub path: PathBuf,
+    /// Whether the whole subtree is watched, or only this directory's own
+    /// entries.
+    pub recursive: bool,
+}
+
+impl WatchRoot {
+    /// Watch this path and everything under it.
+    pub fn tree(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            recursive: true,
+        }
+    }
+
+    /// Watch only this directory's own entries.
+    pub fn directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            recursive: false,
+        }
+    }
+}
+
+/// Every path the live-capture watcher should monitor for the given adapters,
+/// deduplicated and ordered.
+///
+/// Roots that do not exist are kept rather than dropped: a provider installed
+/// after the watcher started still has to become covered, so the loop retries
+/// them, and a caller can report which ones are not covered yet.
+///
+/// A path named both ways keeps the wider watch.
+pub fn watch_roots(
+    providers: &[Box<dyn ShallowSessionProvider>],
+    roots: &ProviderRoots<'_>,
+) -> Vec<WatchRoot> {
+    let mut widest: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut order = Vec::new();
+    for provider in providers {
+        for root in provider.watch_roots(roots) {
+            match widest.get_mut(&root.path) {
+                Some(recursive) => *recursive |= root.recursive,
+                None => {
+                    widest.insert(root.path.clone(), root.recursive);
+                    order.push(root.path);
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let recursive = widest[&path];
+            WatchRoot { path, recursive }
+        })
+        .collect()
+}
+
+/// A stat-only fold over everything discovery would enumerate, cheap enough to
+/// run on every watch tick.
+///
+/// The value is `"{candidates}:{bytes}:{hash}"`. It is a change *detector*, not
+/// a content hash: two distinct source states could in principle collide. For
+/// append-only transcripts inside one inter-tick window that is not a practical
+/// concern, and the worst case is one skipped no-op sweep — never lost
+/// evidence, because the per-session stamps still catch up on the next tick
+/// whose fingerprint differs.
+///
+/// `bytes` is the size each adapter's stamp reports, summed; it is a cheap
+/// guard that makes an accidental collision harder to hit, and the hash is the
+/// load-bearing part. Nothing here opens a file, so a tick over unchanged
+/// sources leaves [`DiscoveryCounters::files_opened`] at zero.
+pub fn source_fingerprint(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+) -> Result<String> {
+    source_fingerprint_with(env, providers, &[])
+}
+
+/// [`source_fingerprint`] plus inputs no adapter owns.
+///
+/// A sweep can read sources discovery never enumerates — flat per-harness
+/// logs, and records that are deliberately [`DISCOVERY_EXEMPTIONS`] entries.
+/// Anything the sweep reads has to be in the fold, or the fast path will skip
+/// a sweep that had work to do.
+pub fn source_fingerprint_with(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+    extra: &[Candidate],
+) -> Result<String> {
+    let mut candidates: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut hash: u64 = 0;
+    let mut fold = |candidate: &Candidate| {
+        candidates = candidates.wrapping_add(1);
+        bytes = bytes.wrapping_add(stamp_reported_bytes(&candidate.stamp));
+        hash = hash.wrapping_add(fingerprint_hash(
+            candidate.source,
+            &candidate.locator,
+            &candidate.stamp,
+        ));
+    };
+    for provider in providers {
+        for candidate in provider.fingerprint_inputs(env)? {
+            fold(&candidate);
+        }
+    }
+    for candidate in extra {
+        fold(candidate);
+    }
+    Ok(format!("{candidates}:{bytes}:{hash:016x}"))
+}
+
+/// [`source_fingerprint`] over the built-in adapters.
+pub fn source_fingerprint_for(
+    env: &DiscoveryEnv<'_>,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Result<String> {
+    let refs = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    source_fingerprint(env, &refs)
+}
+
+/// The byte count a file stamp reports, best effort.
+///
+/// File stamps are `"{mtime_nanos}:{len}"`, joined with `|` where one session
+/// is stamped from several files (grok's chat plus its summary). A stamp that
+/// is not shaped that way — a database adapter's `"{updated}:{count}"` — still
+/// contributes through the hash, so an unparseable size costs nothing.
+fn stamp_reported_bytes(stamp: &str) -> u64 {
+    stamp
+        .split('|')
+        .filter_map(|part| part.rsplit(':').next())
+        .filter_map(|len| len.parse::<u64>().ok())
+        .fold(0u64, |total, len| total.wrapping_add(len))
+}
+
+/// FNV-1a over one candidate's identity and change stamp. Summed rather than
+/// chained across candidates so the fold does not depend on enumeration order.
+fn fingerprint_hash(source: &str, locator: &str, stamp: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut hash = OFFSET;
+    for bytes in [source.as_bytes(), b"\0", locator.as_bytes(), b"\0", stamp.as_bytes()] {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
+}
+
 /// What a provider's [`read_shallow`](ShallowSessionProvider::read_shallow)
 /// needs access to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +599,37 @@ pub trait ShallowSessionProvider: Sync {
     /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
     fn read_access(&self) -> ShallowReadAccess {
         ShallowReadAccess::Filesystem
+    }
+    /// Directories the live-capture watcher should monitor for this adapter's
+    /// evidence, watched recursively.
+    ///
+    /// Return the widest directory whose subtree the provider writes into, not
+    /// the individual transcripts: a new session is a *new file*, and a watch
+    /// on a path that does not exist yet never fires. Adapters with no local
+    /// files (remote connectors, the relay adapter reading our own catalog)
+    /// return none, and the watcher skips roots that do not exist.
+    fn watch_roots(&self, _roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        Vec::new()
+    }
+    /// The change signal [`source_fingerprint`] folds for this adapter.
+    ///
+    /// The default is [`enumerate`](ShallowSessionProvider::enumerate), which
+    /// for the file-backed adapters is a directory walk plus one `stat` per
+    /// file and opens nothing — exactly the cost the watch fast path is
+    /// willing to pay every tick. Override when enumeration costs more than a
+    /// stat (a database query), returning the cheapest signal that still moves
+    /// whenever the provider's sources move; return none when the adapter's
+    /// rows are derived from RelayHistory's own catalog, where only our own
+    /// writes can move them.
+    ///
+    /// A remote connector contributes nothing by default: its enumeration is a
+    /// network listing, which is not a cost a per-tick fast path may pay, and
+    /// watch mode does not drive remote acquisition in the first place.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        if self.location() != SessionLocation::Local {
+            return Ok(Vec::new());
+        }
+        self.enumerate(env, None)
     }
     /// Bounded read of one candidate into a catalog row.
     ///
@@ -709,6 +917,25 @@ impl ShallowSessionProvider for ClaudeProvider {
         "claude"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".claude/projects"))]
+    }
+
+    /// Claude's enumeration collects `*.jsonl`, but a subagent transcript's
+    /// `agent-<id>.meta.json` sidecar is evidence too — `source_snapshot`
+    /// stamps it, so a sidecar arriving or changing on its own re-hydrates the
+    /// session. Left out of the fold, a tick whose only change was a sidecar
+    /// would sit behind an unchanged fingerprint and never run.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = self.enumerate(env, None)?;
+        inputs.extend(file_candidates(
+            "claude",
+            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "json")?,
+            crate::file_stamp_and_modified,
+        )?);
+        Ok(inputs)
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -879,6 +1106,13 @@ impl ShallowSessionProvider for CodexProvider {
         "codex"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![
+            WatchRoot::tree(roots.home.join(".codex/sessions")),
+            WatchRoot::tree(roots.home.join(".codex/archived_sessions")),
+        ]
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1030,6 +1264,10 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".cursor/projects"))]
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1121,6 +1359,10 @@ impl ShallowSessionProvider for GrokProvider {
     }
     fn source(&self) -> &'static str {
         "grok"
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".grok/sessions"))]
     }
 
     fn enumerate(
@@ -1389,6 +1631,45 @@ impl ShallowSessionProvider for OpencodeProvider {
         "opencode"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        // The database file is rewritten in place and SQLite's -wal and -shm
+        // siblings move with it, so the directory is what actually sees every
+        // write. Its own entries are enough — opencode keeps unrelated state
+        // in subdirectories, and waking on those would cost a fingerprint walk
+        // each time.
+        roots
+            .opencode_db
+            .parent()
+            .map(|dir| vec![WatchRoot::directory(dir)])
+            .unwrap_or_default()
+    }
+
+    /// Opencode's enumeration is a SQL query against the provider database, so
+    /// it costs an open plus a scan — far more than the watch fast path should
+    /// pay per tick. The database file's own size and mtime (plus its
+    /// write-ahead log, where a commit lands first) move whenever a session or
+    /// message does, and cost three stats.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let db = &env.opencode_db;
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: "opencode",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+        Ok(out)
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1648,6 +1929,41 @@ struct RelayProvider;
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
+    }
+
+    /// Relay rows come from RelayHistory's own `history` table, so there is no
+    /// file to stat — but "no file" is not "cannot change". `ai-hist import`
+    /// writes relay history straight into that table without going through a
+    /// sweep, and nothing else in the fingerprint moves when it does. Left out
+    /// of the fold entirely, an import would land rows that discovery then
+    /// declined to look at, and the imported sessions would never reach the
+    /// catalog.
+    ///
+    /// So the signal is a generation for the relay slice: how many rows there
+    /// are and the highest one. Both move on an insert, and the count alone
+    /// moves on a delete. It is one range scan of `idx_history_session`, whose
+    /// leading column is `source`, so the cost is proportional to the relay
+    /// rows rather than the table.
+    ///
+    /// This does not invalidate itself: no local sweep source writes
+    /// `source = 'relay'`, so a tick that folds this value cannot be the
+    /// reason it changed next time.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let (rows, highest) = env.conn().query_row(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM history WHERE source = 'relay'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Candidate {
+            source: "relay",
+            locator: "history:relay".into(),
+            session_id: None,
+            recency_hint_ms: None,
+            stamp: format!("{rows}:{highest}"),
+        }])
     }
 
     fn enumerate(
