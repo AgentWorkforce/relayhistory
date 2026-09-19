@@ -51,6 +51,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   before a captured table gained a column are now rebuilt rather than left in
   place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
   reporting successful delivery while silently emitting the old column list.
+  `session_events` also gains `raw_facts_version`, stamped by the local parser
+  on every event it writes: plain `sync` reads it to tell a row indexed before
+  the facts existed from one whose facts the provider never recorded, and
+  re-reads that transcript once. Without it a migrated database skipped every
+  unchanged transcript on the stamp fast path and left the six columns null
+  forever while reporting a successful sync.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

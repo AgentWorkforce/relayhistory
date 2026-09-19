@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     is_sidechain INTEGER,
     is_meta INTEGER,
     turn_id TEXT,
+    raw_facts_version INTEGER,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -481,6 +482,14 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     ("is_sidechain", "INTEGER"),
     ("is_meta", "INTEGER"),
     ("turn_id", "TEXT"),
+    // Not a provider fact: the generation of raw-fact parsing the local parser
+    // wrote the row with. It is the only field stamped on every event the
+    // parser writes, whatever the provider recorded, which is what lets a
+    // plain `sync` tell a row indexed before the facts existed from one whose
+    // facts the provider genuinely never recorded. Adapter-supplied rows do
+    // not carry it (it is absent from the session-event evidence spec), so the
+    // probes that read it exclude sessions with remote provenance.
+    ("raw_facts_version", "INTEGER"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,

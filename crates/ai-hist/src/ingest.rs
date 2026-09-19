@@ -1613,7 +1613,12 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
-                    Some(id) if codex_session_events_exist(conn, id)? => continue,
+                    Some(id)
+                        if codex_session_events_exist(conn, id)?
+                            && !events_lack_raw_facts(conn, "codex", id)? =>
+                    {
+                        continue
+                    }
                     // Stamp matches but the events are gone (wiped or rebuilt
                     // database): fall through and re-ingest.
                     _ => {}
@@ -2676,6 +2681,10 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
+            // An unchanged transcript whose rows predate the per-message raw
+            // facts is re-read once to backfill them; afterwards it is skipped
+            // again like any other unchanged file.
+            && !claude_transcript_lacks_raw_facts(conn, &path)?
         {
             continue;
         }
@@ -2768,6 +2777,83 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether a session still holds locally parsed rows indexed before the
+/// per-message raw provider facts existed.
+///
+/// A schema migration adds the nullable columns and writes its marker; the
+/// sync stamp maps are what decide whether a provider transcript is opened at
+/// all. Without this probe a database that migrated cleanly skips every
+/// unchanged transcript, and plain `sync` leaves `request_id`, `stop_reason`,
+/// `agent_version`, `is_sidechain`, `is_meta` and `turn_id` null on every row
+/// that was already indexed -- while reporting a perfectly successful sync.
+/// Only explicit hydration, which `HYDRATION_PARSER_VERSION` covers, or an
+/// unrelated edit to the file would ever repair them.
+///
+/// `raw_facts_version` is the field to test, and it is the reason that column
+/// exists: the parser stamps it on every event it writes whatever the record
+/// contained, so a re-read always clears the condition and a transcript cannot
+/// be re-read forever. None of the six facts can play that role -- a real
+/// record legitimately has no `request_id`, no `stop_reason` and no `turn_id`,
+/// and Codex sets none of the other three -- so a probe on any of them would
+/// re-read those transcripts on every sync for as long as they exist.
+///
+/// Rows whose session also has remote provenance are excluded. An installed
+/// source adapter writes session events through the evidence path, which does
+/// not carry this column, so a remote row is permanently unstamped: counting
+/// it would make the local file re-read forever, which is the failure this
+/// probe exists to avoid. A remote-shadowed session is repaired by hydration
+/// instead.
+///
+/// This is deliberately narrower than bumping the stamp-map generation, which
+/// would re-read every transcript in the archive, including the ones with
+/// nothing to gain, and would discard the selective-repair state the codex
+/// generations carry.
+fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_events e
+            WHERE e.source = ? AND e.session_id = ?
+              AND COALESCE(e.raw_facts_version, 0) < ?
+              AND NOT EXISTS(
+                SELECT 1 FROM session_presences p
+                WHERE p.source = e.source AND p.session_id = e.session_id
+                  AND p.location = 'remote'
+              )
+            LIMIT 1
+        )",
+        params![source, session_id, RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// The same question for a Claude transcript, which the walk knows by path.
+///
+/// Scoped through `sessions.raw_path` so it asks only about the rows this file
+/// owns: a session another transcript wrote cannot hold this one on the slow
+/// path.
+fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+              AND COALESCE(e.raw_facts_version, 0) < ?
+              AND NOT EXISTS(
+                SELECT 1 FROM session_presences p
+                WHERE p.source = e.source AND p.session_id = e.session_id
+                  AND p.location = 'remote'
+              )
+            LIMIT 1
+        )",
+        params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -3370,6 +3456,18 @@ fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
 /// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
 /// turn it falls inside (`turn_id`). Every field is optional and stored as the
 /// provider wrote it: relayhistory preserves, consumers map.
+/// The generation of raw-fact parsing the local parser stamps on every event
+/// it writes.
+///
+/// Unlike the facts themselves this is not a provider value and is never null
+/// on a row the current parser wrote: `request_id`, `stop_reason` and
+/// `turn_id` are legitimately absent on real records, and `is_sidechain` /
+/// `is_meta` are absent on any record whose envelope omits the flag, so none
+/// of them can answer "was this row indexed before the facts existed?".
+/// This can, which is what the full-sync backfill probes read. Bump it when a
+/// later change adds facts that existing rows should be re-read for.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 1;
+
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
     request_id: Option<&'a str>,
@@ -3403,14 +3501,15 @@ fn insert_session_event(
     conn.execute(
         "INSERT INTO session_events \
          (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
-          request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, raw_facts_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
          model=excluded.model, token_json=excluded.token_json, request_id=excluded.request_id, \
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
-         is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id",
+         is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
+         raw_facts_version=excluded.raw_facts_version",
         params![
             source,
             session_id,
@@ -3432,6 +3531,7 @@ fn insert_session_event(
             facts.is_sidechain,
             facts.is_meta,
             facts.turn_id,
+            RAW_MESSAGE_FACTS_VERSION,
         ],
     )?;
     Ok(())
@@ -6788,6 +6888,162 @@ mod tests {
         assert_eq!(child_events, 1);
     }
 
+    /// Reproduce what a release without the per-message raw facts left behind:
+    /// the rows and the sync stamps are there, the columns the migration added
+    /// are null. This is exactly the state an upgraded install is in on its
+    /// first `sync`.
+    fn blank_raw_message_facts(conn: &Connection, source: &str) {
+        conn.execute(
+            "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
+             agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
+             raw_facts_version = NULL WHERE source = ?",
+            [source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plain_claude_sync_backfills_raw_facts_for_transcripts_indexed_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-facts.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-facts","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-facts","cwd":"/tmp/project","isSidechain":false,"requestId":"req_1","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let facts =
+            |conn: &Connection| -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+                conn.query_row(
+                    "SELECT request_id, stop_reason, agent_version, is_sidechain \
+                 FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+            };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            facts(&conn),
+            (
+                Some("req_1".into()),
+                Some("end_turn".into()),
+                Some("2.1.96".into()),
+                Some(0)
+            )
+        );
+
+        blank_raw_message_facts(&conn, "claude");
+        // The stamp is unchanged and the events exist, so every other
+        // condition on the fast path says "skip". Without the raw-facts check
+        // this sync is a no-op and the columns stay null indefinitely while
+        // the run still reports success.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            facts(&conn),
+            (
+                Some("req_1".into()),
+                Some("end_turn".into()),
+                Some("2.1.96".into()),
+                Some(0)
+            )
+        );
+
+        // Repaired once, back on the fast path: a sentinel a re-read would
+        // overwrite has to survive, or the transcript is being re-read on
+        // every sync forever.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source='claude' AND event_uid='a1:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("sentinel"));
+    }
+
+    #[test]
+    fn plain_codex_sync_backfills_raw_facts_for_rollouts_indexed_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_backfill.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_backfill","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let turn_ids = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, turn_id FROM session_events \
+                 WHERE source='codex' AND session_id='sess_backfill' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_ids(&conn),
+            vec![
+                ("2:user_message".into(), Some("turn_1".into())),
+                ("3:agent_message".into(), Some("turn_1".into())),
+            ]
+        );
+
+        blank_raw_message_facts(&conn, "codex");
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_ids(&conn),
+            vec![
+                ("2:user_message".into(), Some("turn_1".into())),
+                ("3:agent_message".into(), Some("turn_1".into())),
+            ]
+        );
+
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source='codex' AND event_uid='3:agent_message'",
+            [],
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='codex' AND event_uid='3:agent_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("sentinel"));
+    }
+
     #[test]
     fn an_unchanged_subagent_sidecar_is_not_re_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -6870,7 +7126,8 @@ mod tests {
         init_db(&conn).unwrap();
         // A database synced before delegation was recorded: the parent is
         // registered and indexed, so its stamp fast path skips it entirely,
-        // and no topology exists at all.
+        // and no topology exists at all. The row carries the current raw-facts
+        // generation; what is missing here is topology, not the facts.
         super::upsert_session(
             &conn,
             "claude-root",
@@ -6885,9 +7142,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('claude', 'claude-root', 2, 'assistant', 'text', 'kept event', 'a1:0')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('claude', 'claude-root', 2, 'assistant', 'text', 'kept event', 'a1:0', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         let mut claude_sessions = Map::new();
@@ -7616,9 +7873,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
 
@@ -7702,9 +7959,9 @@ mod tests {
         // already there, so the rollout is never re-read for its own sake.
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
@@ -7759,9 +8016,9 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1')",
-            [],
+             (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('codex', 'sess-unchanged-sub', 2, 'assistant', 'text', 'kept event', 'event-1', ?)",
+            [super::RAW_MESSAGE_FACTS_VERSION],
         )
         .unwrap();
         conn.execute(
@@ -7814,6 +8071,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         // Existing events make the old v4 entries eligible for the fast path.
+        // They carry the current raw-facts generation so this test exercises the
+        // guardian reclassification and not the raw-facts backfill.
         for session_id in [
             "sess-top",
             "sess-standalone-guardian",
@@ -7821,9 +8080,13 @@ mod tests {
         ] {
             conn.execute(
                 "INSERT INTO session_events \
-                 (source, session_id, ts_ms, role, kind, text, event_uid) \
-                 VALUES ('codex', ?, 2, 'assistant', 'text', 'retained event', ?)",
-                rusqlite::params![session_id, format!("retained-{session_id}")],
+                 (source, session_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+                 VALUES ('codex', ?, 2, 'assistant', 'text', 'retained event', ?, ?)",
+                rusqlite::params![
+                    session_id,
+                    format!("retained-{session_id}"),
+                    super::RAW_MESSAGE_FACTS_VERSION
+                ],
             )
             .unwrap();
         }

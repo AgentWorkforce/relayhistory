@@ -348,6 +348,17 @@ A null is "the provider did not record it", which is not the same as `false`
 or as an empty string: a Claude record with no `isSidechain` key stores null,
 while `"isSidechain": false` stores `0`.
 
+Because of that, none of the six can answer "was this row indexed before the
+facts existed?" -- a real record legitimately has no `request_id`, no
+`stop_reason` and no `turn_id`, and Codex records none of the other three.
+`raw_facts_version` answers it instead: the local parser stamps it on every
+event it writes, so the full-sync stamp fast path can re-read a transcript
+whose rows predate the facts exactly once and then skip it again. It is
+bookkeeping rather than a provider fact, is not part of the session-event
+evidence spec, and is therefore null on rows an installed source adapter
+supplied -- the sync probes exclude sessions with remote provenance for that
+reason, and those are repaired by hydration.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
