@@ -87,9 +87,16 @@ call by the number of records it was split across.
 `session_requests` is the grouping that prevents this. It is a **view** over
 `session_events`, one row per `(source, session_id, request_key)`:
 
-- `request_key` is the provider's `request_id` when `session_events` carries
-  that column, and the event `message_id` otherwise. `requestKeySource` says
-  which.
+- `request_key` is the provider's own identity for the API call: `request_id`
+  (Claude's `requestId`) first, then `provider_message_id` (`message.id`), and
+  the event's `message_id` only as a last resort. `requestKeySource` says which
+  of the three was used.
+- `message_id` is **not** a request identity. It holds the JSONL record's own
+  `uuid`, and one Claude request is written as several records with different
+  uuids. A request keyed on it, from a source that spreads requests across
+  records, carries the `unresolved-request-identity` diagnostic — and its
+  session rollup reports no totals at all rather than a figure that is one per
+  content block.
 - Only assistant rows with a message id participate. A user turn is not a
   request.
 - `usage_variants` counts the distinct non-null `token_json` blobs in the
@@ -99,14 +106,20 @@ call by the number of records it was split across.
 
 Because it is a view rather than a materialized table, it cannot drift from the
 events it is derived from, and there is exactly one implementation of the
-normalization rules. The view is rebuilt whenever `session_events` gains or
-loses the `request_id` column, and a view built for a different column set
+normalization rules. A view left over from a build whose grouping key differed
 counts as outstanding migration work — otherwise an upgraded store would keep
 over-counting, silently and plausibly.
 
-Until `request_id` is captured, `message_id` holds Claude's per-record `uuid`,
-so a turn split across records reads as one request per record. That is
-recorded in the test suite as a characterization rather than hidden.
+### Upgrading an existing store
+
+`request_id` and `provider_message_id` are added by migration, but their
+*values* live only in the transcripts. Rows already indexed keep them null
+until their transcript is re-parsed, and `ai-hist sync` does not re-read a
+transcript whose bytes have not changed. `HYDRATION_PARSER_VERSION` is bumped
+so an explicit hydrate does re-parse; until one runs, those Claude sessions
+report their requests and the `unresolved-request-identity` diagnostic with no
+totals. A gap is recoverable. A multiplied total presented as a measurement is
+not.
 
 ## Missing counters
 
@@ -119,9 +132,39 @@ provider never reported it. A session summary merges coverage across its
 requests, so `hasOutputTokens: false` on a summary means *no* request in the
 session reported an output count.
 
-A session with no usage evidence at all returns `null` — `usage` on
-`getSessionUsage`, `None` from `session_usage_summary` — rather than a
-zero-filled record. Zero is a claim.
+`usage` is `null` — on `getSessionUsage`, and on the Rust
+`SessionUsageSummary` — whenever the totals are not established: no request
+carried usage, every request's usage was rejected, the totals overflowed, or
+the requests are not known to be one per API call. Zero is a claim, so nothing
+is zero-filled.
+
+The **summary itself** is still returned in all of those cases, carrying the
+request counts, models, timestamps and `diagnostics`. Only a session nothing
+was ever recorded for answers with nothing at all. A session whose usage is
+unreadable and a session that does not exist are different answers, and
+collapsing them would leave a caller unable to tell corrupt evidence from
+absent evidence.
+
+### Aggregation is all-or-nothing per field
+
+An optional field is reported on a total only when **every** contributing
+request reported it. Folding an unreported `None` in as a zero is how a sum of
+one split cache-write record and one unsplit one ends up describing the whole
+session as split: the unsplit tokens vanish from the TTL buckets that are
+priced, and the result looks complete. So a partial split reports `null` plus
+`partial-cache-write-split`, and a partial cost reports `null` plus
+`partial-reported-cost`. The one exception is a record that wrote no cache
+tokens at all — its split is not unreported, it is known to be zero, and it
+must not erase a real one.
+
+### Counts on the JavaScript boundary
+
+Every count the SDK returns is a safe integer. Core accepts counters up to
+`u64::MAX`; a value above `Number.MAX_SAFE_INTEGER` cannot cross a `number`
+intact, so the native boundary refuses it — `usage: null`, `usageError:
+"USAGE_COUNT_NOT_REPRESENTABLE"`, and the `count-not-representable`
+diagnostic — instead of saturating to something that still looks like a
+measurement.
 
 ## Error codes
 
@@ -138,6 +181,7 @@ usage failed to normalize carries the code in `usageError` and the
 | `USAGE_COUNTER_REGRESSED` | Codex `cached_input_tokens` exceeded `input_tokens`, so cache-exclusive input would be negative |
 | `USAGE_COUNTER_OVERFLOW` | Two reported counters could not be combined within `u64` |
 | `USAGE_INVALID_COST` | A reported cost was negative or non-finite |
+| `USAGE_COUNT_NOT_REPRESENTABLE` | A count exceeded `Number.MAX_SAFE_INTEGER` at the JavaScript boundary |
 
 ## Reading it
 
