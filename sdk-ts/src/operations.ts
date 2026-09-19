@@ -22,6 +22,7 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  FULL_SESSION_KINDS,
   defaultDbPath,
   Source,
   CatalogSource,
@@ -138,6 +139,7 @@ import {
   relationshipCursor,
   validateSessionRef,
   evidenceIdentity,
+  combineHydration,
 } from './normalization.js';
 export { validateNativeLocation, validateNativeScope, parseStoredJson } from './normalization.js';
 
@@ -781,12 +783,18 @@ export async function bootstrapLocal(
         includeRelated: false,
       });
       hydratedSessions++;
-      if (result.capability !== 'full') {
+      // Bootstrap declines delegation evidence above, so an absent
+      // `relationship` is this call's own choice and must not be reported as a
+      // provider limitation. What remains missing is the provider's.
+      const unavailable = FULL_SESSION_KINDS.filter(
+        (kind) => kind !== 'relationship' && !result.coverage.includes(kind),
+      );
+      if (unavailable.length > 0) {
         diagnostics.push({
           source: session.source,
           sessionId: session.sessionId,
           code: 'CAPABILITY_LIMITED',
-          message: `Provider exposes ${result.capability} evidence`,
+          message: `Provider exposes no ${unavailable.join(', ')} evidence`,
         });
       }
     } catch (error) {
@@ -936,26 +944,6 @@ function validateAcquisition(options: {
       'acquisition limit must be an integer from 1 to 10000',
       'INVALID_ARGUMENT',
     );
-}
-function combineHydration(
-  previous: HydrateSessionResult | undefined,
-  next: HydrateSessionResult,
-): HydrateSessionResult {
-  if (!previous) return next;
-  const rank = { full: 2, partial: 1, shallow_only: 0 };
-  const best = rank[next.capability] > rank[previous.capability] ? next : previous;
-  return {
-    ...best,
-    evidence: {
-      prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
-      events: Math.max(previous.evidence.events, next.evidence.events),
-      toolCalls: Math.max(previous.evidence.toolCalls, next.evidence.toolCalls),
-      fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
-      relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
-    },
-    relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
-    diagnostics: [...previous.diagnostics, ...next.diagnostics],
-  };
 }
 function validateSourceConnectors(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;

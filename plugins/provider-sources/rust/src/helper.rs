@@ -1,5 +1,5 @@
 //! Bounded one-request bridge for explicitly selected provider-native adapters.
-use ai_hist::{observations::SessionObservation, SessionLocation};
+use ai_hist::{observations::SessionObservation, EvidenceKind, SessionLocation};
 use ai_hist::discover::DiscoveryEnv;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -21,6 +21,9 @@ pub struct Arguments {
     pub source: Option<String>,
     pub limit: Option<usize>,
     pub observation: Option<SessionObservation>,
+    /// Absent means the caller did not say, which keeps the historical
+    /// behaviour of acquiring related evidence.
+    pub include_related: Option<bool>,
 }
 // Validate caller-controlled identities before resolving HOME, constructing an
 // adapter, or probing credentials. Classification is based on this phase, never
@@ -127,14 +130,35 @@ fn execute(request: Request) -> Result<Value> {
         );
         provider.check_available(home)?;
         let evidence = provider.acquire(home, &observation)?;
-        let normalized = ai_hist::sources::normalize_source_evidence(
+        let mut normalized = ai_hist::sources::normalize_source_evidence(
             provider.source(),
             &observation.key.session_id,
             evidence,
         )?;
+        if args.include_related == Some(false) {
+            drop_related(&mut normalized);
+        }
         Ok(serde_json::to_value(normalized)?)
     }
 }
+/// Remove delegation evidence from a snapshot the caller asked to scope to one
+/// thread.
+///
+/// Claude's full export derives relationships from the transcript it already
+/// fetched, so there is no separate acquisition to skip -- what matters is that
+/// the snapshot neither *reports* nor *returns* the kind. Leaving it in
+/// `covered_kinds` would let the merge union reinstate exactly what the local
+/// path dropped for the same request, and `scope: "all"` could then read `full`
+/// despite the opt-out.
+fn drop_related(normalized: &mut ai_hist::sources::NormalizedSourceEvidence) {
+    normalized
+        .covered_kinds
+        .retain(|kind| *kind != EvidenceKind::Relationship);
+    normalized
+        .records
+        .retain(|record| record.kind != EvidenceKind::Relationship);
+}
+
 pub fn handle(request: Request) -> Value {
     if validate_request(&request).is_err() {
         return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Invalid provider source request; verify operation, connector identity, source and limits"}});
@@ -159,8 +183,61 @@ fn resolve_home(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_home;
+    use super::{drop_related, resolve_home};
+    use ai_hist::{EvidenceKind, EvidenceRecord};
     use std::path::PathBuf;
+
+    fn record(kind: EvidenceKind) -> EvidenceRecord {
+        EvidenceRecord {
+            kind,
+            payload: serde_json::Map::new(),
+            record_id: None,
+            revision_id: None,
+        }
+    }
+
+    /// Declining related evidence has to remove the kind from `covered_kinds`
+    /// as well as the rows: coverage is what the merge unions, so reporting it
+    /// covered would put back what the local path dropped for this request.
+    #[test]
+    fn declining_related_evidence_drops_both_the_coverage_and_the_rows() {
+        let mut normalized = ai_hist::sources::NormalizedSourceEvidence {
+            source_stamp: "stamp".into(),
+            source_bytes: 0,
+            covered_kinds: vec![
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+                EvidenceKind::Relationship,
+            ],
+            records: vec![
+                record(EvidenceKind::History),
+                record(EvidenceKind::Relationship),
+                record(EvidenceKind::ToolCall),
+            ],
+        };
+        drop_related(&mut normalized);
+        assert_eq!(
+            normalized.covered_kinds,
+            vec![
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+            ]
+        );
+        assert_eq!(
+            normalized
+                .records
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![EvidenceKind::History, EvidenceKind::ToolCall]
+        );
+        // Everything else the snapshot carries is untouched.
+        assert_eq!(normalized.source_stamp, "stamp");
+    }
 
     #[test]
     fn home_resolution_supports_windows_profile_and_rejects_empty_paths() {

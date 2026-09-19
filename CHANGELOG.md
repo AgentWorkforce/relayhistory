@@ -41,6 +41,20 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- Hydration contract 3; local hydration no longer claims `full` for
+  prompt-only providers. `capability` is computed from the evidence kinds the
+  selected provider's parser actually produces, declared per adapter as
+  `ShallowSessionProvider::evidence_kinds`, instead of being the literal
+  `"full"` for every local source. `HydrateSessionResult` gains
+  `coverage` (the covered kinds, in canonical order) and a
+  `HYDRATION_PARTIAL_COVERAGE` diagnostic naming what is absent, and
+  `discovery_state` is read back off the catalog row rather than asserted.
+  Cursor, Grok and OpenCode now return `capability: "partial"` with
+  `coverage: ["history"]`; Claude and Codex return `"full"` when related
+  evidence is requested and `"partial"` without `relationship` when
+  `includeRelated: false`, which never reads delegation evidence.
+  Consumers ranking merges on `capability` (`{full, partial, shallow_only}`)
+  will see prompt-only presences drop below full ones, which is the point.
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no
   longer substitutes the OpenCode database file size, and summaries add

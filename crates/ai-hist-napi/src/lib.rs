@@ -1054,6 +1054,10 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Evidence kinds this hydration can have indexed, as wire names
+    /// (`history`, `session_event`, `tool_call`, `file_edit`,
+    /// `relationship`, `commit_link`).
+    pub coverage: Vec<String>,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -1115,6 +1119,11 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
+        coverage: result
+            .coverage
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
         related_session_ids: result.related_session_ids,
         diagnostics: result
             .diagnostics

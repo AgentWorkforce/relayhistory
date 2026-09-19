@@ -32,6 +32,31 @@ pub struct EvidenceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_id: Option<String>,
 }
+impl EvidenceKind {
+    /// The wire name, identical to this enum's serde representation. Callers
+    /// that name a kind in a diagnostic or a JSON contract use this rather
+    /// than `Debug`, which prints the Rust variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::SessionEvent => "session_event",
+            Self::ToolCall => "tool_call",
+            Self::FileEdit => "file_edit",
+            Self::Relationship => "relationship",
+            Self::CommitLink => "commit_link",
+        }
+    }
+}
+
+/// Render a kind list the way diagnostics and docs name it.
+pub fn join_kinds(kinds: &[EvidenceKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct Spec {
     table: &'static str,
     columns: &'static str,
@@ -348,4 +373,29 @@ pub fn read_session(
         records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A diagnostic that names a kind and a JSON contract that serializes one
+    /// must agree, or a consumer matching on the wire name silently misses it.
+    #[test]
+    fn kind_names_match_their_serde_representation() {
+        for kind in [
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+            EvidenceKind::CommitLink,
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+        }
+        assert_eq!(
+            join_kinds(FULL_SESSION_KINDS),
+            "history, session_event, tool_call, file_edit, relationship"
+        );
+    }
 }

@@ -22,6 +22,21 @@ import {
   relayHistorySource,
 } from './plugin.js';
 
+/**
+ * Relationship rows actually ingested for the fixture session.
+ *
+ * Read through the public SDK rather than by opening the database: the claim
+ * is that declining related evidence stops it being *indexed*, and a count the
+ * SDK cannot see would not prove that.
+ */
+async function relationshipRows(dbPath: string): Promise<number> {
+  const { getSessionRelationships } = await import('ai-hist');
+  const topology = await getSessionRelationships({
+    source: 'claude', sessionId: 'session-fixture', dbPath,
+  });
+  return topology.asParent.length + topology.asChild.length;
+}
+
 const account =
   'relayhistory:' +
   createHash('sha256')
@@ -364,6 +379,97 @@ test('multi-origin delivery merges canonical identities without comparing origin
   const result = await hydrate();
   assert.equal(result.status, 'capability_limited');
   assert.equal(result.capability, 'shallow_only');
+});
+
+// A complete export that found no file edits and no delegation examined those
+// kinds and found none. Declaring coverage from the rows that happened to be
+// present reported every such normal session as `partial`, which costs the
+// snapshot its priority in a merge against a less complete presence.
+test('a sparse session keeps its zero-row kinds covered and still hydrates as full', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-sparse-coverage-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const recordsPath = join(dir, 'records.json');
+  const binaryPath = await fixtureHelper(t, 'clear', recordsPath);
+  const dbPath = join(dir, 'history.db');
+  // Prompts and one assistant turn: no tool calls, no file edits, no
+  // delegation. Nothing here is missing -- the session simply has none.
+  await writeFile(recordsPath, JSON.stringify([
+    record('history', 'prompt', { timestamp_ms: 10, prompt: 'question' }),
+    record('session_event', 'answer', {
+      event_uid: 'answer', ts_ms: 20, role: 'assistant', kind: 'text', text: 'answer',
+    }),
+  ]));
+  const registry = new HistoryPluginRegistry();
+  registry.register({ sources: [relayHistorySource({ binaryPath, expectedAccount: account })] });
+  const result = await hydrateSession({
+    source: 'claude', sessionId: 'session-fixture', scope: 'remote', plugins: registry, dbPath,
+  });
+
+  assert.equal(result.capability, 'full');
+  for (const kind of ['history', 'session_event', 'tool_call', 'file_edit', 'relationship']) {
+    assert.ok(result.coverage.includes(kind as never), `${kind} stays covered`);
+  }
+  // Covered and empty, which is the distinction the contract exists to carry.
+  assert.equal(result.evidence.toolCalls, 0);
+  assert.equal(result.evidence.fileEdits, 0);
+  assert.equal(result.evidence.prompts, 1);
+});
+
+// `includeRelated: false` is part of the request, not of the local path. A
+// connector that kept reporting relationship coverage would reinstate, through
+// the merge union, exactly the kind the local result dropped.
+test('a remote snapshot honours includeRelated: false and the merge does not reinstate it', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-include-related-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const recordsPath = join(dir, 'records.json');
+  const binaryPath = await fixtureHelper(t, 'clear', recordsPath);
+  const dbPath = join(dir, 'history.db');
+  await writeFile(recordsPath, JSON.stringify([
+    record('history', 'prompt', { timestamp_ms: 10, prompt: 'question' }),
+    // Built by hand: `session_relationships` is keyed by `parent_session_id`
+    // and has no `session_id` column, which `record` would inject.
+    {
+      ...record('relationship', 'delegation', {}),
+      payload: {
+        source: 'claude',
+        parent_session_id: 'session-fixture',
+        relationship_uid: 'delegation',
+        child_session_id: 'child-fixture',
+        relationship: 'delegated',
+        identity_status: 'observed',
+        evidence_kind: 'transcript',
+        created_ms: 1,
+        updated_ms: 1,
+      },
+    },
+  ]));
+  const registry = new HistoryPluginRegistry();
+  registry.register({ sources: [relayHistorySource({ binaryPath, expectedAccount: account })] });
+  const hydrate = (scope: 'remote' | 'all', includeRelated: boolean) => hydrateSession({
+    source: 'claude', sessionId: 'session-fixture', scope, plugins: registry, dbPath, includeRelated,
+  });
+
+  const declined = await hydrate('remote', false);
+  assert.equal(declined.coverage.includes('relationship'), false);
+  assert.equal(declined.capability, 'partial');
+  assert.deepEqual(declined.relatedSessionIds, []);
+  // The row was in the export and was not ingested: declining is a real
+  // acquisition choice, not a relabelling of the same evidence.
+  assert.equal(await relationshipRows(dbPath), 0);
+
+  // scope 'all' merges the local and remote presences. The union must not put
+  // back what both sides were asked to leave out.
+  const merged = await hydrate('all', false);
+  assert.equal(merged.coverage.includes('relationship'), false);
+  assert.equal(merged.capability, 'partial');
+  assert.equal(await relationshipRows(dbPath), 0);
+
+  // Asking for it brings both the coverage and the rows back, so the assertions
+  // above are about the option and not about an export that never had one.
+  const requested = await hydrate('remote', true);
+  assert.equal(requested.coverage.includes('relationship'), true);
+  assert.equal(requested.capability, 'full');
+  assert.equal(await relationshipRows(dbPath), 1);
 });
 
 test('source discovery orders by evidence recency before applying its limit', async (t) => {

@@ -58,6 +58,10 @@ pub struct ApplyEvidenceRequest {
     #[serde(flatten)]
     pub key: ObservationKey,
     pub expected_revision: String,
+    /// Absent means the caller did not say, which keeps the historical
+    /// behaviour of reporting related sessions.
+    #[serde(default)]
+    pub include_related: Option<bool>,
     #[serde(flatten)]
     pub evidence: NormalizedSourceEvidence,
 }
@@ -78,6 +82,7 @@ pub fn apply_source_evidence(mut request: ApplyEvidenceRequest) -> Result<Hydrat
         &request.key,
         &request.expected_revision,
         request.evidence,
+        request.include_related.unwrap_or(true),
         Instant::now(),
     )
 }
@@ -154,6 +159,7 @@ pub(crate) fn apply_normalized(
     key: &ObservationKey,
     expected: &str,
     mut evidence: NormalizedSourceEvidence,
+    include_related: bool,
     started: Instant,
 ) -> Result<HydrateSessionResult> {
     validate(key, &mut evidence)?;
@@ -235,9 +241,27 @@ pub(crate) fn apply_normalized(
             checkpoint.source_stamp.as_deref() == Some(&evidence.source_stamp)
         });
     observations::save_evidence(&tx, key, &serde_json::to_value(&own)?)?;
+    // The accumulated set models what this connector's snapshot as a whole
+    // still asserts, which is what the stored `discovery_state` is about: an
+    // acquisition that did not cover a kind does not withdraw the records an
+    // earlier one contributed.
     let full = FULL_SESSION_KINDS
         .iter()
         .all(|kind| own.covered_kinds.contains(kind));
+    // The result's `coverage` is a different question: what *this* acquisition
+    // examined. Reporting the accumulated set would let a later
+    // `include_related: false` snapshot inherit `relationship` from an earlier
+    // one and read as `full` despite the opt-out -- the same "nobody looked"
+    // overstatement this contract removes, arriving through retained state
+    // instead of a literal. Canonical order, so the wire shape does not depend
+    // on how a connector ordered its declaration.
+    let coverage = evidence
+        .covered_kinds
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     snapshots.insert(owner(key), own);
     let mut union = BTreeMap::new();
     let mut managed = BTreeSet::new();
@@ -278,7 +302,10 @@ pub(crate) fn apply_normalized(
         } else {
             SessionScope::Remote
         },
-        include_related: true,
+        // The request's own answer, not an assumption: with it hardcoded, a
+        // hydration that declined related evidence still came back listing
+        // related sessions and counting them.
+        include_related,
     };
     crate::hydrate::build_remote_result(
         conn,
@@ -290,8 +317,13 @@ pub(crate) fn apply_normalized(
         } else {
             "hydrated"
         },
-        if full { "full" } else { "partial" },
+        // Capability follows this acquisition's coverage, not the accumulated
+        // set, or it would contradict the `coverage` beside it -- which the SDK
+        // re-derives and rejects on mismatch. `discovery_state` keeps following
+        // the stored row.
+        crate::hydrate::capability_for(&coverage),
         if full { "full" } else { "shallow" },
+        coverage,
         evidence.source_stamp,
         evidence.source_bytes,
         evidence.records.len() as i64,
