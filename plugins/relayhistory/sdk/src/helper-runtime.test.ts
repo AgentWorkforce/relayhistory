@@ -34,7 +34,8 @@ async function fixture(markerDelay?: number) {
   await writeFile(binary, `#!${process.execPath}\n${source}\n`);
   await chmod(binary, 0o700);
   const pid = async () => { for (let attempt=0;attempt<200;attempt++) { try {return Number(await readFile(pidFile,'utf8'));} catch {await pause(10);} } throw new Error('descendant did not start'); };
-  return {binary,marker,pid,source,release:()=>writeFile(gate,'go'),async close(){try{process.kill(Number(await readFile(pidFile,'utf8')),'SIGKILL');}catch{}await rm(directory,{recursive:true,force:true});}};
+  const continued = async () => { for (let attempt=0;attempt<200;attempt++) { try {return await readFile(marker,'utf8');} catch {await pause(25);} } throw new Error('descendant never continued'); };
+  return {binary,marker,pid,source,continued,release:()=>writeFile(gate,'go'),async close(){try{process.kill(Number(await readFile(pidFile,'utf8')),'SIGKILL');}catch{}await rm(directory,{recursive:true,force:true});}};
 }
 
 test('cancellation kills the helper descendant but leaves an unrelated process alone', {skip:process.platform==='win32'}, async()=>{
@@ -82,9 +83,12 @@ test('tree cleanup terminates a real descendant using the platform implementatio
     // Released only now, so a descendant can act solely by having outlived a
     // completed cleanup. A slow platform kill can no longer read as survival.
     await files.release();await control.release();
-    await pause(450);
+    // The control is the clock, not a fixed pause: once a live descendant has
+    // acted on the release, an equally live killed one would have too. The
+    // settle covers scheduling jitter between the two.
+    assert.equal(await control.continued(),'continued');
+    await pause(250);
     await assert.rejects(readFile(files.marker),{code:'ENOENT'});
-    assert.equal(await readFile(control.marker,'utf8'),'continued');
     assert.ok(unrelated.pid);assert.doesNotThrow(()=>process.kill(unrelated.pid!,0));
   } finally {child.kill('SIGKILL');survivor.kill('SIGKILL');unrelated.kill('SIGKILL');await control.close();await files.close();}
 });
