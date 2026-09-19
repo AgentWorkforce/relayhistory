@@ -1,6 +1,6 @@
 //! Embedder entry point. Cargo semver is the contract; there is no separate
 //! Rust contract-version constant.
-use crate::ingest::sync_local_at;
+use crate::ingest::{sync_local_at, sync_local_at_with_home};
 use crate::store::{default_db_path, open_db, open_db_readonly};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -65,34 +65,19 @@ impl Source {
     }
 }
 
-/// Override the default provider search roots for one store.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ProviderRoots {
-    pub claude: Option<PathBuf>,
-    pub codex: Option<PathBuf>,
-    pub cursor: Option<PathBuf>,
-    pub grok: Option<PathBuf>,
-    pub opencode: Option<PathBuf>,
-}
-
 /// How to open a [`SessionStore`].
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct StoreOptions {
     pub db_path: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    pub roots: Option<ProviderRoots>,
     pub read_only: bool,
 }
 
 /// How to run a local ingest.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct SyncOptions {
-    pub force: bool,
-    pub sources: Option<Vec<Source>>,
-}
+pub struct SyncOptions {}
 
 /// A session the store can name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +97,7 @@ pub struct SyncReport {
 /// The single public entry point for embedding `ai-hist` from Rust.
 pub struct SessionStore {
     db_path: PathBuf,
+    home: Option<PathBuf>,
     read_only: bool,
 }
 
@@ -126,6 +112,7 @@ impl SessionStore {
         }
         Ok(Self {
             db_path,
+            home: opts.home,
             read_only: opts.read_only,
         })
     }
@@ -137,7 +124,10 @@ impl SessionStore {
                 message: "SessionStore is read-only".to_string(),
             });
         }
-        let _ran = sync_local_at(&self.db_path)?;
+        let _ran = match &self.home {
+            Some(home) => sync_local_at_with_home(&self.db_path, home)?,
+            None => sync_local_at(&self.db_path)?,
+        };
         Ok(SyncReport {
             changed: Vec::new(),
         })

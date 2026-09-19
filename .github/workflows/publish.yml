@@ -49,7 +49,7 @@ on:
         default: true
         type: boolean
       skip_core:
-        description: 'Re-run only plugins/probe for an already published core version; requires custom_version'
+        description: 'Re-run plugins/probe/crates.io for an already published core version; requires custom_version'
         required: false
         default: false
         type: boolean
@@ -808,7 +808,9 @@ jobs:
   publish-crate:
     name: Publish crate to crates.io
     needs: [version, publish]
-    if: ${{ !inputs.skip_core }}
+    # skip_core is the crates.io-only retry: npm already published this version
+    # and tagged it, so this job checks out that tag instead of the dispatch SHA.
+    if: ${{ !cancelled() && needs.version.result == 'success' && (inputs.skip_core || needs.publish.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -821,6 +823,8 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Stamp the crate at the release version
         run: |

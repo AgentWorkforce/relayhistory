@@ -64,7 +64,7 @@ pub use store::*;
 pub(crate) use store::*;
 
 pub use session_store::{
-    Error, ProviderRoots, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
+    Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
 pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
 

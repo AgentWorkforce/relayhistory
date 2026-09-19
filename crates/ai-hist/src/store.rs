@@ -424,6 +424,9 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_relationships",
     "schema_migrations",
     "discovery_skips",
+];
+#[cfg(feature = "delivery")]
+const REQUIRED_DELIVERY_TABLES: &[&str] = &[
     "delivery_state",
     "delivery_jobs",
     "delivery_journal",
@@ -434,6 +437,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "history_exports",
     "history_export_pages",
 ];
+#[cfg(not(feature = "delivery"))]
+const REQUIRED_DELIVERY_TABLES: &[&str] = &[];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
 /// session catalog (`ai-hist sessions list` / `discover`) reads every one of
@@ -545,8 +550,11 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
-    "delivery_v1",
 ];
+#[cfg(feature = "delivery")]
+const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
+#[cfg(not(feature = "delivery"))]
+const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &[];
 
 /// Whether this database already has everything [`init_db`] would add.
 ///
@@ -599,8 +607,11 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
 
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_TABLES {
-        if !table.exists([name])? {
+    for name in REQUIRED_TABLES
+        .iter()
+        .chain(REQUIRED_DELIVERY_TABLES.iter())
+    {
+        if !table.exists([*name])? {
             return Ok(false);
         }
     }
@@ -610,8 +621,11 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         }
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
-    for name in REQUIRED_SCHEMA_MIGRATIONS {
-        if !migration.exists([name])? {
+    for name in REQUIRED_SCHEMA_MIGRATIONS
+        .iter()
+        .chain(REQUIRED_DELIVERY_MIGRATIONS.iter())
+    {
+        if !migration.exists([*name])? {
             return Ok(false);
         }
     }

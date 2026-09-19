@@ -46,7 +46,9 @@ and `crates/ai-hist-napi/src/lib.rs`).
 4. `publish-crate` publishes the `ai-hist` crate to crates.io at that same
    version (OIDC trusted publishing, or `CARGO_REGISTRY_TOKEN`). If the version
    already exists, the job skips rather than failing. `dry_run` runs
-   `cargo publish --dry-run -p ai-hist` and publishes nothing.
+   `cargo publish --dry-run -p ai-hist` and publishes nothing. A crates.io-only
+   retry uses `skip_core` with the already-published `custom_version`; the job
+   checks out `sdk-ts-v<version>` and publishes the crate from that tag.
 5. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
    and creates the `sdk-ts-v<version>` tag and GitHub Release.

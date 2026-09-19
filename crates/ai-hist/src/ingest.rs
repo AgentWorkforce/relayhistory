@@ -21,7 +21,7 @@ use crate::diagnostics::*;
 use crate::discover;
 #[cfg(test)]
 use crate::history_search::{search_all, SearchRole};
-use crate::paths::{default_opencode_db_path, home_dir};
+use crate::paths::home_dir;
 use crate::remote;
 
 pub use crate::discover::{
@@ -81,8 +81,14 @@ pub fn sync_local() -> Result<()> {
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
+    sync_local_at_with_home(db_path, &home_dir())
+}
+
+/// Full local ingest using an explicit provider home instead of the process
+/// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
+pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive(db_path)
+    sync_exclusive_with_home(db_path, home)
 }
 
 /// Full ingestion for a selected scope into the default database.
@@ -377,8 +383,7 @@ impl SyncSourceReport {
     }
 }
 
-fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
-    let home = home_dir();
+fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -437,7 +442,7 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     {
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, &home)) {
+    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, home)) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -461,7 +466,7 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     }
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(default_opencode_db_path);
+        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
         if opencode.exists() {
             sync_note!("  [opencode] +{open_inserted} rows");
@@ -474,7 +479,7 @@ fn sync_basic(conn: &Connection, db_path: &Path) -> Result<()> {
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
-    let discovery_env = DiscoveryEnv::with_roots(conn, home, opencode);
+    let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode);
     discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
@@ -572,12 +577,16 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
 }
 
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
+    sync_exclusive_with_home(db_path, &home_dir())
+}
+
+fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
         return Ok(false);
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, home).map_err(|error| enrich_sync_error(db_path, error))?;
     Ok(true)
 }
 
@@ -620,7 +629,7 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
         return Ok((conn, true));
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &home_dir()).map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
