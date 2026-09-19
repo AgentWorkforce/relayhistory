@@ -442,14 +442,29 @@ export type UsageAccounting =
   /** A session summary spanning more than one accounting mode. */
   | 'mixed';
 
-/** Where a request's grouping key came from. */
-export type RequestKeySource = 'request-id' | 'message-id';
+/**
+ * Where a request's grouping key came from.
+ *
+ * `request-id` and `provider-message-id` are identities the provider gave the
+ * API call. `record-id` is not: it is the stored event's own id, and for a
+ * source that writes one call as several records a key built from it can be
+ * finer than one row per request.
+ */
+export type RequestKeySource = 'request-id' | 'provider-message-id' | 'record-id';
 
-/** Why a request that has stored usage still reports none. */
+/** Why a request's usage is absent, or narrower than it looks. */
 export type UsageDiagnostic =
   | 'ambiguous-usage-copies'
   | 'unnormalizable-usage'
-  | 'ambiguous-model';
+  | 'ambiguous-model'
+  /** No provider request identity was captured, so rows may be per record. */
+  | 'unresolved-request-identity'
+  /** Only some contributing requests reported the cache-write TTL split. */
+  | 'partial-cache-write-split'
+  /** Only some contributing requests carried a cost. */
+  | 'partial-reported-cost'
+  /** A count exceeded `Number.MAX_SAFE_INTEGER` and was not rounded to fit. */
+  | 'count-not-representable';
 
 /**
  * Usage in provider-neutral terms. `inputTokens` always excludes cache reads,
@@ -475,6 +490,10 @@ export interface NormalizedUsage {
   providerTotalTokens: number | null;
   reportedCostUsd: number | null;
   accounting: UsageAccounting;
+  // Every count above is a safe integer. A value JavaScript cannot represent
+  // exactly is refused at the native boundary — reported as
+  // `count-not-representable` with the usage absent — rather than rounded
+  // into something that looks like a measurement.
   hasInputTokens: boolean;
   hasOutputTokens: boolean;
   hasReasoningTokens: boolean;
@@ -540,8 +559,17 @@ export interface SessionUsageOptions {
 }
 
 /**
- * One session's usage rollup. `usage` is null when the session has no usage
- * evidence at all — not zeroed, because zero is a claim.
+ * One session's usage rollup.
+ *
+ * `usage` is null whenever the totals are not established — no request
+ * carried usage, every request's usage was rejected, the totals overflowed,
+ * or the requests are not known to be one per API call. It is never zeroed,
+ * because zero is a claim.
+ *
+ * The summary itself is still returned in all of those cases, with the
+ * request counts, models, timestamps and `diagnostics` intact: a session
+ * whose usage is unreadable and a session that does not exist are different
+ * answers, and only the second one is nothing.
  */
 export interface SessionUsage {
   contractVersion: number;
@@ -557,6 +585,7 @@ export interface SessionUsage {
   models: string[];
   firstTsMs: number | null;
   lastTsMs: number | null;
+  /** Everything that kept a request out of the totals, or narrows them. */
   diagnostics: UsageDiagnostic[];
   /** The totals exceeded what can be represented and must not be used. */
   overflowed: boolean;

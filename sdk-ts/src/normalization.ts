@@ -289,6 +289,8 @@ const USAGE_ACCOUNTING: readonly string[] = [
 ];
 const USAGE_DIAGNOSTICS: readonly string[] = [
   'ambiguous-usage-copies', 'unnormalizable-usage', 'ambiguous-model',
+  'unresolved-request-identity', 'partial-cache-write-split',
+  'partial-reported-cost', 'count-not-representable',
 ];
 
 export function assertUsageContract(value: number): void {
@@ -314,7 +316,9 @@ export function usageAccounting(value: unknown): UsageAccounting {
 }
 
 export function requestKeySource(value: unknown): RequestKeySource {
-  if (value === 'request-id' || value === 'message-id') return value;
+  if (value === 'request-id' || value === 'provider-message-id' || value === 'record-id') {
+    return value;
+  }
   throw new NativeContractMismatchError(
     `ai-hist-native returned an invalid request key source: ${JSON.stringify(value)}. Reinstall matching ai-hist packages.`,
     'NATIVE_CONTRACT_MISMATCH',

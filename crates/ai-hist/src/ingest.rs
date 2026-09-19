@@ -2538,6 +2538,7 @@ fn insert_codex_event(
         Some(text),
         model,
         token_json,
+        RequestIdentity::none(),
         uid,
     )
 }
@@ -3071,6 +3072,9 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        // Read once per record: every row this record produces belongs to the
+        // same provider request, whatever `message_uuid` the block gets.
+        let identity = RequestIdentity::from_claude_record(obj, message);
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
@@ -3129,6 +3133,7 @@ fn ingest_claude_transcript_as(
                     Some(s),
                     model,
                     token_json.as_deref(),
+                    identity,
                     &format!("{message_uuid}:0"),
                 )?;
             }
@@ -3164,6 +3169,7 @@ fn ingest_claude_transcript_as(
                                 Some(text),
                                 model,
                                 token_json.as_deref(),
+                                identity,
                                 &event_uid,
                             )?;
                         }
@@ -3190,6 +3196,7 @@ fn ingest_claude_transcript_as(
                             text,
                             model,
                             token_json.as_deref(),
+                            identity,
                             &event_uid,
                         )?;
                     }
@@ -3215,6 +3222,7 @@ fn ingest_claude_transcript_as(
                         Some(&event_text),
                         model,
                         token_json.as_deref(),
+                        identity,
                         &event_uid,
                     )?;
                     if !tool_use_id.is_empty() && !name.is_empty() {
@@ -3273,6 +3281,7 @@ fn ingest_claude_transcript_as(
                         text.as_deref(),
                         model,
                         token_json.as_deref(),
+                        identity,
                         &event_uid,
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
@@ -3303,6 +3312,49 @@ fn ingest_claude_transcript_as(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The provider's own identities for the request a record belongs to, read
+/// once per record and stored verbatim.
+///
+/// These are *not* the `message_id` column, which holds the record's own
+/// `uuid`. One Claude request is written as several records with different
+/// uuids and the same `requestId`, so only these establish which rows belong
+/// to one API call.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestIdentity<'a> {
+    /// Claude's `requestId` (older transcripts spell it `request_id`).
+    pub request_id: Option<&'a str>,
+    /// The provider's own message id — Claude's `message.id`.
+    pub provider_message_id: Option<&'a str>,
+}
+
+impl<'a> RequestIdentity<'a> {
+    /// What a source that records neither supplies. Its stored records are
+    /// already one per request.
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// Read both from one Claude transcript record. An empty string is not an
+    /// identity and is stored as absent, so the grouping key never becomes
+    /// `""` for every record in a session.
+    fn from_claude_record(
+        object: &'a Map<String, Value>,
+        message: Option<&'a Map<String, Value>>,
+    ) -> Self {
+        let text = |value: Option<&'a Value>| {
+            value
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            request_id: text(object.get("requestId")).or_else(|| text(object.get("request_id"))),
+            provider_message_id: text(message.and_then(|message| message.get("id"))),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
     source: &str,
@@ -3318,17 +3370,19 @@ fn insert_session_event(
     text: Option<&str>,
     model: Option<&str>,
     token_json: Option<&str>,
+    identity: RequestIdentity<'_>,
     event_uid: &str,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, request_id, provider_message_id, event_uid) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, request_id=excluded.request_id, \
+         provider_message_id=excluded.provider_message_id",
         params![
             source,
             session_id,
@@ -3343,6 +3397,8 @@ fn insert_session_event(
             text,
             model,
             token_json,
+            identity.request_id,
+            identity.provider_message_id,
             event_uid,
         ],
     )?;
@@ -5134,6 +5190,7 @@ mod tests {
             Some("hello"),
             None,
             None,
+            RequestIdentity::none(),
             "event-1",
         )
         .unwrap();
@@ -7330,6 +7387,7 @@ mod tests {
             Some("Done."),
             None,
             None,
+            RequestIdentity::none(),
             "3:agent_message",
         )
         .unwrap();

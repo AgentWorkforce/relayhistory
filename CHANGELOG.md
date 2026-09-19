@@ -56,6 +56,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   records which counters the provider actually wrote so a reported zero stays
   distinguishable from silence.
 
+- Capture the provider's own request identity on `session_events`:
+  `request_id` (Claude's `requestId`) and `provider_message_id`
+  (`message.id`), both stored verbatim. The pre-existing `message_id` column
+  holds each JSONL record's `uuid`, and one Claude request is written as
+  several records, so only these establish which rows belong to one API call.
+  Hydration parser version 2 -> 3 so existing sessions backfill them; until a
+  session is re-parsed its requests carry an `unresolved-request-identity`
+  diagnostic and its rollup reports no totals rather than one figure per
+  content block.
+
 - Add per-request usage records and a session rollup. The `session_requests`
   view is one row per model request — Claude's per-content-block copies of
   `message.usage` collapse into one — read with `session_requests_page` /

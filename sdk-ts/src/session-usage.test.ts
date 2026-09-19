@@ -28,8 +28,10 @@ const CLAUDE_USAGE = {
 
 const CLAUDE_TRANSCRIPT = [
   { type: 'user', uuid: 'u1', sessionId: CLAUDE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T10:00:00.000Z', message: { role: 'user', content: 'check the repo' } },
+  // Three content blocks of one API call, each a copy of the same usage. The
+  // `requestId` is what keeps them one request rather than three.
   {
-    type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId: CLAUDE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T10:00:01.000Z',
+    type: 'assistant', uuid: 'a1', parentUuid: 'u1', requestId: 'req_1', sessionId: CLAUDE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T10:00:01.000Z',
     message: {
       role: 'assistant', model: 'claude-test', id: 'msg_1', usage: CLAUDE_USAGE,
       content: [
@@ -41,8 +43,22 @@ const CLAUDE_TRANSCRIPT = [
   },
   // Input reported, output not: missing evidence, not a zero-output turn.
   {
-    type: 'assistant', uuid: 'a2', parentUuid: 'a1', sessionId: CLAUDE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T10:00:02.000Z',
+    type: 'assistant', uuid: 'a2', parentUuid: 'a1', requestId: 'req_2', sessionId: CLAUDE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T10:00:02.000Z',
     message: { role: 'assistant', model: 'claude-test', id: 'msg_2', usage: { input_tokens: 10 }, content: [{ type: 'text', text: 'Done.' }] },
+  },
+];
+
+const HUGE_SESSION = 'usage-huge-1';
+
+/**
+ * A counter core accepts (it is a non-negative integer) that JavaScript
+ * cannot hold exactly: `Number.MAX_SAFE_INTEGER + 1`.
+ */
+const HUGE_TRANSCRIPT = [
+  { type: 'user', uuid: 'hu1', sessionId: HUGE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T12:00:00.000Z', message: { role: 'user', content: 'hello' } },
+  {
+    type: 'assistant', uuid: 'ha1', parentUuid: 'hu1', requestId: 'req_huge', sessionId: HUGE_SESSION, cwd: '/work/app', timestamp: '2026-08-30T12:00:01.000Z',
+    message: { role: 'assistant', model: 'claude-test', id: 'msg_huge', usage: { input_tokens: 9007199254740992 }, content: [{ type: 'text', text: 'ok' }] },
   },
 ];
 
@@ -61,6 +77,7 @@ async function seededDatabase(): Promise<{ dbPath: string; cleanup: () => Promis
   await mkdir(claude, { recursive: true });
   await mkdir(codex, { recursive: true });
   await writeFile(join(claude, `${CLAUDE_SESSION}.jsonl`), `${CLAUDE_TRANSCRIPT.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  await writeFile(join(claude, `${HUGE_SESSION}.jsonl`), `${HUGE_TRANSCRIPT.map((line) => JSON.stringify(line)).join('\n')}\n`);
   await writeFile(join(codex, `rollout-${CODEX_SESSION}.jsonl`), `${CODEX_ROLLOUT.map((line) => JSON.stringify(line)).join('\n')}\n`);
   const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
   process.env.HOME = home;
@@ -82,9 +99,11 @@ test('a request page collapses one message into one request with normalized usag
     assert.equal(page.contractVersion, SESSION_USAGE_CONTRACT_VERSION);
     assert.equal(page.source, 'claude');
     assert.equal(page.sessionId, CLAUDE_SESSION);
-    const multiBlock = page.requests.find((request) => request.requestKey === 'a1') as SessionRequest;
+    const multiBlock = page.requests.find((request) => request.requestKey === 'req_1') as SessionRequest;
     assert.ok(multiBlock, 'the three-block message is one request');
-    assert.equal(multiBlock.requestKeySource, 'message-id');
+    assert.equal(multiBlock.requestKeySource, 'request-id');
+    // One record carrying three content blocks: one message id, three events.
+    assert.equal(multiBlock.messageIds.length, 1);
     assert.equal(multiBlock.eventCount, 3);
     assert.equal(multiBlock.hasThinking, true);
     assert.deepEqual(multiBlock.toolUseIds, ['toolu_1']);
@@ -117,7 +136,7 @@ test('an absent output count reads as zero with the coverage flag that says so',
   const { dbPath, cleanup } = await seededDatabase();
   try {
     const requests = await getSessionRequests('claude', CLAUDE_SESSION, { dbPath });
-    const partial = requests.find((request) => request.requestKey === 'a2') as SessionRequest;
+    const partial = requests.find((request) => request.requestKey === 'req_2') as SessionRequest;
     assert.ok(partial);
     const usage = partial.usage;
     assert.ok(usage);
@@ -176,6 +195,50 @@ test('a session with no usage evidence reports null rather than an assumed zero'
   }
 });
 
+test('a count JavaScript cannot represent is refused rather than rounded', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const page = await getSessionRequestsPage('claude', HUGE_SESSION, { dbPath });
+    assert.equal(page.requests.length, 1);
+    const request = page.requests[0] as SessionRequest;
+    // Core normalized it — it is a valid non-negative integer — but it cannot
+    // cross the boundary intact, so no number is handed over at all.
+    assert.equal(request.usage, null);
+    assert.equal(request.usageError, 'USAGE_COUNT_NOT_REPRESENTABLE');
+    assert.ok(request.diagnostics.includes('count-not-representable'));
+
+    const summary = await getSessionUsage('claude', HUGE_SESSION, { dbPath });
+    assert.equal(summary.usage, null);
+    assert.equal(summary.totalRequestCount, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('a session whose usage is unreadable still reports its requests and why', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    // The huge-count session is the readable-rows / unusable-usage shape: the
+    // request exists and is counted, the totals are withheld, and the reason
+    // travels with them. Corrupt usage must not look like no session.
+    const summary = await getSessionUsage('claude', HUGE_SESSION, { dbPath });
+    assert.equal(summary.usage, null);
+    assert.equal(summary.totalRequestCount, 1);
+    assert.deepEqual(summary.models, ['claude-test']);
+    assert.ok(summary.diagnostics.length > 0);
+    assert.notEqual(summary.firstTsMs, null);
+
+    // And a session that was never recorded is still the empty answer.
+    const absent = await getSessionUsage('claude', 'no-such-session', { dbPath });
+    assert.equal(absent.usage, null);
+    assert.equal(absent.totalRequestCount, 0);
+    assert.deepEqual(absent.diagnostics, []);
+    assert.equal(absent.firstTsMs, null);
+  } finally {
+    await cleanup();
+  }
+});
+
 test('the request iterator walks every page and both halves of the identity are required', async () => {
   const { dbPath, cleanup } = await seededDatabase();
   try {
@@ -183,7 +246,7 @@ test('the request iterator walks every page and both halves of the identity are 
     for await (const request of sessionRequests('claude', CLAUDE_SESSION, { dbPath, limit: 1 })) {
       walked.push(request.requestKey);
     }
-    assert.deepEqual(walked.sort(), ['a1', 'a2']);
+    assert.deepEqual(walked.sort(), ['req_1', 'req_2']);
 
     for (const [source, sessionId] of [['claude', ''], ['', CLAUDE_SESSION], ['claude', ' padded ']] as const) {
       await assert.rejects(

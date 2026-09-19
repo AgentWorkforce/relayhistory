@@ -165,7 +165,10 @@ export interface NativeNormalizedUsage {
   cacheWrite1hTokens?: number
   providerTotalTokens?: number
   reportedCostUsd?: number
-  /** `per-request`, `per-message`, `cumulative-delta` or `context-proxy`. */
+  /**
+   * `per-request`, `per-message`, `cumulative-delta`, `context-proxy`, or
+   * `mixed` on a summary spanning more than one.
+   */
   accounting: string
   hasInputTokens: boolean
   hasOutputTokens: boolean
@@ -178,7 +181,7 @@ export interface NativeSessionRequest {
   source: string
   sessionId: string
   requestKey: string
-  /** `request-id` or `message-id`. */
+  /** `request-id`, `provider-message-id` or `record-id`. */
   requestKeySource: string
   messageIds: Array<string>
   model?: string

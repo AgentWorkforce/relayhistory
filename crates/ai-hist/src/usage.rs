@@ -184,6 +184,14 @@ impl NormalizedUsage {
     /// Overflow returns `None` rather than saturating for the same reason
     /// normalization errors rather than clamps: a saturated total is a
     /// plausible-looking number that no longer means anything.
+    ///
+    /// **An optional field is reported only when every contributor reported
+    /// it.** Folding an unreported `None` in as a zero is how a sum of one
+    /// split cache-write record and one unsplit one ends up describing the
+    /// whole session as split — the unsplit tokens vanish from the TTL
+    /// buckets that are priced separately, and the result looks complete. The
+    /// one exception is the cache-write split of a record that wrote no cache
+    /// at all: its split is not unreported, it is known to be zero.
     pub fn checked_add(&self, other: &Self) -> Option<Self> {
         Some(Self {
             input_tokens: self.input_tokens.checked_add(other.input_tokens)?,
@@ -195,24 +203,25 @@ impl NormalizedUsage {
             cache_write_tokens: self
                 .cache_write_tokens
                 .checked_add(other.cache_write_tokens)?,
-            cache_write_5m_tokens: checked_add_optional(
-                self.cache_write_5m_tokens,
-                other.cache_write_5m_tokens,
+            cache_write_5m_tokens: checked_add_split(
+                (self.cache_write_5m_tokens, self.cache_write_tokens),
+                (other.cache_write_5m_tokens, other.cache_write_tokens),
             )?,
-            cache_write_1h_tokens: checked_add_optional(
-                self.cache_write_1h_tokens,
-                other.cache_write_1h_tokens,
+            cache_write_1h_tokens: checked_add_split(
+                (self.cache_write_1h_tokens, self.cache_write_tokens),
+                (other.cache_write_1h_tokens, other.cache_write_tokens),
             )?,
             provider_total_tokens: checked_add_optional(
                 self.provider_total_tokens,
                 other.provider_total_tokens,
             )?,
+            // A cost only some requests reported is not the pair's cost.
             reported_cost_usd: match (self.reported_cost_usd, other.reported_cost_usd) {
-                (None, None) => None,
-                (a, b) => {
-                    let sum = a.unwrap_or(0.0) + b.unwrap_or(0.0);
+                (Some(a), Some(b)) => {
+                    let sum = a + b;
                     Some(sum.is_finite().then_some(sum)?)
                 }
+                _ => None,
             },
             accounting: self.accounting,
             coverage: self.coverage.merged(other.coverage),
@@ -220,12 +229,30 @@ impl NormalizedUsage {
     }
 }
 
-/// `None + None` stays `None`; anything reported makes the sum reported.
+/// Sum two optional counters, reporting one only when both sides did.
+///
+/// The outer `Option` is the overflow signal; the inner one is "was this
+/// reported at all". A partial sum would be a number with no defined meaning
+/// presented as a total.
 fn checked_add_optional(a: Option<u64>, b: Option<u64>) -> Option<Option<u64>> {
     match (a, b) {
+        (Some(a), Some(b)) => a.checked_add(b).map(Some),
         (None, None) => Some(None),
-        (a, b) => a.unwrap_or(0).checked_add(b.unwrap_or(0)).map(Some),
+        _ => Some(None),
     }
+}
+
+/// Sum one TTL bucket of the cache-write split.
+///
+/// A record that wrote no cache tokens has a known split — zero in every
+/// bucket — so it does not make the pair's split unknown. Any other
+/// unreported split does.
+fn checked_add_split(a: (Option<u64>, u64), b: (Option<u64>, u64)) -> Option<Option<u64>> {
+    checked_add_optional(known_split(a), known_split(b))
+}
+
+fn known_split((bucket, total): (Option<u64>, u64)) -> Option<u64> {
+    bucket.or((total == 0).then_some(0))
 }
 
 /// Why a `token_json` blob could not be normalized.
@@ -310,6 +337,18 @@ impl std::error::Error for UsageError {}
 /// Sources this build can normalize. Anything else is an explicit
 /// [`UsageError::UnknownSource`] rather than a silent zero.
 pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex"];
+
+/// Whether one model request can be spread across several stored records for
+/// this source.
+///
+/// Claude writes one JSONL record per content block of a message, each with
+/// its own record uuid, so grouping on the record identity alone splits one
+/// API call into several. Codex attaches one differenced delta to one event,
+/// so its records already are its requests. This is what decides whether a
+/// request whose grouping key is only a record id is trustworthy.
+pub fn source_splits_requests_across_records(source: &str) -> bool {
+    matches!(source, "claude")
+}
 
 /// The accounting mode a source's records use, or `None` when this build has
 /// no rule for it.
@@ -852,6 +891,84 @@ mod tests {
         assert_eq!(sum.output_tokens, 2);
         assert_eq!(sum.reasoning_tokens, None);
         assert!(sum.coverage.has_input_tokens && sum.coverage.has_output_tokens);
+    }
+
+    /// The fold that made an unsplit record vanish into a split total.
+    #[test]
+    fn an_unsplit_cache_write_makes_the_pair_split_unknown() {
+        let split = claude(json!({
+            "cache_creation_input_tokens": 100,
+            "cache_creation": { "ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 0 },
+        }))
+        .unwrap()
+        .unwrap();
+        let unsplit = claude(json!({ "cache_creation_input_tokens": 50 }))
+            .unwrap()
+            .unwrap();
+        let sum = split.checked_add(&unsplit).unwrap();
+        // The total still carries every token...
+        assert_eq!(sum.cache_write_tokens, 150);
+        // ...but claiming 100 in the 5m bucket would silently drop the other
+        // 50 from the bucket that is priced.
+        assert_eq!(sum.cache_write_5m_tokens, None);
+        assert_eq!(sum.cache_write_1h_tokens, None);
+    }
+
+    /// A record that wrote no cache at all has a known split, not an absent
+    /// one, so it must not erase a real one.
+    #[test]
+    fn a_record_with_no_cache_writes_keeps_the_pair_split_known() {
+        let split = claude(json!({
+            "cache_creation_input_tokens": 100,
+            "cache_creation": { "ephemeral_5m_input_tokens": 60, "ephemeral_1h_input_tokens": 40 },
+        }))
+        .unwrap()
+        .unwrap();
+        let none_written = claude(json!({ "input_tokens": 7, "cache_creation_input_tokens": 0 }))
+            .unwrap()
+            .unwrap();
+        let sum = split.checked_add(&none_written).unwrap();
+        assert_eq!(sum.cache_write_5m_tokens, Some(60));
+        assert_eq!(sum.cache_write_1h_tokens, Some(40));
+        assert_eq!(sum.cache_write_tokens, 100);
+    }
+
+    #[test]
+    fn a_cost_only_one_side_reported_is_not_the_pair_cost() {
+        let priced = claude(json!({ "input_tokens": 1, "cost_usd": 0.25 }))
+            .unwrap()
+            .unwrap();
+        let unpriced = claude(json!({ "input_tokens": 1 })).unwrap().unwrap();
+        assert_eq!(
+            priced.checked_add(&unpriced).unwrap().reported_cost_usd,
+            None
+        );
+        assert_eq!(
+            priced.checked_add(&priced).unwrap().reported_cost_usd,
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn a_provider_total_only_one_side_reported_is_not_the_pair_total() {
+        let with_total = codex(json!({ "input_tokens": 5, "total_tokens": 5 }))
+            .unwrap()
+            .unwrap();
+        let without = codex(json!({ "input_tokens": 5 })).unwrap().unwrap();
+        assert_eq!(
+            with_total
+                .checked_add(&without)
+                .unwrap()
+                .provider_total_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn only_claude_spreads_one_request_over_several_records() {
+        assert!(source_splits_requests_across_records("claude"));
+        assert!(!source_splits_requests_across_records("codex"));
+        assert!(!source_splits_requests_across_records("cursor"));
     }
 
     #[test]

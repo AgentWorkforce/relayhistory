@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS session_events (
     text TEXT,
     model TEXT,
     token_json TEXT,
+    request_id TEXT,
+    provider_message_id TEXT,
     event_uid TEXT NOT NULL,
     UNIQUE(source, session_id, event_uid)
 );
@@ -455,6 +457,20 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "source_stamp",
     "discovery_state",
 ];
+/// Columns [`init_db`] adds to `session_events` after the original DDL.
+///
+/// These are the provider's own identities for the request a row belongs to,
+/// stored verbatim: `request_id` is Claude's `requestId` and
+/// `provider_message_id` is `message.id`. The pre-existing `message_id`
+/// column is *not* either of these — it holds the JSONL record's `uuid`, and
+/// one Claude request spans several records with different uuids, which is
+/// why grouping usage on it counts one API call once per content block.
+///
+/// `request_id` is deliberately the same name, type and verbatim semantics as
+/// the column the raw-facts change (#190 / #164) adds, so whichever of the two
+/// merges second drops its copy rather than reconciling two spellings of one
+/// fact. `provider_message_id` is only here.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["request_id", "provider_message_id"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
@@ -659,6 +675,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSIONS_COLUMNS
         .iter()
         .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|needed| event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -890,6 +916,11 @@ END;
     migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    // Added before the view below, which groups on them. Existing rows keep
+    // NULL until their transcript is re-parsed; until then the request key
+    // falls back to the record id and the rollup says so rather than
+    // presenting a per-record total as a per-request one.
+    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an

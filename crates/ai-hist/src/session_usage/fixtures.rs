@@ -27,29 +27,6 @@ fn claude_store(relative: &str) -> Connection {
     conn
 }
 
-/// The same transcript on a store that has the raw-facts `request_id` column.
-///
-/// The column and its parser live in the sibling raw-facts change; this only
-/// needs a store shaped like one that has it, so the grouping this module
-/// owns can be proven now rather than after that lands. `init_db` is called
-/// again after the `ALTER` because the view is derived from the column set
-/// and has to be rebuilt when it changes — which is the behaviour under test
-/// as much as the grouping itself.
-fn claude_store_with_request_ids(relative: &str, request_id: &str) -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    init_db(&conn).unwrap();
-    conn.execute_batch("ALTER TABLE session_events ADD COLUMN request_id TEXT")
-        .unwrap();
-    init_db(&conn).unwrap();
-    ingest_claude_transcript(&conn, &fixture(relative)).unwrap();
-    conn.execute(
-        "UPDATE session_events SET request_id = ?1 WHERE role = 'assistant'",
-        [request_id],
-    )
-    .unwrap();
-    conn
-}
-
 fn codex_store(relative: &str) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     init_db(&conn).unwrap();
@@ -77,7 +54,7 @@ fn assistant_rows_with_usage(conn: &Connection) -> i64 {
 /// it in the 1h bucket.
 #[test]
 fn a_multi_block_turn_is_one_request_per_request_id() {
-    let conn = claude_store_with_request_ids("claude/multi-block-turn.jsonl", "req_1");
+    let conn = claude_store("claude/multi-block-turn.jsonl");
     // The fixture's opening `thinking` block is empty, so the parser stores
     // no row for it; the remaining three records each carry a full copy of
     // the one request's usage.
@@ -86,6 +63,14 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
         3,
         "the fixture really does copy one request's usage onto every record"
     );
+    let raw_row_sum: i64 = conn
+        .query_row(
+            "SELECT SUM(json_extract(token_json, '$.output_tokens')) FROM session_events",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_row_sum, 129, "summing rows would triple the request");
 
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
     assert_eq!(page.requests.len(), 1);
@@ -105,41 +90,93 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
         .unwrap()
         .unwrap();
     assert_eq!(summary.request_count, 1);
-    assert_eq!(summary.input_tokens, 3);
-    assert_eq!(summary.output_tokens, 43);
-    assert_eq!(summary.cache_read_tokens, 11496);
-    assert_eq!(summary.cache_write_tokens, 4773);
-    assert_eq!(summary.cache_write_5m_tokens, Some(0));
-    assert_eq!(summary.cache_write_1h_tokens, Some(4773));
+    let usage = summary.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, 3);
+    assert_eq!(usage.output_tokens, 43);
+    assert_eq!(usage.cache_read_tokens, 11496);
+    assert_eq!(usage.cache_write_tokens, 4773);
+    assert_eq!(usage.cache_write_5m_tokens, Some(0));
+    assert_eq!(usage.cache_write_1h_tokens, Some(4773));
     assert_eq!(summary.accounting, vec![UsageAccounting::PerMessage]);
-    assert!(summary.coverage.is_complete());
+    assert!(usage.coverage.is_complete());
     assert!(summary.diagnostics.is_empty());
     assert!(!summary.overflowed);
 }
 
-/// Characterization of the store as it is *before* the raw-facts column
-/// lands. `session_events.message_id` holds Claude's per-record `uuid`, not
-/// `message.id`, so a turn split across records has no shared key to group
-/// on and each record reads as its own request — an over-count of one API
-/// call by the number of records it was split across.
-///
-/// This is recorded rather than hidden because it is the live defect the
-/// grouping above removes, and because a reader who sees several requests on
-/// a pre-migration store should find the reason here instead of concluding
-/// the view is broken.
+/// A transcript old enough to carry no `requestId` still groups correctly on
+/// the provider's `message.id`, which is the same for every record of one
+/// request.
 #[test]
-fn without_a_request_id_a_multi_block_turn_reads_as_one_request_per_record() {
-    let conn = claude_store("claude/multi-block-turn.jsonl");
+fn a_turn_without_a_request_id_groups_on_the_provider_message_id() {
+    let conn = claude_store("claude/multi-block-turn-no-request-id.jsonl");
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
-    assert_eq!(page.requests.len(), 3);
-    assert!(page
-        .requests
-        .iter()
-        .all(|request| request.request_key_source == RequestKeySource::MessageId));
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].request_key, "msg_multi_1");
+    assert_eq!(
+        page.requests[0].request_key_source,
+        RequestKeySource::ProviderMessageId
+    );
+    assert!(page.requests[0].diagnostics.is_empty());
     let summary = session_usage_summary(&conn, "claude", CLAUDE_SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(summary.output_tokens, 43 * 3);
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 43);
+}
+
+/// A store written before request identities were captured: the rows are
+/// still there, keyed only on the record id, and the rollup says so instead
+/// of adding them into a total that would be one per content block.
+///
+/// This is what stops an upgraded database from answering with a multiplied
+/// figure between the migration and the re-parse that fills the columns in.
+#[test]
+fn records_with_no_captured_identity_are_flagged_and_not_summed() {
+    let conn = claude_store("claude/multi-block-turn.jsonl");
+    // Exactly what an existing row looks like after the column migration but
+    // before its transcript is re-parsed.
+    conn.execute(
+        "UPDATE session_events SET request_id = NULL, provider_message_id = NULL",
+        [],
+    )
+    .unwrap();
+
+    let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
+    assert_eq!(page.requests.len(), 3, "one row per record, as stored");
+    for request in &page.requests {
+        assert_eq!(request.request_key_source, RequestKeySource::RecordId);
+        assert_eq!(
+            request.diagnostics,
+            vec![UsageDiagnostic::UnresolvedRequestIdentity]
+        );
+        // The row still reports what its own record said.
+        assert_eq!(request.usage.as_ref().unwrap().output_tokens, 43);
+    }
+
+    let summary = session_usage_summary(&conn, "claude", CLAUDE_SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_request_count, 3);
+    assert_eq!(
+        summary.usage, None,
+        "3 x 43 output tokens is not this session's total"
+    );
+    assert!(summary
+        .diagnostics
+        .contains(&UsageDiagnostic::UnresolvedRequestIdentity));
+    assert_eq!(summary.models, vec!["claude-opus-4-7".to_string()]);
+}
+
+/// Codex attaches one delta to one event, so a key built from the record id
+/// is already one per request and must not be flagged.
+#[test]
+fn codex_record_keys_are_request_keys_and_are_not_flagged() {
+    let conn = codex_store("codex/compaction.jsonl");
+    let page = session_requests_page(&conn, "codex", "sess_codex_compact", 50, None).unwrap();
+    assert_eq!(page.requests.len(), 2);
+    for request in &page.requests {
+        assert_eq!(request.request_key_source, RequestKeySource::RecordId);
+        assert!(request.diagnostics.is_empty());
+    }
 }
 
 /// A transcript that reports input but no output is missing evidence, not a
@@ -151,11 +188,12 @@ fn missing_output_tokens_reports_zero_with_a_coverage_note() {
         .unwrap()
         .unwrap();
     assert_eq!(summary.request_count, 1);
-    assert_eq!(summary.input_tokens, 10);
-    assert_eq!(summary.output_tokens, 0);
-    assert!(summary.coverage.has_input_tokens);
-    assert!(!summary.coverage.has_output_tokens);
-    assert!(!summary.coverage.is_complete());
+    let usage = summary.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, 10);
+    assert_eq!(usage.output_tokens, 0);
+    assert!(usage.coverage.has_input_tokens);
+    assert!(!usage.coverage.has_output_tokens);
+    assert!(!usage.coverage.is_complete());
 }
 
 /// Codex reports cumulative snapshots; the parser differences them into
@@ -169,14 +207,15 @@ fn codex_compaction_deltas_sum_to_the_final_cumulative_total() {
         .unwrap();
     assert_eq!(summary.request_count, 2);
     assert_eq!(summary.accounting, vec![UsageAccounting::CumulativeDelta]);
+    let usage = summary.usage.as_ref().unwrap();
     // Final snapshot: input 6500 (of which 1500 cached), output 450,
     // reasoning 90, total 6950. Normalized input excludes cache reads, so the
     // two have to be added back together to meet the provider's figure.
-    assert_eq!(summary.cache_read_tokens, 1500);
-    assert_eq!(summary.input_tokens + summary.cache_read_tokens, 6500);
-    assert_eq!(summary.output_tokens, 450);
-    assert_eq!(summary.reasoning_tokens, Some(90));
-    assert_eq!(summary.provider_total_tokens, Some(6950));
+    assert_eq!(usage.cache_read_tokens, 1500);
+    assert_eq!(usage.input_tokens + usage.cache_read_tokens, 6500);
+    assert_eq!(usage.output_tokens, 450);
+    assert_eq!(usage.reasoning_tokens, Some(90));
+    assert_eq!(usage.provider_total_tokens, Some(6950));
     assert!(summary.diagnostics.is_empty());
 }
 
@@ -209,7 +248,7 @@ fn a_regressed_codex_counter_is_a_diagnostic_not_a_negative_delta() {
         .unwrap();
     assert_eq!(summary.request_count, 1);
     assert_eq!(summary.total_request_count, 2);
-    assert_eq!(summary.input_tokens, 2000);
+    assert_eq!(summary.usage.as_ref().unwrap().input_tokens, 2000);
     assert_eq!(
         summary.diagnostics,
         vec![UsageDiagnostic::UnnormalizableUsage]

@@ -12,8 +12,8 @@ fn seeded() -> Connection {
         for index in 0..4 {
             conn.execute(
                 "INSERT INTO session_events \
-                 (source, session_id, message_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-                 VALUES ('claude', ?1, ?2, ?3, 'assistant', 'text', 'x', 'm', \
+                 (source, session_id, message_id, provider_message_id, ts_ms, role, kind, text, model, token_json, event_uid) \
+                 VALUES ('claude', ?1, ?2, ?2, ?3, 'assistant', 'text', 'x', 'm', \
                          '{\"input_tokens\":1,\"output_tokens\":2}', ?4)",
                 rusqlite::params![
                     session,
@@ -71,5 +71,5 @@ fn the_reads_still_answer_only_the_session_they_were_asked_for() {
         .unwrap()
         .unwrap();
     assert_eq!(summary.request_count, 4);
-    assert_eq!(summary.output_tokens, 8);
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 8);
 }

@@ -440,7 +440,8 @@ pub struct NativeNormalizedUsage {
     pub cache_write1h_tokens: Option<i64>,
     pub provider_total_tokens: Option<i64>,
     pub reported_cost_usd: Option<f64>,
-    /// `per-request`, `per-message`, `cumulative-delta` or `context-proxy`.
+    /// `per-request`, `per-message`, `cumulative-delta`, `context-proxy`, or
+    /// `mixed` on a summary spanning more than one.
     pub accounting: String,
     pub has_input_tokens: bool,
     pub has_output_tokens: bool,
@@ -449,33 +450,58 @@ pub struct NativeNormalizedUsage {
     pub has_cache_write_tokens: bool,
 }
 
-/// Token counts cross the boundary as `i64` because JavaScript has no
-/// unsigned integer. A count that does not fit is saturated rather than
-/// wrapped — but no provider reports 9.2 quintillion tokens, and the
-/// normalizer has already refused anything that is not a real counter.
-fn js_count(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+/// The largest integer a JavaScript number represents exactly
+/// (`Number.MAX_SAFE_INTEGER`).
+///
+/// This, not `i64::MAX`, is the real ceiling of the boundary: above it a
+/// `number` silently stops being the value it was given, so a count that does
+/// not fit cannot be handed over at all.
+pub(crate) const MAX_JS_SAFE_COUNT: u64 = 9_007_199_254_740_991;
+
+/// Stable code for a count that JavaScript cannot represent exactly.
+const COUNT_NOT_REPRESENTABLE: &str = "USAGE_COUNT_NOT_REPRESENTABLE";
+const COUNT_NOT_REPRESENTABLE_DIAGNOSTIC: &str = "count-not-representable";
+
+/// A token count as a JavaScript-safe integer, or `None` when it is not one.
+///
+/// Core accepts every counter up to `u64::MAX`; this boundary accepts only
+/// what survives the crossing. Saturating to `i64::MAX` would hand JavaScript
+/// a plausible number that is neither the stored value nor representable —
+/// the exact shape of failure this crate refuses everywhere else.
+pub(crate) fn js_count(value: u64) -> Option<i64> {
+    (value <= MAX_JS_SAFE_COUNT).then_some(value as i64)
 }
 
-impl From<CoreNormalizedUsage> for NativeNormalizedUsage {
-    fn from(usage: CoreNormalizedUsage) -> Self {
-        Self {
-            input_tokens: js_count(usage.input_tokens),
-            output_tokens: js_count(usage.output_tokens),
-            reasoning_tokens: usage.reasoning_tokens.map(js_count),
-            cache_read_tokens: js_count(usage.cache_read_tokens),
-            cache_write_tokens: js_count(usage.cache_write_tokens),
-            cache_write5m_tokens: usage.cache_write_5m_tokens.map(js_count),
-            cache_write1h_tokens: usage.cache_write_1h_tokens.map(js_count),
-            provider_total_tokens: usage.provider_total_tokens.map(js_count),
+/// `None` stays `None`; a reported count that is not representable makes the
+/// whole record unrepresentable rather than quietly dropping one field.
+fn js_count_optional(value: Option<u64>) -> Option<Option<i64>> {
+    match value {
+        None => Some(None),
+        Some(value) => js_count(value).map(Some),
+    }
+}
+
+impl NativeNormalizedUsage {
+    /// Convert a normalized record, or `None` when any count it carries
+    /// cannot cross the boundary intact.
+    pub(crate) fn from_core(usage: &CoreNormalizedUsage, accounting: String) -> Option<Self> {
+        Some(Self {
+            input_tokens: js_count(usage.input_tokens)?,
+            output_tokens: js_count(usage.output_tokens)?,
+            reasoning_tokens: js_count_optional(usage.reasoning_tokens)?,
+            cache_read_tokens: js_count(usage.cache_read_tokens)?,
+            cache_write_tokens: js_count(usage.cache_write_tokens)?,
+            cache_write5m_tokens: js_count_optional(usage.cache_write_5m_tokens)?,
+            cache_write1h_tokens: js_count_optional(usage.cache_write_1h_tokens)?,
+            provider_total_tokens: js_count_optional(usage.provider_total_tokens)?,
             reported_cost_usd: usage.reported_cost_usd,
-            accounting: usage.accounting.as_str().to_string(),
+            accounting,
             has_input_tokens: usage.coverage.has_input_tokens,
             has_output_tokens: usage.coverage.has_output_tokens,
             has_reasoning_tokens: usage.coverage.has_reasoning_tokens,
             has_cache_read_tokens: usage.coverage.has_cache_read_tokens,
             has_cache_write_tokens: usage.coverage.has_cache_write_tokens,
-        }
+        })
     }
 }
 
@@ -485,7 +511,7 @@ pub struct NativeSessionRequest {
     pub source: String,
     pub session_id: String,
     pub request_key: String,
-    /// `request-id` or `message-id`.
+    /// `request-id`, `provider-message-id` or `record-id`.
     pub request_key_source: String,
     pub message_ids: Vec<String>,
     pub model: Option<String>,
@@ -504,6 +530,23 @@ pub struct NativeSessionRequest {
 
 impl From<CoreSessionRequest> for NativeSessionRequest {
     fn from(request: CoreSessionRequest) -> Self {
+        let mut diagnostics: Vec<String> = request
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.as_str().to_string())
+            .collect();
+        let mut usage_error = request.usage_error;
+        let usage = request.usage.as_ref().and_then(|usage| {
+            let accounting = usage.accounting.as_str().to_string();
+            let converted = NativeNormalizedUsage::from_core(usage, accounting);
+            if converted.is_none() {
+                // The row normalized; it just cannot be expressed here. Say
+                // so rather than serve a rounded number.
+                usage_error = Some(COUNT_NOT_REPRESENTABLE.to_string());
+                diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+            }
+            converted
+        });
         Self {
             id: request.id,
             source: request.source,
@@ -515,16 +558,12 @@ impl From<CoreSessionRequest> for NativeSessionRequest {
             provider: request.provider,
             first_ts_ms: request.first_ts_ms,
             last_ts_ms: request.last_ts_ms,
-            usage: request.usage.map(NativeNormalizedUsage::from),
-            usage_error: request.usage_error,
+            usage,
+            usage_error,
             tool_use_ids: request.tool_use_ids,
             has_thinking: request.has_thinking,
             event_count: request.event_count,
-            diagnostics: request
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.as_str().to_string())
-                .collect(),
+            diagnostics,
         }
     }
 }
@@ -600,12 +639,32 @@ fn session_usage(
             overflowed: false,
         };
     };
+    let mut diagnostics: Vec<String> = summary
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.as_str().to_string())
+        .collect();
+    // A summary's mode list can be plural; the single-mode field carries a
+    // real mode only when there is exactly one, so a session that mixes units
+    // cannot be read as if it had one.
+    let accounting = match summary.accounting.as_slice() {
+        [mode] => mode.as_str().to_string(),
+        _ => "mixed".to_string(),
+    };
+    let usage = summary.usage.as_ref().and_then(|usage| {
+        let converted = NativeNormalizedUsage::from_core(usage, accounting);
+        if converted.is_none() {
+            diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+        }
+        converted
+    });
     SessionUsage {
         contract_version: SESSION_USAGE_CONTRACT_VERSION,
         source,
         session_id,
-        request_count: js_count(summary.request_count),
-        total_request_count: js_count(summary.total_request_count),
+        usage,
+        request_count: js_count(summary.request_count).unwrap_or(i64::MAX),
+        total_request_count: js_count(summary.total_request_count).unwrap_or(i64::MAX),
         accounting: summary
             .accounting
             .iter()
@@ -614,35 +673,8 @@ fn session_usage(
         models: summary.models,
         first_ts_ms: Some(summary.first_ts_ms),
         last_ts_ms: Some(summary.last_ts_ms),
-        diagnostics: summary
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.as_str().to_string())
-            .collect(),
+        diagnostics,
         overflowed: summary.overflowed,
-        usage: Some(NativeNormalizedUsage {
-            input_tokens: js_count(summary.input_tokens),
-            output_tokens: js_count(summary.output_tokens),
-            reasoning_tokens: summary.reasoning_tokens.map(js_count),
-            cache_read_tokens: js_count(summary.cache_read_tokens),
-            cache_write_tokens: js_count(summary.cache_write_tokens),
-            cache_write5m_tokens: summary.cache_write_5m_tokens.map(js_count),
-            cache_write1h_tokens: summary.cache_write_1h_tokens.map(js_count),
-            provider_total_tokens: summary.provider_total_tokens.map(js_count),
-            reported_cost_usd: summary.reported_cost_usd,
-            // A summary's mode list can be plural; this field carries the
-            // single mode only when there is exactly one, so a mixed session
-            // cannot be read as if it had one accounting unit.
-            accounting: match summary.accounting.as_slice() {
-                [mode] => mode.as_str().to_string(),
-                _ => "mixed".to_string(),
-            },
-            has_input_tokens: summary.coverage.has_input_tokens,
-            has_output_tokens: summary.coverage.has_output_tokens,
-            has_reasoning_tokens: summary.coverage.has_reasoning_tokens,
-            has_cache_read_tokens: summary.coverage.has_cache_read_tokens,
-            has_cache_write_tokens: summary.coverage.has_cache_write_tokens,
-        }),
     }
 }
 
@@ -1893,4 +1925,33 @@ pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
     .await
     .map_err(worker_error)?
     .map_err(|error: anyhow::Error| native_error("GIT_LINK_FAILED", format!("{error:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{js_count, MAX_JS_SAFE_COUNT};
+
+    /// The boundary is `Number.MAX_SAFE_INTEGER`, not `i64::MAX`: beyond it a
+    /// JavaScript number is no longer the value it was handed.
+    #[test]
+    fn a_count_javascript_cannot_represent_is_refused_not_rounded() {
+        assert_eq!(js_count(0), Some(0));
+        assert_eq!(js_count(43), Some(43));
+        assert_eq!(
+            js_count(MAX_JS_SAFE_COUNT),
+            Some(9_007_199_254_740_991_i64),
+            "the largest exactly representable integer still crosses"
+        );
+        assert_eq!(js_count(MAX_JS_SAFE_COUNT + 1), None);
+        assert_eq!(js_count(u64::MAX), None);
+    }
+
+    /// The regression this replaced: `i64::try_from(u64::MAX)` saturating to
+    /// `i64::MAX` handed JavaScript a number that is neither the stored value
+    /// nor representable.
+    #[test]
+    fn the_old_i64_ceiling_is_not_the_boundary() {
+        assert!(i64::try_from(u64::MAX).is_err());
+        assert_eq!(js_count(i64::MAX as u64), None);
+    }
 }
