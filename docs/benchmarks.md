@@ -306,3 +306,66 @@ node scripts/benchmark-sync.mjs --profile full --target-bytes 1048576 \
   --large-session-bytes 209715200 --phases cold_sync,hydrate_cold,hydrate_unchanged
 ```
 
+Rows 1–7 were measured at `2a1e81a` and rows 8–9 at `3672810`; neither commit on
+this branch touches the ingestion or hydration path, so the numbers describe
+`main`'s behaviour either way.
+
+| Operation | Source | Time | Records | Records/s | MB/s | Bytes read | Peak RSS | DB | WAL |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cold `sync`, 100 MB store (4,399 files, 3,518 sessions) | 100.3 MiB | 513.93 s | 172,218 | 335 | 0.20 | 47.1 GiB | 20.9 MiB | 162.1 MiB | 0 B |
+| cold `sync`, 1 GB store | — | not measured; see below | — | — | — | — | — | — | — |
+| incremental `sync`, 1 KiB appended to one transcript | 1,023 B | 10.85 s | 1 | — | — | 1.7 GiB | 21.7 MiB | 162.1 MiB | 0 B |
+| `watch` tick, nothing changed | 0 B | 11.64 s | 0 | — | — | 1.7 GiB | 20.5 MiB | 162.1 MiB | 0 B |
+| `hydrate_session`, 1 MB transcript, cold | 1,020.7 KiB | 1.41 s | 720 | 512 | 0.74 | 17.7 MiB | 12.4 MiB | 162.4 MiB | 0 B |
+| `hydrate_session`, 1 MB transcript, unchanged | 1,020.7 KiB | 7.8 ms | 720 | 91,845 | 133.32 | 13.5 MiB | 12.4 MiB | 162.4 MiB | 0 B |
+| `hydrate_session`, 50 MB transcript, cold | 50.0 MiB | 70.48 s | 36,054 | 512 | 0.74 | 364.1 MiB | 59.6 MiB | 116.2 MiB | 0 B |
+| `hydrate_session`, 50 MB transcript, unchanged | 50.0 MiB | 135.4 ms | 36,054 | 266,198 | 387.38 | 120.4 MiB | 57.4 MiB | 116.2 MiB | 0 B |
+| `hydrate_session`, 200 MB transcript, cold | 200.3 MiB | 335.48 s | 144,216 | 430 | 0.63 | 1.6 GiB | 209.9 MiB | 463.9 MiB | 0 B |
+| `hydrate_session`, 200 MB transcript, unchanged | 200.3 MiB | 518.0 ms | 144,216 | 278,405 | 405.46 | 481.3 MiB | 206.5 MiB | 463.9 MiB | 0 B |
+
+The 50 MB and 200 MB hydration rows were measured against a store holding that
+one transcript and nothing else, so their `DB` column is that store's database
+and not the 100 MB store's. Their cold syncs, for reference: 50 MB in 192.89 s
+(127,129 rows, 659 rows/s, 858.6 MiB read, 59.4 MiB peak RSS) and 200 MB in
+798.50 s (508,294 rows, 637 rows/s, 3.7 GiB read, 209.4 MiB peak RSS).
+
+`MB/s` is decimal megabytes of provider source per second, so it is directly
+comparable to a transcript's size on disk. An `incremental sync` row writes one
+row and a `watch` tick writes none, so records/s is meaningless for them and is
+left blank rather than reported as zero.
+
+**The 1 GB cold-sync row is run on demand.** At the rate above, 1 GB is several
+hours of wall clock and a multi-gigabyte database, which is more than the
+machine this was measured on had spare. Dispatch
+`.github/workflows/benchmark-sync.yml` with `target_bytes: 1073741824` to fill
+it in, or run the `full` profile locally with that override.
+
+### What the baseline says
+
+Four things worth carrying into the parity work, all read off the table rather
+than inferred:
+
+1. **A `watch` tick with nothing changed costs 11.6 s against a 100 MB store**,
+   and reads 1.7 GiB to decide that nothing changed. burn's `ingest --watch`
+   runs on one-second ticks; relayhistory's full `sync` cannot serve that
+   directly at this size. Shallow discovery, whose unchanged case is measured
+   in milliseconds in the tables above, is a different path.
+2. **An incremental sync costs essentially the same as an unchanged one**
+   (10.85 s vs 11.64 s). The cost is the walk and the stamp comparison, not the
+   one changed file. That is where the incremental-cursor work has room.
+3. **Cold sync reads far more than the store.** 47.1 GiB read for a 100 MB
+   store across 12.3 million read syscalls — roughly 470× the corpus. The store
+   is read once; the rest is the growing database being paged back in.
+4. **Hydration's peak RSS tracks the transcript.** 12.4 MiB for 1 MB,
+   59.6 MiB for 50 MB, 209.9 MiB for 200 MB — the transcript is read whole
+   (`fs::read_to_string`), so the memory ceiling for hydration is the largest
+   transcript, not a bounded window. Full sync shows the same shape: 20.9 MiB
+   against 4,399 small files, 209.4 MiB against one 200 MB file.
+
+Throughput itself is flat in the size of the corpus — 512 rows/s cold hydration
+at both 1 MB and 50 MB, 430 at 200 MB — so none of the above is quadratic in
+records. The unchanged hydration path does what it claims: 7.8 ms, 135 ms and
+518 ms for 1 MB, 50 MB and 200 MB, against 1.41 s, 70.5 s and 335.5 s cold.
+
+None of this is optimized here. Recording it is the point: the parity issues in
+#160 can now show a before and an after.
