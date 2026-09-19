@@ -581,26 +581,38 @@ fn a_renewal_blocked_past_the_deadline_never_reports_a_lease_in_the_past() {
     // timer. The renewal below therefore blocks, and by the time it commits, a
     // timestamp taken before the block is long stale.
     let path = fixture.path();
+    let (locked, lock_taken) = std::sync::mpsc::channel();
     let holding = std::thread::spawn(move || {
         let blocker = open_db(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(system_clock()).unwrap();
         std::thread::sleep(hold);
         blocker.execute_batch("ROLLBACK").unwrap();
     });
-    // Let the blocker take the lock before the renewal asks for it.
-    std::thread::sleep(Duration::from_millis(20));
+    // The renewal asks for the lock only once the blocker holds it; a sleep
+    // here is a race on a loaded box, and losing it makes the renewal return
+    // at once with an honest deadline the assertion below would misread.
+    let taken_at = lock_taken.recv().unwrap();
 
     let renewer = open_db(&fixture.path()).unwrap();
     let renewed = renew_lease(&renewer, &claim.lease, lease_ms, &system_clock)
         .expect("the lock is released well inside the busy policy");
-    let returned_at = system_clock();
     holding.join().unwrap();
 
+    // The lock was released no earlier than `hold` after the blocker took
+    // it. A clock read after the block therefore dates the deadline at or
+    // beyond `taken_at + hold + lease_ms`; a clock read before it dates it
+    // at most `taken_at + lease_ms` plus the few ms between the lock and the
+    // ask, five lease lengths short. Asserting against the release time
+    // rather than "still unexpired now" keeps the test honest on a loaded
+    // box, where the return itself can be delayed past a 100 ms lease.
+    let released_no_earlier_than = taken_at + hold.as_millis() as i64;
     assert!(
-        renewed.expires_at_ms > returned_at,
-        "renewal returned a lease that had already expired ({} <= {returned_at}); \
-         the deadline was computed from a clock read before a {}ms block",
+        renewed.expires_at_ms >= released_no_earlier_than + lease_ms,
+        "renewal dated its deadline from before the block: {} < {} + {lease_ms}; \
+         the clock was read before a {}ms wait for the lock",
         renewed.expires_at_ms,
+        released_no_earlier_than,
         hold.as_millis(),
     );
     assert_eq!(
@@ -660,6 +672,62 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
             "a fenced lease must not be able to move another worker's state"
         );
     }
+}
+
+/// The fence proves ownership only for as long as the transaction that read
+/// it. `validate_dispatch` commits before the receiver sends, so an expired
+/// lease that passed it could be claimed by another worker in the gap and the
+/// batch sent twice. Before transport the lease must therefore still be live;
+/// after transport (the test above) ownership alone is enough.
+#[test]
+fn an_expired_lease_cannot_gate_a_dispatch_it_may_no_longer_own() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    // A long lease, and the clock is driven explicitly rather than slept
+    // past: every gate takes `now_ms`, so expiry is a value, not a race.
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, 60_000);
+    let live = claim.lease.expires_at_ms - 1;
+    let expired = claim.lease.expires_at_ms;
+    let body = serde_json::to_string(&claim.batch).unwrap();
+    store_prepared_payload(
+        &fixture.conn,
+        &claim.lease,
+        &claim.batch.mapping_version,
+        "application/json",
+        &body,
+        live,
+    )
+    .expect("a live lease persists its payload");
+    validate_dispatch(&fixture.conn, &claim.lease, live).expect("a live lease validates");
+
+    // At the deadline, still unclaimed. Ownership holds; liveness does not.
+    let refused = validate_dispatch(&fixture.conn, &claim.lease, expired)
+        .expect_err("an expired lease must not be handed to transport");
+    assert!(
+        refused.to_string().contains("expired before dispatch"),
+        "unexpected refusal: {refused}"
+    );
+    assert!(
+        store_prepared_payload(
+            &fixture.conn,
+            &claim.lease,
+            &claim.batch.mapping_version,
+            "application/json",
+            &body,
+            expired,
+        )
+        .is_err(),
+        "an expired lease must not persist a payload it may not get to send"
+    );
+
+    // The very gap the gate exists for: another worker can take it now …
+    let stolen = claim_batch(&fixture.conn, &job.job_id, "other", 30_000, expired)
+        .unwrap()
+        .expect("an expired batch is claimable by another worker");
+    assert_ne!(stolen.lease.fence, claim.lease.fence);
+    // … and a renewal by the first worker is then a fence mismatch, not a
+    // resurrection: renewal only revives a lease nobody has claimed.
+    assert!(renew_lease(&fixture.conn, &claim.lease, 30, &|| expired).is_err());
 }
 
 #[test]
