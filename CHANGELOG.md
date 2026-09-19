@@ -4,6 +4,24 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Live capture
+
+- `ai-hist watch` now wakes on filesystem events under the providers' session
+  roots with a 200 ms debounce and a 30 s slow-poll backstop, falling back to
+  polling when no root can be watched. New flags: `--no-fsevents`,
+  `--debounce-ms`, alongside the existing `--interval`. The watcher backend is
+  behind the optional `fs-events` crate feature, which the CLI enables; a
+  `--no-default-features` build polls.
+- `sync` now short-circuits on a stat-only source fingerprint folded over the
+  same candidates discovery enumerates, recorded in `.sync-state.json`. A tick
+  over unchanged sources opens no files. Filesystem-event ticks force past it,
+  because an event can arrive before the write flushes.
+- New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
+  lifecycle-hook payload from stdin and hydrates exactly the transcript it
+  names. It always exits 0. See `docs/agent-integration.md` for the
+  `settings.json` wiring, including why `PreCompact` cannot be replaced by
+  watch mode.
+
 ### Rust API
 
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and
