@@ -824,7 +824,7 @@ pub fn store_prepared_payload(
     mapping_version: &str,
     content_type: &str,
     body: &str,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<PreparedPayload> {
     ensure!(
         !content_type.is_empty()
@@ -833,6 +833,7 @@ pub fn store_prepared_payload(
         "invalid content type"
     );
     let tx = write_transaction(conn)?;
+    let now_ms = clock();
     check_lease(&tx, lease, now_ms, LeaseCheck::Live)?;
     let job = job(&tx, &lease.job_id)?;
     ensure!(
@@ -1169,9 +1170,12 @@ LEFT JOIN delivery_shadow s ON s.job_id=?3 AND s.kind=?4 AND s.row_id=c.row_id
 pub fn validate_dispatch(
     conn: &Connection,
     lease: &DeliveryLease,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<PreparedPayload> {
     let tx = write_transaction(conn)?;
+    // Dated from inside the lock: a wait for it longer than the lease must
+    // not validate against a timestamp from before the wait.
+    let now_ms = clock();
     check_lease(&tx, lease, now_ms, LeaseCheck::Live)?;
     let job = job(&tx, &lease.job_id)?;
     let (batch, prepared, _) =

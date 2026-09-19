@@ -695,13 +695,13 @@ fn an_expired_lease_cannot_gate_a_dispatch_it_may_no_longer_own() {
         &claim.batch.mapping_version,
         "application/json",
         &body,
-        live,
+        &|| live,
     )
     .expect("a live lease persists its payload");
-    validate_dispatch(&fixture.conn, &claim.lease, live).expect("a live lease validates");
+    validate_dispatch(&fixture.conn, &claim.lease, &|| live).expect("a live lease validates");
 
     // At the deadline, still unclaimed. Ownership holds; liveness does not.
-    let refused = validate_dispatch(&fixture.conn, &claim.lease, expired)
+    let refused = validate_dispatch(&fixture.conn, &claim.lease, &|| expired)
         .expect_err("an expired lease must not be handed to transport");
     assert!(
         refused.to_string().contains("expired before dispatch"),
@@ -714,7 +714,7 @@ fn an_expired_lease_cannot_gate_a_dispatch_it_may_no_longer_own() {
             &claim.batch.mapping_version,
             "application/json",
             &body,
-            expired,
+            &|| expired,
         )
         .is_err(),
         "an expired lease must not persist a payload it may not get to send"
@@ -728,6 +728,52 @@ fn an_expired_lease_cannot_gate_a_dispatch_it_may_no_longer_own() {
     // … and a renewal by the first worker is then a fence mismatch, not a
     // resurrection: renewal only revives a lease nobody has claimed.
     assert!(renew_lease(&fixture.conn, &claim.lease, 30, &|| expired).is_err());
+}
+
+/// The live check is only as good as the clock it reads. `validate_dispatch`
+/// used to take `now_ms` as a value the worker sampled before calling it, so
+/// a wait for the write lock longer than the lease validated against a
+/// timestamp from before the wait, and an expired lease was handed to
+/// transport. The clock is read inside the transaction now, as renewal's is.
+#[test]
+fn a_validation_blocked_past_the_deadline_is_refused_not_dated_from_before_it() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let lease_ms = 100;
+    let hold = Duration::from_millis(lease_ms as u64 * 6);
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, lease_ms);
+    store_prepared_payload(
+        &fixture.conn,
+        &claim.lease,
+        &claim.batch.mapping_version,
+        "application/json",
+        &serde_json::to_string(&claim.batch).unwrap(),
+        &system_clock,
+    )
+    .expect("a live lease persists its payload");
+
+    let path = fixture.path();
+    let (locked, lock_taken) = std::sync::mpsc::channel();
+    let holding = std::thread::spawn(move || {
+        let blocker = open_db(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(hold);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    lock_taken.recv().unwrap();
+
+    // Asked while the lease is live, answered after it has lapsed. A clock
+    // sampled before the wait would say "live"; the one read inside the
+    // lock says the truth.
+    let validator = open_db(&fixture.path()).unwrap();
+    let refused = validate_dispatch(&validator, &claim.lease, &system_clock)
+        .expect_err("a lease that lapsed during the wait must not be handed to transport");
+    holding.join().unwrap();
+    assert!(
+        refused.to_string().contains("expired before dispatch"),
+        "unexpected refusal: {refused}"
+    );
 }
 
 #[test]
