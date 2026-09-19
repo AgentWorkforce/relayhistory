@@ -188,6 +188,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Diagnose --locked drift (temporary, do not merge)
+        shell: bash
+        run: |
+          set -x
+          cargo -Vv
+          cat ~/.cargo/config.toml 2>/dev/null || echo "no ~/.cargo/config.toml"
+          cat .cargo/config.toml 2>/dev/null || echo "no .cargo/config.toml"
+          env | grep -i '^CARGO' || true
+          cp plugins/relayhistory/rust/Cargo.lock /tmp/lock.before
+          cargo update --dry-run --manifest-path plugins/relayhistory/rust/Cargo.toml -v 2>&1 | grep -v '^ *Unchanged' | tail -80 || true
+          cargo metadata --manifest-path plugins/relayhistory/rust/Cargo.toml --format-version 1 >/dev/null 2>/tmp/meta.err || cat /tmp/meta.err
+          diff -u /tmp/lock.before plugins/relayhistory/rust/Cargo.lock || true
+          git checkout -- plugins/relayhistory/rust/Cargo.lock
+          CARGO_LOG=cargo::core::resolver=debug,cargo::ops::lockfile=debug cargo metadata --manifest-path plugins/relayhistory/rust/Cargo.toml --locked --format-version 1 >/dev/null 2>/tmp/locked.err || tail -40 /tmp/locked.err
       - name: Probe regression tests
         run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
       - name: Native release build
