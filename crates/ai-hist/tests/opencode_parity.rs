@@ -276,6 +276,7 @@ fn use_layout(home: &Path, db: Option<&Path>, storage: Option<&Path>) {
 #[test]
 fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     the_two_layouts_normalize_to_identical_evidence();
+    every_session_in_the_corpus_is_parsed();
     a_parent_id_links_a_child_session_and_the_tree_returns_it();
     a_tool_turn_records_errors_tokens_provider_and_stop_reason();
     a_compaction_part_records_one_boundary_marker();
@@ -338,6 +339,82 @@ fn raw_path(db_path: &Path, session_id: &str) -> String {
         )
         .unwrap()
         .unwrap_or_default()
+}
+
+/// All five legacy-JSON cases at once, so no fixture in the corpus is carried
+/// without being read. The other phases each assert one acceptance criterion
+/// in depth; this one is the breadth check that would catch a case the parser
+/// silently produces nothing for — `simple`, in particular, is covered only
+/// here, and it is the case that proves a `step-start` part is ignored rather
+/// than mistaken for a turn.
+fn every_session_in_the_corpus_is_parsed() {
+    let root = temp_root("corpus");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    for case in [
+        "legacy-json-simple",
+        "legacy-json-multi-turn",
+        "legacy-json-with-tool",
+        "legacy-json-with-compaction",
+        "legacy-json-user-turn-blocks",
+    ] {
+        copy_tree(&fixtures().join(case).join("storage"), &tree);
+    }
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    let conn = open_db(&db_path).unwrap();
+
+    // (session, user text, assistant text, tool_use, tool_result) counts.
+    let expected = [
+        ("ses_simple", 0, 1, 0, 0),
+        ("ses_multi", 0, 0, 1, 1),
+        ("ses_child", 0, 0, 0, 0),
+        ("ses_tool", 0, 0, 3, 3),
+        ("ses_compact", 2, 1, 0, 0),
+        ("ses_utb", 2, 1, 2, 2),
+    ];
+    for (session_id, users, assistants, tool_uses, tool_results) in expected {
+        let events = session_events(&conn, session_id, Some("opencode")).unwrap();
+        let count = |role: &str, kind: &str| {
+            events
+                .iter()
+                .filter(|event| event.role == role && event.kind == kind)
+                .count()
+        };
+        assert_eq!(
+            (
+                count("user", "text"),
+                count("assistant", "text"),
+                count("assistant", "tool_use"),
+                count("tool_result", "tool_result"),
+            ),
+            (users, assistants, tool_uses, tool_results),
+            "{session_id} parsed to the wrong shape; events were {:?}",
+            events
+                .iter()
+                .map(|event| (&event.role, &event.kind, &event.event_uid))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // `simple`: one assistant turn, its `step-start` part contributing
+    // nothing, and the model and tokens carried from the message.
+    let simple = session_events(&conn, "ses_simple", Some("opencode")).unwrap();
+    assert_eq!(
+        simple.len(),
+        1,
+        "a step-start part is not a turn: {simple:?}"
+    );
+    assert_eq!(simple[0].text.as_deref(), Some("Hello."));
+    assert_eq!(
+        simple[0].model.as_deref(),
+        Some("anthropic/claude-sonnet-4-5")
+    );
+    assert_eq!(simple[0].provider.as_deref(), Some("anthropic"));
+    assert_eq!(simple[0].stop_reason.as_deref(), Some("end_turn"));
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// Acceptance: "`multi-turn` fixture: `ses_child` is linked to its parent via
