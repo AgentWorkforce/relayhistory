@@ -3367,6 +3367,17 @@ fn insert_session_event(
     // straight back to the sweep this design exists to avoid. Resolving the
     // cwd is the fallback, and it agrees with what `upsert_session` will store
     // for the same directory, so the ordinary case converges with no rewrite.
+    //
+    // On conflict the order is the same but the stored value comes second, so
+    // a re-ingest can only ever improve the key. The cwd fallback is last
+    // precisely because it is the weakest: for a delegated child there is no
+    // `sessions` row to consult, and its stored key is the parent's, inherited
+    // by the denormalizing pass. Preferring the incoming value there -- which
+    // is what a plain `COALESCE(excluded.project_key, ...)` does now that the
+    // fallback makes it non-null -- would overwrite a canonical repository key
+    // with a machine-local path on every re-ingest, and hand every one of
+    // those events back to the sweep to fix, journalling a second delivery
+    // upsert each time.
     let resolved = cwd
         .and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None))
         .map(|(key, _)| key);
@@ -3375,7 +3386,8 @@ fn insert_session_event(
          (source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
          VALUES (?1, ?2, ?3, COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
-         project=excluded.project, project_key=COALESCE(excluded.project_key, session_events.project_key), \
+         project=excluded.project, \
+         project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
          cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
          model=excluded.model, token_json=excluded.token_json",

@@ -68,6 +68,10 @@ name = "project_identity"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "project_identity_discovery"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "project_key_delivery"
 required-features = ["delivery", "unstable-internal"]
 

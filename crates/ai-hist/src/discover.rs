@@ -3014,6 +3014,24 @@ pub fn discover_sessions_with_provider_refs(
         }
     }
 
+    // A candidate whose bytes have not changed is served from the catalog
+    // without ever reaching `upsert_shallow_session_in_transaction`, so the
+    // stamp shortcut is also a shortcut past project-identity resolution. A
+    // session first discovered before its checkout had an `origin` would then
+    // keep its path key on every later `sessions discover`, no matter how many
+    // times it ran: the transcript is unchanged, so the row is never revisited.
+    //
+    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
+    // path key is not final for, and probes before writing, so a pass with
+    // nothing to upgrade stays read-only. Reporting rather than failing, for
+    // the same reason the sync path does: the rows this discovery wrote are
+    // already committed, and every key here is derived from them.
+    if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+        eprintln!(
+            "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+             (project keys stay as they were; the next pass retries)"
+        );
+    }
     summary.counters = env.counters();
     Ok(summary)
 }

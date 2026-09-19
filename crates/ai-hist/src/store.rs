@@ -2199,13 +2199,25 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let mut update = conn.prepare(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
-         WHERE (project_key IS NULL \
-                OR (project_key_method = 'path' \
-                    AND (?2 = 'remote' OR project_key <> ?1))) \
-           AND cwd IS ?3 AND repo_url IS ?4",
-    )?;
+    // The predicate the update would apply, asked as a question first.
+    //
+    // In the steady state every one of these rows resolves to the key it
+    // already has: a `path` key is reconsidered on every pass precisely
+    // because it might be upgradable, and almost always is not. Issuing the
+    // UPDATE anyway takes the write lock to change nothing, on every sync, for
+    // every path-keyed session -- and a `SQLITE_BUSY` on that no-op would fail
+    // the whole refresh, taking inheritance and denormalization down with it.
+    // The other two passes probe for the same reason.
+    const UPGRADABLE: &str = "(project_key IS NULL \
+             OR (project_key_method = 'path' \
+                 AND (?2 = 'remote' OR project_key <> ?1))) \
+           AND cwd IS ?3 AND repo_url IS ?4";
+    let mut needed = conn.prepare(&format!(
+        "SELECT 1 FROM sessions WHERE {UPGRADABLE} LIMIT 1"
+    ))?;
+    let mut update = conn.prepare(&format!(
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 WHERE {UPGRADABLE}"
+    ))?;
     let mut written = 0;
     for (cwd, repo_url) in pending {
         let Some((key, method)) =
@@ -2213,7 +2225,11 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
         else {
             continue;
         };
-        written += update.execute(params![key, method.as_str(), cwd, repo_url])?;
+        let arguments = params![key, method.as_str(), cwd, repo_url];
+        if !needed.exists(arguments)? {
+            continue;
+        }
+        written += update.execute(arguments)?;
     }
     Ok(written)
 }

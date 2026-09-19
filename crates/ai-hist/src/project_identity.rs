@@ -105,9 +105,7 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
         .ok()
         .and_then(|text| {
             let config = parse_git_config(&text);
-            let url = config
-                .get("remote \"origin\"")
-                .and_then(|section| section.get("url"))?;
+            let url = single(config.get("remote \"origin\"")?, "url")?;
             Some(apply_insteadof(&config, url))
         });
     match repo_url
@@ -314,8 +312,8 @@ fn gitdir_pointer(text: &str) -> Option<&str> {
 /// quotes. Deliberately not a full git-config implementation: only enough to
 /// read `remote "origin"`'s `url`, and byte-for-byte the same subset burn
 /// reads so the two cannot disagree about a config they both parse.
-pub fn parse_git_config(text: &str) -> HashMap<String, HashMap<String, String>> {
-    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+pub fn parse_git_config(text: &str) -> GitConfig {
+    let mut out: GitConfig = HashMap::new();
     let mut current: Option<String> = None;
     for raw_line in text.split('\n') {
         let line = raw_line
@@ -341,9 +339,33 @@ pub fn parse_git_config(text: &str) -> HashMap<String, HashMap<String, String>> 
             continue;
         }
         let value = strip_inline_comment(line[eq + 1..].trim());
-        out.entry(section.clone()).or_default().insert(key, value);
+        out.entry(section.clone())
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(value);
     }
     out
+}
+
+/// A parsed `.git/config`: `{section -> {key -> values}}`.
+///
+/// Keys are multi-valued because git's are. `url.<base>.insteadOf` is the case
+/// that matters here — one `url` section may carry several rewrites, and a map
+/// keeping only the last would silently drop all but one, leaving every remote
+/// the others covered to fall back to a path key.
+///
+/// Single-valued keys like `remote.origin.url` take the last entry, which is
+/// git's own rule for them.
+pub type GitConfig = HashMap<String, HashMap<String, Vec<String>>>;
+
+/// The effective value of a single-valued key: the last written, as git
+/// resolves it. Key comparison is case-insensitive, as git's is.
+fn single<'a>(section: &'a HashMap<String, Vec<String>>, key: &str) -> Option<&'a String> {
+    section
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, values)| values.last())
 }
 
 /// Normalize a section header body, mirroring `^([A-Za-z0-9._-]+)\s+"(.*)"$`.
@@ -409,7 +431,7 @@ fn strip_inline_comment(value: &str) -> String {
 /// one that does, burn falls back to a path key and this returns the canonical
 /// one. That is a strictly better answer rather than a disagreement to
 /// preserve, and the burn characterization issue should adopt the same rule.
-fn apply_insteadof(config: &HashMap<String, HashMap<String, String>>, url: &str) -> String {
+fn apply_insteadof(config: &GitConfig, url: &str) -> String {
     let mut best: Option<(&str, &str)> = None;
     for (section, entries) in config {
         let Some(base) = section
@@ -418,20 +440,20 @@ fn apply_insteadof(config: &HashMap<String, HashMap<String, String>>, url: &str)
         else {
             continue;
         };
-        // Git config keys are case-insensitive, and hand-edited files spell
-        // this one several ways.
-        let Some(prefix) = entries
+        // Every `insteadOf` in the section, not merely one: git treats the key
+        // as multi-valued, so one base may carry several rewrites. Keys are
+        // case-insensitive, and hand-edited files spell this one several ways.
+        let prefixes = entries
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("insteadOf"))
-            .map(|(_, value)| value)
-        else {
-            continue;
-        };
-        if prefix.is_empty() || !url.starts_with(prefix.as_str()) {
-            continue;
-        }
-        if best.is_none_or(|(longest, _)| prefix.len() > longest.len()) {
-            best = Some((prefix.as_str(), base));
+            .filter(|(key, _)| key.eq_ignore_ascii_case("insteadOf"))
+            .flat_map(|(_, values)| values.iter());
+        for prefix in prefixes {
+            if prefix.is_empty() || !url.starts_with(prefix.as_str()) {
+                continue;
+            }
+            if best.is_none_or(|(longest, _)| prefix.len() > longest.len()) {
+                best = Some((prefix.as_str(), base));
+            }
         }
     }
     match best {
@@ -647,10 +669,13 @@ mod tests {
         let cfg = parse_git_config(
             "\n[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = git@github.com:foo/bar.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         );
-        assert_eq!(cfg["core"]["repositoryformatversion"], "0");
         assert_eq!(
-            cfg["remote \"origin\""]["url"],
-            "git@github.com:foo/bar.git"
+            cfg["core"]["repositoryformatversion"],
+            vec!["0".to_string()]
+        );
+        assert_eq!(
+            single(&cfg["remote \"origin\""], "url").map(String::as_str),
+            Some("git@github.com:foo/bar.git")
         );
     }
 
@@ -660,15 +685,15 @@ mod tests {
             "\n# a comment\n; another comment\n[remote \"origin\"]\n\turl = https://github.com/foo/bar ; inline comment\n",
         );
         assert_eq!(
-            cfg["remote \"origin\""]["url"],
-            "https://github.com/foo/bar"
+            single(&cfg["remote \"origin\""], "url").map(String::as_str),
+            Some("https://github.com/foo/bar")
         );
     }
 
     #[test]
     fn parse_keeps_a_non_subsection_header_verbatim() {
         let cfg = parse_git_config("[branch]\n\tx = 1\n");
-        assert_eq!(cfg["branch"]["x"], "1");
+        assert_eq!(cfg["branch"]["x"], vec!["1".to_string()]);
     }
 
     // ---- resolution ------------------------------------------------------
@@ -859,6 +884,51 @@ mod tests {
         assert_eq!(
             apply_insteadof(&config, "git@github.com:Org/Repo.git"),
             "git@github.com:Org/Repo.git"
+        );
+    }
+
+    /// Git treats `insteadOf` as multi-valued: one `url` section may carry
+    /// several rewrites. A config map that kept only the last would drop the
+    /// others silently, and every remote they covered would fall back to a
+    /// path key -- resolved-looking, and wrong.
+    #[test]
+    fn several_insteadof_values_in_one_section_all_apply() {
+        let config = parse_git_config(
+            "[url \"https://github.com/\"]\n\tinsteadOf = gh:\n\tinsteadOf = github:\n",
+        );
+        assert_eq!(
+            apply_insteadof(&config, "gh:Org/Repo.git"),
+            "https://github.com/Org/Repo.git"
+        );
+        assert_eq!(
+            apply_insteadof(&config, "github:Org/Repo.git"),
+            "https://github.com/Org/Repo.git",
+            "the second value must not have been overwritten by the first"
+        );
+    }
+
+    #[test]
+    fn several_insteadof_values_still_take_the_longest_match() {
+        let config = parse_git_config(
+            "[url \"https://example.invalid/\"]\n\tinsteadOf = gh:\n\tinsteadOf = x:\n\
+             [url \"https://github.com/me/\"]\n\tinsteadOf = gh:me/\n",
+        );
+        assert_eq!(
+            apply_insteadof(&config, "gh:me/Repo.git"),
+            "https://github.com/me/Repo.git"
+        );
+    }
+
+    /// The counterpart rule for a single-valued key: git takes the last one.
+    #[test]
+    fn a_repeated_remote_url_takes_the_last_value() {
+        let config = parse_git_config(
+            "[remote \"origin\"]\n\turl = git@github.com:Org/Old.git\n\
+             \turl = git@github.com:Org/New.git\n",
+        );
+        assert_eq!(
+            single(&config["remote \"origin\""], "url").map(String::as_str),
+            Some("git@github.com:Org/New.git")
         );
     }
 
