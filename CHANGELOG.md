@@ -97,10 +97,25 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `top_projects` by the canonical key and reports `grouped_by`; `--by-cwd`
   restores the previous per-directory grouping. The cloud outbox's `projectId`
   derivation reads the remote through the same helper instead of shelling out
-  to `git remote get-url`. Existing databases migrate additively and
-  deliberately backfill no keys: a column stays `null` until the next sync or
-  hydration resolves it for real, rather than being stamped with a path key
-  for a checkout that does have a remote.
+  to `git remote get-url`; `url.<base>.insteadOf` rewrites are expanded, as
+  that command does. Existing databases migrate additively and deliberately
+  backfill no keys: a column stays `null` until the next sync or hydration
+  resolves it for real, rather than being stamped with a path key for a
+  checkout that does have a remote. A `path` key is likewise never final —
+  every pass reconsiders it, so a session whose checkout has been deleted
+  picks up the canonical key as soon as a recorded remote makes one available,
+  and a `remote` key is never downgraded. `ai-hist sessions list --project`
+  and `ai-hist stats --by-cwd` are available on the Node CLI as well as the
+  native one.
+
+- Fix three defects in the delivery worker's lease keepalive that let a live
+  claim lapse under load, allowing a second worker to dispatch the same batch:
+  the renewal cadence was measured in requested sleep rather than elapsed time
+  (so it stretched by exactly the factor the machine was overloaded by), each
+  wait was scheduled from the previous renewal instead of the lease's own
+  deadline (so a slow renewal compounded rather than corrected), and a
+  contended `SQLITE_BUSY` write was treated as a lost lease rather than
+  retried while the claim still had time to run.
 
 - Add first-class delegation topology. `session_relationships` gains an
   identity status (`observed` or `unlinked`), child agent type, name, model and

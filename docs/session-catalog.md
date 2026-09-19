@@ -163,16 +163,26 @@ arrived at, and the three are not interchangeable:
 The rules match burn's `crates/relayburn-sdk/src/reader/git.rs` vector for
 vector, so `burn --group-by project` and a RelayHistory rollup agree on the
 same checkout. No `git` subprocess is involved: `.git/config` is read directly,
-including a linked worktree's `gitdir:` pointer.
+including a linked worktree's `gitdir:` pointer and `url.<base>.insteadOf`
+rewrites (which `git remote get-url` also expands). An `[include]`d config file
+is not followed, so a remote defined only in one falls back to a path key.
 
 Both are `null` while a session's identity has not been resolved yet — a
 database that predates the columns migrates without inventing keys, and the
 next sync or hydration fills them. `null` means "not resolved", never "no
 project".
 
+A key is resolved from the working directory, or from a remote the provider
+recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
+never final: every sync reconsiders it, so a session whose checkout was deleted
+picks up the canonical key as soon as a recorded remote makes one available. A
+`remote` key is never downgraded.
+
 Filter a listing to one project with `ai-hist sessions list --project <key>`
 (SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
-key, not a path or a prefix.
+key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
+and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
+the per-directory grouping.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate

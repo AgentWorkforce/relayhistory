@@ -2133,10 +2133,18 @@ pub(crate) fn project_key_merge_sql() -> String {
 /// How many times the inheritance pass is repeated.
 ///
 /// One statement propagates one level, so a chain of delegations needs one
-/// pass per level. The loop stops as soon as a pass changes nothing, so the
-/// bound only caps a pathological topology (a relationship cycle, which the
-/// ledger does not forbid) rather than being the normal exit.
-const PROJECT_KEY_INHERITANCE_PASSES: usize = 16;
+/// pass per level, and a bound below the deepest chain the ledger can hold
+/// would silently leave the tail of that chain on a path key. It is therefore
+/// tied to [`crate::relationships::MAX_TREE_MAX_DEPTH`], the depth the
+/// relationship reader itself will traverse: anything the tree can show, this
+/// can key.
+///
+/// The loop stops as soon as no inheritable row remains, so the bound is not
+/// the normal exit. It is a termination guarantee for a pathological topology
+/// — the ledger does not forbid a relationship cycle — and it is safe as a
+/// bound because each pass converts rows to `inherited`, which the predicate
+/// excludes, so the candidate set strictly shrinks.
+const PROJECT_KEY_INHERITANCE_PASSES: usize = crate::relationships::MAX_TREE_MAX_DEPTH as usize;
 
 /// Resolve, inherit and denormalize canonical project identity.
 ///
@@ -2165,13 +2173,26 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
-/// Pass 1: stamp sessions that have a `cwd` (or a provider-recorded remote)
-/// but no key yet.
+/// Pass 1: stamp sessions with no key, and upgrade ones stuck on a path.
+///
+/// A path key is not a settled answer, it is the absence of one. Only filling
+/// NULLs would freeze it: `upsert_session` resolves from the working directory
+/// alone, so a session whose checkout has since been deleted or moved gets a
+/// path key, and nothing would ever revisit it — not this pass, which would
+/// see a non-NULL key, and not shallow discovery, which skips a source whose
+/// bytes have not changed. The repository's own `repo_url`, which the Codex
+/// reader records, then sits in the same row unused while every worktree of
+/// that repository files under a different key.
+///
+/// So a `path` row is reconsidered on every pass and replaced only by
+/// something strictly better. Nothing here can downgrade a key: `remote`
+/// replaces `path`, and `path` replaces only `path` or NULL.
 fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     let pending: Vec<(Option<String>, Option<String>)> = conn
         .prepare(
             "SELECT DISTINCT cwd, repo_url FROM sessions \
-             WHERE project_key IS NULL AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
+             WHERE (project_key IS NULL OR project_key_method = 'path') \
+               AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
         )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -2179,9 +2200,11 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
         return Ok(0);
     }
     let mut update = conn.prepare(
-        "UPDATE sessions SET project_key = ?, project_key_method = ? \
-         WHERE project_key IS NULL \
-           AND cwd IS ? AND repo_url IS ?",
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
+         WHERE (project_key IS NULL \
+                OR (project_key_method = 'path' \
+                    AND (?2 = 'remote' OR project_key <> ?1))) \
+           AND cwd IS ?3 AND repo_url IS ?4",
     )?;
     let mut written = 0;
     for (cwd, repo_url) in pending {

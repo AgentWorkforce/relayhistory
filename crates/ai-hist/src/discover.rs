@@ -2578,6 +2578,11 @@ pub fn discover_sessions_with_provider_refs(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
+    // A pass is the unit over which the filesystem is treated as fixed, so it
+    // is also the unit the project-identity cache may span. A host that stays
+    // up across many passes must not keep answering from a checkout's state at
+    // the first one.
+    crate::project_identity::begin_acquisition_pass();
     let mut identities = std::collections::HashSet::new();
     for provider in providers {
         observation_key(*provider, provider.source(), "validation").validate()?;

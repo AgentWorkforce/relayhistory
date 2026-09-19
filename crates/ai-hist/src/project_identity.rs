@@ -104,10 +104,11 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
     let repo_url = fs::read_to_string(found.git_dir.join("config"))
         .ok()
         .and_then(|text| {
-            parse_git_config(&text)
+            let config = parse_git_config(&text);
+            let url = config
                 .get("remote \"origin\"")
-                .and_then(|section| section.get("url"))
-                .cloned()
+                .and_then(|section| section.get("url"))?;
+            Some(apply_insteadof(&config, url))
         });
     match repo_url
         .as_deref()
@@ -207,8 +208,26 @@ static GLOBAL_RESOLVER: LazyLock<ProjectIdentityResolver> =
 
 /// Resolve `cwd` through a process-global cache. One sync pass touches the
 /// same handful of directories thousands of times.
+///
+/// The cache is only valid for the length of one acquisition pass, and callers
+/// must open a pass with [`begin_acquisition_pass`]. A repository that gains
+/// an `origin`, or has one changed, would otherwise keep its stale identity
+/// for as long as the process lives — which for `ai-hist watch`, the Node
+/// addon or a desktop host is indefinitely, and the wrong answer would look
+/// exactly like a correct one.
 pub fn resolve_project_identity(cwd: &str) -> ProjectIdentity {
     GLOBAL_RESOLVER.resolve(cwd)
+}
+
+/// Discard everything the process-global resolver has cached.
+///
+/// Called at the start of every sync, discovery and hydration pass. Within one
+/// pass the filesystem is treated as fixed — that is what makes the cache
+/// sound, and it is why the pass boundary is where it has to be dropped. A
+/// long-lived host therefore sees a repository's new remote on its next pass
+/// rather than on its next restart.
+pub fn begin_acquisition_pass() {
+    GLOBAL_RESOLVER.clear();
 }
 
 struct FoundGitDir {
@@ -368,6 +387,57 @@ fn strip_inline_comment(value: &str) -> String {
         out.push(ch);
     }
     out.trim().to_string()
+}
+
+/// Expand a `url.<base>.insteadOf` rewrite over a configured remote.
+///
+/// `git remote get-url origin` performs this rewrite, so a repository whose
+/// `origin` is stored as `gh:Org/Repo.git` with
+/// `url."https://github.com/".insteadOf = gh:` reports the expanded URL. Any
+/// reader that skips it sees an unrecognizable remote and falls back to the
+/// working directory — which is the fragmentation a canonical key exists to
+/// prevent, and would have been a regression in the cloud outbox, whose
+/// previous subprocess did expand it.
+///
+/// Git's rule is longest-match-wins, so a configuration with both `gh:` and
+/// `gh:me/` rewrites resolves against the more specific one. `pushInsteadOf`
+/// is deliberately not applied: it changes only where pushes go, never the
+/// identity of the repository being read.
+///
+/// This is a superset of burn's `reader/git.rs`, which does not implement the
+/// rewrite. The two still agree on every remote that needs no rewriting; for
+/// one that does, burn falls back to a path key and this returns the canonical
+/// one. That is a strictly better answer rather than a disagreement to
+/// preserve, and the burn characterization issue should adopt the same rule.
+fn apply_insteadof(config: &HashMap<String, HashMap<String, String>>, url: &str) -> String {
+    let mut best: Option<(&str, &str)> = None;
+    for (section, entries) in config {
+        let Some(base) = section
+            .strip_prefix("url \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        else {
+            continue;
+        };
+        // Git config keys are case-insensitive, and hand-edited files spell
+        // this one several ways.
+        let Some(prefix) = entries
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("insteadOf"))
+            .map(|(_, value)| value)
+        else {
+            continue;
+        };
+        if prefix.is_empty() || !url.starts_with(prefix.as_str()) {
+            continue;
+        }
+        if best.is_none_or(|(longest, _)| prefix.len() > longest.len()) {
+            best = Some((prefix.as_str(), base));
+        }
+    }
+    match best {
+        Some((prefix, base)) => format!("{base}{}", &url[prefix.len()..]),
+        None => url.to_string(),
+    }
 }
 
 /// Canonicalize a remote URL into `host/path`, lowercasing the host and
@@ -742,6 +812,99 @@ mod tests {
         let (key, method) = identity_for(Some(&cwd), Some("not-a-git-remote")).expect("identity");
         assert_eq!(key, cwd);
         assert_eq!(method, ProjectKeyMethod::PathFallback);
+    }
+
+    /// `git remote get-url origin` expands `insteadOf`, and the cloud outbox
+    /// used to read the remote through exactly that command. A reader that
+    /// skipped the rewrite would see `gh:Org/Repo.git`, fail to canonicalize
+    /// it, and fall back to a path — reintroducing the fragmentation the key
+    /// exists to end.
+    #[test]
+    fn insteadof_rewrites_are_expanded_like_git_does() {
+        let root = tempdir().unwrap();
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = gh:Org/Repo.git\n\
+             [url \"https://github.com/\"]\n\tinsteadOf = gh:\n",
+        )
+        .unwrap();
+
+        let identity = project_identity(root.path());
+        assert_eq!(identity.project_key, "github.com/Org/Repo");
+        assert_eq!(identity.method, ProjectKeyMethod::Remote);
+        assert_eq!(
+            identity.repo_url.as_deref(),
+            Some("https://github.com/Org/Repo.git"),
+            "the recorded remote is the expanded one, as `git remote get-url` reports it"
+        );
+    }
+
+    #[test]
+    fn insteadof_takes_the_longest_matching_prefix() {
+        let config = parse_git_config(
+            "[url \"https://github.com/\"]\n\tinsteadOf = gh:\n\
+             [url \"https://github.com/me/\"]\n\tinsteadOf = gh:me/\n",
+        );
+        assert_eq!(
+            apply_insteadof(&config, "gh:me/Repo.git"),
+            "https://github.com/me/Repo.git"
+        );
+        assert_eq!(
+            apply_insteadof(&config, "gh:Other/Repo.git"),
+            "https://github.com/Other/Repo.git"
+        );
+        // A remote that matches no rewrite is returned untouched.
+        assert_eq!(
+            apply_insteadof(&config, "git@github.com:Org/Repo.git"),
+            "git@github.com:Org/Repo.git"
+        );
+    }
+
+    #[test]
+    fn pushinsteadof_does_not_change_the_identity_of_a_repository() {
+        let config = parse_git_config("[url \"ssh://git@github.com/\"]\n\tpushInsteadOf = gh:\n");
+        assert_eq!(
+            apply_insteadof(&config, "gh:Org/Repo.git"),
+            "gh:Org/Repo.git"
+        );
+    }
+
+    /// A process that stays up across many acquisition passes -- `watch`, the
+    /// Node addon, a desktop host -- must not keep answering from a checkout's
+    /// state at the first one. A repository that gains an `origin` would
+    /// otherwise carry a path key for the life of the process, and the stale
+    /// answer is indistinguishable from a correct one.
+    #[test]
+    fn a_new_acquisition_pass_sees_a_repository_that_gained_a_remote() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().to_string_lossy().to_string();
+        // Seed the global cache with the directory as it stands: no remote.
+        assert_eq!(
+            resolve_project_identity(&cwd).method,
+            ProjectKeyMethod::PathFallback
+        );
+
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:Org/Repo.git\n",
+        )
+        .unwrap();
+
+        // Deliberately no assertion that the stale answer survives until the
+        // pass ends: the global resolver is shared with every other test in
+        // this binary, so "still cached" is not something one test can claim
+        // without asserting something about the others. `resolver_memoizes`
+        // pins the caching itself on a resolver it owns. What matters here is
+        // the recovery, and clearing is idempotent, so a concurrent clear can
+        // only make this pass sooner.
+        begin_acquisition_pass();
+        let identity = resolve_project_identity(&cwd);
+        assert_eq!(identity.project_key, "github.com/Org/Repo");
+        assert_eq!(identity.method, ProjectKeyMethod::Remote);
     }
 
     #[test]

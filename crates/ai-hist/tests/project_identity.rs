@@ -315,3 +315,125 @@ fn a_child_catalog_row_records_that_its_key_was_inherited() {
     // candidate, so a relationship cycle cannot make the loop churn.
     assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
 }
+
+/// Inheritance must reach as deep as the ledger can record.
+///
+/// One statement propagates one level, so the pass bound is a depth limit. At
+/// 16 it sat below `MAX_TREE_MAX_DEPTH`, the depth the relationship reader
+/// itself will walk, which meant a chain the tree renders in full could have
+/// its tail keyed by path while its head was keyed by repository — a split
+/// inside one delegation, reported as if both were settled.
+#[test]
+fn inheritance_reaches_the_full_depth_the_relationship_ledger_can_record() {
+    const DEPTH: usize = 40;
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("deep.db")).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'gen-0', '/work/app', 'github.com/Org/Repo', 'remote', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    for generation in 1..=DEPTH {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, cwd, last_activity_ms, discovery_state) \
+             VALUES ('codex', ?, '/tmp/scratch', 1, 'full')",
+            rusqlite::params![format!("gen-{generation}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, child_has_events, \
+             created_ms, updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegated', 'observed', 'test', 1, ?4, ?4)",
+            rusqlite::params![
+                format!("gen-{}", generation - 1),
+                format!("child:gen-{generation}"),
+                format!("gen-{generation}"),
+                generation as i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    refresh_project_identity(&conn).unwrap();
+
+    for generation in 1..=DEPTH {
+        assert_eq!(
+            session_key(&conn, "codex", &format!("gen-{generation}")),
+            (
+                Some("github.com/Org/Repo".to_string()),
+                Some(ProjectKeyMethod::Inherited.as_str().to_string())
+            ),
+            "generation {generation} did not inherit"
+        );
+    }
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// A path key is the absence of an answer, not an answer, and must not stick.
+///
+/// `upsert_session` resolves from the working directory alone. When that
+/// checkout has since been deleted or moved it stamps a path key — and if the
+/// refresh only ever filled NULLs, nothing would revisit that row: not the
+/// refresh, which sees a non-NULL key, and not shallow discovery, which skips
+/// a source whose bytes have not changed. The repository's own `repo_url`,
+/// which the Codex reader records, would sit unused in the same row while
+/// every worktree of that repository filed under a different key.
+#[test]
+fn a_path_key_is_upgraded_once_a_recorded_remote_is_available() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("stale.db")).unwrap();
+    let gone = temp.path().join("deleted-checkout");
+
+    // The state `upsert_session` leaves for a session whose checkout is gone.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) VALUES ('codex', 'sess', ?, ?, 'path', 1, 'full')",
+        rusqlite::params![gone.to_string_lossy(), gone.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text, cwd) \
+         VALUES ('codex', 'sess', 'e1', 1, 'user', 'text', 'hi', ?)",
+        rusqlite::params![gone.to_string_lossy()],
+    )
+    .unwrap();
+    // Nothing to upgrade with yet, so the path key stands rather than being
+    // replaced by a guess.
+    refresh_project_identity(&conn).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "sess").1.as_deref(),
+        Some(ProjectKeyMethod::PathFallback.as_str())
+    );
+
+    // The provider recorded the repository all along.
+    conn.execute(
+        "UPDATE sessions SET repo_url = 'git@github.com:Org/Repo.git' WHERE session_id = 'sess'",
+        [],
+    )
+    .unwrap();
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    assert_eq!(
+        session_key(&conn, "codex", "sess"),
+        (
+            Some("github.com/Org/Repo".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+    );
+    assert_eq!(
+        event_keys(&conn, "codex", "sess"),
+        vec![Some("github.com/Org/Repo".to_string())],
+        "the denormalized copy must follow the upgrade"
+    );
+
+    // And a remote key is never downgraded back to a path on a later pass,
+    // even though the checkout is still missing.
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+    assert_eq!(
+        session_key(&conn, "codex", "sess").1.as_deref(),
+        Some(ProjectKeyMethod::Remote.as_str())
+    );
+}

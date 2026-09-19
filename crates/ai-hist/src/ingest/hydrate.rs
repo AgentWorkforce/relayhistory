@@ -125,6 +125,8 @@ fn hydrate_session_at_with_home_and_connectors(
     connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    // One hydration is one acquisition pass; see `begin_acquisition_pass`.
+    crate::project_identity::begin_acquisition_pass();
     if options.scope == SessionScope::Remote {
         crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "hydration",

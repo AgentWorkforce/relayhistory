@@ -384,6 +384,10 @@ impl SyncSourceReport {
 }
 
 fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
+    // See `begin_acquisition_pass`: the resolver's cache is sound only within
+    // one pass, and a long-lived host (watch, the Node addon, a desktop app)
+    // runs many passes without restarting.
+    crate::project_identity::begin_acquisition_pass();
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -3349,21 +3353,27 @@ fn insert_session_event(
     event_uid: &str,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    // `project_key` is read from the owning session rather than resolved here.
-    // Every ingest path upserts the session before walking its records, so the
-    // key is already canonical (including a codex `repository_url` the shallow
-    // reader saw), and the subquery is answered by the `sessions` primary key.
-    // Doing it in the INSERT rather than in a sweep afterwards matters beyond
-    // cost: an UPDATE over `session_events` is a change every durable-delivery
-    // subscriber has to be told about, so a sweep would journal a second
-    // upsert for every event of every session on every sync.
-    // `COALESCE` on conflict so a re-ingest that runs before the session row
-    // exists cannot erase a key an earlier pass already stamped;
-    // [`crate::store::refresh_project_identity`] fills what remains NULL.
+    // Stamp `project_key` as the row is inserted rather than sweeping for it
+    // afterwards. An UPDATE over `session_events` is a change every
+    // durable-delivery subscriber has to be told about, so a sweep would
+    // journal a second upsert for every event of every session on every sync.
+    //
+    // The owning session's key is preferred when the row already exists,
+    // because it may be stronger than anything derivable here (a Codex
+    // `repository_url`, or a key inherited from a delegating parent). But it
+    // is not depended on: the Codex walk writes a rollout's events *before*
+    // upserting its session, and a delegated thread never gets a catalog row
+    // at all, so a lookup alone would leave those events null and hand them
+    // straight back to the sweep this design exists to avoid. Resolving the
+    // cwd is the fallback, and it agrees with what `upsert_session` will store
+    // for the same directory, so the ordinary case converges with no rewrite.
+    let resolved = cwd
+        .and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None))
+        .map(|(key, _)| key);
     conn.execute(
         "INSERT INTO session_events \
          (source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?1, ?2, ?3, (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         VALUES (?1, ?2, ?3, COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, project_key=COALESCE(excluded.project_key, session_events.project_key), \
          cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
@@ -3384,6 +3394,7 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            resolved,
         ],
     )?;
     Ok(())

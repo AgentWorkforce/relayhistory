@@ -672,3 +672,63 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
     );
     Ok(())
 }
+
+/// A plugin snapshot must not leave the canonical project key null or stale.
+///
+/// `apply_normalized` writes `session_events` rows straight from an adapter's
+/// payload and commits. The adapter is free to omit `project_key` -- an older
+/// one does not know the field exists -- or to report one that no longer
+/// matches the session. Without a refresh inside that transaction, those rows
+/// are the one place in the database where the identity is missing, and for an
+/// adapter that never reports again the gap never closes. It has to be inside
+/// the transaction, not after the commit, or every reader in between is served
+/// the gap.
+#[test]
+fn a_plugin_snapshot_leaves_every_event_carrying_the_session_key() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("history.db");
+    observe(&path, "one")?;
+
+    let conn = ai_hist::open_db(&path)?;
+    // The session's identity, as discovery would have resolved it.
+    conn.execute(
+        "UPDATE sessions SET cwd = '/work/app', project_key = 'github.com/Org/Repo', \
+         project_key_method = 'remote' WHERE source = 'claude' AND session_id = 's'",
+        [],
+    )?;
+    // A legacy event already in the store with no key at all.
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+         VALUES ('claude', 's', 'legacy', 1, 'user', 'text', 'older row')",
+        [],
+    )?;
+    let revision = state(&path, "one")?
+        .revision
+        .expect("an observed session has a revision");
+
+    // The adapter reports one event and says nothing about the project.
+    apply(
+        &path,
+        "one",
+        revision,
+        vec![EvidenceKind::SessionEvent],
+        vec![event("fresh", "from the plugin")],
+    )?;
+
+    let keys: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT event_uid, project_key FROM session_events ORDER BY event_uid")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(
+        keys,
+        vec![
+            ("fresh".to_string(), Some("github.com/Org/Repo".to_string())),
+            (
+                "legacy".to_string(),
+                Some("github.com/Org/Repo".to_string())
+            ),
+        ],
+        "the snapshot must leave both the new and the legacy row keyed"
+    );
+    Ok(())
+}
