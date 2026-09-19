@@ -1,0 +1,17 @@
+{
+  "id": "msg_child_asst",
+  "sessionID": "ses_child",
+  "role": "assistant",
+  "time": { "created": 1776988823500 },
+  "parentID": "msg_child_user",
+  "providerID": "anthropic",
+  "modelID": "claude-haiku-4-5",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 3,
+    "output": 50,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 2000 }
+  }
+}

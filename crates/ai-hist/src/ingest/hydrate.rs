@@ -11,7 +11,16 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 when OpenCode stopped being prompts-only. An install indexed by
+/// an earlier release has `history` rows and nothing else for its OpenCode
+/// sessions; the bump makes the next hydration of each one re-read it and
+/// write the events, tool calls, file edits, markers and relationships it
+/// should have had. The global `sync --local` path keeps no per-session stamp
+/// for OpenCode — it re-reads every session each run — so it repairs itself
+/// without a predicate; `an_install_indexed_as_prompts_only_gains_events_on_the_next_plain_sync`
+/// proves that rather than assuming it.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -1022,6 +1031,9 @@ fn source_snapshot(
         let configured_path = std::env::var_os("OPENCODE_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+        let configured_storage = std::env::var_os("OPENCODE_STORAGE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
@@ -1029,6 +1041,12 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
+        // A locator inside the legacy tree is a session file, not the store:
+        // it is stamped by its own bytes, the way every other file-backed
+        // provider is.
+        if opencode_locator_is_in_storage_tree(&path, &configured_storage) {
+            return opencode_json_tree_snapshot(options, &path);
+        }
         if fs::canonicalize(&path).ok() != fs::canonicalize(&configured_path).ok() {
             return Err(hydration_error(
                 "SESSION_SOURCE_MISMATCH",
@@ -1150,6 +1168,93 @@ fn source_snapshot(
     })
 }
 
+/// Whether a catalog locator points inside the configured legacy tree. The
+/// comparison is on canonical paths so a symlinked storage root still matches,
+/// and a locator outside it is rejected rather than read.
+fn opencode_locator_is_in_storage_tree(path: &Path, storage_dir: &Path) -> bool {
+    let (Ok(path), Ok(root)) = (fs::canonicalize(path), fs::canonicalize(storage_dir)) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+/// Stamp one legacy-tree session by the bytes of everything that composes it:
+/// the session file, its messages and its parts. The session file alone does
+/// not change when a new turn is appended — the new part is a *new file* — so
+/// stamping only the session file would make a growing session look unchanged
+/// and freeze its evidence at the first read.
+fn opencode_json_tree_snapshot(
+    options: &HydrateSessionOptions,
+    session_file: &Path,
+) -> Result<SourceSnapshot> {
+    if !session_file.is_file() {
+        return Err(hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!("OpenCode source {} is unavailable", session_file.display()),
+        ));
+    }
+    let root = session_file
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                "OpenCode session file is not inside a storage tree",
+            )
+        })?;
+    let mut bytes = fs::metadata(session_file)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let mut records: i64 = 1;
+    let mut newest: u128 = 0;
+    let mut stamp_file = |path: &Path| {
+        if let Ok(meta) = fs::metadata(path) {
+            bytes += meta.len();
+            records += 1;
+            newest = newest.max(
+                meta.modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default(),
+            );
+        }
+    };
+    let messages = root.join("message").join(&options.session_id);
+    let mut message_ids = Vec::new();
+    if let Ok(entries) = fs::read_dir(&messages) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            stamp_file(&path);
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                message_ids.push(stem.to_string());
+            }
+        }
+    }
+    message_ids.sort();
+    for message_id in &message_ids {
+        if let Ok(entries) = fs::read_dir(root.join("part").join(message_id)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    stamp_file(&path);
+                }
+            }
+        }
+    }
+    Ok(SourceSnapshot {
+        stamp: format!("{bytes}:{records}:{newest}"),
+        bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+        records,
+        path: Some(session_file.to_path_buf()),
+        claude_subagents: Vec::new(),
+    })
+}
+
 fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> {
     let roots = match source {
         "claude" => vec![home.join(".claude/projects")],
@@ -1208,7 +1313,18 @@ fn ingest_selected(
         "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
         "grok" => ingest_grok(conn, options, path.unwrap()),
         "opencode" => {
-            sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
+            let path = path.unwrap();
+            // Whichever layout the catalog recorded. Both end in the same
+            // normalizer, so the evidence is identical either way.
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                crate::store::sync_opencode_session_from_storage_dir(
+                    conn,
+                    path,
+                    &options.session_id,
+                )?;
+            } else {
+                sync_opencode_session(conn, path, &options.session_id)?;
+            }
             Ok(())
         }
         _ => Err(hydration_error(

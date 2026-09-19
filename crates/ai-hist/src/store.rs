@@ -141,11 +141,32 @@ CREATE TABLE IF NOT EXISTS session_events (
     text TEXT,
     model TEXT,
     token_json TEXT,
+    -- The upstream inference provider, when the harness records it as its own
+    -- field. OpenCode writes `providerID`; Claude and Codex do not name one,
+    -- so theirs stays null rather than being guessed from the model string.
+    provider TEXT,
+    -- Why the turn ended, as the harness itself reported it (OpenCode's last
+    -- `step-finish.reason`).
+    stop_reason TEXT,
     event_uid TEXT NOT NULL,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
     text, role, project, content='session_events', content_rowid='id'
+);
+-- Points in a session that are not turns: a context compaction, a resume, a
+-- fork. `marker_uid` is derived from the provider record that established the
+-- marker, so re-ingesting the same session is idempotent.
+CREATE TABLE IF NOT EXISTS session_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    message_id TEXT,
+    ts_ms INTEGER,
+    detail_json TEXT,
+    marker_uid TEXT NOT NULL,
+    UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -410,6 +431,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "history_fts",
     "session_events",
     "session_events_fts",
+    "session_markers",
     "tool_calls",
     "file_edits",
     "session_commit_links",
@@ -457,6 +479,10 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 ];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
+/// `session_events` columns added after the table shipped. Like the `sessions`
+/// list above, this single declaration is both the migration list and the
+/// read-only guard list, so the two cannot drift.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["provider", "stop_reason"];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
 /// so a database still carrying the v1 table is not current for any read.
@@ -656,6 +682,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSION_PRESENCE_COLUMNS
         .iter()
         .all(|needed| presence_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|needed| event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -878,6 +914,7 @@ END;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
+    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
     // already-current database remains cheap to check. The outer immediate
@@ -1015,6 +1052,10 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_markers_session ON session_markers(source, session_id, ts_ms)",
         [],
     )?;
     conn.execute(
@@ -1549,6 +1590,10 @@ pub struct SessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The upstream inference provider the harness named, when it names one.
+    pub provider: Option<String>,
+    /// Why the turn ended, as the harness reported it.
+    pub stop_reason: Option<String>,
     pub event_uid: String,
 }
 
@@ -1636,7 +1681,7 @@ pub fn session_events(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionEvent>> {
-    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
+    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, provider, stop_reason,                    event_uid FROM session_events WHERE session_id = ?"
         .to_string();
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
@@ -1661,7 +1706,9 @@ pub fn session_events(
             text: row.get(11)?,
             model: row.get(12)?,
             token_json: row.get(13)?,
-            event_uid: row.get(14)?,
+            provider: row.get(14)?,
+            stop_reason: row.get(15)?,
+            event_uid: row.get(16)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1678,7 +1725,8 @@ pub fn session_events_page(
     let limit = limit.clamp(1, 1_000);
     let mut sql =
         "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
-                          ts_ms, role, kind, text, model, token_json, event_uid \
+                          ts_ms, role, kind, text, model, token_json, provider, stop_reason, \
+                          event_uid \
                    FROM session_events WHERE session_id = ?"
             .to_string();
     let mut params_vec = vec![session_id.to_string()];
@@ -1712,7 +1760,9 @@ pub fn session_events_page(
             text: row.get(11)?,
             model: row.get(12)?,
             token_json: row.get(13)?,
-            event_uid: row.get(14)?,
+            provider: row.get(14)?,
+            stop_reason: row.get(15)?,
+            event_uid: row.get(16)?,
         })
     })?;
     let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2146,12 +2196,32 @@ pub fn shell_quote(value: &str) -> String {
     }
 }
 
+/// Whether the caller explicitly asked for the whole-database copy.
+///
+/// The copy is a per-sync `Connection::backup` of the provider's entire store
+/// plus a provider-side index build on the copy; on a large `opencode.db` that
+/// is hundreds of megabytes of I/O for evidence the bounded path reads with
+/// session-keyed queries. It is now opt-in at *runtime* as well as at compile
+/// time, so the default path does not copy even in a build that has the
+/// feature — which is what `--all-features` gives CI.
+#[cfg(feature = "opencode-backup")]
+fn opencode_backup_requested() -> bool {
+    std::env::var_os("AI_HIST_OPENCODE_BACKUP").is_some_and(|value| value == "1")
+}
+
+/// Index every OpenCode session the provider store holds.
+///
+/// The default path opens the live store read-only, pins one deferred read
+/// transaction, and runs session-keyed queries against it. Nothing is copied,
+/// no temporary database is created, and no provider DDL is issued, so the
+/// cost is proportional to the history actually read rather than to the size
+/// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
     if !opencode_db.exists() {
         return Ok(0);
     }
     #[cfg(feature = "opencode-backup")]
-    {
+    if opencode_backup_requested() {
         let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
         let src_live = Connection::open_with_flags(
             opencode_db,
@@ -2166,38 +2236,55 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
         src.execute_batch(
             "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
         )?;
-        sync_opencode_sessions_from_source(conn, &src)
+        return sync_opencode_sessions_from_source(conn, &src, opencode_db);
     }
-    #[cfg(not(feature = "opencode-backup"))]
-    {
-        let src = Connection::open_with_flags(
-            opencode_db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("opening {}", opencode_db.display()))?;
-        src.busy_timeout(std::time::Duration::from_secs(5))?;
-        src.execute_batch("BEGIN")?;
-        let result = sync_opencode_sessions_from_source(conn, &src);
-        let _ = src.execute_batch("ROLLBACK");
-        result
-    }
+    let src = Connection::open_with_flags(
+        opencode_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", opencode_db.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    src.execute_batch("BEGIN")?;
+    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db);
+    let _ = src.execute_batch("ROLLBACK");
+    result
 }
 
-fn sync_opencode_sessions_from_source(conn: &Connection, src: &Connection) -> Result<usize> {
-    let session_ids = src
-        .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+/// Index every OpenCode session in a legacy `storage/` JSON tree.
+pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Result<usize> {
+    if !storage_dir.join("session").is_dir() {
+        return Ok(0);
+    }
     let mut inserted = 0;
-    for session_id in session_ids {
-        inserted += sync_opencode_session_from_connection(conn, src, &session_id)?;
+    for session_file in crate::ingest::opencode::list_json_tree_session_files(storage_dir) {
+        let Some(loaded) = crate::ingest::opencode::load_from_json_tree(&session_file)? else {
+            continue;
+        };
+        inserted +=
+            crate::ingest::opencode::normalize(conn, &loaded, &session_file.to_string_lossy())?
+                .prompts;
+    }
+    Ok(inserted)
+}
+
+fn sync_opencode_sessions_from_source(
+    conn: &Connection,
+    src: &Connection,
+    raw_path: &Path,
+) -> Result<usize> {
+    let raw_path = raw_path.to_string_lossy().into_owned();
+    let mut inserted = 0;
+    for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
+        if let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, &session_id)? {
+            inserted += crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+        }
     }
     Ok(inserted)
 }
 
 /// Ingest one OpenCode session with session-keyed queries against the live
-/// source database. Unlike global sync this never copies or enumerates the
-/// complete provider store.
+/// source database. Unlike global sync this never enumerates the complete
+/// provider store.
 pub fn sync_opencode_session(
     conn: &Connection,
     opencode_db: &Path,
@@ -2210,60 +2297,82 @@ pub fn sync_opencode_session(
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src.busy_timeout(std::time::Duration::from_secs(5))?;
     src.execute_batch("BEGIN")?;
-    let result = sync_opencode_session_from_connection(conn, &src, session_id);
+    let result = sync_opencode_session_from_connection(conn, &src, session_id, opencode_db);
     let _ = src.execute_batch("ROLLBACK");
     result
+}
+
+/// Ingest one OpenCode session from a legacy `storage/` JSON tree.
+pub fn sync_opencode_session_from_storage_dir(
+    conn: &Connection,
+    session_file: &Path,
+    session_id: &str,
+) -> Result<usize> {
+    let Some(loaded) = crate::ingest::opencode::load_from_json_tree(session_file)? else {
+        return Ok(0);
+    };
+    if loaded.session.id != session_id {
+        anyhow::bail!(
+            "OpenCode session file {} holds session '{}', not '{session_id}'",
+            session_file.display(),
+            loaded.session.id
+        );
+    }
+    Ok(crate::ingest::opencode::normalize(conn, &loaded, &session_file.to_string_lossy())?.prompts)
 }
 
 fn sync_opencode_session_from_connection(
     conn: &Connection,
     src: &Connection,
     session_id: &str,
+    raw_path: &Path,
 ) -> Result<usize> {
-    let mut stmt = src.prepare(
-        "SELECT s.directory, p.data, COALESCE(p.time_created, m.time_created, s.time_created) \
-         FROM session s \
-         JOIN part p ON p.session_id = s.id \
-         JOIN message m ON m.id = p.message_id \
-         WHERE s.id = ? \
-           AND json_extract(m.data, '$.role') = 'user' \
-           AND json_extract(p.data, '$.type') = 'text' \
-         ORDER BY COALESCE(p.time_created, m.time_created, s.time_created) ASC",
-    )?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut inserted = 0;
-    for (project, data, timestamp_ms) in rows {
-        let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
-        let prompt = value
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if prompt.is_empty() {
-            continue;
-        }
-        inserted += insert_history(
-            conn,
-            &HistoryEntry {
-                id: 0,
-                source: "opencode".into(),
-                session_id: Some(session_id.to_string()),
-                project,
-                prompt: prompt.to_string(),
-                prompt_hash: Some(prompt_hash(prompt)),
-                timestamp_ms,
-            },
-        )?;
+    let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, session_id)? else {
+        return Ok(0);
+    };
+    Ok(crate::ingest::opencode::normalize(conn, &loaded, &raw_path.to_string_lossy())?.prompts)
+}
+
+/// One session's markers, oldest first. A marker is a point in the session
+/// that is not a turn: a compaction boundary, for instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMarker {
+    pub source: String,
+    pub session_id: String,
+    pub kind: String,
+    pub message_id: Option<String>,
+    pub ts_ms: Option<i64>,
+    pub detail_json: Option<String>,
+    pub marker_uid: String,
+}
+
+pub fn session_markers(
+    conn: &Connection,
+    session_id: &str,
+    source: Option<&str>,
+) -> Result<Vec<SessionMarker>> {
+    let mut sql = "SELECT source, session_id, kind, message_id, ts_ms, detail_json, marker_uid \
+                   FROM session_markers WHERE session_id = ?"
+        .to_string();
+    let mut values = vec![session_id.to_string()];
+    if let Some(source) = source {
+        sql.push_str(" AND source = ?");
+        values.push(source.to_string());
     }
-    Ok(inserted)
+    sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok(SessionMarker {
+            source: row.get(0)?,
+            session_id: row.get(1)?,
+            kind: row.get(2)?,
+            message_id: row.get(3)?,
+            ts_ms: row.get(4)?,
+            detail_json: row.get(5)?,
+            marker_uid: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
@@ -2305,6 +2414,68 @@ mod tests {
         // A database opened through init_db has everything.
         let current = open_db(&dir.join("current.db")).unwrap();
         assert!(schema_is_current(&current).unwrap());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database written by a release before OpenCode carried event-level
+    /// evidence: `session_events` without `provider`/`stop_reason`, and no
+    /// `session_markers` at all. The migration has to be additive — the rows
+    /// already there survive it — and the read-only guard has to refuse the
+    /// database until it has run, or a search would meet `no such column`.
+    #[test]
+    fn a_database_from_before_opencode_event_evidence_migrates_additively() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-hist-opencode-migration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE session_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     project TEXT, cwd TEXT, git_branch TEXT,
+                     message_id TEXT, parent_id TEXT,
+                     ts_ms INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     text TEXT, model TEXT, token_json TEXT,
+                     event_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, event_uid)
+                 );
+                 INSERT INTO session_events
+                     (source, session_id, ts_ms, role, kind, text, event_uid)
+                 VALUES ('opencode', 'ses_old', 1, 'user', 'text', 'kept', 'uid-1');",
+            )
+            .unwrap();
+            assert!(
+                !schema_is_current(&old).unwrap(),
+                "an unmigrated database must not be served read-only"
+            );
+        }
+
+        // Opening writably migrates.
+        let migrated = open_db(&path).unwrap();
+        assert!(schema_is_current(&migrated).unwrap());
+        let (text, provider, stop_reason): (String, Option<String>, Option<String>) = migrated
+            .query_row(
+                "SELECT text, provider, stop_reason FROM session_events WHERE event_uid = 'uid-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "kept", "the existing row survives the migration");
+        assert_eq!(provider, None, "a backfilled column starts null");
+        assert_eq!(stop_reason, None);
+        assert!(session_markers(&migrated, "ses_old", None)
+            .unwrap()
+            .is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }

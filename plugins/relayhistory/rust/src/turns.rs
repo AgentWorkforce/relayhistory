@@ -241,6 +241,7 @@ mod tests {
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
+                provider TEXT, stop_reason TEXT,
                 event_uid TEXT NOT NULL
             );",
         )

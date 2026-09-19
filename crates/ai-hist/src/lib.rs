@@ -46,7 +46,7 @@ pub mod git_sdk;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
 mod git_sdk;
 
-pub(crate) use paths::{default_opencode_db_path, home_dir};
+pub(crate) use paths::{default_opencode_db_path, default_opencode_storage_dir, home_dir};
 pub(crate) use relationship_capture::now_ms;
 #[cfg(feature = "unstable-internal")]
 pub use relationship_graph as relationships;

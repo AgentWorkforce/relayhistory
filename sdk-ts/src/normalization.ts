@@ -190,6 +190,8 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     text: nullableString(value.text),
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
+    provider: nullableString(value.provider),
+    stopReason: nullableString(value.stopReason),
     eventUid: String(value.eventUid),
   };
 }

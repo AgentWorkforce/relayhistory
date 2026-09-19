@@ -197,6 +197,14 @@ export interface SessionEvent {
   text: string | null;
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
+  /**
+   * The upstream inference provider, when the harness records one of its own
+   * (OpenCode's `providerID`). Null for harnesses that do not name one — it is
+   * never inferred from `model`.
+   */
+  provider: string | null;
+  /** Why the turn ended, as the harness itself reported it. */
+  stopReason: string | null;
   eventUid: string;
 }
 

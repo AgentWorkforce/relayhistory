@@ -1,7 +1,7 @@
 use crate::{
     default_db_path, insert_history, now_ms, open_db, open_db_readonly, parse_cursor_text,
     prompt_hash, schema_is_catalog_read_current, sync_opencode_db, sync_opencode_session,
-    HistoryEntry, SessionLocation, SessionScope,
+    sync_opencode_storage_dir, HistoryEntry, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -16,6 +16,13 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod hydrate;
+pub(crate) mod opencode;
+
+/// `session_markers.kind` for the point a harness compacted its context. The
+/// turns either side of it are real, but the model's view of everything
+/// before it was replaced by a summary, so a consumer reading straight across
+/// the boundary is reading two different contexts as one.
+pub(crate) const OPENCODE_MARKER_COMPACTION_BOUNDARY: &str = "compaction_boundary";
 
 use crate::diagnostics::*;
 use crate::discover;
@@ -468,9 +475,24 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
-    if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
+    let opencode_storage = std::env::var_os("OPENCODE_STORAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
+    // One owner, two layouts: `opencode.db` when the host has it, the legacy
+    // `storage/` tree when it does not. Never both — a host that upgraded has
+    // a stale tree sitting beside a live database.
+    let opencode_result = match opencode.exists() {
+        true => sync_opencode_db(conn, &opencode),
+        false => sync_opencode_storage_dir(conn, &opencode_storage),
+    };
+    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
         if opencode.exists() {
             sync_note!("  [opencode] +{open_inserted} rows");
+        } else if opencode_storage.join("session").is_dir() {
+            sync_note!(
+                "  [opencode] +{open_inserted} rows from {}",
+                opencode_storage.display()
+            );
         } else {
             sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
         }
@@ -480,7 +502,8 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
-    let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode);
+    let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode)
+        .with_opencode_storage_dir(opencode_storage);
     discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
@@ -3302,6 +3325,9 @@ fn ingest_claude_transcript_as(
     Ok(())
 }
 
+/// For the providers that do not record an upstream inference provider or a
+/// per-turn stop reason. OpenCode does record both; it calls
+/// [`insert_session_event_with_provenance`] instead.
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
@@ -3320,15 +3346,48 @@ fn insert_session_event(
     token_json: Option<&str>,
     event_uid: &str,
 ) -> Result<()> {
+    insert_session_event_with_provenance(
+        conn, source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role,
+        kind, text, model, token_json, None, None, event_uid,
+    )
+}
+
+/// One normalized event, including the two columns only some providers can
+/// fill: `provider` (the upstream inference provider, which OpenCode records
+/// as `providerID`) and `stop_reason` (OpenCode's last `step-finish.reason`).
+/// Both stay null for a provider that does not record them rather than being
+/// inferred from the model string, which is a consumer's job and not a
+/// parser's.
+#[allow(clippy::too_many_arguments)]
+fn insert_session_event_with_provenance(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    message_id: &str,
+    parent_id: Option<&str>,
+    ts_ms: i64,
+    role: &str,
+    kind: &str,
+    text: Option<&str>,
+    model: Option<&str>,
+    token_json: Option<&str>,
+    provider: Option<&str>,
+    stop_reason: Option<&str>,
+    event_uid: &str,
+) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, stop_reason, event_uid) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, provider=excluded.provider, \
+         stop_reason=excluded.stop_reason",
         params![
             source,
             session_id,
@@ -3343,6 +3402,8 @@ fn insert_session_event(
             text,
             model,
             token_json,
+            provider,
+            stop_reason,
             event_uid,
         ],
     )?;

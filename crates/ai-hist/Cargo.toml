@@ -60,6 +60,10 @@ name = "hydration_preflight"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "opencode_parity"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "session_relationships"
 required-features = ["unstable-internal"]
 

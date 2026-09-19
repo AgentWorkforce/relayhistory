@@ -165,6 +165,10 @@ pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
     let (stable_child_identity, records) = match source {
         // Every Codex subagent rollout opens with its own thread id.
         "codex" => ("always", true),
+        // An OpenCode subagent session is a session in its own right and its
+        // record names the parent outright, in `session.parentID`. Nothing is
+        // inferred, so the child identity is always stable.
+        "opencode" => ("always", true),
         // Claude subagent transcripts carry the parent's `sessionId`; only
         // provider versions that also emit a per-child `agentId` give the
         // child a stable identity.
@@ -1077,11 +1081,18 @@ mod tests {
             relationship_capabilities("codex").stable_child_identity,
             "always"
         );
+        // OpenCode's `session.parentID` names the parent outright, so its
+        // child identity is observed rather than inferred.
+        let opencode = relationship_capabilities("opencode");
+        assert_eq!(opencode.stable_child_identity, "always");
+        assert!(opencode.records_agent_type);
+        assert!(opencode.records_spawn_time);
+        assert!(opencode.records_evidence_locator);
         assert_eq!(
             relationship_capabilities("claude").stable_child_identity,
             "sometimes"
         );
-        for source in ["cursor", "grok", "opencode", "relay"] {
+        for source in ["cursor", "grok", "relay"] {
             let capabilities = relationship_capabilities(source);
             assert_eq!(capabilities.stable_child_identity, "never");
             assert!(!capabilities.records_agent_type);

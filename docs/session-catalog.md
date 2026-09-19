@@ -326,7 +326,7 @@ read.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – | – (never) | mtime-derived | ✓ | – | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
-| **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
 Delegation is a separate capability, reported on every relationship result as
@@ -335,8 +335,14 @@ Delegation is a separate capability, reported on every relationship result as
 | Source | Stable child identity | Agent type | Spawn time | Evidence locator |
 |---|---|---|---|---|
 | **codex** | always | ✓ | ✓ | ✓ |
+| **opencode** | always | ✓ | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
-| **cursor**, **grok**, **opencode**, **relay** | never | – | – | – |
+| **cursor**, **grok**, **relay** | never | – | – | – |
+
+OpenCode is `always` because a subagent session is a session in its own right
+and its own record names the parent, in `session.parentID`. Nothing is
+inferred from file names or ordering, so the edge is recorded with
+`evidence_kind = "opencode_parent_id"` and `identity_status = "observed"`.
 
 Claude is `sometimes` because a subagent transcript carries the *parent's*
 `sessionId` on every record; the child's own identity is the per-child
@@ -371,8 +377,44 @@ How each adapter works:
 - **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
-- **opencode** — the SQLite store at `$OPENCODE_DB` (default
-  `~/.local/share/opencode/opencode.db`). Discovery opens the live store with
+- **opencode** — **two storage layouts**, because both are in the field.
+  RelayHistory prefers `opencode.db` when the host has it and falls back to the
+  legacy JSON tree when it does not; it never reads both, because a host that
+  upgraded has a stale tree sitting beside a live database.
+
+  | Layout | Location | Environment override |
+  |---|---|---|
+  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB` |
+  | Legacy JSON tree (older installs) | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_DIR` |
+
+  The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
+  `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
+  The *payloads* are identical to the `data` columns in the SQLite tables, so
+  one normalizer parses both and the evidence a session produces does not
+  depend on how it was stored. `crates/ai-hist/tests/opencode_parity.rs`
+  asserts that by deriving a JSON tree from the SQLite fixture and comparing
+  every row apart from the provenance path.
+
+  A hydrated OpenCode session yields, per assistant message: `session_events`
+  of kind `text` for each non-synthetic `text` part, `tool_use` plus a
+  `tool_calls` row for each `tool` part (`tool_use_id` = `callID`, `is_error`
+  from `state.status == "error"` or `state.metadata.exit != 0`), a
+  `tool_result` event from `state.output`, and a `file_edits` row for
+  `write`/`edit`/`patch`. Each event carries `model` as
+  `"<providerID>/<modelID>"`, `provider` as the bare `providerID`, `token_json`
+  as the message's `tokens` object verbatim
+  (`{input, output, reasoning, cache:{read, write}}`), and `stop_reason` from
+  the message's last `step-finish.reason`. A `compaction` part records a
+  `session_markers` row of kind `compaction_boundary`.
+
+  Global sync reads the live store with session-keyed queries and copies
+  nothing. The old whole-database `Connection::backup` is now opt-in at both
+  compile time (the `opencode-backup` feature) *and* run time
+  (`AI_HIST_OPENCODE_BACKUP=1`); on a large store it is hundreds of megabytes
+  of I/O for evidence the default path already reads, so it exists only as an
+  escape hatch for a provider schema whose indexes make the bounded path slow.
+
+  For the SQLite layout, discovery opens the live store with
   SQLite read-only and `query_only` enforcement, then holds one deferred read
   transaction for the run. Candidate enumeration and every selected-session
   query therefore share one committed SQLite snapshot. In WAL mode OpenCode's
@@ -476,7 +518,8 @@ Each connector presence stores a `source_stamp` —
 |---|---|
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
 | grok | the chat file's marker, `\|`, the `summary.json` marker |
-| opencode | `{database identity}:{schema version}:{time_created}:{time_updated}` |
+| opencode (SQLite) | `{database identity}:{schema version}:{time_created}:{time_updated}` |
+| opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}` over the session file, its messages and their parts |
 | relay | `{newest synced timestamp}:{synced row count}` |
 
 On a rescan, a candidate whose stamp matches the stamp for that same location

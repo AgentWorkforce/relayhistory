@@ -68,6 +68,13 @@ export interface NativeSessionEvent {
   text?: string
   model?: string
   tokenJson?: string
+  /**
+   * The upstream inference provider the harness named, when it names one
+   * (OpenCode's `providerID`). Null elsewhere rather than inferred.
+   */
+  provider?: string
+  /** Why the turn ended, as the harness reported it. */
+  stopReason?: string
   eventUid: string
 }
 export interface EventCursor {

@@ -62,6 +62,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use crate::{
     open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
 };
+use crate::ingest::opencode::OpencodeLayout;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -256,6 +257,9 @@ pub struct DiscoveryEnv<'a> {
     pub home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
+    /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
+    /// is no `opencode.db`.
+    pub opencode_storage_dir: PathBuf,
     conn: &'a Connection,
     counters: CounterCell,
 }
@@ -266,6 +270,7 @@ impl<'a> DiscoveryEnv<'a> {
         Self {
             home: crate::home_dir(),
             opencode_db: crate::default_opencode_db_path(),
+            opencode_storage_dir: crate::default_opencode_storage_dir(),
             conn,
             counters: CounterCell::default(),
         }
@@ -275,12 +280,26 @@ impl<'a> DiscoveryEnv<'a> {
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
+        let opencode_storage_dir = opencode_db
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         Self {
             home,
             opencode_db,
+            opencode_storage_dir,
             conn,
             counters: CounterCell::default(),
         }
+    }
+
+    /// Point the legacy JSON tree somewhere other than beside the database.
+    /// Hosts that set `OPENCODE_STORAGE_DIR` independently of `OPENCODE_DB`
+    /// need this; so do tests, which must not mutate process-wide variables.
+    #[must_use]
+    pub fn with_opencode_storage_dir(mut self, storage_dir: PathBuf) -> Self {
+        self.opencode_storage_dir = storage_dir;
+        self
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -296,6 +315,7 @@ impl<'a> DiscoveryEnv<'a> {
         ScanEnv {
             home: &self.home,
             opencode_db: &self.opencode_db,
+            opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
         }
     }
@@ -331,6 +351,8 @@ pub struct ScanEnv<'a> {
     pub home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Root of OpenCode's legacy `storage/` JSON tree.
+    pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
 }
 
@@ -1273,13 +1295,24 @@ struct OpencodeReadSnapshot {
 
 impl OpencodeProvider {
     /// Open the provider once, read-only, and start the transaction that pins
-    /// the run's SQLite snapshot. `None` means there is no OpenCode store.
+    /// the run's SQLite snapshot. `None` means this host is not on the SQLite
+    /// layout — either it has the legacy JSON tree, or it has no OpenCode
+    /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && scan.opencode_db.exists() {
+        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
             *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
+    }
+}
+
+impl ScanEnv<'_> {
+    /// Which OpenCode layout this host actually has. `opencode.db` wins when
+    /// both are present: newer releases write SQLite and leave the old tree
+    /// behind, so preferring the tree would serve stale history.
+    pub(crate) fn opencode_layout(&self) -> Option<OpencodeLayout> {
+        OpencodeLayout::detect(self.opencode_db, self.opencode_storage_dir)
     }
 }
 
@@ -1395,6 +1428,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
+        if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
+            return enumerate_opencode_json_tree(&scan, &root, requested_limit);
+        }
         let mut guard = self.snapshot(&scan)?;
         let Some(snapshot) = guard.as_mut() else {
             return Ok(Vec::new());
@@ -1498,6 +1534,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
+        if let Some(OpencodeLayout::JsonTree(_)) = scan.opencode_layout() {
+            return read_shallow_opencode_json_tree(scan, candidate);
+        }
         let guard = self.snapshot(scan)?;
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
@@ -1598,6 +1637,98 @@ impl ShallowSessionProvider for OpencodeProvider {
             ..Default::default()
         }))
     }
+}
+
+/// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
+///
+/// The tree has no index, so the stamp is the session file's own size and
+/// modification time: a file whose bytes have not changed since the last run
+/// cannot have new turns in it.
+fn enumerate_opencode_json_tree(
+    scan: &ScanEnv<'_>,
+    root: &Path,
+    requested_limit: Option<usize>,
+) -> Result<Vec<Candidate>> {
+    let mut rows = Vec::new();
+    for path in crate::ingest::opencode::list_json_tree_session_files(root) {
+        let Some(session_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let modified = file_generation_time(&metadata);
+        rows.push((session_id, path, metadata.len(), modified));
+    }
+    // Newest first, then by id, so a limit takes the same bounded head every
+    // run and the tie-break is total.
+    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    if let Some(limit) = requested_limit {
+        rows.truncate(limit);
+    }
+    scan.note_records(rows.len() as u64);
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, path, bytes, modified)| Candidate {
+            source: "opencode",
+            locator: path.to_string_lossy().into_owned(),
+            session_id: Some(session_id),
+            recency_hint_ms: i64::try_from(modified / 1_000_000).ok(),
+            stamp: format!("{bytes}:{modified}"),
+        })
+        .collect())
+}
+
+/// One session's catalog row from the legacy tree. This reads the session
+/// file plus that session's own messages and parts — never the whole tree.
+fn read_shallow_opencode_json_tree(
+    scan: &ScanEnv<'_>,
+    candidate: &Candidate,
+) -> Result<Option<ShallowSession>> {
+    let path = Path::new(&candidate.locator);
+    scan.note_open();
+    let Some(loaded) = crate::ingest::opencode::load_from_json_tree(path)? else {
+        return Ok(None);
+    };
+    scan.note_records(loaded.messages.len() as u64);
+    let first_prompt = loaded
+        .first_user_text()
+        .map(excerpt)
+        .filter(|text| !text.is_empty());
+    let mut models = Vec::new();
+    push_unique(&mut models, loaded.first_model().as_deref());
+    let times: Vec<i64> = loaded
+        .messages
+        .iter()
+        .map(|message| message.time_created)
+        .collect();
+    Ok(Some(ShallowSession {
+        source: "opencode".into(),
+        session_id: loaded.session.id.clone(),
+        cwd: loaded
+            .messages
+            .iter()
+            .find_map(|message| message.path_cwd.clone())
+            .or_else(|| loaded.session.directory.clone()),
+        first_activity_ms: loaded
+            .session
+            .created_ms
+            .or_else(|| times.iter().min().copied()),
+        last_activity_ms: loaded
+            .session
+            .updated_ms
+            .or_else(|| times.iter().max().copied()),
+        first_prompt,
+        models,
+        // The concrete session file, so hydration can stamp exactly what
+        // discovery read.
+        raw_path: Some(candidate.locator.clone()),
+        ..Default::default()
+    }))
 }
 
 fn file_generation_time(metadata: &fs::Metadata) -> u128 {

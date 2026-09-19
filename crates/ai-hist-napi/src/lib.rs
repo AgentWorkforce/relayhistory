@@ -34,7 +34,7 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -261,6 +261,11 @@ pub struct NativeSessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The upstream inference provider the harness named, when it names one
+    /// (OpenCode's `providerID`). Null elsewhere rather than inferred.
+    pub provider: Option<String>,
+    /// Why the turn ended, as the harness reported it.
+    pub stop_reason: Option<String>,
     pub event_uid: String,
 }
 
@@ -281,6 +286,8 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             text: event.text,
             model: event.model,
             token_json: event.token_json,
+            provider: event.provider,
+            stop_reason: event.stop_reason,
             event_uid: event.event_uid,
         }
     }
