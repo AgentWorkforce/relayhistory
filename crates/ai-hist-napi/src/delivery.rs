@@ -162,7 +162,7 @@ pub async fn history_delivery(
                     lease,
                     lease_ms,
                     now_ms,
-                } => serde_json::to_value(core::renew_lease(&conn, &lease, lease_ms, now_ms)?)?,
+                } => serde_json::to_value(core::renew_lease(&conn, &lease, lease_ms, &|| now_ms)?)?,
                 Request::StorePreparedPayload {
                     lease,
                     mapping_version,
