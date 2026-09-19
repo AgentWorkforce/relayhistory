@@ -123,6 +123,7 @@ pub async fn history_delivery(
     let request: Request = serde_json::from_str(&request_json)
         .map_err(|_| crate::native_error("INVALID_ARGUMENT", "invalid typed delivery request"))?;
     let path = crate::db_path(db_path);
+    let received = Instant::now();
     napi::tokio::task::spawn_blocking(move || {
         if !path.exists() {
             match request {
@@ -162,7 +163,12 @@ pub async fn history_delivery(
                     lease,
                     lease_ms,
                     now_ms,
-                } => serde_json::to_value(core::renew_lease(&conn, &lease, lease_ms, &|| now_ms)?)?,
+                } => serde_json::to_value(core::renew_lease(
+                    &conn,
+                    &lease,
+                    lease_ms,
+                    &renewal_clock(now_ms, received),
+                )?)?,
                 Request::StorePreparedPayload {
                     lease,
                     mapping_version,
@@ -558,4 +564,46 @@ pub async fn history_delivery_drain(
     })
     .await
     .map_err(crate::worker_error)?
+}
+
+/// The clock a native lease renewal is dated by.
+///
+/// The JavaScript caller supplies `now_ms` when it builds the request, but
+/// `renew_lease` reads its clock only once it holds the write lock, and a
+/// contended lock can take longer than the lease itself. Handing the request's
+/// timestamp through unchanged would commit a deadline dated from before the
+/// wait — the stale renewal that `renew_lease` taking a clock exists to stop —
+/// so the caller's timestamp is advanced by the monotonic time that has
+/// elapsed since the request was received. The caller's clock stays the base,
+/// which keeps a deterministic test clock deterministic when nothing waits.
+fn renewal_clock(now_ms: i64, received: Instant) -> impl Fn() -> i64 {
+    move || {
+        let waited = i64::try_from(received.elapsed().as_millis()).unwrap_or(i64::MAX);
+        now_ms.saturating_add(waited)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renewal_clock;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_renewal_dated_after_a_wait_is_not_dated_from_before_it() {
+        let received = Instant::now();
+        let clock = renewal_clock(1_000, received);
+        // Read immediately: the caller's timestamp is the base, not replaced.
+        assert!((1_000..1_000 + 5_000).contains(&clock()));
+        sleep(Duration::from_millis(120));
+        // Read after waiting: the time waited is on the clock. Passing the
+        // request's `now_ms` straight through returned exactly 1_000 here.
+        assert!(clock() >= 1_120, "clock did not advance past the wait");
+    }
+
+    #[test]
+    fn a_renewal_clock_cannot_overflow() {
+        let clock = renewal_clock(i64::MAX, Instant::now());
+        assert_eq!(clock(), i64::MAX);
+    }
 }
