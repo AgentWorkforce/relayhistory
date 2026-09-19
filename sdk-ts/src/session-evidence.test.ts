@@ -373,11 +373,18 @@ test('a native full capability unsupported by its coverage is a contract mismatc
   );
 });
 
+function diagnostic(code: string, message: string): Record<string, unknown> {
+  return { code, message, durationMs: null, sourceBytes: null, recordsParsed: null };
+}
+
 function hydrationPart(
   capability: 'full' | 'partial' | 'shallow_only',
   coverage: readonly string[],
   evidence: Partial<{ prompts: number; events: number; toolCalls: number; fileEdits: number }> = {},
 ): ReturnType<typeof normalizeHydration> {
+  // A real partial result carries its own partial-coverage note, naming only
+  // the kinds *that* presence is missing.
+  const missing = FULL_SESSION_KINDS.filter((kind) => !coverage.includes(kind));
   return normalizeHydration({
     contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
     source: 'claude', sessionId: SHARED_SESSION, status: 'hydrated',
@@ -386,7 +393,14 @@ function hydrationPart(
     evidence: {
       prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0, ...evidence,
     },
-    coverage: [...coverage], relatedSessionIds: [], diagnostics: [],
+    coverage: [...coverage],
+    relatedSessionIds: [],
+    diagnostics: [
+      diagnostic('HYDRATION_METRICS', `metrics for ${coverage.join('+') || 'nothing'}`),
+      ...(missing.length > 0
+        ? [diagnostic('HYDRATION_PARTIAL_COVERAGE', `no ${missing.join(', ')}`)]
+        : []),
+    ],
   });
 }
 
@@ -401,6 +415,18 @@ test('merging complementary partial presences yields a capability the union supp
   const merged = combineHydration(a, b);
   assert.deepEqual(merged.coverage, [...FULL_SESSION_KINDS]);
   assert.equal(merged.capability, 'full');
+  // Each part arrived with its own partial-coverage note naming kinds the
+  // other one covers. Concatenating them would leave a `full` result carrying
+  // a claim that four kinds are absent.
+  assert.deepEqual(
+    merged.diagnostics.filter((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE'),
+    [],
+  );
+  // Every other diagnostic is a per-presence fact and survives.
+  assert.deepEqual(
+    merged.diagnostics.map((item) => item.message),
+    ['metrics for history+session_event', 'metrics for tool_call+file_edit+relationship'],
+  );
   // The union is what makes it full, so the evidence it reports must be the
   // union too, not just the winning presence's.
   assert.equal(merged.evidence.prompts, 2);
@@ -419,6 +445,17 @@ test('a merge that is still short of full coverage stays partial, and empty cove
   );
   assert.deepEqual(short.coverage, ['history', 'tool_call']);
   assert.equal(short.capability, 'partial');
+  // Exactly one reconciled note, naming what the *union* still lacks -- not
+  // one per part, each naming kinds the other one supplied.
+  const reconciled = short.diagnostics.filter(
+    (item) => item.code === 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  assert.equal(reconciled.length, 1);
+  assert.equal(
+    reconciled[0].message,
+    'merged evidence covers history, tool_call; no presence produces session_event, file_edit, relationship',
+  );
+  assert.equal(short.diagnostics.filter((item) => item.code === 'HYDRATION_METRICS').length, 2);
 
   // Two listing-only connectors covered nothing; `partial` would imply some
   // evidence kind was indexed, so shallow_only survives.
@@ -428,6 +465,11 @@ test('a merge that is still short of full coverage stays partial, and empty cove
   );
   assert.deepEqual(nothing.coverage, []);
   assert.equal(nothing.capability, 'shallow_only');
+  assert.equal(
+    nothing.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE')?.message,
+    'merged evidence covers no evidence kinds; no presence produces '
+    + 'history, session_event, tool_call, file_edit, relationship',
+  );
 
   // One of them did index something: no longer shallow_only.
   assert.equal(

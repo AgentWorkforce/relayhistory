@@ -485,10 +485,15 @@ export function mergedHydrationCapability(
   coverage: readonly EvidenceKind[],
   parts: readonly HydrateSessionResult[],
 ): HydrateSessionResult['capability'] {
-  if (FULL_SESSION_KINDS.every((kind) => coverage.includes(kind))) return 'full';
+  if (missingHydrationCoverage(coverage).length === 0) return 'full';
   if (coverage.length === 0 && parts.every((part) => part.capability === 'shallow_only'))
     return 'shallow_only';
   return 'partial';
+}
+
+/** The `FULL_SESSION_KINDS` a coverage set leaves out, in canonical order. */
+export function missingHydrationCoverage(coverage: readonly EvidenceKind[]): EvidenceKind[] {
+  return FULL_SESSION_KINDS.filter((kind) => !coverage.includes(kind));
 }
 
 /**
@@ -510,6 +515,25 @@ export function combineHydration(
   const coverage = EVIDENCE_KINDS.filter(
     (kind) => previous.coverage.includes(kind) || next.coverage.includes(kind),
   );
+  const missing = missingHydrationCoverage(coverage);
+  // Each part's partial-coverage diagnostic describes only that part, so once
+  // the union is formed they are stale: concatenating them would leave a
+  // merged `full` result carrying a note naming kinds it does cover. They are
+  // reconciled into at most one, recomputed from the union. Every other
+  // diagnostic is per-presence fact and survives untouched.
+  const diagnostics = [...previous.diagnostics, ...next.diagnostics].filter(
+    (item) => item.code !== 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  if (missing.length > 0) {
+    diagnostics.push({
+      code: 'HYDRATION_PARTIAL_COVERAGE',
+      message: `merged evidence covers ${coverage.join(', ') || 'no evidence kinds'}; `
+        + `no presence produces ${missing.join(', ')}`,
+      durationMs: null,
+      sourceBytes: null,
+      recordsParsed: null,
+    });
+  }
   return {
     ...best,
     // Derived from the union rather than carried off `best`, which is spread
@@ -524,7 +548,7 @@ export function combineHydration(
     },
     coverage,
     relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
-    diagnostics: [...previous.diagnostics, ...next.diagnostics],
+    diagnostics,
   };
 }
 
