@@ -399,8 +399,11 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
 }
 
-function relationshipLine(direction: 'child' | 'parent', row: SessionRelationship): string {
-  const identity = direction === 'child' ? row.childSessionId ?? '(unlinked)' : row.parentSessionId;
+function relationshipLine(
+  direction: 'child' | 'parent' | 'continuity',
+  row: SessionRelationship,
+): string {
+  const identity = direction === 'parent' ? row.parentSessionId : row.childSessionId ?? '(unlinked)';
   return [
     direction, identity, row.relationship, row.childAgentType ?? '-', row.spawnedAtMs ?? '-',
     `events=${row.childHasEvents ? 'yes' : 'no'}`, `identity=${row.identityStatus}`,
@@ -420,6 +423,12 @@ function outputRelationships(io: CliIo, value: Awaited<ReturnType<typeof getSess
       `${value.asChild.length} parent relationship(s)\n`);
   for (const row of value.asParent) io.stdout(`${relationshipLine('child', row)}\n`);
   for (const row of value.asChild) io.stdout(`${relationshipLine('parent', row)}\n`);
+  if (value.continuity.length > 0) {
+    io.stdout(`${value.continuity.length} continuity relationship(s)\n`);
+    for (const row of value.continuity) {
+      io.stdout(`${relationshipLine('continuity', row)}  origin=${row.originSessionId ?? '-'}\n`);
+    }
+  }
   io.stdout(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);
   for (const diagnostic of value.diagnostics) {
     io.stdout(`${diagnostic.code}: ${diagnostic.message}\n`);

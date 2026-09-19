@@ -164,7 +164,7 @@ test('sessions relationships and sessions tree render topology in both modes', a
       cli, 'sessions', 'relationships', 'codex', 'topology-root', '--db', db, '--json', '--no-warning',
     ], { env });
     const wire = JSON.parse(relationships.stdout) as Record<string, unknown>;
-    assert.equal(wire.contract_version, 1);
+    assert.equal(wire.contract_version, 2);
     assert.equal(wire.session_id, 'topology-root');
     assert.deepEqual(wire.as_child, []);
     const [edge] = wire.as_parent as Array<Record<string, unknown>>;

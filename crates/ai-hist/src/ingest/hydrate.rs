@@ -11,7 +11,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 for continuity evidence. A checkpoint written before continuity
+/// existed reports the session unchanged, so targeted hydration would return
+/// success without ever reading the transcript that holds the fork, resume or
+/// continuation signal. The bump forces exactly one re-read per session, which
+/// banks the evidence and then settles.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -1249,6 +1255,13 @@ fn ingest_claude(
     )?;
     ingest_claude_transcript(conn, path)?;
     record_claude_remote_relationship(conn, &meta)?;
+    // Continuity evidence is banked per transcript so reconciliation can run
+    // here, over one file, instead of only during a full sync holding every
+    // file at once. Whatever this file cannot resolve yet stays pending with
+    // its reason, and the hydration that indexes the missing record resolves
+    // it without this file being read again.
+    crate::continuity::capture_claude_transcript(conn, path)?;
+    crate::continuity::reconcile(conn, "claude")?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     for evidence in subagents {
@@ -1296,6 +1309,7 @@ pub(crate) fn ingest_claude_subagent(
                     evidence_ref: evidence.tool_use_id.as_deref(),
                     child_has_events: session_events_exist(conn, "claude", agent_id)?,
                     spawned_at_ms: evidence.first_ts_ms,
+                    ..ObservedRelationship::default()
                 },
             )
         }
@@ -1317,6 +1331,7 @@ pub(crate) fn ingest_claude_subagent(
                     evidence_ref: evidence.tool_use_id.as_deref(),
                     child_has_events: false,
                     spawned_at_ms: evidence.first_ts_ms,
+                    ..ObservedRelationship::default()
                 },
             )
         }
@@ -1463,6 +1478,11 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
             Some(&path.to_string_lossy()),
         )?;
     }
+    // Codex records continuity only when a producer writes the explicit
+    // fields on `session_meta`; a plain `codex resume` leaves nothing behind
+    // to read, so this is a no-op for it rather than a guess.
+    crate::continuity::capture_codex_rollout(conn, path)?;
+    crate::continuity::reconcile(conn, "codex")?;
     if options.include_related {
         ingest_codex_children(conn, options, path)?;
     }
@@ -1633,6 +1653,13 @@ fn build_result(
             &options.session_id,
         )?);
     }
+    // Not gated on `include_related`: unresolved continuity is a fact about
+    // this session's own transcript, not about anything it delegated to.
+    diagnostics.extend(continuity_diagnostics(
+        conn,
+        &options.source,
+        &options.session_id,
+    )?);
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
@@ -1651,6 +1678,17 @@ fn build_result(
     })
 }
 
+/// The delegated threads whose evidence this hydration also acquired.
+///
+/// Delegation only, on both the seed and the recursive step. A continuation or
+/// a fork is a *different conversation* that this one carried on from, not
+/// work this session delegated: counting it here would put a separate
+/// session's events into this hydration's evidence totals and hand the caller
+/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
+/// `getSessionRelationships`'s `continuity` array instead. This mirrors
+/// `RelationshipKinds::delegation()` — everything that is not a continuity
+/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
+/// being related exactly as before.
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(
@@ -1658,11 +1696,13 @@ fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<
                SELECT child_session_id FROM session_relationships \
                WHERE source = ?1 AND parent_session_id = ?2 \
                  AND child_session_id IS NOT NULL AND child_session_id != ?2 \
+                 AND relationship NOT IN ('continuation', 'fork', 'resume') \
                UNION \
                SELECT relationship.child_session_id FROM session_relationships relationship \
                JOIN descendants ON relationship.parent_session_id = descendants.child_session_id \
                WHERE relationship.source = ?1 AND relationship.child_session_id IS NOT NULL \
                  AND relationship.child_session_id != ?2 \
+                 AND relationship.relationship NOT IN ('continuation', 'fork', 'resume') \
              ) \
              SELECT child_session_id FROM descendants ORDER BY child_session_id",
         )?
@@ -1684,6 +1724,7 @@ fn unlinked_diagnostics(
         .prepare(
             "SELECT evidence_locator FROM session_relationships \
              WHERE source = ? AND parent_session_id = ? AND child_session_id IS NULL \
+               AND relationship NOT IN ('continuation', 'fork', 'resume') \
              ORDER BY relationship_uid",
         )?
         .query_map(params![source, session_id], |row| {
@@ -1703,6 +1744,33 @@ fn unlinked_diagnostics(
             records_parsed: None,
         })
         .collect())
+}
+
+/// Continuity this transcript points at but nothing has indexed yet.
+///
+/// Reported rather than guessed: a fork with one branch so far and a
+/// continuation whose parent record is not stored anywhere are both real,
+/// nameable states, and the caller needs to know the evidence was read and is
+/// waiting — not that there was none.
+fn continuity_diagnostics(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<HydrationDiagnostic>> {
+    Ok(
+        crate::continuity::pending_reasons(conn, source, session_id)?
+            .into_iter()
+            .map(|(locator, reason)| HydrationDiagnostic {
+                code: crate::continuity::CONTINUITY_UNRESOLVED.to_string(),
+                message: format!(
+                    "{source} continuity evidence at {locator} is unresolved: {reason}"
+                ),
+                duration_ms: None,
+                source_bytes: None,
+                records_parsed: None,
+            })
+            .collect(),
+    )
 }
 
 fn evidence_counts(
@@ -3232,6 +3300,7 @@ mod tests {
                 evidence_ref: None,
                 child_has_events: true,
                 spawned_at_ms: None,
+                ..ObservedRelationship::default()
             },
         )
         .unwrap();
@@ -3683,6 +3752,180 @@ mod tests {
                 "local-1".into(),
                 "materialized_local".into()
             )]
+        );
+    }
+
+    /// Copy one of burn's transcript fixtures into a Claude project directory
+    /// under `home`, keeping its original file name — the name is what tells
+    /// two branches of one conversation apart.
+    fn claude_fixture(home: &Path, name: &str) -> PathBuf {
+        let projects = home.join(".claude/projects/app");
+        fs::create_dir_all(&projects).unwrap();
+        let destination = projects.join(name);
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/claude")
+                .join(name),
+            &destination,
+        )
+        .unwrap();
+        destination
+    }
+
+    #[test]
+    fn hydrating_a_continuation_before_its_origin_reports_it_and_resolves_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let branch = claude_fixture(dir.path(), "cross-file-parent.jsonl");
+        let origin = claude_fixture(dir.path(), "original-session.jsonl");
+        let branch_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let origin_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", branch_id, Some(&branch));
+        catalog_row(&conn, "claude", origin_id, Some(&origin));
+        drop(conn);
+
+        // The branch is hydrated first. Its first record answers
+        // `u-original-asst`, which nothing has indexed, so the hydration says
+        // so rather than guessing or silently recording nothing.
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", branch_id), dir.path()).unwrap();
+        assert!(first.diagnostics.iter().any(|diagnostic| diagnostic.code
+            == "RELATIONSHIP_CONTINUITY_UNRESOLVED"
+            && diagnostic.message.contains("u-original-asst")));
+        let conn = open_db(&db).unwrap();
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE relationship = 'continuation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 0);
+        drop(conn);
+
+        // Hydrating the origin resolves it. The branch transcript is not read
+        // again: its evidence was banked on the first pass.
+        let branch_mtime = fs::metadata(&branch).unwrap().modified().unwrap();
+        hydrate_session_at_with_home(&db, &options("claude", origin_id), dir.path()).unwrap();
+        assert_eq!(
+            fs::metadata(&branch).unwrap().modified().unwrap(),
+            branch_mtime
+        );
+
+        let conn = open_db(&db).unwrap();
+        let edge: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT parent_session_id, relationship, child_session_id, evidence_ref \
+                 FROM session_relationships WHERE relationship = 'continuation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edge,
+            (
+                origin_id.to_string(),
+                "continuation".to_string(),
+                Some(branch_id.to_string()),
+                Some("u-original-asst".to_string()),
+            )
+        );
+        // And the branch stops reporting itself as unresolved.
+        let settled =
+            hydrate_session_at_with_home(&db, &options("claude", branch_id), dir.path()).unwrap();
+        assert!(!settled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RELATIONSHIP_CONTINUITY_UNRESOLVED"));
+    }
+
+    #[test]
+    fn a_resume_marker_reaches_the_relationship_graph_through_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_fixture(dir.path(), "resume-marker.jsonl");
+        let resumed = "99999999-9999-9999-9999-999999999999";
+        let prior = "11111111-1111-1111-1111-111111111111";
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", resumed, Some(&transcript));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", resumed), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let relationships = crate::session_relationships(&conn, "claude", resumed).unwrap();
+        // Continuity is reported on its own array; delegation reads exactly
+        // what it read before continuity existed.
+        assert!(relationships.as_parent.is_empty());
+        assert!(relationships.as_child.is_empty());
+        assert_eq!(relationships.continuity.len(), 1);
+        let edge = &relationships.continuity[0];
+        assert_eq!(edge.relationship, "resume");
+        assert_eq!(edge.parent_session_id, prior);
+        assert_eq!(edge.child_session_id.as_deref(), Some(resumed));
+        assert_eq!(edge.origin_session_id.as_deref(), Some(prior));
+        assert!(edge.child_has_events);
+    }
+
+    #[test]
+    fn a_continued_session_is_not_a_related_session_of_its_origin() {
+        // `relatedSessionIds` is what this hydration also acquired evidence
+        // for. A continuation is a different conversation that carried on from
+        // this one, not work it delegated — counting it would put a separate
+        // session's events into this hydration's totals and hand the caller
+        // sessions it never asked to acquire.
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join(".claude/projects/app");
+        fs::create_dir_all(&projects).unwrap();
+        let origin = projects.join("origin.jsonl");
+        fs::write(
+            &origin,
+            concat!(
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"start\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-a\",\"parentUuid\":\"origin-u\",",
+                "\"type\":\"assistant\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"assistant\",",
+                "\"content\":\"ok\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let follower = projects.join("follower.jsonl");
+        fs::write(
+            &follower,
+            concat!(
+                "{\"sessionId\":\"follower\",\"uuid\":\"follow-u\",\"parentUuid\":\"origin-a\",",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"carry on\"},\"timestamp\":\"2026-08-31T11:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "origin", Some(&origin));
+        catalog_row(&conn, "claude", "follower", Some(&follower));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", "follower"), dir.path()).unwrap();
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "origin"), dir.path()).unwrap();
+
+        // The positive control: the continuation really was recorded, so this
+        // is not an assertion over an empty relationship table.
+        let conn = open_db(&db).unwrap();
+        let continuation: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE relationship = 'continuation' AND parent_session_id = 'origin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(continuation, 1);
+        assert!(
+            result.related_session_ids.is_empty(),
+            "a continuation is not a delegated thread: {:?}",
+            result.related_session_ids
         );
     }
 }

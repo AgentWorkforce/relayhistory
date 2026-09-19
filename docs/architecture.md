@@ -126,15 +126,25 @@ hydration stays provider-bounded: Claude uses the CLI's private
 teleport-evidence contract, while Codex indexes the supported cloud diff and
 reports partial capability because no transcript export exists.
 
-## Delegation topology
+## Session topology
 
-`session_relationships` records one row per observed delegation, keyed by
+`session_relationships` records one row per observed relationship, keyed by
 `(source, parent_session_id, relationship_uid)`. Each row carries what
 established the link — `evidence_kind`, the provider file in
 `evidence_locator`, and the provider-native reference in `evidence_ref` (a
-Claude `toolUseId`, a Codex `parent_thread_id`) — plus whatever the provider
-recorded about the child: agent type, agent name, model, spawn depth, and the
+Claude `toolUseId`, a Codex `parent_thread_id`, the field name or the record
+uuid that established a continuity edge) — plus whatever the provider recorded
+about the child: agent type, agent name, model, spawn depth, and the
 provider's own spawn time.
+
+There are two kinds of relationship, and they answer different questions.
+**Delegation** (`delegated`, `materialized_local`) is one session starting a
+different thread of work. **Continuity** (`continuation`, `fork`, `resume`) is
+one conversation carrying on as another: a `/resume`d session, a branch taken
+from a shared origin, a transcript that opens by answering a record it does not
+contain. Continuity rows also carry `origin_session_id`: the conversation a
+fork or continuation came from, when the provider named one distinct from the
+parent.
 
 `identity_status` separates two honestly different things. An `observed` row
 names the child: `child_session_id` is the provider's own identity for it, and
@@ -188,6 +198,69 @@ Claude remote-to-local materialization is also recorded as a
 infer one. The SDK's
 `sessionDescendants` walker applies the same `childCount` and `truncated`
 rules to the nodes it yields.
+
+### Continuity
+
+`getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`. Omitted
+means delegation only — defined as *every kind that is not a continuity kind*,
+not as a whitelist of `delegated`, so `materialized_local` keeps traversing as
+it always has and a delegation-only database answers byte-identically to before
+continuity existed. Naming the continuity kinds instead rolls a resumed or
+forked conversation up to its origin over the same bounded walk.
+`getSessionRelationships` reports continuity on its own `continuity` array, in
+both directions, leaving `asParent` and `asChild` delegation-only.
+
+Continuity is reconstructed from four signals, in that order of authority: the
+explicit fields a provider writes (`continuedFromSessionId`, `forkSessionId`,
+`sourceSessionId`), a `/resume <id>` or `/continue <id>` the human typed, a
+transcript's first `parentUuid` resolved against the session that actually
+holds that record, and two or more transcripts carrying one in-log session id.
+`evidence_ref` names which one produced the row.
+
+A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
+human types, and the control wrapper Claude Code actually stores —
+`<command-name>/resume</command-name>` with the target in `<command-args>`,
+which this crate already classifies as a control prompt. Matching only the bare
+form matched the one shape a real transcript never contains.
+
+Unlike delegation, continuity is not observable inside a single transcript, so
+each transcript's evidence is banked in `session_continuity_evidence`, keyed by
+the transcript. Reconciliation then runs over the stored rows rather than over
+a set of files held in memory, which is what makes it work during targeted
+hydration of one session. Evidence that cannot resolve yet — a parent record no
+session has indexed, a lone branch with no sibling, a resume marker naming no
+session — keeps a `pending_reason` and is reported as a
+`RELATIONSHIP_CONTINUITY_UNRESOLVED` diagnostic on both hydration and
+`getSessionRelationships`. Hydrating the file that supplies the missing piece
+resolves it without re-reading the first file.
+
+A re-read replaces what a transcript says, including retracting it. Every edge
+carries the `evidence_locator` that established it, and a reconciliation pass
+removes that locator's edges which the current read no longer produces — so a
+rewritten `/resume`, a changed explicit field, or a file that stops being a
+session at all cannot leave a stale edge queryable. Retraction is keyed on the
+whole row identity, not the uid alone: a `/resume` retyped against a different
+session keeps its uid and changes only the parent.
+
+The stamp maps decide whether a file is opened at all, so an install upgrading
+into continuity would otherwise skip exactly the files whose evidence has never
+been banked, and report a successful sync over an empty table. Both providers
+re-read once when a locator has no evidence row: Claude falls through to a full
+re-read, Codex reads only the `session_meta` line its continuity lives on. Every
+readable file writes a row — including one carrying no continuity at all — so
+the condition always clears and nothing is re-read forever. This is deliberately
+narrower than bumping a stamp-map generation, which would re-read the whole
+archive and discard the selective-repair state those maps carry.
+
+A fork branch is given a child identity only when the provider gave it one. Two
+transcripts carrying the same in-log `sessionId` are branches with no identity
+of their own, so each is recorded as unlinked evidence keyed on its transcript;
+a branch's identity is never taken from its file name, here or anywhere else.
+
+Codex records continuity only when a producer writes those explicit fields on
+`session_meta`. A plain `codex resume` opens with a fresh `payload.id` and
+leaves behind only a carried-over token baseline, which is a number and not a
+session, so no `resume` row is recorded for it.
 
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null
