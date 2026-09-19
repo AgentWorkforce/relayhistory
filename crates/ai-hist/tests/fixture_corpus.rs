@@ -802,6 +802,10 @@ fn redact(value: Value, home: &Path) -> Value {
     if let Ok(canonical) = fs::canonicalize(home) {
         homes.push(canonical.to_string_lossy().to_string());
     }
+    // Longest first: on macOS the temp root is `/var/...` while its canonical
+    // form is `/private/var/...`, so replacing the short one first would leave
+    // `/private<home>/…` behind and the long one would then never match.
+    homes.sort_by_key(|home| std::cmp::Reverse(home.len()));
     redact_value(value, &homes, false)
 }
 
@@ -826,12 +830,33 @@ fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
     }
 }
 
+/// Redact one string: strip the fixture's `HOME` prefix, and — only when that
+/// prefix was actually found — normalize the separators of what is left.
+///
+/// The separator pass is what keeps the corpus cross-platform. `raw_path`,
+/// `evidence_locator` and the `evidence:…:<path>` form of `relationship_uid`
+/// are built from real `PathBuf`s, so on Windows they arrive as
+/// `<home>\.claude\projects\…` while the committed snapshots (generated on
+/// Linux) hold `<home>/.claude/projects/…`. Without this, every snapshot reads
+/// as stale on a Windows checkout even though no parser changed.
+///
+/// It is deliberately gated on a replacement having happened: a `\` only means
+/// "path separator" in a string that carries one of these locators. Applying it
+/// to every string would corrupt the JSON payloads in `token_json` and
+/// `args_json`, whose escapes are backslashes. Nothing this normalizes reaches
+/// the store — the ledger keeps the platform's own separators.
 fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     let mut text = text;
+    let mut replaced = false;
     for home in homes {
-        if !home.is_empty() {
-            text = text.replace(home.as_str(), "<home>");
+        if home.is_empty() || !text.contains(home.as_str()) {
+            continue;
         }
+        text = text.replace(home.as_str(), "<home>");
+        replaced = true;
+    }
+    if replaced {
+        text = text.replace('\\', "/");
     }
     if stamp {
         text = mask_long_digit_runs(&text);
@@ -869,6 +894,67 @@ fn flush_digits(digits: &mut String, out: &mut String) {
         out.push_str(digits);
     }
     digits.clear();
+}
+
+/// A Windows locator redacts to the same string a Linux one does.
+///
+/// This is the whole reason the corpus can be reviewed from any checkout: the
+/// snapshots are generated on Linux, and a Windows contributor running the
+/// harness locally must see "no parser changed", not 46 stale snapshots.
+#[test]
+fn redaction_normalizes_windows_locators_to_the_committed_form() {
+    let windows = vec![r"C:\Users\dev\AppData\Local\Temp\.tmpAbCd\claude__simple-turn".to_string()];
+    assert_eq!(
+        redact_string(
+            r"C:\Users\dev\AppData\Local\Temp\.tmpAbCd\claude__simple-turn\.claude\projects\corpus\simple-turn.jsonl".to_string(),
+            &windows,
+            false,
+        ),
+        "<home>/.claude/projects/corpus/simple-turn.jsonl"
+    );
+    // The `evidence:<kind>:<path>` relationship key carries a locator too.
+    assert_eq!(
+        redact_string(
+            r"evidence:claude_sidechain_records:C:\Users\dev\AppData\Local\Temp\.tmpAbCd\claude__simple-turn\.claude\projects\corpus\sidechain-turn.jsonl".to_string(),
+            &windows,
+            false,
+        ),
+        "evidence:claude_sidechain_records:<home>/.claude/projects/corpus/sidechain-turn.jsonl"
+    );
+
+    let unix = vec!["/tmp/.tmpAbCd/claude__simple-turn".to_string()];
+    assert_eq!(
+        redact_string(
+            "/tmp/.tmpAbCd/claude__simple-turn/.claude/projects/corpus/simple-turn.jsonl"
+                .to_string(),
+            &unix,
+            false,
+        ),
+        "<home>/.claude/projects/corpus/simple-turn.jsonl",
+        "both platforms redact to one committed form"
+    );
+
+    // A string with no locator in it is left exactly as it was: the escapes in
+    // a stored JSON payload are not path separators.
+    let payload = r#"{"text":"a\\b","input_tokens":3}"#.to_string();
+    assert_eq!(redact_string(payload.clone(), &unix, false), payload);
+
+    // macOS hands back both `/var/...` and its canonical `/private/var/...`.
+    // `redact` sorts longest-first so the short one cannot shadow the long one.
+    let mut macos = vec![
+        "/var/folders/xy/T/corpus".to_string(),
+        "/private/var/folders/xy/T/corpus".to_string(),
+    ];
+    macos.sort_by_key(|home| std::cmp::Reverse(home.len()));
+    assert_eq!(
+        redact_string(
+            "/private/var/folders/xy/T/corpus/.claude/projects/corpus/simple-turn.jsonl"
+                .to_string(),
+            &macos,
+            false,
+        ),
+        "<home>/.claude/projects/corpus/simple-turn.jsonl"
+    );
 }
 
 // ---------------------------------------------------------------------------
