@@ -1,0 +1,97 @@
+{
+  "comment": [
+    "Regression bounds for scripts/benchmark-sync.mjs. A baseline is the number a",
+    "clean run produced on the machine named in `measuredOn`; the policy factors turn",
+    "each one into a floor (throughput) or a ceiling (time, memory). Re-measure with",
+    "`node scripts/benchmark-sync.mjs --profile <name> --update-baselines` and justify",
+    "the move in the pull request -- these are not knobs to turn until CI is green.",
+    "The published baseline table lives in docs/benchmarks.md."
+  ],
+  "policy": {
+    "minRecordsPerSecondFactor": 0.5,
+    "maxElapsedMsFactor": 2,
+    "maxPeakRssFactor": 1.5,
+    "absoluteFloorsComment": [
+      "A ceiling derived from a very small baseline measures the runner, not the",
+      "code. These floors raise such a ceiling and never lower one. On the tiny PR",
+      "store the peak-RSS check is therefore a blow-up guard -- it catches 'the whole",
+      "store is now buffered in memory', not a 1.5x drift. The proportional rule",
+      "bites on the `full` profile, whose store is two orders of magnitude larger."
+    ],
+    "absoluteFloors": {
+      "elapsedMs": 40,
+      "peakRssBytes": 67108864
+    }
+  },
+  "profiles": {
+    "ci-debug": {
+      "description": "Fast PR gate: an unoptimized build against a small synthetic store, sized to keep the whole gate inside 60 s on a 4-core runner.",
+      "cargoProfile": "debug",
+      "store": {
+        "seed": 176,
+        "sources": [
+          "claude",
+          "codex",
+          "cursor",
+          "grok"
+        ],
+        "targetBytes": 1310720,
+        "largeSessionBytes": 393216,
+        "turns": 12,
+        "toolResults": 2,
+        "toolResultBytes": 1024
+      },
+      "measuredOn": {
+        "commit": "2a1e81a0c5c6675bd2ee9aee0760a2d27e64067d",
+        "machine": "Intel(R) Xeon(R) Processor @ 2.80GHz (4 cores), linux/x64",
+        "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "cargoProfile": "debug",
+        "at": "2026-09-19T18:08:29.664Z"
+      },
+      "phases": {
+        "cold_sync": {
+          "recordsPerSecond": 640,
+          "peakRssBytes": 12738560
+        },
+        "incremental_sync": {
+          "elapsedMs": 284,
+          "peakRssBytes": 10219520
+        },
+        "unchanged_sync": {
+          "elapsedMs": 65,
+          "peakRssBytes": 9687040
+        },
+        "hydrate_cold": {
+          "recordsPerSecond": 255,
+          "peakRssBytes": 11046912
+        },
+        "hydrate_unchanged": {
+          "elapsedMs": 17,
+          "peakRssBytes": 8925184
+        }
+      },
+      "repeat": 2
+    },
+    "full": {
+      "description": "Release-build matrix run by .github/workflows/benchmark-sync.yml on workflow_dispatch. Not a PR gate: it has no stored baselines, it publishes numbers.",
+      "cargoProfile": "release",
+      "store": {
+        "seed": 176,
+        "sources": [
+          "claude",
+          "codex",
+          "cursor",
+          "grok"
+        ],
+        "targetBytes": 104857600,
+        "largeSessionBytes": 52428800,
+        "turns": 12,
+        "toolResults": 2,
+        "toolResultBytes": 1024
+      },
+      "measuredOn": null,
+      "phases": {},
+      "repeat": 1
+    }
+  }
+}

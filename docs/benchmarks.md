@@ -173,3 +173,136 @@ prompt:    SEARCH p USING INDEX part_session_idx (session_id=?)
 The selected-session assertions fail if `message` or `part` regresses to a
 full table scan. The prompt query may use a temporary B-tree to order the few
 parts belonging to the selected session; it never sorts unrelated history.
+
+## Sync and hydration throughput
+
+The tables above cover shallow discovery and warm catalog reads — the paths
+that deliberately do not open a transcript. This section covers the write path:
+a full `sync`, the incremental `sync` a `watch` tick performs, and
+`hydrate_session`. It exists because `burn`'s `ingest --watch` runs on one-second
+ticks and `burn summary --ingest` inherits whatever full ingestion costs, so the
+cost has to be a published number rather than an impression.
+
+Three pieces:
+
+| File | Role |
+|---|---|
+| `scripts/gen-synthetic-history.mjs` | Fabricates a deterministic Claude/Codex/Cursor/Grok (and, on Node 22.13+, OpenCode) store of a requested size from a seed. |
+| `crates/ai-hist-cli/tests/sync_bench.rs` | The `#[ignore]`d harness that runs one phase and reports what it cost. |
+| `scripts/benchmark-sync.mjs` | Generates the store, runs each phase in its own process, renders the table, and applies `scripts/benchmark-thresholds.json`. |
+
+```bash
+# the fast subset, exactly as CI runs it on every pull request
+node scripts/benchmark-sync.mjs --gate
+
+# the published matrix (release build, 100 MB store)
+cargo test --workspace --all-features --test sync_bench --release --no-run
+node scripts/benchmark-sync.mjs --profile full --output sync-bench.md
+
+# one store on disk, to poke at by hand
+node scripts/gen-synthetic-history.mjs --out /tmp/bench-home --target-bytes 104857600
+```
+
+Nothing real is read and nothing generated is committed. The record shapes are
+modelled on what the parsers in `crates/ai-hist/src/ingest.rs` accept — a Claude
+turn is a user prompt, an assistant record carrying `thinking`/`text`/`tool_use`
+blocks, and a user record carrying the matching `tool_result` blocks — so the
+corpus exercises every row the hot loop writes. A seed plus a byte target
+reproduces a store exactly; session count is an outcome of the target, not an
+input.
+
+### The phases
+
+| Phase | Setup outside timing | Timed work |
+|---|---|---|
+| `cold_sync` | Generated store; the database does not exist | Create and migrate the database, walk every provider location, and ingest every transcript |
+| `incremental_sync` | A completed `cold_sync`; one 1 KiB assistant record appended to one Claude transcript | Walk every provider location, match stamps, re-read the one changed file, and ingest its new record |
+| `unchanged_sync` | A completed `incremental_sync` | The `watch` tick with nothing changed: walk every location, match every stamp, write nothing |
+| `hydrate_cold` | A completed sync, so the session is in the catalog | `hydrate_session` on the largest transcript in the store: full parse, evidence written |
+| `hydrate_unchanged` | One untimed `hydrate_session` on the same session | The checkpoint hit: stamp matches, nothing is re-parsed |
+
+`records` is the exact row delta across `history`, `session_events`,
+`tool_calls`, `file_edits` and `sessions`, counted from the database before and
+after — not a parser's own estimate. For the hydration phases it is the
+`records_parsed` the hydration diagnostic reports.
+
+### How peak RSS is measured
+
+`getrusage(RUSAGE_SELF).ru_maxrss`, read inside the harness at the end of the
+phase. **Linux reports kibibytes and macOS reports bytes**; the harness
+normalizes both to bytes, and that one line is the whole cross-platform story.
+No `/usr/bin/time` is involved — it is absent from some Linux images entirely,
+and its `-v` (GNU) and `-l` (BSD) output formats do not agree.
+
+Two consequences worth knowing before trusting a number:
+
+* Linux does **not** reset `ru_maxrss` across `execve`. A harness launched
+  through `cargo test` therefore inherits cargo's own high-water mark and
+  reports roughly 55 MiB for every phase. The driver builds the harness once
+  with `cargo test --no-run` and then executes the test binary directly, which
+  is why its numbers are a tenth of that. A phase run by hand under
+  `cargo test` produces a valid report whose `peakRssBytes` is cargo's, and it
+  must not be compared against a driver-produced baseline.
+* Windows has no `getrusage`; the field is `null` there and the gate does not
+  run on Windows.
+
+`bytesRead` and `readSyscalls` are the `rchar` and `syscr` deltas from
+`/proc/self/io`, which count every byte the process received from a `read`,
+page cache included. macOS has no unprivileged equivalent, so those two columns
+are empty there rather than filled with a guess.
+
+### The CI gate
+
+`node scripts/benchmark-sync.mjs --gate` runs in the `verify` job of `ci.yml` on
+every pull request, immediately after `cargo test --workspace --all-features` so
+that the harness is already built and the step spends its time measuring. It
+uses the `ci-debug` profile: an unoptimized build against a 1.25 MiB store, two
+rounds per phase, the faster round reported. It takes roughly 15 s on a 4-core
+machine — well inside the 60 s budget — and the `full` matrix runs separately on
+`workflow_dispatch` through `.github/workflows/benchmark-sync.yml`.
+
+Bounds come from `scripts/benchmark-thresholds.json`:
+
+* throughput must stay at or above **half** its stored baseline (a > 2×
+  regression in records/s is red),
+* peak RSS must stay at or below **1.5×** its stored baseline,
+* elapsed time on the phases where records/s is meaningless (an unchanged tick
+  parses nothing) must stay at or below **2×**.
+
+A ceiling derived from a very small baseline measures the runner rather than the
+code, so `policy.absoluteFloors` can raise a ceiling — never lower one, and
+never a throughput floor. On the PR store the peak-RSS check is consequently a
+blow-up guard: it catches "the transcript is now buffered whole" and not a 1.5×
+drift. The proportional rule bites on the `full` profile, whose store is two
+orders of magnitude larger.
+
+A phase that a profile names but that produced no measurement is a failure, not
+a skip. A run that measured nothing must not read as a pass.
+
+Baselines are re-measured, never nudged:
+
+```bash
+node scripts/benchmark-sync.mjs --profile ci-debug --update-baselines
+```
+
+Re-measuring records the commit, machine and toolchain it came from in the
+thresholds file, and the pull request has to say why the number moved.
+
+### 2026-09-19 baseline
+
+Measured on commit `2a1e81a`, before any of the parity work in #160 lands, so
+those pull requests can show a before and after. Release build
+(`rustc 1.98.1`), Linux x86_64, Intel Xeon @ 2.80 GHz, 4 cores, 15.7 GiB RAM,
+Node 22.22.2. Synthetic store, seed 176. Commands:
+
+```bash
+cargo test --workspace --all-features --test sync_bench --release --no-run
+# rows 1, 3, 4 and the 1 MB hydration rows
+node scripts/benchmark-sync.mjs --profile full --large-session-bytes 1048576
+# the 50 MB and 200 MB hydration rows
+node scripts/benchmark-sync.mjs --profile full --target-bytes 1048576 \
+  --large-session-bytes 52428800 --phases cold_sync,hydrate_cold,hydrate_unchanged
+node scripts/benchmark-sync.mjs --profile full --target-bytes 1048576 \
+  --large-session-bytes 209715200 --phases cold_sync,hydrate_cold,hydrate_unchanged
+```
+
