@@ -22,9 +22,6 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
-  EVIDENCE_KINDS,
-  EvidenceKind,
-  FULL_SESSION_KINDS,
   defaultDbPath,
   Source,
   CatalogSource,
@@ -141,6 +138,7 @@ import {
   relationshipCursor,
   validateSessionRef,
   evidenceIdentity,
+  combineHydration,
 } from './normalization.js';
 export { validateNativeLocation, validateNativeScope, parseStoredJson } from './normalization.js';
 
@@ -939,32 +937,6 @@ function validateAcquisition(options: {
       'acquisition limit must be an integer from 1 to 10000',
       'INVALID_ARGUMENT',
     );
-}
-function combineHydration(
-  previous: HydrateSessionResult | undefined,
-  next: HydrateSessionResult,
-): HydrateSessionResult {
-  if (!previous) return next;
-  const rank = { full: 2, partial: 1, shallow_only: 0 };
-  const best = rank[next.capability] > rank[previous.capability] ? next : previous;
-  return {
-    ...best,
-    evidence: {
-      prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
-      events: Math.max(previous.evidence.events, next.evidence.events),
-      toolCalls: Math.max(previous.evidence.toolCalls, next.evidence.toolCalls),
-      fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
-      relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
-    },
-    // The merged result reports both presences' evidence, so it covers the
-    // union of what each one could index -- taking only the winner's coverage
-    // would understate a merge whose other half indexed a kind it does not.
-    coverage: EVIDENCE_KINDS.filter(
-      (kind) => previous.coverage.includes(kind) || next.coverage.includes(kind),
-    ),
-    relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
-    diagnostics: [...previous.diagnostics, ...next.diagnostics],
-  };
 }
 function validateSourceConnectors(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;

@@ -11,7 +11,7 @@ import {
   hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
-import { normalizeHydration } from './normalization.js';
+import { combineHydration, normalizeHydration } from './normalization.js';
 
 // Undated tool calls and file edits are legal — both `ts_ms` columns are
 // nullable — but no provider adapter writes one, so the only way to build the
@@ -341,6 +341,72 @@ test('a native full capability unsupported by its coverage is a contract mismatc
     normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
     ['history'],
   );
+});
+
+function hydrationPart(
+  capability: 'full' | 'partial' | 'shallow_only',
+  coverage: readonly string[],
+  evidence: Partial<{ prompts: number; events: number; toolCalls: number; fileEdits: number }> = {},
+): ReturnType<typeof normalizeHydration> {
+  return normalizeHydration({
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'claude', sessionId: SHARED_SESSION, status: 'hydrated',
+    capability, discoveryState: capability === 'full' ? 'full' : 'shallow', presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    evidence: {
+      prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0, ...evidence,
+    },
+    coverage: [...coverage], relatedSessionIds: [], diagnostics: [],
+  });
+}
+
+test('merging complementary partial presences yields a capability the union supports', () => {
+  // Neither connector is `full` on its own, but between them every kind in
+  // FULL_SESSION_KINDS is indexed. Carrying an input's `partial` through the
+  // merge ranked complete merged evidence below a single full result -- the
+  // same "capability that does not describe the coverage" defect one level up.
+  const a = hydrationPart('partial', ['history', 'session_event'], { prompts: 2, events: 5 });
+  const b = hydrationPart('partial', ['tool_call', 'file_edit', 'relationship'], { toolCalls: 3, fileEdits: 1 });
+
+  const merged = combineHydration(a, b);
+  assert.deepEqual(merged.coverage, [...FULL_SESSION_KINDS]);
+  assert.equal(merged.capability, 'full');
+  // The union is what makes it full, so the evidence it reports must be the
+  // union too, not just the winning presence's.
+  assert.equal(merged.evidence.prompts, 2);
+  assert.equal(merged.evidence.events, 5);
+  assert.equal(merged.evidence.toolCalls, 3);
+  assert.equal(merged.evidence.fileEdits, 1);
+  // Order of folding must not change the verdict.
+  assert.equal(combineHydration(b, a).capability, 'full');
+  assert.deepEqual(combineHydration(b, a).coverage, [...FULL_SESSION_KINDS]);
+});
+
+test('a merge that is still short of full coverage stays partial, and empty coverage stays shallow_only', () => {
+  const short = combineHydration(
+    hydrationPart('partial', ['history']),
+    hydrationPart('partial', ['tool_call']),
+  );
+  assert.deepEqual(short.coverage, ['history', 'tool_call']);
+  assert.equal(short.capability, 'partial');
+
+  // Two listing-only connectors covered nothing; `partial` would imply some
+  // evidence kind was indexed, so shallow_only survives.
+  const nothing = combineHydration(
+    hydrationPart('shallow_only', []),
+    hydrationPart('shallow_only', []),
+  );
+  assert.deepEqual(nothing.coverage, []);
+  assert.equal(nothing.capability, 'shallow_only');
+
+  // One of them did index something: no longer shallow_only.
+  assert.equal(
+    combineHydration(hydrationPart('shallow_only', []), hydrationPart('partial', ['history']))
+      .capability,
+    'partial',
+  );
+  // A single result is returned untouched.
+  assert.equal(combineHydration(undefined, hydrationPart('partial', ['history'])).capability, 'partial');
 });
 
 test('unparseable stored JSON yields null without discarding the raw string', () => {

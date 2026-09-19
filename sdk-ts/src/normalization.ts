@@ -467,6 +467,64 @@ function hydrationCoverage(value: unknown): EvidenceKind[] {
   });
 }
 
+/**
+ * The capability a merged hydration result is entitled to claim.
+ *
+ * `capability` is *defined* by `coverage` -- `full` exactly when every kind in
+ * `FULL_SESSION_KINDS` is covered -- so a merge has to recompute it. Two
+ * connectors that complement each other can cover all five kinds while neither
+ * is `full` alone, and carrying an input's `partial` through would rank
+ * complete merged evidence below a single full result. `shallow_only` survives
+ * only when nothing was covered and nothing claimed otherwise: a `partial`
+ * over empty coverage would imply some kind was indexed.
+ */
+export function mergedHydrationCapability(
+  coverage: readonly EvidenceKind[],
+  parts: readonly HydrateSessionResult[],
+): HydrateSessionResult['capability'] {
+  if (FULL_SESSION_KINDS.every((kind) => coverage.includes(kind))) return 'full';
+  if (coverage.length === 0 && parts.every((part) => part.capability === 'shallow_only'))
+    return 'shallow_only';
+  return 'partial';
+}
+
+/**
+ * Fold one more presence's hydration result into the running one.
+ *
+ * Evidence counts take the maximum and coverage takes the union, because the
+ * merged result reports what *either* presence indexed; the remaining
+ * scalar fields come from the richer of the two.
+ */
+export function combineHydration(
+  previous: HydrateSessionResult | undefined,
+  next: HydrateSessionResult,
+): HydrateSessionResult {
+  if (!previous) return next;
+  const rank = { full: 2, partial: 1, shallow_only: 0 };
+  const best = rank[next.capability] > rank[previous.capability] ? next : previous;
+  // Taking only the winner's coverage would understate a merge whose other
+  // half indexed a kind the winner does not.
+  const coverage = EVIDENCE_KINDS.filter(
+    (kind) => previous.coverage.includes(kind) || next.coverage.includes(kind),
+  );
+  return {
+    ...best,
+    // Derived from the union rather than carried off `best`, which is spread
+    // above: an individual `partial` no longer describes the merged coverage.
+    capability: mergedHydrationCapability(coverage, [previous, next]),
+    evidence: {
+      prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
+      events: Math.max(previous.evidence.events, next.evidence.events),
+      toolCalls: Math.max(previous.evidence.toolCalls, next.evidence.toolCalls),
+      fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
+      relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
+    },
+    coverage,
+    relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
+    diagnostics: [...previous.diagnostics, ...next.diagnostics],
+  };
+}
+
 export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   const contractVersion = Number(value.contractVersion);
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
