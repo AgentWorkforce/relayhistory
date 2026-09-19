@@ -30,6 +30,10 @@ const CLAUDE_TRANSCRIPT = [
   { type: 'user', uuid: 'r2', parentUuid: 'a2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:04.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'ok', toolUseResult: { filePath: '/work/app/notes.md', structuredPatch: [{ oldStart: 1, newStart: 1, lines: ['+notes'] }], userModified: false } }] } },
   { type: 'assistant', uuid: 'a3', parentUuid: 'r2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:05.000Z', message: { role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'cargo test' } }] } },
   { type: 'user', uuid: 'r3', parentUuid: 'a3', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:06.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_3', is_error: true, content: 'failed' }] } },
+  // A harness line, not a block on a user message. It is stored as a tool
+  // result because that is what it is evidence of, so anything that groups on
+  // role alone turns it into a user turn that never happened.
+  { type: 'system', subtype: 'subagent_completed', sessionId: SHARED_SESSION, timestamp: '2026-08-30T10:00:07.000Z', parent_tool_use_id: 'toolu_3', agent_id: 'agent-1', subagent_session_id: 'child-1', status: 'completed', content: 'subagent completed' },
 ];
 
 const CODEX_ROLLOUT = [
@@ -300,17 +304,24 @@ test('tool result events carry measured payload facts across the native boundary
   try {
     const events = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'claude' });
     const results = events.filter((event) => event.kind === 'tool_result');
-    assert.deepEqual(results.map((event) => event.toolUseId), ['toolu_1', 'toolu_2', 'toolu_3']);
+    assert.deepEqual(results.map((event) => event.toolUseId), ['toolu_1', 'toolu_2', 'toolu_3', 'toolu_3']);
+    // The notification is a tool result on a different rail, with the child
+    // identity that is the only reason it exists.
+    const notification = results[3];
+    assert.equal(notification.eventSource, 'subagent_notification');
+    assert.equal(notification.subagentSessionId, 'child-1');
+    assert.equal(notification.agentId, 'agent-1');
     // Byte counts are measurements of the raw payload: 'ok' is two bytes and
     // 'failed' is six, asserted as those numbers rather than as "non-zero",
     // which a fabricated default would also satisfy.
-    assert.deepEqual(results.map((event) => event.payloadBytes), [2, 2, 6]);
-    assert.deepEqual(results.map((event) => event.payloadTruncated), [false, false, false]);
-    assert.deepEqual(results.map((event) => event.eventIndex), [0, 1, 2]);
-    assert.deepEqual(results.map((event) => event.callIndex), [0, 0, 0]);
-    assert.deepEqual(results.map((event) => event.eventSource), ['tool_result', 'tool_result', 'tool_result']);
-    assert.deepEqual(results.map((event) => event.resultStatus), ['completed', 'completed', 'errored']);
-    assert.deepEqual(results.map((event) => event.errorSignal), [null, null, 'tool_result.is_error']);
+    assert.deepEqual(results.map((event) => event.payloadBytes), [2, 2, 6, 'subagent completed'.length]);
+    assert.deepEqual(results.map((event) => event.payloadTruncated), [false, false, false, false]);
+    assert.deepEqual(results.map((event) => event.eventIndex), [0, 1, 2, 3]);
+    // `toolu_3` answers twice: once as the tool result, once as the
+    // notification that the delegated agent finished.
+    assert.deepEqual(results.map((event) => event.callIndex), [0, 0, 0, 1]);
+    assert.deepEqual(results.map((event) => event.resultStatus), ['completed', 'completed', 'errored', 'completed']);
+    assert.deepEqual(results.map((event) => event.errorSignal), [null, null, 'tool_result.is_error', null]);
     for (const event of results) assert.match(String(event.payloadHash), /^[0-9a-f]{16}$/);
 
     // Rows that are not tool results report nothing rather than a zero that
@@ -329,6 +340,9 @@ test('user turn pages group each message with its blocks and page by keyset', as
   const { dbPath, cleanup } = await seededDatabase();
   try {
     const turns = await getSessionUserTurns('claude', SHARED_SESSION, { dbPath });
+    // Four turns, not five: the subagent notification is a harness line and
+    // never arrived on a user message, so it is not a turn.
+    assert.equal(turns.length, 4);
     assert.deepEqual(
       turns.map((turn) => turn.blocks.map((block) => [block.kind, block.toolUseId, block.byteLen, block.isError])),
       [

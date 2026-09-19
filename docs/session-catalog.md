@@ -353,10 +353,25 @@ a floor".
 Codex reports how a call ended out of band (`exec_command_end`,
 `patch_apply_end`, `mcp_tool_call_end`), so its result rows are written with
 `result_status = 'unknown'` and settled when the turn closes at
-`task_complete`; a still-open turn at end of file is settled with the signals
-seen so far rather than left unknown. The remaining providers land with their
-parity issues; they share the `ToolResultFacts::from_payload` helper, so the
-columns will mean the same thing for them.
+`task_complete`. End of file is **not** a turn boundary: a live rollout's last
+turn can still receive the `exec_command_end` that fails one of its calls after
+the bytes a sync read, so a partial read records the failures it saw and leaves
+anything else `unknown`. Only `task_complete` can call a result a success. The
+remaining providers land with their parity issues; they share the
+`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
+for them.
+
+A result with nothing displayable in it — a silent command's empty string, a
+structured payload carrying no text — is still recorded. `payload_bytes = 0` is
+a measurement; dropping the row would lose the call's linkage and its place in
+the ordering too.
+
+Because the columns are nullable and the schema migration marks itself
+complete, an upgraded install would otherwise keep skipping unchanged
+transcripts on the sync fast path and leave every historical tool result null.
+A transcript whose indexed tool results have no `event_index` is therefore
+re-read once by plain `sync` and skipped again afterwards; this is narrower
+than invalidating the whole stamp map, which would re-read the entire archive.
 
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
@@ -643,7 +658,10 @@ discoverable".
   sessionId, options?)` returns one keyset page of user turns, each with the
   ordered `[{kind, toolUseId, byteLen, isError}]` blocks its message carried.
   Both are cache-only and derived from `session_events`, so they cannot
-  disagree with the transcript. `approxTokens` is deliberately absent: every
+  disagree with the transcript. A turn is what arrived on one user message;
+  harness lines stored as tool results — Claude subagent notifications — are
+  not turns and are excluded, because grouping on `role` alone would invent a
+  turn that is neither human text nor an in-message result. `approxTokens` is deliberately absent: every
   estimate available here is a bytes-per-token heuristic, and a heuristic
   served beside measured values is indistinguishable from a measurement at the
   call site.

@@ -2098,6 +2098,20 @@ const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, LENGTH(CAST(text AS BL
 /// turn of its own instead of merging with every other unattributed event.
 const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 
+/// Which rows are blocks on a user message.
+///
+/// `role` alone is not the discriminator. A Claude subagent notification is a
+/// harness line reporting on a delegated child; it is stored with
+/// `role = 'tool_result'` because that is what it is evidence of, but it never
+/// arrived on a user message and carries its own `message_id`. Grouping by role
+/// alone would turn every one of them into a user turn that is neither human
+/// text nor an in-message tool result. `event_source` is the field that
+/// separates the two, and a row indexed before that column existed is null, so
+/// the test excludes the one source that does not qualify rather than naming
+/// the ones that do.
+const USER_TURN_ROW_FILTER: &str = "role IN ('user', 'tool_result') \
+     AND COALESCE(event_source, '') <> 'subagent_notification'";
+
 /// One bounded page of user turns for one session, oldest first.
 ///
 /// Derived from `session_events` rather than a table of its own: the blocks
@@ -2106,11 +2120,13 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// instead of in each consumer is what makes every consumer agree on where a
 /// turn starts and how its bytes are counted.
 ///
-/// A turn is the set of user-side rows (`role` `user` or `tool_result`)
-/// sharing one provider message id. That is exactly a Claude user message,
-/// whose text and tool-result blocks arrive together. Codex records each
-/// output as its own response item, so a Codex turn is one block wide; the
-/// per-block facts are the same either way.
+/// A turn is the set of rows that arrived on one user message, selected by
+/// [`USER_TURN_ROW_FILTER`] and grouped by provider message id. That is exactly
+/// a Claude user message, whose text and tool-result blocks arrive together.
+/// Codex records each output as its own response item, so a Codex turn is one
+/// block wide; the per-block facts are the same either way. Harness lines
+/// stored as tool results that never arrived on a user message -- Claude
+/// subagent notifications -- are not turns and are excluded.
 pub fn session_user_turns_page(
     conn: &Connection,
     source: &str,
@@ -2123,7 +2139,7 @@ pub fn session_user_turns_page(
         "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
          MIN(NULLIF(message_id, '')) AS turn_message_id \
          FROM session_events \
-         WHERE source = ? AND session_id = ? AND role IN ('user', 'tool_result') \
+         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
          GROUP BY turn_key"
     );
     let mut params_vec: Vec<rusqlite::types::Value> =
@@ -2157,7 +2173,7 @@ pub fn session_user_turns_page(
         let mut block_stmt = conn.prepare(&format!(
             "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
              FROM session_events \
-             WHERE source = ? AND session_id = ? AND role IN ('user', 'tool_result') \
+             WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
                AND {USER_TURN_KEY} = ? \
              ORDER BY ts_ms ASC, id ASC"
         ))?;

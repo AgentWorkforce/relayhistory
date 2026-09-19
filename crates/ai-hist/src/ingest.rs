@@ -1621,7 +1621,12 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
-                    Some(id) if codex_session_events_exist(conn, id)? => continue,
+                    Some(id)
+                        if codex_session_events_exist(conn, id)?
+                            && !tool_results_lack_fidelity(conn, "codex", id)? =>
+                    {
+                        continue
+                    }
                     // Stamp matches but the events are gone (wiped or rebuilt
                     // database): fall through and re-ingest.
                     _ => {}
@@ -2318,6 +2323,7 @@ fn ingest_codex_rollout(
                         session_id,
                         &mut pending_results,
                         &mut turn_error_signals,
+                        Settle::TurnComplete,
                     )?;
                 }
                 "thread_settings_applied" => {
@@ -2513,36 +2519,43 @@ fn ingest_codex_rollout(
                 }
                 "function_call_output" | "custom_tool_call_output" => {
                     let output = payload.get("output").unwrap_or(&Value::Null);
-                    if let Some(output_text) = materialize_codex_output_text(output) {
-                        let uid = format!("{index}:{payload_type}");
-                        let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
-                        let call_id = payload_str("call_id").unwrap_or("");
-                        let (call_index, event_index) = indexer.next(call_id);
-                        // Measured over the provider's raw `output`, not the
-                        // flattened text below: a payload that arrives as
-                        // structured blocks is bigger on the wire than the
-                        // joined string this row stores.
-                        let facts = tool_result_facts::codex_output_facts(output, call_id)
-                            .with_ordering(call_index, event_index);
-                        insert_codex_event(
-                            conn,
-                            session_id,
-                            cwd,
-                            branch,
-                            ts_ms,
-                            "tool_result",
-                            "tool_result",
-                            &output_text,
-                            &uid,
-                            &message_id,
-                            None,
-                            None,
-                            Some(&facts),
-                        )?;
-                        outcome.events += 1;
-                        if !call_id.is_empty() {
-                            pending_results.push((uid, call_id.to_string()));
-                        }
+                    // An output with nothing displayable in it -- a silent
+                    // command's empty string, a structured array carrying no
+                    // `text` member -- is still a result the tool returned.
+                    // Dropping it because a transcript view would render
+                    // nothing also drops the call's linkage, its measured size
+                    // (an empty payload is zero bytes, not an unknown number)
+                    // and its place in the ordering, which is exactly what a
+                    // span tree needs when a tool answers with silence.
+                    let output_text = materialize_codex_output_text(output).unwrap_or_default();
+                    let uid = format!("{index}:{payload_type}");
+                    let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
+                    let call_id = payload_str("call_id").unwrap_or("");
+                    let (call_index, event_index) = indexer.next(call_id);
+                    // Measured over the provider's raw `output`, not the
+                    // flattened text below: a payload that arrives as
+                    // structured blocks is bigger on the wire than the
+                    // joined string this row stores.
+                    let facts = tool_result_facts::codex_output_facts(output, call_id)
+                        .with_ordering(call_index, event_index);
+                    insert_codex_event(
+                        conn,
+                        session_id,
+                        cwd,
+                        branch,
+                        ts_ms,
+                        "tool_result",
+                        "tool_result",
+                        &output_text,
+                        &uid,
+                        &message_id,
+                        None,
+                        None,
+                        Some(&facts),
+                    )?;
+                    outcome.events += 1;
+                    if !call_id.is_empty() {
+                        pending_results.push((uid, call_id.to_string()));
                     }
                 }
                 // Readable reasoning arrives as event_msg/agent_reasoning;
@@ -2557,32 +2570,50 @@ fn ingest_codex_rollout(
             _ => {}
         }
     }
-    // A live session's last turn has no `task_complete` yet. Applying the
-    // signals seen so far is strictly better than leaving the rows `unknown`,
-    // and the next sync re-reads the file and resolves them again.
+    // End of file is not a turn boundary. A live rollout's last turn has no
+    // `task_complete` yet, and the `exec_command_end` that fails one of its
+    // calls can still be written after the bytes this pass read. Failures
+    // already observed are recorded; a result with no signal yet stays
+    // `unknown`, because "not known to have failed" is not "succeeded". The
+    // next sync re-reads the file and settles it.
     resolve_codex_tool_results(
         conn,
         session_id,
         &mut pending_results,
         &mut turn_error_signals,
+        Settle::EndOfFile,
     )?;
     Ok(outcome)
 }
 
-/// Apply a finished Codex turn's out-of-band error signals to the tool-result
-/// rows it buffered, and settle the rest as completed.
+/// Whether the pass that is resolving buffered results knows the turn is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// `task_complete` was read: every out-of-band signal for the turn has
+    /// arrived, so a result with none of them succeeded.
+    TurnComplete,
+    /// The readable transcript ended mid-turn: record the failures seen, and
+    /// leave everything else undecided.
+    EndOfFile,
+}
+
+/// Apply a Codex turn's out-of-band error signals to the tool-result rows it
+/// buffered.
 fn resolve_codex_tool_results(
     conn: &Connection,
     session_id: &str,
     pending: &mut Vec<(String, String)>,
     signals: &mut HashMap<String, &'static str>,
+    settle: Settle,
 ) -> Result<()> {
     for (uid, call_id) in pending.drain(..) {
         let signal = signals.get(call_id.as_str()).copied();
-        let status = if signal.is_some() {
-            tool_result_facts::STATUS_ERRORED
-        } else {
-            tool_result_facts::STATUS_COMPLETED
+        let status = match (signal, settle) {
+            (Some(_), _) => tool_result_facts::STATUS_ERRORED,
+            (None, Settle::TurnComplete) => tool_result_facts::STATUS_COMPLETED,
+            // Left as inserted, so a later pass over a completed turn is the
+            // only thing that can call it a success.
+            (None, Settle::EndOfFile) => continue,
         };
         conn.execute(
             "UPDATE session_events SET result_status = ?, error_signal = ? \
@@ -2745,6 +2776,10 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
+            // An unchanged transcript whose tool results predate the fidelity
+            // columns is re-read once to backfill them; afterwards it is
+            // skipped again like any other unchanged file.
+            && !claude_transcript_lacks_tool_result_fidelity(conn, &path)?
         {
             continue;
         }
@@ -2837,6 +2872,56 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether a session's indexed tool results predate the fidelity columns.
+///
+/// A schema migration adds nullable columns and declares itself done; the sync
+/// stamp maps are what decide whether a transcript is opened at all. Without
+/// this, a database that migrated cleanly skips every unchanged transcript and
+/// plain `sync` leaves their `payload_bytes`, `event_index` and the rest null
+/// indefinitely -- while reporting a perfectly successful sync. Only explicit
+/// hydration or an unrelated edit to the file would ever repair them.
+///
+/// `event_index` is the field to test: every tool-result row the current
+/// parsers write has one, whatever the payload was, so a re-read always clears
+/// the condition and a transcript cannot be re-read forever. A session with no
+/// tool results has nothing to backfill and stays on the fast path.
+///
+/// This is deliberately narrower than bumping the stamp-map generation, which
+/// would re-read every transcript in the archive, including the ones with
+/// nothing to gain, and would discard the selective-repair state the codex
+/// generations carry.
+fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_events
+            WHERE source = ? AND session_id = ? AND kind = 'tool_result'
+              AND event_index IS NULL
+            LIMIT 1
+        )",
+        params![source, session_id],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// The same question for a Claude transcript, which the walk knows by path.
+fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+              AND e.kind = 'tool_result' AND e.event_index IS NULL
+            LIMIT 1
+        )",
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -6579,6 +6664,138 @@ mod tests {
         assert_eq!(event_count, 4);
     }
 
+    /// Simulate a database that was synced by a release without the fidelity
+    /// columns: the rows and the sync stamps are there, the columns the
+    /// migration added are null. This is exactly the state an upgraded install
+    /// is in on its first `sync`.
+    fn blank_tool_result_fidelity(conn: &Connection, source: &str) {
+        conn.execute(
+            "UPDATE session_events SET tool_use_id = NULL, payload_bytes = NULL, \
+             payload_truncated = NULL, payload_hash = NULL, call_index = NULL, \
+             event_index = NULL, result_status = NULL, event_source = NULL, \
+             error_signal = NULL WHERE source = ?",
+            [source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plain_claude_sync_backfills_fidelity_for_transcripts_indexed_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-fidelity.jsonl");
+        let lines = [
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "sess-fidelity",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:00.000Z",
+                "message": { "role": "user", "content": "run it" },
+            })),
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "sess-fidelity", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "sess-fidelity", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "a\nb\n" },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-fidelity")[0].payload_bytes,
+            Some(4)
+        );
+
+        blank_tool_result_fidelity(&conn, "claude");
+        // The stamp is unchanged and the events exist, so every other
+        // condition on the fast path says "skip". Without the fidelity check
+        // this sync is a no-op and the columns stay null indefinitely while
+        // the run still reports success.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let rows = tool_results(&conn, "claude", "sess-fidelity");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("tu_1"));
+        assert_eq!(rows[0].event_index, Some(0));
+        assert_eq!(rows[0].event_source.as_deref(), Some("tool_result"));
+
+        // Repaired once, back on the fast path: a sentinel a re-read would
+        // overwrite has to survive, or the transcript is being re-read on
+        // every sync forever.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source = 'claude' AND kind = 'tool_result'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-fidelity")[0]
+                .text
+                .as_deref(),
+            Some("sentinel"),
+        );
+    }
+
+    #[test]
+    fn plain_codex_sync_backfills_fidelity_for_rollouts_indexed_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-04-20T05-00-00-sess_backfill.jsonl");
+        let lines = [
+            r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_backfill","cwd":"/tmp/project"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"call_1"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"a\nb\n"}}"#,
+            r#"{"timestamp":"2026-04-20T05:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        fs::write(&rollout, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_backfill")[0].payload_bytes,
+            Some(4)
+        );
+
+        blank_tool_result_fidelity(&conn, "codex");
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let rows = tool_results(&conn, "codex", "sess_backfill");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload_bytes, Some(4));
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("call_1"));
+        assert_eq!(rows[0].event_index, Some(0));
+        assert_eq!(rows[0].result_status.as_deref(), Some("completed"));
+
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE source = 'codex' AND kind = 'tool_result'",
+            [],
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            tool_results(&conn, "codex", "sess_backfill")[0]
+                .text
+                .as_deref(),
+            Some("sentinel"),
+        );
+    }
+
     /// One Claude project tree as the provider writes it: a parent transcript,
     /// a subagent sidecar the provider named with an in-record `agentId` (with
     /// its `meta.json` beside it), and a sidechain sidecar from a provider
@@ -7278,6 +7495,17 @@ mod tests {
         assert_eq!(row.text.as_deref(), Some("subagent completed"));
         assert_eq!(row.payload_bytes, Some("subagent completed".len() as i64));
 
+        // A subagent notification is stored as a tool result because that is
+        // what it is evidence of, but it never arrived on a user message. It
+        // is not a user turn, and grouping on `role` alone would make it one.
+        let turns =
+            crate::session_user_turns_page(&conn, "claude", "subagent-session", 100, None).unwrap();
+        assert!(
+            turns.user_turns.is_empty(),
+            "a harness notification is not a user turn: {:?}",
+            turns.user_turns,
+        );
+
         // A system line that names no child is harness chatter, not a tool
         // result, and must not manufacture one.
         let noise = dir.path().join("noise.jsonl");
@@ -7362,14 +7590,17 @@ mod tests {
         let path = dir
             .path()
             .join("rollout-2026-04-20T02-00-00-sess_live_1.jsonl");
-        // A live session has no `task_complete` yet. Leaving its rows
-        // `unknown` would report "we do not know" about a failure the
-        // transcript already states.
+        // A live session has no `task_complete` yet. A failure the transcript
+        // already states is recorded; a result that has simply not been
+        // reported on yet stays `unknown`, because end of file is not a turn
+        // boundary and "no failure seen" is not "succeeded".
         let lines = [
             r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess_live_1","cwd":"/tmp/project","timestamp":"2026-04-20T02:00:00.000Z"}}"#,
             r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"false\"}","call_id":"call_live_1"}}"#,
             r#"{"timestamp":"2026-04-20T02:00:01.500Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_live_1","exit_code":1}}"#,
             r#"{"timestamp":"2026-04-20T02:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_live_1","output":"nope"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/a.ts\"}","call_id":"call_live_2"}}"#,
+            r#"{"timestamp":"2026-04-20T02:00:02.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_live_2","output":"contents"}}"#,
         ];
         fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
 
@@ -7378,9 +7609,99 @@ mod tests {
         super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
 
         let rows = tool_results(&conn, "codex", "sess_live_1");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].result_status.as_deref(), Some("errored"));
+        assert_eq!(rows[0].error_signal.as_deref(), Some("exit_code"));
+        assert_eq!(rows[1].result_status.as_deref(), Some("unknown"));
+        assert_eq!(rows[1].error_signal, None);
+    }
+
+    #[test]
+    fn a_codex_failure_reported_after_the_output_is_not_pre_empted_by_a_partial_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T03-00-00-sess_late_1.jsonl");
+        // The exact ordering that makes end-of-file unsafe to settle on:
+        // the output is written, the sync reads the file, and only then does
+        // the `exec_command_end` that failed the call arrive. Calling it
+        // `completed` on the first pass would be a well-formed lie that the
+        // second pass has to retract.
+        let head = [
+            r#"{"timestamp":"2026-04-20T03:00:00.000Z","type":"session_meta","payload":{"id":"sess_late_1","cwd":"/tmp/project","timestamp":"2026-04-20T03:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"make\"}","call_id":"call_late_1"}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:01.700Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_late_1","output":"building"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", head.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        let rows = tool_results(&conn, "codex", "sess_late_1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result_status.as_deref(), Some("unknown"));
+
+        // The rest of the turn lands, and the next sync re-reads the file.
+        let tail = [
+            r#"{"timestamp":"2026-04-20T03:00:02.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_late_1","turn_id":"t1","exit_code":1}}"#,
+            r#"{"timestamp":"2026-04-20T03:00:02.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        let mut grown = head.to_vec();
+        grown.extend_from_slice(&tail);
+        fs::write(&path, format!("{}\n", grown.join("\n"))).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_late_1");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].result_status.as_deref(), Some("errored"));
         assert_eq!(rows[0].error_signal.as_deref(), Some("exit_code"));
+    }
+
+    #[test]
+    fn a_codex_result_with_no_displayable_text_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-20T04-00-00-sess_silent_1.jsonl");
+        // A silent command answers with an empty string, and a structured
+        // output can carry no `text` member at all. Both are results; a row
+        // that reports zero bytes is a measurement, and dropping the row
+        // would lose the call linkage and the ordering as well.
+        let lines = [
+            r#"{"timestamp":"2026-04-20T04:00:00.000Z","type":"session_meta","payload":{"id":"sess_silent_1","cwd":"/tmp/project","timestamp":"2026-04-20T04:00:00.000Z"}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"true\"}","call_id":"c1"}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:01.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":""}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":[{"type":"image","data":"zz"}]}}"#,
+            r#"{"timestamp":"2026-04-20T04:00:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows = tool_results(&conn, "codex", "sess_silent_1");
+        assert_eq!(rows.len(), 2);
+        let empty = &rows[0];
+        assert_eq!(empty.tool_use_id.as_deref(), Some("c1"));
+        assert_eq!(empty.payload_bytes, Some(0));
+        assert_eq!(
+            empty.payload_hash.as_deref(),
+            Some(tool_result_facts::content_hash(b"").as_str()),
+        );
+        assert_eq!(empty.payload_truncated, Some(0));
+        assert_eq!(empty.result_status.as_deref(), Some("completed"));
+        assert_eq!(empty.event_index, Some(0));
+        assert_eq!(empty.text.as_deref(), Some(""));
+
+        // The structured payload has no text to show but is far from empty on
+        // the wire, and its ordering continues the sequence.
+        let structured = &rows[1];
+        assert_eq!(structured.tool_use_id.as_deref(), Some("c2"));
+        let expected =
+            tool_result_facts::stable_stringify(&json!([{ "type": "image", "data": "zz" }]));
+        assert_eq!(structured.payload_bytes, Some(expected.len() as i64));
+        assert_eq!(structured.event_index, Some(1));
     }
 
     #[test]

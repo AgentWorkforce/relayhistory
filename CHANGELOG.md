@@ -19,17 +19,35 @@ Notable changes to the native `ai-hist` CLI are documented here.
   subagent notifications as tool results carrying the delegated child's
   `subagent_session_id` / `agent_id`; Codex writes results with
   `result_status = 'unknown'` and settles them from the turn's out-of-band
-  signals (`exit_code`, `patch_apply`, `mcp_err`) at `task_complete`, or at end
-  of file for a turn still open. Added by the
+  signals (`exit_code`, `patch_apply`, `mcp_err`) at `task_complete`. End of
+  file is not a turn boundary — a live rollout can still report a failure after
+  the bytes a sync read — so a partial read records the failures it saw and
+  leaves the rest `unknown`. A result with no displayable text (a silent
+  command, a structured payload with no text member) is recorded too, with its
+  measured zero-byte payload, rather than dropped. Added by the
   `session_events_tool_result_fidelity_v1` marker migration, which also adds
   `session_hydration_checkpoints.last_tool_result_index`; a database written
   before this shape is routed through the writable open rather than read as
-  current. `HYDRATION_PARSER_VERSION` 2 -> 3.
+  current. Plain `sync` re-reads a transcript once when its indexed tool
+  results have no `event_index`, so an upgraded install backfills them instead
+  of skipping every unchanged file on the stamp fast path and reporting a
+  successful sync over permanently null columns.
+  `HYDRATION_PARSER_VERSION` 2 -> 3.
+
+- Validate submitted `session_events` fidelity on the source-adapter boundary:
+  `payload_bytes`, `call_index` and `event_index` must be non-negative,
+  `result_status`, `event_source` and `error_signal` must come from the
+  documented vocabularies, and all of them must be null on a row that is not a
+  tool result. The TypeScript SDK types these as closed unions and casts
+  without re-checking, so an unvalidated synonym would reach consumers looking
+  exactly like a value they were told to expect.
 
 - Add `session_user_turns_page(conn, source, session_id, limit, after)`:
   one keyset page of user turns, each with the ordered
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
-  derived from `session_events` rather than a second table. `approx_tokens` is
+  derived from `session_events` rather than a second table. A turn is what
+  arrived on one user message, so harness lines stored as tool results (Claude
+  subagent notifications) are excluded. `approx_tokens` is
   deliberately not computed — every estimate available here is a
   bytes-per-token heuristic, and one served beside measured values is
   indistinguishable from a measurement at the call site.
