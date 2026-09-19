@@ -11,7 +11,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 for continuity evidence. A checkpoint written before continuity
+/// existed reports the session unchanged, so targeted hydration would return
+/// success without ever reading the transcript that holds the fork, resume or
+/// continuation signal. The bump forces exactly one re-read per session, which
+/// banks the evidence and then settles.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

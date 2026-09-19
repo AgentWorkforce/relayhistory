@@ -1609,6 +1609,16 @@ fn sync_codex_rollouts(
                         }
                     }
                 }
+                // The same gap on the continuity side, repaired the same way.
+                // A rollout's continuity signals all live on its `session_meta`
+                // line, so a database that predates continuity is backfilled by
+                // reading that one line rather than re-ingesting the rollout.
+                // The capture always writes a row for a readable rollout, so
+                // this clears after one pass and never re-reads again.
+                if recorded_session.is_some() && !codex_continuity_evidence_exists(conn, &rollout)?
+                {
+                    crate::continuity::capture_codex_rollout(conn, &rollout)?;
+                }
                 match recorded_session {
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
@@ -2663,6 +2673,16 @@ fn sync_claude_session_metadata(
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
         {
+            // An unchanged transcript indexed before continuity existed still
+            // owes its evidence. Reading it here rather than falling through
+            // keeps the skip's promise: continuity is written to its own
+            // table and touches no indexed row, so the file is read without
+            // being re-ingested — the same shape as the subagent delegation
+            // backfill in the Codex walk. The capture writes a row for every
+            // readable transcript, so this clears after one pass.
+            if claude_transcript_lacks_continuity_evidence(conn, &path)? {
+                crate::continuity::capture_claude_transcript(conn, &path)?;
+            }
             continue;
         }
         scanned += 1;
@@ -2760,6 +2780,51 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether this rollout's continuity evidence has ever been banked.
+///
+/// Keyed on the locator, like the Claude probe below and for the same reason:
+/// the stamp map would otherwise skip exactly the rollouts that an upgrade
+/// into continuity needs to read.
+fn codex_continuity_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_continuity_evidence \
+         WHERE source = 'codex' AND locator = ? LIMIT 1)",
+        [locator.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// Whether an unchanged transcript still owes the continuity index one read.
+///
+/// The stamp map decides whether a transcript is opened at all, so an install
+/// that upgrades into continuity has a stamp for every existing file and would
+/// skip exactly the ones whose evidence has never been banked — reporting a
+/// successful sync over a `session_continuity_evidence` table that stays empty
+/// until some transcript happens to change. This is narrower than bumping the
+/// `claude_sessions_v3` generation, which would re-read the whole archive and
+/// discard the selective-repair state that map carries.
+///
+/// Keyed on the locator alone, deliberately. Joining `sessions.raw_path` would
+/// have read the fork case wrong in exactly the way continuity exists to
+/// catch: two transcripts sharing one in-log session id are one `sessions`
+/// row, whose `raw_path` names only the last of them, so the other branch
+/// would never have been backfilled. The caller only reaches this on the fast
+/// path, which already established that the file produced events or sidecar
+/// evidence — so it has an in-log `sessionId`, so the capture writes a row,
+/// so the condition clears and nothing is re-read forever.
+fn claude_transcript_lacks_continuity_evidence(conn: &Connection, path: &Path) -> Result<bool> {
+    let locator = path.to_string_lossy();
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_continuity_evidence \
+         WHERE source = 'claude' AND locator = ? LIMIT 1)",
+        [locator.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 0)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -8104,5 +8169,255 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
+    }
+
+    /// Reproduce a database synced by a release without continuity: the events
+    /// and the sync stamps are there, the evidence table that release never
+    /// wrote is not. Deleting the row is exactly the pre-upgrade state, and it
+    /// is the only thing these two tests fake.
+    fn forget_continuity_evidence(conn: &Connection) {
+        conn.execute("DELETE FROM session_continuity_evidence", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn an_upgraded_claude_install_backfills_continuity_without_a_generation_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects/app");
+        std::fs::create_dir_all(&projects).unwrap();
+        // Two transcripts, the second continuing the first across files.
+        std::fs::write(
+            projects.join("origin.jsonl"),
+            concat!(
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"start\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-a\",\"parentUuid\":\"origin-u\",",
+                "\"type\":\"assistant\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"assistant\",",
+                "\"content\":\"on it\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            projects.join("continued.jsonl"),
+            concat!(
+                "{\"sessionId\":\"continued\",\"uuid\":\"cont-u\",\"parentUuid\":\"origin-a\",",
+                "\"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",",
+                "\"content\":\"carry on\"},\"timestamp\":\"2026-08-31T11:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let generation = state
+            .get("claude_sessions_v3")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap();
+        assert_eq!(generation.len(), 2, "both transcripts are stamped");
+
+        forget_continuity_evidence(&conn);
+        conn.execute(
+            "DELETE FROM session_relationships WHERE relationship = 'continuation'",
+            [],
+        )
+        .unwrap();
+
+        // A plain sync, with every stamp still matching. Without the fast-path
+        // predicate this walks straight past both files and the continuation
+        // is never recorded; with it, each is re-read exactly once.
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let banked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(banked, 2);
+        let edge: (String, Option<String>) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id FROM session_relationships \
+                 WHERE relationship = 'continuation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(edge, ("origin".to_string(), Some("continued".to_string())));
+        assert_eq!(
+            state
+                .get("claude_sessions_v3")
+                .and_then(Value::as_object)
+                .unwrap(),
+            &generation,
+            "the stamp map is untouched: this is a repair, not a generation reset"
+        );
+
+        // The files are back on the fast path. A sentinel written into the
+        // indexed events survives the next sync, which proves nothing is
+        // re-read forever.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE session_id = 'origin' AND role = 'user'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let survived: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE session_id = 'origin' AND role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, "sentinel");
+    }
+
+    #[test]
+    fn an_upgraded_codex_install_backfills_continuity_without_a_generation_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join("rollout-forked.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"forked\",\"cwd\":\"/work/app\",\"cli_version\":\"0.148.0\",",
+                "\"continuedFromSessionId\":\"prior-thread\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",",
+                "\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, dir.path()).unwrap();
+        let generation = state.get("codex_rollouts_v5").cloned().unwrap();
+
+        forget_continuity_evidence(&conn);
+        conn.execute(
+            "DELETE FROM session_relationships WHERE relationship = 'continuation'",
+            [],
+        )
+        .unwrap();
+
+        // The rollout is unchanged and its events are present, so the skip
+        // path takes it. Continuity still has to be backfilled from the one
+        // `session_meta` line it lives on.
+        sync_codex(&conn, &mut state, dir.path()).unwrap();
+        let banked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(banked, 1);
+        let edge: (String, Option<String>) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id FROM session_relationships \
+                 WHERE relationship = 'continuation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edge,
+            ("prior-thread".to_string(), Some("forked".to_string()))
+        );
+        assert_eq!(
+            state.get("codex_rollouts_v5").unwrap(),
+            &generation,
+            "the stamp map is untouched: this is a repair, not a generation reset"
+        );
+
+        // Back on the skip path: a sentinel in the indexed events survives.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' WHERE session_id = 'forked' AND role = 'user'",
+            [],
+        )
+        .unwrap();
+        sync_codex(&conn, &mut state, dir.path()).unwrap();
+        let survived: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE session_id = 'forked' AND role = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, "sentinel");
+    }
+
+    #[test]
+    fn an_upgrade_backfills_both_branches_that_share_one_session_id() {
+        // The hole a `sessions.raw_path` join would have left, in the one case
+        // continuity exists to catch: two transcripts carrying one in-log
+        // session id are a single catalog row whose `raw_path` names only the
+        // last of them, so keying the backfill on that row would have left the
+        // other branch unread and the fork undetected forever.
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects/app");
+        std::fs::create_dir_all(&projects).unwrap();
+        for branch in ["branch-a", "branch-b"] {
+            std::fs::write(
+                projects.join(format!("{branch}.jsonl")),
+                format!(
+                    "{{\"sessionId\":\"shared\",\"uuid\":\"{branch}-u\",\"parentUuid\":null,\
+                     \"type\":\"user\",\"cwd\":\"/work/app\",\"message\":{{\"role\":\"user\",\
+                     \"content\":\"{branch}\"}},\"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let raw_paths: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_paths, 1, "both branches are one catalog row");
+
+        forget_continuity_evidence(&conn);
+        conn.execute(
+            "DELETE FROM session_relationships WHERE relationship = 'fork'",
+            [],
+        )
+        .unwrap();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let banked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            banked, 2,
+            "both transcripts were read, not just the one the catalog names"
+        );
+        let forks: Vec<String> = conn
+            .prepare(
+                "SELECT relationship_uid FROM session_relationships \
+                 WHERE relationship = 'fork' ORDER BY relationship_uid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(forks, vec!["fork:branch-a", "fork:branch-b"]);
     }
 }

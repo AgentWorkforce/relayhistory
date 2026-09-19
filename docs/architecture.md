@@ -217,6 +217,12 @@ transcript's first `parentUuid` resolved against the session that actually
 holds that record, and two or more transcripts carrying one in-log session id.
 `evidence_ref` names which one produced the row.
 
+A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
+human types, and the control wrapper Claude Code actually stores —
+`<command-name>/resume</command-name>` with the target in `<command-args>`,
+which this crate already classifies as a control prompt. Matching only the bare
+form matched the one shape a real transcript never contains.
+
 Unlike delegation, continuity is not observable inside a single transcript, so
 each transcript's evidence is banked in `session_continuity_evidence`, keyed by
 the transcript. Reconciliation then runs over the stored rows rather than over
@@ -227,6 +233,24 @@ session — keeps a `pending_reason` and is reported as a
 `RELATIONSHIP_CONTINUITY_UNRESOLVED` diagnostic on both hydration and
 `getSessionRelationships`. Hydrating the file that supplies the missing piece
 resolves it without re-reading the first file.
+
+A re-read replaces what a transcript says, including retracting it. Every edge
+carries the `evidence_locator` that established it, and a reconciliation pass
+removes that locator's edges which the current read no longer produces — so a
+rewritten `/resume`, a changed explicit field, or a file that stops being a
+session at all cannot leave a stale edge queryable. Retraction is keyed on the
+whole row identity, not the uid alone: a `/resume` retyped against a different
+session keeps its uid and changes only the parent.
+
+The stamp maps decide whether a file is opened at all, so an install upgrading
+into continuity would otherwise skip exactly the files whose evidence has never
+been banked, and report a successful sync over an empty table. Both providers
+re-read once when a locator has no evidence row: Claude falls through to a full
+re-read, Codex reads only the `session_meta` line its continuity lives on. Every
+readable file writes a row — including one carrying no continuity at all — so
+the condition always clears and nothing is re-read forever. This is deliberately
+narrower than bumping a stamp-map generation, which would re-read the whole
+archive and discard the selective-repair state those maps carry.
 
 A fork branch is given a child identity only when the provider gave it one. Two
 transcripts carrying the same in-log `sessionId` are branches with no identity

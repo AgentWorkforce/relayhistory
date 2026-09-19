@@ -236,12 +236,10 @@ pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
     if let Some(target) = string_field(payload, &["forkSessionId", "fork_session_id"]) {
         push_unique(&mut evidence.explicit_fork_targets, target);
     }
-    if evidence.explicit_continuation_targets.is_empty()
-        && evidence.explicit_fork_targets.is_empty()
-        && evidence.explicit_source_session_id.is_none()
-    {
-        return Ok(None);
-    }
+    // A rollout that names nothing still gets a row. The row's existence is
+    // what tells a later sync this locator has already been read, and without
+    // it every rollout that carries no continuity — which is nearly all of
+    // them — would be re-read on every sync forever.
     Ok(Some(evidence))
 }
 
@@ -292,18 +290,75 @@ pub fn record_evidence(conn: &Connection, evidence: &ContinuityEvidence) -> Resu
 
 /// Read one transcript's evidence and store it, in one call.
 pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
-    if let Some(evidence) = scan_claude_transcript(path)? {
-        record_evidence(conn, &evidence)?;
+    capture(conn, "claude", path, scan_claude_transcript(path)?)
+}
+
+/// Read one rollout's evidence and store it, in one call.
+pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<()> {
+    capture(conn, "codex", path, scan_codex_rollout(path)?)
+}
+
+/// Store what a file says now, or retract what it used to say.
+///
+/// A transcript that stops yielding evidence — rewritten, truncated, replaced
+/// by a file that is not a session at all — has to retract the edges it
+/// established, not keep them queryable forever. Leaving the old row in place
+/// was the quieter failure: the file no longer says a thing, and the graph
+/// went on reporting it.
+fn capture(
+    conn: &Connection,
+    source: &str,
+    path: &Path,
+    evidence: Option<ContinuityEvidence>,
+) -> Result<()> {
+    match evidence {
+        Some(evidence) => record_evidence(conn, &evidence),
+        None => clear_evidence(conn, source, &path.to_string_lossy()),
     }
+}
+
+/// Drop one locator's evidence and every continuity edge it established.
+pub fn clear_evidence(conn: &Connection, source: &str, locator: &str) -> Result<()> {
+    retract_edges(conn, source, locator, &[])?;
+    conn.execute(
+        "DELETE FROM session_continuity_evidence WHERE source = ? AND locator = ?",
+        params![source, locator],
+    )?;
     Ok(())
 }
 
-/// Read one rollout's evidence and store it, when it carries any.
-pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<()> {
-    if let Some(evidence) = scan_codex_rollout(path)? {
-        record_evidence(conn, &evidence)?;
+/// Remove the continuity edges this locator established that it no longer does.
+///
+/// Retraction is keyed on `evidence_locator`, so it reaches only the rows this
+/// file is responsible for — a sibling branch's fork row carries the sibling's
+/// locator and is untouched. Surviving rows are left alone rather than deleted
+/// and rewritten, which keeps their `created_ms` at first observation.
+fn retract_edges(
+    conn: &Connection,
+    source: &str,
+    locator: &str,
+    keep: &[(String, String)],
+) -> Result<usize> {
+    // Keyed on the whole row identity, not the uid alone: a `/resume` retyped
+    // against a different session keeps its `resume:<child>` uid and changes
+    // only the parent, so a uid-only keep-set would have let the edge to the
+    // old target survive beside the new one.
+    let kept = keep
+        .iter()
+        .map(|_| " AND NOT (parent_session_id = ? AND relationship_uid = ?)")
+        .collect::<String>();
+    let sql = format!(
+        "DELETE FROM session_relationships \
+         WHERE source = ? AND evidence_locator = ? \
+           AND relationship IN ('continuation', 'fork', 'resume'){kept}"
+    );
+    let mut values: Vec<rusqlite::types::Value> =
+        vec![source.to_string().into(), locator.to_string().into()];
+    for (parent, uid) in keep {
+        values.push(parent.clone().into());
+        values.push(uid.clone().into());
     }
-    Ok(())
+    Ok(conn.execute(&sql, rusqlite::params_from_iter(values))?)
 }
 
 /// What one reconciliation pass did.
@@ -311,6 +366,9 @@ pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<()> {
 pub struct ContinuityReconciliation {
     pub considered: usize,
     pub edges_written: usize,
+    /// Edges a re-read transcript no longer establishes, removed rather than
+    /// left queryable.
+    pub retracted: usize,
     pub resolved: usize,
     pub pending: usize,
 }
@@ -332,11 +390,17 @@ pub fn reconcile(conn: &Connection, source: &str) -> Result<ContinuityReconcilia
     };
     for evidence in &pending {
         let mut reasons: Vec<String> = Vec::new();
-        let mut lineage = resolve_explicit(conn, evidence)?;
-        lineage += resolve_resume(conn, evidence, &mut reasons)?;
-        lineage += resolve_cross_file_parent(conn, evidence, &mut reasons)?;
-        report.edges_written += lineage;
-        report.edges_written += resolve_fork_group(conn, evidence, lineage > 0, &mut reasons)?;
+        // Every uid this locator establishes on this pass. What it established
+        // on an earlier pass and no longer does is retracted below, so a
+        // rewritten transcript cannot leave a stale edge queryable.
+        let mut written: Vec<(String, String)> = Vec::new();
+        resolve_explicit(conn, evidence, &mut written)?;
+        resolve_resume(conn, evidence, &mut reasons, &mut written)?;
+        resolve_cross_file_parent(conn, evidence, &mut reasons, &mut written)?;
+        let lineage = written.len();
+        resolve_fork_group(conn, evidence, lineage > 0, &mut reasons, &mut written)?;
+        report.edges_written += written.len();
+        report.retracted += retract_edges(conn, &evidence.source, &evidence.locator, &written)?;
         let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         if reason.is_none() {
             report.resolved += 1;
@@ -419,13 +483,16 @@ pub fn pending_reasons(
 
 /// Explicit provider fields. These name the origin outright, so they never
 /// wait on anything and never produce a pending reason.
-fn resolve_explicit(conn: &Connection, evidence: &ContinuityEvidence) -> Result<usize> {
-    let mut written = 0;
+fn resolve_explicit(
+    conn: &Connection,
+    evidence: &ContinuityEvidence,
+    written: &mut Vec<(String, String)>,
+) -> Result<()> {
     for target in &evidence.explicit_continuation_targets {
         if target.is_empty() || *target == evidence.session_id {
             continue;
         }
-        write_edge(
+        written.push(write_edge(
             conn,
             evidence,
             RELATIONSHIP_CONTINUATION,
@@ -433,8 +500,7 @@ fn resolve_explicit(conn: &Connection, evidence: &ContinuityEvidence) -> Result<
             Some(evidence.session_id.as_str()),
             REF_CONTINUED_FROM,
             evidence.explicit_source_session_id.as_deref(),
-        )?;
-        written += 1;
+        )?);
     }
     for target in &evidence.explicit_fork_targets {
         if target.is_empty() || *target == evidence.session_id {
@@ -444,7 +510,7 @@ fn resolve_explicit(conn: &Connection, evidence: &ContinuityEvidence) -> Result<
             .explicit_source_session_id
             .as_deref()
             .unwrap_or(target.as_str());
-        write_edge(
+        written.push(write_edge(
             conn,
             evidence,
             RELATIONSHIP_FORK,
@@ -452,10 +518,9 @@ fn resolve_explicit(conn: &Connection, evidence: &ContinuityEvidence) -> Result<
             Some(evidence.session_id.as_str()),
             REF_FORK_SESSION,
             Some(origin),
-        )?;
-        written += 1;
+        )?);
     }
-    Ok(written)
+    Ok(())
 }
 
 /// A `/resume <id>` or `/continue <id>` the human typed.
@@ -467,9 +532,10 @@ fn resolve_resume(
     conn: &Connection,
     evidence: &ContinuityEvidence,
     reasons: &mut Vec<String>,
-) -> Result<usize> {
+    written: &mut Vec<(String, String)>,
+) -> Result<()> {
     if !evidence.has_resume_marker {
-        return Ok(0);
+        return Ok(());
     }
     let Some(target) = evidence
         .resume_target
@@ -477,12 +543,12 @@ fn resolve_resume(
         .filter(|target| !target.is_empty())
     else {
         reasons.push("resume marker names no prior session".to_string());
-        return Ok(0);
+        return Ok(());
     };
     if target == evidence.session_id {
-        return Ok(0);
+        return Ok(());
     }
-    write_edge(
+    written.push(write_edge(
         conn,
         evidence,
         RELATIONSHIP_RESUME,
@@ -490,8 +556,8 @@ fn resolve_resume(
         Some(evidence.session_id.as_str()),
         REF_RESUME_MARKER,
         Some(target),
-    )?;
-    Ok(1)
+    )?);
+    Ok(())
 }
 
 /// The transcript answers a record it does not contain.
@@ -504,23 +570,24 @@ fn resolve_cross_file_parent(
     conn: &Connection,
     evidence: &ContinuityEvidence,
     reasons: &mut Vec<String>,
-) -> Result<usize> {
+    written: &mut Vec<(String, String)>,
+) -> Result<()> {
     let Some(parent_uuid) = evidence
         .first_parent_uuid
         .as_deref()
         .filter(|uuid| !uuid.is_empty())
     else {
-        return Ok(0);
+        return Ok(());
     };
     let Some(parent_session_id) = session_holding_record(conn, &evidence.source, parent_uuid)?
     else {
         reasons.push(format!(
             "parent record {parent_uuid} is not indexed in any session yet"
         ));
-        return Ok(0);
+        return Ok(());
     };
     if parent_session_id == evidence.session_id {
-        return Ok(0);
+        return Ok(());
     }
     // An explicit field already said this, and said it better.
     if evidence
@@ -528,9 +595,9 @@ fn resolve_cross_file_parent(
         .contains(&parent_session_id)
         || evidence.resume_target.as_deref() == Some(parent_session_id.as_str())
     {
-        return Ok(0);
+        return Ok(());
     }
-    write_edge(
+    written.push(write_edge(
         conn,
         evidence,
         RELATIONSHIP_CONTINUATION,
@@ -538,8 +605,8 @@ fn resolve_cross_file_parent(
         Some(evidence.session_id.as_str()),
         parent_uuid,
         evidence.explicit_source_session_id.as_deref(),
-    )?;
-    Ok(1)
+    )?);
+    Ok(())
 }
 
 /// Two or more transcripts claiming one origin conversation are its branches.
@@ -557,13 +624,14 @@ fn resolve_fork_group(
     evidence: &ContinuityEvidence,
     has_lineage: bool,
     reasons: &mut Vec<String>,
-) -> Result<usize> {
+    written: &mut Vec<(String, String)>,
+) -> Result<()> {
     let Some(origin) = evidence.origin_session_id() else {
-        return Ok(0);
+        return Ok(());
     };
     // An explicit fork field already established the branch.
     if !evidence.explicit_fork_targets.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
     let group = fork_group(conn, &evidence.source, &origin)?;
     let labels: BTreeSet<&str> = group
@@ -580,12 +648,11 @@ fn resolve_fork_group(
                 "only one transcript claims origin {origin}; a fork needs a sibling"
             ));
         }
-        return Ok(0);
+        return Ok(());
     }
-    let mut written = 0;
     for member in &group {
         let child = (member.session_id != origin).then_some(member.session_id.as_str());
-        write_edge(
+        let uid = write_edge(
             conn,
             member,
             RELATIONSHIP_FORK,
@@ -594,9 +661,13 @@ fn resolve_fork_group(
             REF_SHARED_SESSION_ID,
             Some(origin.as_str()),
         )?;
-        written += 1;
+        // Only this locator's own row is part of its keep-set; a sibling's row
+        // is retracted by the sibling's own pass, never by this one.
+        if member.locator == evidence.locator {
+            written.push(uid);
+        }
     }
-    Ok(written)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +683,7 @@ fn write_edge(
     child_session_id: Option<&str>,
     evidence_ref: &str,
     origin_session_id: Option<&str>,
-) -> Result<()> {
+) -> Result<(String, String)> {
     // Unlinked branches of one origin must not collapse into a single row, so
     // their uid carries the transcript that distinguishes them.
     let uid = match child_session_id {
@@ -639,7 +710,8 @@ fn write_edge(
             relationship_uid: Some(&uid),
             ..ObservedRelationship::default()
         },
-    )
+    )?;
+    Ok((parent_session_id.to_string(), uid))
 }
 
 fn evidence_kind(source: &str) -> &'static str {
@@ -757,6 +829,17 @@ fn file_session_id_from_path(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A `/resume` or `/continue` the human ran, in either form Claude writes.
+///
+/// Claude Code does not store a slash command as the text the human typed. It
+/// stores a control wrapper — `<command-message>resume is running…`,
+/// `<command-name>/resume</command-name>`, `<command-args>…</command-args>` —
+/// which this crate already recognises as a control prompt and keeps out of
+/// prompt history. Matching only bare `/resume` therefore matched the one form
+/// a real session never contains, and every actual resume went unrecorded.
+///
+/// burn reads the same marker off plain user text only, so on the bare form
+/// the two agree; the wrapped form is one burn does not detect either.
 fn record_resume_marker(
     evidence: &mut ContinuityEvidence,
     object: &serde_json::Map<String, Value>,
@@ -765,13 +848,17 @@ fn record_resume_marker(
         return;
     };
     let trimmed = text.trim();
-    let Some(after_slash) = trimmed.strip_prefix('/') else {
-        return;
+    let (command, rest) = if crate::discover::is_claude_control_prompt(trimmed) {
+        match wrapped_command(trimmed) {
+            Some(parsed) => parsed,
+            None => return,
+        }
+    } else {
+        match bare_command(trimmed) {
+            Some(parsed) => parsed,
+            None => return,
+        }
     };
-    let command_end = after_slash
-        .find(char::is_whitespace)
-        .unwrap_or(after_slash.len());
-    let command = after_slash[..command_end].to_lowercase();
     if command != "resume" && command != "continue" {
         return;
     }
@@ -779,12 +866,43 @@ fn record_resume_marker(
     if evidence.resume_target.is_some() {
         return;
     }
-    let rest = after_slash[command_end..].trim_start();
     let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let token = &rest[..token_end];
     if !token.is_empty() {
         evidence.resume_target = Some(token.to_string());
     }
+}
+
+/// `/resume <target>` as typed: the form burn matches.
+fn bare_command(text: &str) -> Option<(String, &str)> {
+    let after_slash = text.strip_prefix('/')?;
+    let command_end = after_slash
+        .find(char::is_whitespace)
+        .unwrap_or(after_slash.len());
+    Some((
+        after_slash[..command_end].to_lowercase(),
+        after_slash[command_end..].trim_start(),
+    ))
+}
+
+/// The command name and arguments Claude Code's control wrapper carries.
+///
+/// `<command-args>` is absent when the command took none, and the elements can
+/// arrive in either order, so each is read independently rather than by
+/// position.
+fn wrapped_command(text: &str) -> Option<(String, &str)> {
+    let name = tag_body(text, "command-name")?;
+    let command = name.trim().trim_start_matches('/').to_lowercase();
+    let args = tag_body(text, "command-args").unwrap_or("").trim_start();
+    Some((command, args))
+}
+
+fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(&text[start..end])
 }
 
 /// The user's own typed text, from either content shape. Tool results and
@@ -1210,10 +1328,20 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(scan_codex_rollout(&resumed).unwrap(), None);
+        let evidence = scan_codex_rollout(&resumed).unwrap().unwrap();
+        assert_eq!(evidence.session_id, "sess-resumed");
+        assert!(evidence.explicit_continuation_targets.is_empty());
+        assert!(evidence.explicit_fork_targets.is_empty());
+        assert_eq!(evidence.explicit_source_session_id, None);
+        assert_eq!(evidence.origin_session_id(), None);
+
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         capture_codex_rollout(&conn, &resumed).unwrap();
         reconcile(&conn, "codex").unwrap();
+        // The rollout still gets an evidence row. That row is what tells the
+        // next sync this locator has already been read: without it, every
+        // rollout that carries no continuity — nearly all of them — would be
+        // re-read on every sync forever.
         let stored: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM session_continuity_evidence",
@@ -1221,12 +1349,190 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, 0);
+        assert_eq!(stored, 1);
+        // What it does not get is an edge pointed at a guess.
         let edges: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(edges, 0);
+        // And it settles: a second pass has nothing left to consider.
+        assert_eq!(reconcile(&conn, "codex").unwrap().considered, 0);
+    }
+
+    #[test]
+    fn a_rewritten_transcript_retracts_the_edge_it_no_longer_establishes() {
+        // The quiet failure this guards: the upsert replaces the evidence row,
+        // reconciliation only ever adds, so the edge the file used to
+        // establish stayed queryable after the file stopped saying it.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resumer.jsonl");
+        let write = |target: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"sessionId\":\"resumer\",\"uuid\":\"u1\",\"parentUuid\":null,\
+                     \"type\":\"user\",\"message\":{{\"role\":\"user\",\
+                     \"content\":\"/resume {target}\"}},\
+                     \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let current = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT relationship, parent_session_id FROM session_relationships \
+                 WHERE relationship IN ('continuation', 'fork', 'resume') \
+                 ORDER BY parent_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+
+        write("old-origin");
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            current(&conn),
+            vec![(RELATIONSHIP_RESUME.to_string(), "old-origin".to_string())]
+        );
+
+        // The human re-ran the command against a different session.
+        write("new-origin");
+        capture_claude_transcript(&conn, &path).unwrap();
+        let report = reconcile(&conn, "claude").unwrap();
+        assert_eq!(report.retracted, 1);
+        assert_eq!(
+            current(&conn),
+            vec![(RELATIONSHIP_RESUME.to_string(), "new-origin".to_string())],
+            "exactly one current edge remains, naming the session the file now names"
+        );
+    }
+
+    #[test]
+    fn a_transcript_that_stops_yielding_evidence_retracts_it_entirely() {
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resumer.jsonl");
+        std::fs::write(
+            &path,
+            "{\"sessionId\":\"resumer\",\"uuid\":\"u1\",\"type\":\"user\",\
+             \"message\":{\"role\":\"user\",\"content\":\"/resume old-origin\"},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(edges(&conn, "old-origin").len(), 1);
+
+        // Truncated, replaced, or otherwise no longer a session at all.
+        std::fs::write(&path, "").unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        assert!(edges(&conn, "old-origin").is_empty());
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn a_siblings_fork_row_survives_this_locators_retraction() {
+        // Retraction is keyed on `evidence_locator`, so a pass over one branch
+        // must not remove the row the other branch is responsible for.
+        let (_dir, conn) = database();
+        ingest(&conn, "fork-branch-a.jsonl");
+        ingest(&conn, "fork-branch-b.jsonl");
+        assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+        // Re-capture one branch and reconcile: the sibling's row is untouched.
+        capture_claude_transcript(&conn, &fixture("fork-branch-a.jsonl")).unwrap();
+        let report = reconcile(&conn, "claude").unwrap();
+        assert_eq!(report.retracted, 0);
+        assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+    }
+
+    #[test]
+    fn a_wrapped_slash_command_is_the_form_a_real_session_carries() {
+        // Claude Code stores `/resume <id>` as a control wrapper, not as the
+        // text the human typed. Matching only the bare form matched the one
+        // shape a real transcript never contains.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"wrapped\",\"uuid\":\"u1\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":",
+                "\"<command-message>resume is running…</command-message>\\n",
+                "<command-name>/resume</command-name>\\n",
+                "<command-args>prior-session extra</command-args>\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target.as_deref(), Some("prior-session"));
+
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            edges(&conn, "prior-session")
+                .into_iter()
+                .map(|edge| edge.0)
+                .collect::<Vec<_>>(),
+            vec![RELATIONSHIP_RESUME.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_command_without_args_is_a_marker_with_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare-wrapped.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"wrapped\",\"uuid\":\"u1\",\"type\":\"user\",",
+                "\"message\":{\"role\":\"user\",\"content\":",
+                "\"<command-message>continue is running…</command-message>\\n",
+                "<command-name>/continue</command-name>\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target, None);
+    }
+
+    #[test]
+    fn a_wrapped_command_that_is_not_a_resume_sets_no_marker() {
+        // The positive control for the two above: the same wrapper shape, a
+        // different command, and nothing is recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("review.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"wrapped\",\"uuid\":\"u1\",\"type\":\"user\",",
+                "\"message\":{\"role\":\"user\",\"content\":",
+                "\"<command-message>review is running…</command-message>\\n",
+                "<command-name>/review</command-name>\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(!evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target, None);
     }
 }
