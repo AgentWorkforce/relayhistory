@@ -335,7 +335,7 @@ Delegation is a separate capability, reported on every relationship result as
 | Source | Stable child identity | Agent type | Spawn time | Evidence locator |
 |---|---|---|---|---|
 | **codex** | always | ✓ | ✓ | ✓ |
-| **opencode** | always | ✓ | ✓ | ✓ |
+| **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **cursor**, **grok**, **relay** | never | – | – | – |
 
@@ -343,6 +343,12 @@ OpenCode is `always` because a subagent session is a session in its own right
 and its own record names the parent, in `session.parentID`. Nothing is
 inferred from file names or ordering, so the edge is recorded with
 `evidence_kind = "opencode_parent_id"` and `identity_status = "observed"`.
+
+OpenCode is the one source whose four columns do not move together, which is
+the point of reporting them separately: it names the parent and the spawn
+time and keeps the evidence locator, but records no *type* for the child, so
+`childAgentType` and `childAgentName` are always null and the capability says
+so rather than promising a field the adapter never writes.
 
 Claude is `sometimes` because a subagent transcript carries the *parent's*
 `sessionId` on every record; the child's own identity is the per-child
@@ -521,6 +527,17 @@ Each connector presence stores a `source_stamp` —
 | opencode (SQLite) | `{database identity}:{schema version}:{time_created}:{time_updated}` |
 | opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}` over the session file, its messages and their parts |
 | relay | `{newest synced timestamp}:{synced row count}` |
+
+The OpenCode JSON-tree marker is an aggregate for a reason: the provider
+appends a turn by writing *new* files under `message/` and `part/` and does
+not touch the session JSON, so a marker over that file alone reports an active
+session as unchanged forever. All three components earn their place —
+modification time because a birth time cannot see an in-place rewrite, the
+file count because a coarse filesystem clock can give an appended turn the
+same mtime as the read before it, and the byte total because an in-place edit
+can preserve the count. Discovery and hydration compute it with the same
+function, so the catalog and the checkpoint cannot disagree about whether a
+session has moved.
 
 On a rescan, a candidate whose stamp matches the stamp for that same location
 in `session_presences` is served straight from the catalog: no read, no parse,

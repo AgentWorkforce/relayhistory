@@ -1098,8 +1098,27 @@ fn a_sqlite_store_named_like_json_is_still_read_as_sqlite() {
     use_layout(&home, Some(&store), None);
     let db_path = root.join("history.db");
 
+    // Establish the catalog row and its locator. Global sync does not route
+    // by extension, so this alone would index the session and an assertion
+    // made after it would pass whatever targeted hydration does -- that is
+    // the trap this test has to avoid, so the evidence is cleared before the
+    // path under test runs.
     sync_local_at(&db_path).unwrap();
     discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    clear_opencode_evidence(&db_path);
+
+    // Positive control: hydration is now the only thing that can put the
+    // events back.
+    {
+        let conn = open_db(&db_path).unwrap();
+        assert!(
+            session_events(&conn, "ses_sqlite_root", Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "the evidence must actually be gone, or this test proves nothing"
+        );
+    }
+
     let hydrated = hydrate(&db_path, "ses_sqlite_root");
     assert!(
         hydrated.evidence.events > 0,
@@ -1112,10 +1131,28 @@ fn a_sqlite_store_named_like_json_is_still_read_as_sqlite() {
         !session_events(&conn, "ses_sqlite_root", Some("opencode"))
             .unwrap()
             .is_empty(),
-        "the session's events must be indexed"
+        "targeted hydration must re-index the session it was pointed at"
     );
 
     fs::remove_dir_all(&root).ok();
+}
+
+/// Drop every OpenCode row targeted hydration would write, and the checkpoint
+/// that would let it skip the work. What a session looks like before it has
+/// ever been hydrated.
+fn clear_opencode_evidence(db_path: &Path) {
+    open_db(db_path)
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM session_events WHERE source='opencode';
+             DELETE FROM tool_calls WHERE source='opencode';
+             DELETE FROM file_edits WHERE source='opencode';
+             DELETE FROM session_markers WHERE source='opencode';
+             DELETE FROM session_hydration_checkpoints WHERE source='opencode';
+             UPDATE sessions SET discovery_state='shallow' WHERE source='opencode';
+             UPDATE session_presences SET discovery_state='shallow' WHERE source='opencode';",
+        )
+        .unwrap();
 }
 
 // --- helpers for the regression phases -------------------------------------
