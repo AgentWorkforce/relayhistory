@@ -255,6 +255,10 @@ export async function hydrateSourcePlugin(
             ...key,
             db_path: options.dbPath,
             expected_revision: state.revision,
+            // Reaches intake as well as the connector: the result it builds
+            // reports related sessions, and a request that declined them must
+            // not come back listing them.
+            include_related: options.includeRelated,
             source_stamp: snapshot.source_stamp,
             source_bytes: snapshot.source_bytes,
             covered_kinds: snapshot.covered_kinds,

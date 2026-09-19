@@ -1737,7 +1737,7 @@ fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
 /// written down because `ShallowSessionProvider::evidence_kinds` defaults to
 /// `&[]`, so a new adapter that has not declared its kinds yet would otherwise
 /// reach the SDK as `partial` over nothing.
-fn capability_for(coverage: &[EvidenceKind]) -> &'static str {
+pub(crate) fn capability_for(coverage: &[EvidenceKind]) -> &'static str {
     if missing_from(coverage).is_empty() {
         "full"
     } else if coverage.is_empty() {
@@ -1913,6 +1913,7 @@ pub(crate) fn hydrate_with_provider(
                 &observation.key,
                 &revision,
                 evidence,
+                options.include_related,
                 started,
             )
         }
