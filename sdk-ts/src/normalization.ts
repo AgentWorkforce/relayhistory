@@ -525,10 +525,16 @@ export function combineHydration(
     (item) => item.code !== 'HYDRATION_PARTIAL_COVERAGE',
   );
   if (missing.length > 0) {
+    // States what the merge covers and no more. Only the producing side knows
+    // *why* a kind is absent -- a provider that cannot record it, or a request
+    // that declined it with `includeRelated: false` -- and that reason does not
+    // survive a union of presences that may have had different ones. Inferring
+    // provider inability from reduced coverage would make this text false for
+    // two relationship-capable presences merged under `includeRelated: false`.
     diagnostics.push({
       code: 'HYDRATION_PARTIAL_COVERAGE',
-      message: `merged evidence covers ${coverage.join(', ') || 'no evidence kinds'}; `
-        + `no presence produces ${missing.join(', ')}`,
+      message: `merged hydration covers ${coverage.join(', ') || 'no evidence kinds'}; `
+        + `it does not cover ${missing.join(', ')}`,
       durationMs: null,
       sourceBytes: null,
       recordsParsed: null,

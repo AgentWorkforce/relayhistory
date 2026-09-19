@@ -453,7 +453,7 @@ test('a merge that is still short of full coverage stays partial, and empty cove
   assert.equal(reconciled.length, 1);
   assert.equal(
     reconciled[0].message,
-    'merged evidence covers history, tool_call; no presence produces session_event, file_edit, relationship',
+    'merged hydration covers history, tool_call; it does not cover session_event, file_edit, relationship',
   );
   assert.equal(short.diagnostics.filter((item) => item.code === 'HYDRATION_METRICS').length, 2);
 
@@ -467,7 +467,7 @@ test('a merge that is still short of full coverage stays partial, and empty cove
   assert.equal(nothing.capability, 'shallow_only');
   assert.equal(
     nothing.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE')?.message,
-    'merged evidence covers no evidence kinds; no presence produces '
+    'merged hydration covers no evidence kinds; it does not cover '
     + 'history, session_event, tool_call, file_edit, relationship',
   );
 
@@ -479,6 +479,35 @@ test('a merge that is still short of full coverage stays partial, and empty cove
   );
   // A single result is returned untouched.
   assert.equal(combineHydration(undefined, hydrationPart('partial', ['history'])).capability, 'partial');
+});
+
+test('a merge does not infer provider inability from coverage the request declined', () => {
+  // scope: 'all' over two presences that *can* record delegation, hydrated
+  // with includeRelated: false. Each part's own note carries the reason the
+  // producing side knew ("include_related is off"); the merge does not, and a
+  // reason does not survive a union of presences that may have had different
+  // ones -- so the reconciled note must state what is uncovered and no more.
+  const thread = FULL_SESSION_KINDS.filter((kind) => kind !== 'relationship');
+  const local = hydrationPart('partial', thread);
+  const remote = hydrationPart('partial', thread);
+
+  const merged = combineHydration(local, remote);
+  assert.equal(merged.capability, 'partial');
+  assert.deepEqual(merged.coverage, [...thread]);
+  const reconciled = merged.diagnostics.filter(
+    (item) => item.code === 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  assert.equal(reconciled.length, 1);
+  assert.equal(
+    reconciled[0].message,
+    'merged hydration covers history, session_event, tool_call, file_edit; '
+    + 'it does not cover relationship',
+  );
+  // Both presences record delegation; only the request declined it. Any claim
+  // about a producer being unable to supply the kind would be false here.
+  for (const claim of [/no presence produces/, /cannot/, /does not produce/, /provider/i]) {
+    assert.doesNotMatch(reconciled[0].message, claim);
+  }
 });
 
 test('unparseable stored JSON yields null without discarding the raw string', () => {
