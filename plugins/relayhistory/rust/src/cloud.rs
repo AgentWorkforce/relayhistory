@@ -868,7 +868,7 @@ impl Ingestor for UreqIngestor {
     }
 }
 
-struct AuthRefreshLock {
+pub(crate) struct AuthRefreshLock {
     _file: fs::File,
 }
 
@@ -882,7 +882,7 @@ fn refresh_lock_path(base_url: &str) -> Result<PathBuf> {
     Ok(auth.with_file_name(name))
 }
 
-fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
+pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
     let path = refresh_lock_path(base_url)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
