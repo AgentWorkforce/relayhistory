@@ -52,11 +52,18 @@ Notable changes to the native `ai-hist` CLI are documented here.
   place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
   reporting successful delivery while silently emitting the old column list.
   `session_events` also gains `raw_facts_version`, stamped by the local parser
-  on every event it writes: plain `sync` reads it to tell a row indexed before
-  the facts existed from one whose facts the provider never recorded, and
-  re-reads that transcript once. Without it a migrated database skipped every
-  unchanged transcript on the stamp fast path and left the six columns null
-  forever while reporting a successful sync.
+  on every event it writes: plain `sync` runs one recorded backfill pass per
+  provider and reads that column to pick the transcripts to re-read, telling a
+  row indexed before the facts existed from one whose facts the provider never
+  recorded. Without the pass a migrated database skipped every unchanged
+  transcript on the stamp fast path and left the six columns null forever while
+  reporting a successful sync. The pass is bounded by a recorded generation
+  rather than by "an unstamped row exists", because local and remote
+  observations share `(source, session_id)` and an adapter contributes rows
+  through the evidence path, which does not carry the column — re-reading the
+  local transcript can never stamp those. Claude selects sidecar transcripts
+  through `session_relationships.evidence_locator` as well as
+  `sessions.raw_path`, since a subagent sidecar has no catalog row of its own.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

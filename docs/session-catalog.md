@@ -352,12 +352,20 @@ Because of that, none of the six can answer "was this row indexed before the
 facts existed?" -- a real record legitimately has no `request_id`, no
 `stop_reason` and no `turn_id`, and Codex records none of the other three.
 `raw_facts_version` answers it instead: the local parser stamps it on every
-event it writes, so the full-sync stamp fast path can re-read a transcript
-whose rows predate the facts exactly once and then skip it again. It is
-bookkeeping rather than a provider fact, is not part of the session-event
-evidence spec, and is therefore null on rows an installed source adapter
-supplied -- the sync probes exclude sessions with remote provenance for that
-reason, and those are repaired by hydration.
+event it writes, so a full sync can pick out the transcripts whose rows predate
+the facts and re-read them. It is bookkeeping rather than a provider fact and is
+not part of the session-event evidence spec, so a row an installed source
+adapter contributed is permanently unstamped.
+
+That is why the column selects files but does not bound the work. Local and
+remote observations of one session share `(source, session_id)`, so a contributed
+row would otherwise hold an unchanged local transcript off the stamp fast path on
+every sync while never being stamped itself. What ends the work is a per-provider
+generation recorded in the sync state (`claude_raw_message_facts`,
+`codex_raw_message_facts`), written only after a walk completes, so the backfill
+runs exactly once and an interrupted sync retries it. Claude reaches a subagent
+sidecar's rows through `session_relationships.evidence_locator`, because a
+sidecar never gets a `sessions` row of its own.
 
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:

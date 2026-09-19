@@ -768,6 +768,36 @@ impl Drop for SyncStateLock {
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
+/// Bump when a parser change needs transcripts an earlier release already
+/// indexed to be re-read once.
+///
+/// The per-session "does this look unparsed?" probes below decide *which*
+/// files a backfill pass re-reads. They cannot decide *whether* a pass is
+/// still owed, because a row they can see may not be a row the local
+/// transcript owns: `session_events` is keyed by `(source, session_id)`, and
+/// local and remote observations of one session share that identity. An
+/// installed source adapter contributes rows through the evidence path, which
+/// does not carry `raw_facts_version`, and re-reading the local transcript
+/// never repairs a row that came from somewhere else -- so "some row for this
+/// session is unstamped" is a condition that can stay true forever, re-reading
+/// an unchanged file on every sync while never repairing anything.
+///
+/// Recording the generation per provider makes the pass happen exactly once.
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 1;
+const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
+const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
+
+/// Whether this provider still owes a one-time raw-facts backfill pass.
+fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
+    state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
+}
+
+/// Record that the pass finished. Only reached when the walk completed, so an
+/// interrupted sync retries the backfill rather than skipping it.
+fn record_raw_facts_backfill(state: &mut Map<String, Value>, key: &str) {
+    state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
+}
+
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts", "codex_rollouts_v5"),
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
@@ -1561,6 +1591,7 @@ fn sync_codex_rollouts(
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1615,7 +1646,8 @@ fn sync_codex_rollouts(
                     None => continue,
                     Some(id)
                         if codex_session_events_exist(conn, id)?
-                            && !events_lack_raw_facts(conn, "codex", id)? =>
+                            && !(backfill_raw_facts
+                                && events_lack_raw_facts(conn, "codex", id)?) =>
                     {
                         continue
                     }
@@ -1725,6 +1757,7 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY);
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2673,6 +2706,7 @@ fn sync_claude_session_metadata(
         .unwrap_or_default();
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2681,10 +2715,12 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
-            // An unchanged transcript whose rows predate the per-message raw
-            // facts is re-read once to backfill them; afterwards it is skipped
-            // again like any other unchanged file.
-            && !claude_transcript_lacks_raw_facts(conn, &path)?
+            // During the one-time backfill pass, an unchanged transcript
+            // whose rows predate the per-message raw facts is re-read to
+            // populate them. Outside that pass the stamp alone decides, so a
+            // row this transcript does not own -- an adapter's contribution to
+            // the same session -- cannot pin the file off the fast path.
+            && !(backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
         {
             continue;
         }
@@ -2727,6 +2763,7 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
+    record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2793,34 +2830,28 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
 ///
 /// `raw_facts_version` is the field to test, and it is the reason that column
 /// exists: the parser stamps it on every event it writes whatever the record
-/// contained, so a re-read always clears the condition and a transcript cannot
-/// be re-read forever. None of the six facts can play that role -- a real
-/// record legitimately has no `request_id`, no `stop_reason` and no `turn_id`,
-/// and Codex sets none of the other three -- so a probe on any of them would
-/// re-read those transcripts on every sync for as long as they exist.
+/// contained. None of the six facts can play that role -- a real record
+/// legitimately has no `request_id`, no `stop_reason` and no `turn_id`, and
+/// Codex sets none of the other three -- so a probe on any of them would
+/// select transcripts that have nothing to gain.
 ///
-/// Rows whose session also has remote provenance are excluded. An installed
-/// source adapter writes session events through the evidence path, which does
-/// not carry this column, so a remote row is permanently unstamped: counting
-/// it would make the local file re-read forever, which is the failure this
-/// probe exists to avoid. A remote-shadowed session is repaired by hydration
-/// instead.
+/// This only selects which files a backfill pass re-reads; it is not what ends
+/// the pass. `session_events` is keyed by `(source, session_id)` and local and
+/// remote observations of one session share that identity, so a row this probe
+/// sees may be an adapter's contribution that re-reading the local transcript
+/// will never stamp. `RAW_MESSAGE_FACTS_GENERATION` is what guarantees the
+/// work happens once.
 ///
-/// This is deliberately narrower than bumping the stamp-map generation, which
-/// would re-read every transcript in the archive, including the ones with
-/// nothing to gain, and would discard the selective-repair state the codex
-/// generations carry.
+/// Selecting files this way is narrower than bumping the stamp-map generation,
+/// which would re-read every transcript in the archive, including the ones
+/// with nothing to gain, and would discard the selective-repair state the
+/// codex generations carry.
 fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let lacking: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM session_events e
             WHERE e.source = ? AND e.session_id = ?
               AND COALESCE(e.raw_facts_version, 0) < ?
-              AND NOT EXISTS(
-                SELECT 1 FROM session_presences p
-                WHERE p.source = e.source AND p.session_id = e.session_id
-                  AND p.location = 'remote'
-              )
             LIMIT 1
         )",
         params![source, session_id, RAW_MESSAGE_FACTS_VERSION],
@@ -2831,25 +2862,36 @@ fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> R
 
 /// The same question for a Claude transcript, which the walk knows by path.
 ///
-/// Scoped through `sessions.raw_path` so it asks only about the rows this file
-/// owns: a session another transcript wrote cannot hold this one on the slow
-/// path.
+/// A file reaches its rows by one of two routes, matching the two ways the
+/// walk already decides a transcript is indexed. A session transcript owns the
+/// `sessions` row carrying its `raw_path`. A subagent sidecar never gets one:
+/// the walk hands it to `ingest_claude_subagent` and skips the catalog upsert
+/// entirely, so its rows are reachable only through the relationship whose
+/// `evidence_locator` is the sidecar's own path. Asking through `raw_path`
+/// alone left every sidecar out of the backfill -- unchanged on disk, never
+/// re-read, its events keeping null facts for good.
 fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let lacking: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM sessions s
-            JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-              AND COALESCE(e.raw_facts_version, 0) < ?
-              AND NOT EXISTS(
-                SELECT 1 FROM session_presences p
-                WHERE p.source = e.source AND p.session_id = e.session_id
-                  AND p.location = 'remote'
-              )
-            LIMIT 1
-        )",
+        "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                JOIN session_events e
+                  ON e.source = 'claude'
+                 AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND COALESCE(e.raw_facts_version, 0) < ?2
+                LIMIT 1
+            )",
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
         |row| row.get(0),
     )?;
@@ -6890,8 +6932,14 @@ mod tests {
 
     /// Reproduce what a release without the per-message raw facts left behind:
     /// the rows and the sync stamps are there, the columns the migration added
-    /// are null. This is exactly the state an upgraded install is in on its
-    /// first `sync`.
+    /// are null, and the sync state carries no backfill generation because that
+    /// release never wrote one. This is exactly the state an upgraded install
+    /// is in on its first `sync`.
+    fn blank_raw_message_facts_state(state: &mut Map<String, Value>) {
+        state.remove(super::CLAUDE_RAW_MESSAGE_FACTS_KEY);
+        state.remove(super::CODEX_RAW_MESSAGE_FACTS_KEY);
+    }
+
     fn blank_raw_message_facts(conn: &Connection, source: &str) {
         conn.execute(
             "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
@@ -6941,6 +6989,7 @@ mod tests {
         );
 
         blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
         // The stamp is unchanged and the events exist, so every other
         // condition on the fast path says "skip". Without the raw-facts check
         // this sync is a no-op and the columns stay null indefinitely while
@@ -6973,6 +7022,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(text.as_deref(), Some("sentinel"));
+    }
+
+    /// A subagent sidecar has no `sessions` row of its own: the walk hands it
+    /// to `ingest_claude_subagent` before the catalog upsert. A backfill that
+    /// asks only `sessions.raw_path` therefore never selects one, and every
+    /// sidecar's events keep null facts however many times `sync` runs.
+    #[test]
+    fn plain_claude_sync_backfills_raw_facts_for_subagent_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // The sidecar's assistant output lives under the child id the provider
+        // named, which no `sessions.raw_path` points at.
+        let child = |conn: &Connection| -> (Option<i64>, Option<i64>, Option<String>) {
+            conn.query_row(
+                "SELECT is_sidechain, raw_facts_version, text FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            child(&conn),
+            (
+                Some(1),
+                Some(super::RAW_MESSAGE_FACTS_VERSION),
+                Some("child result".into())
+            )
+        );
+
+        // The state an upgraded install is in: rows and stamps intact, facts
+        // null, no backfill generation recorded. Neither file changes on disk.
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            child(&conn),
+            (
+                Some(1),
+                Some(super::RAW_MESSAGE_FACTS_VERSION),
+                Some("child result".into())
+            ),
+            "an unchanged sidecar must be re-read by the one-time backfill pass"
+        );
+
+        // Marker recorded: the pass is over and the sidecar is back on the
+        // fast path, so a sentinel a re-read would overwrite survives.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source='claude' AND session_id='abc' AND event_uid='side-a:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child(&conn).2.as_deref(), Some("sentinel"));
+    }
+
+    #[test]
+    fn a_contributed_row_without_raw_facts_does_not_re_read_the_local_transcript_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-shared.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-shared","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-shared","cwd":"/tmp/project","isSidechain":false,"requestId":"req_1","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // A remote observation of the same session, contributed through the
+        // source-adapter boundary. `session_events` is keyed by
+        // `(source, session_id)`, so it lands beside the local rows -- and the
+        // evidence spec does not carry `raw_facts_version`, so it is
+        // permanently unstamped. Re-reading the local transcript can never
+        // stamp this row, because the local transcript does not contain it.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sess-shared', 3, 'assistant', 'text', \
+                     'remote output', 'remote-uid-1')",
+            [],
+        )
+        .unwrap();
+
+        // A sentinel a re-read would overwrite. If the unstamped remote row put
+        // the file back in the backfill set, this sync re-reads it -- and so
+        // would every sync after it, forever, while never stamping the remote
+        // row.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source = 'claude' AND event_uid = 'a1:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let local: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='a1:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, "sentinel",
+            "an unchanged transcript must stay on the fast path even when another \
+             observation of the same session carries no raw facts"
+        );
     }
 
     #[test]
@@ -7018,6 +7185,7 @@ mod tests {
         );
 
         blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
         super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
         assert_eq!(
             turn_ids(&conn),
