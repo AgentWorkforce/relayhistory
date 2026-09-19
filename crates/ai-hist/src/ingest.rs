@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod hook;
 pub(crate) mod hydrate;
 
 use crate::diagnostics::*;
@@ -34,10 +35,14 @@ pub use crate::discover::{
     DISCOVERY_EXEMPTIONS, SESSION_CATALOG_CONTRACT_VERSION, SHALLOW_SCANNER_VERSION,
 };
 pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
+pub use hook::{
+    ingest_transcript_at, ingest_transcript_at_with_home, TranscriptIngest, TranscriptStatus,
+    HOOK_HARNESSES,
+};
 pub use hydrate::{
-    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors, HydrateSessionOptions,
-    HydrateSessionResult, HydrationDiagnostic, HydrationEvidence, HydrationIndexedThrough,
-    SESSION_HYDRATION_CONTRACT_VERSION,
+    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors,
+    hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic,
+    HydrationEvidence, HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
 };
 
 fn is_delivery_retention_limit(error: &anyhow::Error) -> bool {
@@ -88,7 +93,57 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
 /// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home)
+    sync_exclusive_with_home(db_path, home, false).map(|tick| tick.attempted)
+}
+
+/// One live-capture tick against an explicit provider home.
+///
+/// `force` bypasses the stat-only source fingerprint. The watch loop sets it
+/// for filesystem-event ticks, where the event can arrive before the write
+/// flushes and the fingerprint is therefore not yet trustworthy.
+pub fn sync_tick_at_with_home(
+    db_path: &Path,
+    home: &Path,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    sync_exclusive_with_home(db_path, home, force)
+}
+
+/// One live-capture tick. Local scope only: remote connectors are not driven
+/// from watch mode, and a `remote`-only request is rejected the same way
+/// [`sync_scoped_at_with_connectors`] rejects it.
+pub fn sync_tick_at(
+    db_path: &Path,
+    scope: SessionScope,
+    connectors: &remote::SourceConnectorSelection,
+    output: SyncOutput,
+    force: bool,
+) -> Result<SyncTick> {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+    if scope == SessionScope::Remote {
+        remote::ensure_selected_remote_connectors_configured_for_at(
+            "sync",
+            &home_dir(),
+            &[],
+            connectors,
+        )?;
+    }
+    let mut tick = SyncTick::default();
+    if matches!(scope, SessionScope::Local | SessionScope::All) {
+        tick = sync_exclusive_with_home(db_path, &home_dir(), force)?;
+    }
+    if matches!(scope, SessionScope::Remote | SessionScope::All) {
+        tick.attempted |= sync_remote_connectors(db_path, scope, connectors)?;
+    }
+    Ok(tick)
 }
 
 /// Full ingestion for a selected scope into the default database.
@@ -383,7 +438,34 @@ impl SyncSourceReport {
     }
 }
 
-fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
+/// Where [`discover::source_fingerprint`] is remembered between sweeps, inside
+/// the sync state file that already holds every per-source cursor.
+const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
+
+/// Whether the stat-only fingerprint says this sweep has nothing to do.
+///
+/// The catalog check is the guard that keeps the fast path honest across a
+/// database that went away: `.sync-state.json` lives beside the database but
+/// outlives it, so a fingerprint recorded against a catalog that has since been
+/// deleted must not skip the sweep that would rebuild it. An empty catalog also
+/// means an empty fingerprint walk, so the sweep it forces is the cheap one.
+fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &str) -> bool {
+    let Some(stored) = state.get(SOURCE_FINGERPRINT_KEY).and_then(Value::as_str) else {
+        return false;
+    };
+    if stored.is_empty() || stored != current {
+        return false;
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
+        == 1
+}
+
+/// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
+/// matched the last sweep's and nothing was walked.
+fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Result<bool> {
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -412,6 +494,31 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         }
     }
     let mut state = load_sync_state(&state_path)?;
+    let opencode = std::env::var_os("OPENCODE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+    let providers = shallow_providers();
+    // Captured before the sweep, not after. Anything that changes while the
+    // sweep runs yields a different fingerprint next time and forces one more
+    // pass — cheap, because the per-session stamps then skip what already
+    // landed. A fingerprint recorded ahead of the work it describes would lose
+    // that append instead.
+    let fingerprint = {
+        let env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode.clone());
+        let taken = discover::source_fingerprint_for(&env, &providers);
+        if let Err(error) = &taken {
+            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
+        }
+        taken.ok()
+    };
+    if !force {
+        if let Some(current) = fingerprint.as_deref() {
+            if sources_unchanged(conn, &state, current) {
+                sync_note!("  [sync] sources unchanged since the last sweep; skipped");
+                return Ok(false);
+            }
+        }
+    }
     // Checkpoint after every source that advances `state`, rather than once at
     // the end. A run can die partway through -- killed process, locked database,
     // full disk -- and state written only at the end discards every source that
@@ -465,9 +572,6 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    let opencode = std::env::var_os("OPENCODE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
         if opencode.exists() {
             sync_note!("  [opencode] +{open_inserted} rows");
@@ -476,6 +580,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         }
         total_inserted += open_inserted;
     }
+    // A source that was statted into the fingerprint but could not be read is
+    // the one case where caching the fingerprint would make a transient
+    // failure permanent: the next sweep would match the stored value and skip
+    // before retrying. Leave the stored fingerprint stale instead. The cost is
+    // one full re-walk per tick until the source reads again, which is the
+    // conservative side of the trade.
+    let all_sources_read = report.failures.is_empty();
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
@@ -484,9 +595,19 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
-        &shallow_providers(),
+        &providers,
         |_| {},
     )?;
+    // Written after every cursor this sweep advanced, and in its own
+    // checkpoint. A crash between them leaves cursors ahead of a stale
+    // fingerprint, which costs one extra full walk that then finds nothing —
+    // never a missed append. The reverse order would lose one.
+    if all_sources_read {
+        if let Some(fingerprint) = fingerprint {
+            state.insert(SOURCE_FINGERPRINT_KEY.to_string(), Value::from(fingerprint));
+            checkpoint_sync_state(&state_path, &state);
+        }
+    }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -519,7 +640,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
-    Ok(())
+    Ok(true)
 }
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
@@ -578,17 +699,43 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
 }
 
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
-    sync_exclusive_with_home(db_path, &home_dir())
+    sync_exclusive_with_home(db_path, &home_dir(), false).map(|tick| tick.attempted)
 }
 
-fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+/// What one local sweep did, for callers that need to tell "no provider source
+/// moved" apart from "another process holds the sync lock".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SyncTick {
+    /// This process took the sync lock and entered the sweep path.
+    pub attempted: bool,
+    /// A full walk ran. False when the stat-only source fingerprint matched
+    /// the previous sweep's, and false when the lock was held elsewhere.
+    pub swept: bool,
+}
+
+impl SyncTick {
+    /// The sweep was skipped because no provider source had moved.
+    pub fn skipped_unchanged(&self) -> bool {
+        self.attempted && !self.swept
+    }
+}
+
+pub(crate) fn sync_exclusive_with_home(
+    db_path: &Path,
+    home: &Path,
+    force: bool,
+) -> Result<SyncTick> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
-        return Ok(false);
+        return Ok(SyncTick::default());
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, home).map_err(|error| enrich_sync_error(db_path, error))?;
-    Ok(true)
+    let swept = sync_basic(&conn, db_path, home, force)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
+    Ok(SyncTick {
+        attempted: true,
+        swept,
+    })
 }
 
 fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool> {
@@ -630,7 +777,8 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
         return Ok((conn, true));
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, &home_dir()).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &home_dir(), false)
+        .map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }

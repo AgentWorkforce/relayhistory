@@ -18,6 +18,10 @@ path = "src/lib.rs"
 [features]
 default = []
 delivery = []
+# Filesystem-event driver for the live-capture watch loop. Optional so the
+# crate still builds with --no-default-features on a host with no watcher
+# backend; without it `watch` falls back to polling.
+fs-events = ["dep:notify"]
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
@@ -26,7 +30,10 @@ unstable-internal = []
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+notify = { version = "8", default-features = false, features = [
+    "macos_fsevent",
+], optional = true }
+rusqlite ={ version = "0.32", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -50,6 +57,10 @@ required-features = ["delivery", "unstable-internal"]
 [[test]]
 name = "delivery_capture"
 required-features = ["delivery", "unstable-internal"]
+
+[[test]]
+name = "live_capture"
+required-features = ["unstable-internal"]
 
 [[test]]
 name = "local_history_boundary"

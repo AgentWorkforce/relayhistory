@@ -356,6 +356,114 @@ impl ScanEnv<'_> {
     }
 }
 
+/// Where the local providers' evidence lives, without the catalog connection
+/// a [`DiscoveryEnv`] carries. What [`ShallowSessionProvider::watch_roots`]
+/// resolves its directories against.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRoots<'a> {
+    /// Home directory the file-backed providers are rooted at.
+    pub home: &'a Path,
+    /// Path to the opencode database.
+    pub opencode_db: &'a Path,
+}
+
+/// Every directory the live-capture watcher should monitor, deduplicated and
+/// ordered, for the given adapters.
+///
+/// Roots that do not exist are kept: the watcher skips them, and keeping them
+/// means a caller can log what *would* be watched once `~/.codex` appears.
+pub fn watch_roots(
+    providers: &[Box<dyn ShallowSessionProvider>],
+    roots: &ProviderRoots<'_>,
+) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for provider in providers {
+        for root in provider.watch_roots(roots) {
+            if seen.insert(root.clone()) {
+                out.push(root);
+            }
+        }
+    }
+    out
+}
+
+/// A stat-only fold over everything discovery would enumerate, cheap enough to
+/// run on every watch tick.
+///
+/// The value is `"{candidates}:{bytes}:{hash}"`. It is a change *detector*, not
+/// a content hash: two distinct source states could in principle collide. For
+/// append-only transcripts inside one inter-tick window that is not a practical
+/// concern, and the worst case is one skipped no-op sweep — never lost
+/// evidence, because the per-session stamps still catch up on the next tick
+/// whose fingerprint differs.
+///
+/// `bytes` is the size each adapter's stamp reports, summed; it is a cheap
+/// guard that makes an accidental collision harder to hit, and the hash is the
+/// load-bearing part. Nothing here opens a file, so a tick over unchanged
+/// sources leaves [`DiscoveryCounters::files_opened`] at zero.
+pub fn source_fingerprint(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+) -> Result<String> {
+    let mut candidates: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut hash: u64 = 0;
+    for provider in providers {
+        for candidate in provider.fingerprint_inputs(env)? {
+            candidates = candidates.wrapping_add(1);
+            bytes = bytes.wrapping_add(stamp_reported_bytes(&candidate.stamp));
+            hash = hash.wrapping_add(fingerprint_hash(
+                candidate.source,
+                &candidate.locator,
+                &candidate.stamp,
+            ));
+        }
+    }
+    Ok(format!("{candidates}:{bytes}:{hash:016x}"))
+}
+
+/// [`source_fingerprint`] over the built-in adapters.
+pub fn source_fingerprint_for(
+    env: &DiscoveryEnv<'_>,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Result<String> {
+    let refs = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    source_fingerprint(env, &refs)
+}
+
+/// The byte count a file stamp reports, best effort.
+///
+/// File stamps are `"{mtime_nanos}:{len}"`, joined with `|` where one session
+/// is stamped from several files (grok's chat plus its summary). A stamp that
+/// is not shaped that way — a database adapter's `"{updated}:{count}"` — still
+/// contributes through the hash, so an unparseable size costs nothing.
+fn stamp_reported_bytes(stamp: &str) -> u64 {
+    stamp
+        .split('|')
+        .filter_map(|part| part.rsplit(':').next())
+        .filter_map(|len| len.parse::<u64>().ok())
+        .fold(0u64, |total, len| total.wrapping_add(len))
+}
+
+/// FNV-1a over one candidate's identity and change stamp. Summed rather than
+/// chained across candidates so the fold does not depend on enumeration order.
+fn fingerprint_hash(source: &str, locator: &str, stamp: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut hash = OFFSET;
+    for bytes in [source.as_bytes(), b"\0", locator.as_bytes(), b"\0", stamp.as_bytes()] {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
+}
+
 /// What a provider's [`read_shallow`](ShallowSessionProvider::read_shallow)
 /// needs access to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +530,37 @@ pub trait ShallowSessionProvider: Sync {
     /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
     fn read_access(&self) -> ShallowReadAccess {
         ShallowReadAccess::Filesystem
+    }
+    /// Directories the live-capture watcher should monitor for this adapter's
+    /// evidence, watched recursively.
+    ///
+    /// Return the widest directory whose subtree the provider writes into, not
+    /// the individual transcripts: a new session is a *new file*, and a watch
+    /// on a path that does not exist yet never fires. Adapters with no local
+    /// files (remote connectors, the relay adapter reading our own catalog)
+    /// return none, and the watcher skips roots that do not exist.
+    fn watch_roots(&self, _roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    /// The change signal [`source_fingerprint`] folds for this adapter.
+    ///
+    /// The default is [`enumerate`](ShallowSessionProvider::enumerate), which
+    /// for the file-backed adapters is a directory walk plus one `stat` per
+    /// file and opens nothing — exactly the cost the watch fast path is
+    /// willing to pay every tick. Override when enumeration costs more than a
+    /// stat (a database query), returning the cheapest signal that still moves
+    /// whenever the provider's sources move; return none when the adapter's
+    /// rows are derived from RelayHistory's own catalog, where only our own
+    /// writes can move them.
+    ///
+    /// A remote connector contributes nothing by default: its enumeration is a
+    /// network listing, which is not a cost a per-tick fast path may pay, and
+    /// watch mode does not drive remote acquisition in the first place.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        if self.location() != SessionLocation::Local {
+            return Ok(Vec::new());
+        }
+        self.enumerate(env, None)
     }
     /// Bounded read of one candidate into a catalog row.
     ///
@@ -709,6 +848,10 @@ impl ShallowSessionProvider for ClaudeProvider {
         "claude"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        vec![roots.home.join(".claude/projects")]
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -879,6 +1022,13 @@ impl ShallowSessionProvider for CodexProvider {
         "codex"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        vec![
+            roots.home.join(".codex/sessions"),
+            roots.home.join(".codex/archived_sessions"),
+        ]
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1030,6 +1180,10 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        vec![roots.home.join(".cursor/projects")]
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1121,6 +1275,10 @@ impl ShallowSessionProvider for GrokProvider {
     }
     fn source(&self) -> &'static str {
         "grok"
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        vec![roots.home.join(".grok/sessions")]
     }
 
     fn enumerate(
@@ -1389,6 +1547,43 @@ impl ShallowSessionProvider for OpencodeProvider {
         "opencode"
     }
 
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+        // The database file itself is rewritten in place, and SQLite's -wal
+        // and -shm siblings move with it, so the directory is the root that
+        // actually sees every write.
+        roots
+            .opencode_db
+            .parent()
+            .map(|dir| vec![dir.to_path_buf()])
+            .unwrap_or_default()
+    }
+
+    /// Opencode's enumeration is a SQL query against the provider database, so
+    /// it costs an open plus a scan — far more than the watch fast path should
+    /// pay per tick. The database file's own size and mtime (plus its
+    /// write-ahead log, where a commit lands first) move whenever a session or
+    /// message does, and cost three stats.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let db = &env.opencode_db;
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: "opencode",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+        Ok(out)
+    }
+
     fn enumerate(
         &self,
         env: &DiscoveryEnv<'_>,
@@ -1648,6 +1843,16 @@ struct RelayProvider;
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
+    }
+
+    /// Relay rows are derived from RelayHistory's own `history` table, so the
+    /// only thing that can move them is a write we just made. Folding them
+    /// into the fingerprint would invalidate it on our own sweep and cost an
+    /// extra no-op pass every time; folding them in *and* short-circuiting on
+    /// them would be worse, because a relay row can change without any
+    /// upstream provider having moved.
+    fn fingerprint_inputs(&self, _env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        Ok(Vec::new())
     }
 
     fn enumerate(
