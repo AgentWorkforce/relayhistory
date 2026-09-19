@@ -80,6 +80,8 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         text: Some(text.into()),
         model: None,
         token_json: None,
+        provider: None,
+        stop_reason: None,
         event_uid: uid.into(),
     }
 }
