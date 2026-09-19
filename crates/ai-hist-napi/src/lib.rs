@@ -31,10 +31,16 @@ use ai_hist::{
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+use ai_hist::{
+    schema_is_usage_read_current, session_requests_page as core_session_requests_page,
+    session_usage_summary as core_session_usage_summary, NormalizedUsage as CoreNormalizedUsage,
+    SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
+    SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
+};
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -416,6 +422,230 @@ pub struct SessionFileEditsPage {
     pub next_cursor: Option<EvidenceCursor>,
 }
 
+/// Normalized usage for one request or one session.
+///
+/// The optional fields stay optional across the boundary: `null` means the
+/// provider did not report that counter, which is a different fact from a
+/// reported zero and the only thing that makes `coverage` interpretable.
+#[napi(object)]
+pub struct NativeNormalizedUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    #[napi(js_name = "cacheWrite5mTokens")]
+    pub cache_write5m_tokens: Option<i64>,
+    #[napi(js_name = "cacheWrite1hTokens")]
+    pub cache_write1h_tokens: Option<i64>,
+    pub provider_total_tokens: Option<i64>,
+    pub reported_cost_usd: Option<f64>,
+    /// `per-request`, `per-message`, `cumulative-delta` or `context-proxy`.
+    pub accounting: String,
+    pub has_input_tokens: bool,
+    pub has_output_tokens: bool,
+    pub has_reasoning_tokens: bool,
+    pub has_cache_read_tokens: bool,
+    pub has_cache_write_tokens: bool,
+}
+
+/// Token counts cross the boundary as `i64` because JavaScript has no
+/// unsigned integer. A count that does not fit is saturated rather than
+/// wrapped — but no provider reports 9.2 quintillion tokens, and the
+/// normalizer has already refused anything that is not a real counter.
+fn js_count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+impl From<CoreNormalizedUsage> for NativeNormalizedUsage {
+    fn from(usage: CoreNormalizedUsage) -> Self {
+        Self {
+            input_tokens: js_count(usage.input_tokens),
+            output_tokens: js_count(usage.output_tokens),
+            reasoning_tokens: usage.reasoning_tokens.map(js_count),
+            cache_read_tokens: js_count(usage.cache_read_tokens),
+            cache_write_tokens: js_count(usage.cache_write_tokens),
+            cache_write5m_tokens: usage.cache_write_5m_tokens.map(js_count),
+            cache_write1h_tokens: usage.cache_write_1h_tokens.map(js_count),
+            provider_total_tokens: usage.provider_total_tokens.map(js_count),
+            reported_cost_usd: usage.reported_cost_usd,
+            accounting: usage.accounting.as_str().to_string(),
+            has_input_tokens: usage.coverage.has_input_tokens,
+            has_output_tokens: usage.coverage.has_output_tokens,
+            has_reasoning_tokens: usage.coverage.has_reasoning_tokens,
+            has_cache_read_tokens: usage.coverage.has_cache_read_tokens,
+            has_cache_write_tokens: usage.coverage.has_cache_write_tokens,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionRequest {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub request_key: String,
+    /// `request-id` or `message-id`.
+    pub request_key_source: String,
+    pub message_ids: Vec<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub first_ts_ms: i64,
+    pub last_ts_ms: i64,
+    /// Absent when the request carried no usage evidence, or when the
+    /// evidence could not be trusted — `diagnostics` says which.
+    pub usage: Option<NativeNormalizedUsage>,
+    pub usage_error: Option<String>,
+    pub tool_use_ids: Vec<String>,
+    pub has_thinking: bool,
+    pub event_count: i64,
+    pub diagnostics: Vec<String>,
+}
+
+impl From<CoreSessionRequest> for NativeSessionRequest {
+    fn from(request: CoreSessionRequest) -> Self {
+        Self {
+            id: request.id,
+            source: request.source,
+            session_id: request.session_id,
+            request_key: request.request_key,
+            request_key_source: request.request_key_source.as_str().to_string(),
+            message_ids: request.message_ids,
+            model: request.model,
+            provider: request.provider,
+            first_ts_ms: request.first_ts_ms,
+            last_ts_ms: request.last_ts_ms,
+            usage: request.usage.map(NativeNormalizedUsage::from),
+            usage_error: request.usage_error,
+            tool_use_ids: request.tool_use_ids,
+            has_thinking: request.has_thinking,
+            event_count: request.event_count,
+            diagnostics: request
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.as_str().to_string())
+                .collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RequestCursor {
+    pub ts_ms: i64,
+    pub id: i64,
+}
+
+#[napi(object)]
+pub struct RequestPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionRequestsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub requests: Vec<NativeSessionRequest>,
+    pub next_cursor: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUsageOptions {
+    pub db_path: Option<String>,
+}
+
+/// One session's usage rollup. `usage` is absent when the session has no
+/// usage evidence at all — not zeroed, because zero is a claim.
+#[napi(object)]
+pub struct SessionUsage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub usage: Option<NativeNormalizedUsage>,
+    /// Requests that contributed to `usage`.
+    pub request_count: i64,
+    /// Requests seen, including ones with no usage.
+    pub total_request_count: i64,
+    /// Every accounting mode present. More than one means the totals mix
+    /// units and should be read per mode.
+    pub accounting: Vec<String>,
+    pub models: Vec<String>,
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    pub diagnostics: Vec<String>,
+    /// The totals exceeded what can be represented and must not be used.
+    pub overflowed: bool,
+}
+
+fn session_usage(
+    source: String,
+    session_id: String,
+    summary: Option<CoreSessionUsageSummary>,
+) -> SessionUsage {
+    let Some(summary) = summary else {
+        return SessionUsage {
+            contract_version: SESSION_USAGE_CONTRACT_VERSION,
+            source,
+            session_id,
+            usage: None,
+            request_count: 0,
+            total_request_count: 0,
+            accounting: Vec::new(),
+            models: Vec::new(),
+            first_ts_ms: None,
+            last_ts_ms: None,
+            diagnostics: Vec::new(),
+            overflowed: false,
+        };
+    };
+    SessionUsage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source,
+        session_id,
+        request_count: js_count(summary.request_count),
+        total_request_count: js_count(summary.total_request_count),
+        accounting: summary
+            .accounting
+            .iter()
+            .map(|mode| mode.as_str().to_string())
+            .collect(),
+        models: summary.models,
+        first_ts_ms: Some(summary.first_ts_ms),
+        last_ts_ms: Some(summary.last_ts_ms),
+        diagnostics: summary
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.as_str().to_string())
+            .collect(),
+        overflowed: summary.overflowed,
+        usage: Some(NativeNormalizedUsage {
+            input_tokens: js_count(summary.input_tokens),
+            output_tokens: js_count(summary.output_tokens),
+            reasoning_tokens: summary.reasoning_tokens.map(js_count),
+            cache_read_tokens: js_count(summary.cache_read_tokens),
+            cache_write_tokens: js_count(summary.cache_write_tokens),
+            cache_write5m_tokens: summary.cache_write_5m_tokens.map(js_count),
+            cache_write1h_tokens: summary.cache_write_1h_tokens.map(js_count),
+            provider_total_tokens: summary.provider_total_tokens.map(js_count),
+            reported_cost_usd: summary.reported_cost_usd,
+            // A summary's mode list can be plural; this field carries the
+            // single mode only when there is exactly one, so a mixed session
+            // cannot be read as if it had one accounting unit.
+            accounting: match summary.accounting.as_slice() {
+                [mode] => mode.as_str().to_string(),
+                _ => "mixed".to_string(),
+            },
+            has_input_tokens: summary.coverage.has_input_tokens,
+            has_output_tokens: summary.coverage.has_output_tokens,
+            has_reasoning_tokens: summary.coverage.has_reasoning_tokens,
+            has_cache_read_tokens: summary.coverage.has_cache_read_tokens,
+            has_cache_write_tokens: summary.coverage.has_cache_write_tokens,
+        }),
+    }
+}
+
 #[napi(object)]
 pub struct SourceCount {
     pub source: String,
@@ -700,6 +930,75 @@ pub async fn get_session_file_edits_page(
             .collect(),
         next_cursor: page.next_cursor.map(evidence_cursor),
     })
+}
+
+/// One bounded page of a session's model requests, oldest first.
+///
+/// Both halves of the identity are required for the same reason the evidence
+/// pages require them: provider session ids collide across providers.
+#[napi]
+pub async fn get_session_requests_page(
+    source: String,
+    session_id: String,
+    options: Option<RequestPageOptions>,
+) -> napi::Result<SessionRequestsPage> {
+    let options = options.unwrap_or(RequestPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreRequestCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionRequestPage {
+            requests: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_usage_read_current,
+        move |conn| core_session_requests_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionRequestsPage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        requests: page
+            .requests
+            .into_iter()
+            .map(NativeSessionRequest::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| RequestCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
+    })
+}
+
+/// Provider-neutral usage rollup for one session.
+#[napi]
+pub async fn get_session_usage(
+    source: String,
+    session_id: String,
+    options: Option<SessionUsageOptions>,
+) -> napi::Result<SessionUsage> {
+    let options = options.unwrap_or(SessionUsageOptions { db_path: None });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let path = db_path(options.db_path);
+    let (summary_source, summary_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(path, None, schema_is_usage_read_current, move |conn| {
+        core_session_usage_summary(conn, &source, &session_id)
+    })
+    .await
+    .map(|summary| session_usage(summary_source, summary_session_id, summary))
 }
 
 /// Database statistics over already-indexed data.

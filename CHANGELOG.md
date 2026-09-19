@@ -41,6 +41,36 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- Bump the native-addon contract to 16 for the usage surface below. An older
+  addon is rejected rather than served a shape it does not implement.
+
+### Added
+
+- Normalize token usage in the core crate. `ai_hist::normalize_usage` turns a
+  provider's stored `token_json` into a `NormalizedUsage`: input always
+  excludes cache reads, Anthropic's `cache_creation.ephemeral_5m`/`1h` split is
+  preserved, `provider_total_tokens` is what the provider wrote and is never
+  recomputed, and `reported_cost_usd` appears only when the source data carried
+  a cost. A negative, fractional, non-finite, or out-of-range counter is a
+  `UsageError` with a stable code, never a clamped zero, and a `UsageCoverage`
+  records which counters the provider actually wrote so a reported zero stays
+  distinguishable from silence.
+
+- Add per-request usage records and a session rollup. The `session_requests`
+  view is one row per model request — Claude's per-content-block copies of
+  `message.usage` collapse into one — read with `session_requests_page` /
+  `getSessionRequestsPage` (keyset on `(firstTsMs, id)`) and
+  `session_usage_summary` / `getSessionUsage`, plus the MCP tools
+  `get_session_requests` and `get_session_usage`. Session usage contract 1. A
+  session with no usage evidence reports `null`, not zeros. See
+  [docs/usage-accounting.md](docs/usage-accounting.md).
+
+- Move prompt usage attribution out of the commercial plugin into
+  `ai_hist::attribute_usage_to_prompts`, refusal semantics unchanged; the
+  plugin keeps its wire shape and becomes a thin caller.
+
+### Breaking
+
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no
   longer substitutes the OpenCode database file size, and summaries add
