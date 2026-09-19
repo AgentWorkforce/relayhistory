@@ -60,7 +60,7 @@ fn prepare(conn: &Connection, claim: &ClaimedBatch, now: i64) {
         &claim.batch.mapping_version,
         "application/json",
         &serde_json::to_string(&claim.batch).unwrap(),
-        now,
+        &|| now,
     )
     .unwrap();
 }
@@ -135,7 +135,7 @@ fn restart_after_remote_acceptance_preserves_batch_and_prepared_bytes() {
         "1",
         "application/json",
         "changed bytes",
-        1002
+        &|| 1002
     )
     .is_err());
     assert!(acknowledge(&conn, &first.lease, &ack(&first), 1002).is_err());
@@ -344,7 +344,7 @@ fn lease_renewal_prevents_overlap_and_stale_failure_cannot_change_progress() {
     event(&conn, "a", "first");
     let job = create_job(&conn, &config("one"), 0).unwrap();
     let claim = claim(&conn, &job.job_id, 0).unwrap();
-    let renewed = renew_lease(&conn, &claim.lease, 5000, 500).unwrap();
+    let renewed = renew_lease(&conn, &claim.lease, 5000, &|| 500).unwrap();
     assert_eq!(renewed.expires_at_ms, 5500);
     assert!(claim_batch(&conn, &job.job_id, "other", 1000, 1001)
         .unwrap()
@@ -567,9 +567,9 @@ fn dispatch_requires_immutable_payload_and_rechecks_privacy_after_mapping() {
     event(&conn, "a", "private");
     let job = create_job(&conn, &config("one"), 0).unwrap();
     let claim = claim(&conn, &job.job_id, 0).unwrap();
-    assert!(validate_dispatch(&conn, &claim.lease, 1).is_err());
+    assert!(validate_dispatch(&conn, &claim.lease, &|| 1).is_err());
     prepare(&conn, &claim, 1);
-    assert!(validate_dispatch(&conn, &claim.lease, 2).is_ok());
+    assert!(validate_dispatch(&conn, &claim.lease, &|| 2).is_ok());
     set_session_excluded(
         &conn,
         &SessionIdentity {
@@ -579,7 +579,7 @@ fn dispatch_requires_immutable_payload_and_rechecks_privacy_after_mapping() {
         true,
     )
     .unwrap();
-    assert!(validate_dispatch(&conn, &claim.lease, 3).is_err());
+    assert!(validate_dispatch(&conn, &claim.lease, &|| 3).is_err());
     assert!(claim_batch(&conn, &job.job_id, "other", 1000, 3)
         .unwrap()
         .is_none());
@@ -680,7 +680,7 @@ fn permanent_failure_cannot_resume_through_pause_without_explicit_retry() {
         let job = create_job(&conn, &config("blocked"), 0).unwrap();
         let first = claim(&conn, &job.job_id, 0).unwrap();
         prepare(&conn, &first, 0);
-        let expected_prepared = validate_dispatch(&conn, &first.lease, 0).unwrap();
+        let expected_prepared = validate_dispatch(&conn, &first.lease, &|| 0).unwrap();
         let blocked = record_failure(&conn, &first.lease, failure, None, 1).unwrap();
         assert_eq!(blocked.state, "blocked");
         assert!(pause_job(&conn, &job.job_id).is_err());

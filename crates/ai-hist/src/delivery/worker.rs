@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Receiver-classified failure. `retry_after_ms` is an absolute epoch-ms retry
 /// time, exactly as `record_failure` interprets its own `retry_after_ms`.
@@ -180,6 +180,46 @@ pub struct DrainResult {
     pub retention: DrainRetention,
 }
 
+/// Shortest gap between two lease-renewal attempts.
+///
+/// Once the keepalive is inside its renewal margin the computed wait is zero,
+/// so without a floor a contended renewal would retry in a tight loop against
+/// the writer holding the lock.
+const RENEWAL_RETRY_FLOOR_MS: u64 = 5;
+
+/// How long one renewal waits for the write lock before giving the decision
+/// back to the renewal loop.
+///
+/// A sixth of the lease, so a blocked renewal returns with most of its margin
+/// intact and several attempts still available before the deadline. Floored so
+/// a very short lease still makes progress, and capped so a very long one does
+/// not inherit the thirty-second wait this exists to avoid.
+fn keepalive_busy_timeout_ms(lease_ms: i64) -> u64 {
+    (lease_ms / 6).clamp(5, 2_000) as u64
+}
+
+/// Whether a failed write is SQLite refusing it because another connection
+/// holds the lock, rather than the write itself being rejected.
+///
+/// "I could not write just now" and "this write is not allowed" are the same
+/// `Err` at the call site, and the delivery keepalive read the first as the
+/// second: a renewal that merely lost a race for the database marked the claim
+/// lost, discarding a send that had already succeeded.
+fn lost_a_race_for_the_database(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if matches!(
+                        failure.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            )
+        })
+}
+
 pub fn system_clock() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -234,9 +274,19 @@ pub fn drain(
         1,
         3_600_000,
     )?;
+    let keepalive = crate::open_db(db_path)?;
+    // The shared busy policy retries for about thirty seconds, which is right
+    // for a sync that must not give up and exactly wrong for a keepalive: a
+    // renewal that waits thirty seconds to protect a lease shorter than that
+    // has already lost the thing it was protecting, and it made the decision
+    // inside a busy handler that has never heard of the deadline. Bound it so
+    // contention comes back to the renewal loop, which does know.
+    keepalive.busy_timeout(Duration::from_millis(keepalive_busy_timeout_ms(
+        options.lease_ms,
+    )))?;
     let mut worker = Worker {
         conn: crate::open_db(db_path)?,
-        keepalive: Mutex::new(crate::open_db(db_path)?),
+        keepalive: Mutex::new(keepalive),
         receivers,
         options,
         clock,
@@ -404,17 +454,60 @@ impl Worker<'_> {
             let clock = self.clock;
             let lease = &claim.lease;
             let lease_ms = self.options.lease_ms;
-            let interval = Duration::from_millis(1.max(lease_ms / 3) as u64);
+            // Renew with two thirds of the lease still to run, so two
+            // consecutive renewals can be missed entirely before the claim is
+            // at risk. Same cadence as a fixed `lease_ms / 3` interval in the
+            // quiet case; the difference is that each wait is computed from
+            // the lease's own deadline, so a renewal that took 300 ms is
+            // followed by a correspondingly shorter wait instead of a full
+            // interval on top of it. Anchoring on the deadline is what stops
+            // the cadence drifting out under sustained load, which is how a
+            // live claim silently lapsed and let a second worker dispatch the
+            // same batch.
+            let margin_ms = lease_ms - 1.max(lease_ms / 3);
             std::thread::scope(|scope| {
                 let renewals = scope.spawn(|| {
-                    while sleep_until(&stop, interval) {
+                    let mut expires_at_ms = lease.expires_at_ms;
+                    loop {
+                        let wait_ms = (expires_at_ms - clock() - margin_ms).max(0) as u64;
+                        // Inside the renewal margin the computed wait is zero,
+                        // and a renewal that lost a race for the write lock
+                        // must back off a little rather than contend in a
+                        // tight loop with the writer it is waiting for.
+                        let wait = Duration::from_millis(wait_ms.max(RENEWAL_RETRY_FLOOR_MS));
+                        if !sleep_until(&stop, wait) {
+                            break;
+                        }
+                        // Deliberately no "the deadline passed, so the claim is
+                        // gone" check here. Expiry is a signal to *other*
+                        // workers that an abandoned batch may be stolen, and
+                        // `claim_batch` enforces it; a lease that lapsed while
+                        // nobody took it is still ours, and `check_lease` says
+                        // so by fence. Giving up on the clock alone would
+                        // discard a send that had already succeeded, for a
+                        // batch no one else ever touched.
                         let renewed = keepalive
                             .lock()
                             .map_err(|_| anyhow!("delivery keepalive connection is poisoned"))
-                            .and_then(|conn| renew_lease(&conn, lease, lease_ms, clock()));
-                        if renewed.is_err() {
-                            lost.store(true, Ordering::SeqCst);
-                            break;
+                            .and_then(|conn| renew_lease(&conn, lease, lease_ms, &clock));
+                        match renewed {
+                            Ok(lease) => expires_at_ms = lease.expires_at_ms,
+                            // Losing a race for the database is not losing the
+                            // lease: the keepalive's connection gives up on a
+                            // contended write quickly (see
+                            // `keepalive_busy_timeout_ms`) precisely so the
+                            // decision comes back here, where the deadline is
+                            // known, rather than being made by a busy handler
+                            // that has never heard of it. Retry.
+                            //
+                            // Anything else -- notably `check_lease` refusing
+                            // because another worker now owns the batch -- is a
+                            // verdict, and is reported at once.
+                            Err(error) if lost_a_race_for_the_database(&error) => {}
+                            Err(_) => {
+                                lost.store(true, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                 });
@@ -504,7 +597,7 @@ impl Worker<'_> {
                 receiver.mapping_version(),
                 &prepared.content_type,
                 &prepared.body,
-                (self.clock)(),
+                self.clock,
             )
             .map_err(|_| transient())?;
         }
@@ -514,7 +607,7 @@ impl Worker<'_> {
         // Eligibility can change while a receiver maps its payload. Recheck it
         // in core immediately before transport and send the persisted bytes.
         let payload =
-            validate_dispatch(&self.conn, &claim.lease, (self.clock)()).map_err(|_| transient())?;
+            validate_dispatch(&self.conn, &claim.lease, self.clock).map_err(|_| transient())?;
         if stopping() {
             return Err(transient());
         }
@@ -561,16 +654,25 @@ impl Drop for StopOnDrop<'_> {
 
 /// Sleep in slices so a finished attempt joins the keepalive thread promptly.
 /// Returns false once the attempt asked it to stop.
+///
+/// The wait is measured against a real deadline, not by accumulating the
+/// durations it asked for. `thread::sleep` guarantees only a lower bound, so a
+/// loaded machine routinely returns from a 5 ms slice after 30 ms or more;
+/// counting the requested 5 ms instead of the elapsed time made this function
+/// silently overshoot by exactly the factor the machine was overloaded by.
+/// That is the wrong way round for a keepalive: the renewal cadence stretched
+/// precisely when scheduling pressure made a timely renewal matter most.
 fn sleep_until(stop: &AtomicBool, interval: Duration) -> bool {
     let slice = Duration::from_millis(5);
-    let mut waited = Duration::ZERO;
-    while waited < interval {
+    let deadline = Instant::now() + interval;
+    loop {
         if stop.load(Ordering::SeqCst) {
             return false;
         }
-        let step = slice.min(interval - waited);
-        std::thread::sleep(step);
-        waited += step;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return !stop.load(Ordering::SeqCst);
+        }
+        std::thread::sleep(slice.min(remaining));
     }
-    !stop.load(Ordering::SeqCst)
 }

@@ -97,7 +97,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **3**
+Both operations carry `contract_version` — currently **4**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -108,7 +108,7 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "sessions": [
     {
@@ -129,6 +129,8 @@ One object, never a bare array, so the version travels with the payload:
       "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
       "source_stamp": "v2:1788042670103317900:569",
       "discovery_state": "shallow",
+      "project_key": "github.com/acme/api",
+      "project_key_method": "remote",
       "locations": ["local"],
       "from_cache": true
     }
@@ -144,6 +146,43 @@ One object, never a bare array, so the version travels with the payload:
 Keys are `snake_case`. `models`, `workspace_roots`, and `locations` are always
 arrays (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
+
+`project_key` is the canonical project identity: the `origin` remote
+canonicalized to `host/owner/repo`, or the working directory when no remote
+resolves. **Group by it rather than by `cwd`** — two checkouts, two worktrees
+or two subdirectories of one repository share a key but never share a path, and
+a path-keyed rollup splits them. `project_key_method` says how the key was
+arrived at, and the three are not interchangeable:
+
+| `project_key_method` | meaning |
+| --- | --- |
+| `remote` | canonicalized `origin` remote; comparable across machines |
+| `path` | no remote resolved, so the key is the directory and is only meaningful on the machine that produced it |
+| `inherited` | adopted from the delegating parent session, because the child's own directory resolved to nothing canonical |
+
+The rules match burn's `crates/relayburn-sdk/src/reader/git.rs` vector for
+vector, so `burn --group-by project` and a RelayHistory rollup agree on the
+same checkout. No `git` subprocess is involved: `.git/config` is read directly,
+including a linked worktree's `gitdir:` pointer and `url.<base>.insteadOf`
+rewrites (which `git remote get-url` also expands). An `[include]`d config file
+is not followed, so a remote defined only in one falls back to a path key.
+
+Both are `null` while a session's identity has not been resolved yet — a
+database that predates the columns migrates without inventing keys, and the
+next sync or hydration fills them. `null` means "not resolved", never "no
+project".
+
+A key is resolved from the working directory, or from a remote the provider
+recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
+never final: every sync reconsiders it, so a session whose checkout was deleted
+picks up the canonical key as soon as a recorded remote makes one available. A
+`remote` key is never downgraded.
+
+Filter a listing to one project with `ai-hist sessions list --project <key>`
+(SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
+key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
+and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
+the per-directory grouping.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
@@ -170,7 +209,7 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "locations_run": ["local"],
   "discovered": 2,

@@ -269,6 +269,15 @@ pub(crate) fn apply_normalized(
         false,
         full,
     )?;
+    // Inside the transaction that wrote the records, for the same reason the
+    // local hydration path does it: a snapshot supplies `session_events` rows
+    // whose `project_key` is whatever the emitting side happened to know --
+    // null from an older adapter, or a key that no longer matches the session
+    // -- and without this those events would be the one place in the database
+    // where the canonical identity is missing or stale. Committing first and
+    // refreshing later would serve that gap to every reader in between, and
+    // for an adapter that never reports again it would never close at all.
+    crate::store::refresh_project_identity(&tx)?;
     tx.commit()?;
     let options = HydrateSessionOptions {
         source: key.source.clone(),
