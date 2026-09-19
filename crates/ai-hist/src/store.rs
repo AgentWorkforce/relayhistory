@@ -1218,12 +1218,12 @@ pub fn parse_cursor_text(line: &str) -> Result<Option<String>> {
             }
         }
     }
-    let mut trimmed = text.trim().to_string();
-    if trimmed.starts_with("<user_query>") && trimmed.ends_with("</user_query>") {
-        trimmed = trimmed["<user_query>".len()..trimmed.len() - "</user_query>".len()]
-            .trim()
-            .to_string();
-    }
+    // Cursor's client wraps a human turn in `<user_query>` and, on builds that
+    // record a time, prefixes it with a `<timestamp>` tag. Stripping only a
+    // whole-string envelope leaves the markup in the catalog's prompt excerpt
+    // whenever the timestamp tag is there, so both wrappers are handled in one
+    // place with the full parser.
+    let trimmed = crate::ingest::cursor::unwrap_user_text(&text);
     Ok((!trimmed.is_empty()).then_some(trimmed))
 }
 
@@ -2885,6 +2885,23 @@ mod tests {
         assert_eq!(
             parse_cursor_text(r#"{"role":"user","message":{"content":"tag the release"}}"#)
                 .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // Builds that record a time put a <timestamp> tag in front of the
+        // envelope. The prompt is still the query, not the markup.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>\ntag the release\n</user_query>"}]}}"#
+            )
+            .unwrap(),
+            Some("tag the release".to_string())
+        );
+        // A turn with the tag but no envelope keeps its text and loses the tag.
+        assert_eq!(
+            parse_cursor_text(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\ntag the release"}]}}"#
+            )
+            .unwrap(),
             Some("tag the release".to_string())
         );
     }
