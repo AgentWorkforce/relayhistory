@@ -6036,13 +6036,19 @@ mod tests {
         let mut competing_write = None;
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
-                visited.push(path.to_path_buf());
-                if path == second {
-                    competing_write =
-                        Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+            super::sync_cursor_with_scan_hook(
+                &conn,
+                &mut state,
+                dir.path(),
+                &mut SweepCoverage::default(),
+                &mut |path| {
+                    visited.push(path.to_path_buf());
+                    if path == second {
+                        competing_write =
+                            Some(competitor.execute("INSERT INTO writer_probe VALUES (1)", []));
+                    }
                 }
-            })
+            )
             .unwrap(),
             2
         );
@@ -6083,7 +6089,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         let saved = state.clone();
@@ -6108,8 +6115,12 @@ mod tests {
         )
         .unwrap();
         let mut visited = Vec::new();
-        let inserted =
-            super::sync_cursor_with_scan_hook(&conn, &mut state, dir.path(), &mut |path| {
+        let inserted = super::sync_cursor_with_scan_hook(
+            &conn,
+            &mut state,
+            dir.path(),
+            &mut SweepCoverage::default(),
+            &mut |path| {
                 visited.push(path.to_path_buf());
                 if path == second {
                     assert_eq!(
@@ -6122,8 +6133,9 @@ mod tests {
                     // The hook runs after the existence check, forcing open to fail.
                     fs::remove_file(path).unwrap();
                 }
-            })
-            .expect("one vanished transcript must not abort the whole Cursor source");
+            },
+        )
+        .expect("one vanished transcript must not abort the whole Cursor source");
         assert_eq!(visited, vec![first.clone(), second.clone()]);
         assert_eq!(
             inserted, 1,
@@ -6167,7 +6179,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -6193,8 +6206,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("a failed database write must fail Cursor sync");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("a failed database write must fail Cursor sync");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(
             state, saved,
@@ -6230,7 +6244,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             4
         );
         assert_eq!(
@@ -6238,7 +6253,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -6293,8 +6309,9 @@ mod tests {
         .unwrap();
         let mut state = Map::new();
         let saved = state.clone();
-        let error = super::sync_cursor(&conn, &mut state, dir.path())
-            .expect_err("the later file must fail the entire source");
+        let error =
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .expect_err("the later file must fail the entire source");
         assert!(format!("{error:#}").contains("forced Cursor write failure"));
         assert_eq!(state, saved, "first failed sync must not publish any state");
         assert_eq!(
@@ -6335,7 +6352,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER reject_cursor_prompt;")
             .unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             6
         );
         for path in [&first, &second] {
@@ -6345,7 +6363,8 @@ mod tests {
             );
         }
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<(String, i64)> = conn
@@ -6392,7 +6411,8 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             2
         );
         assert_eq!(
@@ -6400,7 +6420,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
 
@@ -6412,7 +6433,8 @@ mod tests {
         .unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -6420,7 +6442,8 @@ mod tests {
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, dir.path()).unwrap(),
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
             0
         );
         let prompts: Vec<String> = conn
@@ -6457,7 +6480,13 @@ mod tests {
         fs::create_dir_all(cursor.parent().unwrap()).unwrap();
         fs::write(&cursor, r#"{"role":"user","message":{"content":"cursor"#).unwrap();
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -6469,11 +6498,23 @@ mod tests {
         file.write_all(b"\n").unwrap();
         drop(file);
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             1
         );
         assert_eq!(
-            super::sync_cursor(&conn, &mut state, &cursor_root).unwrap(),
+            super::sync_cursor(
+                &conn,
+                &mut state,
+                &cursor_root,
+                &mut SweepCoverage::default()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
