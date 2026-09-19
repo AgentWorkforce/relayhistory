@@ -324,7 +324,7 @@ read.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **cursor** | ✓ (dir name) | ✓ (decoded path) | – | – (never) | mtime-derived | ✓ | – | – | – | – | – | – |
+| **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | – (never written) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
@@ -337,6 +337,11 @@ Delegation is a separate capability, reported on every relationship result as
 | **codex** | always | ✓ | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **cursor**, **grok**, **opencode**, **relay** | never | – | – | – |
+
+Cursor is `never` for a different reason from grok, opencode and relay: it does
+record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
+`tool_calls` row — but the block names no child transcript, so there is no
+identity to link. See ["cursor → Delegation"](#cursor).
 
 Claude is `sometimes` because a subagent transcript carries the *parent's*
 `sessionId` on every record; the child's own identity is the per-child
@@ -364,10 +369,180 @@ How each adapter works:
   rollouts but not user sessions, so they are excluded — exactly as the full
   sync excludes them — and remembered in `discovery_skips` so a rescan does not
   re-read them.
+<a id="cursor"></a>
+
 - **cursor** — `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`.
-  Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
-  always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
-  the project directory name.
+  The session id is the directory name and `cwd` is decoded from the project
+  directory name; neither appears inside the file. The head read takes the
+  first human prompt and the first readable turn time, the tail read takes the
+  last assistant prose and the last readable turn time, and `models` comes from
+  `message.model` for the builds that write one — an empty list means "not seen
+  cheaply", never "no model". Full details, and what Cursor does **not** write,
+  are below.
+
+  ### Cursor record shapes
+
+  Cursor publishes no schema for this file, so the shapes below were
+  characterized from public descriptions of real transcript corpora rather than
+  from Cursor's documentation. **Sources are cited per field, and nothing here
+  was verified against a real Cursor install on the machine this was written
+  on** — see "Verification status" at the end of this section.
+
+  A record is a bare object with the role at the **top level**:
+
+  ```jsonl
+  {"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>ship it</user_query>"}]}}
+  {"role":"assistant","message":{"content":[{"type":"text","text":"Reading the file."},{"type":"tool_use","name":"Read","input":{"path":"CHANGELOG.md"}}]}}
+  {"role":"assistant","message":{"content":[{"type":"turn_ended","status":"success"}]}}
+  ```
+
+  There is no `message.role` and no record `type` — reading the role from the
+  Claude Code nesting finds nothing and labels every turn as unknown. Older
+  rows carry `message.content` as a bare string with no framing at all.
+
+  | Field | Status | What RelayHistory does |
+  |---|---|---|
+  | top-level `role` | **Corroborated** by several independent adapters | Drives `session_events.role`; `user` turns also become `history` rows |
+  | `message.content` as an array of blocks | **Corroborated** | Each block becomes one `session_events` row |
+  | `message.content` as a bare string | **Corroborated** (the shape the pre-existing parser was written against) | Normalized into one synthetic `text` block |
+  | `{"type":"text","text"}` | **Corroborated** | `session_events.kind = 'text'` |
+  | `{"type":"tool_use","name","input"}`, **no `id`** | **Corroborated**; one report of `"id": null` in the CLI | `session_events.kind = 'tool_use'` plus a `tool_calls` row, keyed on the record's byte offset because there is no provider id |
+  | `{"type":"turn_ended","status"}` | **Corroborated** | Skipped: it is a marker, and no `session_events.kind` honestly fits it |
+  | `<timestamp>…</timestamp>` in the human turn's text | **Corroborated**; a localized human string, e.g. `Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)` | Parsed explicitly (English month, 12- or 24-hour clock, required `(UTC±H[:MM])`). The records answering that turn inherit it |
+  | `<user_query>…</user_query>` in the human turn's text | **Corroborated** | Stripped, so the stored prompt is what the person typed |
+  | `message.model` | **Not written** by any reported build | Recorded if a build ever writes it; otherwise `models` is empty and the matrix says unavailable |
+  | `message.usage` | **Not written** by any reported build | Same: recorded when present, never synthesized |
+  | `{"type":"tool_result",…}` | **Not written** — "not one line of tool output is persisted" | Parsed when present; the observed corpus produces none |
+  | `{"type":"thinking",…}` | **Not written** by any reported build | Parsed when present |
+  | record `timestamp` field | **Not written** | Preferred over the injected tag when present |
+  | `sessionId`, `cwd`, `gitBranch` inside the file | **Not written** | Taken from the path layout instead; `git_branch` stays null |
+  | `parentMessageId`, `isSidechain`, `message.id` | **Not written** (an early adapter assumed these and was rejected against a real corpus) | `message.id` is used if present; the rest are not read |
+
+  Tool names come in three dialects across Cursor versions and served models,
+  and all three are classified: the unprefixed set (`Read`, `Grep`, `Glob`,
+  `Shell`, `AwaitShell`, `Write`, `StrReplace`, `Delete`, `EditNotebook`,
+  `ReadLints`, `TodoWrite`, `Task`, `SwitchMode`, `WebSearch`, `WebFetch`,
+  `GetMcpTools`, `CallMcpTool`, `FetchMcpResource`, `GenerateImage`), the
+  `functions.*` namespaced set used by GPT-served models (including
+  `functions.ApplyPatch`, `functions.rg` and `functions.Subagent`), and an older
+  snake_case set (`edit_file`, `search_replace`, `run_terminal_cmd`,
+  `codebase_search`). `Write`, `StrReplace`, `ApplyPatch`, `Delete` and
+  `EditNotebook` (plus their namespaced and snake_case spellings) produce
+  `file_edits` rows. `ApplyPatch` is the awkward one: its `input` is the patch
+  **text**, not an object, so the file path comes out of the patch header and
+  the line counts come from the same `count_patch_text` the Claude parser uses.
+  `StrReplace` carries old/new strings rather than a diff, so its edit is
+  recorded with no line counts rather than guessed ones. `Shell` records only
+  the command string, so no file is attributed to it.
+
+  ### Identity and re-reads
+
+  Because Cursor writes no record uuid and no `tool_use` id, every
+  `session_events.event_uid`, `tool_calls.tool_use_id` and
+  `file_edits.tool_use_id` is derived from the record's **byte offset** in the
+  file. An offset is stable across an incremental read, a whole-file re-parse
+  and a re-hydration, and it resets exactly when Cursor rewrites the file —
+  which is also when the byte cursor resets. This is what makes a repeat read
+  upsert in place instead of duplicating.
+
+  `history` is the one table that cannot be upserted this way: a prompt's
+  identity is `(source, timestamp_ms, prompt)`, and a turn with no readable
+  time is stamped with a file mtime that moves on every append. Targeted
+  hydration therefore rebuilds the session's `history` rows from the file, and
+  plain `sync` inserts prompts only for records at or after the offset it
+  resumed from — except on a read that restarts at offset 0, where it rebuilds
+  them too.
+
+  ### Timestamps
+
+  No prompt or event is stamped with the file mtime unless its turn carried no
+  readable time. When that happens, targeted hydration reports a
+  `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic naming the fallback; it is never
+  silent. Shallow discovery reports `first_activity_ms` from the first readable
+  turn time and leaves it `null` when the build wrote none, and
+  `last_activity_ms` falls back to the mtime.
+
+  ### Delegation
+
+  Cursor's `Task` / `functions.Subagent` calls are recorded as ordinary
+  `tool_calls` rows, so the spawn is visible. The block carries **no child
+  transcript id**, so there is nothing to link to and
+  `relationship_capabilities("cursor").stableChildIdentity` stays `never`;
+  targeted hydration reports `CURSOR_SUBAGENT_SPAWN_UNLINKED` when a transcript
+  contains such a call. Third-party reports describe subagent sidecars at
+  `agent-transcripts/<parent>/subagents/<child>.jsonl`, but that layout is
+  **unverified here** and no relationship row is written on the strength of it.
+
+  ### Verification status
+
+  Cursor was not installed on the machine this adapter was written on, so no
+  real `~/.cursor/.../agent-transcripts/*.jsonl` was read. The fixtures under
+  `crates/ai-hist/tests/fixtures/cursor/` reproduce the shapes described by the
+  sources below; `extended-unverified.jsonl` is named so nobody mistakes it for
+  evidence about Cursor.
+
+  Sources consulted (all public, September 2026):
+
+  - [agitHQ/agit PR #165](https://github.com/agitHQ/agit/pull/165) — the
+    strongest source: an adapter built to a shape histogram over **104 real
+    transcripts** (60 sessions + 44 subagents; 5,335 records, 11,162 content
+    blocks) from **Cursor IDE 3.13.25**. Origin of "bare `{role, message}`,
+    id-less `tool_use`, `turn_ended`, no `tool_result`/`thinking`/`timestamp`/
+    `model`/`usage`", and of `ApplyPatch` taking patch text directly.
+  - [agitHQ/agit PR #118](https://github.com/agitHQ/agit/pull/118) — the
+    rejected predecessor. Useful as a negative result: it assumed an
+    Anthropic-shaped `{role, type, message:{id, model, usage}, parentMessageId,
+    isSidechain, timestamp}` record and was rejected because *none* of those
+    fields exist in a real transcript.
+  - [clickety-clacks/engram issue #19](https://github.com/clickety-clacks/engram/issues/19)
+    — independent confirmation of `role` + `message.content[]` with `text` and
+    `tool_use` blocks and no top-level `type`/`session_id`.
+  - [ArcadeAI/safeword issue #4594](https://github.com/ArcadeAI/safeword/issues/4594)
+    — independent confirmation that `role` is top-level and `message` has no
+    `role`, measured against a real 564 KB transcript (76 user, 333 assistant).
+  - [nixfred/infomarchy PR #34](https://github.com/nixfred/infomarchy/pull/34)
+    — the `<timestamp>` tag, its exact wording
+    (`Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)`), the warning that `Date.parse`
+    drops the offset on some builds, the `turn_ended` end-of-turn marker, and
+    that hooks/rules inject turns indistinguishable from human prompts.
+  - [entireio/cli `agent/cursor`](https://pkg.go.dev/github.com/entireio/cli/cmd/entire/cli/agent/cursor)
+    — the `Write`/`StrReplace` file-modification pair, and that `Shell` records
+    only a command string.
+  - [fitchmultz/pi-cursor-sdk evidence, 2026-08-02](https://github.com/fitchmultz/pi-cursor-sdk/blob/main/docs/evidence/cursor-system-prompts-2026-08-02/README.md)
+    — the full 19-tool inventory in both the unprefixed and `functions.*`
+    dialects.
+  - [cavi-ai/secure-agent PR #104](https://github.com/cavi-ai/secure-agent/pull/104)
+    and [microsoft/AI-Engineering-Coach PR #264](https://github.com/microsoft/AI-Engineering-Coach/pull/264)
+    — independent confirmation of "no timestamps, no tool results, no token
+    usage, no model ID", and of the `subagents/` sidecar directory.
+  - [kenn-io/agentsview issue #1627](https://github.com/kenn-io/agentsview/issues/1627)
+    — reports `"id": null` on `tool_use` blocks in the CLI JSONL and absent
+    tool results.
+
+  **Checklist for a maintainer who has Cursor installed.** Run a short agent
+  session, then against
+  `~/.cursor/projects/*/agent-transcripts/<id>/<id>.jsonl`:
+
+  1. `jq -r 'keys|join(",")' … | sort -u` — confirm the top-level key set is
+     exactly `role,message` (and record any extra key).
+  2. `jq -r '.message|keys|join(",")' … | sort -u` — confirm `content` is the
+     only key, or capture `id`/`model`/`usage` if your build writes them.
+  3. `jq -r '.message.content[]?.type' … | sort | uniq -c` — capture the real
+     block-type histogram; confirm whether `tool_result` or `thinking` ever
+     appear.
+  4. `jq -r '.message.content[]? | select(.type=="tool_use") | .name' … | sort | uniq -c`
+     — capture the real tool-name dialect for your model.
+  5. `jq -r '.message.content[]? | select(.type=="tool_use") | .id' … | sort -u`
+     — confirm ids are absent or null.
+  6. `grep -c '<timestamp>' <file>` and eyeball one tag — confirm the wording
+     and offset format in your locale.
+  7. Delegate to a subagent and check whether
+     `agent-transcripts/<id>/subagents/` exists and whether the parent's `Task`
+     block names the child.
+
+  Anything that comes back different should replace the matching row in the
+  table above, move the fixture out of `extended-unverified.jsonl`, and update
+  the capability matrix.
 - **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.

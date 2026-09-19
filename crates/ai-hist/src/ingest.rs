@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod cursor;
 pub(crate) mod hydrate;
 
 use crate::diagnostics::*;
@@ -773,14 +774,27 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
     ("codex_rollouts_v3", "codex_rollouts_v5"),
     ("codex_rollouts_v4", "codex_rollouts_v5"),
+    ("cursor", CURSOR_SYNC_STATE_KEY),
 ];
+
+/// Where plain `sync` remembers how far it has read each Cursor transcript.
+///
+/// Renaming the key is how an unchanged transcript gets re-read after a parser
+/// upgrade: the old map is retired, every file opens at offset 0 again, and the
+/// records that only ever produced a prompt are re-indexed into
+/// `session_events`, `tool_calls` and `file_edits`. Bumping
+/// `HYDRATION_PARSER_VERSION` alone only repairs sessions somebody hydrates by
+/// name; plain `sync` would keep skipping the rest forever.
+const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v1";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
     let mut changed = false;
     for (key, value) in ours {
         let next = match merged.get(key) {
-            Some(existing) if key == "cursor" => merge_file_cursor_map(existing, value),
+            Some(existing) if key == CURSOR_SYNC_STATE_KEY => {
+                merge_file_cursor_map(existing, value)
+            }
             Some(existing) => merge_sync_value(existing, value),
             None => value.clone(),
         };
@@ -3709,7 +3723,15 @@ struct PreparedCursorTranscript {
     session_id: String,
     project: String,
     timestamp_ms: i64,
-    prompts: Vec<String>,
+    /// True when the byte cursor started this transcript from the beginning —
+    /// a first sight of the file, a Cursor rewrite, or the one re-read a
+    /// retired state key forces after a parser upgrade. Only then may the
+    /// session's existing `history` rows be rebuilt, because only then can
+    /// their timestamps have come from a previous parser.
+    restarted: bool,
+    /// The byte offset this sync resumed from. Records before it are already
+    /// in `history`; see [`ingest_cursor_transcript`].
+    history_from_offset: u64,
 }
 
 struct PreparedCursorSync {
@@ -3736,19 +3758,43 @@ fn sync_cursor_with_scan_hook(
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
     for transcript in prepared.transcripts {
-        for prompt in transcript.prompts {
-            inserted += insert_cursor_prompt(
-                &tx,
-                prompt,
-                &transcript.session_id,
-                &transcript.project,
-                transcript.timestamp_ms,
-            )
-            .with_context(|| format!("insert Cursor prompt from {}", transcript.path.display()))?;
+        // A transcript read from its start may hold prompts a previous parser
+        // version stamped with the file mtime; those rows cannot be updated in
+        // place because the timestamp is part of their uniqueness key. Rebuild
+        // them from the file, the way the Codex rollout repair does.
+        if transcript.restarted {
+            tx.execute(
+                "DELETE FROM history WHERE source = 'cursor' AND session_id = ?",
+                [transcript.session_id.as_str()],
+            )?;
         }
+        let outcome = ingest_cursor_transcript(
+            &tx,
+            &transcript.path,
+            &transcript.session_id,
+            Some(&transcript.project),
+            transcript.timestamp_ms,
+            transcript.history_from_offset,
+        )
+        .with_context(|| format!("index Cursor transcript {}", transcript.path.display()))?;
+        inserted += outcome.prompts_inserted;
+        upsert_session(
+            &tx,
+            &transcript.session_id,
+            "cursor",
+            Some(&transcript.project),
+            None,
+            outcome.first_ts_ms.unwrap_or(transcript.timestamp_ms),
+            outcome.last_ts_ms.unwrap_or(transcript.timestamp_ms),
+            outcome.last_assistant_text.as_deref(),
+            Some(&transcript.path.to_string_lossy()),
+        )?;
     }
     tx.commit().context("commit Cursor sync")?;
-    state.insert("cursor".to_string(), Value::Object(prepared.cursor_state));
+    state.insert(
+        CURSOR_SYNC_STATE_KEY.to_string(),
+        Value::Object(prepared.cursor_state),
+    );
     if prepared.files_seen > 0 {
         let suffix = if prepared.errors > 0 {
             format!(" ({} errors)", prepared.errors)
@@ -3767,10 +3813,15 @@ fn sync_cursor_with_scan_hook(
 /// written in place so a transcript that fails midway leaves its saved checkpoint
 /// exactly as it was.
 struct ScannedCursorTranscript {
-    prompts: Vec<String>,
     timestamp_ms: i64,
     parse_errors: usize,
     checkpoint: Option<Value>,
+    /// The byte cursor opened this file at its start.
+    restarted: bool,
+    /// The read found bytes this store has not seen.
+    advanced: bool,
+    /// Where the byte cursor resumed from.
+    resumed_from: u64,
 }
 
 fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
@@ -3791,7 +3842,6 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let mut consumed = offset;
-    let mut prompts = Vec::new();
     let mut parse_errors = 0;
     if offset < size {
         let mut line = String::new();
@@ -3800,10 +3850,11 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
             .with_context(|| format!("read Cursor transcript {}", jsonl.display()))?
         {
             consumed = position;
-            match parse_cursor_text(&line) {
-                Ok(Some(prompt)) => prompts.push(prompt),
-                Ok(None) => {}
-                Err(_) => parse_errors += 1,
+            // The scan advances and validates the byte cursor; indexing happens
+            // over the whole file afterwards. A malformed record is still
+            // counted here so the sync note reports it.
+            if parse_cursor_text(&line).is_err() {
+                parse_errors += 1;
             }
         }
     }
@@ -3819,10 +3870,12 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         None
     };
     Ok(ScannedCursorTranscript {
-        prompts,
         timestamp_ms,
         parse_errors,
         checkpoint,
+        restarted: offset == 0,
+        advanced: consumed != offset,
+        resumed_from: offset,
     })
 }
 
@@ -3832,7 +3885,7 @@ fn prepare_cursor_sync(
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
-        .get("cursor")
+        .get(CURSOR_SYNC_STATE_KEY)
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -3880,13 +3933,20 @@ fn prepare_cursor_sync(
             if let Some(checkpoint) = scan.checkpoint {
                 cursor_state.insert(key, checkpoint);
             }
-            if !scan.prompts.is_empty() {
+            // The byte cursor is the change detector; the parser then reads the
+            // whole file. Cursor's records are id-less, so every event, tool
+            // call and file edit is keyed on the record's byte offset — which a
+            // full re-parse reproduces exactly, and a resumed partial read
+            // could not, because a window's records have no absolute position
+            // of their own.
+            if scan.advanced {
                 transcripts.push(PreparedCursorTranscript {
                     path: jsonl,
                     session_id,
                     project: project_path.clone(),
                     timestamp_ms: scan.timestamp_ms,
-                    prompts: scan.prompts,
+                    restarted: scan.restarted,
+                    history_from_offset: scan.resumed_from,
                 });
             }
         }
@@ -3899,38 +3959,356 @@ fn prepare_cursor_sync(
     })
 }
 
-fn ingest_cursor_line(
-    conn: &Connection,
-    line: &str,
-    session_id: &str,
-    project: &str,
-    timestamp_ms: i64,
-) -> Result<usize> {
-    let Some(prompt) = parse_cursor_text(line)? else {
-        return Ok(0);
-    };
-    insert_cursor_prompt(conn, prompt, session_id, project, timestamp_ms)
+/// What one pass over a Cursor transcript established.
+///
+/// `used_mtime_fallback` is the honest part: Cursor records carry no timestamp
+/// field, so every event whose turn had no readable `<timestamp>` tag is
+/// stamped with the file mtime, and the caller reports that as a
+/// `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic rather than letting a
+/// filesystem-derived time pass for a provider-recorded one.
+#[derive(Debug, Default)]
+pub(crate) struct CursorTranscriptOutcome {
+    pub prompts_inserted: usize,
+    pub records: i64,
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    pub last_assistant_text: Option<String>,
+    pub models: Vec<String>,
+    pub used_mtime_fallback: bool,
+    pub subagent_calls: usize,
 }
 
-fn insert_cursor_prompt(
+/// Index one Cursor agent transcript into every evidence table.
+///
+/// Mirrors [`ingest_claude_transcript_as`]: `session_events` for text,
+/// thinking, tool use and tool results; `tool_calls` for every call Cursor
+/// names; `file_edits` for the calls that write a file; `history` for the
+/// human turns.
+///
+/// Two things are structurally different from Claude and drive the design:
+///
+/// * Cursor writes **no record identity** — no uuid, and its `tool_use` blocks
+///   carry no `id`. Event and tool identity therefore come from the record's
+///   byte offset in the file, which is stable across an incremental read, a
+///   whole-file re-parse and a re-hydration, and resets exactly when Cursor
+///   rewrites the file.
+/// * Cursor writes **no timestamp field**. The only time signal is the
+///   `<timestamp>` tag its client injects into a user turn; the assistant
+///   records that answer that turn inherit it, because they belong to it. A
+///   record with no turn time at all takes the file mtime and sets
+///   `used_mtime_fallback`.
+///
+/// `model` and `usage` are read from `message.model` / `message.usage` when a
+/// build writes them. No observed Cursor build does; the parser does not
+/// invent them, and the capability matrix says so.
+/// `history_from_offset` is the one place the whole-file re-parse is *not*
+/// idempotent. A prompt's `history` identity is `(source, timestamp_ms,
+/// prompt)`, so a turn that carries a real `<timestamp>` re-inserts harmlessly
+/// — but a turn with no readable time is stamped with the file mtime, which
+/// moves every time Cursor appends to the transcript, and re-inserting it would
+/// leave one copy per sync. Callers that resume mid-file therefore pass the
+/// offset they had already committed, and only records at or after it become
+/// history. Callers that rebuild the session's history first pass `0`.
+pub(crate) fn ingest_cursor_transcript(
     conn: &Connection,
-    prompt: String,
+    path: &Path,
     session_id: &str,
-    project: &str,
-    timestamp_ms: i64,
-) -> Result<usize> {
-    insert_history(
-        conn,
-        &HistoryEntry {
-            id: 0,
-            source: "cursor".into(),
-            session_id: Some(session_id.to_string()),
-            project: Some(project.to_string()),
-            prompt_hash: Some(prompt_hash(&prompt)),
-            prompt,
-            timestamp_ms,
-        },
-    )
+    project: Option<&str>,
+    mtime_ms: i64,
+    history_from_offset: u64,
+) -> Result<CursorTranscriptOutcome> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut outcome = CursorTranscriptOutcome::default();
+    let mut offset: u64 = 0;
+    // The last turn time seen while walking forward, inherited by the records
+    // that answer that turn.
+    let mut turn_ts: Option<i64> = None;
+    for line in text.split_inclusive('\n') {
+        let record_offset = offset;
+        offset += line.len() as u64;
+        let line = line.trim_end_matches(['\n', '\r']);
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let Some(role) = cursor::record_role(obj) else {
+            continue;
+        };
+        let blocks = cursor::record_blocks(obj);
+        if blocks.is_empty() {
+            continue;
+        }
+        outcome.records += 1;
+        let message = obj.get("message").and_then(Value::as_object);
+        let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
+        if let Some(model) = model.filter(|model| !model.is_empty()) {
+            if !outcome.models.iter().any(|seen| seen == model) {
+                outcome.models.push(model.to_string());
+            }
+        }
+        let token_json = message
+            .and_then(|m| m.get("usage"))
+            .filter(|usage| !usage.is_null())
+            .and_then(|usage| serde_json::to_string(usage).ok());
+        // A build that does write a record timestamp is believed over the
+        // injected tag; none observed so far does.
+        let record_ts = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+            .or_else(|| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .find_map(cursor::timestamp_from_text)
+            });
+        if let Some(ts) = record_ts {
+            turn_ts = Some(ts);
+        }
+        let ts_ms = match turn_ts {
+            Some(ts) => ts,
+            None => {
+                outcome.used_mtime_fallback = true;
+                mtime_ms
+            }
+        };
+        let message_id = message
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("cursor:{record_offset}"));
+        if record_ts.is_some() {
+            outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+            outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
+        }
+        for (block_index, block) in blocks.iter().enumerate() {
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            let event_uid = format!("{record_offset}:{block_index}");
+            match block_type {
+                "text" => {
+                    let Some(raw) = block.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let is_user = role == "user";
+                    let text = if is_user {
+                        cursor::unwrap_user_text(raw)
+                    } else {
+                        raw.trim().to_string()
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if is_user {
+                        if record_offset >= history_from_offset {
+                            outcome.prompts_inserted += insert_history(
+                                conn,
+                                &HistoryEntry {
+                                    id: 0,
+                                    source: "cursor".into(),
+                                    session_id: Some(session_id.to_string()),
+                                    project: project.map(str::to_string),
+                                    prompt_hash: Some(prompt_hash(&text)),
+                                    prompt: text.clone(),
+                                    timestamp_ms: ts_ms,
+                                },
+                            )?;
+                        }
+                    } else {
+                        outcome.last_assistant_text = Some(text.clone());
+                    }
+                    insert_session_event(
+                        conn,
+                        "cursor",
+                        session_id,
+                        project,
+                        project,
+                        None,
+                        &message_id,
+                        None,
+                        ts_ms,
+                        if is_user { "user" } else { "assistant" },
+                        "text",
+                        Some(&text),
+                        model,
+                        token_json.as_deref(),
+                        &event_uid,
+                    )?;
+                }
+                "thinking" | "reasoning" => {
+                    let thinking = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty());
+                    if let Some(thinking) = thinking {
+                        insert_session_event(
+                            conn,
+                            "cursor",
+                            session_id,
+                            project,
+                            project,
+                            None,
+                            &message_id,
+                            None,
+                            ts_ms,
+                            "assistant",
+                            "thinking",
+                            Some(thinking),
+                            model,
+                            token_json.as_deref(),
+                            &event_uid,
+                        )?;
+                    }
+                }
+                "tool_use" | "tool_call" => {
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let args = block
+                        .get("input")
+                        .or_else(|| block.get("args"))
+                        .unwrap_or(&Value::Null);
+                    let target = cursor::pick_tool_target(&name, args);
+                    // Cursor writes no `id` on a tool_use block, so the call is
+                    // addressed by where it sits in the file. A build that does
+                    // write one is preferred, because it also links a
+                    // tool_result.
+                    let tool_use_id = block
+                        .get("id")
+                        .or_else(|| block.get("tool_use_id"))
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("cursor:{record_offset}:{block_index}"));
+                    if cursor::is_subagent_tool(&name) {
+                        outcome.subagent_calls += 1;
+                    }
+                    insert_session_event(
+                        conn,
+                        "cursor",
+                        session_id,
+                        project,
+                        project,
+                        None,
+                        &message_id,
+                        None,
+                        ts_ms,
+                        "assistant",
+                        "tool_use",
+                        Some(&format_tool_event_text(&name, target.as_deref(), args)),
+                        model,
+                        token_json.as_deref(),
+                        &event_uid,
+                    )?;
+                    insert_tool_call(
+                        conn,
+                        "cursor",
+                        session_id,
+                        &message_id,
+                        &tool_use_id,
+                        &name,
+                        target.as_deref(),
+                        &serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
+                        None,
+                        ts_ms,
+                    )?;
+                    if cursor::is_file_edit_tool(&name) {
+                        if let Some(file_path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                "cursor",
+                                session_id,
+                                &message_id,
+                                &tool_use_id,
+                                file_path,
+                                &name,
+                                ts_ms,
+                                None,
+                                project,
+                            )?;
+                            // An edit tool that carried a diff gets its line
+                            // counts from the same counter Claude edits use.
+                            if let Some(patch) = cursor::patch_text(args) {
+                                update_file_edit_from_tool_result(
+                                    conn,
+                                    "cursor",
+                                    session_id,
+                                    &message_id,
+                                    &tool_use_id,
+                                    &json!({ "structuredPatch": patch }),
+                                    ts_ms,
+                                    None,
+                                    project,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                "tool_result" => {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .or_else(|| block.get("toolUseId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let content = block.get("content").unwrap_or(&Value::Null);
+                    insert_session_event(
+                        conn,
+                        "cursor",
+                        session_id,
+                        project,
+                        project,
+                        None,
+                        &message_id,
+                        None,
+                        ts_ms,
+                        "tool_result",
+                        "tool_result",
+                        materialize_tool_result_text(content).as_deref(),
+                        model,
+                        token_json.as_deref(),
+                        &event_uid,
+                    )?;
+                    if !tool_use_id.is_empty() {
+                        if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                            set_tool_call_error(
+                                conn,
+                                "cursor",
+                                session_id,
+                                &tool_use_id,
+                                is_error,
+                            )?;
+                        }
+                        if let Some(result) = find_tool_use_result(block) {
+                            update_file_edit_from_tool_result(
+                                conn,
+                                "cursor",
+                                session_id,
+                                &message_id,
+                                &tool_use_id,
+                                result,
+                                ts_ms,
+                                None,
+                                project,
+                            )?;
+                        }
+                    }
+                }
+                // `turn_ended` closes a turn; it is a marker, not an event, and
+                // there is no `session_events.kind` that it honestly is.
+                _ => {}
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 pub(crate) fn sorted_dirs(root: &Path) -> Result<Vec<PathBuf>> {
@@ -4871,7 +5249,7 @@ mod tests {
         let mut newest = Map::new();
         newest.insert("claude".into(), test_file_cursor(25, 10, 200));
         newest.insert(
-            "cursor".into(),
+            super::CURSOR_SYNC_STATE_KEY.into(),
             json!({transcript: test_file_cursor(30, 10, 200)}),
         );
         checkpoint_sync_state(&path, &newest);
@@ -4880,7 +5258,7 @@ mod tests {
         let mut stale_generation = Map::new();
         stale_generation.insert("claude".into(), test_file_cursor(900, 9, 100));
         stale_generation.insert(
-            "cursor".into(),
+            super::CURSOR_SYNC_STATE_KEY.into(),
             json!({transcript: test_file_cursor(800, 9, 100)}),
         );
         checkpoint_sync_state(&path, &stale_generation);
@@ -4893,14 +5271,17 @@ mod tests {
         later_open.generation.observed_at_ns += 10;
         slow_same_generation.insert("claude".into(), later_open.to_value());
         slow_same_generation.insert(
-            "cursor".into(),
+            super::CURSOR_SYNC_STATE_KEY.into(),
             json!({transcript: test_file_cursor(14, 10, 200)}),
         );
         checkpoint_sync_state(&path, &slow_same_generation);
 
         let saved = load_sync_state(&path).unwrap();
         assert_eq!(saved_cursor_offset(&saved["claude"]), 25);
-        assert_eq!(saved_cursor_offset(&saved["cursor"][transcript]), 30);
+        assert_eq!(
+            saved_cursor_offset(&saved[super::CURSOR_SYNC_STATE_KEY][transcript]),
+            30
+        );
     }
 
     #[test]
@@ -5699,7 +6080,9 @@ mod tests {
         );
         for path in [&first, &second] {
             assert_eq!(
-                saved_cursor_offset(&state["cursor"][path.to_string_lossy().as_ref()]),
+                saved_cursor_offset(
+                    &state[super::CURSOR_SYNC_STATE_KEY][path.to_string_lossy().as_ref()]
+                ),
                 fs::metadata(path).unwrap().len()
             );
         }
@@ -5788,13 +6171,15 @@ mod tests {
         // The surviving file advances; the vanished file keeps whatever checkpoint it
         // had, so the next sync retries it from the same offset.
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][first.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][first.to_string_lossy().as_ref()]
+            ),
             fs::metadata(&first).unwrap().len(),
             "the readable transcript's checkpoint must advance"
         );
         assert_eq!(
-            state["cursor"].get(second.to_string_lossy().as_ref()),
-            saved["cursor"].get(second.to_string_lossy().as_ref()),
+            state[super::CURSOR_SYNC_STATE_KEY].get(second.to_string_lossy().as_ref()),
+            saved[super::CURSOR_SYNC_STATE_KEY].get(second.to_string_lossy().as_ref()),
             "the vanished transcript's checkpoint must be left untouched"
         );
     }
@@ -5814,7 +6199,9 @@ mod tests {
             1
         );
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][cursor.to_string_lossy().as_ref()]
+            ),
             seed.len() as u64
         );
         let saved = state.clone();
@@ -5877,7 +6264,9 @@ mod tests {
             4
         );
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][cursor.to_string_lossy().as_ref()]
+            ),
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
@@ -5983,7 +6372,9 @@ mod tests {
         );
         for path in [&first, &second] {
             assert_eq!(
-                saved_cursor_offset(&state["cursor"][path.to_string_lossy().as_ref()]),
+                saved_cursor_offset(
+                    &state[super::CURSOR_SYNC_STATE_KEY][path.to_string_lossy().as_ref()]
+                ),
                 fs::metadata(path).unwrap().len()
             );
         }
@@ -6008,6 +6399,315 @@ mod tests {
                 ("second appended".into(), 1),
                 ("second before failure".into(), 1),
             ]
+        );
+    }
+
+    fn cursor_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cursor")
+            .join(name)
+    }
+
+    /// Stage a fixture where a Cursor install would put it, so the project
+    /// decoding and the session id both come from the real path layout.
+    fn stage_cursor_fixture(root: &Path, fixture: &str, session_id: &str) -> PathBuf {
+        let transcript = root
+            .join(".cursor/projects/home-dev-demo/agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::copy(cursor_fixture(fixture), &transcript).unwrap();
+        transcript
+    }
+
+    fn event_kinds(conn: &Connection, session_id: &str) -> Vec<(String, String)> {
+        crate::session_events(conn, session_id, Some("cursor"))
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.role, event.kind))
+            .collect()
+    }
+
+    #[test]
+    fn an_observed_cursor_transcript_yields_events_tool_calls_and_file_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-observed");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &path,
+            "s-observed",
+            Some("/home/dev/demo"),
+            7_000_000_000_000,
+            0,
+        )
+        .unwrap();
+
+        // Both human turns land in history with the time the client injected,
+        // never the file mtime.
+        assert_eq!(outcome.prompts_inserted, 2);
+        assert!(!outcome.used_mtime_fallback);
+        assert_eq!(outcome.first_ts_ms, Some(1_789_587_420_000));
+        assert_eq!(outcome.last_ts_ms, Some(1_789_587_660_000));
+        assert_eq!(
+            outcome.last_assistant_text.as_deref(),
+            Some("Fixed the failing assertion.")
+        );
+        // Cursor 3.13.25 writes no model, so none is claimed.
+        assert!(outcome.models.is_empty());
+
+        let kinds = event_kinds(&conn, "s-observed");
+        assert!(kinds.contains(&("user".into(), "text".into())));
+        assert!(kinds.contains(&("assistant".into(), "text".into())));
+        assert!(kinds.contains(&("assistant".into(), "tool_use".into())));
+        // The observed shape carries no tool_result and no thinking; the
+        // parser must not manufacture either.
+        assert!(!kinds.iter().any(|(_, kind)| kind == "tool_result"));
+        assert!(!kinds.iter().any(|(_, kind)| kind == "thinking"));
+
+        let events = crate::session_events(&conn, "s-observed", Some("cursor")).unwrap();
+        let stamps: HashSet<i64> = events.iter().map(|event| event.ts_ms).collect();
+        assert!(
+            stamps.len() > 1,
+            "per-turn timestamps must differ across records: {stamps:?}"
+        );
+        assert!(
+            !stamps.contains(&7_000_000_000_000),
+            "no record with a readable turn time may take the file mtime"
+        );
+        // A human turn is stored as what the person typed, not as the markup
+        // the client wrapped around it.
+        assert!(events.iter().any(|event| event.role == "user"
+            && event.text.as_deref() == Some("add a changelog entry for the cursor adapter")));
+
+        let calls = crate::session_tool_calls(&conn, "s-observed", Some("cursor")).unwrap();
+        let named: Vec<&str> = calls.iter().map(|call| call.name.as_str()).collect();
+        assert_eq!(named, vec!["Read", "ApplyPatch", "Shell", "StrReplace"]);
+        // Cursor writes no tool_use id, so identity comes from the record's
+        // byte offset and every call still gets its own row.
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.tool_use_id.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .find(|call| call.name == "Shell")
+                .and_then(|call| call.target.clone()),
+            Some("cargo test -p ai-hist".into())
+        );
+
+        let edits = crate::session_file_edits(&conn, "s-observed", Some("cursor")).unwrap();
+        let touched: Vec<&str> = edits.iter().map(|edit| edit.file_path.as_str()).collect();
+        assert_eq!(touched, vec!["CHANGELOG.md", "src/lib.rs"]);
+        // ApplyPatch carries the diff, so its line counts are real.
+        let patched = edits
+            .iter()
+            .find(|edit| edit.file_path == "CHANGELOG.md")
+            .unwrap();
+        assert_eq!(
+            (patched.lines_added, patched.lines_removed),
+            (Some(2), Some(0))
+        );
+        assert!(patched.structured_patch_json.is_some());
+        // StrReplace carries no diff; counts stay at zero rather than guessed.
+        let replaced = edits
+            .iter()
+            .find(|edit| edit.file_path == "src/lib.rs")
+            .unwrap();
+        assert_eq!((replaced.lines_added, replaced.lines_removed), (None, None));
+        assert!(replaced.structured_patch_json.is_none());
+    }
+
+    #[test]
+    fn a_cursor_build_that_writes_model_usage_and_tool_results_has_them_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_cursor_fixture(dir.path(), "extended-unverified.jsonl", "s-extended");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &path,
+            "s-extended",
+            Some("/home/dev/demo"),
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(outcome.models, vec!["claude-4.5-sonnet".to_string()]);
+        assert_eq!(outcome.subagent_calls, 1);
+
+        let events = crate::session_events(&conn, "s-extended", Some("cursor")).unwrap();
+        let kinds: HashSet<&str> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            HashSet::from(["text", "thinking", "tool_use", "tool_result"])
+        );
+        let assistant = events
+            .iter()
+            .find(|event| event.kind == "thinking")
+            .expect("thinking event");
+        assert_eq!(assistant.model.as_deref(), Some("claude-4.5-sonnet"));
+        assert_eq!(
+            assistant.token_json.as_deref(),
+            Some(r#"{"input_tokens":812,"output_tokens":77}"#)
+        );
+
+        // A build that writes tool ids links the result back to the call.
+        let calls = crate::session_tool_calls(&conn, "s-extended", Some("cursor")).unwrap();
+        assert!(calls.iter().any(|call| call.tool_use_id == "toolu_ext_1"));
+        assert_eq!(
+            calls
+                .iter()
+                .find(|call| call.tool_use_id == "toolu_ext_1")
+                .and_then(|call| call.is_error),
+            Some(0)
+        );
+        let edits = crate::session_file_edits(&conn, "s-extended", Some("cursor")).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].file_path, "src/helper.rs");
+        assert_eq!(
+            (edits[0].lines_added, edits[0].lines_removed),
+            (Some(1), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_cursor_record_with_no_readable_turn_time_takes_the_mtime_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_cursor_fixture(dir.path(), "legacy-string-content.jsonl", "s-legacy");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &path,
+            "s-legacy",
+            Some("/home/dev/demo"),
+            4_242,
+            0,
+        )
+        .unwrap();
+        assert!(outcome.used_mtime_fallback);
+        assert_eq!(outcome.first_ts_ms, None);
+        let events = crate::session_events(&conn, "s-legacy", Some("cursor")).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.ts_ms == 4_242));
+    }
+
+    #[test]
+    fn re_reading_a_cursor_transcript_upserts_in_place_instead_of_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-repeat");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for _ in 0..2 {
+            super::ingest_cursor_transcript(&conn, &path, "s-repeat", Some("/home/dev/demo"), 1, 0)
+                .unwrap();
+        }
+        let counts = |table: &str| {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE source = 'cursor'"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(counts("history"), 2);
+        assert_eq!(counts("session_events"), 9);
+        assert_eq!(counts("tool_calls"), 4);
+        assert_eq!(counts("file_edits"), 2);
+    }
+
+    #[test]
+    fn plain_sync_indexes_cursor_events_and_re_reads_after_the_state_key_retires() {
+        let dir = tempfile::tempdir().unwrap();
+        stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-sync");
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 2);
+        assert!(state.contains_key(super::CURSOR_SYNC_STATE_KEY));
+        let events = crate::session_events(&conn, "s-sync", Some("cursor")).unwrap();
+        assert!(
+            events.iter().any(|event| event.kind == "tool_use"),
+            "plain sync must index tool use, not just prompts"
+        );
+        assert_eq!(
+            crate::session_file_edits(&conn, "s-sync", Some("cursor"))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // An unchanged transcript is skipped while the key matches.
+        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 0);
+
+        // A store written by the prompt-only parser carries the retired key and
+        // no events. Retiring it is what makes plain `sync` re-read the file.
+        let mut legacy = Map::new();
+        legacy.insert("cursor".into(), state[super::CURSOR_SYNC_STATE_KEY].clone());
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert_eq!(super::sync_cursor(&fresh, &mut legacy, &root).unwrap(), 2);
+        assert!(crate::session_events(&fresh, "s-sync", Some("cursor"))
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_use"));
+    }
+
+    #[test]
+    fn a_restarted_cursor_transcript_rebuilds_prompts_stamped_by_the_old_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-restamp");
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the prompt-only parser left behind: the right text at the file
+        // mtime instead of the turn time.
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "cursor".into(),
+                session_id: Some("s-restamp".into()),
+                project: Some("/home/dev/demo".into()),
+                prompt: "add a changelog entry for the cursor adapter".into(),
+                prompt_hash: None,
+                timestamp_ms: 7_000_000_000_000,
+            },
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, timestamp_ms FROM history WHERE source = 'cursor' ORDER BY timestamp_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "add a changelog entry for the cursor adapter".to_string(),
+                    1_789_587_420_000
+                ),
+                ("now run the tests".to_string(), 1_789_587_660_000),
+            ],
+            "the mtime-stamped row must be replaced, not kept alongside the real one"
         );
     }
 
@@ -6039,7 +6739,9 @@ mod tests {
             2
         );
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][cursor.to_string_lossy().as_ref()]
+            ),
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
@@ -6059,7 +6761,9 @@ mod tests {
             1
         );
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][cursor.to_string_lossy().as_ref()]
+            ),
             fs::metadata(&cursor).unwrap().len()
         );
         assert_eq!(
@@ -6104,7 +6808,9 @@ mod tests {
             0
         );
         assert_eq!(
-            saved_cursor_offset(&state["cursor"][cursor.to_string_lossy().as_ref()]),
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][cursor.to_string_lossy().as_ref()]
+            ),
             0
         );
         let mut file = fs::OpenOptions::new().append(true).open(&cursor).unwrap();
