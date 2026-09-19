@@ -324,6 +324,8 @@ fn the_two_layouts_normalize_to_identical_evidence() {
     let json_raw = raw_path(&json_db, "ses_sqlite_root");
     assert!(sqlite_raw.ends_with("opencode.db"), "{sqlite_raw}");
     assert!(json_raw.ends_with("ses_sqlite_root.json"), "{json_raw}");
+
+    fs::remove_dir_all(&root).ok();
 }
 
 fn raw_path(db_path: &Path, session_id: &str) -> String {
@@ -383,6 +385,8 @@ fn a_parent_id_links_a_child_session_and_the_tree_returns_it() {
             .map(|node| (&node.session_id, node.depth))
             .collect::<Vec<_>>()
     );
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// Acceptance: "`with-tool` fixture: `tool_calls` rows with `is_error` set from
@@ -513,6 +517,8 @@ fn a_tool_turn_records_errors_tokens_provider_and_stop_reason() {
         .expect("a terminal tool part must produce a tool_result event");
     assert_eq!(result.role, "tool_result");
     assert_eq!(result.text.as_deref(), Some("file listing"));
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// Acceptance: "`with-compaction`: one `compaction_boundary` marker."
@@ -559,6 +565,8 @@ fn a_compaction_part_records_one_boundary_marker() {
         1,
         "marker writes are idempotent"
     );
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// Acceptance: "`sync --local` on a 50 MB `opencode.db` fixture completes
@@ -632,6 +640,9 @@ fn a_large_store_is_synced_without_copying_it() {
             .is_empty(),
         "a bounded sync still has to produce the session's events"
     );
+
+    // 55 MB of ballast has no business outliving the test.
+    fs::remove_dir_all(&root).ok();
 }
 
 /// An install indexed by an earlier release has `history` rows for its OpenCode
@@ -725,4 +736,6 @@ fn an_install_indexed_as_prompts_only_gains_events_on_the_next_plain_sync() {
         "targeted hydration must report the events it indexed, got {:?}",
         hydrated.evidence
     );
+
+    fs::remove_dir_all(&root).ok();
 }

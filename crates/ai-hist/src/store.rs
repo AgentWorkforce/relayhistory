@@ -2418,6 +2418,68 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A database written by a release before OpenCode carried event-level
+    /// evidence: `session_events` without `provider`/`stop_reason`, and no
+    /// `session_markers` at all. The migration has to be additive — the rows
+    /// already there survive it — and the read-only guard has to refuse the
+    /// database until it has run, or a search would meet `no such column`.
+    #[test]
+    fn a_database_from_before_opencode_event_evidence_migrates_additively() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-hist-opencode-migration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE session_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     project TEXT, cwd TEXT, git_branch TEXT,
+                     message_id TEXT, parent_id TEXT,
+                     ts_ms INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     text TEXT, model TEXT, token_json TEXT,
+                     event_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, event_uid)
+                 );
+                 INSERT INTO session_events
+                     (source, session_id, ts_ms, role, kind, text, event_uid)
+                 VALUES ('opencode', 'ses_old', 1, 'user', 'text', 'kept', 'uid-1');",
+            )
+            .unwrap();
+            assert!(
+                !schema_is_current(&old).unwrap(),
+                "an unmigrated database must not be served read-only"
+            );
+        }
+
+        // Opening writably migrates.
+        let migrated = open_db(&path).unwrap();
+        assert!(schema_is_current(&migrated).unwrap());
+        let (text, provider, stop_reason): (String, Option<String>, Option<String>) = migrated
+            .query_row(
+                "SELECT text, provider, stop_reason FROM session_events WHERE event_uid = 'uid-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "kept", "the existing row survives the migration");
+        assert_eq!(provider, None, "a backfilled column starts null");
+        assert_eq!(stop_reason, None);
+        assert!(session_markers(&migrated, "ses_old", None)
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn session_relationships_v1_database_migrates_to_v2() {
         let dir = tempfile::tempdir().unwrap();
