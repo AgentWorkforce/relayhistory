@@ -344,7 +344,7 @@ fn lease_renewal_prevents_overlap_and_stale_failure_cannot_change_progress() {
     event(&conn, "a", "first");
     let job = create_job(&conn, &config("one"), 0).unwrap();
     let claim = claim(&conn, &job.job_id, 0).unwrap();
-    let renewed = renew_lease(&conn, &claim.lease, 5000, 500).unwrap();
+    let renewed = renew_lease(&conn, &claim.lease, 5000, &|| 500).unwrap();
     assert_eq!(renewed.expires_at_ms, 5500);
     assert!(claim_batch(&conn, &job.job_id, "other", 1000, 1001)
         .unwrap()

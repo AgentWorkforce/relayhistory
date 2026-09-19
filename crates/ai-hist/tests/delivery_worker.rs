@@ -545,6 +545,123 @@ fn invalid_selections_and_bounds_are_invalid_arguments() {
     }
 }
 
+/// Prepare and claim one batch, the way the drain loop does. `create_job`
+/// alone leaves nothing to claim: a batch has to be materialized first.
+fn prepare_and_claim(conn: &Connection, job_id: &str, lease_ms: i64) -> ClaimedBatch {
+    for _ in 0..100 {
+        let now = system_clock();
+        if prepare_batch(conn, job_id, now).unwrap().batch_id.is_some() {
+            return claim_batch(conn, job_id, "worker", lease_ms, now)
+                .unwrap()
+                .expect("a prepared batch is claimable");
+        }
+    }
+    panic!("bounded fixture failed to produce a batch")
+}
+
+/// A renewal blocked past the deadline must not report a lease it does not
+/// hold.
+///
+/// `renew_lease` used to take its timestamp before asking for the write lock.
+/// Acquiring that lock can block for as long as the connection's busy policy
+/// allows, so the value it then committed was `stale_now + lease_ms` - for any
+/// wait longer than the lease, a deadline already in the past - and it
+/// returned `Ok`. The keepalive recorded a renewed lease it did not have while
+/// another worker was free to reclaim the batch mid-send: a well-formed answer
+/// computed over nothing.
+#[test]
+fn a_renewal_blocked_past_the_deadline_never_reports_a_lease_in_the_past() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let lease_ms = 100;
+    let hold = Duration::from_millis(lease_ms as u64 * 6);
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, lease_ms);
+
+    // Hold the write lock for several lease lengths, then release it on a
+    // timer. The renewal below therefore blocks, and by the time it commits, a
+    // timestamp taken before the block is long stale.
+    let path = fixture.path();
+    let holding = std::thread::spawn(move || {
+        let blocker = open_db(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::sleep(hold);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    // Let the blocker take the lock before the renewal asks for it.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let renewer = open_db(&fixture.path()).unwrap();
+    let renewed = renew_lease(&renewer, &claim.lease, lease_ms, &system_clock)
+        .expect("the lock is released well inside the busy policy");
+    let returned_at = system_clock();
+    holding.join().unwrap();
+
+    assert!(
+        renewed.expires_at_ms > returned_at,
+        "renewal returned a lease that had already expired ({} <= {returned_at}); \
+         the deadline was computed from a clock read before a {}ms block",
+        renewed.expires_at_ms,
+        hold.as_millis(),
+    );
+    assert_eq!(
+        lease_until_ms(&fixture.conn, &job.job_id),
+        Some(renewed.expires_at_ms),
+        "the stored deadline must be the one the caller was told about"
+    );
+}
+
+/// A lapsed lease that nobody took is still this worker's claim.
+///
+/// `check_lease` used to require `lease_until_ms > now`, which reads an expiry
+/// nobody acted on as "the claim is gone". Expiry is a signal to *other*
+/// workers that an abandoned batch may be stolen, and `claim_batch` enforces
+/// it; every takeover bumps the fence, so the fence alone proves ownership.
+/// Conflating the two meant a worker could not record its own outcome after
+/// its lease lapsed — which is how a panicking receiver stopped producing a
+/// `transient` failure under load.
+#[test]
+fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, 30);
+    // Past the deadline, with no second worker anywhere near it.
+    std::thread::sleep(Duration::from_millis(60));
+
+    let status = record_failure(
+        &fixture.conn,
+        &claim.lease,
+        DeliveryFailure::Transient,
+        None,
+        system_clock(),
+    )
+    .expect("an unclaimed batch is still ours to fail");
+    assert_eq!(status.failure.as_deref(), Some("transient"));
+
+    // A batch that really was taken is still refused. `claim_batch` bumps the
+    // fence, which is what the check now rests on.
+    let stolen = claim_batch(
+        &fixture.conn,
+        &job.job_id,
+        "other",
+        30,
+        system_clock() + 10_000,
+    )
+    .unwrap();
+    if stolen.is_some() {
+        assert!(
+            record_failure(
+                &fixture.conn,
+                &claim.lease,
+                DeliveryFailure::Transient,
+                None,
+                system_clock(),
+            )
+            .is_err(),
+            "a fenced lease must not be able to move another worker's state"
+        );
+    }
+}
+
 #[test]
 fn a_panicking_receiver_is_a_transient_failure_and_releases_the_keepalive() {
     let fixture = fixture();
