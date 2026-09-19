@@ -40,6 +40,10 @@ fs2 = "0.4"
 tempfile = "3"
 
 [[test]]
+name = "fixture_corpus"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "delivery_worker"
 required-features = ["delivery", "unstable-internal"]
 

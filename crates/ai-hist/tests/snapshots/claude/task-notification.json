@@ -1,0 +1,181 @@
+{
+  "corpus_files": [
+    "claude/task-notification.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/task-notification",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "please fix the build",
+      "session_id": "tn-session",
+      "source": "claude",
+      "timestamp_ms": 1779667200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "<task-notification>background task bash_1 completed</task-notification>",
+      "session_id": "tn-session",
+      "source": "claude",
+      "timestamp_ms": 1779667202000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "<task-notification>background task bash_2 completed</task-notification>",
+      "session_id": "tn-session",
+      "source": "claude",
+      "timestamp_ms": 1779667203000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "thanks, also add a changelog entry",
+      "session_id": "tn-session",
+      "source": "claude",
+      "timestamp_ms": 1779667204000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 6,
+        "file_edits": 0,
+        "prompts": 4,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "tn-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "Task tool notifications arrive as their own records",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "please fix the build",
+      "token_json": null,
+      "ts_ms": 1779667200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "running tests",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1779667201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-tn-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-tn-1",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "<task-notification>background task bash_1 completed</task-notification>",
+      "token_json": null,
+      "ts_ms": 1779667202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-tn-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-tn-2",
+      "model": null,
+      "parent_id": "u-tn-1",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "<task-notification>background task bash_2 completed</task-notification>",
+      "token_json": null,
+      "ts_ms": 1779667203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-tn-2",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "thanks, also add a changelog entry",
+      "token_json": null,
+      "ts_ms": 1779667204000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "tn-session",
+      "source": "claude",
+      "text": "done",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":12,\"output_tokens\":2}",
+      "ts_ms": 1779667205000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1779667200000,
+      "first_prompt": "please fix the build",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1779667205000,
+      "last_assistant_text": "done",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/task-notification.jsonl",
+      "repo_url": null,
+      "session_id": "tn-session",
+      "source": "claude",
+      "source_stamp": "<n>:2134",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

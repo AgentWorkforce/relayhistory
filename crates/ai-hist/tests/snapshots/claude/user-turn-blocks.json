@@ -1,0 +1,226 @@
+{
+  "corpus_files": [
+    "claude/user-turn-blocks.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/user-turn-blocks",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "please fix the build",
+      "session_id": "utb-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 8,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 3
+      },
+      "related_session_ids": [],
+      "session_id": "utb-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "user records carrying tool_result blocks of very different sizes, one of them errored",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "please fix the build",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "Bash ls",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "Read /src/app.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "a\nb\n",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "Bash npm run build",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":22,\"output_tokens\":5}",
+      "ts_ms": 1776643203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-3:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-3",
+      "model": null,
+      "parent_id": "u-asst-2",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "npm ERR! ENOENT",
+      "token_json": null,
+      "ts_ms": 1776643204000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-3:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-3",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-3",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "utb-session",
+      "source": "claude",
+      "text": "done",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":11,\"output_tokens\":2}",
+      "ts_ms": 1776643205000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "please fix the build",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643205000,
+      "last_assistant_text": "done",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/user-turn-blocks.jsonl",
+      "repo_url": null,
+      "session_id": "utb-session",
+      "source": "claude",
+      "source_stamp": "<n>:2676",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"ls\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Bash",
+      "session_id": "utb-session",
+      "source": "claude",
+      "target": "ls",
+      "tool_use_id": "tu_bash_1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"file_path\":\"/src/app.ts\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Read",
+      "session_id": "utb-session",
+      "source": "claude",
+      "target": "/src/app.ts",
+      "tool_use_id": "tu_read_1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"command\":\"npm run build\"}",
+      "is_error": 1,
+      "message_id": "u-asst-2",
+      "name": "Bash",
+      "session_id": "utb-session",
+      "source": "claude",
+      "target": "npm run build",
+      "tool_use_id": "tu_bash_2",
+      "ts_ms": 1776643203000
+    }
+  ]
+}

@@ -1,0 +1,199 @@
+{
+  "corpus_files": [
+    "claude/nested-subagent.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/nested-subagent",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "explore",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 7,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 2
+      },
+      "related_session_ids": [],
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "a subagent spawns a subagent, in one file, joined by `agentId`",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-main-user:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-main-user",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "explore",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-main-asst:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-main-asst",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-main-user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "Agent {\"description\":\"Research the codebase\",\"prompt\":\"Research\",\"subagent_type\":\"Explore\"}",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":20,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-sub1-asst:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-sub1-asst",
+      "model": "claude-haiku-4-5",
+      "parent_id": "u-sub1-user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "Agent {\"description\":\"Review\",\"prompt\":\"Review the code\",\"subagent_type\":\"code-reviewer\"}",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":30,\"output_tokens\":8}",
+      "ts_ms": 1776643203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-sub2-asst:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-sub2-asst",
+      "model": "claude-haiku-4-5",
+      "parent_id": "u-sub2-user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "looks good",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":40,\"output_tokens\":12}",
+      "ts_ms": 1776643205000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-sub1-asst2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-sub1-asst2",
+      "model": "claude-haiku-4-5",
+      "parent_id": "u-sub1-toolresult",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "done",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":50,\"output_tokens\":4}",
+      "ts_ms": 1776643207000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-main-toolresult:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-main-toolresult",
+      "model": null,
+      "parent_id": "u-main-asst",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "done",
+      "token_json": null,
+      "ts_ms": 1776643208000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-main-asst2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-main-asst2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-main-toolresult",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "text": "all set",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":25,\"output_tokens\":3}",
+      "ts_ms": 1776643209000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "explore",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643209000,
+      "last_assistant_text": "all set",
+      "models_json": "[\"claude-sonnet-4-6\",\"claude-haiku-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/nested-subagent.jsonl",
+      "repo_url": null,
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "source_stamp": "<n>:3927",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"description\":\"Research the codebase\",\"prompt\":\"Research\",\"subagent_type\":\"Explore\"}",
+      "is_error": null,
+      "message_id": "u-main-asst",
+      "name": "Agent",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "toolu_outer",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"description\":\"Review\",\"prompt\":\"Review the code\",\"subagent_type\":\"code-reviewer\"}",
+      "is_error": null,
+      "message_id": "u-sub1-asst",
+      "name": "Agent",
+      "session_id": "55555555-5555-5555-5555-555555555555",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "toolu_inner",
+      "ts_ms": 1776643203000
+    }
+  ]
+}

@@ -1,0 +1,151 @@
+{
+  "corpus_files": [
+    "claude/multi-block-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/multi-block-turn",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "check the repo",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 4,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 2
+      },
+      "related_session_ids": [],
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "four assistant records share one `message.id` and one `requestId`; only the first carries the usage payload",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "check the repo",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1b:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1b",
+      "model": "claude-opus-4-7",
+      "parent_id": "u-asst-1a",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Let me check.",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":4773,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":4773,\"cache_read_input_tokens\":11496,\"input_tokens\":3,\"output_tokens\":43,\"service_tier\":\"standard\"}",
+      "ts_ms": 1776643201500
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1c:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1c",
+      "model": "claude-opus-4-7",
+      "parent_id": "u-asst-1b",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Bash ls -la /tmp/project",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":4773,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":4773,\"cache_read_input_tokens\":11496,\"input_tokens\":3,\"output_tokens\":43,\"service_tier\":\"standard\"}",
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1d:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1d",
+      "model": "claude-opus-4-7",
+      "parent_id": "u-asst-1c",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Agent {\"description\":\"Research task\",\"prompt\":\"do something\",\"subagent_type\":\"general-purpose\"}",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":4773,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":4773,\"cache_read_input_tokens\":11496,\"input_tokens\":3,\"output_tokens\":43,\"service_tier\":\"standard\"}",
+      "ts_ms": 1776643202500
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "check the repo",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643202500,
+      "last_assistant_text": "Let me check.",
+      "models_json": "[\"claude-opus-4-7\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/multi-block-turn.jsonl",
+      "repo_url": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "source_stamp": "<n>:2992",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"ls -la /tmp/project\"}",
+      "is_error": null,
+      "message_id": "u-asst-1c",
+      "name": "Bash",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "target": "ls -la /tmp/project",
+      "tool_use_id": "toolu_bash_1",
+      "ts_ms": 1776643202000
+    },
+    {
+      "args_json": "{\"description\":\"Research task\",\"prompt\":\"do something\",\"subagent_type\":\"general-purpose\"}",
+      "is_error": null,
+      "message_id": "u-asst-1d",
+      "name": "Agent",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "toolu_agent_1",
+      "ts_ms": 1776643202500
+    }
+  ]
+}

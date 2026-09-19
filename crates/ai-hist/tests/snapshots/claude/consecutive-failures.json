@@ -1,0 +1,210 @@
+{
+  "corpus_files": [
+    "claude/consecutive-failures.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/consecutive-failures",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "look around",
+      "session_id": "fail-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 7,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 3
+      },
+      "related_session_ids": [],
+      "session_id": "fail-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "three different tools fail back to back, each with its own errored tool_result",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "look around",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "Bash ls /no/such/dir",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":100},\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":0,\"input_tokens\":5,\"output_tokens\":3}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "No such file",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "Read /tmp/no/such/file.txt",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":50},\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":100,\"input_tokens\":5,\"output_tokens\":3}",
+      "ts_ms": 1776643203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-3:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-3",
+      "model": null,
+      "parent_id": "u-asst-2",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "file not found",
+      "token_json": null,
+      "ts_ms": 1776643204000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-3:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-3",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-3",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "Grep broken[",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":50},\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":150,\"input_tokens\":5,\"output_tokens\":3}",
+      "ts_ms": 1776643205000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-4:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-4",
+      "model": null,
+      "parent_id": "u-asst-3",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "fail-session",
+      "source": "claude",
+      "text": "regex parse error",
+      "token_json": null,
+      "ts_ms": 1776643206000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "look around",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643206000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/consecutive-failures.jsonl",
+      "repo_url": null,
+      "session_id": "fail-session",
+      "source": "claude",
+      "source_stamp": "<n>:2822",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"ls /no/such/dir\"}",
+      "is_error": 1,
+      "message_id": "u-asst-1",
+      "name": "Bash",
+      "session_id": "fail-session",
+      "source": "claude",
+      "target": "ls /no/such/dir",
+      "tool_use_id": "tu_bash",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"file_path\":\"/tmp/no/such/file.txt\"}",
+      "is_error": 1,
+      "message_id": "u-asst-2",
+      "name": "Read",
+      "session_id": "fail-session",
+      "source": "claude",
+      "target": "/tmp/no/such/file.txt",
+      "tool_use_id": "tu_read",
+      "ts_ms": 1776643203000
+    },
+    {
+      "args_json": "{\"path\":\"/tmp\",\"pattern\":\"broken[\"}",
+      "is_error": 1,
+      "message_id": "u-asst-3",
+      "name": "Grep",
+      "session_id": "fail-session",
+      "source": "claude",
+      "target": "broken[",
+      "tool_use_id": "tu_grep",
+      "ts_ms": 1776643205000
+    }
+  ]
+}

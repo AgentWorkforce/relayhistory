@@ -1,0 +1,189 @@
+{
+  "corpus_files": [
+    "claude/parent-chain-out-of-order.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/src/auth.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-bug",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "toolu_edit_bug",
+      "ts_ms": 1777593602000,
+      "user_modified": null
+    },
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/src/billing.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-feature",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "toolu_edit_feature",
+      "ts_ms": 1777593603000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "claude/parent-chain-out-of-order",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "fix the bug in auth.ts",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "timestamp_ms": 1777593600000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "add a new feature to billing.ts",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "timestamp_ms": 1777593600500
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 4,
+        "file_edits": 2,
+        "prompts": 2,
+        "related_sessions": 0,
+        "tool_calls": 2
+      },
+      "related_session_ids": [],
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "records arrive out of `parentUuid` order, so turn grouping cannot rely on file order",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-bug:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-bug",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "fix the bug in auth.ts",
+      "token_json": null,
+      "ts_ms": 1777593600000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-feature:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-feature",
+      "model": null,
+      "parent_id": "u-user-bug",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "add a new feature to billing.ts",
+      "token_json": null,
+      "ts_ms": 1777593600500
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-bug:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-bug",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-bug",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "Edit /tmp/project/src/auth.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1777593602000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-feature:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-feature",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-feature",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "Edit /tmp/project/src/billing.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1777593603000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1777593600000,
+      "first_prompt": "fix the bug in auth.ts",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1777593603000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/parent-chain-out-of-order.jsonl",
+      "repo_url": null,
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "source_stamp": "<n>:2048",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"file_path\":\"/tmp/project/src/auth.ts\",\"new_string\":\"const x = 2\",\"old_string\":\"const x = 1\"}",
+      "is_error": null,
+      "message_id": "u-asst-bug",
+      "name": "Edit",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "target": "/tmp/project/src/auth.ts",
+      "tool_use_id": "toolu_edit_bug",
+      "ts_ms": 1777593602000
+    },
+    {
+      "args_json": "{\"file_path\":\"/tmp/project/src/billing.ts\",\"new_string\":\"const y = 2\",\"old_string\":\"const y = 1\"}",
+      "is_error": null,
+      "message_id": "u-asst-feature",
+      "name": "Edit",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "target": "/tmp/project/src/billing.ts",
+      "tool_use_id": "toolu_edit_feature",
+      "ts_ms": 1777593603000
+    }
+  ]
+}

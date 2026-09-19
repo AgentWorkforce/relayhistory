@@ -1,0 +1,111 @@
+{
+  "corpus_files": [
+    "opencode/sqlite-store.sql"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/sqlite-store",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "review the retry change",
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "timestamp_ms": 1776643230000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "add a retry to the client",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now write the test",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "timestamp_ms": 1776643250000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 0,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "status": "hydrated"
+    },
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 0,
+        "file_edits": 0,
+        "prompts": 2,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "OpencodeSqlite",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "the current SQLite store: two sessions (one a child through `parent_id`), text/tool/step-finish parts, provider+model and token payloads on the assistant messages",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643230000,
+      "first_prompt": "review the retry change",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643240000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-haiku-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/opencode.db",
+      "repo_url": null,
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "source_stamp": "<n>:<n>",
+      "workspace_roots_json": null
+    },
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "add a retry to the client",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643260000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/opencode.db",
+      "repo_url": null,
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "source_stamp": "<n>:<n>",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "opencode",
+  "tool_calls": []
+}

@@ -1,0 +1,292 @@
+{
+  "corpus_files": [
+    "codex/user-turn-blocks.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/x.ts",
+      "git_branch": null,
+      "lines_added": 0,
+      "lines_removed": 0,
+      "message_id": "16:patch_apply_end",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "structured_patch_json": "{\"type\":\"update\"}",
+      "tool_name": "apply_patch",
+      "tool_use_id": "call_p1#/tmp/project/x.ts",
+      "ts_ms": 1776729601750,
+      "user_modified": null
+    }
+  ],
+  "fixture": "codex/user-turn-blocks",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "fix the build",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "timestamp_ms": 1776729600100
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now run tests",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "timestamp_ms": 1776729601100
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 10,
+        "file_edits": 1,
+        "prompts": 2,
+        "related_sessions": 0,
+        "tool_calls": 4
+      },
+      "related_session_ids": [],
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "user input arriving as `response_item` message blocks rather than `event_msg`",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "2:response_item_user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "2:response_item_user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "fix the build",
+      "token_json": null,
+      "ts_ms": 1776729600100
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "4:function_call",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "exec_command ls",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":100,\"output_tokens\":50,\"reasoning_output_tokens\":0,\"total_tokens\":0}",
+      "ts_ms": 1776729600400
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "6:function_call_output",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "6:function_call_output",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "a\n",
+      "token_json": null,
+      "ts_ms": 1776729600600
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "9:response_item_user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "9:response_item_user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "now run tests",
+      "token_json": null,
+      "ts_ms": 1776729601100
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "12:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "12:function_call",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "exec_command npm test",
+      "token_json": null,
+      "ts_ms": 1776729601400
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "14:function_call_output",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "14:function_call_output",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "FAIL: 1 test broke",
+      "token_json": null,
+      "ts_ms": 1776729601600
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "15:custom_tool_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "15:custom_tool_call",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "apply_patch /tmp/project/x.ts",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":55,\"output_tokens\":35,\"reasoning_output_tokens\":0,\"total_tokens\":0}",
+      "ts_ms": 1776729601700
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "17:custom_tool_call_output",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "17:custom_tool_call_output",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "patched",
+      "token_json": null,
+      "ts_ms": 1776729601800
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "22:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "22:function_call",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "exec_command echo done",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":43,\"output_tokens\":25,\"reasoning_output_tokens\":0,\"total_tokens\":0}",
+      "ts_ms": 1776729602400
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "24:function_call_output",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "24:function_call_output",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "text": "done\n",
+      "token_json": null,
+      "ts_ms": 1776729602600
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776729600000,
+      "first_prompt": "fix the build",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776729603000,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-user-turn-blocks.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "source_stamp": "<n>:4179",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": [
+    {
+      "args_json": "{\"cmd\":\"ls\"}",
+      "is_error": 0,
+      "message_id": "4:function_call",
+      "name": "exec_command",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "target": "ls",
+      "tool_use_id": "call_b1",
+      "ts_ms": 1776729600400
+    },
+    {
+      "args_json": "{\"cmd\":\"npm test\"}",
+      "is_error": 1,
+      "message_id": "12:function_call",
+      "name": "exec_command",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "target": "npm test",
+      "tool_use_id": "call_b2",
+      "ts_ms": 1776729601400
+    },
+    {
+      "args_json": "{\"input\":\"*** Begin Patch\\n*** Update File: /tmp/project/x.ts\\n@@\\n+ok\\n*** End Patch\\n\"}",
+      "is_error": 0,
+      "message_id": "15:custom_tool_call",
+      "name": "apply_patch",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "target": "/tmp/project/x.ts",
+      "tool_use_id": "call_p1",
+      "ts_ms": 1776729601700
+    },
+    {
+      "args_json": "{\"cmd\":\"echo done\"}",
+      "is_error": 0,
+      "message_id": "22:function_call",
+      "name": "exec_command",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "target": "echo done",
+      "tool_use_id": "call_b3",
+      "ts_ms": 1776729602400
+    }
+  ]
+}

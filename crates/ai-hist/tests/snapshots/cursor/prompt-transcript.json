@@ -1,0 +1,77 @@
+{
+  "corpus_files": [
+    "cursor/prompt-transcript"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "cursor/prompt-transcript",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "add a retry to the client",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now write the test",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "wrapped query",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 0,
+        "file_edits": 0,
+        "prompts": 3,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "add a retry to the client",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643200000,
+      "last_assistant_text": null,
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.cursor/projects/tmp-project/agent-transcripts/cur-00000001/cur-00000001.jsonl",
+      "repo_url": null,
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "source_stamp": "<n>:688",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "cursor",
+  "tool_calls": []
+}

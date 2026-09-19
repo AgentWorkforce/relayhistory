@@ -1,0 +1,189 @@
+{
+  "corpus_files": [
+    "claude/parent-chain-interrupt-resume.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/src/auth.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-bugfix",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "toolu_edit_bugfix",
+      "ts_ms": 1777595460000,
+      "user_modified": null
+    },
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/src/auth.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-refactor",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "toolu_edit_refactor",
+      "ts_ms": 1777597200000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "claude/parent-chain-interrupt-resume",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "refactor the auth module",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "timestamp_ms": 1777593600000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "fix the bug in auth.ts",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "timestamp_ms": 1777595400000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 4,
+        "file_edits": 2,
+        "prompts": 2,
+        "related_sessions": 0,
+        "tool_calls": 2
+      },
+      "related_session_ids": [],
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "an interrupted turn is resumed, and both halves hang off the same parent record",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-refactor:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-refactor",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "text": "refactor the auth module",
+      "token_json": null,
+      "ts_ms": 1777593600000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-bugfix:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-bugfix",
+      "model": null,
+      "parent_id": "u-user-refactor",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "text": "fix the bug in auth.ts",
+      "token_json": null,
+      "ts_ms": 1777595400000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-bugfix:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-bugfix",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-bugfix",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "text": "Edit /tmp/project/src/auth.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1777595460000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-refactor:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-refactor",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-refactor",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "text": "Edit /tmp/project/src/auth.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1777597200000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1777593600000,
+      "first_prompt": "refactor the auth module",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1777597200000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/parent-chain-interrupt-resume.jsonl",
+      "repo_url": null,
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "source_stamp": "<n>:2069",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"file_path\":\"/tmp/project/src/auth.ts\",\"new_string\":\"const x = 2\",\"old_string\":\"const x = 1\"}",
+      "is_error": null,
+      "message_id": "u-asst-bugfix",
+      "name": "Edit",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "target": "/tmp/project/src/auth.ts",
+      "tool_use_id": "toolu_edit_bugfix",
+      "ts_ms": 1777595460000
+    },
+    {
+      "args_json": "{\"file_path\":\"/tmp/project/src/auth.ts\",\"new_string\":\"function bar\",\"old_string\":\"function foo\"}",
+      "is_error": null,
+      "message_id": "u-asst-refactor",
+      "name": "Edit",
+      "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "target": "/tmp/project/src/auth.ts",
+      "tool_use_id": "toolu_edit_refactor",
+      "ts_ms": 1777597200000
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "corpus_files": [
+    "claude/summary-record.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/summary-record",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "summarize what we did",
+      "session_id": "summary-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 2,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "summary-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a `type: \"summary\"` record with a `leafUuid` between two ordinary turns",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-sum-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-sum-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "summary-session",
+      "source": "claude",
+      "text": "summarize what we did",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-sum-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-sum-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-sum-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "summary-session",
+      "source": "claude",
+      "text": "Summarized above.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":8,\"output_tokens\":4}",
+      "ts_ms": 1776643202000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "summarize what we did",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643202000,
+      "last_assistant_text": "Summarized above.",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/summary-record.jsonl",
+      "repo_url": null,
+      "session_id": "summary-session",
+      "source": "claude",
+      "source_stamp": "<n>:945",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

@@ -1,0 +1,84 @@
+{
+  "corpus_files": [
+    "codex/multi-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/multi-turn",
+  "history": [],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 1,
+        "file_edits": 0,
+        "prompts": 0,
+        "related_sessions": 0,
+        "tool_calls": 1
+      },
+      "related_session_ids": [],
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "two turns in one rollout, each with its own cumulative `total_token_usage`",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "8:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "8:function_call",
+      "model": "gpt-5.3-codex",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "text": "exec_command ls",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":2500,\"input_tokens\":5000,\"output_tokens\":500,\"reasoning_output_tokens\":50,\"total_tokens\":5500}",
+      "ts_ms": 1776650411000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776650400000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776650412500,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.4\",\"gpt-5.3-codex\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-multi-turn.jsonl",
+      "repo_url": null,
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "source_stamp": "<n>:1812",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": [
+    {
+      "args_json": "{\"cmd\":\"ls\"}",
+      "is_error": null,
+      "message_id": "8:function_call",
+      "name": "exec_command",
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "target": "ls",
+      "tool_use_id": "call_m2_1",
+      "ts_ms": 1776650411000
+    }
+  ]
+}

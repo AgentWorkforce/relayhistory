@@ -586,6 +586,31 @@ The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
 
+### Add a fixture and a snapshot
+
+A provider is not added until its log shape is in the checked-in corpus. Add at
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
+in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
+quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
+generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+
+```sh
+UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
+```
+
+`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
+the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
+documented fixture exemption for a source that has no provider log on disk
+(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
+`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
+without being described, and `no_orphaned_snapshots` stops a snapshot from
+outliving its fixture.
+
+The snapshots are the *current* extraction, gaps included — they are the
+review artifact for a parser change, not a statement of intent. Facts a
+provider's logs contain that relayhistory does not capture yet are written as
+`#[ignore = "closed by #<issue>"]` tests in the same file.
+
 ---
 
 ## Programmatic access

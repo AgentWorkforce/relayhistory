@@ -1,0 +1,96 @@
+{
+  "corpus_files": [
+    "claude/original-session.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/original-session",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "start the work",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "timestamp_ms": 1776815940000
+    }
+  ],
+  "hydration": [
+    {
+      "capability": "full",
+      "discovery_state": "full",
+      "evidence": {
+        "events": 2,
+        "file_edits": 0,
+        "prompts": 1,
+        "related_sessions": 0,
+        "tool_calls": 0
+      },
+      "related_session_ids": [],
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "the root transcript that the fork and continuation fixtures point back at",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-original-user:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-original-user",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "start the work",
+      "token_json": null,
+      "ts_ms": 1776815940000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-original-asst:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-original-asst",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-original-user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "text": "On it.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":4,\"output_tokens\":2}",
+      "ts_ms": 1776815941000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.97",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776815940000,
+      "first_prompt": "start the work",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776815941000,
+      "last_assistant_text": "On it.",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/original-session.jsonl",
+      "repo_url": null,
+      "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "source": "claude",
+      "source_stamp": "<n>:781",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}
