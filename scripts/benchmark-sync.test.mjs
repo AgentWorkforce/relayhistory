@@ -5,6 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  CALIBRATION_CLAMP,
+  calibrationFactor,
   claudeTranscript,
   codexRollout,
   createRng,
@@ -14,7 +16,7 @@ import {
   REPORT_COLUMNS,
 } from "./benchmark-sync-lib.mjs";
 import { generateStore } from "./gen-synthetic-history.mjs";
-import { PHASE_ORDER, findHarnessExecutable } from "./benchmark-sync.mjs";
+import { CALIBRATION_PHASE, PHASE_ORDER, findHarnessExecutable } from "./benchmark-sync.mjs";
 
 const thresholds = JSON.parse(
   await readFile(new URL("./benchmark-thresholds.json", import.meta.url), "utf8"),
@@ -92,8 +94,8 @@ test("generated records carry the fields the ingest parsers read", () => {
   assert.equal(codex[0].payload.id, "def");
 });
 
-function report(phases) {
-  return { phases };
+function report(phases, calibrationMs = 100) {
+  return { phases, calibrationMs };
 }
 
 const gateThresholds = {
@@ -105,6 +107,7 @@ const gateThresholds = {
   },
   profiles: {
     demo: {
+      calibrationMs: 100,
       phases: {
         cold_sync: { recordsPerSecond: 600, peakRssBytes: 10_000_000 },
         unchanged_sync: { elapsedMs: 10 },
@@ -185,13 +188,53 @@ test("a phase that produced nothing is a failure, not a silent pass", () => {
   );
 });
 
+test("a slower machine is normalized away, but a slower code path is not", () => {
+  // Everything three times slower, including the reference workload: a busy or
+  // smaller runner, not a regression.
+  const busy = report([
+    { phase: "cold_sync", recordsPerSecond: 610 / 3, peakRssBytes: 10_100_000 },
+    { phase: "unchanged_sync", elapsedMs: 11 * 3 },
+  ], 300);
+  const verdict = evaluateGate(busy, gateThresholds, "demo");
+  assert.equal(verdict.ok, true, verdict.failures.join("; "));
+  assert.equal(verdict.calibration.raw, 3);
+
+  // The same three-times-slower phases while the reference is unchanged: that
+  // is the code, and it has to stay red.
+  const regressed = report([
+    { phase: "cold_sync", recordsPerSecond: 610 / 3, peakRssBytes: 10_100_000 },
+    { phase: "unchanged_sync", elapsedMs: 11 * 3 },
+  ], 100);
+  assert.equal(evaluateGate(regressed, gateThresholds, "demo").ok, false);
+});
+
+test("the calibration factor is clamped and reports when it was", () => {
+  assert.equal(calibrationFactor(100, 100).factor, 1);
+  assert.equal(calibrationFactor(100, 100).clamped, false);
+  const wild = calibrationFactor(100_000, 100);
+  assert.equal(wild.factor, CALIBRATION_CLAMP.max);
+  assert.equal(wild.clamped, true);
+  assert.equal(calibrationFactor(1, 100).factor, CALIBRATION_CLAMP.min);
+  for (const bad of [[0, 100], [100, 0], [NaN, 100], [undefined, 100]]) {
+    assert.equal(calibrationFactor(...bad), null);
+  }
+  // A profile that stores a calibration baseline must get one back.
+  const missing = { phases: [{ phase: "cold_sync", recordsPerSecond: 610, peakRssBytes: 1 }] };
+  assert.match(
+    evaluateGate(missing, gateThresholds, "demo").failures.join("\n"),
+    /stores a calibration baseline but this run measured none/,
+  );
+});
+
 test("the committed thresholds file is usable by the gate", () => {
   assert.ok(thresholds.policy.minRecordsPerSecondFactor > 0);
   assert.ok(thresholds.policy.maxPeakRssFactor >= 1);
   const gateProfile = thresholds.profiles["ci-debug"];
   assert.ok(gateProfile, "the PR gate profile exists");
   assert.ok(gateProfile.measuredOn?.commit, "the gate baseline records where it came from");
+  assert.ok(gateProfile.calibrationMs > 0, "the gate baseline carries its reference workload");
   assert.deepEqual(Object.keys(gateProfile.phases).sort(), [...PHASE_ORDER].sort());
+  assert.ok(!PHASE_ORDER.includes(CALIBRATION_PHASE), "calibration is not a gated phase");
   const known = new Set(["recordsPerSecond", "elapsedMs", "peakRssBytes"]);
   for (const [phase, metrics] of Object.entries(gateProfile.phases)) {
     assert.ok(Object.keys(metrics).length > 0, `${phase} stores at least one metric`);
@@ -228,7 +271,7 @@ test("every report row has one cell per column header", () => {
 test("the harness the driver runs is the file this repository ships", async () => {
   const harness = new URL("../crates/ai-hist-cli/tests/sync_bench.rs", import.meta.url);
   const source = await readFile(harness, "utf8");
-  for (const phase of PHASE_ORDER) {
+  for (const phase of [...PHASE_ORDER, CALIBRATION_PHASE]) {
     assert.ok(source.includes(`"${phase}"`), `sync_bench.rs implements the ${phase} phase`);
   }
   assert.ok(fileURLToPath(harness).endsWith("sync_bench.rs"));

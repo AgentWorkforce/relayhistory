@@ -263,11 +263,40 @@ export function formatNumber(value) {
 }
 
 /**
+ * How much slower this machine is, right now, than the one the baselines were
+ * recorded on — measured by the reference workload in the harness.
+ *
+ * A throughput floor recorded on one machine says nothing on another, and a
+ * shared CI runner under load is several times slower than the same runner
+ * idle. Dividing that out is what keeps the gate about the code. The factor is
+ * clamped: a calibration that lands outside this range is evidence something is
+ * wrong with the measurement, not a licence to normalize an arbitrary amount of
+ * regression away.
+ */
+export const CALIBRATION_CLAMP = { min: 0.2, max: 8 };
+
+export function calibrationFactor(measuredMs, baselineMs) {
+  if (!Number.isFinite(measuredMs) || !Number.isFinite(baselineMs)) return null;
+  if (measuredMs <= 0 || baselineMs <= 0) return null;
+  const raw = measuredMs / baselineMs;
+  return {
+    raw,
+    factor: Math.min(CALIBRATION_CLAMP.max, Math.max(CALIBRATION_CLAMP.min, raw)),
+    clamped: raw < CALIBRATION_CLAMP.min || raw > CALIBRATION_CLAMP.max,
+  };
+}
+
+/**
  * Compare one measured report against stored thresholds.
  *
  * Every metric the profile stores a baseline for is checked, and a phase the
  * profile names but the report does not carry is a failure rather than a skip:
  * a harness that silently ran nothing must not read as a pass.
+ *
+ * Throughput and elapsed time are first scaled by the calibration factor, so
+ * what is compared is "what this phase would have cost on the machine the
+ * baseline came from". Peak RSS is not scaled: memory does not get bigger
+ * because the box is busy.
  */
 export function evaluateGate(report, thresholds, profileName) {
   const profile = thresholds?.profiles?.[profileName];
@@ -282,13 +311,31 @@ export function evaluateGate(report, thresholds, profileName) {
   const policy = thresholds.policy ?? {};
   const floors = policy.absoluteFloors ?? {};
   const factors = {
-    recordsPerSecond: { direction: "min", factor: policy.minRecordsPerSecondFactor ?? 0.5 },
+    // `scale` turns a measurement into what it would have been on the baseline
+    // machine: a busy box reports less throughput and more elapsed time.
+    recordsPerSecond: {
+      direction: "min",
+      factor: policy.minRecordsPerSecondFactor ?? 0.5,
+      scale: (value, load) => value * load,
+    },
     peakRssBytes: { direction: "max", factor: policy.maxPeakRssFactor ?? 1.5 },
-    elapsedMs: { direction: "max", factor: policy.maxElapsedMsFactor ?? 2 },
+    elapsedMs: {
+      direction: "max",
+      factor: policy.maxElapsedMsFactor ?? 2,
+      scale: (value, load) => value / load,
+    },
   };
   const measured = new Map((report.phases ?? []).map((phase) => [phase.phase, phase]));
   const checks = [];
   const failures = [];
+  const calibration = calibrationFactor(report.calibrationMs, profile.calibrationMs);
+  if (profile.calibrationMs && !calibration) {
+    failures.push(
+      "the profile stores a calibration baseline but this run measured none; "
+      + "throughput cannot be compared across machines without it",
+    );
+  }
+  const load = calibration?.factor ?? 1;
   for (const [phaseName, baselines] of Object.entries(profile.phases ?? {})) {
     const phase = measured.get(phaseName);
     if (!phase) {
@@ -313,13 +360,17 @@ export function evaluateGate(report, thresholds, profileName) {
       const bound = rule.direction === "max"
         ? Math.max(baseline * rule.factor, floors[metric] ?? 0)
         : baseline * rule.factor;
-      const ok = rule.direction === "min" ? Number(value) >= bound : Number(value) <= bound;
-      checks.push({ phase: phaseName, metric, value: Number(value), baseline, bound, ok });
+      const normalized = rule.scale ? rule.scale(Number(value), load) : Number(value);
+      const ok = rule.direction === "min" ? normalized >= bound : normalized <= bound;
+      checks.push({
+        phase: phaseName, metric, value: Number(value), normalized, baseline, bound, ok,
+      });
       if (!ok) {
         failures.push(
-          `${phaseName}.${metric} = ${formatNumber(value)} ` +
-          `(baseline ${formatNumber(baseline)}, ` +
-          `${rule.direction === "min" ? "floor" : "ceiling"} ${formatNumber(bound)})`,
+          `${phaseName}.${metric} = ${formatNumber(value)}` +
+          (rule.scale ? ` (${formatNumber(normalized)} machine-normalized)` : "") +
+          `, baseline ${formatNumber(baseline)}, ` +
+          `${rule.direction === "min" ? "floor" : "ceiling"} ${formatNumber(bound)}`,
         );
       }
     }
@@ -327,7 +378,15 @@ export function evaluateGate(report, thresholds, profileName) {
   if (checks.length === 0 && failures.length === 0) {
     failures.push(`threshold profile "${profileName}" checked nothing`);
   }
-  return { ok: failures.length === 0, profile: profileName, checks, failures };
+  return {
+    ok: failures.length === 0,
+    profile: profileName,
+    calibration: calibration
+      ? { measuredMs: report.calibrationMs, baselineMs: profile.calibrationMs, ...calibration }
+      : null,
+    checks,
+    failures,
+  };
 }
 
 /** The committed baseline table's row order and headers. */

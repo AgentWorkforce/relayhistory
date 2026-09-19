@@ -42,35 +42,36 @@
         "toolResultBytes": 1024
       },
       "measuredOn": {
-        "commit": "2a1e81a0c5c6675bd2ee9aee0760a2d27e64067d",
+        "commit": "c8fbc648a98f80d795fab0ce23ce9b0262fa3551",
         "machine": "Intel(R) Xeon(R) Processor @ 2.80GHz (4 cores), linux/x64",
         "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
         "cargoProfile": "debug",
-        "at": "2026-09-19T18:08:29.664Z"
+        "at": "2026-09-19T19:27:46.922Z"
       },
       "phases": {
         "cold_sync": {
-          "recordsPerSecond": 640,
-          "peakRssBytes": 12738560
+          "recordsPerSecond": 642,
+          "peakRssBytes": 12591104
         },
         "incremental_sync": {
-          "elapsedMs": 284,
-          "peakRssBytes": 10219520
+          "elapsedMs": 268,
+          "peakRssBytes": 10510336
         },
         "unchanged_sync": {
-          "elapsedMs": 65,
-          "peakRssBytes": 9687040
+          "elapsedMs": 62,
+          "peakRssBytes": 9629696
         },
         "hydrate_cold": {
-          "recordsPerSecond": 255,
-          "peakRssBytes": 11046912
+          "recordsPerSecond": 261,
+          "peakRssBytes": 10985472
         },
         "hydrate_unchanged": {
           "elapsedMs": 17,
-          "peakRssBytes": 8925184
+          "peakRssBytes": 8830976
         }
       },
-      "repeat": 2
+      "repeat": 2,
+      "calibrationMs": 192.9
     },
     "full": {
       "description": "Release-build matrix run by .github/workflows/benchmark-sync.yml on workflow_dispatch. Not a PR gate: it has no stored baselines, it publishes numbers.",

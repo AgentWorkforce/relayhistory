@@ -220,6 +220,7 @@ input.
 | `unchanged_sync` | A completed `incremental_sync` | The `watch` tick with nothing changed: walk every location, match every stamp, write nothing |
 | `hydrate_cold` | A completed sync, so the session is in the catalog | `hydrate_session` on the largest transcript in the store: full parse, evidence written |
 | `hydrate_unchanged` | One untimed `hydrate_session` on the same session | The checkpoint hit: stamp matches, nothing is re-parsed |
+| `calibration` | A fixed 120-file tree in a temp directory | The reference workload — walk and read the tree, parse JSON, insert into a WAL+FTS5 database, checkpoint. Touches nothing the other phases touch; see "Why the gate is not machine-dependent" |
 
 `records` is the exact row delta across `history`, `session_events`,
 `tool_calls`, `file_edits` and `sessions`, counted from the database before and
@@ -260,6 +261,35 @@ uses the `ci-debug` profile: an unoptimized build against a 1.25 MiB store, two
 rounds per phase, the faster round reported. It takes roughly 15 s on a 4-core
 machine — well inside the 60 s budget — and the `full` matrix runs separately on
 `workflow_dispatch` through `.github/workflows/benchmark-sync.yml`.
+
+#### Why the gate is not machine-dependent
+
+A throughput floor recorded on one machine says nothing on another, and a shared
+runner under load can be several times slower than the same runner idle — which
+is exactly the shape of the regression the gate is looking for. Measured
+directly, the first version of this gate went red on a developer box simply
+because a neighbouring build was running.
+
+So every run measures a **calibration phase** beside the real ones: a fixed
+reference workload built from the same materials as the code under test — walk
+and read a small file tree, parse JSON, insert into a WAL-mode SQLite database
+with an FTS5 index, commit periodically, checkpoint. Throughput and elapsed
+checks are then scaled by `stored_calibration / measured_calibration` before
+being compared, so what the gate compares is "what this phase would have cost on
+the machine the baseline came from". Peak RSS is not scaled: memory does not
+grow because the box is busy.
+
+The calibration deliberately touches neither the synthetic store nor the
+benchmark database and shares no code with the ingestion path, so a real
+slowdown in `sync` or `hydrate_session` cannot normalize itself away. A 3×
+slowdown patched into `ingest_claude_transcript_as` leaves the calibration at
+1.00× and turns three checks red; the same 3× applied to the whole machine
+leaves every check green. Both cases are covered by
+`scripts/benchmark-sync.test.mjs`.
+
+The factor is clamped to 0.2×–8×. A calibration outside that range is evidence
+that the measurement is wrong, not a licence to normalize an arbitrary amount of
+regression away, and the gate says when it clamped.
 
 Bounds come from `scripts/benchmark-thresholds.json`:
 

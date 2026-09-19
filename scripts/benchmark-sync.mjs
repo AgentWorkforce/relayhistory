@@ -32,6 +32,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(here, "..");
 const THRESHOLDS = join(here, "benchmark-thresholds.json");
 
+/**
+ * The reference workload, measured beside every run so the gate can divide out
+ * how fast or how busy the machine is. See `calibration()` in the harness.
+ */
+export const CALIBRATION_PHASE = "calibration";
+
 /** Phases in the order they must run: each one leans on the previous state. */
 export const PHASE_ORDER = [
   "cold_sync",
@@ -207,6 +213,7 @@ function renderReport(report) {
     `Machine: ${report.machine.cpu} (${report.machine.cores} cores, ${formatBytes(report.machine.memoryBytes)}), ${report.machine.platform}/${report.machine.arch}`,
     `Toolchain: ${report.machine.rustc ?? "unknown"} (${report.cargoProfile} profile), Node ${report.machine.node}`,
     `Store: ${formatBytes(report.store.storeBytes)} across ${report.store.storeFiles} files / ${report.store.sessionCount} sessions (seed ${report.store.plan.seed})`,
+    `Calibration: ${report.calibrationMs?.toFixed(1) ?? "—"} ms`,
     "",
     renderMarkdownTable(report),
   ];
@@ -267,7 +274,9 @@ async function main(argv) {
       rmSync(`${context.dbPath}-wal`, { force: true });
       rmSync(`${context.dbPath}-shm`, { force: true });
       rmSync(join(work, ".sync-state.json"), { force: true });
-      for (const phase of phases) samples.push({ round, ...runPhase(phase, context) });
+      for (const phase of [CALIBRATION_PHASE, ...phases]) {
+        samples.push({ round, ...runPhase(phase, context) });
+      }
     }
   } finally {
     if (!keep) rmSync(work, { recursive: true, force: true });
@@ -276,10 +285,11 @@ async function main(argv) {
   // only ever makes a phase slower, so the best sample is the one that
   // describes the code rather than the neighbours; taking the whole row from
   // one round keeps records, bytes and RSS internally consistent.
-  const measured = phases.map((phase) => {
-    const rounds = samples.filter((sample) => sample.phase === phase);
-    return rounds.reduce((best, sample) => (sample.elapsedMs < best.elapsedMs ? sample : best));
-  });
+  const fastest = (phase) => samples
+    .filter((sample) => sample.phase === phase)
+    .reduce((best, sample) => (sample.elapsedMs < best.elapsedMs ? sample : best));
+  const measured = phases.map(fastest);
+  const calibration = fastest(CALIBRATION_PHASE);
 
   const report = {
     generatedAt: new Date().toISOString(),
@@ -297,12 +307,14 @@ async function main(argv) {
     },
     totalWallMs: Date.now() - started,
     repeat,
+    calibrationMs: calibration.elapsedMs,
     phases: measured,
     samples,
   };
 
   if (flag(argv, "update-baselines")) {
     const next = structuredClone(thresholds);
+    next.profiles[profileName].calibrationMs = Number(report.calibrationMs.toFixed(1));
     next.profiles[profileName].phases = baselinesFromReport(report, BASELINE_METRICS);
     next.profiles[profileName].measuredOn = {
       commit: report.commit,
@@ -334,10 +346,21 @@ async function main(argv) {
 
   const verdict = evaluateGate(report, thresholds, profileName);
   const seconds = (report.totalWallMs / 1000).toFixed(1);
-  for (const check of verdict.checks) {
+  if (verdict.calibration) {
+    const { measuredMs, baselineMs, raw, factor, clamped } = verdict.calibration;
     process.stdout.write(
-      `${check.ok ? "ok  " : "FAIL"} ${check.phase}.${check.metric}: ` +
-      `${check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)} ` +
+      `calibration: ${measuredMs.toFixed(1)} ms here vs ${baselineMs.toFixed(1)} ms ` +
+      `on the baseline machine — this run is ${raw.toFixed(2)}x its speed` +
+      `${clamped ? `, clamped to ${factor.toFixed(2)}x` : ""}. ` +
+      "Throughput and elapsed checks below are normalized by that.\n\n",
+    );
+  }
+  for (const check of verdict.checks) {
+    const shown = check.normalized === check.value
+      ? check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)
+      : `${check.value.toFixed(1)} -> ${check.normalized.toFixed(1)}`;
+    process.stdout.write(
+      `${check.ok ? "ok  " : "FAIL"} ${check.phase}.${check.metric}: ${shown} ` +
       `(baseline ${check.baseline}, bound ${check.bound.toFixed(0)})\n`,
     );
   }

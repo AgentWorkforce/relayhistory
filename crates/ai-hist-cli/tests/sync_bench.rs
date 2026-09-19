@@ -267,8 +267,152 @@ fn append_one_record(path: &Path) -> u64 {
     bytes
 }
 
+/// A fixed reference workload, used to divide out how busy the machine is.
+///
+/// A throughput floor stored on one machine is meaningless on another, and a
+/// shared CI runner under load can be several times slower than the same
+/// runner idle — exactly the shape of a regression the gate is looking for.
+/// So the driver measures this alongside every run and scales the
+/// measurements by `stored_calibration / measured_calibration` before
+/// comparing them with the baselines.
+///
+/// It has to be made of the same materials as the work it is calibrating —
+/// `serde_json` parsing plus SQLite inserts through the same bundled
+/// amalgamation — or it would normalize CPU contention while the real cost
+/// was I/O. It deliberately touches neither the synthetic store nor the
+/// benchmark database, so a code change to the ingestion path cannot move it:
+/// that is what keeps a real 3x slowdown red instead of normalizing itself
+/// away.
+fn calibration() -> Measurement {
+    let document = serde_json::to_string(&json!({
+        "sessionId": "calibration",
+        "uuid": "calibration-0000",
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4",
+            "usage": { "input_tokens": 1200, "output_tokens": 300 },
+            "content": [
+                { "type": "thinking", "thinking": "x".repeat(220) },
+                { "type": "text", "text": "y".repeat(260) },
+                { "type": "tool_use", "id": "toolu_0", "name": "Read",
+                  "input": { "file_path": "/work/bench/src/lib.rs" } },
+            ],
+        },
+        "timestamp": "2026-09-19T12:00:00.000Z",
+    }))
+    .expect("calibration document");
+    const ROWS: usize = 3_500;
+    const COMMIT_EVERY: usize = 400;
+    const TREE_FILES: usize = 120;
+    const WALKS: usize = 12;
+    let dir = tempfile::tempdir().expect("calibration tempdir");
+
+    // A small provider-shaped tree, built once outside the timed region. The
+    // first version of this calibration measured only parsing and inserts, and
+    // under a neighbour hammering the disk it moved 1.15x while a full sync —
+    // which enumerates and stats every provider file — moved 2.9x. Directory
+    // metadata contention is real and has to be part of the reference or the
+    // normalization silently under-corrects.
+    let tree = dir.path().join("tree");
+    for index in 0..TREE_FILES {
+        let path = tree
+            .join(format!("project-{}", index % 8))
+            .join(format!("session-{index:04}.jsonl"));
+        fs::create_dir_all(path.parent().expect("tree parent")).expect("calibration tree dir");
+        fs::write(&path, &document).expect("calibration tree file");
+    }
+
+    let mut best = f64::INFINITY;
+    // Best of three: contention only ever makes a round slower, so the fastest
+    // round is the one that describes the machine rather than its neighbours.
+    for round in 0..3 {
+        let path = dir.path().join(format!("calibration-{round}.db"));
+        let started = Instant::now();
+
+        // Enumerate, stat and read the tree, the way an ingest walk does.
+        let mut walked = 0u64;
+        for _ in 0..WALKS {
+            let mut stack = vec![tree.clone()];
+            while let Some(directory) = stack.pop() {
+                for entry in fs::read_dir(&directory)
+                    .expect("calibration walk")
+                    .flatten()
+                {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        stack.push(entry_path);
+                    } else {
+                        let _ = entry_path.metadata().expect("calibration stat").len();
+                        let _ = fs::read_to_string(&entry_path).expect("calibration read");
+                        walked += 1;
+                    }
+                }
+            }
+        }
+
+        // WAL, a full-text index and a truncating checkpoint, because that is
+        // what the ledger being calibrated against is made of. Without the FTS
+        // writes the reference under-counts exactly the page churn a cold sync
+        // is dominated by.
+        let conn = rusqlite::Connection::open(&path).expect("calibration db");
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE rows (id INTEGER PRIMARY KEY, kind TEXT, body TEXT);
+             CREATE VIRTUAL TABLE rows_fts USING fts5(body);
+             BEGIN",
+        )
+        .expect("calibration schema");
+        for index in 0..ROWS {
+            let value: Value = serde_json::from_str(&document).expect("calibration parse");
+            let kind = value["message"]["content"][index % 3]["type"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let body = value["message"]["content"][index % 3].to_string();
+            conn.execute(
+                "INSERT INTO rows (kind, body) VALUES (?, ?)",
+                rusqlite::params![kind, body],
+            )
+            .expect("calibration insert");
+            conn.execute("INSERT INTO rows_fts (body) VALUES (?)", [&body])
+                .expect("calibration fts insert");
+            // Commit periodically so the reference pays for durable writes too,
+            // not just one fsync at the end.
+            if index % COMMIT_EVERY == COMMIT_EVERY - 1 {
+                conn.execute_batch("COMMIT; BEGIN")
+                    .expect("calibration commit");
+            }
+        }
+        conn.execute_batch("COMMIT").expect("calibration commit");
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("calibration checkpoint");
+        drop(conn);
+        best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+        assert_eq!(walked, (TREE_FILES * WALKS) as u64);
+    }
+    Measurement {
+        elapsed_ms: best,
+        records: ROWS as u64,
+        source_bytes: (document.len() * ROWS) as u64,
+        detail: json!({
+            "rounds": 3,
+            "rowsPerRound": ROWS,
+            "commitEvery": COMMIT_EVERY,
+            "treeFiles": TREE_FILES,
+            "walksPerRound": WALKS,
+        }),
+    }
+}
+
 fn run_phase(phase: &str, home: &Path, db_path: &Path) -> Measurement {
     match phase {
+        "calibration" => calibration(),
         "cold_sync" => {
             assert!(
                 !db_path.exists(),
