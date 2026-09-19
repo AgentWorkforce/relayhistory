@@ -23,6 +23,7 @@
 use crate::store::SessionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -656,10 +657,23 @@ pub fn attribute_usage_to_prompts(
         if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
             continue;
         }
-        let total = attributed
-            .entry(key)
-            .or_insert_with(|| Some(NormalizedUsage::empty(usage.accounting)));
-        *total = total.as_ref().and_then(|total| total.checked_add(usage));
+        // Seed from the first contribution rather than from an all-zero
+        // record. `empty()` reports *nothing* optional, and an optional field
+        // is only reported when every contributor reported it — so folding
+        // through it would strip reasoning, the cache-write split, the
+        // provider total and the cost from every prompt.
+        match attributed.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(Some(usage.clone()));
+            }
+            Entry::Occupied(mut slot) => {
+                let folded = slot
+                    .get()
+                    .as_ref()
+                    .and_then(|total| total.checked_add(usage));
+                slot.insert(folded);
+            }
+        }
     }
     attributed
         .into_iter()
@@ -978,6 +992,88 @@ mod tests {
             .unwrap();
         let b = claude(json!({ "input_tokens": 1 })).unwrap().unwrap();
         assert_eq!(a.checked_add(&b), None);
+    }
+
+    /// Attribution folds several responses into one prompt. Seeding that fold
+    /// with an all-`None` identity record would meet the "every contributor
+    /// reported it" rule vacuously and strip every optional field — reasoning
+    /// counts, the cache-write split, the provider total, the cost — from
+    /// every prompt, while still returning a well-formed usage record.
+    #[test]
+    fn attribution_keeps_optional_fields_when_folding_several_responses() {
+        let events = vec![
+            user_event("u1", 100, "ask"),
+            assistant_event(
+                "a1",
+                Some("u1"),
+                150,
+                r#"{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":120,"reasoning_output_tokens":10,"total_tokens":1120}"#,
+            ),
+            assistant_event(
+                "a2",
+                Some("u1"),
+                200,
+                r#"{"input_tokens":600,"cached_input_tokens":500,"output_tokens":60,"reasoning_output_tokens":30,"total_tokens":660}"#,
+            ),
+        ];
+        let attributed = attribute_usage_to_prompts(&events, "codex");
+        let usage = attributed
+            .get(&(100, "ask".to_string()))
+            .expect("both responses belong to the one prompt");
+        assert_eq!(usage.output_tokens, 180);
+        assert_eq!(
+            usage.reasoning_tokens,
+            Some(40),
+            "both responses reported reasoning, so the sum is reported"
+        );
+        assert_eq!(usage.provider_total_tokens, Some(1780));
+    }
+
+    fn user_event(message_id: &str, ts_ms: i64, text: &str) -> SessionEvent {
+        session_event(message_id, None, ts_ms, "user", text, None)
+    }
+
+    fn assistant_event(
+        message_id: &str,
+        parent_id: Option<&str>,
+        ts_ms: i64,
+        token_json: &str,
+    ) -> SessionEvent {
+        session_event(
+            message_id,
+            parent_id,
+            ts_ms,
+            "assistant",
+            "answer",
+            Some(token_json),
+        )
+    }
+
+    fn session_event(
+        message_id: &str,
+        parent_id: Option<&str>,
+        ts_ms: i64,
+        role: &str,
+        text: &str,
+        token_json: Option<&str>,
+    ) -> SessionEvent {
+        SessionEvent {
+            id: 0,
+            source: "codex".into(),
+            session_id: "s1".into(),
+            project: None,
+            cwd: None,
+            git_branch: None,
+            message_id: Some(message_id.to_string()),
+            parent_id: parent_id.map(str::to_string),
+            ts_ms,
+            role: role.into(),
+            kind: "text".into(),
+            text: Some(text.to_string()),
+            model: None,
+            token_json: token_json.map(str::to_string),
+            event_uid: format!("{message_id}:0"),
+        }
     }
 
     #[test]
