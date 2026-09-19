@@ -77,19 +77,34 @@ ai-hist watch --interval 30         # polling cadence when fs events are off
 ai-hist watch --no-fsevents         # poll only
 ```
 
-Watch attaches a recursive filesystem watcher to the providers' session roots
-(`~/.claude/projects`, `~/.codex/sessions`, `~/.codex/archived_sessions`,
-`~/.cursor/projects`, `~/.grok/sessions`, and the directory holding the
-OpenCode database) and runs one sweep per burst of writes, with a slow poll
-behind it. When no root can be watched — a network mount, a container without
-inotify, `--no-fsevents` — it falls back to polling at `--interval`, and says
-which driver it took on startup.
+Watch attaches a filesystem watcher to everything a local sweep reads: the
+providers' session roots (`~/.claude/projects`, `~/.codex/sessions`,
+`~/.codex/archived_sessions`, `~/.cursor/projects`, `~/.grok/sessions`, and the
+directory holding the OpenCode database) plus the flat per-harness logs
+`~/.claude/history.jsonl` and `~/.codex/history.jsonl` and any `.trajectories`
+directory. It then runs one sweep per burst of writes, with a slow poll behind
+it. When no root can be watched — a network mount, a container without inotify,
+`--no-fsevents` — it falls back to polling at `--interval`.
+
+Startup reports which driver it took **and which roots are not covered yet**. A
+root that does not exist cannot be watched, so a provider installed after
+`watch` started would otherwise be silently missed; those roots are retried on
+every backstop tick, and a loop that started with nothing to watch promotes
+itself to filesystem events as soon as one appears.
+
+`watch --remote` installs no local roots at all. Local provider writes are not
+what a remote-only run collects, and letting them drive the loop would fire the
+remote connectors on every local keystroke instead of at `--interval`.
 
 Two things make this cheap enough to leave running:
 
-- A tick first folds a **stat-only fingerprint** over everything discovery
-  would enumerate. If it matches the previous sweep's, the tick returns without
-  opening a single file. The value is recorded in `.sync-state.json` beside the
+- A tick first folds a **stat-only fingerprint** over everything the sweep
+  reads — the transcripts discovery enumerates, the Claude subagent
+  `agent-*.meta.json` sidecars beside them, the two flat logs, and the
+  trajectory records. If it matches the previous sweep's, the tick returns
+  without opening a single file. Anything the sweep reads has to be in that
+  fold: a source left out would sit behind an unchanged fingerprint and never
+  be read again. The value is recorded in `.sync-state.json` beside the
   database, after the sweep's cursors and only when every source read
   successfully — a source that failed is retried next tick rather than being
   cached over.
@@ -116,9 +131,13 @@ another process, and an arbitrary path must never become an ingest target.
 **The command always exits 0.** A hook runs inside the agent's tool call, and a
 non-zero exit there fails that tool call. A missing or rotated transcript, an
 unparseable payload, a locked database: all are reported on stderr and shrugged
-off. `--quiet` silences the reporting, not the shrug. Pass `--json` for a
-machine-readable report on stdout. A payload without `transcript_path` (some
-releases elide it) falls back to a forced full sweep.
+off. `--quiet` silences the reporting, not the shrug. A payload without
+`transcript_path` (some releases elide it) falls back to a forced full sweep.
+
+Pass `--json` for a machine-readable report on stdout. **`--quiet` outranks
+`--json`**: given both, the command prints nothing at all. A hook told to stay
+out of the way must not write a JSON document into the stdout of every tool
+call; use `--json` on its own when you want to read the report.
 
 ### Wiring the Claude Code hooks
 

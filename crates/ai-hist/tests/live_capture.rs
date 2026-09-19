@@ -287,7 +287,7 @@ fn an_unwatchable_root_falls_back_to_polling() {
         watch
             .with_immediate(false)
             .with_fs_events(true)
-            .with_roots(vec![missing])
+            .with_roots(vec![ai_hist::discover::WatchRoot::tree(missing)])
             .with_poll_interval_ms(50)
     });
 
@@ -306,7 +306,7 @@ fn disabling_fs_events_polls_a_real_directory() {
         watch
             .with_immediate(false)
             .with_fs_events(false)
-            .with_roots(vec![dir.path().to_path_buf()])
+            .with_roots(vec![ai_hist::discover::WatchRoot::tree(dir.path())])
             .with_poll_interval_ms(50)
     });
 
@@ -333,7 +333,9 @@ fn appending_to_a_watched_transcript_drives_one_forced_tick() {
         },
     );
     assert!(
-        roots.contains(&home.path().join(".claude/projects")),
+        roots
+            .iter()
+            .any(|root| root.path == home.path().join(".claude/projects")),
         "claude's transcript root must be watched: {roots:?}"
     );
 
@@ -391,18 +393,103 @@ fn every_file_backed_provider_contributes_a_watch_root() {
         opencode_db.parent().expect("opencode dir").to_path_buf(),
     ] {
         assert!(
-            roots.contains(&expected),
+            roots.iter().any(|root| root.path == expected),
             "{expected:?} missing from {roots:?}"
         );
     }
-    let mut deduped = roots.clone();
-    deduped.sort();
-    deduped.dedup();
+    let mut paths = roots.iter().map(|root| &root.path).collect::<Vec<_>>();
+    paths.sort();
+    let before = paths.len();
+    paths.dedup();
+    assert_eq!(paths.len(), before, "watch roots must be deduplicated");
+}
+
+#[test]
+fn the_sweep_only_sources_are_watched_too() {
+    let home = PathBuf::from("/tmp/relayhistory-sweep-watch-roots");
+    let roots = ai_hist::sync_watch_roots(&home, &home.join("opencode.db"));
+
+    // The flat logs are reached through their parent: a watch on the file
+    // itself follows an inode the harness may replace.
+    for (expected, recursive) in [
+        (home.join(".claude"), false),
+        (home.join(".codex"), false),
+        (home.join(".claude/projects"), true),
+    ] {
+        let root = roots
+            .iter()
+            .find(|root| root.path == expected)
+            .unwrap_or_else(|| panic!("{expected:?} missing from {roots:?}"));
+        assert_eq!(
+            root.recursive, recursive,
+            "{expected:?} is watched at the wrong depth"
+        );
+    }
+}
+
+/// A watch loop started before a provider exists must pick that provider up,
+/// not report itself as event-driven while the directory is uncovered.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_root_created_after_startup_is_picked_up() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let late = home.path().join(".claude/projects");
+    let roots = vec![ai_hist::discover::WatchRoot::tree(late.clone())];
+
+    let running = RunningLoop::reporting(|watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(true)
+            .with_roots(roots)
+            .with_debounce_ms(100)
+            // The backstop is what retries an unattached root, so it has to be
+            // short here; it is also the only cadence that can fire, which is
+            // why the assertions below look at `forced` to tell the two apart.
+            .with_slow_poll_ms(200)
+            .with_poll_interval_ms(200)
+    });
+
+    let status = running.watch.status().expect("status");
     assert_eq!(
-        deduped.len(),
-        roots.len(),
-        "watch roots must be deduplicated"
+        status.driver,
+        WatchDriver::Polling,
+        "a loop with nothing attached is polling, whatever its roots say"
     );
+    assert_eq!(status.pending, vec![late.clone()]);
+
+    std::fs::create_dir_all(&late).expect("create the root late");
+
+    // Wait for the loop to notice and re-attach. The status is published
+    // before the tick that follows it, so this is the loop's own signal.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while running.watch.driver() != Some(WatchDriver::FsEvents) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a root created after startup was never picked up: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+    assert!(running.watch.status().expect("status").pending.is_empty());
+
+    // A write under the newly attached root must drive a *forced* tick. Only a
+    // filesystem event forces, so the backstop ticks this short cadence keeps
+    // producing cannot be mistaken for the thing being proved.
+    write_claude_transcript(home.path(), "late", "late-1", 1);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            Ok(false) => assert!(
+                std::time::Instant::now() < deadline,
+                "only backstop ticks arrived after a write under the new root"
+            ),
+            Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a write under the newly attached root drove no tick"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +571,87 @@ fn appending_to_a_transcript_reopens_the_sweep() {
     assert!(
         sync_tick(&db, home.path(), false).swept,
         "an append must reopen the sweep without forcing"
+    );
+}
+
+/// The sweep reads three kinds of source discovery never enumerates. Each one
+/// must move the fingerprint on its own, or a machine whose only activity is
+/// of that kind never syncs again after its first sweep.
+#[test]
+fn a_change_confined_to_a_sweep_only_source_still_runs_the_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // One transcript so the catalog is non-empty and the fast path can arm at
+    // all; it is never touched again.
+    write_claude_transcript(home.path(), "proj", "anchor-1", 1);
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the gap is testable"
+    );
+
+    // 1. The flat Claude log. Nothing under ~/.claude/projects moved.
+    append_history_log(home.path(), "claude", "flat claude");
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a new record in ~/.claude/history.jsonl must reopen the sweep"
+    );
+    assert_eq!(
+        history_prompt_count(&db, "flat claude"),
+        1,
+        "the record appended to the flat log never landed"
+    );
+
+    // 2. The flat Codex log.
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+    append_history_log(home.path(), "codex", "flat codex");
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a new record in ~/.codex/history.jsonl must reopen the sweep"
+    );
+    assert_eq!(history_prompt_count(&db, "flat codex"), 1);
+
+    // 3. A Claude subagent's `agent-<id>.meta.json` sidecar, which is stamped
+    //    as evidence even when the transcript beside it is unchanged.
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+    let sidecar = home
+        .path()
+        .join(".claude/projects/proj/anchor-1/subagents/agent-a1.meta.json");
+    std::fs::create_dir_all(sidecar.parent().expect("subagents dir")).expect("subagents dir");
+    std::fs::write(&sidecar, "{\"agentId\":\"a1\"}\n").expect("write sidecar");
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a subagent sidecar arriving must reopen the sweep"
+    );
+}
+
+/// Trajectory records are a declared discovery exemption, so nothing enumerates
+/// them — and the sweep reads them anyway.
+#[test]
+fn a_change_confined_to_a_trajectory_still_runs_the_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_claude_transcript(home.path(), "proj", "anchor-2", 1);
+    let db = home.path().join("history.db");
+    let trajectories = home.path().join("Projects/app/.trajectories");
+    std::fs::create_dir_all(&trajectories).expect("trajectory root");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+
+    std::fs::write(
+        trajectories.join("run-1.json"),
+        r#"{"id":"traj-1","task":"trajectory only","startedAt":"2026-09-19T10:00:00.000Z"}"#,
+    )
+    .expect("write trajectory");
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a new trajectory record must reopen the sweep"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "and the fast path must re-arm once it has been read"
     );
 }
 
@@ -671,6 +839,43 @@ fn append_claude_record(path: &Path, session_id: &str, index: u64) {
     file.write_all(claude_record(session_id, index).as_bytes())
         .expect("append record");
     file.flush().expect("flush");
+}
+
+/// Append one record to a flat per-harness history log, creating it if needed.
+/// The two harnesses spell a record differently: Claude's is
+/// `{display, timestamp}`, Codex's is `{text, ts}`.
+fn append_history_log(home: &Path, source: &str, prompt: &str) {
+    use std::io::Write;
+    let (dir, line) = match source {
+        "claude" => (
+            ".claude",
+            format!("{{\"display\":\"{prompt}\",\"timestamp\":1758276000000}}\n"),
+        ),
+        "codex" => (
+            ".codex",
+            format!("{{\"text\":\"{prompt}\",\"ts\":1758276000}}\n"),
+        ),
+        other => panic!("no flat history log for {other}"),
+    };
+    let path = home.join(dir).join("history.jsonl");
+    std::fs::create_dir_all(path.parent().expect("log dir")).expect("log dir");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open history log");
+    file.write_all(line.as_bytes()).expect("append record");
+    file.flush().expect("flush");
+}
+
+fn history_prompt_count(db: &Path, prompt: &str) -> i64 {
+    let conn = ai_hist::open_db(db).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM history WHERE prompt = ?",
+        [prompt],
+        |row| row.get(0),
+    )
+    .expect("count history rows")
 }
 
 fn session_event_count(db: &Path, session_id: &str) -> i64 {

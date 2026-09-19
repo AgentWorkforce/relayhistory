@@ -6,19 +6,28 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Live capture
 
-- `ai-hist watch` now wakes on filesystem events under the providers' session
-  roots with a 200 ms debounce and a 30 s slow-poll backstop, falling back to
-  polling when no root can be watched. New flags: `--no-fsevents`,
-  `--debounce-ms`, alongside the existing `--interval`. The watcher backend is
-  behind the optional `fs-events` crate feature, which the CLI enables; a
+- `ai-hist watch` now wakes on filesystem events over everything a local sweep
+  reads — the providers' session roots, the flat `~/.claude/history.jsonl` and
+  `~/.codex/history.jsonl` logs, and `.trajectories` directories — with a
+  200 ms debounce and a 30 s slow-poll backstop, falling back to polling when
+  no root can be watched. New flags: `--no-fsevents`, `--debounce-ms`,
+  alongside the existing `--interval`. The watcher backend is behind the
+  optional `fs-events` crate feature, which the CLI enables; a
   `--no-default-features` build polls.
-- `sync` now short-circuits on a stat-only source fingerprint folded over the
-  same candidates discovery enumerates, recorded in `.sync-state.json`. A tick
-  over unchanged sources opens no files. Filesystem-event ticks force past it,
-  because an event can arrive before the write flushes.
+- Startup reports the driver **and any root not covered yet**. Roots that do
+  not exist are retried on every backstop tick, so a provider installed after
+  `watch` started becomes covered without a restart. `watch --remote` installs
+  no local roots, so local writes cannot drive remote connector traffic.
+- `sync` now short-circuits on a stat-only source fingerprint folded over
+  everything the sweep reads — the enumerated transcripts, the Claude subagent
+  `agent-*.meta.json` sidecars, the two flat logs and the trajectory records —
+  recorded in `.sync-state.json`. A tick over unchanged sources opens no files.
+  Filesystem-event ticks force past it, because an event can arrive before the
+  write flushes.
 - New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
   lifecycle-hook payload from stdin and hydrates exactly the transcript it
-  names. It always exits 0. See `docs/agent-integration.md` for the
+  names. It always exits 0, and `--quiet` outranks `--json` so a hook wired
+  with both stays silent. See `docs/agent-integration.md` for the
   `settings.json` wiring, including why `PreCompact` cannot be replaced by
   watch mode.
 

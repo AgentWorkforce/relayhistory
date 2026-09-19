@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::discover::WatchRoot;
+
 /// Default coalescing window for filesystem-event bursts. Short enough that an
 /// interactive pause feels live, long enough to collapse the event burst from
 /// one tool result appending a multi-line transcript update.
@@ -65,6 +67,23 @@ impl WatchDriver {
             WatchDriver::Polling => "polling",
         }
     }
+}
+
+/// What the loop is actually driven by right now, and what it is not covering.
+///
+/// `pending` is the honest part. A root that did not exist when the loop
+/// started is not watched, and reporting `FsEvents` while `~/.codex/sessions`
+/// is uncovered would claim a liveness the loop does not have for that
+/// provider — its transcripts would only be seen by the backstop, by which
+/// time a short session can already have been cleaned up. The loop keeps
+/// retrying these, so the list shrinks as providers appear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverStatus {
+    pub driver: WatchDriver,
+    /// Roots the watcher is attached to.
+    pub watched: Vec<PathBuf>,
+    /// Roots that do not exist yet, retried on every backstop tick.
+    pub pending: Vec<PathBuf>,
 }
 
 /// What woke a tick.
@@ -122,8 +141,9 @@ pub type TickFn = Arc<dyn Fn(bool) -> Result<TickOutcome> + Send + Sync>;
 pub type ReportSink = Arc<dyn Fn(&TickReport) + Send + Sync>;
 /// Sink for ticks that failed. A failed tick never stops the loop.
 pub type ErrorSink = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
-/// Sink called once, with the driver the loop actually selected.
-pub type DriverSink = Arc<dyn Fn(WatchDriver) + Send + Sync>;
+/// Sink called whenever what drives the loop changes — at startup, and again
+/// when a root that did not exist appears and is picked up.
+pub type DriverSink = Arc<dyn Fn(&DriverStatus) + Send + Sync>;
 
 #[derive(Default)]
 struct WakeState {
@@ -149,7 +169,7 @@ struct WatchInner {
     wake_cv: Condvar,
     run: Mutex<RunState>,
     run_cv: Condvar,
-    driver: Mutex<Option<WatchDriver>>,
+    driver: Mutex<Option<DriverStatus>>,
 }
 
 /// Resets `in_flight` even when the sweep panics, so one bad tick cannot wedge
@@ -335,7 +355,7 @@ pub struct WatchLoop {
     /// Whether to attempt the filesystem-event driver at all.
     pub use_fs_events: bool,
     /// Roots to watch, usually [`crate::discover::watch_roots`].
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<WatchRoot>,
     /// Run one sweep before parking.
     pub immediate: bool,
     on_driver: Option<DriverSink>,
@@ -363,12 +383,12 @@ impl WatchLoop {
                 wake_cv: Condvar::new(),
                 run: Mutex::new(RunState::default()),
                 run_cv: Condvar::new(),
-                driver: Mutex::new(None),
+                    driver: Mutex::new(None),
             }),
         }
     }
 
-    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
+    pub fn with_roots(mut self, roots: Vec<WatchRoot>) -> Self {
         self.roots = roots;
         self
     }
@@ -417,9 +437,14 @@ impl WatchLoop {
         self
     }
 
-    /// The driver [`run`](WatchLoop::run) selected, once it has started.
+    /// What drives the loop right now, once it has started.
+    pub fn status(&self) -> Option<DriverStatus> {
+        self.inner.driver.lock().expect("watch driver").clone()
+    }
+
+    /// The driver [`run`](WatchLoop::run) is using, once it has started.
     pub fn driver(&self) -> Option<WatchDriver> {
-        *self.inner.driver.lock().expect("watch driver")
+        self.status().map(|status| status.driver)
     }
 
     /// Post a change signal by hand. The filesystem watcher calls this; hosts
@@ -444,30 +469,22 @@ impl WatchLoop {
 
     /// Drive the loop on this thread until [`stop`](WatchLoop::stop).
     ///
-    /// Returns the driver that ran. Attaching the filesystem watcher is best
-    /// effort: a root that cannot be watched is skipped, and a complete
-    /// failure demotes the loop to polling rather than failing the run.
+    /// Returns the driver it ended on. Attaching the watcher is best effort in
+    /// both directions: a root that does not exist yet is not an error and is
+    /// retried on every backstop tick, and a backend that cannot be brought up
+    /// at all demotes the loop to polling rather than failing the run. A loop
+    /// that started with nothing to watch is promoted to filesystem events the
+    /// moment one of its roots appears — a machine that installs Codex an hour
+    /// in should not be stuck polling until restart.
     pub fn run(&self) -> Result<WatchDriver> {
         let debounce = Duration::from_millis(self.debounce_ms);
-        let watcher = if self.use_fs_events && !self.roots.is_empty() {
+        let mut watcher = if self.use_fs_events && !self.roots.is_empty() {
             let inner = self.inner.clone();
             fs_events::attach(&self.roots, move || inner.signal_change()).ok()
         } else {
             None
         };
-        let driver = if watcher.is_some() {
-            WatchDriver::FsEvents
-        } else {
-            WatchDriver::Polling
-        };
-        *self.inner.driver.lock().expect("watch driver") = Some(driver);
-        if let Some(sink) = &self.on_driver {
-            sink(driver);
-        }
-        let idle = Duration::from_millis(match driver {
-            WatchDriver::FsEvents => self.slow_poll_ms,
-            WatchDriver::Polling => self.poll_interval_ms,
-        });
+        self.publish_status(watcher.as_ref());
 
         if self.immediate {
             // A first sweep against a cold catalog has nothing to compare
@@ -475,16 +492,70 @@ impl WatchLoop {
             self.inner.run_skip_if_busy(TickTrigger::Startup);
         }
         while !self.inner.stopped() {
+            let idle = Duration::from_millis(match self.current_driver() {
+                WatchDriver::FsEvents => self.slow_poll_ms,
+                WatchDriver::Polling => self.poll_interval_ms,
+            });
             let Some(trigger) = self.inner.wait_for_wake(idle, debounce) else {
                 break;
             };
             if self.inner.stopped() {
                 break;
             }
+            // Only on a backstop tick: retrying on every filesystem event
+            // would hammer the watcher during a burst, and a root appearing is
+            // not something an event on another root tells us about.
+            if trigger == TickTrigger::Poll {
+                if let Some(watch) = watcher.as_mut() {
+                    if watch.retry_pending() > 0 {
+                        self.publish_status(Some(&*watch));
+                    }
+                }
+            }
             self.inner.run_skip_if_busy(trigger);
         }
+        let driver = self.current_driver();
         drop(watcher);
         Ok(driver)
+    }
+
+    fn current_driver(&self) -> WatchDriver {
+        self.status()
+            .map(|status| status.driver)
+            .unwrap_or(WatchDriver::Polling)
+    }
+
+    fn publish_status(&self, watcher: Option<&fs_events::FsWatch>) {
+        let status = match watcher {
+            // A watcher holding no attachment is not driving anything: the
+            // loop is polling until one of its roots shows up.
+            Some(watch) if watch.watched().is_empty() => DriverStatus {
+                driver: WatchDriver::Polling,
+                watched: Vec::new(),
+                pending: watch.pending(),
+            },
+            Some(watch) => DriverStatus {
+                driver: WatchDriver::FsEvents,
+                watched: watch.watched(),
+                pending: watch.pending(),
+            },
+            None => DriverStatus {
+                driver: WatchDriver::Polling,
+                watched: Vec::new(),
+                pending: self.roots.iter().map(|root| root.path.clone()).collect(),
+            },
+        };
+        let changed = {
+            let mut held = self.inner.driver.lock().expect("watch driver");
+            let changed = held.as_ref() != Some(&status);
+            *held = Some(status.clone());
+            changed
+        };
+        if changed {
+            if let Some(sink) = &self.on_driver {
+                sink(&status);
+            }
+        }
     }
 }
 
@@ -494,22 +565,58 @@ mod fs_events {
     use notify::event::EventKind;
     use notify::{RecursiveMode, Watcher};
 
-    /// Holds the OS-level watch open; dropping it stops the watcher.
+    /// Holds the OS-level watches open; dropping it stops them.
+    ///
+    /// Roots that did not exist at attach time stay in `pending` rather than
+    /// being dropped. A watch on a path that is not there yet cannot be
+    /// registered, and never retrying would leave a provider installed after
+    /// the loop started permanently uncovered while the loop still reported
+    /// itself as event-driven.
     pub(super) struct FsWatch {
-        _watcher: notify::RecommendedWatcher,
+        watcher: notify::RecommendedWatcher,
+        watched: Vec<PathBuf>,
+        pending: Vec<WatchRoot>,
     }
 
-    /// Watch every existing path in `roots` recursively, calling `on_change`
-    /// for each create/modify/remove event.
+    impl FsWatch {
+        pub(super) fn watched(&self) -> Vec<PathBuf> {
+            self.watched.clone()
+        }
+
+        pub(super) fn pending(&self) -> Vec<PathBuf> {
+            self.pending.iter().map(|root| root.path.clone()).collect()
+        }
+
+        /// Try the roots that were not there before. Returns how many were
+        /// picked up, so the caller knows whether to republish its status.
+        pub(super) fn retry_pending(&mut self) -> usize {
+            if self.pending.is_empty() {
+                return 0;
+            }
+            let mut attached = 0usize;
+            self.pending.retain(|root| {
+                if !register(&mut self.watcher, root) {
+                    return true;
+                }
+                self.watched.push(root.path.clone());
+                attached += 1;
+                false
+            });
+            attached
+        }
+    }
+
+    /// Watch every existing path in `roots`, calling `on_change` for each
+    /// create/modify/remove event.
     ///
-    /// Recursive is required: a new transcript lands *inside*
-    /// `~/.claude/projects/<project>/`, not at the root itself.
+    /// Depth comes from each root: a transcript tree is recursive because a
+    /// new session is a new file somewhere under it, while a directory holding
+    /// one flat log is not, so the unrelated churn beside it costs nothing.
     ///
-    /// Errors when not a single root could be watched, which is the caller's
-    /// signal to fall back to polling (network mounts, containers without
-    /// inotify, a home with no provider directories yet).
+    /// Errors only when the backend itself could not be brought up. A root
+    /// that does not exist is not an error — it becomes `pending`.
     pub(super) fn attach(
-        roots: &[PathBuf],
+        roots: &[WatchRoot],
         on_change: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -526,17 +633,32 @@ mod fs_events {
                 on_change();
             }
         })?;
-        let mut watched = 0usize;
+        let mut watched = Vec::new();
+        let mut pending = Vec::new();
         for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
-                watched += 1;
+            if register(&mut watcher, root) {
+                watched.push(root.path.clone());
+            } else {
+                pending.push(root.clone());
             }
         }
-        anyhow::ensure!(watched > 0, "no watchable provider roots");
-        Ok(FsWatch { _watcher: watcher })
+        Ok(FsWatch {
+            watcher,
+            watched,
+            pending,
+        })
+    }
+
+    fn register(watcher: &mut notify::RecommendedWatcher, root: &WatchRoot) -> bool {
+        if !root.path.exists() {
+            return false;
+        }
+        let mode = if root.recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(&root.path, mode).is_ok()
     }
 }
 
@@ -546,11 +668,25 @@ mod fs_events {
 
     pub(super) struct FsWatch;
 
+    impl FsWatch {
+        pub(super) fn watched(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        pub(super) fn pending(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        pub(super) fn retry_pending(&mut self) -> usize {
+            0
+        }
+    }
+
     /// Without the `fs-events` feature there is no watcher backend, so every
     /// caller falls back to polling. The signature matches the real one so the
     /// loop itself is identical in both builds.
     pub(super) fn attach(
-        _roots: &[PathBuf],
+        _roots: &[WatchRoot],
         _on_change: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
         anyhow::bail!("ai-hist was built without the fs-events feature")

@@ -367,25 +367,74 @@ pub struct ProviderRoots<'a> {
     pub opencode_db: &'a Path,
 }
 
-/// Every directory the live-capture watcher should monitor, deduplicated and
-/// ordered, for the given adapters.
+/// One path the live-capture watcher monitors, and how deeply.
 ///
-/// Roots that do not exist are kept: the watcher skips them, and keeping them
-/// means a caller can log what *would* be watched once `~/.codex` appears.
+/// Depth is not a detail. A transcript root has to be watched recursively,
+/// because a new session is a new file inside a directory that may not exist
+/// yet. A flat log such as `~/.claude/history.jsonl` is watched through its
+/// *parent*, non-recursively: watching the file itself stops firing the moment
+/// the file is replaced rather than appended to, and watching the parent
+/// recursively would pull in everything else under `~/.claude` — the todo
+/// files and shell snapshots a busy session rewrites constantly — so every one
+/// of those would wake a full fingerprint walk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WatchRoot {
+    pub path: PathBuf,
+    /// Whether the whole subtree is watched, or only this directory's own
+    /// entries.
+    pub recursive: bool,
+}
+
+impl WatchRoot {
+    /// Watch this path and everything under it.
+    pub fn tree(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            recursive: true,
+        }
+    }
+
+    /// Watch only this directory's own entries.
+    pub fn directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            recursive: false,
+        }
+    }
+}
+
+/// Every path the live-capture watcher should monitor for the given adapters,
+/// deduplicated and ordered.
+///
+/// Roots that do not exist are kept rather than dropped: a provider installed
+/// after the watcher started still has to become covered, so the loop retries
+/// them, and a caller can report which ones are not covered yet.
+///
+/// A path named both ways keeps the wider watch.
 pub fn watch_roots(
     providers: &[Box<dyn ShallowSessionProvider>],
     roots: &ProviderRoots<'_>,
-) -> Vec<PathBuf> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
+) -> Vec<WatchRoot> {
+    let mut widest: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut order = Vec::new();
     for provider in providers {
         for root in provider.watch_roots(roots) {
-            if seen.insert(root.clone()) {
-                out.push(root);
+            match widest.get_mut(&root.path) {
+                Some(recursive) => *recursive |= root.recursive,
+                None => {
+                    widest.insert(root.path.clone(), root.recursive);
+                    order.push(root.path);
+                }
             }
         }
     }
-    out
+    order
+        .into_iter()
+        .map(|path| {
+            let recursive = widest[&path];
+            WatchRoot { path, recursive }
+        })
+        .collect()
 }
 
 /// A stat-only fold over everything discovery would enumerate, cheap enough to
@@ -406,19 +455,39 @@ pub fn source_fingerprint(
     env: &DiscoveryEnv<'_>,
     providers: &[&dyn ShallowSessionProvider],
 ) -> Result<String> {
+    source_fingerprint_with(env, providers, &[])
+}
+
+/// [`source_fingerprint`] plus inputs no adapter owns.
+///
+/// A sweep can read sources discovery never enumerates — flat per-harness
+/// logs, and records that are deliberately [`DISCOVERY_EXEMPTIONS`] entries.
+/// Anything the sweep reads has to be in the fold, or the fast path will skip
+/// a sweep that had work to do.
+pub fn source_fingerprint_with(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+    extra: &[Candidate],
+) -> Result<String> {
     let mut candidates: u64 = 0;
     let mut bytes: u64 = 0;
     let mut hash: u64 = 0;
+    let mut fold = |candidate: &Candidate| {
+        candidates = candidates.wrapping_add(1);
+        bytes = bytes.wrapping_add(stamp_reported_bytes(&candidate.stamp));
+        hash = hash.wrapping_add(fingerprint_hash(
+            candidate.source,
+            &candidate.locator,
+            &candidate.stamp,
+        ));
+    };
     for provider in providers {
         for candidate in provider.fingerprint_inputs(env)? {
-            candidates = candidates.wrapping_add(1);
-            bytes = bytes.wrapping_add(stamp_reported_bytes(&candidate.stamp));
-            hash = hash.wrapping_add(fingerprint_hash(
-                candidate.source,
-                &candidate.locator,
-                &candidate.stamp,
-            ));
+            fold(&candidate);
         }
+    }
+    for candidate in extra {
+        fold(candidate);
     }
     Ok(format!("{candidates}:{bytes}:{hash:016x}"))
 }
@@ -539,7 +608,7 @@ pub trait ShallowSessionProvider: Sync {
     /// on a path that does not exist yet never fires. Adapters with no local
     /// files (remote connectors, the relay adapter reading our own catalog)
     /// return none, and the watcher skips roots that do not exist.
-    fn watch_roots(&self, _roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+    fn watch_roots(&self, _roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
         Vec::new()
     }
     /// The change signal [`source_fingerprint`] folds for this adapter.
@@ -848,8 +917,23 @@ impl ShallowSessionProvider for ClaudeProvider {
         "claude"
     }
 
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
-        vec![roots.home.join(".claude/projects")]
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".claude/projects"))]
+    }
+
+    /// Claude's enumeration collects `*.jsonl`, but a subagent transcript's
+    /// `agent-<id>.meta.json` sidecar is evidence too — `source_snapshot`
+    /// stamps it, so a sidecar arriving or changing on its own re-hydrates the
+    /// session. Left out of the fold, a tick whose only change was a sidecar
+    /// would sit behind an unchanged fingerprint and never run.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = self.enumerate(env, None)?;
+        inputs.extend(file_candidates(
+            "claude",
+            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "json")?,
+            crate::file_stamp_and_modified,
+        )?);
+        Ok(inputs)
     }
 
     fn enumerate(
@@ -1022,10 +1106,10 @@ impl ShallowSessionProvider for CodexProvider {
         "codex"
     }
 
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
         vec![
-            roots.home.join(".codex/sessions"),
-            roots.home.join(".codex/archived_sessions"),
+            WatchRoot::tree(roots.home.join(".codex/sessions")),
+            WatchRoot::tree(roots.home.join(".codex/archived_sessions")),
         ]
     }
 
@@ -1180,8 +1264,8 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
 
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
-        vec![roots.home.join(".cursor/projects")]
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".cursor/projects"))]
     }
 
     fn enumerate(
@@ -1277,8 +1361,8 @@ impl ShallowSessionProvider for GrokProvider {
         "grok"
     }
 
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
-        vec![roots.home.join(".grok/sessions")]
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".grok/sessions"))]
     }
 
     fn enumerate(
@@ -1547,14 +1631,16 @@ impl ShallowSessionProvider for OpencodeProvider {
         "opencode"
     }
 
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<PathBuf> {
-        // The database file itself is rewritten in place, and SQLite's -wal
-        // and -shm siblings move with it, so the directory is the root that
-        // actually sees every write.
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        // The database file is rewritten in place and SQLite's -wal and -shm
+        // siblings move with it, so the directory is what actually sees every
+        // write. Its own entries are enough — opencode keeps unrelated state
+        // in subdirectories, and waking on those would cost a fingerprint walk
+        // each time.
         roots
             .opencode_db
             .parent()
-            .map(|dir| vec![dir.to_path_buf()])
+            .map(|dir| vec![WatchRoot::directory(dir)])
             .unwrap_or_default()
     }
 

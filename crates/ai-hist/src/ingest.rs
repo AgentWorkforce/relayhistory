@@ -442,6 +442,81 @@ impl SyncSourceReport {
 /// the sync state file that already holds every per-source cursor.
 const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 
+/// The sources a sweep reads that discovery never enumerates.
+///
+/// Discovery is about *sessions*, so its adapters walk the transcript trees.
+/// The sweep also reads two flat per-harness logs and the trajectory records,
+/// and `trajectory` is a declared [`discover::DISCOVERY_EXEMPTIONS`] entry
+/// precisely because it is not a provider session. Folding only the adapters
+/// into the fingerprint would leave these three outside it: after one
+/// successful sweep, a change confined to them would match the stored value
+/// and the sweep would return before ever reaching
+/// `sync_jsonl_incremental` / `sync_trajectories`. The records would then wait
+/// for an unrelated transcript to move — indefinitely, on a machine that only
+/// uses the flat log.
+///
+/// Stat-only, like the adapters' own inputs: enumerating trajectory files is a
+/// directory walk, and the two logs are one stat each.
+fn sweep_only_fingerprint_inputs(home: &Path) -> Vec<Candidate> {
+    let mut paths = vec![
+        home.join(".claude/history.jsonl"),
+        home.join(".codex/history.jsonl"),
+    ];
+    // Errors here mean an unreadable directory, not "no trajectories". The
+    // fold simply omits what it could not enumerate, which can only cause an
+    // extra sweep, never a skipped one.
+    paths.extend(trajectory_files(home).unwrap_or_default());
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path).ok()?;
+            Some(Candidate {
+                source: "sweep",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            })
+        })
+        .collect()
+}
+
+/// Every path live capture watches for a local sweep: the providers' own roots
+/// plus the sweep-only sources above.
+///
+/// The flat logs are watched through their parent directory rather than
+/// directly. A watch on a file follows that file's inode, so it stops firing
+/// the moment the log is replaced instead of appended to; and `~/.claude`
+/// watched recursively would pull in the todo files and shell snapshots an
+/// active session rewrites constantly, each one waking a full fingerprint
+/// walk.
+///
+/// A `.trajectories` directory created after the loop started is not here —
+/// the alternative is watching every project tree — but the fingerprint
+/// re-enumerates them every tick, so the backstop still picks one up.
+pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
+    let mut roots = discover::watch_roots(
+        &shallow_providers(),
+        &discover::ProviderRoots { home, opencode_db },
+    );
+    roots.push(discover::WatchRoot::directory(home.join(".claude")));
+    roots.push(discover::WatchRoot::directory(home.join(".codex")));
+    for file in trajectory_files(home).unwrap_or_default() {
+        if let Some(parent) = file.parent() {
+            roots.push(discover::WatchRoot::tree(parent));
+        }
+    }
+    roots.sort();
+    roots.dedup_by(|later, first| {
+        if later.path != first.path {
+            return false;
+        }
+        first.recursive |= later.recursive;
+        true
+    });
+    roots
+}
+
 /// Whether the stat-only fingerprint says this sweep has nothing to do.
 ///
 /// The catalog check is the guard that keeps the fast path honest across a
@@ -505,7 +580,14 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // that append instead.
     let fingerprint = {
         let env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode.clone());
-        let taken = discover::source_fingerprint_for(&env, &providers);
+        let taken = discover::source_fingerprint_with(
+            &env,
+            &providers
+                .iter()
+                .map(|provider| provider.as_ref())
+                .collect::<Vec<_>>(),
+            &sweep_only_fingerprint_inputs(home),
+        );
         if let Err(error) = &taken {
             sync_note!("  [sync] source fingerprint unavailable: {error:#}");
         }

@@ -263,10 +263,10 @@ enum Command {
         /// Harness whose hook payload is on stdin. Only `claude` today.
         #[arg(long, value_name = "HARNESS")]
         hook: String,
-        /// Say nothing at all, on any stream.
+        /// Say nothing at all, on any stream. Wins over --json.
         #[arg(long)]
         quiet: bool,
-        /// Print the ingest report as JSON on stdout.
+        /// Print the ingest report as JSON on stdout. Ignored under --quiet.
         #[arg(long)]
         json: bool,
     },
@@ -2131,13 +2131,8 @@ fn watch_loop_with_connectors(
     connectors: &remote::SourceConnectorSelection,
     drivers: WatchDrivers,
 ) -> Result<()> {
-    let roots = ai_hist::discover::watch_roots(
-        &shallow_providers(),
-        &ai_hist::discover::ProviderRoots {
-            home: &home_dir(),
-            opencode_db: &default_opencode_db_path(),
-        },
-    );
+    let roots = watch_roots_for_scope(scope);
+    let remote_only = scope == SessionScope::Remote;
     let db = db_path.to_path_buf();
     let connectors = connectors.clone();
     let tick: ai_hist::watch::TickFn = Arc::new(move |force| {
@@ -2154,17 +2149,52 @@ fn watch_loop_with_connectors(
         .with_poll_interval_ms(interval.saturating_mul(1000))
         .with_immediate(true)
         .on_error(Arc::new(|error| eprintln!("Error: {error:#}")))
-        .on_driver(Arc::new(move |driver| match driver {
-            ai_hist::watch::WatchDriver::FsEvents => println!(
-                "Watching session roots for changes (debounce {}ms, {}s backstop; Ctrl-C to stop)...",
-                drivers.debounce_ms,
-                ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000
-            ),
-            ai_hist::watch::WatchDriver::Polling => {
-                println!("Watching every {interval}s (Ctrl-C to stop)...")
+        .on_driver(Arc::new(move |status| {
+            match status.driver {
+                ai_hist::watch::WatchDriver::FsEvents => println!(
+                    "Watching {} session root(s) for changes (debounce {}ms, {}s backstop; Ctrl-C to stop)...",
+                    status.watched.len(),
+                    drivers.debounce_ms,
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000
+                ),
+                ai_hist::watch::WatchDriver::Polling if remote_only => println!(
+                    "Watching remote connectors every {interval}s (Ctrl-C to stop)..."
+                ),
+                ai_hist::watch::WatchDriver::Polling => {
+                    println!("Watching every {interval}s (Ctrl-C to stop)...")
+                }
+            }
+            // Saying which roots are uncovered is the difference between "live
+            // capture is on" and "live capture is on for the providers that
+            // were installed when you started it".
+            if !status.pending.is_empty() {
+                println!(
+                    "  not watched yet (retried every {}s): {}",
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000,
+                    status
+                        .pending
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }));
     watch.run().map(|_| ())
+}
+
+/// The roots watch installs for a scope.
+///
+/// A remote-scoped watch installs none. Local provider roots would otherwise
+/// select the filesystem-event driver, and every local Claude or Codex write —
+/// which a remote-only run is not collecting at all — would fire the remote
+/// connectors, plus the 30s backstop on top. The user asked for remote at
+/// `--interval`; that is what they get.
+fn watch_roots_for_scope(scope: SessionScope) -> Vec<ai_hist::discover::WatchRoot> {
+    if scope == SessionScope::Remote {
+        return Vec::new();
+    }
+    sync_watch_roots(&home_dir(), &default_opencode_db_path())
 }
 
 /// `ingest --hook <harness>`: read one lifecycle-hook payload from stdin and
@@ -2246,14 +2276,21 @@ fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Resul
     };
     match outcome {
         Ok(report) => {
-            if json {
-                println!("{report}");
-            } else if !quiet {
-                let status = report
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("done");
-                eprintln!("ai-hist ingest: {hook} {status}");
+            // `--quiet` outranks `--json`. A hook's contract is "exit 0, say
+            // nothing"; a caller passing both asked for silence and for a
+            // shape to parse if anything *is* said, and silence is the
+            // stronger of the two. Printing anyway would put JSON on the
+            // stdout of a hook that was told to stay out of the way.
+            match (quiet, json) {
+                (true, _) => {}
+                (false, true) => println!("{report}"),
+                (false, false) => {
+                    let status = report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("done");
+                    eprintln!("ai-hist ingest: {hook} {status}");
+                }
             }
         }
         Err(error) => note(format!("{error:#}")),
@@ -3258,6 +3295,25 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
+
+    /// A remote-scoped watch must install no local roots. If it did, the
+    /// filesystem-event driver would be selected by local writes the run is
+    /// not even collecting, and every one of them would fire the remote
+    /// connectors — plus the 30s backstop, instead of the requested interval.
+    #[test]
+    fn a_remote_watch_installs_no_local_roots() {
+        assert!(
+            watch_roots_for_scope(SessionScope::Remote).is_empty(),
+            "remote scope must not watch local provider roots"
+        );
+        for scope in [SessionScope::Local, SessionScope::All] {
+            assert!(
+                !watch_roots_for_scope(scope).is_empty(),
+                "{scope:?} must still watch local provider roots"
+            );
+        }
+    }
+
     #[test]
     fn cron_schedule_maps_intervals_to_step_expressions() {
         assert_eq!(cron_schedule(60).0, "* * * * *");
