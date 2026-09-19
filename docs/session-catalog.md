@@ -369,9 +369,18 @@ the ordering too.
 Because the columns are nullable and the schema migration marks itself
 complete, an upgraded install would otherwise keep skipping unchanged
 transcripts on the sync fast path and leave every historical tool result null.
-A transcript whose indexed tool results have no `event_index` is therefore
-re-read once by plain `sync` and skipped again afterwards; this is narrower
-than invalidating the whole stamp map, which would re-read the entire archive.
+Plain `sync` therefore runs one backfill pass per provider, recorded in the
+sync state, during which a transcript whose indexed tool results have no
+`event_index` is re-read. Selecting files that way is narrower than
+invalidating the whole stamp map, which would re-read the entire archive.
+
+The pass is bounded by a recorded generation rather than by "some row is still
+null", and that distinction matters: `session_events` is keyed by
+`(source, session_id)`, local and remote observations of one session share
+that identity, and an adapter may contribute a tool result with no fidelity at
+all. Re-reading the local transcript never populates a row that came from
+somewhere else, so a null-row condition could stay true forever and re-read an
+unchanged file on every sync without ever repairing it.
 
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
@@ -658,7 +667,11 @@ discoverable".
   sessionId, options?)` returns one keyset page of user turns, each with the
   ordered `[{kind, toolUseId, byteLen, isError}]` blocks its message carried.
   Both are cache-only and derived from `session_events`, so they cannot
-  disagree with the transcript. A turn is what arrived on one user message;
+  disagree with the transcript. Both reads a page makes — the turn headers and
+  each turn's blocks — run inside one deferred read transaction, so a sync
+  writing concurrently cannot hand back a header whose blocks have moved or
+  vanished behind a cursor that already advanced past it.
+  A turn is what arrived on one user message;
   harness lines stored as tool results — Claude subagent notifications — are
   not turns and are excluded, because grouping on `role` alone would invent a
   turn that is neither human text nor an in-message result. `approxTokens` is deliberately absent: every

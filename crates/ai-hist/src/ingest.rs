@@ -776,6 +776,35 @@ impl Drop for SyncStateLock {
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
+/// Bump when a parser change needs transcripts an earlier release already
+/// indexed to be re-read once.
+///
+/// The per-session "does this look unparsed?" probes below decide *which*
+/// files a backfill pass re-reads. They cannot decide *whether* a pass is
+/// still owed, because a row they can see may not be a row the local
+/// transcript owns: `session_events` is keyed by `(source, session_id)`, and
+/// local and remote observations of one session share that identity. An
+/// adapter is allowed to contribute a tool result with no fidelity at all, and
+/// re-reading the local transcript never repairs a row that came from
+/// somewhere else -- so "any canonical row is null" is a condition that can
+/// stay true forever, re-reading an unchanged file on every sync.
+///
+/// Recording the generation per provider makes the pass happen exactly once.
+const TOOL_RESULT_FIDELITY_GENERATION: i64 = 1;
+const CLAUDE_FIDELITY_GENERATION_KEY: &str = "claude_tool_result_fidelity";
+const CODEX_FIDELITY_GENERATION_KEY: &str = "codex_tool_result_fidelity";
+
+/// Whether this provider still owes a one-time fidelity backfill pass.
+fn fidelity_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
+    state.get(key).and_then(Value::as_i64).unwrap_or(0) < TOOL_RESULT_FIDELITY_GENERATION
+}
+
+/// Record that the pass finished. Only reached when the walk completed, so an
+/// interrupted sync retries the backfill rather than skipping it.
+fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
+    state.insert(key.to_string(), json!(TOOL_RESULT_FIDELITY_GENERATION));
+}
+
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts", "codex_rollouts_v5"),
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
@@ -1569,6 +1598,7 @@ fn sync_codex_rollouts(
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1623,7 +1653,8 @@ fn sync_codex_rollouts(
                     None => continue,
                     Some(id)
                         if codex_session_events_exist(conn, id)?
-                            && !tool_results_lack_fidelity(conn, "codex", id)? =>
+                            && !(backfill_fidelity
+                                && tool_results_lack_fidelity(conn, "codex", id)?) =>
                     {
                         continue
                     }
@@ -1733,6 +1764,7 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2768,6 +2800,7 @@ fn sync_claude_session_metadata(
         .unwrap_or_default();
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2776,10 +2809,12 @@ fn sync_claude_session_metadata(
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
-            // An unchanged transcript whose tool results predate the fidelity
-            // columns is re-read once to backfill them; afterwards it is
-            // skipped again like any other unchanged file.
-            && !claude_transcript_lacks_tool_result_fidelity(conn, &path)?
+            // During the one-time backfill pass, an unchanged transcript
+            // whose tool results predate the fidelity columns is re-read to
+            // populate them. Outside that pass the stamp alone decides, so a
+            // row this transcript does not own -- an adapter's contribution to
+            // the same session -- cannot pin the file off the fast path.
+            && !(backfill_fidelity && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
         {
             continue;
         }
@@ -2822,6 +2857,7 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
+    record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2884,14 +2920,20 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
 /// hydration or an unrelated edit to the file would ever repair them.
 ///
 /// `event_index` is the field to test: every tool-result row the current
-/// parsers write has one, whatever the payload was, so a re-read always clears
-/// the condition and a transcript cannot be re-read forever. A session with no
-/// tool results has nothing to backfill and stays on the fast path.
+/// parsers write has one, whatever the payload was. A session with no tool
+/// results has nothing to backfill and stays on the fast path.
 ///
-/// This is deliberately narrower than bumping the stamp-map generation, which
-/// would re-read every transcript in the archive, including the ones with
-/// nothing to gain, and would discard the selective-repair state the codex
-/// generations carry.
+/// This only selects which files a backfill pass re-reads; it is not what
+/// ends the pass. `session_events` is keyed by `(source, session_id)` and
+/// local and remote observations of one session share that identity, so a row
+/// this probe sees may be an adapter's contribution that re-reading the local
+/// transcript will never touch. `TOOL_RESULT_FIDELITY_GENERATION` is what
+/// guarantees the work happens once.
+///
+/// Selecting files this way is narrower than bumping the stamp-map
+/// generation, which would re-read every transcript in the archive, including
+/// the ones with nothing to gain, and would discard the selective-repair state
+/// the codex generations carry.
 fn tool_results_lack_fidelity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let lacking: i64 = conn.query_row(
         "SELECT EXISTS(
@@ -6666,8 +6708,14 @@ mod tests {
 
     /// Simulate a database that was synced by a release without the fidelity
     /// columns: the rows and the sync stamps are there, the columns the
-    /// migration added are null. This is exactly the state an upgraded install
-    /// is in on its first `sync`.
+    /// migration added are null, and the sync state carries no backfill
+    /// generation because that release never wrote one. This is exactly the
+    /// state an upgraded install is in on its first `sync`.
+    fn blank_tool_result_fidelity_state(state: &mut Map<String, Value>) {
+        state.remove(super::CLAUDE_FIDELITY_GENERATION_KEY);
+        state.remove(super::CODEX_FIDELITY_GENERATION_KEY);
+    }
+
     fn blank_tool_result_fidelity(conn: &Connection, source: &str) {
         conn.execute(
             "UPDATE session_events SET tool_use_id = NULL, payload_bytes = NULL, \
@@ -6719,6 +6767,7 @@ mod tests {
         );
 
         blank_tool_result_fidelity(&conn, "claude");
+        blank_tool_result_fidelity_state(&mut state);
         // The stamp is unchanged and the events exist, so every other
         // condition on the fast path says "skip". Without the fidelity check
         // this sync is a no-op and the columns stay null indefinitely while
@@ -6774,6 +6823,7 @@ mod tests {
         );
 
         blank_tool_result_fidelity(&conn, "codex");
+        blank_tool_result_fidelity_state(&mut state);
         super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
         let rows = tool_results(&conn, "codex", "sess_backfill");
         assert_eq!(rows.len(), 1);
@@ -6793,6 +6843,78 @@ mod tests {
                 .text
                 .as_deref(),
             Some("sentinel"),
+        );
+    }
+
+    #[test]
+    fn a_contributed_row_without_fidelity_does_not_re_read_the_local_transcript_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-shared.jsonl");
+        let lines = [
+            claude_line(json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "sess-shared",
+                "cwd": "/tmp/project", "timestamp": "2026-04-20T00:00:01.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                      "input": { "command": "ls" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "user", "uuid": "u2", "parentUuid": "a1",
+                "sessionId": "sess-shared", "cwd": "/tmp/project",
+                "timestamp": "2026-04-20T00:00:02.000Z",
+                "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "ok" },
+                ]},
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-shared")[0].payload_bytes,
+            Some(2)
+        );
+
+        // A remote observation of the same session, contributed through the
+        // source-adapter boundary. `session_events` is keyed by
+        // `(source, session_id)`, so it lands beside the local rows -- and the
+        // adapter contract lets it record no fidelity at all. Re-reading the
+        // local transcript can never populate this row, because the local
+        // transcript does not contain it.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sess-shared', 3, 'tool_result', 'tool_result', \
+                     'remote output', 'remote-uid-1')",
+            [],
+        )
+        .unwrap();
+
+        // A sentinel a re-read would overwrite. If the null remote row put the
+        // file back in the backfill set, this sync re-reads it -- and so would
+        // every sync after it, forever, while never repairing the remote row.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source = 'claude' AND event_uid = 'u2:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let local = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='u2:0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, "sentinel",
+            "an unchanged transcript must stay on the fast path even when another \
+             observation of the same session has no fidelity"
         );
     }
 

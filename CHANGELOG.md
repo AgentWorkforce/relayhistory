@@ -28,10 +28,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `session_events_tool_result_fidelity_v1` marker migration, which also adds
   `session_hydration_checkpoints.last_tool_result_index`; a database written
   before this shape is routed through the writable open rather than read as
-  current. Plain `sync` re-reads a transcript once when its indexed tool
-  results have no `event_index`, so an upgraded install backfills them instead
-  of skipping every unchanged file on the stamp fast path and reporting a
-  successful sync over permanently null columns.
+  current. Plain `sync` runs one recorded backfill pass per provider, re-reading
+  a transcript whose indexed tool results have no `event_index`, so an upgraded
+  install backfills them instead of skipping every unchanged file on the stamp
+  fast path and reporting a successful sync over permanently null columns. The
+  pass is bounded by a recorded generation rather than by "a null row exists",
+  because local and remote observations share `(source, session_id)` and an
+  adapter may contribute a tool result with no fidelity that re-reading the
+  local transcript can never repair.
   `HYDRATION_PARSER_VERSION` 2 -> 3.
 
 - Validate submitted `session_events` fidelity on the source-adapter boundary:
@@ -47,7 +51,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
   derived from `session_events` rather than a second table. A turn is what
   arrived on one user message, so harness lines stored as tool results (Claude
-  subagent notifications) are excluded. `approx_tokens` is
+  subagent notifications) are excluded. The turn headers and the per-turn block
+  reads share one deferred read transaction, so a concurrent sync cannot
+  produce a page whose headers and blocks come from different snapshots. `approx_tokens` is
   deliberately not computed — every estimate available here is a
   bytes-per-token heuristic, and one served beside measured values is
   indistinguishable from a measurement at the call site.

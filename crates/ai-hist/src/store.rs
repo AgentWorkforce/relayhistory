@@ -2135,6 +2135,20 @@ pub fn session_user_turns_page(
     after: Option<&SessionEventCursor>,
 ) -> Result<SessionUserTurnPage> {
     let limit = limit.clamp(1, 1_000);
+    // The turn headers and each turn's blocks are separate statements, and a
+    // sync writing to this database between them would hand back a header
+    // whose blocks had moved or vanished -- an empty `blocks` array on a turn
+    // that has them, and a cursor that has already advanced past it. One
+    // deferred read transaction puts every statement on one SQLite snapshot.
+    // WAL readers do not block the writer, so this costs nothing but keeps
+    // the page internally consistent.
+    //
+    // A caller that already holds a transaction supplies the snapshot itself;
+    // opening a nested one would fail outright.
+    let snapshot = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
     let mut sql = format!(
         "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
          MIN(NULLIF(message_id, '')) AS turn_message_id \
@@ -2219,6 +2233,11 @@ pub fn session_user_turns_page(
             id: last.id,
         }
     });
+    // Read-only: nothing to commit, and an explicit rollback releases the
+    // snapshot rather than leaving it to drop order.
+    if let Some(snapshot) = snapshot {
+        snapshot.rollback()?;
+    }
     Ok(SessionUserTurnPage {
         user_turns,
         next_cursor,
@@ -2646,6 +2665,164 @@ mod tests {
             )
             .unwrap();
         assert_eq!(checkpoint_columns, 1);
+    }
+
+    /// Seed two user turns, each with one tool-result block, in a file
+    /// database so a second connection can write to it concurrently.
+    fn seed_two_user_turns(path: &std::path::Path) {
+        let conn = open_db(path).unwrap();
+        for (index, message) in ["m1", "m2"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                  tool_use_id, payload_bytes, event_index, result_status, event_source) \
+                 VALUES ('claude', 's1', ?, ?, 'tool_result', 'tool_result', 'out', ?, \
+                  ?, 3, ?, 'completed', 'tool_result')",
+                rusqlite::params![
+                    message,
+                    (index as i64) + 1,
+                    format!("uid-{message}"),
+                    format!("tu-{message}"),
+                    index as i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_user_turn_page_reads_one_snapshot_even_while_a_sync_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.db");
+        seed_two_user_turns(&path);
+
+        let conn = open_db(&path).unwrap();
+        // Commit a delete from a second connection in the middle of the page
+        // read -- exactly between the header pass and the per-turn block
+        // reads. WAL lets that writer through without blocking the reader, so
+        // without a single snapshot the second turn comes back as a header
+        // with an empty `blocks` array and a cursor already past it.
+        // The write has to land in the window between the header pass and the
+        // per-turn block reads, or it proves nothing: a delete that commits
+        // before the first read is simply an earlier snapshot, which every
+        // implementation reports consistently. So first measure what the
+        // header pass costs in progress ticks, by running that exact query
+        // standalone against the same data.
+        let header_ticks = {
+            let probe = open_db(&path).unwrap();
+            let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let seen = std::rc::Rc::clone(&counter);
+            // `progress_handler` wants a 'static closure; count through a
+            // channel instead of borrowing the local.
+            let (tx, rx) = std::sync::mpsc::channel();
+            probe.progress_handler(
+                1,
+                Some(move || {
+                    let _ = tx.send(());
+                    false
+                }),
+            );
+            let sql = format!(
+                "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
+                 MIN(NULLIF(message_id, '')) AS turn_message_id \
+                 FROM session_events \
+                 WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+                 GROUP BY turn_key ORDER BY turn_ts ASC, turn_id ASC LIMIT ?"
+            );
+            let mut stmt = probe.prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params!["claude", "s1", 101], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            drop(stmt);
+            probe.progress_handler(0, None::<fn() -> bool>);
+            while rx.try_recv().is_ok() {
+                seen.set(seen.get() + 1);
+            }
+            counter.get()
+        };
+        assert!(header_ticks > 0, "the header pass must cost some ticks");
+
+        // Delete on every tick from just past the header pass onwards (the
+        // statement is idempotent). Without a shared snapshot the first of
+        // those ticks falls between the header read and the block reads,
+        // which is precisely the race.
+        let writer_path = path.clone();
+        let tick = std::sync::atomic::AtomicU32::new(0);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                if tick.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= header_ticks {
+                    let writer = Connection::open(&writer_path).unwrap();
+                    writer
+                        .execute("DELETE FROM session_events WHERE message_id = 'm2'", [])
+                        .unwrap();
+                }
+                false
+            }),
+        );
+
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+
+        // Which snapshot the page lands on depends on whether the delete beat
+        // the first read, and either is correct: both turns, or only the one
+        // that survived. What must never happen is the mixture -- a header
+        // built from the old snapshot with blocks read from the new one, which
+        // is a turn reporting itself as having no content at all, behind a
+        // cursor that has already advanced past it.
+        assert!(
+            matches!(page.user_turns.len(), 1 | 2),
+            "unexpected page size: {:?}",
+            page.user_turns,
+        );
+        for turn in &page.user_turns {
+            assert_eq!(
+                turn.blocks.len(),
+                1,
+                "a header must keep the blocks it was built from: {turn:?}"
+            );
+        }
+
+        // The delete really did land, so the assertion above is about the
+        // snapshot and not about a write that never happened.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE message_id = 'm2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn a_user_turn_page_uses_a_callers_transaction_instead_of_nesting_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns-nested.db");
+        seed_two_user_turns(&path);
+
+        let mut conn = open_db(&path).unwrap();
+        // SQLite has no nested transactions, so opening one unconditionally
+        // would turn every call from inside a caller's transaction into an
+        // error. The caller's transaction is already the snapshot.
+        let tx = conn.transaction().unwrap();
+        let page = session_user_turns_page(&tx, "claude", "s1", 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2);
+        tx.rollback().unwrap();
+
+        // A plain call leaves the connection as it found it.
+        assert!(conn.is_autocommit());
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 2);
+        assert!(
+            conn.is_autocommit(),
+            "the read snapshot must be released before returning"
+        );
     }
 
     #[test]
