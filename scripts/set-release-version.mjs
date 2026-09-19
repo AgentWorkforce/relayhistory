@@ -92,9 +92,46 @@ async function setCrateVersion(directory, version) {
 }
 
 /**
- * Set `version`, the seven optional helper pins, the public `ai-hist` peer range
- * and the matching lockfile coordinates for both optional plugins, plus the
- * version of each plugin's Rust crate. Idempotent.
+ * Stamp `version` into the core crate itself: `crates/ai-hist/Cargo.toml` and
+ * its entry in the root `Cargo.lock`. Every plugin crate depends on it by path,
+ * and Cargo compares that manifest's version with the plugin lockfile's entry,
+ * so the two must move together in the same checkout. The publish job stamps
+ * these files too (same version, so this is a no-op there); the helper matrix
+ * and the plugin job run this script on their own checkouts, where nothing else
+ * does. Idempotent.
+ *
+ * @returns the paths written, in order.
+ */
+async function setCoreCrateVersion(root, version) {
+  const written = [];
+  const files = [
+    [
+      resolve(root, "crates", coreCrate, "Cargo.toml"),
+      new RegExp(
+        `(\\[package\\]\\r?\\nname = "${coreCrate}"\\r?\\nversion = ")[^"]+(")`,
+      ),
+    ],
+    [resolve(root, "Cargo.lock"), lockVersionPattern(coreCrate)],
+  ];
+  for (const [path, pattern] of files) {
+    const contents = await readFile(path, "utf8");
+    assert.match(contents, pattern, `${path} has no ${coreCrate} version to set`);
+    await writeFile(
+      path,
+      contents.replace(
+        pattern,
+        (_, prefix, suffix) => prefix + version + suffix,
+      ),
+    );
+    written.push(path);
+  }
+  return written;
+}
+
+/**
+ * Set `version` on the core crate, then the seven optional helper pins, the
+ * public `ai-hist` peer range and the matching lockfile coordinates for both
+ * optional plugins, plus the version of each plugin's Rust crate. Idempotent.
  *
  * @param version stable semver shared with the core release.
  * @param root repository root, so tests can run against a temporary copy.
@@ -106,7 +143,7 @@ export async function setReleaseVersion(version, root = repositoryRoot) {
     releaseVersionPattern,
     `A release version must be stable semver, received ${version}`,
   );
-  const written = [];
+  const written = await setCoreCrateVersion(root, version);
   for (const [plugin, info] of Object.entries(plugins)) {
     const directory = resolve(root, "plugins", plugin, "sdk");
     const manifestPath = resolve(directory, "package.json");
