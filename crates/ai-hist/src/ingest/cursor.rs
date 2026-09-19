@@ -142,33 +142,121 @@ pub(crate) fn pick_tool_target(name: &str, input: &Value) -> Option<String> {
     }
 }
 
+/// One file's slice of a patch that may touch several.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PatchFile {
+    pub path: String,
+    /// Only the lines belonging to this file, so line counts and the stored
+    /// patch are per file rather than per call.
+    pub patch: String,
+}
+
 /// The file named by a patch, from either the `apply_patch` envelope Cursor
 /// uses or a unified-diff header.
+///
+/// This is the *first* file only, and exists for the `tool_calls.target`
+/// column, which names one thing. Anything that records edits must use
+/// [`split_patch_files`]: a single `ApplyPatch` call routinely rewrites
+/// several files, and taking only the first silently drops the rest.
 pub(crate) fn patch_target(patch: &str) -> Option<String> {
-    for line in patch.lines() {
+    split_patch_files(patch).into_iter().next().map(|f| f.path)
+}
+
+/// Every file a patch touches, each with its own slice of the patch text.
+///
+/// Handles both shapes Cursor emits: the `*** Begin Patch` envelope, whose
+/// files are introduced by `*** Update/Add/Delete File:`, and a plain unified
+/// diff, whose files are introduced by a `--- ` / `+++ ` header pair. Lines
+/// before the first header (the envelope preamble) belong to no file and are
+/// dropped, as is a trailing `*** End Patch`.
+pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
+    let lines: Vec<&str> = patch.lines().collect();
+    // Which shape is this? An envelope names its files with `*** … File:`
+    // markers, and inside one a `---`/`+++` pair is ordinary diff content —
+    // a Markdown horizontal rule being replaced, say. Only a patch with no
+    // envelope markers at all is read as a bare unified diff.
+    let envelope = lines.iter().any(|line| {
         let line = line.trim();
-        for marker in [
-            "*** Update File: ",
-            "*** Add File: ",
-            "*** Delete File: ",
-            "*** Move to: ",
-        ] {
+        ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+    });
+    let mut files: Vec<PatchFile> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let raw = lines[index];
+        let line = raw.trim();
+        let mut header: Option<String> = None;
+        for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
             if let Some(rest) = line.strip_prefix(marker) {
                 let rest = rest.trim();
                 if !rest.is_empty() {
-                    return Some(rest.to_string());
+                    header = Some(rest.to_string());
+                }
+                break;
+            }
+        }
+        // A `--- ` line only opens a file when a `+++ ` line follows it;
+        // otherwise it is a removed line of content that happens to start
+        // with three dashes.
+        if !envelope && header.is_none() && line.starts_with("--- ") {
+            if let Some(next) = lines.get(index + 1).map(|next| next.trim()) {
+                if let Some(rest) = next.strip_prefix("+++ ") {
+                    header = Some(unified_diff_path(rest).unwrap_or_else(|| {
+                        unified_diff_path(line.strip_prefix("--- ").unwrap_or_default())
+                            .unwrap_or_default()
+                    }));
                 }
             }
         }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let rest = rest.trim();
-            let rest = rest.strip_prefix("b/").unwrap_or(rest);
-            if !rest.is_empty() && rest != "/dev/null" {
-                return Some(rest.to_string());
+        if let Some(path) = header {
+            if let Some((path, body)) = current.take() {
+                files.push(PatchFile {
+                    path,
+                    patch: body.join("\n"),
+                });
+            }
+            if !path.is_empty() {
+                current = Some((path, vec![raw]));
+                index += 1;
+                continue;
             }
         }
+        if line == "*** End Patch" {
+            if let Some((path, body)) = current.take() {
+                files.push(PatchFile {
+                    path,
+                    patch: body.join("\n"),
+                });
+            }
+            index += 1;
+            continue;
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push(raw);
+        }
+        index += 1;
     }
-    None
+    if let Some((path, body)) = current.take() {
+        files.push(PatchFile {
+            path,
+            patch: body.join("\n"),
+        });
+    }
+    files
+}
+
+/// `b/src/main.rs` and `a/src/main.rs` both name `src/main.rs`; `/dev/null`
+/// names nothing.
+fn unified_diff_path(raw: &str) -> Option<String> {
+    // A unified-diff header may carry a tab-separated timestamp after the path.
+    let path = raw.trim().split('\t').next()?.trim();
+    let path = path
+        .strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path);
+    (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
 }
 
 /// The patch text a Cursor edit tool carried, if it carried one.
@@ -426,6 +514,62 @@ mod tests {
         assert!(is_subagent_tool("Task"));
         assert!(is_subagent_tool("functions.Subagent"));
         assert!(!is_subagent_tool("Shell"));
+    }
+
+    #[test]
+    fn a_patch_is_split_into_one_entry_per_file_it_touches() {
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/a.rs\n\
+                     @@\n-one\n+two\n\
+                     *** Add File: src/b.rs\n\
+                     @@\n+alpha\n+beta\n\
+                     *** Delete File: src/c.rs\n\
+                     @@\n-gone\n\
+                     *** End Patch";
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
+        // Each slice holds only its own file's lines, so per-file counts are
+        // possible at all.
+        assert!(files[1].patch.contains("+alpha"));
+        assert!(!files[1].patch.contains("-one"));
+        assert!(!files[1].patch.contains("-gone"));
+        // The preamble belongs to no file and the terminator is dropped.
+        assert!(!files[0].patch.contains("*** Begin Patch"));
+        assert!(!files[2].patch.contains("*** End Patch"));
+        // `patch_target` still names one thing, for `tool_calls.target`.
+        assert_eq!(patch_target(patch), Some("src/a.rs".to_string()));
+    }
+
+    #[test]
+    fn a_multi_file_unified_diff_splits_on_its_header_pairs() {
+        let patch = "--- a/one.rs\n+++ b/one.rs\n@@\n-x\n+y\n\
+                     --- a/two.rs\n+++ b/two.rs\n@@\n+z\n";
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["one.rs", "two.rs"]
+        );
+        assert!(files[1].patch.contains("+z"));
+        assert!(!files[1].patch.contains("-x"));
+    }
+
+    #[test]
+    fn a_removed_line_of_dashes_does_not_open_a_new_file() {
+        // `--- ` only opens a file when a `+++ ` line follows it; otherwise it
+        // is content that happens to start with three dashes, which is common
+        // in Markdown and YAML.
+        let patch = "*** Begin Patch\n\
+                     *** Update File: notes.md\n\
+                     @@\n--- a horizontal rule\n+++ still content\n\
+                     *** End Patch";
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
     }
 
     #[test]

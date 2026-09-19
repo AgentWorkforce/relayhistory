@@ -429,8 +429,12 @@ How each adapter works:
   `codebase_search`). `Write`, `StrReplace`, `ApplyPatch`, `Delete` and
   `EditNotebook` (plus their namespaced and snake_case spellings) produce
   `file_edits` rows. `ApplyPatch` is the awkward one: its `input` is the patch
-  **text**, not an object, so the file path comes out of the patch header and
+  **text**, not an object, so the file paths come out of the patch headers and
   the line counts come from the same `count_patch_text` the Claude parser uses.
+  One patch routinely rewrites several files, so it produces **one `file_edits`
+  row per file**, each keyed `<tool_use_id>#<path>` and carrying only that
+  file's slice of the patch — the same shape the Codex `patch_apply_end` path
+  uses — under a single `tool_calls` row whose `target` names the first file.
   `StrReplace` carries old/new strings rather than a diff, so its edit is
   recorded with no line counts rather than guessed ones. `Shell` records only
   the command string, so no file is attributed to it.
@@ -445,13 +449,42 @@ How each adapter works:
   which is also when the byte cursor resets. This is what makes a repeat read
   upsert in place instead of duplicating.
 
-  `history` is the one table that cannot be upserted this way: a prompt's
-  identity is `(source, timestamp_ms, prompt)`, and a turn with no readable
-  time is stamped with a file mtime that moves on every append. Targeted
-  hydration therefore rebuilds the session's `history` rows from the file, and
-  plain `sync` inserts prompts only for records at or after the offset it
-  resumed from — except on a read that restarts at offset 0, where it rebuilds
-  them too.
+  Stability *within* a generation is not enough, though, because a rewrite
+  reuses those offsets for different records. Any read that starts at offset 0
+  — a first sight of the file, a Cursor rewrite, or the one re-read a retired
+  state key forces after a parser upgrade — is therefore a **rebuild**: it
+  clears the session's `history`, `session_events`, `tool_calls` and
+  `file_edits` together, inside the writing transaction, before indexing.
+  Upserting on top would leave every row the previous, longer generation wrote
+  past the new end of the file, so the session would keep tool calls and edits
+  it never made. Targeted hydration always re-reads the whole transcript, so it
+  always rebuilds.
+
+  `history` additionally cannot be upserted even within a generation: a
+  prompt's identity is `(source, timestamp_ms, prompt)`, and a turn with no
+  readable time is stamped with a file mtime that moves on every append. Plain
+  `sync` therefore inserts prompts only for records at or after the offset it
+  resumed from, except on a rebuild, where it re-inserts all of them.
+
+  Only newline-terminated records are indexed, matching `CompleteJsonlReader`
+  and `complete_jsonl_records`. A record Cursor has flushed but not yet
+  terminated is left alone: publishing it would put evidence at a byte offset
+  the checkpoint does not consider consumed.
+
+  A transcript that cannot be read — it vanished between the scan and the
+  index, or it is not valid UTF-8 — **fails** the sync. It is not indexed as an
+  empty session. That matters because the rebuild has already deleted the rows
+  it is about to recreate: swallowing the read error would commit an empty
+  session and advance the byte checkpoint past content nobody read. The error
+  rolls the whole transaction back, including the checkpoint, so the next sync
+  retries the same offset.
+
+  A rebuild also **replaces** both ends of `sessions.first_activity_ms` /
+  `last_activity_ms` rather than merging into them. The usual merge widens the
+  window, which is right for an incremental read that saw only the tail — but a
+  `MAX()` can never retract an endpoint an earlier, prompt-only parser derived
+  from the file mtime, because a real recorded timestamp is almost always
+  smaller than it.
 
   ### Timestamps
 
@@ -461,6 +494,13 @@ How each adapter works:
   silent. Shallow discovery reports `first_activity_ms` from the first readable
   turn time and leaves it `null` when the build wrote none, and
   `last_activity_ms` falls back to the mtime.
+
+  A **user** record opens a new turn, so it replaces the inherited time even
+  when it has none of its own; only assistant and tool records inherit. An
+  undated human turn that kept the previous turn's time would be dated to a
+  conversation that had already ended, and — worse — would look dated, so the
+  mtime fallback would never fire and the diagnostic would never be reported
+  for a transcript that plainly needed it.
 
   ### Delegation
 

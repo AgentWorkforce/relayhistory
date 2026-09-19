@@ -3600,19 +3600,99 @@ pub(crate) fn upsert_session(
     last_assistant_text: Option<&str>,
     raw_path: Option<&str>,
 ) -> Result<()> {
+    upsert_session_inner(
+        conn,
+        session_id,
+        source,
+        cwd,
+        git_branch,
+        first_ts,
+        last_ts,
+        last_assistant_text,
+        raw_path,
+        ActivityWindow::Expand,
+    )
+}
+
+/// How an upsert reconciles the activity window it carries with the one the
+/// row already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityWindow {
+    /// Widen the stored window — the default, and right whenever this pass saw
+    /// only part of the session.
+    Expand,
+    /// Replace both endpoints. Only for a caller that just re-read the
+    /// session's *entire* source and is therefore authoritative about both
+    /// ends. A rebuild that expanded instead would keep an endpoint an earlier
+    /// parser derived from the file mtime forever: MAX() can never retract it,
+    /// because a real recorded timestamp is almost always smaller.
+    Replace,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_session_rebuilt(
+    conn: &Connection,
+    session_id: &str,
+    source: &str,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    first_ts: i64,
+    last_ts: i64,
+    last_assistant_text: Option<&str>,
+    raw_path: Option<&str>,
+) -> Result<()> {
+    upsert_session_inner(
+        conn,
+        session_id,
+        source,
+        cwd,
+        git_branch,
+        first_ts,
+        last_ts,
+        last_assistant_text,
+        raw_path,
+        ActivityWindow::Replace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_session_inner(
+    conn: &Connection,
+    session_id: &str,
+    source: &str,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    first_ts: i64,
+    last_ts: i64,
+    last_assistant_text: Option<&str>,
+    raw_path: Option<&str>,
+    window: ActivityWindow,
+) -> Result<()> {
+    let (first_activity, last_activity) = match window {
+        ActivityWindow::Expand => (
+            "first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms)",
+            "last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms)",
+        ),
+        ActivityWindow::Replace => (
+            "first_activity_ms = excluded.first_activity_ms",
+            "last_activity_ms = excluded.last_activity_ms",
+        ),
+    };
     conn.execute(
+        &format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, discovery_state) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'full') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
-         first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms), \
-         last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms), \
+         {first_activity}, \
+         {last_activity}, \
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
          raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
          parser_version = excluded.parser_version, \
-         discovery_state = 'full'",
+         discovery_state = 'full'"
+        ),
         params![
             session_id,
             source,
@@ -3758,15 +3838,13 @@ fn sync_cursor_with_scan_hook(
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
     for transcript in prepared.transcripts {
-        // A transcript read from its start may hold prompts a previous parser
-        // version stamped with the file mtime; those rows cannot be updated in
-        // place because the timestamp is part of their uniqueness key. Rebuild
-        // them from the file, the way the Codex rollout repair does.
+        // A transcript read from its start is a rebuild: its prompts may carry
+        // timestamps a previous parser took from the file mtime, and its
+        // events, tool calls and file edits are keyed on byte offsets from a
+        // generation of the file that no longer exists. Clear all of it and
+        // rebuild from the file, the way the Codex rollout repair does.
         if transcript.restarted {
-            tx.execute(
-                "DELETE FROM history WHERE source = 'cursor' AND session_id = ?",
-                [transcript.session_id.as_str()],
-            )?;
+            clear_cursor_session_evidence(&tx, &transcript.session_id)?;
         }
         let outcome = ingest_cursor_transcript(
             &tx,
@@ -3778,7 +3856,14 @@ fn sync_cursor_with_scan_hook(
         )
         .with_context(|| format!("index Cursor transcript {}", transcript.path.display()))?;
         inserted += outcome.prompts_inserted;
-        upsert_session(
+        // A restarted read saw the whole file, so it owns both endpoints; an
+        // incremental one saw only the tail and may only widen the window.
+        let upsert = if transcript.restarted {
+            upsert_session_rebuilt
+        } else {
+            upsert_session
+        };
+        upsert(
             &tx,
             &transcript.session_id,
             "cursor",
@@ -3959,6 +4044,25 @@ fn prepare_cursor_sync(
     })
 }
 
+/// Drop every row a previous read of this Cursor transcript produced.
+///
+/// Cursor evidence is keyed on the record's byte offset, which is stable only
+/// within one generation of the file. When Cursor rewrites a transcript — or
+/// when a retired state key reopens it at offset 0 — the offsets it produced
+/// before name records that no longer exist there. Upserting the new read on
+/// top leaves those stale rows behind, so a session keeps tool calls and file
+/// edits it never made. Clearing all four tables together, inside the caller's
+/// transaction, is what makes a rebuild a rebuild.
+pub(crate) fn clear_cursor_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
+    for table in ["history", "session_events", "tool_calls", "file_edits"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE source = 'cursor' AND session_id = ?"),
+            [session_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// What one pass over a Cursor transcript established.
 ///
 /// `used_mtime_fallback` is the honest part: Cursor records carry no timestamp
@@ -4017,13 +4121,27 @@ pub(crate) fn ingest_cursor_transcript(
     mtime_ms: i64,
     history_from_offset: u64,
 ) -> Result<CursorTranscriptOutcome> {
-    let text = fs::read_to_string(path).unwrap_or_default();
+    // An unreadable transcript is a failure, not an empty one. Swallowing the
+    // error here would index the session as having no records at all — after
+    // the caller has already deleted the rows it is about to rebuild — and
+    // then let the byte checkpoint advance over content nobody read. The
+    // error propagates so the whole transaction, including the checkpoint
+    // update, rolls back and the next sync retries the same offset.
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read Cursor transcript {}", path.display()))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // The last turn time seen while walking forward, inherited by the records
     // that answer that turn.
     let mut turn_ts: Option<i64> = None;
-    for line in text.split_inclusive('\n') {
+    // Only complete records are indexed, matching `CompleteJsonlReader` and
+    // `complete_jsonl_records`. A transcript Cursor is mid-write has a partial
+    // final line; indexing it would publish a truncated prompt that the next
+    // read replaces at a different byte offset, leaving both.
+    for line in text
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
         let record_offset = offset;
         offset += line.len() as u64;
         let line = line.trim_end_matches(['\n', '\r']);
@@ -4063,8 +4181,15 @@ pub(crate) fn ingest_cursor_transcript(
                     .filter_map(|block| block.get("text").and_then(Value::as_str))
                     .find_map(cursor::timestamp_from_text)
             });
-        if let Some(ts) = record_ts {
-            turn_ts = Some(ts);
+        // A user record opens a new turn, so it *replaces* the inherited time
+        // — including with `None`. Letting an untimed human turn keep the
+        // previous turn's time would date a prompt to a conversation that had
+        // already ended, and would hide the fact that it was undated: the
+        // mtime fallback would never fire and `CURSOR_TIMESTAMP_FROM_MTIME`
+        // would never be reported. Assistant and tool records answer the open
+        // turn, so they only move it when they carry a time of their own.
+        if role == "user" || record_ts.is_some() {
+            turn_ts = record_ts;
         }
         let ts_ms = match turn_ts {
             Some(ts) => ts,
@@ -4221,29 +4346,59 @@ pub(crate) fn ingest_cursor_transcript(
                         ts_ms,
                     )?;
                     if cursor::is_file_edit_tool(&name) {
-                        if let Some(file_path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                "cursor",
-                                session_id,
-                                &message_id,
-                                &tool_use_id,
-                                file_path,
-                                &name,
-                                ts_ms,
-                                None,
-                                project,
-                            )?;
-                            // An edit tool that carried a diff gets its line
-                            // counts from the same counter Claude edits use.
-                            if let Some(patch) = cursor::patch_text(args) {
-                                update_file_edit_from_tool_result(
+                        // One `ApplyPatch` call routinely rewrites several
+                        // files. `file_edits` keys on `tool_use_id`, so each
+                        // path gets its own scoped id and its own slice of the
+                        // patch — the same shape the Codex `patch_apply_end`
+                        // path uses. Taking only the first header, as this
+                        // once did, dropped every later file in the patch.
+                        let patched = cursor::patch_text(args)
+                            .map(cursor::split_patch_files)
+                            .unwrap_or_default();
+                        if patched.is_empty() {
+                            // A non-patch edit tool (Write, StrReplace) names
+                            // exactly one file and carries no diff, so its
+                            // edit keeps the unscoped call id and no line
+                            // counts are invented for it.
+                            if let Some(file_path) = target.as_deref() {
+                                upsert_file_edit_from_call(
                                     conn,
                                     "cursor",
                                     session_id,
                                     &message_id,
                                     &tool_use_id,
-                                    &json!({ "structuredPatch": patch }),
+                                    file_path,
+                                    &name,
+                                    ts_ms,
+                                    None,
+                                    project,
+                                )?;
+                            }
+                        } else {
+                            for file in &patched {
+                                let edit_id = format!("{tool_use_id}#{}", file.path);
+                                upsert_file_edit_from_call(
+                                    conn,
+                                    "cursor",
+                                    session_id,
+                                    &message_id,
+                                    &edit_id,
+                                    &file.path,
+                                    &name,
+                                    ts_ms,
+                                    None,
+                                    project,
+                                )?;
+                                // Line counts come from this file's own slice
+                                // of the patch, through the same counter the
+                                // Claude edits use.
+                                update_file_edit_from_tool_result(
+                                    conn,
+                                    "cursor",
+                                    session_id,
+                                    &message_id,
+                                    &edit_id,
+                                    &json!({ "structuredPatch": file.patch }),
                                     ts_ms,
                                     None,
                                     project,
@@ -6426,6 +6581,505 @@ mod tests {
             .into_iter()
             .map(|event| (event.role, event.kind))
             .collect()
+    }
+
+    /// Write one Cursor transcript verbatim, so a test can control the exact
+    /// bytes — a partial final line, a rewrite, a multi-file patch.
+    fn write_cursor_transcript(root: &Path, session_id: &str, body: &str) -> PathBuf {
+        let transcript = root
+            .join(".cursor/projects/home-dev-demo/agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, body).unwrap();
+        transcript
+    }
+
+    fn cursor_row_count(conn: &Connection, table: &str, session_id: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE source = 'cursor' AND session_id = ?"),
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Group A. An unreadable transcript must abort the read, not index the
+    /// session as empty after its rows have already been deleted.
+    ///
+    /// Positive control: with `read_to_string(...).unwrap_or_default()` this
+    /// returned `Ok` with an empty outcome, and the assertion below failed
+    /// with `expected an error, indexed 0 records instead`.
+    #[test]
+    fn an_unreadable_cursor_transcript_fails_the_read_instead_of_indexing_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // A transcript that vanished between the scan and the read.
+        let missing = dir.path().join("gone/gone.jsonl");
+        let error = super::ingest_cursor_transcript(&conn, &missing, "s-gone", None, 1, 0)
+            .err()
+            .unwrap_or_else(|| panic!("expected an error for a vanished transcript"));
+        assert!(
+            format!("{error:#}").contains("read Cursor transcript"),
+            "the failure must name the transcript it could not read: {error:#}"
+        );
+
+        // A transcript that is not UTF-8 — Cursor writes UTF-8, so this is a
+        // corrupt or truncated multi-byte write, not an empty session.
+        let binary = dir.path().join("bin/bin.jsonl");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, [0x7b, 0xff, 0xfe, 0x0a]).unwrap();
+        let error = super::ingest_cursor_transcript(&conn, &binary, "s-bin", None, 1, 0)
+            .err()
+            .unwrap_or_else(|| panic!("expected an error for a non-UTF-8 transcript"));
+        assert!(
+            format!("{error:#}").contains("read Cursor transcript"),
+            "{error:#}"
+        );
+    }
+
+    /// Group A, at the sync boundary: the failure must roll the transaction
+    /// back, so the deleted rows return and the byte checkpoint does not move
+    /// past content nobody read.
+    ///
+    /// Positive control: before the fix this test failed at the first
+    /// assertion with `left: 0, right: 1` — the session's history had been
+    /// deleted, the empty read committed, and the checkpoint advanced.
+    #[test]
+    fn a_failed_cursor_read_rolls_back_the_delete_and_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-fail",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>seed</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 1);
+        let committed = state.clone();
+        assert_eq!(cursor_row_count(&conn, "history", "s-fail"), 1);
+
+        // Rewrite the file so the next sync restarts it, and add a second
+        // transcript that sorts after it. The scan hook fires per transcript
+        // *before* that transcript is opened, so deleting the first one while
+        // the second is being prepared leaves the first already scanned and
+        // checkpointed but unreadable when the write phase indexes it — the
+        // exact window this defect lived in.
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-later",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:45 PM (UTC-4)</timestamp><user_query>later</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>second</user_query>"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut next = state.clone();
+        let error = super::sync_cursor_with_scan_hook(&conn, &mut next, &root, &mut |path| {
+            if path == later {
+                fs::remove_file(&transcript).unwrap();
+            }
+        })
+        .expect_err("an unreadable transcript must fail the Cursor sync");
+        assert!(
+            format!("{error:#}").contains("index Cursor transcript"),
+            "{error:#}"
+        );
+
+        // The seeded prompt survives: the delete was inside the transaction
+        // that rolled back.
+        assert_eq!(
+            cursor_row_count(&conn, "history", "s-fail"),
+            1,
+            "a failed read must not leave the session's history deleted"
+        );
+        // And the caller's state map is untouched, so the next sync retries.
+        assert_eq!(state, committed);
+    }
+
+    /// Group B. A rewritten transcript reuses byte offsets, so the rows an
+    /// earlier generation wrote past the new end of the file must go.
+    ///
+    /// Positive control: with only `history` cleared this failed with
+    /// `stale tool calls survived the rewrite: left: 3, right: 1` — the two
+    /// tool calls from the longer first generation were still attributed to
+    /// the session.
+    #[test]
+    fn rewriting_a_cursor_transcript_clears_the_evidence_keyed_on_the_old_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"a.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"b.rs"}}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-rewrite", long);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rewrite"), 2);
+        assert_eq!(cursor_row_count(&conn, "file_edits", "s-rewrite"), 2);
+
+        // Cursor rewrites the transcript shorter. The old offsets now name
+        // records that are not in the file.
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>only</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"c.rs"}}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        assert_eq!(
+            cursor_row_count(&conn, "tool_calls", "s-rewrite"),
+            1,
+            "stale tool calls survived the rewrite"
+        );
+        let edits = crate::session_file_edits(&conn, "s-rewrite", Some("cursor")).unwrap();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|e| e.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c.rs"],
+            "the session kept file edits it never made"
+        );
+        let events = crate::session_events(&conn, "s-rewrite", Some("cursor")).unwrap();
+        assert_eq!(events.len(), 2, "stale events survived the rewrite");
+    }
+
+    /// Group B, targeted hydration: the same rebuild guarantee.
+    ///
+    /// Positive control: before the fix this failed with
+    /// `left: 3, right: 1` on the tool_calls count.
+    #[test]
+    fn re_hydrating_a_rewritten_cursor_transcript_clears_the_old_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-rehydrate",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"a.rs"}}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"b.rs"}}]}}"#,
+                "\n"
+            ),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rehydrate"), 2);
+
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>only</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"c.rs"}}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        // What targeted hydration does around the parser.
+        super::clear_cursor_session_evidence(&conn, "s-rehydrate").unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0).unwrap();
+
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rehydrate"), 1);
+        assert_eq!(cursor_row_count(&conn, "file_edits", "s-rehydrate"), 1);
+        assert_eq!(cursor_row_count(&conn, "history", "s-rehydrate"), 1);
+    }
+
+    /// Group C. An untimed human turn opens a new turn with no time; it must
+    /// not inherit the previous turn's.
+    ///
+    /// Positive control: with `if let Some(ts) = record_ts { turn_ts = ... }`
+    /// this failed at `used_mtime_fallback` (`false`, expected `true`) and the
+    /// second prompt was dated 1789587420000 — the first turn's time — so
+    /// `CURSOR_TIMESTAMP_FROM_MTIME` was never reported for a transcript that
+    /// plainly needed it.
+    #[test]
+    fn an_untimed_cursor_turn_does_not_inherit_the_previous_turns_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-untimed",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>timed turn</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"answering the timed turn"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"untimed turn"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"answering the untimed turn"}]}}"#,
+                "\n"
+            ),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let outcome =
+            super::ingest_cursor_transcript(&conn, &transcript, "s-untimed", None, 7_777, 0)
+                .unwrap();
+
+        assert!(
+            outcome.used_mtime_fallback,
+            "an undated turn must set the mtime fallback so the diagnostic fires"
+        );
+        let events = crate::session_events(&conn, "s-untimed", Some("cursor")).unwrap();
+        let by_text: Vec<(i64, &str)> = events
+            .iter()
+            .map(|event| (event.ts_ms, event.text.as_deref().unwrap_or("")))
+            .collect();
+        assert!(
+            by_text.contains(&(7_777, "untimed turn")),
+            "the undated prompt must take the mtime, not the earlier turn's time: {by_text:?}"
+        );
+        assert!(
+            by_text.contains(&(7_777, "answering the untimed turn")),
+            "the reply to an undated turn inherits the undated turn: {by_text:?}"
+        );
+        assert!(
+            by_text.contains(&(1_789_587_420_000, "answering the timed turn")),
+            "a reply still inherits a turn that does have a time: {by_text:?}"
+        );
+        // The window reports only what was actually recorded.
+        assert_eq!(outcome.first_ts_ms, Some(1_789_587_420_000));
+        assert_eq!(outcome.last_ts_ms, Some(1_789_587_420_000));
+    }
+
+    /// Group D. Only newline-terminated records may be indexed, matching
+    /// `CompleteJsonlReader` and `complete_jsonl_records`.
+    ///
+    /// The interesting case is a final record that is *already valid JSON* but
+    /// whose newline has not landed yet — a truncated one is skipped anyway by
+    /// the parse guard, so it proves nothing. The byte checkpoint does not
+    /// consider an unterminated record consumed, and `records_parsed` does not
+    /// count it; a parser that indexes it publishes evidence at an offset the
+    /// checkpoint has not covered, and the row then has to be reconciled
+    /// against whatever Cursor actually appends after it.
+    ///
+    /// Positive control: without the `ends_with('\n')` filter this failed at
+    /// the first assertion with `left: 2, right: 1` — the unterminated record
+    /// was indexed as if it were complete.
+    #[test]
+    fn a_cursor_record_without_its_newline_is_not_indexed_until_it_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let complete = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>done</user_query>"}]}}"#,
+            "\n"
+        );
+        // Valid JSON, no trailing newline: Cursor has flushed the object but
+        // not yet terminated the line.
+        let unterminated = r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>still writing</user_query>"}]}}"#;
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-partial",
+            &format!("{complete}{unterminated}"),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let outcome =
+            super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0).unwrap();
+        assert_eq!(
+            cursor_row_count(&conn, "history", "s-partial"),
+            1,
+            "a record whose newline has not landed must not be published"
+        );
+        // The parser agrees with the reader that only one record exists.
+        assert_eq!(outcome.records, 1);
+
+        // Cursor terminates the line. Now it is indexed, exactly once, at the
+        // byte offset the checkpoint covers.
+        fs::write(&transcript, format!("{complete}{unterminated}\n")).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0).unwrap();
+        let prompts: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'cursor' ORDER BY timestamp_ms")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["done".to_string(), "still writing".to_string()]
+        );
+    }
+
+    /// Group E. A full rebuild owns both ends of the activity window, so an
+    /// endpoint an earlier parser took from the file mtime must be replaced.
+    ///
+    /// Positive control: through `upsert_session`'s MAX() merge this failed
+    /// with `left: 7000000000000, right: 1789587660000` — the mtime endpoint
+    /// the prompt-only parser had written outlived the rebuild, because MAX()
+    /// can never retract it.
+    #[test]
+    fn a_full_cursor_rebuild_replaces_a_stale_mtime_activity_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-window");
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the prompt-only parser left: both endpoints at the file mtime.
+        super::upsert_session(
+            &conn,
+            "s-window",
+            "cursor",
+            Some("/home/dev/demo"),
+            None,
+            7_000_000_000_000,
+            7_000_000_000_000,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let (first, last): (i64, i64) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 's-window'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, 1_789_587_420_000);
+        assert_eq!(
+            last, 1_789_587_660_000,
+            "a rebuild must replace a stale mtime endpoint, not merge under it"
+        );
+    }
+
+    /// Group E, the other half: an incremental read saw only the tail, so it
+    /// may only widen the window.
+    #[test]
+    fn an_incremental_cursor_read_still_widens_rather_than_replaces_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_turn = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-grow", first_turn);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        // Append a later turn; the sync resumes mid-file.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>second</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let (first, last): (i64, i64) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 's-grow'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            first, 1_789_587_420_000,
+            "an incremental read must not drop the start it never re-read"
+        );
+        assert_eq!(last, 1_789_587_660_000);
+    }
+
+    /// Group F. One `ApplyPatch` call can rewrite several files; each needs
+    /// its own `file_edits` identity and its own line counts, under one
+    /// `tool_calls` row.
+    ///
+    /// Positive control: taking only the first `*** Update File:` header this
+    /// failed with `left: ["src/a.rs"], right: ["src/a.rs", "src/b.rs",
+    /// "src/c.rs"]` — two of the three files the patch wrote were lost.
+    #[test]
+    fn a_multi_file_apply_patch_records_one_edit_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = "*** Begin Patch\\n\
+                     *** Update File: src/a.rs\\n\
+                     @@\\n-one\\n+two\\n\
+                     *** Add File: src/b.rs\\n\
+                     @@\\n+alpha\\n+beta\\n+gamma\\n\
+                     *** Delete File: src/c.rs\\n\
+                     @@\\n-gone\\n\
+                     *** End Patch";
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-multi",
+            &format!(
+                concat!(
+                    r#"{{"role":"user","message":{{"content":[{{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>refactor</user_query>"}}]}}}}"#,
+                    "\n",
+                    r#"{{"role":"assistant","message":{{"content":[{{"type":"tool_use","name":"ApplyPatch","input":"{patch}"}}]}}}}"#,
+                    "\n"
+                ),
+                patch = patch
+            ),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-multi", None, 1, 0).unwrap();
+
+        // One call, three edits.
+        let calls = crate::session_tool_calls(&conn, "s-multi", Some("cursor")).unwrap();
+        assert_eq!(calls.len(), 1, "a patch is one tool call");
+        assert_eq!(calls[0].name, "ApplyPatch");
+
+        let edits = crate::session_file_edits(&conn, "s-multi", Some("cursor")).unwrap();
+        let mut touched: Vec<&str> = edits.iter().map(|e| e.file_path.as_str()).collect();
+        touched.sort_unstable();
+        assert_eq!(touched, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+
+        // Each file's counts come from its own slice of the patch, not from
+        // the whole call.
+        let counts = |path: &str| {
+            let edit = edits.iter().find(|e| e.file_path == path).unwrap();
+            (edit.lines_added, edit.lines_removed)
+        };
+        assert_eq!(counts("src/a.rs"), (Some(1), Some(1)));
+        assert_eq!(counts("src/b.rs"), (Some(3), Some(0)));
+        assert_eq!(counts("src/c.rs"), (Some(0), Some(1)));
+        // And each stores only its own patch text.
+        let b = edits.iter().find(|e| e.file_path == "src/b.rs").unwrap();
+        let stored = b.structured_patch_json.as_deref().unwrap();
+        assert!(stored.contains("src/b.rs"), "{stored}");
+        assert!(!stored.contains("src/a.rs"), "{stored}");
     }
 
     #[test]

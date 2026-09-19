@@ -1568,16 +1568,19 @@ fn ingest_cursor(
         .and_then(|s| s.to_str())
         .map(decode_cursor_project);
     let mtime_ms = file_modified_ms(path).unwrap_or(0);
-    // Re-index the whole transcript. Every evidence row is keyed on the
-    // record's byte offset, so a repeat hydration upserts in place instead of
-    // duplicating, and a parser upgrade repairs the rows it already wrote.
-    // `history` is the exception — a prompt's identity includes its timestamp,
-    // and a turn with no readable time is stamped with a mtime that moves — so
-    // the session's prompts are rebuilt from the file rather than merged into.
-    conn.execute(
-        "DELETE FROM history WHERE source = 'cursor' AND session_id = ?",
-        params![options.session_id],
-    )?;
+    // Targeted hydration always re-reads the whole transcript, so it is a
+    // rebuild: clear every row a previous read left before writing the new
+    // one. Upserting on top is not enough. Cursor evidence is keyed on the
+    // record's byte offset, and a rewritten transcript reuses those offsets
+    // for different records, so the rows an earlier generation wrote past the
+    // new end of the file would survive as tool calls and edits this session
+    // never made. `history` cannot be upserted at all, because a prompt's
+    // identity includes a timestamp an earlier parser took from the mtime.
+    //
+    // The read happens inside the caller's transaction, and it propagates its
+    // error, so a transcript that has vanished or turned unreadable since the
+    // snapshot rolls this delete back rather than committing an empty session.
+    clear_cursor_session_evidence(conn, &options.session_id)?;
     let outcome = ingest_cursor_transcript(
         conn,
         path,
@@ -1586,7 +1589,10 @@ fn ingest_cursor(
         mtime_ms,
         0,
     )?;
-    upsert_session(
+    // Authoritative about both ends of the window, having just read the whole
+    // file: an expanding merge would keep a mtime endpoint an earlier parser
+    // wrote, which MAX() can never retract.
+    upsert_session_rebuilt(
         conn,
         &options.session_id,
         "cursor",
