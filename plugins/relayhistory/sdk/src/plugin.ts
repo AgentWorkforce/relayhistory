@@ -435,7 +435,22 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
         'relationship',
         'commit_link',
       ] as const;
-      const covered = allowed.filter((kind) => rows.some((row) => row.kind === kind));
+      // What the export examined, not what it happened to contain. This read
+      // is the complete delivered history for the session, so once it yields
+      // any supported evidence every supported kind was looked at, and a kind
+      // with no rows means the session has none of it. Declaring coverage from
+      // row presence instead reported a normal session with no file edits or
+      // delegation as `partial` and cost it priority in a merge. `records`
+      // below still carries only the rows that exist.
+      //
+      // An export with nothing of any supported kind stays uncovered: a read
+      // that yielded no evidence has not shown it examined anything here, and
+      // the caller gets `capability_limited` rather than a complete-looking
+      // snapshot over nothing.
+      const examined = rows.some((row) => (allowed as readonly string[]).includes(row.kind));
+      const covered = !examined
+        ? []
+        : allowed.filter((kind) => kind !== 'relationship' || context.includeRelated !== false);
       const records = canonicalDeliveredEvidence(rows)
         .filter(
           (row) =>

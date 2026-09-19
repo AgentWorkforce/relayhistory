@@ -73,6 +73,14 @@ Claude or Codex session hydrated that way reports `partial`. That is the
 difference between "this session has no delegation" and "nothing looked"; the
 diagnostic says which by naming `include_related`.
 
+A source plugin declares its own `coverage` the same way, and the same
+distinction applies to it: `covered_kinds` names what the acquisition
+*examined*, so a complete export of a session that has no file edits still
+covers `file_edit` and reports `full`. A connector also receives
+`includeRelated` and must omit `relationship` from both its coverage and its
+records when it is `false` -- otherwise a `scope: 'all'` merge would union the
+kind back in and report `full` despite the opt-out.
+
 `discoveryState` stays `full` for that row: it records that the session was
 indexed through its recorded source stamp, which is what the unchanged
 short-circuit reads. A parser upgrade still forces a re-parse, because the

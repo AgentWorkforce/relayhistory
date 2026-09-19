@@ -180,7 +180,12 @@ export async function discoverSourcePlugins(
 export async function hydrateSourcePlugin(
   connector: HistorySource,
   identity: { source: CatalogSource; sessionId: string },
-  options: { dbPath?: string; signal?: AbortSignal; acquisitionTimeoutMs?: number } = {},
+  options: {
+    dbPath?: string;
+    signal?: AbortSignal;
+    acquisitionTimeoutMs?: number;
+    includeRelated?: boolean;
+  } = {},
 ) {
   sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
   throwIfSourceAborted(options.signal);
@@ -201,7 +206,12 @@ export async function hydrateSourcePlugin(
   let snapshot;
   try {
     snapshot = await acquire(
-      (signal, acquisitionTimeoutMs) => connector.hydrate(state.observation!, { signal, acquisitionTimeoutMs }),
+      // `includeRelated` is part of the request, not of the transport: a
+      // connector that keeps acquiring delegation evidence would reinstate,
+      // through the merge union, the kind the local path dropped.
+      (signal, acquisitionTimeoutMs) => connector.hydrate(state.observation!, {
+        signal, acquisitionTimeoutMs, includeRelated: options.includeRelated,
+      }),
       options,
     );
   } catch (error) {
