@@ -1,5 +1,6 @@
 import { nativeCall } from './native.js';
 import {
+  SESSION_HYDRATION_CONTRACT_VERSION,
   RelayHistoryError,
   AuthenticationExpiredError,
   SessionNotFoundError,
@@ -214,7 +215,7 @@ export async function hydrateSourcePlugin(
     snapshot.records.length === 0
   )
     return {
-      contract_version: 2,
+      contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
       source: identity.source,
       session_id: identity.sessionId,
       status: 'capability_limited',
@@ -223,6 +224,8 @@ export async function hydrateSourcePlugin(
       presence: connector.location,
       indexed_through: { source_stamp: null, last_event_at_ms: null },
       evidence: { prompts: 0, events: 0, tool_calls: 0, file_edits: 0, related_sessions: 0 },
+      // A listing-only connector covers nothing; it is not a partial parse.
+      coverage: [],
       related_session_ids: [],
       diagnostics: [
         {

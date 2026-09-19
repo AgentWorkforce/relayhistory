@@ -5,11 +5,13 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
-  InvalidArgumentError, SESSION_EVIDENCE_CONTRACT_VERSION,
+  EVIDENCE_KINDS, FULL_SESSION_KINDS, InvalidArgumentError, NativeContractMismatchError,
+  SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
   getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls, getSessionToolCallsPage,
-  parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
+  hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
+import { normalizeHydration } from './normalization.js';
 
 // Undated tool calls and file edits are legal — both `ts_ms` columns are
 // nullable — but no provider adapter writes one, so the only way to build the
@@ -41,7 +43,9 @@ const CODEX_ROLLOUT = [
   { timestamp: '2026-08-30T11:00:04.000Z', type: 'event_msg', payload: { type: 'patch_apply_end', call_id: 'call_2', success: true, changes: { '/work/codex/a.rs': { type: 'update', unified_diff: '@@\n+one\n-zero' }, '/work/codex/b.rs': { type: 'update', unified_diff: '@@\n+two' } } } },
 ];
 
-async function seededDatabase(): Promise<{ dbPath: string; cleanup: () => Promise<void> }> {
+async function seededDatabase(): Promise<{
+  dbPath: string; home: string; cleanup: () => Promise<void>;
+}> {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-evidence-'));
   const home = join(root, 'home');
   const claude = join(home, '.claude', 'projects', 'work-app');
@@ -60,7 +64,7 @@ async function seededDatabase(): Promise<{ dbPath: string; cleanup: () => Promis
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
   }
-  return { dbPath, cleanup: () => rm(root, { recursive: true, force: true }) };
+  return { dbPath, home, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
 test('tool call pages expose structured arguments, errors, and identity', async () => {
@@ -284,6 +288,59 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
   } finally {
     await cleanup();
   }
+});
+
+test('hydration reports coverage alongside a capability computed from it', async () => {
+  const { dbPath, home, cleanup } = await seededDatabase();
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const hydrated = await hydrateSession({ source: 'claude', sessionId: SHARED_SESSION, dbPath });
+    assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
+    assert.equal(SESSION_HYDRATION_CONTRACT_VERSION, 3);
+    assert.equal(hydrated.capability, 'full');
+    assert.deepEqual(hydrated.coverage, [...FULL_SESSION_KINDS]);
+    for (const kind of hydrated.coverage) {
+      assert.ok((EVIDENCE_KINDS as readonly string[]).includes(kind), `${kind} is a known kind`);
+    }
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+    await cleanup();
+  }
+});
+
+test('a native full capability unsupported by its coverage is a contract mismatch, not a value', () => {
+  const base = {
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'cursor', sessionId: 's', status: 'hydrated',
+    capability: 'full', discoveryState: 'full', presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    evidence: { prompts: 1, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
+    relatedSessionIds: [], diagnostics: [],
+  };
+  // Exactly the defect contract 3 removes: a well-formed result asserting
+  // `full` over evidence kinds nothing looked at must not reach a caller.
+  assert.throws(
+    () => normalizeHydration({ ...base, coverage: ['history'] }),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.code === 'NATIVE_CONTRACT_MISMATCH',
+  );
+  assert.throws(
+    () => normalizeHydration({ ...base, capability: 'partial', coverage: ['prompts'] }),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.message.includes('prompts'),
+  );
+  assert.equal(
+    normalizeHydration({ ...base, coverage: [...FULL_SESSION_KINDS] }).capability,
+    'full',
+  );
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
+    ['history'],
+  );
 });
 
 test('unparseable stored JSON yields null without discarding the raw string', () => {

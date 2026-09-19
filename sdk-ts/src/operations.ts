@@ -22,6 +22,9 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  EVIDENCE_KINDS,
+  EvidenceKind,
+  FULL_SESSION_KINDS,
   defaultDbPath,
   Source,
   CatalogSource,
@@ -953,6 +956,12 @@ function combineHydration(
       fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
       relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
     },
+    // The merged result reports both presences' evidence, so it covers the
+    // union of what each one could index -- taking only the winner's coverage
+    // would understate a merge whose other half indexed a kind it does not.
+    coverage: EVIDENCE_KINDS.filter(
+      (kind) => previous.coverage.includes(kind) || next.coverage.includes(kind),
+    ),
     relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
     diagnostics: [...previous.diagnostics, ...next.diagnostics],
   };

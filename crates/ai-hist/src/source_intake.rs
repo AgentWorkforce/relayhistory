@@ -238,6 +238,9 @@ pub(crate) fn apply_normalized(
     let full = FULL_SESSION_KINDS
         .iter()
         .all(|kind| own.covered_kinds.contains(kind));
+    // What this connector actually reported covering, reported onward as the
+    // hydration result's `coverage`.
+    let coverage = own.covered_kinds.clone();
     snapshots.insert(owner(key), own);
     let mut union = BTreeMap::new();
     let mut managed = BTreeSet::new();
@@ -292,6 +295,7 @@ pub(crate) fn apply_normalized(
         },
         if full { "full" } else { "partial" },
         if full { "full" } else { "shallow" },
+        coverage,
         evidence.source_stamp,
         evidence.source_bytes,
         evidence.records.len() as i64,

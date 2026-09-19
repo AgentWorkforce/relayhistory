@@ -4,6 +4,9 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  EVIDENCE_KINDS,
+  EvidenceKind,
+  FULL_SESSION_KINDS,
   Source,
   CatalogSource,
   CATALOG_SOURCES,
@@ -441,6 +444,29 @@ export function evidenceIdentity(source: unknown, sessionId: unknown, operation:
  * only meaningful against 'release'.
  */
 
+/**
+ * Validate the reported coverage rather than cast it: an unknown kind is a
+ * native contract mismatch, not a value to hand a caller that will branch on it.
+ */
+function hydrationCoverage(value: unknown): EvidenceKind[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new NativeContractMismatchError(
+      'ai-hist-native returned a non-list hydration coverage.',
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value.map((kind) => {
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(String(kind))) {
+      throw new NativeContractMismatchError(
+        `ai-hist-native returned an unknown evidence kind: ${String(kind)}.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    return String(kind) as EvidenceKind;
+  });
+}
+
 export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   const contractVersion = Number(value.contractVersion);
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
@@ -461,6 +487,18 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   }
   const indexed = (value.indexedThrough ?? {}) as UnknownRecord;
   const evidence = (value.evidence ?? {}) as UnknownRecord;
+  const coverage = hydrationCoverage(value.coverage);
+  // A `full` capability the coverage does not support is the exact defect
+  // contract 3 exists to remove; surface it as a mismatch rather than pass it on.
+  if (
+    String(value.capability) === 'full' &&
+    !FULL_SESSION_KINDS.every((kind) => coverage.includes(kind))
+  ) {
+    throw new NativeContractMismatchError(
+      'ai-hist-native reported full hydration capability without full evidence coverage.',
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
   return {
     contractVersion,
     source: String(value.source) as CatalogSource,
@@ -480,6 +518,7 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
       fileEdits: Number(evidence.fileEdits),
       relatedSessions: Number(evidence.relatedSessions),
     },
+    coverage,
     relatedSessionIds: Array.isArray(value.relatedSessionIds)
       ? value.relatedSessionIds.map(String)
       : [],

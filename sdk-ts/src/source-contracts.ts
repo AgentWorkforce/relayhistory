@@ -1,4 +1,4 @@
-import type { CatalogSource, SessionLocation } from './sdk-common.js';
+import type { CatalogSource, EvidenceKind, SessionLocation } from './sdk-common.js';
 /** Native JSON intake uses stored snake_case fields; no SQL crosses this API. */
 export interface SourceObservationKey {
   source: string;
@@ -28,13 +28,8 @@ export interface ShallowSourceSession {
   source_stamp?: string | null;
   [field: string]: unknown;
 }
-export type AcquiredEvidenceKind =
-  | 'history'
-  | 'session_event'
-  | 'tool_call'
-  | 'file_edit'
-  | 'relationship'
-  | 'commit_link';
+/** The same closed set as {@link EvidenceKind}; kept as its acquisition-side name. */
+export type AcquiredEvidenceKind = EvidenceKind;
 export interface SourceEvidenceSnapshot {
   source_stamp: string;
   source_bytes: number;

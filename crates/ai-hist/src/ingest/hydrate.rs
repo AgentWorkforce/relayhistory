@@ -2,12 +2,18 @@
 
 use super::*;
 use crate::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
+use crate::source_evidence::EvidenceKind;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::time::Instant;
 
-pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
+/// Bumped to 3 when `capability` stopped being the literal `"full"` for every
+/// local hydration and `coverage` was added: a consumer ranking merges on
+/// `capability` now gets an answer computed from the evidence kinds the
+/// selected provider's parser actually produces, and can see which kinds
+/// those are.
+pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
@@ -51,11 +57,19 @@ pub struct HydrateSessionResult {
     pub source: String,
     pub session_id: String,
     pub status: String,
+    /// `full` only when every kind in [`FULL_SESSION_KINDS`] is covered.
+    /// Derived from [`coverage`](Self::coverage), never asserted.
     pub capability: String,
     pub discovery_state: String,
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// The evidence kinds this hydration can have indexed, in canonical order.
+    /// For a local session it is the provider adapter's declared coverage; for
+    /// an acquired snapshot it is the connector's reported `covered_kinds`. A
+    /// zero count for a *covered* kind means the session has none of it; an
+    /// absent kind means nothing here ever looked.
+    pub coverage: Vec<EvidenceKind>,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -456,6 +470,7 @@ fn remote_limited_result(
         presence: "remote".to_string(),
         indexed_through: HydrationIndexedThrough::default(),
         evidence,
+        coverage: Vec::new(),
         related_session_ids,
         diagnostics: vec![HydrationDiagnostic {
             code: code.to_string(),
@@ -519,6 +534,7 @@ fn hydrate_remote_claude_observed(
             "unchanged",
             "full",
             "full",
+            crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
             source_stamp,
             source_bytes,
             records.len() as i64,
@@ -622,6 +638,7 @@ fn hydrate_remote_claude_observed(
         },
         "full",
         "full",
+        crate::source_evidence::FULL_SESSION_KINDS.to_vec(),
         source_stamp,
         source_bytes,
         records.len() as i64,
@@ -750,6 +767,8 @@ fn hydrate_remote_codex_diff_observed(
         },
         "partial",
         "shallow",
+        // The cloud task exposes its diff and nothing else.
+        vec![EvidenceKind::FileEdit],
         source_stamp,
         source_bytes,
         1,
@@ -911,6 +930,7 @@ pub(crate) fn build_remote_result(
     status: &str,
     capability: &str,
     discovery_state: &str,
+    coverage: Vec<EvidenceKind>,
     source_stamp: String,
     source_bytes: i64,
     records_parsed: i64,
@@ -948,6 +968,7 @@ pub(crate) fn build_remote_result(
             &ids,
             related_session_ids.len() as u64,
         )?,
+        coverage,
         related_session_ids,
         diagnostics: vec![HydrationDiagnostic {
             code: diagnostic_code.to_string(),
@@ -1633,22 +1654,71 @@ fn build_result(
             &options.session_id,
         )?);
     }
+    // Declared coverage, not a literal: a provider whose local parser only
+    // reads prompts has not produced the other four kinds no matter how
+    // cleanly the pass completed, and reporting `full` for it is a well-formed
+    // answer computed over nothing.
+    let coverage = crate::discover::declared_evidence_kinds(&options.source).to_vec();
+    let missing = crate::discover::missing_evidence_kinds(&options.source);
+    if !missing.is_empty() {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
+            message: format!(
+                "{} local evidence covers {}; no local parser produces {}",
+                options.source,
+                if coverage.is_empty() {
+                    "no evidence kinds".to_string()
+                } else {
+                    crate::source_evidence::join_kinds(&coverage)
+                },
+                crate::source_evidence::join_kinds(&missing),
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
         session_id: options.session_id.clone(),
         status: status.to_string(),
-        capability: "full".to_string(),
-        discovery_state: "full".to_string(),
+        capability: if missing.is_empty() {
+            "full"
+        } else {
+            "partial"
+        }
+        .to_string(),
+        // The catalog row's own value, so the reported state cannot disagree
+        // with the one the unchanged short-circuit reads back.
+        discovery_state: stored_discovery_state(conn, &options.source, &options.session_id)?,
         presence: "local".to_string(),
         indexed_through: HydrationIndexedThrough {
             source_stamp: Some(snapshot.stamp),
             last_event_at_ms,
         },
         evidence,
+        coverage,
         related_session_ids,
         diagnostics,
     })
+}
+
+/// The `discovery_state` actually stored on the catalog row.
+///
+/// `full` here means "indexed through the recorded source stamp", which is a
+/// different question from how many evidence kinds the provider can produce —
+/// that is `capability`. A row with no value has not been deep-indexed.
+fn stored_discovery_state(conn: &Connection, source: &str, session_id: &str) -> Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE source = ? AND session_id = ?",
+            params![source, session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or_else(|| "shallow".to_string()))
 }
 
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
@@ -1802,6 +1872,7 @@ pub(crate) fn hydrate_with_provider(
                 "capability_limited",
                 "shallow_only",
                 &observation.discovery_state,
+                Vec::new(),
                 observation.source_stamp.clone().unwrap_or_default(),
                 0,
                 0,
@@ -1967,6 +2038,7 @@ pub fn normalize_source_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_evidence::FULL_SESSION_KINDS;
     use std::io::Write;
 
     #[test]
@@ -2183,6 +2255,214 @@ mod tests {
         assert_eq!(appended.status, "updated");
         assert_eq!(appended.evidence.prompts, 2);
         assert_eq!(appended.evidence.events, 4);
+    }
+
+    /// Write a cursor transcript at the layout its adapter enumerates and
+    /// return the path the catalog stores as the locator.
+    fn cursor_transcript(home: &Path, session_id: &str, prompt: &str) -> PathBuf {
+        let path = home
+            .join(".cursor/projects/work-app/agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "role": "user",
+                    "message": {"content": prompt},
+                })
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// A completed prompt-only hydration is `partial`, and says which evidence
+    /// nobody looked for. Reporting `full` here is the defect contract 3 fixes:
+    /// the SDK ranks merges on `capability`, so "prompts only" outranked a
+    /// remote presence that had the events.
+    #[test]
+    fn prompt_only_providers_report_partial_capability_and_name_what_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_transcript(dir.path(), "cursor-1", "cursor prompt");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cursor-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cursor-1"), dir.path()).unwrap();
+        assert_eq!(result.contract_version, 3);
+        assert_eq!(result.status, "hydrated");
+        assert_eq!(result.capability, "partial");
+        assert_eq!(result.coverage, vec![EvidenceKind::History]);
+        // The prompt really was indexed: `partial` is about the kinds nobody
+        // parses, not about this pass having failed.
+        assert_eq!(result.evidence.prompts, 1);
+        let partial = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+            .expect("a partial hydration names the evidence it does not cover");
+        assert!(
+            partial
+                .message
+                .contains("session_event, tool_call, file_edit, relationship"),
+            "{}",
+            partial.message
+        );
+        assert!(
+            partial.message.contains("covers history"),
+            "{}",
+            partial.message
+        );
+
+        // Unchanged re-hydration reports the same capability: a consumer that
+        // polls must not see the claim change under it.
+        let unchanged =
+            hydrate_session_at_with_home(&db, &options("cursor", "cursor-1"), dir.path()).unwrap();
+        assert_eq!(unchanged.status, "unchanged");
+        assert_eq!(unchanged.capability, "partial");
+        assert_eq!(unchanged.coverage, vec![EvidenceKind::History]);
+        assert!(unchanged
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
+    }
+
+    /// A provider whose parser produces every kind still reports `full`, with
+    /// the coverage that justifies it and no partial-coverage diagnostic.
+    #[test]
+    fn full_coverage_providers_still_report_full_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join(".claude/projects/app/full-1.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            "{\"sessionId\":\"full-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "full-1", Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", "full-1"), dir.path()).unwrap();
+        assert_eq!(result.capability, "full");
+        assert_eq!(result.discovery_state, "full");
+        assert_eq!(result.coverage, FULL_SESSION_KINDS.to_vec());
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
+    }
+
+    /// `discovery_state` answers "indexed through the recorded stamp", not
+    /// "every evidence kind exists". A partial hydration still reaches `full`
+    /// there -- and the reported value is read back off the row rather than
+    /// asserted, so the two cannot disagree.
+    ///
+    /// The risk that buys is a stale short-circuit: `discovery_state = 'full'`
+    /// is one of the conditions for skipping re-hydration. The parser version
+    /// has to be the thing that breaks the tie after a parser upgrade, or a
+    /// prompt-only provider that grows a real parser would never re-parse the
+    /// sessions it already touched.
+    #[test]
+    fn partial_coverage_keeps_discovery_state_full_and_still_reparses_on_parser_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_transcript(dir.path(), "cursor-2", "cursor prompt");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cursor-2", Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        assert_eq!(first.capability, "partial");
+        assert_eq!(first.discovery_state, "full");
+        let stored: String = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT discovery_state FROM sessions WHERE source='cursor' AND session_id='cursor-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, first.discovery_state);
+
+        // Same bytes, same parser: the short-circuit is reached.
+        assert_eq!(
+            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path())
+                .unwrap()
+                .status,
+            "unchanged"
+        );
+
+        // A parser upgrade must re-parse even though the row still says full.
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "UPDATE observation_hydration_checkpoints SET parser_version = ? \
+                 WHERE source='cursor' AND session_id='cursor-2'",
+                params![HYDRATION_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        let reparsed =
+            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        assert_eq!(reparsed.status, "updated");
+        assert_eq!(reparsed.discovery_state, "full");
+        let parser_version: i64 = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT parser_version FROM observation_hydration_checkpoints \
+                 WHERE source='cursor' AND session_id='cursor-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parser_version, HYDRATION_PARSER_VERSION);
+    }
+
+    /// The declared table is what `build_result` computes from, so it is
+    /// asserted directly: a provider that grows a parser flips its entry here
+    /// and the hydration contract follows without another edit.
+    #[test]
+    fn declared_coverage_matches_what_each_local_parser_writes() {
+        for source in ["claude", "codex"] {
+            assert_eq!(
+                crate::discover::declared_evidence_kinds(source),
+                FULL_SESSION_KINDS,
+                "{source} parses every evidence kind"
+            );
+            assert!(crate::discover::missing_evidence_kinds(source).is_empty());
+        }
+        for source in ["cursor", "grok", "opencode"] {
+            assert_eq!(
+                crate::discover::declared_evidence_kinds(source),
+                &[EvidenceKind::History],
+                "{source} parses prompts only"
+            );
+            assert_eq!(
+                crate::discover::missing_evidence_kinds(source),
+                vec![
+                    EvidenceKind::SessionEvent,
+                    EvidenceKind::ToolCall,
+                    EvidenceKind::FileEdit,
+                    EvidenceKind::Relationship,
+                ],
+            );
+        }
+        // Relay rows come out of already-ingested history and an unknown
+        // source has no adapter at all: neither declares anything.
+        assert!(crate::discover::declared_evidence_kinds("relay").is_empty());
+        assert!(crate::discover::declared_evidence_kinds("not-a-provider").is_empty());
+        assert_eq!(
+            crate::discover::missing_evidence_kinds("relay"),
+            FULL_SESSION_KINDS.to_vec()
+        );
     }
 
     #[test]

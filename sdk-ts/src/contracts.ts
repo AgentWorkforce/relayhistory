@@ -1,5 +1,7 @@
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
-import type { Source, CatalogSource, SessionScope, SessionLocation } from './sdk-common.js';
+import type {
+  Source, CatalogSource, EvidenceKind, SessionScope, SessionLocation,
+} from './sdk-common.js';
 export interface HistoryEntry {
   id: number;
   source: Source;
@@ -164,6 +166,11 @@ export interface HydrateSessionResult {
   source: CatalogSource;
   sessionId: string;
   status: 'hydrated' | 'updated' | 'unchanged' | 'capability_limited';
+  /**
+   * `full` only when every kind in `FULL_SESSION_KINDS` appears in
+   * {@link HydrateSessionResult.coverage}. Derived from the provider's
+   * declared coverage, never asserted by the local path.
+   */
   capability: 'full' | 'partial' | 'shallow_only';
   discoveryState: 'shallow' | 'full';
   presence: SessionLocation;
@@ -178,6 +185,13 @@ export interface HydrateSessionResult {
     fileEdits: number;
     relatedSessions: number;
   };
+  /**
+   * The evidence kinds this hydration could have indexed, in canonical order.
+   * A zero count for a covered kind means the session has none of it; a kind
+   * absent from this list means no parser on this path ever looked, and a
+   * `HYDRATION_PARTIAL_COVERAGE` diagnostic names the ones that are missing.
+   */
+  coverage: EvidenceKind[];
   relatedSessionIds: string[];
   diagnostics: HydrationDiagnostic[];
 }

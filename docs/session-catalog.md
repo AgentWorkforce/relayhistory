@@ -42,6 +42,29 @@ remain `shallow` and report their capability explicitly. File providers
 validate the saved locator against the expected provider root; OpenCode uses
 session-keyed queries against its live read-only database.
 
+`capability` and `coverage` answer a different question from `discoveryState`,
+and hydration contract 3 made the local path compute both rather than assert
+them. `coverage` lists the evidence kinds the selected provider's parser can
+produce; `capability` is `full` only when that list contains every kind in
+`FULL_SESSION_KINDS` (`history`, `session_event`, `tool_call`, `file_edit`,
+`relationship`), and `partial` otherwise, with a `HYDRATION_PARTIAL_COVERAGE`
+diagnostic naming the missing ones. A zero count for a *covered* kind means
+this session has none of it; a kind absent from `coverage` means nothing
+looked. So a completed Cursor hydration reports:
+
+```json
+{
+  "capability": "partial",
+  "coverage": ["history"],
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor local evidence covers history; no local parser produces session_event, tool_call, file_edit, relationship" }]
+}
+```
+
+`discoveryState` stays `full` for that row: it records that the session was
+indexed through its recorded source stamp, which is what the unchanged
+short-circuit reads. A parser upgrade still forces a re-parse, because the
+stored `parser_version` is checked independently of `discoveryState`.
+
 Codex child rollouts, and Claude subagent transcripts whose records carry a
 per-child `agentId`, retain their provider-native IDs and are linked through
 `session_relationships`: their events are indexed under the child's own
@@ -328,6 +351,21 @@ read.
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
+
+Evidence coverage is the hydration-side version of that matrix: what each
+local parser writes, and therefore the `coverage` a completed local hydration
+reports. It is declared per adapter (`ShallowSessionProvider::evidence_kinds`),
+so a provider that grows a parser flips one entry and the reported capability
+follows.
+
+| Source | `history` | `session_event` | `tool_call` | `file_edit` | `relationship` | `capability` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **cursor** | ✓ | – | – | – | – | `partial` |
+| **grok** | ✓ | – | – | – | – | `partial` |
+| **opencode** | ✓ | – | – | – | – | `partial` |
+| **relay** | – | – | – | – | – | targeted hydration unsupported |
 
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
