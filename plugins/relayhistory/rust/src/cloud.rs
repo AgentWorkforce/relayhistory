@@ -1007,9 +1007,21 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
             .and_then(|v| v.as_str())
             .map(String::from),
         refresh_token: Some(field(&payload, "refreshToken")?),
-        org_id: auth.org_id.clone(),
-        workspace_id: auth.workspace_id.clone(),
+        // Tenancy is issued by the service with the rotated token. Older
+        // services omit these fields, so preserve the cached values rather
+        // than erasing them during refresh.
+        org_id: nonblank_field(&payload, "orgId").or_else(|| auth.org_id.clone()),
+        workspace_id: nonblank_field(&payload, "workspaceId").or_else(|| auth.workspace_id.clone()),
     })
+}
+
+fn nonblank_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
 }
 
 /// `POST /v1/admin/mint` (dev-only bootstrap) → store the `rth_at_` session.
@@ -1665,7 +1677,7 @@ pub fn resolve_recall_auth(
     now: i64,
     allow_refresh: bool,
 ) -> Result<StoredAuth> {
-    let auth = load_selected_auth(base_url)?
+    let mut auth = load_selected_auth(base_url)?
         .context("no stored relayhistory session (run `ai-hist login`)")?;
     require_secure_transport(&auth.base_url)?;
     anyhow::ensure!(
@@ -1681,6 +1693,20 @@ pub fn resolve_recall_auth(
             .refresh_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty());
+    // A session created before the service began returning tenancy can still
+    // recover it on refresh. Do this before the provenance check, under the
+    // same lock as every other token rotation, so a concurrent writer cannot
+    // overwrite the newly adopted tenancy with stale auth.
+    if can_refresh
+        && auth
+            .org_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        let _refresh_lock = acquire_refresh_lock(&auth.base_url)?;
+        let current = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+        auth = refresh_and_save_auth(&current)?;
+    }
     anyhow::ensure!(can_refresh || expiry.is_some_and(|expiry| expiry >= now.saturating_add(60_000)),
         "stored relayhistory access-token expiry is missing, invalid, or less than 60s away (run `ai-hist login`)");
     // Recall rollups omit tenancy; the locally cached org is needed only for
