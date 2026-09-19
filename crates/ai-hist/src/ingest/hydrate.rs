@@ -968,15 +968,19 @@ pub(crate) fn build_remote_result(
             &ids,
             related_session_ids.len() as u64,
         )?,
-        coverage,
         related_session_ids,
-        diagnostics: vec![HydrationDiagnostic {
+        diagnostics: std::iter::once(HydrationDiagnostic {
             code: diagnostic_code.to_string(),
             message: diagnostic_message.to_string(),
             duration_ms: Some(started.elapsed().as_millis() as i64),
             source_bytes: Some(source_bytes),
             records_parsed: Some(records_parsed),
-        }],
+        })
+        // A remote or plugin snapshot that covers less than a full session
+        // names what it left out, exactly as the local path does.
+        .chain(partial_coverage_diagnostic(options, &coverage))
+        .collect(),
+        coverage,
     })
 }
 
@@ -1660,30 +1664,7 @@ fn build_result(
     // and reporting `full` for it is a well-formed answer computed over
     // nothing.
     let coverage = effective_coverage(options);
-    let missing = missing_from(&coverage);
-    if !missing.is_empty() {
-        diagnostics.push(HydrationDiagnostic {
-            code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
-            message: format!(
-                "{} evidence covers {}; this hydration produces no {}{}",
-                options.source,
-                if coverage.is_empty() {
-                    "no evidence kinds".to_string()
-                } else {
-                    crate::source_evidence::join_kinds(&coverage)
-                },
-                crate::source_evidence::join_kinds(&missing),
-                if options.include_related {
-                    ""
-                } else {
-                    " (include_related is off, so delegation evidence is not read)"
-                },
-            ),
-            duration_ms: None,
-            source_bytes: None,
-            records_parsed: None,
-        });
-    }
+    diagnostics.extend(partial_coverage_diagnostic(options, &coverage));
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
@@ -1720,6 +1701,44 @@ fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
         .copied()
         .filter(|kind| options.include_related || *kind != EvidenceKind::Relationship)
         .collect()
+}
+
+/// The diagnostic naming the evidence kinds a result does not cover.
+///
+/// Shared by every path that builds a result, so a plugin snapshot missing a
+/// kind says the same thing, in the same words, as a local hydration missing
+/// one. Without it a `partial` capability arrived with nothing naming what was
+/// absent, which is most of what makes `partial` actionable.
+///
+/// `None` for complete coverage, and also for *empty* coverage: nothing
+/// covered is a capability-limited acquisition, reported as `shallow_only`
+/// with its own diagnostic, and calling that "partial coverage" would blur the
+/// two.
+fn partial_coverage_diagnostic(
+    options: &HydrateSessionOptions,
+    coverage: &[EvidenceKind],
+) -> Option<HydrationDiagnostic> {
+    let missing = missing_from(coverage);
+    if coverage.is_empty() || missing.is_empty() {
+        return None;
+    }
+    Some(HydrationDiagnostic {
+        code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
+        message: format!(
+            "{} evidence covers {}; this hydration produces no {}{}",
+            options.source,
+            crate::source_evidence::join_kinds(coverage),
+            crate::source_evidence::join_kinds(&missing),
+            if options.include_related {
+                ""
+            } else {
+                " (include_related is off, so delegation evidence is not read)"
+            },
+        ),
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    })
 }
 
 /// The capability a coverage set entitles a result to claim.
@@ -3997,6 +4016,25 @@ mod tests {
         assert_eq!(first.discovery_state, "shallow");
         assert_eq!(first.evidence.file_edits, 1);
         assert_eq!(first.diagnostics[0].code, "EVIDENCE_PARTIAL");
+        // A `partial` capability is only actionable if something names what is
+        // absent. The remote and plugin paths used to report the capability
+        // and stop there, unlike the local one.
+        assert_eq!(first.coverage, vec![EvidenceKind::FileEdit]);
+        let partial = first
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+            .expect("a partial remote snapshot names the kinds it does not cover");
+        assert_eq!(
+            partial.message,
+            "codex evidence covers file_edit; this hydration produces no \
+             history, session_event, tool_call, relationship"
+        );
+        // The acquisition's own diagnostic is kept, not replaced.
+        assert!(first
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "EVIDENCE_PARTIAL"));
 
         let repeated = hydrate_remote_codex_diff(
             &mut conn,

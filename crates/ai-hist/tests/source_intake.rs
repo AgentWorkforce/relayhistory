@@ -168,6 +168,25 @@ fn declining_related_evidence_does_not_inherit_coverage_from_an_earlier_acquisit
         ]
     );
     assert_eq!(thread_only.capability, "partial");
+    // The normalized plugin path names what it left out too, in the same words
+    // the local path uses. A `partial` capability with nothing naming the
+    // absent kinds is most of the way back to the defect this contract removes.
+    let partial = thread_only
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+        .expect("a partial plugin snapshot names the kinds it does not cover");
+    assert_eq!(
+        partial.message,
+        "claude evidence covers history, session_event, tool_call, file_edit; \
+         this hydration produces no relationship \
+         (include_related is off, so delegation evidence is not read)"
+    );
+    // The acquisition's own diagnostic survives beside it.
+    assert!(thread_only
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SOURCE_EVIDENCE_INDEXED"));
     // The earlier acquisition's delegation record is not withdrawn -- not
     // covering a kind is not a claim that it is gone -- so the snapshot as a
     // whole is still complete and the stored state stays `full`. That is the
@@ -202,6 +221,13 @@ fn declining_related_evidence_does_not_inherit_coverage_from_an_earlier_acquisit
     )?;
     assert_eq!(again.capability, "full");
     assert!(again.coverage.contains(&EvidenceKind::Relationship));
+    assert!(
+        !again
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"),
+        "complete coverage names nothing as absent"
+    );
     // Positive control for the two assertions above: with related evidence
     // requested the same store does report the child, so their emptiness is
     // about the option rather than about a relationship that never landed.
