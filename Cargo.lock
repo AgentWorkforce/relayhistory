@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.18.7"
+version = "0.18.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist-napi"
-version = "0.18.7"
+version = "0.18.8"
 dependencies = [
  "ai-hist",
  "anyhow",

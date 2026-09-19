@@ -709,7 +709,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "relayhistory-plugin"
-version = "0.18.7"
+version = "0.18.8"
 dependencies = [
  "ai-hist",
  "anyhow",
