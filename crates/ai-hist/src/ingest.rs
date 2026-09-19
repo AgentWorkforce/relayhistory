@@ -460,7 +460,8 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state)) {
+    if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
+    {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -4208,8 +4209,12 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn sync_trajectories(conn: &Connection, state: &mut Map<String, Value>) -> Result<usize> {
-    let files = trajectory_files()?;
+fn sync_trajectories(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    home: &Path,
+) -> Result<usize> {
+    let files = trajectory_files(home)?;
     if files.is_empty() {
         return Ok(0);
     }
@@ -4302,7 +4307,7 @@ struct TrajectoryRow {
     timestamp_ms: i64,
 }
 
-fn trajectory_files() -> Result<Vec<PathBuf>> {
+fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
         for part in std::env::split_paths(&raw) {
@@ -4311,7 +4316,7 @@ fn trajectory_files() -> Result<Vec<PathBuf>> {
             }
         }
     } else {
-        let projects = home_dir().join("Projects");
+        let projects = home.join("Projects");
         if projects.exists() {
             collect_named_dirs(&projects, ".trajectories", &mut roots)?;
         }
