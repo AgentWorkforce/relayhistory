@@ -2331,3 +2331,152 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     assert_eq!(rescan.summary.counters.shallow_reads, 1);
     assert_eq!(rescan.summary.skipped_unchanged, 0);
 }
+
+// ---------------------------------------------------------------------------
+// project identity on the cached path
+// ---------------------------------------------------------------------------
+
+fn stored_key(conn: &Connection, source: &str, session_id: &str) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT project_key, project_key_method FROM sessions WHERE source = ? AND session_id = ?",
+        params![source, session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or_else(|error| panic!("reading {source}/{session_id}: {error}"))
+}
+
+/// A codex rollout whose only interesting property is where it ran.
+fn codex_in(home: &Path, id: &str, cwd: &Path, mtime_ms: i64) {
+    let body = format!(
+        "{}\n{}\n",
+        format_args!(
+            r#"{{"timestamp":"2026-06-20T11:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+            cwd.display()
+        ),
+        r#"{"timestamp":"2026-06-20T11:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"delegated work"}}"#,
+    );
+    codex_rollout(home, id, &body, mtime_ms);
+}
+
+/// What discovery streams for a cached row must be what the pass then stores.
+///
+/// The cached-row upgrade resolves the working directory, which for a
+/// delegated child is frequently not a repository at all — a path key. The
+/// end-of-pass refresh then replaces that path with the parent's repository,
+/// because a borrowed key beats a machine-local directory. If the upgrade
+/// emits its own answer, the JSONL a consumer parses says one project and the
+/// database it came from says another, with nothing anywhere recording the
+/// disagreement.
+#[test]
+fn a_cached_child_is_streamed_the_key_the_refresh_pass_will_store() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/child");
+    fs::create_dir_all(&work).unwrap();
+    codex_in(home.path(), "child", &work, 1_750_000_000_000);
+
+    // Nothing to inherit from yet, so the child's own directory is all there
+    // is, and it is not a repository.
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(
+        first.row("child").project_key_method.as_deref(),
+        Some(ProjectKeyMethod::PathFallback.as_str()),
+        "the premise is a child that resolved to nothing canonical"
+    );
+
+    // The delegating parent lands, keyed to the repository it ran in.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    // The child's transcript is untouched, so this pass serves it by its stamp.
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let emitted = second.row("child");
+    let inherited = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        inherited,
+        "discovery streamed a path key for a child the refresh pass then made inherited"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        inherited,
+        "the streamed row and the stored row must not disagree"
+    );
+}
+
+/// An upgrade the catalog refuses must not be reported as if it happened.
+///
+/// The cached-row upgrade reads the row, resolves, and writes — three steps
+/// with no transaction around them, so a hydrate or a concurrent sync can
+/// settle the same session in between. The write is guarded and correctly
+/// declines to downgrade the settled key; the row streamed to the caller has
+/// to decline with it. Reporting the key the write *wanted* invents a value no
+/// row anywhere holds, which is worse than a stale one because nothing
+/// downstream can tell it is wrong.
+#[test]
+fn a_cached_upgrade_the_catalog_refuses_streams_the_stored_key() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/api");
+    fs::create_dir_all(&work).unwrap();
+    // A row from before project identity existed: no key at all.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'settled', ?, 1, 'shallow')",
+        params![work.to_string_lossy()],
+    )
+    .unwrap();
+    let mut row = fetch_catalog_row(&conn, "codex", "settled")
+        .unwrap()
+        .expect("the row was just inserted");
+
+    // Between that read and the upgrade, a hydrate settles the session on the
+    // repository it actually belongs to.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/api', project_key_method = 'remote' \
+         WHERE source = 'codex' AND session_id = 'settled'",
+        [],
+    )
+    .unwrap();
+
+    crate::project_identity::begin_acquisition_pass();
+    upgrade_cached_project_identity(&conn, &mut row).unwrap();
+
+    let settled = (
+        Some("github.com/acme/api".to_string()),
+        Some(ProjectKeyMethod::Remote.as_str().to_string()),
+    );
+    assert_eq!(
+        (row.project_key.clone(), row.project_key_method.clone()),
+        settled,
+        "the streamed row reported a key the catalog refused to store"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "settled"),
+        settled,
+        "a settled remote key must never be overwritten by a path"
+    );
+}

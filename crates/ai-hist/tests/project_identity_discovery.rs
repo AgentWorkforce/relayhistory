@@ -140,4 +140,88 @@ fn discovery_upgrades_a_path_key_once_the_checkout_gains_a_remote() {
         session_key(&conn, "codex", "later").0,
         "the streamed row and the stored row must not disagree"
     );
+
+    // --- and the same for a borrowed key ---------------------------------
+    //
+    // An inherited key is a stand-in for a child whose own directory resolved
+    // to nothing canonical. It outranks a path, so the upgrade above must not
+    // touch it -- but it loses to the child's own remote, and because the
+    // transcript never changes, the cached path is the only thing that will
+    // ever revisit it. Left alone, the session wears the parent's repository
+    // forever.
+    //
+    // Put the row into that state directly: no provider in the corpus gives a
+    // delegated thread a catalog row, so constructing it through a fixture
+    // would be testing the fixture.
+    let parent_key = "github.com/acme/parent";
+    conn.execute(
+        "UPDATE sessions SET project_key = ?, project_key_method = 'inherited' \
+         WHERE source = 'codex' AND session_id = 'later'",
+        rusqlite::params![parent_key],
+    )
+    .unwrap();
+    // Point it at a directory of its own that is not yet a repository.
+    let own = home.join("work/child");
+    fs::create_dir_all(&own).unwrap();
+    conn.execute(
+        "UPDATE sessions SET cwd = ? WHERE source = 'codex' AND session_id = 'later'",
+        rusqlite::params![own.to_string_lossy()],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Nothing better is available yet, so the borrowed key must stand: a path
+    // key never displaces an inherited one.
+    discover();
+    {
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            session_key(&conn, "codex", "later"),
+            (
+                Some(parent_key.to_string()),
+                Some(ProjectKeyMethod::Inherited.as_str().to_string())
+            ),
+            "discovery traded an inherited key for a path"
+        );
+    }
+
+    // The child gains an origin of its own. Its transcript is still untouched,
+    // so this is again the cached branch.
+    let child_git = own.join(".git");
+    fs::create_dir_all(&child_git).unwrap();
+    fs::write(
+        child_git.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/child.git\n",
+    )
+    .unwrap();
+
+    let (rows, summary) = discover();
+    assert!(
+        summary.skipped_unchanged > 0,
+        "still expected the cached branch; {summary:?}"
+    );
+    let emitted = rows
+        .iter()
+        .find(|row| row.session_id == "later")
+        .expect("the session was not emitted");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        (
+            Some("github.com/acme/child".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "discovery streamed the inherited key after the child gained its own remote"
+    );
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "later"),
+        (
+            Some("github.com/acme/child".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "a cached row kept the parent's key after gaining its own remote"
+    );
 }

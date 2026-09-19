@@ -437,3 +437,71 @@ fn a_path_key_is_upgraded_once_a_recorded_remote_is_available() {
         Some(ProjectKeyMethod::Remote.as_str())
     );
 }
+
+/// An inherited key is a stand-in, not a settled answer.
+///
+/// A delegated child wears its parent's repository because its own directory
+/// resolved to nothing canonical. If that directory later gains an `origin`,
+/// the borrowed key is no longer the best thing known about the session -- and
+/// because the child's transcript never changes, nothing would ever revisit
+/// it. The child would be filed under the parent's repository forever, which
+/// is wrong in exactly the way that looks right.
+#[test]
+fn an_inherited_key_yields_to_the_child_gaining_its_own_remote() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("inherit.db")).unwrap();
+
+    // The child's own directory: not a repository yet.
+    let own = temp.path().join("child-checkout");
+    fs::create_dir_all(&own).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'child', ?, 'github.com/acme/parent', 'inherited', 1, 'full')",
+        rusqlite::params![own.to_string_lossy()],
+    )
+    .unwrap();
+
+    ai_hist::project_identity::begin_acquisition_pass();
+    // Nothing better is available, so the borrowed key stands. A path key must
+    // never displace an inherited one: the parent's repository says more about
+    // the session than the directory it happened to run in.
+    refresh_project_identity(&conn).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "an inherited key was traded for a path"
+    );
+
+    // `git init` and an origin of its own, some time later.
+    let git_dir = own.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/child.git\n",
+    )
+    .unwrap();
+
+    // A new acquisition pass, exactly as the next sync or discovery opens:
+    // the resolver's cache is only valid within one, and the directory it
+    // cached as "not a repository" has since become one.
+    ai_hist::project_identity::begin_acquisition_pass();
+
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/child".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the child kept the inherited key after gaining its own remote"
+    );
+
+    // Settled: the inheritance pass does not claw a `remote` key back, and a
+    // further refresh writes nothing.
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}

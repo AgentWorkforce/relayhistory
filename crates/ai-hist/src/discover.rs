@@ -2140,33 +2140,89 @@ fn now_ms() -> i64 {
 /// and still have emitted the stale value — the JSONL a consumer parses would
 /// disagree with the database it came from.
 ///
-/// Only a key that is absent or merely a path can change, and only to
-/// something at least as strong, so nothing here can downgrade a `remote` or
-/// `inherited` key. The write is skipped entirely when the answer is the one
-/// already stored, which is the usual case: a path key is reconsidered because
-/// it *might* be upgradable, and almost never is.
+/// For the same reason, the answer it streams must be the answer the
+/// end-of-pass refresh will store, so a cached child that is about to inherit
+/// its parent's repository is given that key here rather than the path its own
+/// directory resolves to.
+///
+/// Only a key that is absent, a path, or inherited can change, and an
+/// inherited one only for the child's own `remote`. A `remote` key is never
+/// touched, and inheritance is never traded for a path. The write is skipped
+/// entirely when the answer is the one already stored, which is the usual
+/// case: these are reconsidered because they *might* be upgradable, and almost
+/// never are.
 fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
-    let upgradable = row.project_key.is_none()
-        || row.project_key_method.as_deref() == Some(ProjectKeyMethod::PathFallback.as_str());
-    if !upgradable {
+    let stored = row.project_key_method.as_deref();
+    if stored == Some(ProjectKeyMethod::Remote.as_str()) {
+        // The strongest answer there is. Nothing this function can learn
+        // improves on it, so do not even touch the filesystem.
         return Ok(());
     }
-    let Some((key, method)) =
-        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref())
-    else {
+    let resolved =
+        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref());
+    let candidate = match resolved {
+        // The session's own repository beats anything borrowed.
+        Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
+        // Anything weaker has to be weighed against what this row already has
+        // and against what the end-of-pass refresh is about to give it.
+        weaker => {
+            if stored == Some(ProjectKeyMethod::Inherited.as_str()) {
+                // An inherited key is borrowed, so it outranks a path: a child
+                // whose directory still resolves to nothing canonical keeps
+                // the parent's repository, which is the point of inheriting it.
+                None
+            } else if let Some(parent) = crate::store::inheritable_parent_project_key(
+                conn,
+                &row.source,
+                &row.session_id,
+            )? {
+                // A delegated child about to inherit. Deciding that here, and
+                // not only in the refresh pass, is what keeps the row this
+                // function streams equal to the row the pass will store: a
+                // consumer reading `sessions discover --json` beside the
+                // catalog must not be told two different projects.
+                Some((parent, ProjectKeyMethod::Inherited))
+            } else {
+                weaker
+            }
+        }
+    };
+    let Some((key, method)) = candidate else {
         return Ok(());
     };
-    if row.project_key.as_deref() == Some(key.as_str())
-        && row.project_key_method.as_deref() == Some(method.as_str())
-    {
+    if row.project_key.as_deref() == Some(key.as_str()) && stored == Some(method.as_str()) {
         return Ok(());
     }
-    conn.execute(
-        "UPDATE sessions SET project_key = ?, project_key_method = ? \
-         WHERE source = ? AND session_id = ? \
-           AND (project_key IS NULL OR project_key_method = 'path')",
+    // The same precedence the merge and the refresh pass apply, as a guard:
+    // this runs outside any transaction, so a hydrate or a concurrent sync may
+    // have settled the row since it was read.
+    let changed = conn.execute(
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
+         WHERE source = ?3 AND session_id = ?4 \
+           AND (project_key IS NULL \
+                OR project_key_method = 'path' \
+                OR (project_key_method = 'inherited' AND ?2 = 'remote'))",
         params![key, method.as_str(), row.source, row.session_id],
     )?;
+    if changed == 0 {
+        // Refused: someone else knows better. Stream what the catalog holds
+        // rather than what this function wanted it to hold — an emitted key no
+        // row anywhere agrees with is worse than a stale one, because nothing
+        // downstream can tell it is wrong.
+        if let Some((key, method)) = conn
+            .query_row(
+                "SELECT project_key, project_key_method FROM sessions \
+                 WHERE source = ?1 AND session_id = ?2",
+                params![row.source, row.session_id],
+                |stored| Ok((stored.get(0)?, stored.get(1)?)),
+            )
+            .optional()?
+        {
+            row.project_key = key;
+            row.project_key_method = method;
+        }
+        return Ok(());
+    }
     row.project_key = Some(key);
     row.project_key_method = Some(method.as_str().to_string());
     Ok(())

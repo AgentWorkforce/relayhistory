@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 #[cfg(feature = "opencode-backup")]
 use rusqlite::DatabaseName;
-use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -2173,7 +2175,8 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
-/// Pass 1: stamp sessions with no key, and upgrade ones stuck on a path.
+/// Pass 1: stamp sessions with no key, and upgrade ones stuck on a borrowed
+/// or provisional key.
 ///
 /// A path key is not a settled answer, it is the absence of one. Only filling
 /// NULLs would freeze it: `upsert_session` resolves from the working directory
@@ -2185,13 +2188,21 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
 /// that repository files under a different key.
 ///
 /// So a `path` row is reconsidered on every pass and replaced only by
-/// something strictly better. Nothing here can downgrade a key: `remote`
-/// replaces `path`, and `path` replaces only `path` or NULL.
+/// something strictly better. An `inherited` row is reconsidered too, for the
+/// mirror-image reason: the parent's repository is a stand-in, and a child
+/// that later gains its own `origin` would otherwise wear the parent's key for
+/// as long as its transcript stayed unchanged — which is forever.
+///
+/// Nothing here can downgrade a key. `remote` replaces `path` or `inherited`;
+/// `path` replaces only `path` or NULL, never an inherited key, because a
+/// borrowed repository says more about a session than the directory it
+/// happened to run in.
 fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     let pending: Vec<(Option<String>, Option<String>)> = conn
         .prepare(
             "SELECT DISTINCT cwd, repo_url FROM sessions \
-             WHERE (project_key IS NULL OR project_key_method = 'path') \
+             WHERE (project_key IS NULL \
+                    OR project_key_method IN ('path', 'inherited')) \
                AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
         )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -2208,9 +2219,16 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     // every path-keyed session -- and a `SQLITE_BUSY` on that no-op would fail
     // the whole refresh, taking inheritance and denormalization down with it.
     // The other two passes probe for the same reason.
+    //
+    // An `inherited` key is reconsidered too, but displaced only by a
+    // `remote`: it is a borrowed key, so it outranks a path and loses to the
+    // child's own repository. A child that later gains its own `origin` would
+    // otherwise keep the parent's repository for as long as its transcript
+    // stayed unchanged, which is forever.
     const UPGRADABLE: &str = "(project_key IS NULL \
              OR (project_key_method = 'path' \
-                 AND (?2 = 'remote' OR project_key <> ?1))) \
+                 AND (?2 = 'remote' OR project_key <> ?1)) \
+             OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
            AND cwd IS ?3 AND repo_url IS ?4";
     let mut needed = conn.prepare(&format!(
         "SELECT 1 FROM sessions WHERE {UPGRADABLE} LIMIT 1"
@@ -2243,20 +2261,12 @@ fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
 /// parent's, and a subagent genuinely running in another checkout should not
 /// be filed under the delegator's repository.
 fn inherit_project_keys(conn: &Connection) -> Result<usize> {
-    let sql = "UPDATE sessions SET \
-         project_key = (SELECT p.project_key FROM session_relationships r \
-             JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
-             WHERE r.source = sessions.source AND r.child_session_id = sessions.session_id \
-               AND p.project_key IS NOT NULL \
-               AND p.project_key_method IN ('remote', 'inherited') \
-             ORDER BY r.created_ms, r.parent_session_id LIMIT 1), \
-         project_key_method = 'inherited' \
-     WHERE (project_key IS NULL OR project_key_method = 'path') \
-       AND EXISTS (SELECT 1 FROM session_relationships r \
-             JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
-             WHERE r.source = sessions.source AND r.child_session_id = sessions.session_id \
-               AND p.project_key IS NOT NULL \
-               AND p.project_key_method IN ('remote', 'inherited'))";
+    let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    let inheritable = inheritable_session_sql();
+    let sql = format!(
+        "UPDATE sessions SET project_key = ({parent}), project_key_method = 'inherited' \
+         WHERE {inheritable}"
+    );
     let mut written = 0;
     for _ in 0..PROJECT_KEY_INHERITANCE_PASSES {
         // The predicate excludes rows already marked `inherited`, so each pass
@@ -2269,13 +2279,13 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
         // by another writer would otherwise turn a no-op into a failure.
         if !conn
             .prepare(&format!(
-                "SELECT 1 FROM sessions WHERE {INHERITABLE_SESSION_SQL} LIMIT 1"
+                "SELECT 1 FROM sessions WHERE {inheritable} LIMIT 1"
             ))?
             .exists([])?
         {
             break;
         }
-        let changed = conn.execute(sql, [])?;
+        let changed = conn.execute(&sql, [])?;
         written += changed;
         if changed == 0 {
             break;
@@ -2284,14 +2294,57 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
+/// The key pass 2 would adopt for a child: that of its earliest-recorded
+/// delegating parent which has something better than a path of its own.
+///
+/// The child is named by two SQL expressions so that one statement serves both
+/// callers — correlated against the `sessions` row pass 2 is updating, and
+/// against bound parameters when discovery asks the same question about a
+/// single row before the pass runs. The two must not drift: discovery streams
+/// its answer to the caller while pass 2 writes the row, and a consumer
+/// reading both would otherwise be told two different projects for one
+/// session.
+fn inheritable_parent_key_sql(source: &str, session_id: &str) -> String {
+    format!(
+        "SELECT p.project_key FROM session_relationships r \
+         JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
+         WHERE r.source = {source} AND r.child_session_id = {session_id} \
+           AND p.project_key IS NOT NULL \
+           AND p.project_key_method IN ('remote', 'inherited') \
+         ORDER BY r.created_ms, r.parent_session_id LIMIT 1"
+    )
+}
+
 /// The rows pass 2 would rewrite: a delegated child whose own key is absent or
 /// merely its own path, whose parent has something better.
-const INHERITABLE_SESSION_SQL: &str = "(project_key IS NULL OR project_key_method = 'path') \
-       AND EXISTS (SELECT 1 FROM session_relationships r \
-             JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
-             WHERE r.source = sessions.source AND r.child_session_id = sessions.session_id \
-               AND p.project_key IS NOT NULL \
-               AND p.project_key_method IN ('remote', 'inherited'))";
+fn inheritable_session_sql() -> String {
+    let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    format!("(project_key IS NULL OR project_key_method = 'path') AND EXISTS ({parent})")
+}
+
+/// Pass 2's answer for one session, asked before the pass runs.
+///
+/// Shallow discovery decides a cached row's key and hands it to its caller in
+/// the same breath, long before the end-of-pass refresh. Resolving the working
+/// directory alone is not enough to do that honestly: a delegated child whose
+/// directory is not a repository resolves to a path, and pass 2 will shortly
+/// replace that with the parent's repository. Emitting the path would put a
+/// key on the wire that the database never holds.
+///
+/// Returns `None` when nothing would be inherited, which is the common case.
+pub(crate) fn inheritable_parent_project_key(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            &inheritable_parent_key_sql("?1", "?2"),
+            params![source, session_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
 
 /// The canonical key for the session an event belongs to: its own catalog
 /// row's, or, failing that, its delegating parent's.
