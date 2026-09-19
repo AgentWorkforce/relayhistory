@@ -362,8 +362,12 @@ remote observations of one session share `(source, session_id)`, so a contribute
 row would otherwise hold an unchanged local transcript off the stamp fast path on
 every sync while never being stamped itself. What ends the work is a per-provider
 generation recorded in the sync state (`claude_raw_message_facts`,
-`codex_raw_message_facts`), written only after a walk completes, so the backfill
-runs exactly once and an interrupted sync retries it. Claude reaches a subagent
+`codex_raw_message_facts`), written only after a walk completes **and only when
+every archive root the state already names was present on that run**, so the
+backfill runs exactly once, an interrupted sync retries it, and a walk over an
+unmounted or not-yet-created root does not retire it having read nothing. A root
+the state never knew about — an install with no `.codex/archived_sessions` — is
+not a missing archive and does not hold the pass open. Claude reaches a subagent
 sidecar's rows through `session_relationships.evidence_locator`, because a
 sidecar never gets a `sessions` row of its own.
 

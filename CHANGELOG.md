@@ -63,7 +63,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   through the evidence path, which does not carry the column — re-reading the
   local transcript can never stamp those. Claude selects sidecar transcripts
   through `session_relationships.evidence_locator` as well as
-  `sessions.raw_path`, since a subagent sidecar has no catalog row of its own.
+  `sessions.raw_path`, since a subagent sidecar has no catalog row of its own,
+  and the generation is recorded only when every archive root the sync state
+  already names was present on that run — a walk over an unmounted or
+  not-yet-created root would otherwise retire the pass having read nothing.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

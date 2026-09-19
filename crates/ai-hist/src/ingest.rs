@@ -793,9 +793,41 @@ fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
 }
 
 /// Record that the pass finished. Only reached when the walk completed, so an
-/// interrupted sync retries the backfill rather than skipping it.
-fn record_raw_facts_backfill(state: &mut Map<String, Value>, key: &str) {
+/// interrupted sync retires the backfill rather than skipping it.
+///
+/// `walked_every_known_root` is the other half of that: a walk that completed
+/// without being able to open the files it was meant to repair has not done
+/// the pass, and recording the generation there retires it for good. The facts
+/// then stay null on every row for the life of the install while `sync` goes
+/// on reporting success -- the same shape of failure the pass exists to undo,
+/// one level up.
+fn record_raw_facts_backfill(
+    state: &mut Map<String, Value>,
+    key: &str,
+    walked_every_known_root: bool,
+) {
+    if !walked_every_known_root {
+        return;
+    }
     state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
+}
+
+/// Whether the sync state already names transcripts under `root`.
+///
+/// This is what distinguishes an archive that is *unavailable* on this run --
+/// an unmounted home, a profile directory that has not been created yet, an
+/// external drive -- from one that simply does not exist for this install. The
+/// first makes the walk complete over nothing while the rows it should have
+/// repaired are still there; the second has nothing to repair. Only the first
+/// may hold the generation back, or an install that never had an
+/// `archived_sessions` tree would keep re-probing forever.
+fn state_names_files_under(known: &Map<String, Value>, root: &Path) -> bool {
+    let prefix = root.to_string_lossy();
+    known.keys().any(|key| {
+        key.len() > prefix.len()
+            && key.starts_with(prefix.as_ref())
+            && key[prefix.len()..].starts_with(std::path::MAIN_SEPARATOR)
+    })
 }
 
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
@@ -1592,6 +1624,11 @@ fn sync_codex_rollouts(
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
     let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
+    // A root the stamp map has entries for but that is not on disk this run is
+    // an archive we could not read, not an archive that is gone. Walking it
+    // vacuously and then recording the generation would retire the one-time
+    // backfill over rollouts nothing ever looked at.
+    let mut walked_every_known_root = true;
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1600,6 +1637,9 @@ fn sync_codex_rollouts(
         home.join(".codex/archived_sessions"),
     ] {
         if !root.exists() {
+            if state_names_files_under(&seen, &root) {
+                walked_every_known_root = false;
+            }
             continue;
         }
         for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
@@ -1757,7 +1797,7 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
-    record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY);
+    record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2693,6 +2733,9 @@ fn sync_claude_session_metadata(
     state: &mut Map<String, Value>,
     root: &Path,
 ) -> Result<()> {
+    // Load-bearing for the raw-facts generation below: an absent root returns
+    // before anything is recorded, so a run that could not see the archive
+    // does not retire the one-time backfill pass over it.
     if !root.exists() {
         return Ok(());
     }
@@ -2763,7 +2806,8 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
-    record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    // The one root this walk has was present, or the function returned above.
+    record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, true);
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -7139,6 +7183,115 @@ mod tests {
             local, "sentinel",
             "an unchanged transcript must stay on the fast path even when another \
              observation of the same session carries no raw facts"
+        );
+    }
+
+    /// An archive root the stamp map knows about but that is not on disk this
+    /// run is one the walk could not read, not one that is gone. Recording the
+    /// generation there would retire the one-time pass over rollouts nothing
+    /// ever opened, and the facts would stay null for the life of the install
+    /// while `sync` went on reporting success.
+    #[test]
+    fn an_unavailable_codex_archive_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let archived = home.join(".codex/archived_sessions/2026/04/20");
+        fs::create_dir_all(&archived).unwrap();
+        let rollout = archived.join("rollout-2026-04-20T05-00-00-sess_archived.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_archived","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let turn_id = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT turn_id FROM session_events \
+                 WHERE source='codex' AND event_uid='3:agent_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn), Some("turn_1".into()));
+
+        // The upgraded-install state, with the archive unavailable: an
+        // unmounted home, an external drive, a profile not yet materialized.
+        blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
+        fs::remove_dir_all(home.join(".codex/archived_sessions")).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            turn_id(&conn),
+            None,
+            "nothing could be repaired while the archive was unavailable"
+        );
+        assert!(
+            state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a walk that could not open the archive has not done the pass"
+        );
+
+        // Back on disk, unchanged: the pass is still owed, so it runs now.
+        fs::create_dir_all(&archived).unwrap();
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_archived","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/project","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn), Some("turn_1".into()));
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// The other side of that guard: a root this install never had is not an
+    /// archive we failed to read, and must not hold the generation back
+    /// forever. Only `.codex/sessions` exists here and `archived_sessions`
+    /// never did.
+    #[test]
+    fn a_root_the_state_never_knew_does_not_hold_the_backfill_pass_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-2026-04-20T05-00-00-sess_only.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{"id":"sess_only","cwd":"/tmp/project"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"run it"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert!(!home.join(".codex/archived_sessions").exists());
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
         );
     }
 
