@@ -1641,9 +1641,24 @@ impl ShallowSessionProvider for OpencodeProvider {
 
 /// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
 ///
-/// The tree has no index, so the stamp is the session file's own size and
-/// modification time: a file whose bytes have not changed since the last run
-/// cannot have new turns in it.
+/// The tree has no index, so both the stamp and the recency hint are computed
+/// over *every file that composes a session* — the session JSON, its messages
+/// and their parts — by the same helper hydration stamps with.
+///
+/// Two things make that necessary rather than thorough. OpenCode appends a
+/// turn by writing new files under `message/` and `part/` without touching the
+/// session JSON, so a stamp over that file alone reports an active session as
+/// unchanged and the cache serves its stale first prompt and model forever;
+/// with a `--limit`, ordering on the same unchanged timestamp also ranks a
+/// busy session as old and can drop it from the page entirely. And the birth
+/// time `file_generation_time` prefers does not move when a session file is
+/// rewritten in place, so it cannot be the change signal here either — the
+/// helper reads modification time, and carries a file count and a byte total
+/// so an edit that preserves both size and mtime still moves the stamp.
+///
+/// The cost is one `stat` per file in the tree, no reads and no parsing, and
+/// it is paid before the limit because a limit applied to stale recency is
+/// the bug above.
 fn enumerate_opencode_json_tree(
     scan: &ScanEnv<'_>,
     root: &Path,
@@ -1658,27 +1673,31 @@ fn enumerate_opencode_json_tree(
         else {
             continue;
         };
-        let Ok(metadata) = fs::metadata(&path) else {
+        if !path.is_file() {
             continue;
-        };
-        let modified = file_generation_time(&metadata);
-        rows.push((session_id, path, metadata.len(), modified));
+        }
+        let stamp = crate::ingest::opencode::stamp_json_tree_session(&path, &session_id);
+        rows.push((session_id, path, stamp));
     }
     // Newest first, then by id, so a limit takes the same bounded head every
     // run and the tie-break is total.
-    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| {
+        b.2.newest_ns
+            .cmp(&a.2.newest_ns)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     if let Some(limit) = requested_limit {
         rows.truncate(limit);
     }
     scan.note_records(rows.len() as u64);
     Ok(rows
         .into_iter()
-        .map(|(session_id, path, bytes, modified)| Candidate {
+        .map(|(session_id, path, stamp)| Candidate {
             source: "opencode",
             locator: path.to_string_lossy().into_owned(),
             session_id: Some(session_id),
-            recency_hint_ms: i64::try_from(modified / 1_000_000).ok(),
-            stamp: format!("{bytes}:{modified}"),
+            recency_hint_ms: stamp.newest_ms(),
+            stamp: stamp.token(),
         })
         .collect())
 }

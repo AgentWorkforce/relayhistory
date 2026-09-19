@@ -282,6 +282,10 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_compaction_part_records_one_boundary_marker();
     a_large_store_is_synced_without_copying_it();
     an_install_indexed_as_prompts_only_gains_events_on_the_next_plain_sync();
+    a_turn_appended_as_new_files_is_not_reported_unchanged();
+    a_session_file_rewritten_in_place_moves_its_stamp_and_recency();
+    a_tool_call_persisted_progressively_keeps_its_final_state();
+    a_sqlite_store_named_like_json_is_still_read_as_sqlite();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -861,4 +865,290 @@ fn an_install_indexed_as_prompts_only_gains_events_on_the_next_plain_sync() {
     );
 
     fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found in review of this change
+// ---------------------------------------------------------------------------
+
+/// A legacy-tree session grows by gaining *files*, not by its session JSON
+/// changing. Hydration derived the tree root two `parent()` calls up from a
+/// scoped session file, which lands on `storage/session` rather than
+/// `storage`, so every message and part lookup probed a directory that does
+/// not exist. The stamp was then computed over the session file alone and the
+/// session reported `unchanged` for the rest of its life.
+///
+/// Discovery had the same blind spot from the other end: a candidate stamped
+/// only by its session file stays cached with its first prompt and model, and
+/// under a `--limit` sorts as old while it is the busiest session on the box.
+fn a_turn_appended_as_new_files_is_not_reported_unchanged() {
+    let root = temp_root("appended");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let first = hydrate(&db_path, "ses_simple");
+    assert_eq!(first.status, "hydrated", "the first hydration indexes it");
+    let indexed_first = first.evidence.events;
+    assert!(indexed_first > 0);
+
+    // Positive control: with nothing touched at all, `unchanged` is correct
+    // and is what the checkpoint is for. Without this, the assertion below
+    // would pass for a stamp that simply always differs.
+    assert_eq!(
+        hydrate(&db_path, "ses_simple").status,
+        "unchanged",
+        "an untouched session must still short-circuit"
+    );
+    let before = catalog_row(&db_path, "ses_simple");
+
+    // Now append a turn the way OpenCode does: new message and part files,
+    // session JSON untouched.
+    let session_json = tree.join("session/global/ses_simple.json");
+    let session_bytes_before = fs::metadata(&session_json).unwrap().len();
+    write_json(
+        &tree.join("message/ses_simple/msg_simple_user2.json"),
+        r#"{"id":"msg_simple_user2","sessionID":"ses_simple","role":"user","time":{"created":1776988810000}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_simple_user2/prt_simple_u2.json"),
+        r#"{"id":"prt_simple_u2","sessionID":"ses_simple","messageID":"msg_simple_user2","type":"text","text":"and now the second turn"}"#,
+    );
+    assert_eq!(
+        fs::metadata(&session_json).unwrap().len(),
+        session_bytes_before,
+        "the fixture must leave the session file alone, or the test proves nothing"
+    );
+
+    let second = hydrate(&db_path, "ses_simple");
+    // "updated" rather than "hydrated": the session was already full, and
+    // this pass re-read it. Either way the point is that it is not
+    // "unchanged" -- the checkpoint was invalidated.
+    assert_eq!(
+        second.status, "updated",
+        "a turn appended as new files must invalidate the checkpoint"
+    );
+    assert!(
+        second.evidence.events > indexed_first,
+        "the appended turn must be indexed: {indexed_first} -> {}",
+        second.evidence.events
+    );
+
+    // Discovery must see it too, with a newer recency than before.
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let after = catalog_row(&db_path, "ses_simple");
+    assert_ne!(
+        after.0, before.0,
+        "the catalog source stamp must move when a turn is appended"
+    );
+    assert!(
+        after.1 >= before.1,
+        "the recency hint must not go backwards: {:?} -> {:?}",
+        before.1,
+        after.1
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The discovery stamp used `file_generation_time`, which prefers *birth*
+/// time. A session file rewritten in place keeps its birth time, so an edit
+/// that also preserved the byte count left the stamp identical and ranked a
+/// just-resumed session as old. The stamp reads modification time now, and
+/// carries a file count and byte total so an edit that preserves both still
+/// moves it.
+fn a_session_file_rewritten_in_place_moves_its_stamp_and_recency() {
+    let root = temp_root("rewritten");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let before = catalog_row(&db_path, "ses_simple");
+
+    // Rewrite the session file in place, same byte count, later mtime.
+    let session_json = tree.join("session/global/ses_simple.json");
+    let original = fs::read_to_string(&session_json).unwrap();
+    let rewritten = original.replace("simple turn", "simple TURN");
+    assert_eq!(
+        rewritten.len(),
+        original.len(),
+        "the rewrite must preserve the byte count, or it proves nothing about birth time"
+    );
+    assert_ne!(rewritten, original);
+    // A coarse filesystem clock would otherwise let the new mtime equal the
+    // old one; wait for the observed mtime to actually move rather than
+    // sleeping a guessed interval.
+    let before_mtime = fs::metadata(&session_json).unwrap().modified().unwrap();
+    loop {
+        fs::write(&session_json, &rewritten).unwrap();
+        if fs::metadata(&session_json).unwrap().modified().unwrap() > before_mtime {
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let after = catalog_row(&db_path, "ses_simple");
+    assert_ne!(
+        after.0, before.0,
+        "an in-place rewrite that preserves size must still move the stamp"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// OpenCode persists a tool call once per state as it progresses, each state
+/// its own part sharing the `callID`. Keeping the first meant storing a call
+/// that looks successful and has no result; the last state is the finished
+/// call.
+fn a_tool_call_persisted_progressively_keeps_its_final_state() {
+    let root = temp_root("progressive");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    write_json(
+        &tree.join("session/global/ses_progressive.json"),
+        r#"{"id":"ses_progressive","directory":"/tmp/project","time":{"created":1777000000000,"updated":1777000002000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_progressive/msg_prog_a1.json"),
+        r#"{"id":"msg_prog_a1","sessionID":"ses_progressive","role":"assistant","time":{"created":1777000001000},"providerID":"anthropic","modelID":"claude-opus-4-5","path":{"cwd":"/tmp/project"},"tokens":{"input":1,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+    );
+    // Part ids order the two states: `p1` running, `p2` finished and failed.
+    write_json(
+        &tree.join("part/msg_prog_a1/p1.json"),
+        r#"{"id":"p1","sessionID":"ses_progressive","messageID":"msg_prog_a1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"running","input":{"command":"true"}}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_prog_a1/p2.json"),
+        r#"{"id":"p2","sessionID":"ses_progressive","messageID":"msg_prog_a1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{"command":"run the tests"},"output":"ERROR: tests failed","metadata":{"exit":1}}}"#,
+    );
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    let conn = open_db(&db_path).unwrap();
+
+    let calls: Vec<(String, Option<String>, String, Option<i64>)> = conn
+        .prepare(
+            "SELECT tool_use_id, target, args_json, is_error FROM tool_calls \
+             WHERE source='opencode' AND session_id='ses_progressive'",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a call persisted twice is still one call: {calls:?}"
+    );
+    let (tool_use_id, target, args_json, is_error) = &calls[0];
+    assert_eq!(tool_use_id, "call_1");
+    // The first-write-wins result was `Some("true")`, `exit` absent, hence
+    // `is_error = 0` and no tool_result at all. Each of these three is that
+    // control, stated as the value it must not have.
+    assert_eq!(
+        target.as_deref(),
+        Some("run the tests"),
+        "the final state's arguments win, not the running state's"
+    );
+    assert!(args_json.contains("run the tests"));
+    assert_eq!(
+        *is_error,
+        Some(1),
+        "the final state failed with exit 1; the running state had no exit at all"
+    );
+
+    let results: Vec<String> = session_events(&conn, "ses_progressive", Some("opencode"))
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result")
+        .filter_map(|event| event.text)
+        .collect();
+    assert_eq!(
+        results,
+        vec!["ERROR: tests failed".to_string()],
+        "exactly one terminal result, from the final state"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `OPENCODE_DB` is an arbitrary path, so its suffix says nothing about the
+/// layout. Routing the loader by a `.json` extension handed a perfectly good
+/// SQLite store to the JSON-tree loader, which indexed nothing — and reported
+/// success doing it. The layout now travels from the snapshot that validated
+/// the locator.
+fn a_sqlite_store_named_like_json_is_still_read_as_sqlite() {
+    let root = temp_root("json-named-sqlite");
+    let home = root.join("home");
+    // A SQLite store that happens to be called `.json`.
+    let store = home.join(".local/share/opencode/opencode.json");
+    build_sqlite_store(&store);
+    use_layout(&home, Some(&store), None);
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let hydrated = hydrate(&db_path, "ses_sqlite_root");
+    assert!(
+        hydrated.evidence.events > 0,
+        "a SQLite store must be read as SQLite whatever it is called, got {:?}",
+        hydrated.evidence
+    );
+
+    let conn = open_db(&db_path).unwrap();
+    assert!(
+        !session_events(&conn, "ses_sqlite_root", Some("opencode"))
+            .unwrap()
+            .is_empty(),
+        "the session's events must be indexed"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+// --- helpers for the regression phases -------------------------------------
+
+fn opencode_only() -> DiscoverOptions {
+    DiscoverOptions {
+        sources: vec!["opencode".into()],
+        ..Default::default()
+    }
+}
+
+fn hydrate(db_path: &Path, session_id: &str) -> ai_hist::HydrateSessionResult {
+    hydrate_session_at(
+        db_path,
+        &HydrateSessionOptions {
+            source: "opencode".into(),
+            session_id: session_id.into(),
+            scope: SessionScope::Local,
+            include_related: false,
+        },
+    )
+    .unwrap()
+}
+
+/// `(source_stamp, last_activity_ms)` as the catalog holds them.
+fn catalog_row(db_path: &Path, session_id: &str) -> (Option<String>, Option<i64>) {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT source_stamp, last_activity_ms FROM sessions \
+             WHERE source='opencode' AND session_id=?",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
 }

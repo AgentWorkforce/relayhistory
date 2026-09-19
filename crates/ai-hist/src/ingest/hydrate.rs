@@ -81,9 +81,24 @@ struct SourceSnapshot {
     bytes: i64,
     records: i64,
     path: Option<PathBuf>,
+    /// For OpenCode: which of the provider's two layouts this locator was
+    /// validated against. Carried rather than re-derived, because the only
+    /// thing that can be re-derived from a path is its spelling — and
+    /// `OPENCODE_DB` is an arbitrary path, so a SQLite store may perfectly
+    /// well be called `opencode.json`. Ingestion picks its loader from this.
+    opencode_layout: Option<OpencodeIngestLayout>,
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
+}
+
+/// Which OpenCode store a validated locator names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpencodeIngestLayout {
+    /// The configured `OPENCODE_DB`, whatever it is called.
+    Sqlite,
+    /// A session file inside the configured `OPENCODE_STORAGE_DIR`.
+    JsonTree,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -219,6 +234,7 @@ fn hydrate_session_at_with_home_and_connectors(
         &target,
         snapshot.path.as_deref(),
         &snapshot.claude_subagents,
+        snapshot.opencode_layout,
     )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
@@ -1105,6 +1121,7 @@ fn source_snapshot(
             records: 0,
             path: Some(path),
             claude_subagents: Vec::new(),
+            opencode_layout: Some(OpencodeIngestLayout::Sqlite),
         });
     }
 
@@ -1165,6 +1182,9 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_subagents: subagents,
+        // Every other provider is file-backed with one layout; only OpenCode
+        // has a choice to record here.
+        opencode_layout: None,
     })
 }
 
@@ -1178,11 +1198,14 @@ fn opencode_locator_is_in_storage_tree(path: &Path, storage_dir: &Path) -> bool 
     path.starts_with(root)
 }
 
-/// Stamp one legacy-tree session by the bytes of everything that composes it:
-/// the session file, its messages and its parts. The session file alone does
-/// not change when a new turn is appended — the new part is a *new file* — so
-/// stamping only the session file would make a growing session look unchanged
-/// and freeze its evidence at the first read.
+/// Stamp one legacy-tree session over everything that composes it: the
+/// session file, its messages and its parts.
+///
+/// The session file alone does not change when a turn is appended — the new
+/// part is a *new file* — so stamping only that would make a growing session
+/// look unchanged and freeze its evidence at the first read. Discovery uses
+/// the same helper, so the catalog and the checkpoint cannot disagree about
+/// whether a session has moved.
 fn opencode_json_tree_snapshot(
     options: &HydrateSessionOptions,
     session_file: &Path,
@@ -1193,65 +1216,14 @@ fn opencode_json_tree_snapshot(
             format!("OpenCode source {} is unavailable", session_file.display()),
         ));
     }
-    let root = session_file
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            hydration_error(
-                "SESSION_SOURCE_MISMATCH",
-                "OpenCode session file is not inside a storage tree",
-            )
-        })?;
-    let mut bytes = fs::metadata(session_file)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    let mut records: i64 = 1;
-    let mut newest: u128 = 0;
-    let mut stamp_file = |path: &Path| {
-        if let Ok(meta) = fs::metadata(path) {
-            bytes += meta.len();
-            records += 1;
-            newest = newest.max(
-                meta.modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|elapsed| elapsed.as_nanos())
-                    .unwrap_or_default(),
-            );
-        }
-    };
-    let messages = root.join("message").join(&options.session_id);
-    let mut message_ids = Vec::new();
-    if let Ok(entries) = fs::read_dir(&messages) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            stamp_file(&path);
-            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                message_ids.push(stem.to_string());
-            }
-        }
-    }
-    message_ids.sort();
-    for message_id in &message_ids {
-        if let Ok(entries) = fs::read_dir(root.join("part").join(message_id)) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                    stamp_file(&path);
-                }
-            }
-        }
-    }
+    let stamp = crate::ingest::opencode::stamp_json_tree_session(session_file, &options.session_id);
     Ok(SourceSnapshot {
-        stamp: format!("{bytes}:{records}:{newest}"),
-        bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
-        records,
+        stamp: stamp.token(),
+        bytes: i64::try_from(stamp.bytes).unwrap_or(i64::MAX),
+        records: i64::try_from(stamp.files).unwrap_or(i64::MAX),
         path: Some(session_file.to_path_buf()),
         claude_subagents: Vec::new(),
+        opencode_layout: Some(OpencodeIngestLayout::JsonTree),
     })
 }
 
@@ -1300,12 +1272,14 @@ fn complete_jsonl_records(path: &Path) -> Result<i64> {
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_selected(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
+    opencode_layout: Option<OpencodeIngestLayout>,
 ) -> Result<()> {
     match options.source.as_str() {
         "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
@@ -1314,16 +1288,23 @@ fn ingest_selected(
         "grok" => ingest_grok(conn, options, path.unwrap()),
         "opencode" => {
             let path = path.unwrap();
-            // Whichever layout the catalog recorded. Both end in the same
-            // normalizer, so the evidence is identical either way.
-            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                crate::store::sync_opencode_session_from_storage_dir(
-                    conn,
-                    path,
-                    &options.session_id,
-                )?;
-            } else {
-                sync_opencode_session(conn, path, &options.session_id)?;
+            // Whichever layout `source_snapshot` validated this locator
+            // against. Not the file extension: `OPENCODE_DB` is an arbitrary
+            // path, so a perfectly good SQLite store may be called
+            // `opencode.json`, and sniffing the suffix would hand it to the
+            // JSON-tree loader and index nothing. Both layouts end in the
+            // same normalizer, so the evidence is identical either way.
+            match opencode_layout {
+                Some(OpencodeIngestLayout::JsonTree) => {
+                    crate::store::sync_opencode_session_from_storage_dir(
+                        conn,
+                        path,
+                        &options.session_id,
+                    )?;
+                }
+                _ => {
+                    sync_opencode_session(conn, path, &options.session_id)?;
+                }
             }
             Ok(())
         }

@@ -394,7 +394,14 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
 /// The tree root, from a session file inside it. OpenCode writes
 /// `session/<scope>/<id>.json`, but has also written `session/<id>.json`, so
 /// the directory holding the file decides how far up the root is.
-fn derive_storage_root(session_file: &Path) -> PathBuf {
+///
+/// Shared, and deliberately the only implementation: hydration once had its
+/// own two-`parent()` version of this, which resolved the scoped layout to
+/// `storage/session` instead of `storage`. Every message and part lookup then
+/// probed a directory that does not exist, found nothing, and produced a
+/// stamp over the session file alone — so a session that grew reported
+/// `unchanged` forever. One caller of one function cannot drift from itself.
+pub(crate) fn derive_storage_root(session_file: &Path) -> PathBuf {
     let mut dir = session_file.to_path_buf();
     dir.pop();
     if dir.file_name().and_then(|name| name.to_str()) == Some("session") {
@@ -404,6 +411,88 @@ fn derive_storage_root(session_file: &Path) -> PathBuf {
     dir.pop(); // out of the <scope> directory
     dir.pop(); // out of `session/`
     dir
+}
+
+/// What a legacy-tree session is composed of, as a change signal.
+///
+/// OpenCode appends a turn by writing *new files* under `message/` and
+/// `part/`; it does not rewrite the session JSON. So anything that stamps the
+/// session file alone reports a growing session as unchanged, and both the
+/// discovery cache and the hydration checkpoint then skip it forever.
+///
+/// `files` is the load-bearing field. `newest_ms` alone would be unreliable —
+/// filesystem timestamp granularity is coarse enough that a turn appended
+/// within the same tick of a previous read can share its mtime — but adding a
+/// turn always adds a file, so the count moves whether or not the clock does.
+/// `bytes` catches an in-place edit of an existing part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct OpencodeTreeStamp {
+    pub bytes: u64,
+    pub files: u64,
+    /// Newest modification time across those files, in nanoseconds.
+    pub newest_ns: u128,
+}
+
+impl OpencodeTreeStamp {
+    /// The opaque token stored as a source stamp.
+    pub fn token(&self) -> String {
+        format!("{}:{}:{}", self.bytes, self.files, self.newest_ns)
+    }
+
+    /// Newest activity as epoch milliseconds, for a recency hint.
+    pub fn newest_ms(&self) -> Option<i64> {
+        i64::try_from(self.newest_ns / 1_000_000).ok()
+    }
+}
+
+/// Stamp every file that composes one legacy-tree session: the session JSON,
+/// its messages, and those messages' parts. Metadata only — nothing is read
+/// or parsed, so this stays cheap enough for discovery to run over a tree.
+pub(crate) fn stamp_json_tree_session(session_file: &Path, session_id: &str) -> OpencodeTreeStamp {
+    let root = derive_storage_root(session_file);
+    let mut stamp = OpencodeTreeStamp::default();
+    let mut add = |path: &Path| {
+        let Ok(meta) = fs::metadata(path) else { return };
+        stamp.bytes += meta.len();
+        stamp.files += 1;
+        let changed = meta
+            .modified()
+            .or_else(|_| meta.created())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        stamp.newest_ns = stamp.newest_ns.max(changed);
+    };
+    add(session_file);
+    let mut message_ids = json_file_stems(&root.join("message").join(session_id), &mut add);
+    message_ids.sort();
+    for message_id in &message_ids {
+        json_file_stems(&root.join("part").join(message_id), &mut add);
+    }
+    stamp
+}
+
+/// Visit every `*.json` in one directory, returning their stems. Sorted by the
+/// caller where order matters; a missing directory is simply empty.
+fn json_file_stems(dir: &Path, visit: &mut impl FnMut(&Path)) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    let mut stems = Vec::new();
+    for path in &paths {
+        visit(path);
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            stems.push(stem.to_string());
+        }
+    }
+    stems
 }
 
 /// `*.json` in one directory, keyed by the payload's own `id` when it has one
@@ -769,8 +858,14 @@ pub(crate) fn normalize(
             continue;
         }
 
-        let mut seen_calls: BTreeSet<String> = BTreeSet::new();
-        for part in parts {
+        // OpenCode persists a tool call several times as it progresses, once
+        // per state, each as its own part sharing the `callID`. Only the last
+        // of them is the finished call: it carries the output, the final
+        // arguments and the failure status. Taking the first would store a
+        // call that looks successful and has no result. `finish` has already
+        // ordered the parts, so "last" here is the provider's own order.
+        let final_part_for_call = last_part_index_per_call(parts);
+        for (index, part) in parts.iter().enumerate() {
             if let Some(text) = part_text(part) {
                 insert_session_event_with_provenance(
                     conn,
@@ -798,10 +893,7 @@ pub(crate) fn normalize(
             let Some(tool) = as_tool_part(part) else {
                 continue;
             };
-            // OpenCode can write the same call id more than once as a call
-            // progresses; the last write wins in the store and the first one
-            // here would otherwise double-count.
-            if !seen_calls.insert(tool.call_id.to_string()) {
+            if final_part_for_call.get(tool.call_id) != Some(&index) {
                 continue;
             }
             let input = tool
@@ -938,6 +1030,21 @@ pub(crate) fn normalize(
     }
 
     Ok(counts)
+}
+
+/// Where each `callID`'s last part sits in this message's ordered parts.
+///
+/// One entry per call, so a call persisted five times still produces one
+/// `tool_calls` row, one `tool_use` event and at most one `tool_result` — from
+/// its final state.
+fn last_part_index_per_call(parts: &[OpencodePart]) -> BTreeMap<&str, usize> {
+    let mut last = BTreeMap::new();
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(tool) = as_tool_part(part) {
+            last.insert(tool.call_id, index);
+        }
+    }
+    last
 }
 
 /// Record one session-level marker. Returns how many rows the write added, so
