@@ -334,27 +334,57 @@ fn an_unregistered_destination_is_reported_once_in_the_host_json_shape() {
     assert_eq!(value["attempts"], serde_json::json!(0));
 }
 
+/// The lease this test claims under.
+///
+/// The keepalive renews with two thirds of the lease left, so the whole margin
+/// for a scheduler stall plus a contended write is one lease. At 100 ms that
+/// margin was shorter than a single step of the database's busy backoff, which
+/// reaches 500 ms, and a 4-way-loaded machine lost it routinely — in both
+/// directions: the claim lapsing and letting this test's "must not be
+/// dispatched twice" receiver fire, or the renewal failing and turning a good
+/// acknowledgment into a transient failure. Neither is the property under
+/// test. A lease that can absorb one full backoff keeps the property intact —
+/// the send below still outlives several lease lifetimes, so nothing but
+/// renewal can hold the claim — without betting on thread wake-up latency.
+const RENEWAL_LEASE_MS: i64 = 600;
+
+/// The lease column for one job, read through the test's own connection.
+fn lease_until_ms(conn: &Connection, job_id: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT lease_until_ms FROM delivery_jobs WHERE id = ?",
+        params![job_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .unwrap()
+}
+
 #[test]
 fn lease_renewal_prevents_a_concurrent_worker_from_dispatching_the_same_batch() {
     let fixture = fixture();
-    create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
     let sending = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
     let sends = Arc::new(AtomicUsize::new(0));
     let leased = DrainOptions {
-        lease_ms: 100,
+        lease_ms: RENEWAL_LEASE_MS,
         request_timeout_ms: 15_000,
         ..options()
     };
     let worker = {
         let (path, sending, sends) = (fixture.path(), sending.clone(), sends.clone());
-        let leased = leased.clone();
+        let (leased, release) = (leased.clone(), release.clone());
         std::thread::spawn(move || {
             let slow = Fake {
                 send: Box::new(move |_payload, batch| {
                     sends.fetch_add(1, SeqCst);
                     sending.store(true, SeqCst);
-                    // Far longer than the lease: only renewal keeps this claim.
-                    std::thread::sleep(Duration::from_millis(400));
+                    // Held until the concurrent claim has been observed rather
+                    // than for a fixed span. The window is then exactly as long
+                    // as the property needs: every extra millisecond is one
+                    // more renewal that has to land, and buys nothing.
+                    while !release.load(SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     Ok(ack(batch))
                 }),
                 ..Fake::default()
@@ -367,18 +397,38 @@ fn lease_renewal_prevents_a_concurrent_worker_from_dispatching_the_same_batch() 
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(sending.load(SeqCst), "the receiver never started sending");
-    // Wait past the original lease: only a successful renewal blocks the claim.
-    std::thread::sleep(Duration::from_millis(150));
+
+    // Wait for a renewal that has actually been written and that carries the
+    // claim a full lease past the one taken at dispatch. Every renewal stores
+    // `now + lease_ms`, so `renewed >= claimed_until + lease_ms` is precisely
+    // "the worker's own clock is past the original expiry" — the condition the
+    // concurrent claim below has to race — established from the database
+    // rather than from how promptly this thread happens to wake up.
+    let claimed_until = lease_until_ms(&fixture.conn, &job.job_id)
+        .expect("the dispatching worker holds a lease while sending");
+    let expired = claimed_until + RENEWAL_LEASE_MS;
+    while lease_until_ms(&fixture.conn, &job.job_id).is_some_and(|until| until < expired)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let renewed = lease_until_ms(&fixture.conn, &job.job_id).expect("the lease is still held");
+    assert!(
+        renewed >= expired,
+        "the keepalive never renewed past the original lease ({renewed} < {expired})"
+    );
     assert!(
         !worker.is_finished(),
         "the first drain finished before the concurrent claim"
     );
+
     let blocked = Fake {
         send: Box::new(|_payload, _batch| panic!("a leased batch must not be dispatched twice")),
         ..Fake::default()
     };
     let second = run(&fixture.path(), &one(&blocked), &leased);
     assert_eq!(second.attempts, 0);
+    release.store(true, SeqCst);
     let first = worker.join().unwrap();
     assert_eq!(first.attempts, 1);
     assert_eq!(first.statuses[0].acknowledged_records, 3);
