@@ -50,7 +50,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `HYDRATION_PARTIAL_COVERAGE` diagnostic naming what is absent, and
   `discovery_state` is read back off the catalog row rather than asserted.
   Cursor, Grok and OpenCode now return `capability: "partial"` with
-  `coverage: ["history"]`; Claude and Codex are unchanged at `"full"`.
+  `coverage: ["history"]`; Claude and Codex return `"full"` when related
+  evidence is requested and `"partial"` without `relationship` when
+  `includeRelated: false`, which never reads delegation evidence.
   Consumers ranking merges on `capability` (`{full, partial, shallow_only}`)
   will see prompt-only presences drop below full ones, which is the point.
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog

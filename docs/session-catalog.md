@@ -60,6 +60,14 @@ looked. So a completed Cursor hydration reports:
 }
 ```
 
+Coverage is narrowed by the request as well as by the provider.
+`includeRelated: false` asks for the selected thread alone, and hydration
+honours that literally -- Claude subagent sidecars are not walked and Codex
+child rollouts are not read -- so `relationship` drops out of `coverage` and a
+Claude or Codex session hydrated that way reports `partial`. That is the
+difference between "this session has no delegation" and "nothing looked"; the
+diagnostic says which by naming `include_related`.
+
 `discoveryState` stays `full` for that row: it records that the session was
 indexed through its recorded source stamp, which is what the unchanged
 short-circuit reads. A parser upgrade still forces a re-parse, because the

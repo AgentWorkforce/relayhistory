@@ -449,10 +449,13 @@ export function evidenceIdentity(source: unknown, sessionId: unknown, operation:
  * native contract mismatch, not a value to hand a caller that will branch on it.
  */
 function hydrationCoverage(value: unknown): EvidenceKind[] {
-  if (value === undefined || value === null) return [];
+  // Every contract-3 result carries `coverage`, including an empty one for a
+  // listing-only connector. Defaulting an absent field to `[]` would let a
+  // malformed result through and silently drop the coverage a merge needs, so
+  // absent is a contract violation rather than "covers nothing".
   if (!Array.isArray(value)) {
     throw new NativeContractMismatchError(
-      'ai-hist-native returned a non-list hydration coverage.',
+      'ai-hist-native returned a hydration result without a coverage list.',
       'NATIVE_CONTRACT_MISMATCH',
     );
   }

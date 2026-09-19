@@ -22,6 +22,7 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  FULL_SESSION_KINDS,
   defaultDbPath,
   Source,
   CatalogSource,
@@ -782,12 +783,18 @@ export async function bootstrapLocal(
         includeRelated: false,
       });
       hydratedSessions++;
-      if (result.capability !== 'full') {
+      // Bootstrap declines delegation evidence above, so an absent
+      // `relationship` is this call's own choice and must not be reported as a
+      // provider limitation. What remains missing is the provider's.
+      const unavailable = FULL_SESSION_KINDS.filter(
+        (kind) => kind !== 'relationship' && !result.coverage.includes(kind),
+      );
+      if (unavailable.length > 0) {
         diagnostics.push({
           source: session.source,
           sessionId: session.sessionId,
           code: 'CAPABILITY_LIMITED',
-          message: `Provider exposes ${result.capability} evidence`,
+          message: `Provider exposes no ${unavailable.join(', ')} evidence`,
         });
       }
     } catch (error) {

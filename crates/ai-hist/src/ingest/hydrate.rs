@@ -1654,17 +1654,18 @@ fn build_result(
             &options.session_id,
         )?);
     }
-    // Declared coverage, not a literal: a provider whose local parser only
-    // reads prompts has not produced the other four kinds no matter how
-    // cleanly the pass completed, and reporting `full` for it is a well-formed
-    // answer computed over nothing.
-    let coverage = crate::discover::declared_evidence_kinds(&options.source).to_vec();
-    let missing = crate::discover::missing_evidence_kinds(&options.source);
+    // Declared coverage narrowed by what this request actually asked for, not a
+    // literal: a provider whose local parser only reads prompts has not
+    // produced the other four kinds no matter how cleanly the pass completed,
+    // and reporting `full` for it is a well-formed answer computed over
+    // nothing.
+    let coverage = effective_coverage(options);
+    let missing = missing_from(&coverage);
     if !missing.is_empty() {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
             message: format!(
-                "{} local evidence covers {}; no local parser produces {}",
+                "{} evidence covers {}; this hydration produces no {}{}",
                 options.source,
                 if coverage.is_empty() {
                     "no evidence kinds".to_string()
@@ -1672,6 +1673,11 @@ fn build_result(
                     crate::source_evidence::join_kinds(&coverage)
                 },
                 crate::source_evidence::join_kinds(&missing),
+                if options.include_related {
+                    ""
+                } else {
+                    " (include_related is off, so delegation evidence is not read)"
+                },
             ),
             duration_ms: None,
             source_bytes: None,
@@ -1702,6 +1708,32 @@ fn build_result(
         related_session_ids,
         diagnostics,
     })
+}
+
+/// The evidence kinds this hydration could actually have indexed.
+///
+/// The provider's declared coverage, narrowed by the request: `include_related:
+/// false` asks for the selected thread alone, and the acquisition honours that
+/// literally -- Claude subagent sidecars are never walked and Codex child
+/// rollouts are never read, so no delegation evidence is examined. Reporting
+/// `relationship` as covered there would tell a merger that unexamined
+/// delegation was fully indexed, which is the same overstatement as the
+/// hard-coded `full` this contract replaced.
+fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
+    crate::discover::declared_evidence_kinds(&options.source)
+        .iter()
+        .copied()
+        .filter(|kind| options.include_related || *kind != EvidenceKind::Relationship)
+        .collect()
+}
+
+/// The `FULL_SESSION_KINDS` a coverage set leaves out, in canonical order.
+fn missing_from(coverage: &[EvidenceKind]) -> Vec<EvidenceKind> {
+    crate::source_evidence::FULL_SESSION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !coverage.contains(kind))
+        .collect()
 }
 
 /// The `discovery_state` actually stored on the catalog row.
@@ -2424,6 +2456,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parser_version, HYDRATION_PARSER_VERSION);
+    }
+
+    /// `include_related: false` is honoured literally by the acquisition --
+    /// Claude sidecars are not walked, Codex child rollouts are not read -- so
+    /// the result must not claim relationship coverage. Reporting `full` there
+    /// tells a merger that unexamined delegation was fully indexed.
+    #[test]
+    fn declining_related_evidence_drops_relationship_coverage_for_both_full_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude/projects/app/root-1.jsonl");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        fs::write(
+            &claude,
+            "{\"sessionId\":\"root-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        let codex = dir
+            .path()
+            .join(".codex/sessions/2026/08/31/rollout-root-2.jsonl");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T11:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root-2\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T11:00:01.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"prompt\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "root-1", Some(&claude));
+        catalog_row(&conn, "codex", "root-2", Some(&codex));
+        drop(conn);
+
+        for (source, session_id) in [("claude", "root-1"), ("codex", "root-2")] {
+            let mut request = options(source, session_id);
+            request.include_related = false;
+            let alone = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+            assert_eq!(alone.capability, "partial", "{source} thread-only");
+            assert_eq!(
+                alone.coverage,
+                vec![
+                    EvidenceKind::History,
+                    EvidenceKind::SessionEvent,
+                    EvidenceKind::ToolCall,
+                    EvidenceKind::FileEdit,
+                ],
+                "{source} thread-only coverage excludes relationship"
+            );
+            let partial = alone
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+                .unwrap_or_else(|| panic!("{source} thread-only names its missing kinds"));
+            assert!(
+                partial.message.contains("no relationship"),
+                "{}",
+                partial.message
+            );
+            // The reason matters: nothing here says this provider cannot record
+            // delegation, only that this request did not ask for it.
+            assert!(
+                partial.message.contains("include_related is off"),
+                "{}",
+                partial.message
+            );
+
+            // Asking for the related evidence restores the claim, and the same
+            // provider is `full` again.
+            request.include_related = true;
+            let related = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+            assert_eq!(related.capability, "full", "{source} with related");
+            assert_eq!(related.coverage, FULL_SESSION_KINDS.to_vec());
+            assert!(!related
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
+        }
+    }
+
+    /// Dropping relationship coverage is scoped to providers that would
+    /// otherwise have claimed it; a prompt-only provider reports the same
+    /// thing either way.
+    #[test]
+    fn declining_related_evidence_does_not_change_a_prompt_only_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_transcript(dir.path(), "cursor-3", "cursor prompt");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cursor-3", Some(&transcript));
+        drop(conn);
+
+        let mut request = options("cursor", "cursor-3");
+        request.include_related = false;
+        let alone = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert_eq!(alone.capability, "partial");
+        assert_eq!(alone.coverage, vec![EvidenceKind::History]);
     }
 
     /// The declared table is what `build_result` computes from, so it is

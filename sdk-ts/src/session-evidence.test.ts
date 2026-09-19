@@ -304,6 +304,20 @@ test('hydration reports coverage alongside a capability computed from it', async
     for (const kind of hydrated.coverage) {
       assert.ok((EVIDENCE_KINDS as readonly string[]).includes(kind), `${kind} is a known kind`);
     }
+
+    // includeRelated: false never walks the subagent sidecars, so the result
+    // must not claim relationship coverage it did not look for -- and it must
+    // stay `partial`, since a merger reading `full` would treat unexamined
+    // delegation as fully indexed.
+    const alone = await hydrateSession({
+      source: 'claude', sessionId: SHARED_SESSION, dbPath, includeRelated: false,
+    });
+    assert.equal(alone.capability, 'partial');
+    assert.deepEqual(alone.coverage, FULL_SESSION_KINDS.filter((kind) => kind !== 'relationship'));
+    const declined = alone.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE');
+    assert.ok(declined, 'the declined evidence is named');
+    assert.ok(declined.message.includes('relationship'), declined.message);
+    assert.ok(declined.message.includes('include_related is off'), declined.message);
   } finally {
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
@@ -340,6 +354,22 @@ test('a native full capability unsupported by its coverage is a contract mismatc
   assert.deepEqual(
     normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
     ['history'],
+  );
+  // An absent or non-list `coverage` is malformed, not "covers nothing":
+  // defaulting it would pass validation and strip the coverage a merge needs.
+  for (const coverage of [undefined, null, 'history', {}]) {
+    assert.throws(
+      () => normalizeHydration({ ...base, capability: 'partial', coverage }),
+      (error: unknown) => error instanceof NativeContractMismatchError
+        && error.code === 'NATIVE_CONTRACT_MISMATCH'
+        && error.message.includes('without a coverage list'),
+      `coverage: ${JSON.stringify(coverage)} is rejected`,
+    );
+  }
+  // An empty list is legitimate -- a listing-only connector covers nothing.
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'shallow_only', coverage: [] }).coverage,
+    [],
   );
 });
 
