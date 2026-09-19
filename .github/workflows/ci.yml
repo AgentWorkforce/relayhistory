@@ -67,9 +67,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: dtolnay/rust-toolchain@1.85.0
       - name: MSRV check
-        run: cargo check -p ai-hist --all-features
+        run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
     runs-on: ubuntu-latest
