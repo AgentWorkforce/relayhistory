@@ -28,6 +28,12 @@ pub struct ObservedRelationship<'a> {
     pub spawned_at_ms: Option<i64>,
     /// The conversation a fork or continuation branched from, when the
     /// provider named one distinct from the parent. `None` for delegation.
+    ///
+    /// Unlike the agent metadata above this is *assigned*, not merged: a
+    /// re-read that no longer finds a `sourceSessionId` is saying the origin
+    /// is gone, and coalescing would have kept the stale one forever.
+    /// Reconciliation rebuilds the whole row on every recapture, so there is
+    /// no thinner later observation for the merge to protect against.
     pub origin_session_id: Option<&'a str>,
     /// Overrides the derived dedupe key. Continuity edges need it: one
     /// session can be both the continuation *and* the resume target of the
@@ -134,7 +140,7 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
            evidence_ref     = COALESCE(excluded.evidence_ref,     session_relationships.evidence_ref), \
            child_has_events = excluded.child_has_events, \
            spawned_at_ms    = COALESCE(excluded.spawned_at_ms,    session_relationships.spawned_at_ms), \
-           origin_session_id = COALESCE(excluded.origin_session_id, session_relationships.origin_session_id), \
+           origin_session_id = excluded.origin_session_id, \
            updated_ms       = excluded.updated_ms",
         params![
             observed.source,

@@ -19,7 +19,7 @@
 //! explicit provider field, a marker the human typed, or a uuid that two
 //! transcripts genuinely share.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -112,7 +112,12 @@ impl ContinuityEvidence {
 /// no identity to attach the evidence to, and inventing one from the file name
 /// is exactly what the delegation model already refuses to do.
 pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // Propagated, never collapsed into empty content. `Ok(None)` is what the
+    // caller retracts on, so a transient read failure returning it would have
+    // deleted real topology and reported a clean sync — the file still says
+    // what it said, and we simply failed to look.
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading Claude transcript {}", path.display()))?;
     let mut evidence = ContinuityEvidence {
         source: "claude".to_string(),
         locator: path.to_string_lossy().to_string(),
@@ -189,14 +194,14 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
 /// records nothing when it does not — see
 /// `codex_resume_without_explicit_fields_records_no_continuity`.
 pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    let first = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.lines().next().map(str::to_string))
-        .unwrap_or_default();
+    // As above: a read failure is an error, not an empty rollout.
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading Codex rollout {}", path.display()))?;
+    let first = text.lines().next().unwrap_or_default();
     if first.trim().is_empty() {
         return Ok(None);
     }
-    let Ok(value) = serde_json::from_str::<Value>(&first) else {
+    let Ok(value) = serde_json::from_str::<Value>(first) else {
         return Ok(None);
     };
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -250,6 +255,9 @@ pub fn scan_codex_rollout(path: &Path) -> Result<Option<ContinuityEvidence>> {
 /// re-read of a changed file has to be reconsidered even when the previous
 /// read had resolved.
 pub fn record_evidence(conn: &Connection, evidence: &ContinuityEvidence) -> Result<()> {
+    // Read before write: a locator's *previous* identity is what its former
+    // dependents were resolved against, and after the upsert it is gone.
+    let previous = stored_identity(conn, &evidence.source, &evidence.locator)?;
     conn.execute(
         "INSERT INTO session_continuity_evidence \
          (source, locator, session_id, file_session_id, first_parent_uuid, first_ts_ms, \
@@ -285,7 +293,83 @@ pub fn record_evidence(conn: &Connection, evidence: &ContinuityEvidence) -> Resu
             crate::now_ms(),
         ],
     )?;
+    reopen_dependents(
+        conn,
+        &evidence.source,
+        &[
+            previous,
+            Some((evidence.session_id.clone(), evidence.origin_session_id())),
+        ],
+    )?;
     Ok(())
+}
+
+/// The session and origin a stored evidence row currently claims.
+fn stored_identity(
+    conn: &Connection,
+    source: &str,
+    locator: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id, origin_session_id FROM session_continuity_evidence \
+             WHERE source = ? AND locator = ?",
+            params![source, locator],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Mark every row whose resolution could have depended on these identities.
+///
+/// A resolved row is not re-read on later passes, which is what makes
+/// reconciliation cheap — and what made it stale. Two rows can depend on a
+/// third: a continuation resolved against the session that holds its parent
+/// record, and a fork branch that is only a fork because a sibling claims the
+/// same origin. When that third transcript is rewritten or removed, the
+/// dependents have to be reconsidered or they keep an edge the evidence no
+/// longer supports — and a fork group that shrinks below two has to lose its
+/// fork edges, which only happens if the survivors are reconciled again.
+///
+/// Both directions are covered exactly rather than by re-reading everything:
+/// fork siblings by the origin they share, and continuation dependents by the
+/// edges that actually point at the session, read back from
+/// `session_relationships`. Reopening is idempotent — a row that resolves the
+/// same way rewrites the same edge.
+fn reopen_dependents(
+    conn: &Connection,
+    source: &str,
+    identities: &[Option<(String, Option<String>)>],
+) -> Result<usize> {
+    let mut sessions: BTreeSet<String> = BTreeSet::new();
+    let mut origins: BTreeSet<String> = BTreeSet::new();
+    for (session_id, origin) in identities.iter().flatten() {
+        sessions.insert(session_id.clone());
+        if let Some(origin) = origin {
+            origins.insert(origin.clone());
+        }
+    }
+    if sessions.is_empty() && origins.is_empty() {
+        return Ok(0);
+    }
+    let session_holes = vec!["?"; sessions.len()].join(", ");
+    let origin_holes = vec!["?"; origins.len()].join(", ");
+    let sql = format!(
+        "UPDATE session_continuity_evidence SET pending_reason = 'unreconciled' \
+         WHERE source = ?1 AND pending_reason IS NULL \
+           AND (origin_session_id IN ({origin_holes}) \
+                OR locator IN ( \
+                  SELECT evidence_locator FROM session_relationships \
+                  WHERE source = ?1 \
+                    AND relationship IN ('continuation', 'fork', 'resume') \
+                    AND evidence_locator IS NOT NULL \
+                    AND parent_session_id IN ({session_holes}) \
+                ))"
+    );
+    let mut values: Vec<rusqlite::types::Value> = vec![source.to_string().into()];
+    values.extend(origins.into_iter().map(Into::into));
+    values.extend(sessions.into_iter().map(Into::into));
+    Ok(conn.execute(&sql, rusqlite::params_from_iter(values))?)
 }
 
 /// Read one transcript's evidence and store it, in one call.
@@ -319,11 +403,16 @@ fn capture(
 
 /// Drop one locator's evidence and every continuity edge it established.
 pub fn clear_evidence(conn: &Connection, source: &str, locator: &str) -> Result<()> {
+    let previous = stored_identity(conn, source, locator)?;
     retract_edges(conn, source, locator, &[])?;
     conn.execute(
         "DELETE FROM session_continuity_evidence WHERE source = ? AND locator = ?",
         params![source, locator],
     )?;
+    // A removed transcript is exactly the case a survivor must be reconsidered
+    // for: a fork group of two becomes a group of one, and the remaining
+    // branch is no longer a branch of anything.
+    reopen_dependents(conn, source, &[previous])?;
     Ok(())
 }
 
@@ -1534,5 +1623,218 @@ mod tests {
         let evidence = scan_claude_transcript(&path).unwrap().unwrap();
         assert!(!evidence.has_resume_marker);
         assert_eq!(evidence.resume_target, None);
+    }
+
+    #[test]
+    fn a_read_failure_never_retracts_what_the_file_still_says() {
+        // A transient read failure used to collapse into empty content, which
+        // `capture` reads as "this file says nothing any more" and retracts
+        // on. The file still says what it said; we simply failed to look.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resumer.jsonl");
+        std::fs::write(
+            &path,
+            "{\"sessionId\":\"resumer\",\"uuid\":\"u1\",\"type\":\"user\",\
+             \"message\":{\"role\":\"user\",\"content\":\"/resume prior\"},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(edges(&conn, "prior").len(), 1);
+
+        // The positive control for the two assertions below: a readable file
+        // scans, an unreadable one errors rather than reporting emptiness.
+        let missing = dir.path().join("not-there.jsonl");
+        assert!(scan_claude_transcript(&path).unwrap().is_some());
+        assert!(scan_claude_transcript(&missing).is_err());
+        assert!(scan_codex_rollout(&missing).is_err());
+
+        // And the error reaches the caller instead of retracting.
+        assert!(capture_claude_transcript(&conn, &missing).is_err());
+        assert_eq!(
+            edges(&conn, "prior").len(),
+            1,
+            "a failed read left the edge the file still establishes"
+        );
+    }
+
+    #[test]
+    fn an_origin_that_the_file_stops_naming_is_dropped_not_merged() {
+        // Optional relationship detail is merged with COALESCE so a thinner
+        // later observation cannot erase it. `origin_session_id` is the
+        // exception: reconciliation rebuilds the whole row on every recapture,
+        // so a re-read that no longer finds `sourceSessionId` is saying the
+        // origin is gone, and merging kept the stale one forever.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branch.jsonl");
+        let write = |source_field: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"sessionId\":\"branch\",\"uuid\":\"u1\",\"type\":\"user\",\
+                     {source_field}\"forkSessionId\":\"base\",\
+                     \"message\":{{\"role\":\"user\",\"content\":\"hi\"}},\
+                     \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let origin = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT origin_session_id FROM session_relationships \
+                 WHERE relationship = 'fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        write("\"sourceSessionId\":\"original\",");
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(origin(&conn).as_deref(), Some("original"));
+
+        // The field is removed; the fork itself still stands.
+        write("");
+        capture_claude_transcript(&conn, &path).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            origin(&conn).as_deref(),
+            Some("base"),
+            "the origin follows the evidence rather than surviving it"
+        );
+    }
+
+    #[test]
+    fn a_survivor_stops_being_a_fork_when_its_sibling_goes_away() {
+        // A resolved row is never re-read, which is what keeps reconciliation
+        // cheap — and what made a shrinking fork group stale. The survivor is
+        // no longer a branch of anything, so its fork edge has to go.
+        let (_dir, conn) = database();
+        ingest(&conn, "fork-branch-a.jsonl");
+        ingest(&conn, "fork-branch-b.jsonl");
+        assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+
+        // One branch is removed from the store.
+        clear_evidence(
+            &conn,
+            "claude",
+            &fixture("fork-branch-b.jsonl").to_string_lossy(),
+        )
+        .unwrap();
+        let report = reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            report.considered, 1,
+            "the survivor was reopened, not left resolved and stale"
+        );
+        assert!(
+            edges(&conn, SHARED_FORK).is_empty(),
+            "one transcript claiming an origin is not a fork"
+        );
+        // It is pending rather than silently empty: a sibling may come back.
+        let pending = pending_reasons(&conn, "claude", SHARED_FORK).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].1.contains("a fork needs a sibling"));
+    }
+
+    /// Two transcripts named after the sessions they contain, the second
+    /// opening by answering the first's last record — the real-world shape,
+    /// with no basename mismatch to make either look like a fork branch, so
+    /// the corpus settles completely and "reopened" is unambiguous.
+    fn linked_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let origin = dir.join("origin.jsonl");
+        let follower = dir.join("follower.jsonl");
+        std::fs::write(
+            &origin,
+            concat!(
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"start\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-a\",\"parentUuid\":\"origin-u\",",
+                "\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},",
+                "\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &follower,
+            concat!(
+                "{\"sessionId\":\"follower\",\"uuid\":\"follow-u\",",
+                "\"parentUuid\":\"origin-a\",\"type\":\"user\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"carry on\"},",
+                "\"timestamp\":\"2026-08-31T11:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        (origin, follower)
+    }
+
+    fn ingest_file(conn: &Connection, path: &std::path::Path) {
+        ingest_claude_transcript(conn, path).unwrap();
+        capture_claude_transcript(conn, path).unwrap();
+        reconcile(conn, "claude").unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_origin_reopens_the_continuation_that_pointed_at_it() {
+        // The other dependency direction: a continuation resolved against the
+        // session that holds its parent record. Rewriting that transcript has
+        // to reconsider the dependent, which is resolved and would otherwise
+        // never be read again.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, follower) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        ingest_file(&conn, &follower);
+        assert_eq!(edges(&conn, "origin").len(), 1);
+        assert_eq!(
+            reconcile(&conn, "claude").unwrap().considered,
+            0,
+            "the corpus is fully explained before the rewrite"
+        );
+
+        capture_claude_transcript(&conn, &origin).unwrap();
+        let report = reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            report.considered, 2,
+            "the origin and the continuation that depends on it"
+        );
+        // The evidence is unchanged, so the edge is too: reopening is
+        // idempotent, not destructive.
+        assert_eq!(edges(&conn, "origin").len(), 1);
+    }
+
+    #[test]
+    fn an_unrelated_transcript_is_not_reopened() {
+        // The positive control for the test above: reopening is scoped to rows
+        // that actually depend on the recaptured locator, not a re-read of
+        // everything, which would give back the cost the pending marker buys.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, follower) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        ingest_file(&conn, &follower);
+        let unrelated = dir.path().join("unrelated.jsonl");
+        std::fs::write(
+            &unrelated,
+            concat!(
+                "{\"sessionId\":\"unrelated\",\"uuid\":\"un-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"alone\"},",
+                "\"timestamp\":\"2026-08-31T12:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &unrelated);
+        assert_eq!(reconcile(&conn, "claude").unwrap().considered, 0);
+
+        capture_claude_transcript(&conn, &unrelated).unwrap();
+        let report = reconcile(&conn, "claude").unwrap();
+        assert_eq!(
+            report.considered, 1,
+            "only the recaptured transcript, which nothing else depends on"
+        );
     }
 }

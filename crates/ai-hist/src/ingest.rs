@@ -2669,18 +2669,24 @@ fn sync_claude_session_metadata(
     for path in collect_matching_files(root, "", "jsonl")? {
         let key = path.to_string_lossy().to_string();
         let stamp = claude_sync_stamp(&path)?;
+        let transcript_events = claude_transcript_events_exist(conn, &path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
-            && (claude_transcript_events_exist(conn, &path)?
-                || claude_sidecar_evidence_exists(conn, &path)?)
+            && (transcript_events || claude_sidecar_evidence_exists(conn, &path)?)
         {
-            // An unchanged transcript indexed before continuity existed still
-            // owes its evidence. Reading it here rather than falling through
-            // keeps the skip's promise: continuity is written to its own
-            // table and touches no indexed row, so the file is read without
-            // being re-ingested — the same shape as the subagent delegation
-            // backfill in the Codex walk. The capture writes a row for every
-            // readable transcript, so this clears after one pass.
-            if claude_transcript_lacks_continuity_evidence(conn, &path)? {
+            // A transcript registered as a session and indexed before
+            // continuity existed still owes its evidence. Reading it here
+            // rather than falling through keeps the skip's promise:
+            // continuity is written to its own table and touches no indexed
+            // row, so the file is read without being re-ingested — the same
+            // shape as the subagent delegation backfill in the Codex walk.
+            // The capture writes a row for every readable transcript, so this
+            // clears after one pass and never reads again.
+            //
+            // Gated on `transcript_events` because a subagent sidecar reaches
+            // this skip through its delegation evidence instead, and a sidecar
+            // is not a session: it never reaches the capture on the ingest
+            // path either, so it has no row to owe and must not be re-read.
+            if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
                 crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
@@ -2808,14 +2814,10 @@ fn codex_continuity_evidence_exists(conn: &Connection, path: &Path) -> Result<bo
 /// `claude_sessions_v3` generation, which would re-read the whole archive and
 /// discard the selective-repair state that map carries.
 ///
-/// Keyed on the locator alone, deliberately. Joining `sessions.raw_path` would
-/// have read the fork case wrong in exactly the way continuity exists to
-/// catch: two transcripts sharing one in-log session id are one `sessions`
-/// row, whose `raw_path` names only the last of them, so the other branch
-/// would never have been backfilled. The caller only reaches this on the fast
-/// path, which already established that the file produced events or sidecar
-/// evidence — so it has an in-log `sessionId`, so the capture writes a row,
-/// so the condition clears and nothing is re-read forever.
+/// Keyed on the locator, which is what the evidence table is keyed on. The
+/// caller has already established that this file is the transcript of a
+/// registered session, so it has an in-log `sessionId`, so the capture writes
+/// a row — the condition clears after one read and never fires again.
 fn claude_transcript_lacks_continuity_evidence(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
     let exists: i64 = conn.query_row(
@@ -8358,11 +8360,11 @@ mod tests {
 
     #[test]
     fn an_upgrade_backfills_both_branches_that_share_one_session_id() {
-        // The hole a `sessions.raw_path` join would have left, in the one case
-        // continuity exists to catch: two transcripts carrying one in-log
-        // session id are a single catalog row whose `raw_path` names only the
-        // last of them, so keying the backfill on that row would have left the
-        // other branch unread and the fork undetected forever.
+        // The upgrade path in the one case continuity exists to catch. Two
+        // transcripts carrying one in-log session id are a single catalog row,
+        // so they reach the backfill by different routes — the one the row
+        // names through the fast path, the other by falling through — and the
+        // fork is only detected if *both* end up with evidence.
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects/app");
         std::fs::create_dir_all(&projects).unwrap();
@@ -8419,5 +8421,80 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(forks, vec!["fork:branch-a", "fork:branch-b"]);
+    }
+
+    #[test]
+    fn an_upgrade_never_turns_a_subagent_sidecar_into_a_fork_branch() {
+        // A sidecar carries its parent's `sessionId` while living in its own
+        // file, which is byte-for-byte the shape the fork inference reads as
+        // "two transcripts claiming one origin". It is not a session, it is
+        // not a branch, and it must never reach the continuity capture — on
+        // the ingest path (where the subagent branch returns before it) or on
+        // the upgrade path, which runs before that classification.
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects/app");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("parent.jsonl"),
+            concat!(
+                "{\"sessionId\":\"parent\",\"uuid\":\"p-u\",\"parentUuid\":null,\"type\":\"user\",",
+                "\"cwd\":\"/work/app\",\"message\":{\"role\":\"user\",\"content\":\"do it\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        // Two sidecars, so a naive capture would group them into a fork pair.
+        for agent in ["agent-one", "agent-two"] {
+            std::fs::write(
+                projects.join(format!("{agent}.jsonl")),
+                format!(
+                    "{{\"sessionId\":\"parent\",\"uuid\":\"{agent}-a\",\"isSidechain\":true,\
+                     \"type\":\"assistant\",\"cwd\":\"/work/app\",\
+                     \"message\":{{\"role\":\"assistant\",\"content\":\"{agent} result\"}},\
+                     \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Reproduce the pre-upgrade state, then sync again: this is the pass
+        // that used to read every file lacking an evidence row, sidecars
+        // included.
+        forget_continuity_evidence(&conn);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let captured: Vec<String> = conn
+            .prepare("SELECT locator FROM session_continuity_evidence ORDER BY locator")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            captured,
+            vec![projects.join("parent.jsonl").to_string_lossy().to_string()],
+            "only the session's own transcript is captured"
+        );
+        let forks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE relationship = 'fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forks, 0, "sidecars are delegation, never branches");
+        // The positive control: the delegation the sidecars really are is
+        // still recorded, so this is not an empty-database pass.
+        let delegated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships WHERE relationship = 'delegated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delegated, 2);
     }
 }
