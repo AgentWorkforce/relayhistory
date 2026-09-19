@@ -187,6 +187,17 @@ pub struct DrainResult {
 /// the writer holding the lock.
 const RENEWAL_RETRY_FLOOR_MS: u64 = 5;
 
+/// How long one renewal waits for the write lock before giving the decision
+/// back to the renewal loop.
+///
+/// A sixth of the lease, so a blocked renewal returns with most of its margin
+/// intact and several attempts still available before the deadline. Floored so
+/// a very short lease still makes progress, and capped so a very long one does
+/// not inherit the thirty-second wait this exists to avoid.
+fn keepalive_busy_timeout_ms(lease_ms: i64) -> u64 {
+    (lease_ms / 6).clamp(5, 2_000) as u64
+}
+
 /// Whether a failed write is SQLite refusing it because another connection
 /// holds the lock, rather than the write itself being rejected.
 ///
@@ -263,9 +274,19 @@ pub fn drain(
         1,
         3_600_000,
     )?;
+    let keepalive = crate::open_db(db_path)?;
+    // The shared busy policy retries for about thirty seconds, which is right
+    // for a sync that must not give up and exactly wrong for a keepalive: a
+    // renewal that waits thirty seconds to protect a lease shorter than that
+    // has already lost the thing it was protecting, and it made the decision
+    // inside a busy handler that has never heard of the deadline. Bound it so
+    // contention comes back to the renewal loop, which does know.
+    keepalive.busy_timeout(Duration::from_millis(keepalive_busy_timeout_ms(
+        options.lease_ms,
+    )))?;
     let mut worker = Worker {
         conn: crate::open_db(db_path)?,
-        keepalive: Mutex::new(crate::open_db(db_path)?),
+        keepalive: Mutex::new(keepalive),
         receivers,
         options,
         clock,
@@ -457,37 +478,32 @@ impl Worker<'_> {
                         if !sleep_until(&stop, wait) {
                             break;
                         }
-                        // The lease is already gone: another worker may
-                        // legitimately own this batch now, so stop renewing
-                        // and let the attempt discard its outcome. Reporting
-                        // it here rather than waiting for `renew_lease` to
-                        // reject the write keeps the uncertain window as
-                        // short as this side can make it.
-                        if clock() >= expires_at_ms {
-                            lost.store(true, Ordering::SeqCst);
-                            break;
-                        }
+                        // Deliberately no "the deadline passed, so the claim is
+                        // gone" check here. Expiry is a signal to *other*
+                        // workers that an abandoned batch may be stolen, and
+                        // `claim_batch` enforces it; a lease that lapsed while
+                        // nobody took it is still ours, and `check_lease` says
+                        // so by fence. Giving up on the clock alone would
+                        // discard a send that had already succeeded, for a
+                        // batch no one else ever touched.
                         let renewed = keepalive
                             .lock()
                             .map_err(|_| anyhow!("delivery keepalive connection is poisoned"))
-                            .and_then(|conn| renew_lease(&conn, lease, lease_ms, clock()));
+                            .and_then(|conn| renew_lease(&conn, lease, lease_ms, &clock));
                         match renewed {
                             Ok(lease) => expires_at_ms = lease.expires_at_ms,
                             // Losing a race for the database is not losing the
-                            // lease. The claim is still ours until its deadline
-                            // passes, and the loop above will retry well inside
-                            // that window; treating a contended write as a
-                            // verdict threw away good work every time a second
-                            // worker happened to be claiming at the same moment.
+                            // lease: the keepalive's connection gives up on a
+                            // contended write quickly (see
+                            // `keepalive_busy_timeout_ms`) precisely so the
+                            // decision comes back here, where the deadline is
+                            // known, rather than being made by a busy handler
+                            // that has never heard of it. Retry.
+                            //
                             // Anything else -- notably `check_lease` refusing
                             // because another worker now owns the batch -- is a
                             // verdict, and is reported at once.
-                            Err(error) if lost_a_race_for_the_database(&error) => {
-                                if clock() >= expires_at_ms {
-                                    lost.store(true, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
+                            Err(error) if lost_a_race_for_the_database(&error) => {}
                             Err(_) => {
                                 lost.store(true, Ordering::SeqCst);
                                 break;
