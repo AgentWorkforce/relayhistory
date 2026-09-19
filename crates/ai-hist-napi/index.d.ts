@@ -336,6 +336,7 @@ export interface NativeSessionRelationship {
   spawnedAtMs?: number
   createdMs: number
   relationshipUid: string
+  originSessionId?: string
 }
 export interface NativeRelationshipCapabilities {
   source: string
@@ -355,6 +356,7 @@ export interface NativeSessionRelationships {
   sessionId: string
   asParent: Array<NativeSessionRelationship>
   asChild: Array<NativeSessionRelationship>
+  continuity: Array<NativeSessionRelationship>
   capabilities: NativeRelationshipCapabilities
   diagnostics: Array<NativeRelationshipDiagnostic>
 }
@@ -398,6 +400,11 @@ export interface SessionTreeOptions {
   dbPath?: string
   maxDepth?: number
   maxNodes?: number
+  /**
+   * Which edges the walk follows. Omitted means delegation only, which is
+   * what every caller got before continuity existed.
+   */
+  relationshipKinds?: Array<string>
 }
 export interface SessionChildrenPageOptions {
   source: string
@@ -405,6 +412,7 @@ export interface SessionChildrenPageOptions {
   dbPath?: string
   limit?: number
   after?: RelationshipCursor
+  relationshipKinds?: Array<string>
 }
 /**
  * Direct delegation relationships for one session, in both directions.

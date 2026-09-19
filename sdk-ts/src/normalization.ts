@@ -73,7 +73,14 @@ import type {
 } from './contracts.js';
 export type UnknownRecord = Record<string, unknown>;
 
-export const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
+/** Delegation kinds: one session started another thread of work. */
+export const DELEGATION_RELATIONSHIP_TYPES: readonly string[] = ['delegated', 'materialized_local'];
+/** Continuity kinds: one conversation carrying on as another. */
+export const CONTINUITY_RELATIONSHIP_TYPES: readonly string[] = ['continuation', 'fork', 'resume'];
+export const RELATIONSHIP_TYPES: readonly string[] = [
+  ...DELEGATION_RELATIONSHIP_TYPES,
+  ...CONTINUITY_RELATIONSHIP_TYPES,
+];
 export const DEFAULT_TREE_MAX_DEPTH = 32;
 export const MAX_TREE_MAX_DEPTH = 64;
 export const DEFAULT_TREE_MAX_NODES = 1_000;
@@ -337,6 +344,7 @@ export function relationship(value: UnknownRecord): SessionRelationship {
     spawnedAtMs: typeof value.spawnedAtMs === 'number' ? value.spawnedAtMs : null,
     createdMs: Number(value.createdMs),
     relationshipUid: String(value.relationshipUid),
+    originSessionId: nullableString(value.originSessionId),
   };
 }
 

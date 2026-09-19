@@ -21,7 +21,8 @@ use ai_hist::{
     stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter,
     RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
-    RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
+    RelationshipDiagnostic as CoreRelationshipDiagnostic,
+    RelationshipKinds as CoreRelationshipKinds, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
     SessionFileEdit as CoreSessionFileEdit, SessionRelationship as CoreSessionRelationship,
     SessionRelationships as CoreSessionRelationships, SessionScope,
@@ -34,7 +35,7 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -1182,6 +1183,7 @@ pub struct NativeSessionRelationship {
     pub spawned_at_ms: Option<i64>,
     pub created_ms: i64,
     pub relationship_uid: String,
+    pub origin_session_id: Option<String>,
 }
 
 impl From<CoreSessionRelationship> for NativeSessionRelationship {
@@ -1203,6 +1205,7 @@ impl From<CoreSessionRelationship> for NativeSessionRelationship {
             spawned_at_ms: relationship.spawned_at_ms,
             created_ms: relationship.created_ms,
             relationship_uid: relationship.relationship_uid,
+            origin_session_id: relationship.origin_session_id,
         }
     }
 }
@@ -1252,6 +1255,7 @@ pub struct NativeSessionRelationships {
     pub session_id: String,
     pub as_parent: Vec<NativeSessionRelationship>,
     pub as_child: Vec<NativeSessionRelationship>,
+    pub continuity: Vec<NativeSessionRelationship>,
     pub capabilities: NativeRelationshipCapabilities,
     pub diagnostics: Vec<NativeRelationshipDiagnostic>,
 }
@@ -1269,6 +1273,11 @@ impl From<CoreSessionRelationships> for NativeSessionRelationships {
                 .collect(),
             as_child: relationships
                 .as_child
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            continuity: relationships
+                .continuity
                 .into_iter()
                 .map(NativeSessionRelationship::from)
                 .collect(),
@@ -1376,6 +1385,9 @@ pub struct SessionTreeOptions {
     pub db_path: Option<String>,
     pub max_depth: Option<i64>,
     pub max_nodes: Option<i64>,
+    /// Which edges the walk follows. Omitted means delegation only, which is
+    /// what every caller got before continuity existed.
+    pub relationship_kinds: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -1385,6 +1397,35 @@ pub struct SessionChildrenPageOptions {
     pub db_path: Option<String>,
     pub limit: Option<i64>,
     pub after: Option<RelationshipCursor>,
+    pub relationship_kinds: Option<Vec<String>>,
+}
+
+/// Every relationship kind a caller may name, so a typo is refused at the
+/// boundary rather than answered with a silently empty page.
+const RELATIONSHIP_KIND_CHOICES: &[&str] = &[
+    "delegated",
+    "materialized_local",
+    "continuation",
+    "fork",
+    "resume",
+];
+
+fn validate_relationship_kinds(kinds: Option<Vec<String>>) -> napi::Result<CoreRelationshipKinds> {
+    let Some(kinds) = kinds else {
+        return Ok(CoreRelationshipKinds::delegation());
+    };
+    for kind in &kinds {
+        if !RELATIONSHIP_KIND_CHOICES.contains(&kind.as_str()) {
+            return Err(native_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "relationshipKinds must name only {}, got '{kind}'",
+                    RELATIONSHIP_KIND_CHOICES.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(CoreRelationshipKinds::only(kinds))
 }
 
 /// Direct delegation relationships for one session, in both directions.
@@ -1405,6 +1446,7 @@ pub async fn get_session_relationships(
         session_id: session_id.clone(),
         as_parent: Vec::new(),
         as_child: Vec::new(),
+        continuity: Vec::new(),
         capabilities: relationship_capabilities(&source).into(),
         diagnostics: Vec::new(),
     };
@@ -1434,6 +1476,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
         DEFAULT_TREE_MAX_NODES,
         MAX_TREE_MAX_NODES,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1471,6 +1514,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
                 &CoreSessionTreeOptions {
                     max_depth,
                     max_nodes,
+                    relationship_kinds,
                 },
             )?;
             Ok(tree.into())
@@ -1491,6 +1535,7 @@ pub async fn get_session_children_page(
         DEFAULT_CHILDREN_PAGE_LIMIT,
         MAX_CHILDREN_PAGE_LIMIT,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1506,8 +1551,14 @@ pub async fn get_session_children_page(
         },
         schema_is_relationship_read_current,
         move |conn| {
-            let page =
-                core_session_children_page(conn, &source, &session_id, limit, after.as_ref())?;
+            let page = core_session_children_page(
+                conn,
+                &source,
+                &session_id,
+                limit,
+                after.as_ref(),
+                &relationship_kinds,
+            )?;
             Ok(NativeSessionChildrenPage {
                 children: page
                     .children

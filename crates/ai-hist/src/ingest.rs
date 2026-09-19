@@ -1638,6 +1638,9 @@ fn sync_codex_rollouts(
                     branches.insert(meta.session_id.clone(), branch.clone());
                 }
             }
+            // Only rollouts whose `session_meta` actually names a prior thread
+            // bank anything here; `codex resume` on its own does not.
+            crate::continuity::capture_codex_rollout(conn, &rollout)?;
             let outcome = if repair_user_messages {
                 repair_codex_rollout_user_messages(conn, &rollout, &meta)
             } else {
@@ -1720,6 +1723,7 @@ fn sync_codex_rollouts(
     );
     state.remove("codex_rollouts_v3");
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    crate::continuity::reconcile(conn, "codex")?;
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -1768,6 +1772,7 @@ fn record_codex_delegation(
             evidence_ref: meta.parent_thread_id.as_deref(),
             child_has_events: codex_session_events_exist(conn, &meta.session_id)?,
             spawned_at_ms: meta.meta_ts_ms,
+            ..ObservedRelationship::default()
         },
     )
 }
@@ -2692,6 +2697,11 @@ fn sync_claude_session_metadata(
             )?;
             ingest_claude_transcript(conn, &path)?;
             record_claude_remote_relationship(conn, &meta)?;
+            // Continuity is cross-file, so the evidence is banked here and
+            // reconciled once the whole walk has indexed everything it can
+            // reach; a branch read before its origin is resolved by the same
+            // pass rather than needing a second sync.
+            crate::continuity::capture_claude_transcript(conn, &path)?;
             upserted += 1;
         }
     }
@@ -2699,6 +2709,7 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
+    crate::continuity::reconcile(conn, "claude")?;
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2954,11 +2965,12 @@ fn record_claude_materialized_relationship(
             evidence_ref: Some(remote_id),
             child_has_events: session_events_exist(conn, "claude", local_id)?,
             spawned_at_ms: None,
+            ..ObservedRelationship::default()
         },
     )
 }
 
-fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     ingest_claude_transcript_as(conn, path, None)
 }
 

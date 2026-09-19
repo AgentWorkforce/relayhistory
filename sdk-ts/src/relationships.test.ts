@@ -94,7 +94,7 @@ test('missing databases answer relationship queries with provider capabilities',
   const dbPath = join(root, 'missing', 'history.db');
   try {
     assert.deepEqual(await getSessionRelationships({ source: 'codex', sessionId: 'root', dbPath }), {
-      contractVersion: 1, source: 'codex', sessionId: 'root', asParent: [], asChild: [],
+      contractVersion: 2, source: 'codex', sessionId: 'root', asParent: [], asChild: [], continuity: [],
       capabilities: {
         source: 'codex', stableChildIdentity: 'always', recordsAgentType: true,
         recordsSpawnTime: true, recordsEvidenceLocator: true,
@@ -104,7 +104,7 @@ test('missing databases answer relationship queries with provider capabilities',
     // A tree always contains its root, so a missing database answers with the
     // same shape a real childless session has.
     assert.deepEqual(await getSessionTree({ source: 'claude', sessionId: 'root', dbPath }), {
-      contractVersion: 1,
+      contractVersion: 2,
       source: 'claude',
       rootSessionId: 'root',
       nodes: [{
@@ -171,7 +171,9 @@ test('codex delegation topology round-trips through discovery and hydration', as
     assert.deepEqual([...hydrated.relatedSessionIds].sort(), ['child-a', 'child-b']);
 
     const relationships = await getSessionRelationships({ source: 'codex', sessionId: 'root', dbPath });
-    assert.equal(relationships.contractVersion, 1);
+    assert.equal(relationships.contractVersion, 2);
+    // A delegation-only database records no continuity at all.
+    assert.deepEqual(relationships.continuity, []);
     assert.deepEqual(relationships.asChild, []);
     // Spawn time orders children ahead of the relationship uid tiebreaker.
     assert.deepEqual(childIds(relationships.asParent), ['child-b', 'child-a']);
@@ -436,6 +438,81 @@ test('large trees stay bounded by the node budget', async () => {
     assert.deepEqual(
       walked.map((node) => node.sessionId),
       Array.from({ length: 49 }, (_, index) => `child-${String(index).padStart(3, '0')}`),
+    );
+  });
+});
+
+test('continuity topology reaches the SDK and stays out of the delegation view', async () => {
+  await withHome('relayhistory-relationships-continuity-', async (home, dbPath) => {
+    // A conversation, and a second transcript that opens by answering the
+    // first one's last record. Nothing but that uuid connects them.
+    const project = join(home, '.claude', 'projects', 'app');
+    await mkdir(project, { recursive: true });
+    const line = (row: Record<string, unknown>) => JSON.stringify(row);
+    await writeFile(join(project, 'origin.jsonl'), [
+      line({
+        sessionId: 'origin', uuid: 'origin-u', parentUuid: null, type: 'user', cwd: '/work/app',
+        message: { role: 'user', content: 'start the work' }, timestamp: '2026-08-31T10:00:00Z',
+      }),
+      line({
+        sessionId: 'origin', uuid: 'origin-a', parentUuid: 'origin-u', type: 'assistant', cwd: '/work/app',
+        message: { role: 'assistant', content: 'on it' }, timestamp: '2026-08-31T10:00:01Z',
+      }),
+      '',
+    ].join('\n'));
+    await writeFile(join(project, 'continued.jsonl'), [
+      line({
+        sessionId: 'continued', uuid: 'continued-u', parentUuid: 'origin-a', type: 'user', cwd: '/work/app',
+        message: { role: 'user', content: 'pick up where we left off' }, timestamp: '2026-08-31T11:00:00Z',
+      }),
+      line({
+        sessionId: 'continued', uuid: 'continued-a', parentUuid: 'continued-u', type: 'assistant', cwd: '/work/app',
+        message: { role: 'assistant', content: 'picking up' }, timestamp: '2026-08-31T11:00:01Z',
+      }),
+      '',
+    ].join('\n'));
+
+    await sync({ dbPath });
+
+    const child = await getSessionRelationships({ source: 'claude', sessionId: 'continued', dbPath });
+    assert.deepEqual(child.asParent, []);
+    assert.deepEqual(child.asChild, []);
+    assert.equal(child.continuity.length, 1);
+    const [edge] = child.continuity;
+    assert.equal(edge.relationship, 'continuation');
+    assert.equal(edge.parentSessionId, 'origin');
+    assert.equal(edge.childSessionId, 'continued');
+    assert.equal(edge.identityStatus, 'observed');
+    // The evidence is the uuid that linked the two transcripts.
+    assert.equal(edge.evidenceRef, 'origin-a');
+    assert.equal(edge.childHasEvents, true);
+
+    // The default tree is delegation only, so the origin is still a lone root.
+    const delegation = await getSessionTree({ source: 'claude', sessionId: 'origin', dbPath });
+    assert.deepEqual(delegation.nodes.map((node: SessionTreeNode) => node.sessionId), ['origin']);
+
+    // Naming the continuity kinds rolls the continuation up to its origin.
+    const rolledUp = await getSessionTree({
+      source: 'claude', sessionId: 'origin', dbPath,
+      relationshipKinds: ['continuation', 'fork', 'resume'],
+    });
+    assert.deepEqual(rolledUp.nodes.map((node: SessionTreeNode) => node.sessionId), ['origin', 'continued']);
+
+    // The children page takes the same filter, and defaults the same way.
+    assert.deepEqual((await getSessionChildrenPage({
+      source: 'claude', sessionId: 'origin', dbPath,
+    })).children, []);
+    const continuityPage = await getSessionChildrenPage({
+      source: 'claude', sessionId: 'origin', dbPath, relationshipKinds: ['continuation'],
+    });
+    assert.deepEqual(childIds(continuityPage.children), ['continued']);
+
+    await assert.rejects(
+      () => getSessionTree({
+        source: 'claude', sessionId: 'origin', dbPath,
+        relationshipKinds: ['not-a-kind' as never],
+      }),
+      (error: unknown) => error instanceof InvalidArgumentError && error.code === 'INVALID_ARGUMENT',
     );
   });
 });

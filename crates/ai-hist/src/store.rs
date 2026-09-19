@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::relationship_graph::{
-    relationship_capabilities, session_children, session_children_page, session_parents,
-    session_relationships, session_tree, RelationshipCapabilities, RelationshipCursor,
-    RelationshipDiagnostic, SessionChildrenPage, SessionRelationship, SessionRelationships,
-    SessionTree, SessionTreeNode, SessionTreeOptions, DEFAULT_CHILDREN_PAGE_LIMIT,
-    DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES, MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH,
-    MAX_TREE_MAX_NODES, SESSION_RELATIONSHIP_CONTRACT_VERSION,
+    relationship_capabilities, session_children, session_children_page, session_continuity_edges,
+    session_parents, session_relationships, session_tree, RelationshipCapabilities,
+    RelationshipCursor, RelationshipDiagnostic, RelationshipKinds, SessionChildrenPage,
+    SessionRelationship, SessionRelationships, SessionTree, SessionTreeNode, SessionTreeOptions,
+    CONTINUITY_RELATIONSHIPS, DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH,
+    DEFAULT_TREE_MAX_NODES, MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
+    RELATIONSHIP_CONTINUATION, RELATIONSHIP_FORK, RELATIONSHIP_RESUME,
+    SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
 
 pub const SOURCE_CHOICES: &[&str] = &[
@@ -422,6 +424,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_hydration_checkpoints",
     "session_identity_correlations",
     "session_relationships",
+    "session_continuity_evidence",
     "schema_migrations",
     "discovery_skips",
 ];
@@ -465,6 +468,9 @@ const REQUIRED_SESSION_RELATIONSHIP_COLUMNS: &[&str] = &[
     "identity_status",
     "evidence_kind",
     "child_has_events",
+    // Continuity: the conversation a fork or continuation branched from,
+    // when the provider named one distinct from the parent.
+    "origin_session_id",
 ];
 
 /// Every index a fast path depends on, across all of them.
@@ -499,6 +505,12 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    // Continuity reconciliation resolves a transcript's first parent uuid
+    // against the record that carries it, across every session. Without this
+    // that is a scan of every event on every hydration.
+    "idx_session_events_message",
+    "idx_session_continuity_parent_uuid",
+    "idx_session_continuity_pending",
 ];
 
 /// Indexes no longer created: nothing queries them, or a replacement covers
@@ -541,11 +553,15 @@ const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"]
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    // `getSessionRelationships` reports still-unresolved continuity evidence
+    // for the session it was asked about.
+    "idx_session_continuity_pending",
 ];
 const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_presences",
     "delete_session_hydration_state",
     "delete_session_identity_correlations",
+    "delete_session_continuity_evidence",
 ];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
@@ -770,14 +786,44 @@ CREATE TABLE IF NOT EXISTS session_relationships (
     spawned_at_ms INTEGER,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
+    origin_session_id TEXT,
     PRIMARY KEY (source, parent_session_id, relationship_uid)
+);
+"#;
+
+/// One transcript's continuity evidence, keyed by the transcript itself.
+///
+/// Kept per file rather than per session because the evidence is a property
+/// of the transcript: two files can carry the same in-log session id, and
+/// that fact is exactly the fork signal. Persisting it is what makes
+/// reconciliation incremental — a later hydration resolves an earlier file's
+/// dangling parent uuid without re-reading that file.
+const SESSION_CONTINUITY_EVIDENCE_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS session_continuity_evidence (
+    source TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    file_session_id TEXT,
+    first_parent_uuid TEXT,
+    first_ts_ms INTEGER,
+    in_log_session_ids_json TEXT NOT NULL DEFAULT '[]',
+    has_resume_marker INTEGER NOT NULL DEFAULT 0,
+    resume_target TEXT,
+    explicit_targets_json TEXT NOT NULL DEFAULT '{}',
+    source_version TEXT,
+    origin_session_id TEXT,
+    -- Why this evidence has not produced its edges yet; NULL once resolved.
+    pending_reason TEXT,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, locator)
 );
 "#;
 
 fn init_db_locked(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
-    // Before the trigger below, whose body deletes from this table.
+    // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
+    conn.execute_batch(SESSION_CONTINUITY_EVIDENCE_DDL)?;
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -864,6 +910,12 @@ BEGIN
     DELETE FROM session_identity_correlations
     WHERE source = OLD.source AND local_session_id = OLD.session_id;
 END;
+CREATE TRIGGER IF NOT EXISTS delete_session_continuity_evidence
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM session_continuity_evidence
+    WHERE source = OLD.source AND session_id = OLD.session_id;
+END;
 "#,
     )?;
     // `sessions` predates the shallow catalog. Databases created by an older
@@ -875,6 +927,10 @@ END;
     // read-only guard) is two chances to drift, and every catalog column is
     // TEXT, so the guard list is the migration list.
     migrate_session_relationships_v2(conn)?;
+    // Additive: a v2 table predating continuity gains the one column the
+    // continuity kinds need, and a fresh database already has it from the DDL
+    // above, so both paths converge on the same shape.
+    ensure_text_columns(conn, "session_relationships", &["origin_session_id"])?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
@@ -979,7 +1035,25 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_continuity_parent_uuid ON session_continuity_evidence(source, first_parent_uuid)",
+        [],
+    )?;
+    // Reconciliation and the pending-evidence diagnostic both read only the
+    // rows still waiting on something, so the index is partial: a database
+    // whose evidence has all resolved carries almost no index at all.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_continuity_pending ON session_continuity_evidence(source, session_id) WHERE pending_reason IS NOT NULL",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
+        [],
+    )?;
+    // Continuity resolves a transcript's first parent uuid to the session
+    // holding the record with that uuid, which is a lookup by message id
+    // across every session rather than within one.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_message ON session_events(source, message_id)",
         [],
     )?;
     conn.execute(
@@ -3872,5 +3946,98 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids.len(), 5);
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn a_pre_continuity_database_gains_the_column_and_the_table_without_losing_rows() {
+        // The v2 relationship shape as it stood before continuity: no
+        // `origin_session_id`, no evidence table. Both additions have to land
+        // on reopen, and the delegation row already there has to survive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-continuity.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY);
+             INSERT INTO schema_migrations (name) VALUES ('session_relationships_v2');
+             CREATE TABLE session_relationships (
+                 source TEXT NOT NULL,
+                 parent_session_id TEXT NOT NULL,
+                 relationship_uid TEXT NOT NULL,
+                 child_session_id TEXT,
+                 relationship TEXT NOT NULL,
+                 identity_status TEXT NOT NULL CHECK(identity_status IN ('observed','unlinked')),
+                 child_agent_type TEXT,
+                 child_agent_name TEXT,
+                 child_model TEXT,
+                 spawn_depth INTEGER,
+                 evidence_kind TEXT NOT NULL,
+                 evidence_locator TEXT,
+                 evidence_ref TEXT,
+                 child_has_events INTEGER NOT NULL DEFAULT 0,
+                 spawned_at_ms INTEGER,
+                 created_ms INTEGER NOT NULL,
+                 updated_ms INTEGER NOT NULL,
+                 PRIMARY KEY (source, parent_session_id, relationship_uid)
+             );
+             INSERT INTO session_relationships
+               (source, parent_session_id, relationship_uid, child_session_id, relationship,
+                identity_status, evidence_kind, child_has_events, created_ms, updated_ms)
+             VALUES ('codex', 'root', 'child:kid', 'kid', 'delegated', 'observed',
+                     'codex_session_meta', 1, 5, 5);",
+        )
+        .unwrap();
+        assert!(!schema_is_current(&old).unwrap());
+        drop(old);
+
+        let conn = open_db(&path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let (child, origin): (String, Option<String>) = conn
+            .query_row(
+                "SELECT child_session_id, origin_session_id FROM session_relationships",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(child, "kid");
+        assert_eq!(origin, None);
+        let evidence_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_rows, 0);
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_continuity_evidence_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id) VALUES ('claude', 'gone')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_continuity_evidence \
+             (source, locator, session_id, in_log_session_ids_json, explicit_targets_json, updated_ms) \
+             VALUES ('claude', '/tmp/gone.jsonl', 'gone', '[]', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE source = 'claude' AND session_id = 'gone'",
+            [],
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }
