@@ -569,12 +569,41 @@ fn a_compaction_part_records_one_boundary_marker() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// How many bytes this process has read, cumulatively, through any `read`.
+/// `rchar` counts cached reads too, which is what we want: a copy of the
+/// provider store is a copy whether or not it came off the disk.
+#[cfg(target_os = "linux")]
+fn bytes_read() -> Option<u64> {
+    let io = fs::read_to_string("/proc/self/io").ok()?;
+    io.lines()
+        .find_map(|line| line.strip_prefix("rchar:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bytes_read() -> Option<u64> {
+    None
+}
+
 /// Acceptance: "`sync --local` on a 50 MB `opencode.db` fixture completes
 /// without copying the DB (assert no temp backup file is created)."
 ///
-/// The store is built in a tempdir at test time and never checked in. The
-/// assertion is on the effect — nothing new appears in the temp directory the
-/// copy would have used — not on the return value of the sync.
+/// The store is built in a tempdir at test time and never checked in.
+///
+/// Two checks, because the obvious one is a false green. Watching the temp
+/// directory would catch a backup file that outlives the sync — but
+/// `NamedTempFile` deletes itself on drop, so a copy that *did* happen leaves
+/// that directory just as empty as one that did not. Measured, not assumed:
+/// re-running this test with `AI_HIST_OPENCODE_BACKUP=1` takes the copy and
+/// the directory assertion still passes.
+///
+/// So the load-bearing check is the number of bytes the process read.
+/// Copying a 55 MB store means reading 55 MB; session-keyed queries against
+/// it mean reading a fraction of that. Under `AI_HIST_OPENCODE_BACKUP=1` that
+/// assertion does fail, with `read 58668442 bytes of a 57798656-byte store`,
+/// which is the positive control for the bound. The `read > 0` assertion is
+/// the positive control for the probe itself: a reading of "nothing happened"
+/// is worth nothing unless something could have.
 fn a_large_store_is_synced_without_copying_it() {
     let root = temp_root("large");
     let home = root.join("home");
@@ -620,7 +649,9 @@ fn a_large_store_is_synced_without_copying_it() {
     }
 
     let db_path = root.join("history.db");
+    let before = bytes_read();
     sync_local_at(&db_path).unwrap();
+    let after = bytes_read();
     std::env::remove_var("TMPDIR");
 
     let leftovers: Vec<PathBuf> = fs::read_dir(&temp_watch)
@@ -632,6 +663,21 @@ fn a_large_store_is_synced_without_copying_it() {
         leftovers.is_empty(),
         "the default sync path must not copy the provider store, found {leftovers:?}"
     );
+
+    if let (Some(before), Some(after)) = (before, after) {
+        let read = after.saturating_sub(before);
+        // Positive control: the probe is live and the sync did read the store.
+        assert!(
+            read > 0,
+            "the byte counter read nothing at all, so the bound below would mean nothing"
+        );
+        assert!(
+            read < size / 2,
+            "the sync read {read} bytes of a {size}-byte store; the bounded path \
+             must not read the whole thing, let alone copy it"
+        );
+    }
+
     // And it still did the work: the evidence is there.
     let conn = open_db(&db_path).unwrap();
     assert!(
