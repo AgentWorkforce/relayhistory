@@ -357,6 +357,11 @@ pub fn parse_git_config(text: &str) -> GitConfig {
 ///
 /// Single-valued keys like `remote.origin.url` take the last entry, which is
 /// git's own rule for them.
+///
+/// Section names arrive lowercased (see [`section_name`]) and subsection names
+/// verbatim, matching git's own case rules. Variable names are stored as
+/// written and compared case-insensitively by [`single`] and the `insteadOf`
+/// scan, so `URL` and `url` are one key.
 pub type GitConfig = HashMap<String, HashMap<String, Vec<String>>>;
 
 /// The effective value of a single-valued key: the last written, as git
@@ -370,12 +375,23 @@ fn single<'a>(section: &'a HashMap<String, Vec<String>>, key: &str) -> Option<&'
 
 /// Normalize a section header body, mirroring `^([A-Za-z0-9._-]+)\s+"(.*)"$`.
 /// A header that does not match that shape is kept verbatim, as burn keeps it.
+/// Normalize a section header body.
+///
+/// Git's case rules are not uniform and the difference is load-bearing here:
+/// **section names are case-insensitive, subsection names are case-sensitive**.
+/// So `[Remote "origin"]` is the same section as `[remote "origin"]`, while
+/// `[remote "Origin"]` is a different remote entirely. The name is lowercased
+/// and the subsection kept verbatim, which lets every lookup below use one
+/// spelling without flattening a distinction git makes.
+///
+/// A header that is not the `name "subsection"` shape keeps its whole body,
+/// lowercased — it is a plain section name, and those are case-insensitive too.
 fn section_name(raw: &str) -> String {
     let Some(quote) = raw.find('"') else {
-        return raw.to_string();
+        return raw.to_ascii_lowercase();
     };
     if !raw.ends_with('"') || raw.len() < quote + 2 {
-        return raw.to_string();
+        return raw.to_ascii_lowercase();
     }
     let (head, tail) = raw.split_at(quote);
     let name = head.trim_end_matches(char::is_whitespace);
@@ -387,12 +403,12 @@ fn section_name(raw: &str) -> String {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
-        return raw.to_string();
+        return raw.to_ascii_lowercase();
     }
     // `(.*)` is greedy, so the subsection runs from the first quote to the
     // last one, embedded quotes and all.
     let subsection = &tail[1..tail.len() - 1];
-    format!("{name} \"{subsection}\"")
+    format!("{} \"{subsection}\"", name.to_ascii_lowercase())
 }
 
 fn strip_inline_comment(value: &str) -> String {
@@ -929,6 +945,61 @@ mod tests {
         assert_eq!(
             single(&config["remote \"origin\""], "url").map(String::as_str),
             Some("git@github.com:Org/New.git")
+        );
+    }
+
+    /// Git's case rules are not uniform: section and variable names are
+    /// case-insensitive, subsection names are case-sensitive. A reader that
+    /// matched `remote "origin"` and `url` literally would see no remote in a
+    /// perfectly ordinary hand-edited config and fall back to a path key --
+    /// resolved-looking, and wrong.
+    #[test]
+    fn mixed_case_sections_and_variables_still_resolve() {
+        let root = tempdir().unwrap();
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[Remote \"origin\"]\n\tURL = gh:Org/Repo.git\n\
+             [URL \"https://github.com/\"]\n\tInsteadOf = gh:\n",
+        )
+        .unwrap();
+
+        let identity = project_identity(root.path());
+        assert_eq!(identity.project_key, "github.com/Org/Repo");
+        assert_eq!(identity.method, ProjectKeyMethod::Remote);
+    }
+
+    #[test]
+    fn a_section_name_is_lowercased_while_its_subsection_is_not() {
+        let config = parse_git_config("[Remote \"Origin\"]\n\tUrl = git@github.com:Org/Repo.git\n");
+        // The section name folds...
+        assert!(config.contains_key("remote \"Origin\""));
+        // ...and the subsection does not: `Origin` is a different remote from
+        // `origin`, which is why this cannot simply lowercase the whole header.
+        assert!(!config.contains_key("remote \"origin\""));
+        assert_eq!(
+            single(&config["remote \"Origin\""], "URL").map(String::as_str),
+            Some("git@github.com:Org/Repo.git"),
+            "variable names are case-insensitive"
+        );
+    }
+
+    /// The corollary: a remote whose subsection is not exactly `origin` is not
+    /// the origin, so the key falls back rather than silently adopting it.
+    #[test]
+    fn a_differently_cased_subsection_is_a_different_remote() {
+        let root = tempdir().unwrap();
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"Origin\"]\n\turl = git@github.com:Org/Repo.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_identity(root.path()).method,
+            ProjectKeyMethod::PathFallback
         );
     }
 

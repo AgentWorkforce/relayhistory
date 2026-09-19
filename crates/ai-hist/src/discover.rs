@@ -2126,6 +2126,52 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// Re-resolve the project identity of a row served straight from the catalog.
+///
+/// The stamp shortcut is right about everything the transcript says and wrong
+/// about the one field derived from the filesystem beside it. A session first
+/// seen before its checkout had an `origin` would otherwise keep its path key
+/// on every later pass, because the transcript never changes and so the row is
+/// never reconsidered.
+///
+/// This runs where the row is read rather than as a sweep at the end of the
+/// pass, because the row is *streamed*: `on_row` hands it to the caller as
+/// soon as the window is decided, so a later correction would fix the catalog
+/// and still have emitted the stale value — the JSONL a consumer parses would
+/// disagree with the database it came from.
+///
+/// Only a key that is absent or merely a path can change, and only to
+/// something at least as strong, so nothing here can downgrade a `remote` or
+/// `inherited` key. The write is skipped entirely when the answer is the one
+/// already stored, which is the usual case: a path key is reconsidered because
+/// it *might* be upgradable, and almost never is.
+fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    let upgradable = row.project_key.is_none()
+        || row.project_key_method.as_deref() == Some(ProjectKeyMethod::PathFallback.as_str());
+    if !upgradable {
+        return Ok(());
+    }
+    let Some((key, method)) =
+        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref())
+    else {
+        return Ok(());
+    };
+    if row.project_key.as_deref() == Some(key.as_str())
+        && row.project_key_method.as_deref() == Some(method.as_str())
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions SET project_key = ?, project_key_method = ? \
+         WHERE source = ? AND session_id = ? \
+           AND (project_key IS NULL OR project_key_method = 'path')",
+        params![key, method.as_str(), row.source, row.session_id],
+    )?;
+    row.project_key = Some(key);
+    row.project_key_method = Some(method.as_str().to_string());
+    Ok(())
+}
+
 static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
     let project_key_merge = crate::store::project_key_merge_sql();
     format!(
@@ -2724,9 +2770,14 @@ pub fn discover_sessions_with_provider_refs(
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
             let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(cached) =
+            if let Some(mut cached) =
                 cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
             {
+                // Before the row is queued for emission, not after the pass:
+                // `on_row` streams these to the caller as they are decided, so
+                // correcting the catalog at the end of the pass would still
+                // have handed every consumer the stale key.
+                upgrade_cached_project_identity(conn, &mut cached)?;
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {

@@ -97,13 +97,35 @@ fn discovery_upgrades_a_path_key_once_the_checkout_gains_a_remote() {
     )
     .unwrap();
 
-    let summary = discover();
+    let (rows, summary) = discover();
     assert!(
-        summary.1.skipped_unchanged > 0,
+        summary.skipped_unchanged > 0,
         "the premise of this test is that the row is served from the catalog, \
-         not re-read; {:?}",
-        summary.1
+         not re-read; {summary:?}"
     );
+
+    // The emitted row, not only the catalog. Discovery streams rows to its
+    // caller as each window is decided — `sessions discover --json` prints
+    // them as it goes — so a correction applied at the end of the pass would
+    // fix the database and still have handed every consumer the stale path
+    // key. The JSONL a consumer parses would disagree with the row the
+    // database holds, and nothing in either would say so.
+    let emitted = rows
+        .iter()
+        .find(|row| row.session_id == "later")
+        .expect("the session was not emitted");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        (
+            Some("github.com/Org/Repo".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "discovery streamed a stale path key for a checkout that has a remote"
+    );
+
     let conn = open_db(&db).unwrap();
     assert_eq!(
         session_key(&conn, "codex", "later"),
@@ -112,5 +134,10 @@ fn discovery_upgrades_a_path_key_once_the_checkout_gains_a_remote() {
             Some(ProjectKeyMethod::Remote.as_str().to_string())
         ),
         "a cached row kept its path key after the checkout gained a remote"
+    );
+    assert_eq!(
+        emitted.project_key,
+        session_key(&conn, "codex", "later").0,
+        "the streamed row and the stored row must not disagree"
     );
 }
