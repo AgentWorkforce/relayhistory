@@ -31,6 +31,8 @@ workspace_mod!(sources);
 mod file_lock;
 mod jsonl_temp;
 mod session_store;
+mod session_usage;
+mod usage;
 
 #[cfg(all(feature = "delivery", feature = "unstable-internal"))]
 pub mod delivery;
@@ -66,7 +68,16 @@ pub(crate) use store::*;
 pub use session_store::{
     Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
+pub use session_usage::{
+    session_requests_page, session_usage_summary, RequestKeySource, SessionRequest,
+    SessionRequestCursor, SessionRequestPage, SessionUsageSummary, UsageDiagnostic,
+    SESSION_USAGE_CONTRACT_VERSION,
+};
 pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+pub use usage::{
+    attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
+    NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
+};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
@@ -78,5 +89,7 @@ pub use store::{
 pub mod internal {
     pub use crate::ingest::*;
     pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
+    pub use crate::session_usage::*;
     pub use crate::store::*;
+    pub use crate::usage::*;
 }

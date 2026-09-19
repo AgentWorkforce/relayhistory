@@ -1795,7 +1795,7 @@ fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<boo
     session_events_exist(conn, "codex", session_id)
 }
 
-struct CodexSessionMeta {
+pub(crate) struct CodexSessionMeta {
     session_id: String,
     cwd: String,
     git_branch: Option<String>,
@@ -1888,7 +1888,7 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
 /// (`thread_source`, or the object form of `payload.source` *together with* an
 /// explicit parent) and excluded from session registration. A standalone
 /// guardian carries `source.subagent` without a parent and stays discoverable.
-fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
+pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
     let first = fs::read_to_string(path)
         .ok()
         .and_then(|text| text.lines().next().map(str::to_string))
@@ -1965,7 +1965,7 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
 }
 
 #[derive(Default)]
-struct CodexIngestOutcome {
+pub(crate) struct CodexIngestOutcome {
     prompts: usize,
     events: usize,
     first_ts: Option<i64>,
@@ -2099,7 +2099,7 @@ fn repair_codex_rollout_user_messages(
     Ok(outcome)
 }
 
-fn ingest_codex_rollout(
+pub(crate) fn ingest_codex_rollout(
     conn: &Connection,
     path: &Path,
     meta: &CodexSessionMeta,
@@ -2958,7 +2958,7 @@ fn record_claude_materialized_relationship(
     )
 }
 
-fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     ingest_claude_transcript_as(conn, path, None)
 }
 

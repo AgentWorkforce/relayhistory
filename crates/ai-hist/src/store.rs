@@ -605,6 +605,13 @@ pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
 
+/// Whether per-request usage reads can be served: the `session_requests` view
+/// has to exist, and the grouped scan behind it rides the same session-scoped
+/// event indexes as the event page.
+pub fn schema_is_usage_read_current(conn: &Connection) -> Result<bool> {
+    schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
 fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_TABLES
@@ -619,6 +626,12 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
         if !table.exists([name])? {
             return Ok(false);
         }
+    }
+    // A view is a query shape, not a row set: it can be present and still be
+    // derived from a column set the table no longer has, which is why this
+    // asks whether it is *current* rather than whether it exists.
+    if !crate::session_usage::session_requests_view_is_current(conn)? {
+        return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
     for name in REQUIRED_SCHEMA_MIGRATIONS
@@ -1029,6 +1042,10 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    // Derived from `session_events`, so it must come after the DDL and the
+    // column migrations above, and needs no backfill: the first query over an
+    // upgraded database already sees every request its events describe.
+    crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
     Ok(())
