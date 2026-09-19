@@ -329,6 +329,25 @@ read.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+### Per-message raw facts on `session_events`
+
+The envelope facts a harness records per message or per API request, kept
+verbatim on every event so a consumer can group, price and time turns without
+re-reading the transcript. `stop_reason` is the provider's own wire string,
+never a normalized enum, and its *absence* is the signal that a turn is still
+in flight.
+
+| Source | `request_id` | `stop_reason` | `agent_version` | `is_sidechain` | `is_meta` | `turn_id` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
+| **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
+| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+
+A null is "the provider did not record it", which is not the same as `false`
+or as an empty string: a Claude record with no `isSidechain` key stores null,
+while `"isSidechain": false` stores `0`.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 

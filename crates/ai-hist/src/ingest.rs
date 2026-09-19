@@ -2113,6 +2113,11 @@ fn ingest_codex_rollout(
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut pending_delta: Option<CodexTokenTotals> = None;
     let mut untokened_assistant_uid: Option<String> = None;
+    // The turn a record falls inside, stamped from the last `turn_context`
+    // until the next one names a different turn. Codex writes it once per turn
+    // rather than on every record, so carrying it forward is what makes turn
+    // boundaries recoverable downstream.
+    let mut turn_id: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
     let mut reader = BufReader::new(file);
@@ -2171,6 +2176,7 @@ fn ingest_codex_rollout(
                 message_id,
                 None,
                 None,
+                turn_id.as_deref(),
             )?;
             outcome.events += 1;
             // A subagent's "user" turns are the parent agent's task prompts;
@@ -2199,6 +2205,10 @@ fn ingest_codex_rollout(
                 if let Some(m) = payload_str("model") {
                     model = Some(m.to_string());
                 }
+                // A turn_context without a turn_id closes the previous turn
+                // rather than extending it: stamping the stale id onto the new
+                // turn's records would fabricate a boundary that is not there.
+                turn_id = payload_str("turn_id").map(str::to_string);
             }
             "event_msg" => match payload_type {
                 "user_message" => {}
@@ -2219,6 +2229,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             token_json.as_deref(),
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2243,6 +2254,7 @@ fn ingest_codex_rollout(
                             &uid,
                             model.as_deref(),
                             None,
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -2449,6 +2461,7 @@ fn ingest_codex_rollout(
                         &message_id,
                         model.as_deref(),
                         token_json.as_deref(),
+                        turn_id.as_deref(),
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -2489,6 +2502,7 @@ fn ingest_codex_rollout(
                             &message_id,
                             None,
                             None,
+                            turn_id.as_deref(),
                         )?;
                         outcome.events += 1;
                     }
@@ -2522,6 +2536,7 @@ fn insert_codex_event(
     message_id: &str,
     model: Option<&str>,
     token_json: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<()> {
     insert_session_event(
         conn,
@@ -2539,6 +2554,10 @@ fn insert_codex_event(
         model,
         token_json,
         uid,
+        RawMessageFacts {
+            turn_id,
+            ..RawMessageFacts::default()
+        },
     )
 }
 
@@ -3020,10 +3039,8 @@ fn ingest_claude_transcript_as(
         // activity (text and token spend), but its user-role rows are the
         // parent agent's own prompts and tool results — ingesting those
         // manufactures fake human turns.
-        let sidechain = obj
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
+        let sidechain = is_sidechain.unwrap_or(false);
         let skipped_sidechain = sidechain
             && obj
                 .get("message")
@@ -3071,13 +3088,30 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        let is_meta = obj.get("isMeta").and_then(Value::as_bool);
+        // Verbatim envelope facts. `stop_reason` is deliberately not mapped to
+        // an enum: a JSON null means the turn is still in flight, and that is
+        // exactly the distinction a normalizing parser would erase.
+        let facts = RawMessageFacts {
+            request_id: obj
+                .get("requestId")
+                .or_else(|| obj.get("request_id"))
+                .and_then(Value::as_str),
+            stop_reason: message
+                .and_then(|m| m.get("stop_reason"))
+                .and_then(Value::as_str),
+            agent_version: obj
+                .get("version")
+                .or_else(|| obj.get("sourceVersion"))
+                .and_then(Value::as_str),
+            is_sidechain,
+            is_meta,
+            turn_id: None,
+        };
         let Some(content) = message.and_then(|m| m.get("content")) else {
             continue;
         };
-        if !sidechain
-            && message_role == "user"
-            && obj.get("isMeta").and_then(Value::as_bool) != Some(true)
-        {
+        if !sidechain && message_role == "user" && is_meta != Some(true) {
             let prompt = if let Some(text) = content.as_str() {
                 text.trim().to_string()
             } else {
@@ -3130,6 +3164,7 @@ fn ingest_claude_transcript_as(
                     model,
                     token_json.as_deref(),
                     &format!("{message_uuid}:0"),
+                    facts,
                 )?;
             }
             continue;
@@ -3165,6 +3200,7 @@ fn ingest_claude_transcript_as(
                                 model,
                                 token_json.as_deref(),
                                 &event_uid,
+                                facts,
                             )?;
                         }
                     }
@@ -3191,6 +3227,7 @@ fn ingest_claude_transcript_as(
                             model,
                             token_json.as_deref(),
                             &event_uid,
+                            facts,
                         )?;
                     }
                 }
@@ -3216,6 +3253,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        facts,
                     )?;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -3274,6 +3312,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        facts,
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
@@ -3302,6 +3341,45 @@ fn ingest_claude_transcript_as(
     Ok(())
 }
 
+/// The verbatim stop reason an OpenCode `step-finish` part carries, if this is
+/// one.
+///
+/// OpenCode does not put a stop reason on the message: it writes a trailing
+/// `step-finish` part whose `reason` is the wire string (`tool-calls`,
+/// `stop`, `length`, …). Stored as written, exactly like Claude's
+/// `message.stop_reason`; consumers map it to their own enum.
+///
+/// The OpenCode adapter currently ingests prompt history only, so nothing calls
+/// this yet — the event-level parity work (#168) is what wires it into the
+/// assistant rows. It is landed with the column so that work is a call site
+/// rather than a schema change.
+#[allow(dead_code)]
+fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
+    (part.get("type").and_then(Value::as_str) == Some("step-finish"))
+        .then(|| part.get("reason").and_then(Value::as_str))
+        .flatten()
+}
+
+/// The per-message facts a provider records on the envelope rather than in the
+/// message body, carried verbatim from the parser to the row.
+///
+/// These are the facts consumers need and normalization would otherwise read
+/// past: which API request a turn belongs to (`request_id`), why the model
+/// stopped — and, by its absence, that it has not yet (`stop_reason`), which
+/// harness build produced it (`agent_version`), whether the row is delegated or
+/// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
+/// turn it falls inside (`turn_id`). Every field is optional and stored as the
+/// provider wrote it: relayhistory preserves, consumers map.
+#[derive(Debug, Default, Clone, Copy)]
+struct RawMessageFacts<'a> {
+    request_id: Option<&'a str>,
+    stop_reason: Option<&'a str>,
+    agent_version: Option<&'a str>,
+    is_sidechain: Option<bool>,
+    is_meta: Option<bool>,
+    turn_id: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
@@ -3319,16 +3397,20 @@ fn insert_session_event(
     model: Option<&str>,
     token_json: Option<&str>,
     event_uid: &str,
+    facts: RawMessageFacts<'_>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+          request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, request_id=excluded.request_id, \
+         stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
+         is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id",
         params![
             source,
             session_id,
@@ -3344,6 +3426,12 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            facts.request_id,
+            facts.stop_reason,
+            facts.agent_version,
+            facts.is_sidechain,
+            facts.is_meta,
+            facts.turn_id,
         ],
     )?;
     Ok(())
@@ -5135,6 +5223,7 @@ mod tests {
             None,
             None,
             "event-1",
+            super::RawMessageFacts::default(),
         )
         .unwrap();
         super::insert_tool_call(
@@ -7331,6 +7420,7 @@ mod tests {
             None,
             None,
             "3:agent_message",
+            super::RawMessageFacts::default(),
         )
         .unwrap();
         super::insert_tool_call(
@@ -8092,5 +8182,329 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
+    }
+
+    /// Envelope facts burn needs per message: which API request a turn belongs
+    /// to, which harness build wrote it, whether the row is delegated, and why
+    /// the model stopped. Shapes follow a real Claude transcript: one request
+    /// id spans several `uuid`s that share a `message.id`, and only the block
+    /// that ends the turn carries a `stop_reason`.
+    #[test]
+    fn claude_records_carry_request_id_stop_reason_agent_version_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-facts.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"check the repo"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_multi_1","role":"assistant","content":[{"type":"text","text":"Let me check."}],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":43}},"requestId":"req_1","type":"assistant","uuid":"u-asst-1b","timestamp":"2026-04-20T00:00:01.500Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1b","isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_multi_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash_1","name":"Bash","input":{"command":"ls -la"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":43}},"requestId":"req_1","type":"assistant","uuid":"u-asst-1c","timestamp":"2026-04-20T00:00:02.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.96"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1c","isSidechain":false,"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash_1","content":"a.txt"}]},"requestId":"req_2","uuid":"u-result-1","timestamp":"2026-04-20T00:00:03.000Z","cwd":"/tmp/project","sessionId":"s-facts","version":"2.1.97"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        type FactRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<FactRow> = conn
+            .prepare(
+                "SELECT event_uid, request_id, stop_reason, agent_version, is_sidechain, is_meta \
+                 FROM session_events ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                // The opening human turn predates the first API request.
+                (
+                    "u-user-1:0".into(),
+                    None,
+                    None,
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                // Both blocks of the same request share `req_1`; only the one
+                // that ended the turn carries a stop reason. A JSON null must
+                // stay null -- burn reads its absence as "still in flight".
+                (
+                    "u-asst-1b:0".into(),
+                    Some("req_1".into()),
+                    None,
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                (
+                    "u-asst-1c:0".into(),
+                    Some("req_1".into()),
+                    Some("tool_use".into()),
+                    Some("2.1.96".into()),
+                    Some(0),
+                    None
+                ),
+                (
+                    "u-result-1:0".into(),
+                    Some("req_2".into()),
+                    None,
+                    Some("2.1.97".into()),
+                    Some(0),
+                    Some(1)
+                ),
+            ]
+        );
+    }
+
+    /// `sourceVersion` is the older spelling of the harness build, and a
+    /// sidechain record's assistant output is the one row a delegated
+    /// transcript contributes: it must be marked as delegated, not as the
+    /// parent's own work.
+    #[test]
+    fn claude_sidechain_rows_are_flagged_and_source_version_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-side.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"sa1","sessionId":"s-side","isSidechain":true,"cwd":"/tmp/proj","timestamp":"2026-06-25T10:01:00.000Z","sourceVersion":"1.0.88","requestId":"req_side","message":{"id":"msg_sub","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Here is the report."}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT request_id, stop_reason, agent_version, is_sidechain FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("req_side".into()),
+                Some("end_turn".into()),
+                Some("1.0.88".into()),
+                Some(1)
+            )
+        );
+    }
+
+    /// `token_json` is the provider's `message.usage` object stored verbatim,
+    /// so the nested ephemeral cache buckets pricing depends on survive a round
+    /// trip. A usage shape flattened to the fields this crate happens to name
+    /// would silently lose them.
+    #[test]
+    fn claude_usage_round_trips_nested_ephemeral_cache_creation_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-usage.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"message":{"model":"claude-opus-4-7","id":"msg_usage","role":"assistant","content":[{"type":"text","text":"Let me check."}],"stop_reason":"end_turn","usage":{"input_tokens":3,"cache_creation_input_tokens":4773,"cache_read_input_tokens":11496,"cache_creation":{"ephemeral_5m_input_tokens":771,"ephemeral_1h_input_tokens":4002},"output_tokens":43,"service_tier":"standard"}},"requestId":"req_1","type":"assistant","uuid":"u-asst-usage","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"s-usage","version":"2.1.96"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let token_json: String = conn
+            .query_row("SELECT token_json FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let usage: Value = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 771);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 4002);
+        assert_eq!(usage["cache_creation_input_tokens"], 4773);
+        assert_eq!(usage["output_tokens"], 43);
+        // The same values are reachable through SQL, which is how a consumer
+        // that does not deserialize the whole object reads them.
+        let ephemeral_1h: i64 = conn
+            .query_row(
+                "SELECT json_extract(token_json, '$.cache_creation.ephemeral_1h_input_tokens') \
+                 FROM session_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ephemeral_1h, 4002);
+    }
+
+    /// Codex names a turn once, in `turn_context`, and every later record
+    /// belongs to it until the next one. Carrying it forward is what makes the
+    /// turn boundary recoverable from the stored events.
+    #[test]
+    fn codex_turn_ids_are_stamped_until_the_next_turn_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-turns.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess-turns","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_multi_1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"first task"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"On it."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:10.000Z","type":"turn_context","payload":{"turn_id":"turn_multi_2","cwd":"/tmp/proj","model":"gpt-5.3-codex"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:11.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Considering."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:12.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":\"ls\"}"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:13.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"a.txt"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT event_uid, turn_id FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("2:user_message".into(), Some("turn_multi_1".into())),
+                ("3:agent_message".into(), Some("turn_multi_1".into())),
+                ("5:agent_reasoning".into(), Some("turn_multi_2".into())),
+                ("6:function_call".into(), Some("turn_multi_2".into())),
+                ("7:function_call_output".into(), Some("turn_multi_2".into())),
+            ]
+        );
+    }
+
+    /// Records before any `turn_context`, and after one that names no turn,
+    /// have no turn to belong to. Stamping the last seen id onto them would
+    /// invent a boundary the provider never recorded.
+    #[test]
+    fn codex_events_outside_a_named_turn_have_no_turn_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-unnamed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-04-20T02:00:00.000Z","type":"session_meta","payload":{"id":"sess-unnamed","cwd":"/tmp/proj"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Before any turn."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:02.000Z","type":"turn_context","payload":{"turn_id":"turn_1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Inside turn one."}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:04.000Z","type":"turn_context","payload":{"cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-04-20T02:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"After an unnamed turn."}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT text, turn_id FROM session_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Before any turn.".into(), None),
+                ("Inside turn one.".into(), Some("turn_1".into())),
+                ("After an unnamed turn.".into(), None),
+            ]
+        );
+    }
+
+    /// OpenCode records the stop reason on a `step-finish` part rather than on
+    /// the message, and writes it as its own wire string. The mapping hook is
+    /// landed here; wiring it to real OpenCode events waits on the OpenCode
+    /// parity work (#168), which is why the end-to-end assertion below is
+    /// ignored rather than absent.
+    #[test]
+    fn opencode_step_finish_reason_is_read_verbatim() {
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(
+                &json!({"type": "step-finish", "reason": "tool-calls"})
+            ),
+            Some("tool-calls")
+        );
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(&json!({"type": "step-finish"})),
+            None
+        );
+        // Another part type never contributes a stop reason, whatever it
+        // happens to carry under that key.
+        assert_eq!(
+            super::opencode_step_finish_stop_reason(
+                &json!({"type": "text", "reason": "not-a-stop-reason"})
+            ),
+            None
+        );
+    }
+
+    /// The end-to-end half of the OpenCode stop-reason contract. OpenCode sync
+    /// ingests prompt history only today, so no assistant event exists to carry
+    /// a stop reason and this cannot pass yet; the OpenCode event parity work
+    /// (#168) is what makes it green. It is written now so that work has a
+    /// failing test to satisfy rather than a field to remember.
+    #[test]
+    #[ignore = "OpenCode assistant events land with the OpenCode parity work (#168)"]
+    fn opencode_assistant_events_carry_step_finish_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("opencode.db");
+        let src = Connection::open(&source_path).unwrap();
+        src.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER);
+             INSERT INTO session VALUES ('s-oc', '/tmp/proj', 1);
+             INSERT INTO message VALUES ('m-user', 's-oc', '{\"role\":\"user\"}', 1);
+             INSERT INTO part VALUES ('p-user', 's-oc', 'm-user', '{\"type\":\"text\",\"text\":\"do the thing\"}', 1);
+             INSERT INTO message VALUES ('m-asst', 's-oc', '{\"role\":\"assistant\"}', 2);
+             INSERT INTO part VALUES ('p-asst', 's-oc', 'm-asst', '{\"type\":\"text\",\"text\":\"doing it\"}', 2);
+             INSERT INTO part VALUES ('p-step', 's-oc', 'm-asst', '{\"type\":\"step-finish\",\"reason\":\"tool-calls\"}', 3);",
+        )
+        .unwrap();
+        drop(src);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::sync_opencode_session(&conn, &source_path, "s-oc").unwrap();
+
+        let stop_reason: Option<String> = conn
+            .query_row(
+                "SELECT stop_reason FROM session_events \
+                 WHERE source = 'opencode' AND role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stop_reason.as_deref(), Some("tool-calls"));
     }
 }

@@ -41,6 +41,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- The native-addon contract is now 16 and the session evidence contract is now
+  2: `session_events` rows carry the per-message raw provider facts (see
+  Added). Hydration parser version 3 re-parses existing databases once on the
+  next `sessions hydrate` so rows already indexed gain the facts instead of
+  staying null forever, and the `session_events_raw_facts_v1` schema marker is
+  required, so the first read of an existing database is routed through a
+  writable open that migrates it. Delivery capture triggers that were created
+  before a captured table gained a column are now rebuilt rather than left in
+  place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
+  reporting successful delivery while silently emitting the old column list.
+
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no
   longer substitutes the OpenCode database file size, and summaries add
@@ -73,6 +84,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
   through a writable open that migrates it.
 
 ### Added
+
+- Capture the per-message raw facts a provider records on the envelope rather
+  than in the message body. `session_events` gains `request_id`, `stop_reason`,
+  `agent_version`, `is_sidechain`, `is_meta` and `turn_id`, and every one is
+  stored as the provider wrote it -- `stop_reason` in particular is the
+  verbatim wire string and stays null while a turn is still in flight, because
+  its absence is how an in-progress turn is recognized. Claude supplies
+  `requestId`/`request_id`, `message.stop_reason`, `version`/`sourceVersion`,
+  `isSidechain` and `isMeta`; Codex stamps `turn_id` from each `turn_context`
+  onto every record until the next one names a different turn. The fields are
+  exposed on `SessionEvent` in Rust, on `NativeSessionEvent`, and as
+  `requestId`, `stopReason`, `agentVersion`, `isSidechain`, `isMeta` and
+  `turnId` on the SDK's `SessionEvent`. `message.usage` continues to be stored
+  verbatim, so nested `cache_creation.ephemeral_5m_input_tokens` and
+  `ephemeral_1h_input_tokens` survive a round trip; there is now a test that
+  says so.
 
 - Add first-class delegation topology. `session_relationships` gains an
   identity status (`observed` or `unlinked`), child agent type, name, model and
