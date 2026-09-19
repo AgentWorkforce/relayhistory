@@ -30,30 +30,12 @@
   ],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 0,
-        "file_edits": 0,
-        "prompts": 1,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "ses_sqlite_child",
       "source": "opencode",
       "status": "hydrated"
     },
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 0,
-        "file_edits": 0,
-        "prompts": 2,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "ses_sqlite_root",
       "source": "opencode",

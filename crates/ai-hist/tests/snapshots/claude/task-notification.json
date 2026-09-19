@@ -37,15 +37,6 @@
   ],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 6,
-        "file_edits": 0,
-        "prompts": 4,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "tn-session",
       "source": "claude",

@@ -8,15 +8,6 @@
   "history": [],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 1,
-        "file_edits": 0,
-        "prompts": 0,
-        "related_sessions": 0,
-        "tool_calls": 1
-      },
       "related_session_ids": [],
       "session_id": "sess_multi_1",
       "source": "codex",

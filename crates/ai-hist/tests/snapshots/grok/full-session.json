@@ -23,15 +23,6 @@
   ],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 0,
-        "file_edits": 0,
-        "prompts": 2,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "grok-00000001",
       "source": "grok",

@@ -39,15 +39,6 @@
   ],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 10,
-        "file_edits": 1,
-        "prompts": 2,
-        "related_sessions": 0,
-        "tool_calls": 4
-      },
       "related_session_ids": [],
       "session_id": "sess_codex_utb",
       "source": "codex",

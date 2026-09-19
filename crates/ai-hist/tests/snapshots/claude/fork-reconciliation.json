@@ -32,30 +32,12 @@
   ],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 4,
-        "file_edits": 0,
-        "prompts": 2,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "00000000-0000-0000-0000-000000000fff",
       "source": "claude",
       "status": "hydrated"
     },
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 2,
-        "file_edits": 0,
-        "prompts": 1,
-        "related_sessions": 0,
-        "tool_calls": 0
-      },
       "related_session_ids": [],
       "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
       "source": "claude",

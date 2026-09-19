@@ -39,15 +39,6 @@
   "history": [],
   "hydration": [
     {
-      "capability": "full",
-      "discovery_state": "full",
-      "evidence": {
-        "events": 3,
-        "file_edits": 2,
-        "prompts": 0,
-        "related_sessions": 0,
-        "tool_calls": 3
-      },
       "related_session_ids": [],
       "session_id": "sess_tools_1",
       "source": "codex",

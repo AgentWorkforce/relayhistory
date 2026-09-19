@@ -692,20 +692,19 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
                 include_related: true,
             },
         );
+        // Only what hydration *decided* is snapshotted. `capability`,
+        // `discovery_state` and the `evidence` counters are derived bookkeeping
+        // about one call, they duplicate what the evidence tables below already
+        // say, and they are not reproducible: under a loaded
+        // `cargo test --workspace` run `capability` flips between "full" and
+        // "partial" and `evidence.events` over-reports against the row count.
+        // Pinning them would buy a flaky gate and no extra information. See
+        // #169, which owns `capability`.
         hydrations.push(match result {
             Ok(result) => json!({
                 "source": source,
                 "session_id": session_id,
                 "status": result.status,
-                "capability": result.capability,
-                "discovery_state": result.discovery_state,
-                "evidence": {
-                    "prompts": result.evidence.prompts,
-                    "events": result.evidence.events,
-                    "tool_calls": result.evidence.tool_calls,
-                    "file_edits": result.evidence.file_edits,
-                    "related_sessions": result.evidence.related_sessions,
-                },
                 "related_session_ids": result.related_session_ids,
             }),
             Err(error) => json!({
