@@ -11362,4 +11362,70 @@ mod tests {
             "the uncontended rebuild must clear the replaced generation"
         );
     }
+
+    /// Group R. A turn whose zone is malformed is an *undated* turn.
+    ///
+    /// The point of rejecting a bad zone is not tidiness: a wrong-but-plausible
+    /// instant is indistinguishable from a recorded one, so it silently
+    /// suppresses the mtime fallback and with it the
+    /// `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic that exists to say "this turn
+    /// was never dated". This asserts that consequence, not just the parser.
+    ///
+    /// Positive control: before the fix, `used_mtime_fallback` was `false` for
+    /// both turns and the doubled-sign turn was stamped `1789558620000` — an
+    /// instant eight hours from the one its tag names.
+    #[test]
+    fn a_turn_with_a_malformed_zone_falls_back_to_the_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-bad-zone",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC--4)</timestamp><user_query>doubled sign</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:39 PM (UTC-4</timestamp><user_query>unterminated</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>well formed</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &transcript,
+            "s-bad-zone",
+            None,
+            4_242,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.used_mtime_fallback,
+            "a malformed zone must leave the turn undated so the diagnostic fires"
+        );
+        let prompts: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT prompt, timestamp_ms FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-bad-zone' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                ("doubled sign".to_string(), 4_242),
+                ("unterminated".to_string(), 4_242),
+                // Control: the well-formed tag beside them still parses, so
+                // this is about the malformed zones and not about the parser
+                // having stopped reading timestamps altogether.
+                ("well formed".to_string(), 1_789_587_660_000),
+            ]
+        );
+    }
 }

@@ -175,8 +175,13 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
     // markers, and inside one a `---`/`+++` pair is ordinary diff content —
     // a Markdown horizontal rule being replaced, say. Only a patch with no
     // envelope markers at all is read as a bare unified diff.
+    // Matched against the raw line, for the same reason the loop below is: a
+    // unified-diff context line is its content prefixed with a space, and
+    // trimming first let a *quoted* marker classify a bare diff as an
+    // envelope. That is worse than mis-splitting it, because being an
+    // envelope switches off `---`/`+++` header detection entirely — the diff
+    // then yields no files at all and the edit disappears.
     let envelope = lines.iter().any(|line| {
-        let line = line.trim();
         ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
             .iter()
             .any(|marker| line.starts_with(marker))
@@ -245,7 +250,12 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
                 continue;
             }
         }
-        if line == "*** End Patch" {
+        // The terminator is a marker too, and only a marker at column zero.
+        // ` *** End Patch` quoted inside a hunk closed the file it was in, so
+        // every hunk after it was dropped and the stored patch reported an
+        // edit smaller than the one that was made. `trim_end` only tolerates
+        // a stray `\r` from a CRLF transcript; it does not admit indentation.
+        if raw.trim_end() == "*** End Patch" {
             if let Some((path, body)) = current.take() {
                 files.push(PatchFile {
                     path,
@@ -368,7 +378,17 @@ pub(crate) fn parse_cursor_timestamp(raw: &str) -> Option<i64> {
     // format, and defaulting to UTC would move every timestamp by hours
     // without ever failing.
     let (clock, zone) = clock_part.split_once('(')?;
-    let (clock, zone) = (clock.trim(), zone.trim_end_matches(')').trim());
+    // Exactly one closing paren, at the end, with nothing after it.
+    // `trim_end_matches` accepted a zone that never closed at all and one
+    // that closed twice, and a tag whose format has changed that far is not a
+    // tag this parser can read. Reading it anyway produces a plausible
+    // instant, and a plausible instant suppresses the mtime fallback and the
+    // `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic.
+    let zone = zone.trim_end().strip_suffix(')')?;
+    if zone.contains(')') {
+        return None;
+    }
+    let (clock, zone) = (clock.trim(), zone.trim());
     let (hour, minute, second) = parse_clock(clock)?;
     let offset_seconds = parse_utc_offset(zone)?;
 
@@ -462,9 +482,27 @@ fn parse_utc_offset(zone: &str) -> Option<i32> {
         Some((hours, minutes)) => (hours, minutes),
         None => (digits, "0"),
     };
-    let hours: i32 = hours.trim().parse().ok()?;
-    let minutes: i32 = minutes.trim().parse().ok()?;
-    (hours < 24 && minutes < 60).then_some(sign * (hours * 3600 + minutes * 60))
+    // Both components are unsigned digits: the sign is the one character
+    // already consumed above, and a second one is not part of a component.
+    // Parsed as signed and checked only against an upper bound, `UTC--4` read
+    // its inner minus as `hours = -4`, passed `hours < 24`, and the outer
+    // minus then flipped it into a *positive* four-hour offset — the same
+    // instant read eight hours wrong, and still plausible enough to suppress
+    // the mtime fallback. `str::parse` also accepts a leading `+`, so the
+    // digits are checked rather than trusted.
+    let hours = parse_offset_component(hours, 23)?;
+    let minutes = parse_offset_component(minutes, 59)?;
+    let seconds = i32::try_from(hours * 3600 + minutes * 60).ok()?;
+    Some(sign * seconds)
+}
+
+/// One unsigned, bounded component of a UTC offset.
+fn parse_offset_component(field: &str, max: u32) -> Option<u32> {
+    let field = field.trim();
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok().filter(|value| *value <= max)
 }
 
 /// The role a Cursor record speaks in.
@@ -492,6 +530,77 @@ pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zone that is not a zone must be unreadable, not re-signed.
+    ///
+    /// The zone was split at `(` and then had *any* trailing `)` stripped, and
+    /// the offset's hours and minutes were parsed as signed, checked only
+    /// against their upper bounds. So `UTC--4` parsed its inner minus into
+    /// `hours = -4`, passed `hours < 24`, and the outer minus flipped it into
+    /// a **positive** four-hour offset — the same instant read eight hours
+    /// wrong. A tag missing its closing `)` parsed as if nothing were missing.
+    /// Both produce a provider-looking timestamp, and a provider-looking
+    /// timestamp suppresses the mtime fallback and the
+    /// `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic — the failure that matters.
+    ///
+    /// Positive control: before the fix, `UTC--4` gave
+    /// `left: Some(1789558620000), right: None` — an instant eight hours from
+    /// the one the tag names — and the unterminated tag parsed normally.
+    #[test]
+    fn a_malformed_zone_is_unreadable_rather_than_re_signed() {
+        // The sign is the one character the parser consumes; a second one is
+        // not a component, and must not become one.
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC--4)"),
+            None,
+            "a doubled sign is not an offset"
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC++4)"),
+            None
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC+5:-30)"),
+            None,
+            "a negative minutes field is not an offset either"
+        );
+        // The zone has to be closed, exactly once, with nothing after it.
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC-4"),
+            None,
+            "an unterminated zone is a changed format, not a zone"
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC-4))"),
+            None
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC-4) (UTC+0)"),
+            None
+        );
+        // Out of range stays out of range, now that the components are
+        // unsigned rather than merely "less than".
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC+24)"),
+            None
+        );
+
+        // Controls: the shapes that really appear still parse, to the same
+        // instants they always did.
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)"),
+            Some(1_789_587_420_000)
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Tuesday, Jun 2, 2026, 11:20 AM (UTC+5:30)"),
+            Some(1_780_379_400_000)
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 19:37 (UTC)"),
+            Some(1_789_587_420_000),
+            "a bare UTC zone is zero, not a malformed offset"
+        );
+    }
 
     #[test]
     fn localized_cursor_timestamps_parse_with_their_offset() {
@@ -707,6 +816,107 @@ mod tests {
         // after it.
         assert!(files[0].patch.contains("*** Update File: example.md"));
         assert!(files[0].patch.contains("+after"));
+    }
+
+    /// The other half of the same fix: the *terminator* is also only a
+    /// terminator at the start of its line.
+    ///
+    /// A context line quoting ` *** End Patch` closed the file it was inside,
+    /// so every hunk after it was dropped — the patch's own text reported an
+    /// edit smaller than the one that was made. The markers moved to the raw
+    /// line; this did not.
+    ///
+    /// Reported by Cursor Bugbot. Positive control: with the terminator
+    /// compared to the trimmed line this failed at `the quoted terminator
+    /// must not close the file: the later hunk was dropped` — `+after` and the
+    /// second hunk were missing from the only file's slice.
+    #[test]
+    fn a_context_line_quoting_the_terminator_does_not_close_the_file() {
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: notes.md\n",
+            "@@\n",
+            "-before\n",
+            " *** End Patch\n",
+            "+after\n",
+            "@@\n",
+            "+second hunk\n",
+            "*** End Patch"
+        );
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        assert!(
+            files[0].patch.contains("+after") && files[0].patch.contains("+second hunk"),
+            "the quoted terminator must not close the file: the later hunk was dropped: {:?}",
+            files[0].patch
+        );
+
+        // Control: a terminator at column zero still closes the file, and
+        // nothing after it is attributed to one.
+        let ended = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: notes.md\n",
+            "@@\n",
+            "+kept\n",
+            "*** End Patch\n",
+            "trailing noise\n"
+        );
+        let files = split_patch_files(ended);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        assert!(files[0].patch.contains("+kept"));
+        assert!(!files[0].patch.contains("trailing noise"));
+    }
+
+    /// And the third: the *classifier* trimmed too.
+    ///
+    /// `split_patch_files` decides between an envelope and a bare unified
+    /// diff by looking for `*** … File:` markers anywhere in the text. Trimmed,
+    /// a unified diff whose context quotes one was classified as an envelope —
+    /// which switches off `---`/`+++` header detection entirely, so the diff
+    /// yielded **no files at all** and the edit vanished rather than merely
+    /// being mis-split.
+    ///
+    /// Reported by Cursor Bugbot. Positive control: with the classifier
+    /// matching the trimmed line this failed with `left: [], right: ["one.rs"]`.
+    #[test]
+    fn a_unified_diff_quoting_an_envelope_marker_is_still_a_unified_diff() {
+        let patch = concat!(
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@\n",
+            "-before\n",
+            " *** Begin Patch\n",
+            " *** Update File: elsewhere.rs\n",
+            "+after\n"
+        );
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["one.rs"]
+        );
+        assert!(files[0].patch.contains("+after"));
+
+        // Control: a genuine envelope is still classified as one, so the
+        // `---`/`+++` lines inside its hunks stay content.
+        let envelope = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: notes.md\n",
+            "@@\n",
+            "--- a horizontal rule\n",
+            "+++ still content\n",
+            "*** End Patch"
+        );
+        let files = split_patch_files(envelope);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
     }
 
     #[test]
