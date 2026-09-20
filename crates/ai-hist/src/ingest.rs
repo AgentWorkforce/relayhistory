@@ -5833,7 +5833,7 @@ fn ingest_grok_session(
                 );
                 inherited = Some(ts);
                 if first_prompt.is_none() {
-                    first_prompt = Some(text.clone());
+                    first_prompt = Some(crate::discover::excerpt(text));
                 }
                 let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
                 insert_session_event(
@@ -8087,6 +8087,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(uid, "ev:ev_visible");
+    }
+
+    /// `sessions.first_prompt` is a bounded catalog excerpt. Hydration must
+    /// not overwrite discovery's 4,096-character field with the full prompt.
+    #[test]
+    fn grok_first_prompt_is_the_bounded_catalog_excerpt() {
+        let home = tempfile::tempdir().unwrap();
+        let long = "x".repeat(crate::discover::EXCERPT_MAX_CHARS + 80);
+        let conn = ingest_grok_lines(
+            home.path(),
+            &format!("{{\"type\":\"user\",\"content\":\"<user_query>{long}</user_query>\"}}\n"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                "\n",
+            ),
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.chars().count(), crate::discover::EXCERPT_MAX_CHARS);
+        let history: String = conn
+            .query_row(
+                "SELECT prompt FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history.chars().count(),
+            crate::discover::EXCERPT_MAX_CHARS + 80,
+            "the transcript keeps the full prompt; only the catalog excerpt is bounded"
+        );
     }
 
     /// A directory that cannot be read is not an empty directory.
