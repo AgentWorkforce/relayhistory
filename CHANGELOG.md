@@ -75,7 +75,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   removal: it folds a run's keys over the state already on disk and cannot
   express a delete, so the dropped paths are carried as an instruction that the
   merge applies and then discards, rather than living only in the run's own
-  copy of the map.
+  copy of the map. A transcript this run enumerated but could not read counts
+  as unobserved rather than as an empty file: both parsers read with
+  `unwrap_or_default()`, so a permission change, a swapped-out path or an I/O
+  error would otherwise be stamped as seen and leave that path's rows null for
+  good.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

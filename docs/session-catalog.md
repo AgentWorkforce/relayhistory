@@ -376,7 +376,10 @@ longer one the state knows about. Removing the entry from the in-memory map is
 not enough to achieve that — the checkpoint merge folds a run's keys over
 what is on disk and has no way to express a delete, so a dropped path would
 come back on every write. The run carries the removals as an instruction the
-merge applies and then discards. A root the state never knew about — an install
+merge applies and then discards. A transcript that is enumerated but cannot be
+read counts as unobserved too, not as an empty one — the parsers read with
+`unwrap_or_default()`, so without that check a file that became unreadable
+between the walk and the read would be stamped as seen. A root the state never knew about — an install
 with no `.codex/archived_sessions` — is not a missing archive and does not hold
 the pass open. Claude reaches a subagent
 sidecar's rows through `session_relationships.evidence_locator`, because a

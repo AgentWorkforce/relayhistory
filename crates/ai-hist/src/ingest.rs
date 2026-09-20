@@ -812,6 +812,32 @@ fn record_raw_facts_backfill(
     state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
 }
 
+/// Whether this run can actually read `path`.
+///
+/// Both parsers reach for a transcript with
+/// `fs::read_to_string(..).unwrap_or_default()`, which turns a read error into
+/// an empty string -- and an empty string is indistinguishable from an empty
+/// file. A permission change, a path swapped for something that is not a
+/// regular file, or an I/O error between enumeration and read therefore all
+/// read as "this transcript has nothing in it", and the walk stamps the file
+/// as seen. Once the raw-facts generation is recorded, the rows behind that
+/// path stay null for the life of the install.
+///
+/// A read that fails is not an observation. Asking here lets the walk treat an
+/// unreadable file exactly as it treats one it never saw: no stamp, the
+/// generation withheld, and the stale stamp dropped so a later run that *can*
+/// read it does.
+///
+/// One byte is enough -- `EACCES`, `EISDIR` and `ENXIO` all surface on the
+/// open or the first read -- and this only runs for files the walk is about to
+/// parse anyway, never for the ones the stamp fast path skips.
+fn transcript_is_readable(path: &Path) -> bool {
+    match fs::File::open(path) {
+        Ok(mut file) => file.read(&mut [0u8; 1]).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Whether `key`, a sync-state path, names a file inside `root`.
 fn path_key_is_under(key: &str, root: &Path) -> bool {
     let prefix = root.to_string_lossy();
@@ -1746,6 +1772,11 @@ fn sync_codex_rollouts(
     // Walking it vacuously and then recording the generation would retire the
     // one-time backfill over rollouts nothing ever looked at.
     let mut walked_every_known_root = true;
+    // Rollouts this run enumerated and then could not read. Collected rather
+    // than handled inline because they are only unobserved if the state knew
+    // about them: one that was never indexed has no rows to backfill, and
+    // holding the pass open for it would never end.
+    let mut unreadable: Vec<String> = Vec::new();
     // Whether the stamp map names rollouts under each root, read before the
     // walk starts inserting into it.
     let known_roots: Vec<bool> = [
@@ -1837,6 +1868,14 @@ fn sync_codex_rollouts(
                     // database): fall through and re-ingest.
                     _ => {}
                 }
+            }
+            // Asked before the parse, because `read_codex_session_meta`
+            // swallows the read error and then cannot tell an unreadable
+            // rollout from one with no `session_meta` line -- and the branch
+            // below stamps the latter as seen.
+            if !transcript_is_readable(&rollout) {
+                unreadable.push(key);
+                continue;
             }
             let Some(meta) = read_codex_session_meta(&rollout)? else {
                 seen.insert(key, json!({ "stamp": stamp }));
@@ -1938,6 +1977,12 @@ fn sync_codex_rollouts(
         ),
     );
     state.remove("codex_rollouts_v3");
+    // Only the unreadable rollouts the state already knew about count against
+    // the pass; one it never indexed has nothing to repair.
+    unreadable.retain(|key| seen.contains_key(key));
+    if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v5", unreadable) {
+        walked_every_known_root = false;
+    }
     state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
     if scanned > 0 {
@@ -2899,8 +2944,12 @@ fn sync_claude_session_metadata(
     // loses the stamp this run can no longer vouch for.
     let transcripts = collect_matching_files(root, "", "jsonl")?;
     let missing = unobserved_known_paths(&session_state, root, &transcripts);
-    let walked_every_known_root =
+    let mut walked_every_known_root =
         forget_unobserved_paths(state, &mut session_state, "claude_sessions_v3", missing);
+    // Transcripts this run enumerated and then could not read. Only the ones
+    // the state already knew about count against the pass; one that was never
+    // indexed has no rows to backfill.
+    let mut unreadable: Vec<String> = Vec::new();
     let mut scanned = 0;
     let mut upserted = 0;
     for path in transcripts {
@@ -2916,6 +2965,14 @@ fn sync_claude_session_metadata(
             // the same session -- cannot pin the file off the fast path.
             && !(backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
         {
+            continue;
+        }
+        // Asked before the parse, because `scan_claude_session_file` reads
+        // with `unwrap_or_default()` and an unreadable transcript is then
+        // indistinguishable from an empty one -- which would be stamped as
+        // seen on the next line.
+        if !transcript_is_readable(&path) {
+            unreadable.push(key);
             continue;
         }
         scanned += 1;
@@ -2952,6 +3009,10 @@ fn sync_claude_session_metadata(
             record_claude_remote_relationship(conn, &meta)?;
             upserted += 1;
         }
+    }
+    unreadable.retain(|key| session_state.contains_key(key));
+    if !forget_unobserved_paths(state, &mut session_state, "claude_sessions_v3", unreadable) {
+        walked_every_known_root = false;
     }
     state.insert(
         "claude_sessions_v3".to_string(),
@@ -7575,6 +7636,210 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(super::RAW_MESSAGE_FACTS_GENERATION),
             "a deleted file must not hold the pass open for the life of the install"
+        );
+    }
+
+    /// Replace `path` with something the walk still enumerates and can still
+    /// stat, but cannot read.
+    ///
+    /// A unix socket, because the obvious choices do not work here: `chmod 000`
+    /// does nothing when the suite runs as root, which it does in CI, and a
+    /// directory in place of the file is recursed into rather than enumerated,
+    /// so it would exercise the unobserved-path rule instead of this one.
+    /// `open(2)` on a socket fails with `ENXIO` whatever the uid, while
+    /// `metadata()` succeeds, which is exactly the shape of the hazard: a path
+    /// that looks present and unchanged to every check the walk makes before
+    /// it tries to read.
+    #[cfg(unix)]
+    fn make_unreadable(path: &std::path::Path) {
+        fs::remove_file(path).unwrap();
+        // Leaked deliberately: dropping the listener would not remove the
+        // socket file, and the file is what the test needs.
+        std::mem::forget(std::os::unix::net::UnixListener::bind(path).unwrap());
+        assert!(
+            fs::read_to_string(path).is_err(),
+            "the fixture must actually be unreadable or this test proves nothing"
+        );
+        assert!(
+            path.metadata().is_ok(),
+            "the fixture must still stat, or the walk would not even enumerate it"
+        );
+    }
+
+    /// A read that fails is not an observation. Both parsers reach for the
+    /// file with `read_to_string(..).unwrap_or_default()`, which turns a
+    /// permission change, a swapped-out file or an I/O error into an empty
+    /// string -- indistinguishable from an empty transcript. The walk then
+    /// stamps the file as seen and records the generation, and the legacy rows
+    /// behind that path stay null for the life of the install.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_claude_transcript_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let transcript = |id: &str| root.join(format!("{id}.jsonl"));
+        let lines = |id: &str| {
+            format!(
+                concat!(
+                    r#"{{"type":"user","uuid":"u1","sessionId":"{0}","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{{"role":"user","content":"run it"}}}}"#,
+                    "\n",
+                    r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"{0}","cwd":"/tmp/project","isSidechain":false,"requestId":"req_{0}","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{{"type":"text","text":"done"}}]}}}}"#,
+                    "\n",
+                ),
+                id
+            )
+        };
+        fs::write(transcript("sess-a"), lines("sess-a")).unwrap();
+        fs::write(transcript("sess-b"), lines("sess-b")).unwrap();
+
+        let request_id = |conn: &Connection, id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT request_id FROM session_events \
+                 WHERE source='claude' AND session_id=? AND event_uid='a1:0'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            sync_claude_session_metadata(conn, &mut state, &root).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let stamped = |state: &Map<String, Value>, path: &std::path::Path| -> bool {
+            state
+                .get("claude_sessions_v3")
+                .and_then(Value::as_object)
+                .is_some_and(|map| map.contains_key(path.to_string_lossy().as_ref()))
+        };
+
+        let state = sync(&conn);
+        assert_eq!(request_id(&conn, "sess-b"), Some("req_sess-b".into()));
+        let b_modified = transcript("sess-b").metadata().unwrap().modified().unwrap();
+
+        let mut state = state;
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        super::save_sync_state(&state_path, &state).unwrap();
+
+        make_unreadable(&transcript("sess-b"));
+        let state = sync(&conn);
+        assert_eq!(request_id(&conn, "sess-a"), Some("req_sess-a".into()));
+        assert!(
+            state.get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a transcript this run could not read has not been backfilled"
+        );
+        assert!(
+            !stamped(&state, &transcript("sess-b")),
+            "a failed read must not be recorded as an observation"
+        );
+
+        // Readable again and unchanged: the stamp it could not be given is
+        // what gets it re-read, and its facts land.
+        fs::remove_file(transcript("sess-b")).unwrap();
+        restore_unchanged(&transcript("sess-b"), &lines("sess-b"), b_modified);
+        let state = sync(&conn);
+        assert_eq!(request_id(&conn, "sess-b"), Some("req_sess-b".into()));
+        assert_eq!(
+            state
+                .get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// The codex walk reaches its rollouts the same way, through
+    /// `read_codex_session_meta`, which swallows the read error with `.ok()`
+    /// and then cannot tell an unreadable rollout from one with no
+    /// `session_meta` line.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_codex_rollout_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let state_path = home.join(".sync-state.json");
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = |id: &str| day.join(format!("rollout-2026-04-20T05-00-00-{id}.jsonl"));
+        let lines = |id: &str| {
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{{"id":"{0}","cwd":"/tmp/project"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{{"turn_id":"turn_{0}","cwd":"/tmp/project","model":"gpt-5.4"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{{"type":"user_message","message":"run it"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{{"type":"agent_message","message":"done"}}}}"#,
+                    "\n",
+                ),
+                id
+            )
+        };
+        fs::write(rollout("sess_a"), lines("sess_a")).unwrap();
+        fs::write(rollout("sess_b"), lines("sess_b")).unwrap();
+
+        let turn_id = |conn: &Connection, id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT turn_id FROM session_events \
+                 WHERE source='codex' AND session_id=? AND event_uid='3:agent_message'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            super::sync_codex_rollouts(conn, &mut state, home).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let stamped = |state: &Map<String, Value>, path: &std::path::Path| -> bool {
+            state
+                .get("codex_rollouts_v5")
+                .and_then(Value::as_object)
+                .is_some_and(|map| map.contains_key(path.to_string_lossy().as_ref()))
+        };
+
+        let state = sync(&conn);
+        assert_eq!(turn_id(&conn, "sess_b"), Some("turn_sess_b".into()));
+        let b_modified = rollout("sess_b").metadata().unwrap().modified().unwrap();
+
+        let mut state = state;
+        blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
+        super::save_sync_state(&state_path, &state).unwrap();
+
+        make_unreadable(&rollout("sess_b"));
+        let state = sync(&conn);
+        assert_eq!(turn_id(&conn, "sess_a"), Some("turn_sess_a".into()));
+        assert!(
+            state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a rollout this run could not read has not been backfilled"
+        );
+        assert!(
+            !stamped(&state, &rollout("sess_b")),
+            "a failed read must not be recorded as an observation"
+        );
+
+        fs::remove_file(rollout("sess_b")).unwrap();
+        restore_unchanged(&rollout("sess_b"), &lines("sess_b"), b_modified);
+        let state = sync(&conn);
+        assert_eq!(turn_id(&conn, "sess_b"), Some("turn_sess_b".into()));
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
         );
     }
 
