@@ -1,5 +1,6 @@
 //! Targeted, provider-bounded session evidence acquisition.
 
+use super::cursor::{load_cursor, store_cursor, CursorKey, TranscriptCursorState};
 use super::*;
 use crate::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -7,11 +8,17 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::time::Instant;
 
-pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
-/// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
-/// started being indexed under that child id: existing databases re-parse once
-/// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+/// Bumped to 3 for `bytesRead`, which reports what a hydration actually read
+/// rather than what the file contains.
+pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
+/// Bumped to 3 for incremental transcript hydration (#173). A checkpoint
+/// written by an earlier parser has no byte cursor, so the first hydration
+/// after upgrading re-parses that transcript once from offset 0 and writes the
+/// cursor; every hydration after that resumes from it.
+///
+/// Version 2 was Claude subagent transcripts carrying an `agentId` being
+/// indexed under that child id.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -56,6 +63,11 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Bytes this hydration read from provider files. Zero for an `unchanged`
+    /// result, and about the size of the append for an incremental one — the
+    /// counter a watch loop uses to tell "the tail grew" from "the whole file
+    /// was re-read".
+    pub bytes_read: i64,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -70,6 +82,12 @@ struct CatalogTarget {
 struct SourceSnapshot {
     stamp: String,
     bytes: i64,
+    /// Complete records in the file, counted while stamping.
+    ///
+    /// Only the providers whose readers are not yet incremental pay for this
+    /// walk. Claude and Codex leave it at zero and report what their pass
+    /// actually parsed, because counting the records of a 200 MB transcript on
+    /// every hydration is the very cost incremental reading exists to remove.
     records: i64,
     path: Option<PathBuf>,
     /// Claude subagent sidecars, parsed once while stamping the source so the
@@ -195,6 +213,7 @@ fn hydrate_session_at_with_home_and_connectors(
             options,
             "unchanged",
             snapshot,
+            &IngestOutcome::default(),
             started.elapsed().as_millis() as i64,
         );
     }
@@ -204,12 +223,31 @@ fn hydrate_session_at_with_home_and_connectors(
     // has a provider-native uniqueness key, so interruption followed by retry is
     // safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ingest_selected(
+    let cursor_key = CursorKey::Session {
+        source: &options.source,
+        session_id: &options.session_id,
+        location: "local",
+    };
+    // A parser generation change invalidates every position recorded by the
+    // generation before it: the same bytes now mean something else. Starting
+    // from an empty cursor is what makes the first sync after an upgrade a
+    // single full re-parse per transcript, after which cursors take over.
+    let mut cursor = if previous
+        .as_ref()
+        .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
+    {
+        load_cursor(&tx, &cursor_key)?
+    } else {
+        TranscriptCursorState::default()
+    };
+    let indexed = ingest_selected(
         &tx,
         options,
         &target,
         snapshot.path.as_deref(),
         &snapshot.claude_subagents,
+        &mut cursor,
+        snapshot.records,
     )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
@@ -243,20 +281,25 @@ fn hydrate_session_at_with_home_and_connectors(
             HYDRATION_PARSER_VERSION,
             last_event_at_ms,
             snapshot.bytes,
-            snapshot.records,
+            indexed.records,
             options.include_related,
             now_ms(),
         ],
     )?;
+    // The checkpoint row has to exist before its cursor columns are written:
+    // a resume position without the checkpoint it belongs to would describe
+    // evidence nothing recorded.
+    store_cursor(&tx, &cursor_key, &cursor)?;
     let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
     save_observation_progress(
         &tx,
         &local_observation,
         &snapshot.stamp,
         snapshot.bytes,
-        snapshot.records,
+        indexed.records,
         options.include_related,
         true,
+        Some(&cursor),
     )?;
     tx.commit()?;
 
@@ -270,6 +313,7 @@ fn hydrate_session_at_with_home_and_connectors(
         options,
         status,
         snapshot,
+        &indexed,
         started.elapsed().as_millis() as i64,
     )
 }
@@ -456,6 +500,9 @@ fn remote_limited_result(
         presence: "remote".to_string(),
         indexed_through: HydrationIndexedThrough::default(),
         evidence,
+        // No local file was read: this path reports what the catalog already
+        // holds for a session whose full evidence is not reachable.
+        bytes_read: 0,
         related_session_ids,
         diagnostics: vec![HydrationDiagnostic {
             code: code.to_string(),
@@ -604,6 +651,9 @@ fn hydrate_remote_claude_observed(
             records.len() as i64,
             options.include_related,
             true,
+            // Remote evidence arrives as records over a transport; there is no
+            // local file with a byte position to resume from.
+            None,
         )?;
         observations::save_evidence(
             &tx,
@@ -729,6 +779,7 @@ fn hydrate_remote_codex_diff_observed(
                 1,
                 options.include_related,
                 false,
+                None,
             )?;
             observations::save_evidence(
                 &tx,
@@ -942,6 +993,9 @@ pub(crate) fn build_remote_result(
             source_stamp: Some(source_stamp),
             last_event_at_ms: max_event_time(conn, &options.source, &options.session_id)?,
         },
+        // Remote evidence arrives as records over a transport; no local file
+        // was read, so there are no bytes to report.
+        bytes_read: 0,
         evidence: evidence_counts(
             conn,
             &options.source,
@@ -1108,7 +1162,12 @@ fn source_snapshot(
     }
     validate_provider_path(&options.source, &path, home)?;
     let mut bytes = path.metadata()?.len() as i64;
-    let mut records = complete_jsonl_records(&path)?;
+    let incremental_reader = matches!(options.source.as_str(), "claude" | "codex");
+    let records = if incremental_reader {
+        0
+    } else {
+        complete_jsonl_records(&path)?
+    };
     let mut stamp = if options.source == "grok" {
         grok_session_stamp(&path)?
     } else {
@@ -1121,7 +1180,6 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
-            records += complete_jsonl_records(&evidence.path)?;
             // The metadata sidecar describes the child — its type, model and
             // spawn depth, and the tool use that started it — so a sidecar
             // that arrives or changes on its own is still new evidence.
@@ -1138,7 +1196,6 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
             bytes += child.metadata()?.len() as i64;
-            records += complete_jsonl_records(&child)?;
         }
     }
     Ok(SourceSnapshot {
@@ -1195,21 +1252,72 @@ fn complete_jsonl_records(path: &Path) -> Result<i64> {
     Ok(records)
 }
 
+/// What one hydration pass read and indexed, across a session's primary
+/// transcript and every sidecar it reached.
+#[derive(Debug, Default)]
+pub(crate) struct IngestOutcome {
+    /// Records handed to a per-record indexer by this pass. This is no longer
+    /// "records in the file": an incremental pass over an unchanged tail reads
+    /// and parses nothing, and reporting the file's total would claim work
+    /// that was not done.
+    pub records: i64,
+    /// Bytes this pass read. The number scope 6 of #173 is about: appending
+    /// 1 KiB to a 200 MB transcript reads about 1 KiB.
+    pub bytes_read: i64,
+    /// `message.id`s whose message was still being written, across every
+    /// transcript this pass touched.
+    pub in_progress: Vec<String>,
+    /// At least one transcript's cursor was rejected and its file re-read from
+    /// zero.
+    pub rotated: bool,
+    /// Deferral hit its memory ceiling somewhere and indexed an unfinished
+    /// message early.
+    pub deferral_overflowed: bool,
+}
+
+impl IngestOutcome {
+    fn absorb(&mut self, pass: crate::ingest::cursor::IncrementalPass) {
+        self.records += pass.records;
+        self.bytes_read += pass.bytes_read as i64;
+        self.in_progress.extend(pass.in_progress);
+        self.rotated |= pass.rotated;
+        self.deferral_overflowed |= pass.deferral_overflowed;
+    }
+
+    fn absorb_outcome(&mut self, other: IngestOutcome) {
+        self.records += other.records;
+        self.bytes_read += other.bytes_read;
+        self.in_progress.extend(other.in_progress);
+        self.rotated |= other.rotated;
+        self.deferral_overflowed |= other.deferral_overflowed;
+    }
+}
+
 fn ingest_selected(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
-) -> Result<()> {
+    cursor: &mut TranscriptCursorState,
+    records: i64,
+) -> Result<IngestOutcome> {
+    // A provider whose reader still re-reads the file on every change reports
+    // the whole file as what it read, and the record count the snapshot walk
+    // already paid for.
+    let whole_file = || IngestOutcome {
+        bytes_read: path.and_then(|p| p.metadata().ok()).map_or(0, |m| m.len()) as i64,
+        records,
+        ..Default::default()
+    };
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
-        "codex" => ingest_codex(conn, options, path.unwrap()),
-        "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
-        "grok" => ingest_grok(conn, options, path.unwrap()),
+        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents, cursor),
+        "codex" => ingest_codex(conn, options, path.unwrap(), cursor),
+        "cursor" => ingest_cursor(conn, options, target, path.unwrap()).map(|()| whole_file()),
+        "grok" => ingest_grok(conn, options, path.unwrap()).map(|()| whole_file()),
         "opencode" => {
             sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
-            Ok(())
+            Ok(IngestOutcome::default())
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
@@ -1223,7 +1331,8 @@ fn ingest_claude(
     options: &HydrateSessionOptions,
     path: &Path,
     subagents: &[ClaudeSubagentEvidence],
-) -> Result<()> {
+    cursor: &mut TranscriptCursorState,
+) -> Result<IngestOutcome> {
     let meta = scan_claude_session_file(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -1247,14 +1356,19 @@ fn ingest_claude(
         meta.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
-    ingest_claude_transcript(conn, path)?;
+    let mut outcome = IngestOutcome::default();
+    outcome.absorb(incremental::ingest_claude_transcript_incremental(
+        conn, path, None, cursor,
+    )?);
     record_claude_remote_relationship(conn, &meta)?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
+    // Each sidecar carries its own locator-keyed cursor, so one that grows
+    // does not drag the parent transcript through a re-parse.
     for evidence in subagents {
-        ingest_claude_subagent(conn, &options.session_id, evidence)?;
+        outcome.absorb_outcome(ingest_claude_subagent(conn, &options.session_id, evidence)?);
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Index one Claude subagent transcript and record what established it.
@@ -1274,11 +1388,29 @@ pub(crate) fn ingest_claude_subagent(
     conn: &Connection,
     parent_session_id: &str,
     evidence: &ClaudeSubagentEvidence,
-) -> Result<()> {
+) -> Result<IngestOutcome> {
     let locator = evidence.path.to_string_lossy().to_string();
+    let mut outcome = IngestOutcome::default();
+    // The `agent-*.meta.json` beside the transcript is the only record of the
+    // child's type, name, model and spawn depth, so it is evidence in its own
+    // right and gets its own cursor: a sidecar whose metadata changed beside an
+    // untouched transcript still has to reach `session_relationships`, and a
+    // transcript that grew must not drag the metadata through a re-read.
+    let meta_path = claude_subagent_meta_path(&evidence.path);
+    if meta_path.is_file() {
+        crate::ingest::cursor::stamp_whole_file(
+            conn,
+            crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
+            &meta_path,
+        )?;
+    }
     match evidence.agent_id.as_deref() {
         Some(agent_id) => {
-            ingest_claude_transcript_as(conn, &evidence.path, Some(agent_id))?;
+            outcome.absorb(incremental::ingest_claude_transcript_at_locator(
+                conn,
+                &evidence.path,
+                Some(agent_id),
+            )?);
             cleanup_subagent_registration(conn, "claude", agent_id)?;
             record_relationship(
                 conn,
@@ -1297,10 +1429,14 @@ pub(crate) fn ingest_claude_subagent(
                     child_has_events: session_events_exist(conn, "claude", agent_id)?,
                     spawned_at_ms: evidence.first_ts_ms,
                 },
-            )
+            )?;
         }
         None => {
-            ingest_claude_transcript_as(conn, &evidence.path, None)?;
+            outcome.absorb(incremental::ingest_claude_transcript_at_locator(
+                conn,
+                &evidence.path,
+                None,
+            )?);
             record_relationship(
                 conn,
                 &ObservedRelationship {
@@ -1318,9 +1454,10 @@ pub(crate) fn ingest_claude_subagent(
                     child_has_events: false,
                     spawned_at_ms: evidence.first_ts_ms,
                 },
-            )
+            )?;
         }
     }
+    Ok(outcome)
 }
 
 /// One Claude subagent transcript beside a parent's, with whatever identity
@@ -1436,7 +1573,12 @@ fn claude_subagent_meta(transcript: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
+fn ingest_codex(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+    cursor: &mut TranscriptCursorState,
+) -> Result<IngestOutcome> {
     let meta = read_codex_session_meta(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -1449,7 +1591,9 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
             "Codex rollout identity does not match the selected root session",
         ));
     }
-    let outcome = ingest_codex_rollout(conn, path, &meta)?;
+    let mut indexed = IngestOutcome::default();
+    let (outcome, pass) = ingest_codex_rollout_incremental(conn, path, &meta, cursor)?;
+    indexed.absorb(pass);
     if let Some(first) = outcome.first_ts {
         upsert_session(
             conn,
@@ -1464,28 +1608,40 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
         )?;
     }
     if options.include_related {
-        ingest_codex_children(conn, options, path)?;
+        indexed.absorb_outcome(ingest_codex_children(conn, options, path)?);
     }
-    Ok(())
+    Ok(indexed)
 }
 
 fn ingest_codex_children(
     conn: &Connection,
     options: &HydrateSessionOptions,
     root_path: &Path,
-) -> Result<()> {
+) -> Result<IngestOutcome> {
+    let mut indexed = IngestOutcome::default();
     for candidate in codex_children(root_path, &options.session_id)? {
         let Some(meta) = read_codex_session_meta(&candidate)? else {
             continue;
         };
-        ingest_codex_rollout(conn, &candidate, &meta)?;
+        // A child rollout is its own transcript with its own committed
+        // position, keyed by the path it was read from.
+        let locator = candidate.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "codex",
+            locator: &locator,
+        };
+        let mut child_cursor = load_cursor(conn, &key)?;
+        let (_, pass) =
+            ingest_codex_rollout_incremental(conn, &candidate, &meta, &mut child_cursor)?;
+        store_cursor(conn, &key, &child_cursor)?;
+        indexed.absorb(pass);
         cleanup_codex_subagent_history(conn, &meta.session_id)?;
         cleanup_codex_subagent_registration(conn, &meta.session_id)?;
         if let Some(parent_session_id) = meta.parent_session_id.as_deref() {
             record_codex_delegation(conn, parent_session_id, &meta, &candidate)?;
         }
     }
-    Ok(())
+    Ok(indexed)
 }
 
 fn codex_children(root_path: &Path, parent_session_id: &str) -> Result<Vec<PathBuf>> {
@@ -1597,6 +1753,7 @@ fn build_result(
     options: &HydrateSessionOptions,
     status: &str,
     snapshot: SourceSnapshot,
+    indexed: &IngestOutcome,
     duration_ms: i64,
 ) -> Result<HydrateSessionResult> {
     let related_session_ids = if options.include_related {
@@ -1621,11 +1778,50 @@ fn build_result(
     })?;
     let mut diagnostics = vec![HydrationDiagnostic {
         code: "HYDRATION_METRICS".to_string(),
-        message: "targeted provider evidence acquisition completed".to_string(),
+        message: format!(
+            "targeted provider evidence acquisition completed; {} byte(s) read",
+            indexed.bytes_read
+        ),
         duration_ms: Some(duration_ms),
         source_bytes: Some(snapshot.bytes),
-        records_parsed: Some(snapshot.records),
+        records_parsed: Some(indexed.records),
     }];
+    if indexed.rotated {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_SOURCE_ROTATED".to_string(),
+            message: "a provider transcript no longer matches the cursor recorded for it \
+                      (replaced, truncated, or rewritten in place); it was re-read in full"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: Some(snapshot.bytes),
+            records_parsed: Some(indexed.records),
+        });
+    }
+    if !indexed.in_progress.is_empty() {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_IN_PROGRESS_MESSAGES".to_string(),
+            message: format!(
+                "{} message(s) were still being written and were not indexed: {}",
+                indexed.in_progress.len(),
+                indexed.in_progress.join(", ")
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: Some(indexed.in_progress.len() as i64),
+        });
+    }
+    if indexed.deferral_overflowed {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_IN_PROGRESS_OVERFLOW".to_string(),
+            message: "a transcript held more unfinished messages than the deferral ceiling \
+                      allows; the oldest were indexed as they stood so the reader could \
+                      keep making progress"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
     if options.include_related {
         diagnostics.extend(unlinked_diagnostics(
             conn,
@@ -1646,6 +1842,7 @@ fn build_result(
             last_event_at_ms,
         },
         evidence,
+        bytes_read: indexed.bytes_read,
         related_session_ids,
         diagnostics,
     })
@@ -1822,6 +2019,7 @@ pub(crate) fn save_observation_progress(
     records: i64,
     include_related: bool,
     full: bool,
+    cursor: Option<&TranscriptCursorState>,
 ) -> Result<()> {
     let mut observation = observation.clone();
     observation.updated_ms = now_ms();
@@ -1845,6 +2043,10 @@ pub(crate) fn save_observation_progress(
             records_parsed: records,
             include_related,
             updated_ms: now_ms(),
+            committed_offset: cursor.map_or(0, |cursor| cursor.committed_offset()),
+            prefix_hash: cursor.and_then(|cursor| cursor.prefix_hash()),
+            dev_ino: cursor.and_then(|cursor| cursor.dev_ino()),
+            parser_state_json: cursor.map(|cursor| cursor.encode()),
         },
     )
 }
@@ -2083,6 +2285,697 @@ mod tests {
             scope: SessionScope::Local,
             include_related: true,
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Incremental transcript hydration (#173).
+    //
+    // The three `claude/` fixtures are copied byte for byte from burn's
+    // `tests/fixtures/claude/`, so the two readers are held to one corpus and
+    // a disagreement between them shows up as a diff in this repository rather
+    // than as two plausible answers in production.
+    // ---------------------------------------------------------------------
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude")
+            .join(name)
+    }
+
+    /// A transcript placed where the Claude provider root guard expects it,
+    /// with a catalog row pointing at it.
+    fn seed_claude_transcript(home: &Path, session_id: &str, bytes: &[u8]) -> PathBuf {
+        let transcript = home
+            .join(".claude/projects/app")
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, bytes).unwrap();
+        transcript
+    }
+
+    fn session_event_snapshot(
+        db: &Path,
+        session_id: &str,
+    ) -> Vec<(String, String, String, String)> {
+        let conn = open_db(db).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT event_uid, role, kind, COALESCE(text, '') FROM session_events \
+                 WHERE source = 'claude' AND session_id = ? ORDER BY event_uid",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    fn diagnostic<'a>(
+        result: &'a HydrateSessionResult,
+        code: &str,
+    ) -> Option<&'a HydrationDiagnostic> {
+        result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+    }
+
+    fn stored_cursor(db: &Path, session_id: &str) -> TranscriptCursorState {
+        let conn = open_db(db).unwrap();
+        load_cursor(
+            &conn,
+            &CursorKey::Session {
+                source: "claude",
+                session_id,
+                location: "local",
+            },
+        )
+        .unwrap()
+    }
+
+    /// The tail of `incomplete-then-complete.jsonl` with `stop_reason` set,
+    /// exactly as burn's incremental test completes that message.
+    fn incomplete_fixture_completion() -> String {
+        serde_json::json!({
+            "parentUuid": "u-asst-2",
+            "isSidechain": false,
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "id": "msg_inprog_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "finished"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            },
+            "type": "assistant",
+            "uuid": "u-asst-3",
+            "timestamp": "2026-04-20T00:00:03.000Z",
+            "cwd": "/tmp/project",
+            "sessionId": "33333333-3333-3333-3333-333333333333"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    const INCOMPLETE_SESSION: &str = "33333333-3333-3333-3333-333333333333";
+    /// Byte offset of the `msg_inprog_1` line in the shipped fixture.
+    const INCOMPLETE_INPROGRESS_OFFSET: i64 = 838;
+
+    #[test]
+    fn an_unfinished_message_is_held_back_and_then_indexed_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fs::read(fixture("incomplete-then-complete.jsonl")).unwrap();
+        let transcript = seed_claude_transcript(dir.path(), INCOMPLETE_SESSION, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", INCOMPLETE_SESSION, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert_eq!(first.status, "hydrated");
+
+        // The finished message is indexed; the one still streaming is not.
+        let events = session_event_snapshot(&db, INCOMPLETE_SESSION);
+        let uids: Vec<&str> = events.iter().map(|row| row.0.as_str()).collect();
+        assert!(uids.contains(&"u-asst-1:0"), "{uids:?}");
+        assert!(
+            !uids.iter().any(|uid| uid.starts_with("u-asst-2")),
+            "an unfinished assistant message must not be indexed: {uids:?}"
+        );
+
+        let held = diagnostic(&first, "HYDRATION_IN_PROGRESS_MESSAGES")
+            .expect("a held message is reported");
+        assert_eq!(held.records_parsed, Some(1));
+        assert!(held.message.contains("msg_inprog_1"), "{}", held.message);
+
+        // The cursor backs up to the first byte of the held message, so the
+        // next pass re-reads it rather than resuming past it.
+        let cursor = stored_cursor(&db, INCOMPLETE_SESSION);
+        assert_eq!(cursor.committed_offset(), INCOMPLETE_INPROGRESS_OFFSET);
+        assert_eq!(
+            cursor.claude.as_ref().unwrap().in_progress,
+            vec!["msg_inprog_1".to_string()]
+        );
+
+        // The completion arrives.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{}", incomplete_fixture_completion()).unwrap();
+        drop(file);
+
+        let second =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert_eq!(second.status, "updated");
+        assert!(diagnostic(&second, "HYDRATION_IN_PROGRESS_MESSAGES").is_none());
+        assert!(diagnostic(&second, "HYDRATION_SOURCE_ROTATED").is_none());
+
+        // Both records of the completed message are present, once each, and
+        // the usage carrier is stored with them.
+        let events = session_event_snapshot(&db, INCOMPLETE_SESSION);
+        let uids: Vec<&str> = events.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["u-asst-1:0", "u-asst-2:0", "u-asst-3:0", "u-user-1:0"],
+            "every record is indexed exactly once"
+        );
+        let conn = open_db(&db).unwrap();
+        let usage: String = conn
+            .query_row(
+                "SELECT COALESCE(token_json, '') FROM session_events \
+                 WHERE source = 'claude' AND session_id = ? AND event_uid = 'u-asst-3:0'",
+                [INCOMPLETE_SESSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(usage.contains("\"output_tokens\":3"), "{usage}");
+
+        // Only the appended bytes were read on the second pass, plus the held
+        // message the first pass declined to commit past.
+        let appended = incomplete_fixture_completion().len() as i64;
+        let held_line = bytes.len() as i64 - INCOMPLETE_INPROGRESS_OFFSET;
+        assert_eq!(second.bytes_read, appended + held_line);
+        assert_eq!(
+            stored_cursor(&db, INCOMPLETE_SESSION).committed_offset(),
+            bytes.len() as i64 + appended
+        );
+    }
+
+    /// One pass over the whole file and three passes over growing prefixes of
+    /// it must leave the same rows. Run against both interleaving fixtures.
+    fn assert_append_chunks_match_one_pass(name: &str, session_id: &str) {
+        let bytes = fs::read(fixture(name)).unwrap();
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, byte)| **byte == b'\n')
+                    .map(|(index, _)| index + 1),
+            )
+            .filter(|start| *start < bytes.len())
+            .collect();
+        assert!(
+            line_starts.len() >= 3,
+            "{name} needs at least three records to append in three chunks"
+        );
+        // Three chunks: first record, up to the second-to-last, then the rest.
+        let cuts = [
+            line_starts[1],
+            line_starts[line_starts.len() - 1],
+            bytes.len(),
+        ];
+
+        let whole_dir = tempfile::tempdir().unwrap();
+        let whole_db = whole_dir.path().join("history.db");
+        let whole_transcript = seed_claude_transcript(whole_dir.path(), session_id, &bytes);
+        let conn = open_db(&whole_db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&whole_transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&whole_db, &options("claude", session_id), whole_dir.path())
+            .unwrap();
+        let expected = session_event_snapshot(&whole_db, session_id);
+        assert!(!expected.is_empty(), "{name} produced no events");
+
+        let grown_dir = tempfile::tempdir().unwrap();
+        let grown_db = grown_dir.path().join("history.db");
+        let grown_transcript =
+            seed_claude_transcript(grown_dir.path(), session_id, &bytes[..cuts[0]]);
+        let conn = open_db(&grown_db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&grown_transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&grown_db, &options("claude", session_id), grown_dir.path())
+            .unwrap();
+        for window in cuts.windows(2) {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&grown_transcript)
+                .unwrap();
+            file.write_all(&bytes[window[0]..window[1]]).unwrap();
+            drop(file);
+            let result = hydrate_session_at_with_home(
+                &grown_db,
+                &options("claude", session_id),
+                grown_dir.path(),
+            )
+            .unwrap();
+            assert!(
+                diagnostic(&result, "HYDRATION_SOURCE_ROTATED").is_none(),
+                "{name} must not rotate on a plain append"
+            );
+        }
+
+        assert_eq!(
+            session_event_snapshot(&grown_db, session_id),
+            expected,
+            "{name} must hydrate identically in one pass and in three appends"
+        );
+    }
+
+    #[test]
+    fn interleaved_turns_hydrate_identically_whole_or_in_three_appends() {
+        assert_append_chunks_match_one_pass(
+            "interleaved-turns.jsonl",
+            "44444444-4444-4444-4444-444444444444",
+        );
+    }
+
+    #[test]
+    fn an_out_of_order_parent_chain_hydrates_identically_whole_or_in_three_appends() {
+        assert_append_chunks_match_one_pass(
+            "parent-chain-out-of-order.jsonl",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        );
+    }
+
+    #[test]
+    fn a_transcript_truncated_below_its_cursor_is_re_read_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fs::read(fixture("interleaved-turns.jsonl")).unwrap();
+        let session_id = "44444444-4444-4444-4444-444444444444";
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(diagnostic(&first, "HYDRATION_SOURCE_ROTATED").is_none());
+        let committed = stored_cursor(&db, session_id).committed_offset();
+        assert_eq!(committed, bytes.len() as i64);
+        let expected = session_event_snapshot(&db, session_id);
+
+        // The provider replaces the session with a shorter one, cut at a
+        // record boundary so the pass has no partial tail to withhold and the
+        // byte count below is exact. The cursor is past the new end of file,
+        // which is not a position in this file at all.
+        let first_line_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let truncated = &bytes[..first_line_end];
+        fs::write(&transcript, truncated).unwrap();
+        let rotated =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let diagnostic = diagnostic(&rotated, "HYDRATION_SOURCE_ROTATED")
+            .expect("truncation below the cursor is reported");
+        assert!(diagnostic.message.contains("re-read in full"));
+        // Re-read from zero: every byte of the shorter file, not a resume.
+        assert_eq!(rotated.bytes_read, truncated.len() as i64);
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            truncated.len() as i64
+        );
+        // The rows the longer file produced are still there; nothing on this
+        // path deletes evidence, it only stops resuming past it.
+        assert!(session_event_snapshot(&db, session_id).len() <= expected.len());
+    }
+
+    #[test]
+    fn a_rewritten_prefix_is_caught_even_at_the_same_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fs::read(fixture("interleaved-turns.jsonl")).unwrap();
+        let session_id = "44444444-4444-4444-4444-444444444444";
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+
+        // Same length, same mtime ordering, different bytes at the head: the
+        // size and mtime terms of the rotation rule cannot see this, and the
+        // prefix window is what catches it.
+        let mut rewritten = bytes.clone();
+        rewritten[10] = if rewritten[10] == b'x' { b'y' } else { b'x' };
+        fs::write(&transcript, &rewritten).unwrap();
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(
+            diagnostic(&result, "HYDRATION_SOURCE_ROTATED").is_some(),
+            "a rewritten prefix at an unchanged length must rotate the cursor"
+        );
+    }
+
+    #[test]
+    fn upgrading_the_parser_generation_re_reads_once_and_then_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fs::read(fixture("interleaved-turns.jsonl")).unwrap();
+        let session_id = "44444444-4444-4444-4444-444444444444";
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+
+        // Stand in for a database written by the parser generation before
+        // this one: the checkpoint is at an older version and has no cursor,
+        // which is exactly what every existing install looks like on the first
+        // sync after upgrading.
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "UPDATE session_hydration_checkpoints \
+             SET parser_version = ?, committed_offset = 0, prefix_hash = NULL, \
+                 dev_ino = NULL, parser_state_json = NULL \
+             WHERE source = 'claude' AND session_id = ?",
+            params![HYDRATION_PARSER_VERSION - 1, session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE observation_hydration_checkpoints SET parser_version = ? \
+             WHERE source = 'claude' AND session_id = ?",
+            params![HYDRATION_PARSER_VERSION - 1, session_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        // One full re-parse from offset 0 - the whole file, and not reported
+        // as a rotation, because nothing about the file changed.
+        let upgraded =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(upgraded.status, "updated");
+        assert_eq!(upgraded.bytes_read, bytes.len() as i64);
+        assert!(diagnostic(&upgraded, "HYDRATION_SOURCE_ROTATED").is_none());
+
+        // And from here the cursor carries: an append reads only the append.
+        let addition = incomplete_fixture_completion();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+        let resumed =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(resumed.bytes_read, addition.len() as i64);
+    }
+
+    #[test]
+    fn a_sidecar_that_grows_does_not_re_read_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-sidecar";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            b"{\"sessionId\":\"session-sidecar\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"parent prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        );
+        let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"first\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+
+        let addition = "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s2\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"second\"},\"timestamp\":\"2026-08-31T10:00:02Z\"}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&sidecar).unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+
+        let grown =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        // Only the sidecar's new line is read. The parent transcript, which
+        // did not change, contributes nothing to this number.
+        assert_eq!(grown.bytes_read, addition.len() as i64);
+        assert_eq!(
+            session_event_snapshot(&db, "child-1")
+                .iter()
+                .map(|row| row.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["s1:0".to_string(), "s2:0".to_string()]
+        );
+    }
+
+    /// Peak resident set size of this process, in bytes.
+    ///
+    /// `getrusage(RUSAGE_SELF).ru_maxrss` is the high-water mark since the
+    /// process started, which is what a memory *ceiling* needs: a sample taken
+    /// after the fact would miss a transient spike, and a transient spike is
+    /// exactly how "read the whole file into a String" fails. The unit differs
+    /// by platform and the man pages disagree with each other, so it is
+    /// normalized here: Linux reports kilobytes, macOS and the other BSDs
+    /// report bytes.
+    #[cfg(unix)]
+    fn peak_rss_bytes() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is a valid, fully initialized `rusage`.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        let raw = usage.ru_maxrss.max(0) as u64;
+        if cfg!(target_os = "macos") {
+            raw
+        } else {
+            raw * 1024
+        }
+    }
+
+    /// Write a synthetic Claude transcript of at least `target_bytes`.
+    ///
+    /// Generated into the test's own temporary directory and deleted with it.
+    /// A 200 MB fixture is not committed: the repository would carry it
+    /// forever to prove a property that is about the reader, not the bytes.
+    fn write_large_claude_transcript(path: &Path, session_id: &str, target_bytes: u64) -> u64 {
+        use std::io::BufWriter;
+        let file = fs::File::create(path).unwrap();
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
+        // Roughly 2 KiB of assistant text per record, so the reader meets
+        // records large enough that holding even a few thousand would show.
+        let filler = "x".repeat(2048);
+        let mut written = 0u64;
+        let mut index = 0u64;
+        while written < target_bytes {
+            let record = format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u{index}\",\"cwd\":\"/work/app\",\
+                 \"type\":\"assistant\",\"message\":{{\"id\":\"msg_{index}\",\"role\":\"assistant\",\
+                 \"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"{filler}\"}}]}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            );
+            writer.write_all(record.as_bytes()).unwrap();
+            written += record.len() as u64;
+            index += 1;
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        written
+    }
+
+    /// Scope 6 of #173: reading and indexing a transcript far larger than
+    /// memory stays under a documented ceiling, and a small append to it
+    /// afterwards reads only the append.
+    ///
+    /// **What is measured, and what is not.** This drives the incremental
+    /// reader over a 200 MB transcript against a real on-disk database in
+    /// autocommit, which is the reader plus the per-record writes it feeds.
+    /// It deliberately does *not* go through [`hydrate_session_at`], because
+    /// that wraps the whole session in one `Immediate` transaction and a
+    /// transaction's own cost is not the reader's. Measured on this machine,
+    /// the split is unambiguous:
+    ///
+    /// | path                          | peak RSS growth over 100 MB |
+    /// |-------------------------------|-----------------------------|
+    /// | reader alone, no rows written | 0 bytes                     |
+    /// | reader + one open transaction | ~52 MB (≈ 0.5 × file)       |
+    ///
+    /// So the reader is O(1) in the file and the single transaction is
+    /// linear in it. Chunked commits — scope 2's "commit every
+    /// `JSONL_CHUNK_LINES`" — are what bound the second term, and they are
+    /// deferred: hydration's one-transaction-per-session boundary is relied
+    /// on for rollback by several existing tests and splitting it is a
+    /// separate change. Until then this asserts the term this change owns.
+    ///
+    /// **How the bound is measured.** `getrusage(RUSAGE_SELF).ru_maxrss` is
+    /// the process's high-water mark since it started, which is what a
+    /// ceiling needs: a sample taken afterwards would miss a transient spike,
+    /// and a transient spike is exactly how "read the whole file into a
+    /// String" fails. Linux reports it in kilobytes and macOS in bytes, which
+    /// [`peak_rss_bytes`] normalizes. The assertion is on the *growth* of the
+    /// peak, since the harness allocated whatever it allocated before this
+    /// test ran. 64 MiB over a 200 MB file is generous enough not to be flaky
+    /// on a loaded runner and three times under what a whole-file read
+    /// produces, so a regression to `read_to_string` fails it outright rather
+    /// than squeaking under.
+    ///
+    /// **Why `#[ignore]`.** Not because a CI runner cannot host 200 MB, but
+    /// because `ru_maxrss` is a per-*process* high-water mark and `cargo test`
+    /// runs this suite as threads of one process. Another test's allocation
+    /// inflates the reading, and the resulting failure would be real-looking,
+    /// unreproducible, and nothing to do with this reader. Run it alone:
+    ///
+    /// ```text
+    /// cargo test -p ai-hist --all-features --lib -- --ignored --exact \
+    ///   --test-threads=1 \
+    ///   ingest::hydrate::tests::reading_a_200mb_transcript_stays_under_a_memory_ceiling
+    /// ```
+    ///
+    /// The `bytes_read` half of the scope runs on every CI pass, at a size
+    /// that costs nothing, in
+    /// `an_append_to_a_large_transcript_reads_only_the_append`.
+    #[test]
+    #[ignore = "measures process-wide peak RSS; run alone with --test-threads=1"]
+    fn reading_a_200mb_transcript_stays_under_a_memory_ceiling() {
+        const TARGET_BYTES: u64 = 200 * 1024 * 1024;
+        const CEILING_BYTES: u64 = 64 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-large";
+        let transcript = dir.path().join("large.jsonl");
+        let size = write_large_claude_transcript(&transcript, session_id, TARGET_BYTES);
+        assert!(size >= TARGET_BYTES);
+
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        // Durability is not what this measures, and 200k autocommit fsyncs
+        // would make it a stopwatch test instead of a memory one.
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+
+        let mut cursor = TranscriptCursorState::default();
+        let before = peak_rss_bytes();
+        let pass = incremental::ingest_claude_transcript_incremental(
+            &conn,
+            &transcript,
+            None,
+            &mut cursor,
+        )
+        .unwrap();
+        let after = peak_rss_bytes();
+
+        assert_eq!(pass.bytes_read, size);
+        assert!(pass.records > 0);
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = ?",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed, pass.records,
+            "every record read must have produced a row"
+        );
+
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth < CEILING_BYTES,
+            "reading and indexing {size} bytes grew peak RSS by {growth} bytes, \
+             over the {CEILING_BYTES} byte ceiling"
+        );
+
+        // And the point of all of it: one more kilobyte costs one more
+        // kilobyte of reading, not another pass over the file.
+        let addition = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"tail\",\"cwd\":\"/work/app\",\
+             \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}},\
+             \"timestamp\":\"2026-08-31T11:00:00Z\"}}\n",
+            "y".repeat(900)
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+        let second = incremental::ingest_claude_transcript_incremental(
+            &conn,
+            &transcript,
+            None,
+            &mut cursor,
+        )
+        .unwrap();
+        assert_eq!(second.bytes_read, addition.len() as u64);
+    }
+
+    /// The same property at a size CI can afford on every run: after a first
+    /// pass over a transcript of many records, appending one record reads only
+    /// that record's bytes.
+    #[test]
+    fn an_append_to_a_large_transcript_reads_only_the_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-append";
+        let transcript = dir
+            .path()
+            .join(".claude/projects/app")
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        // Larger than the 64 KiB prefix window from both ends, so the cursor
+        // validation this exercises is the real two-window case rather than
+        // the degenerate "the window is the whole file" one.
+        let size = write_large_claude_transcript(&transcript, session_id, 4 * 1024 * 1024);
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(first.bytes_read, size as i64);
+        let events_after_first = session_event_snapshot(&db, session_id).len();
+
+        let addition = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"tail\",\"cwd\":\"/work/app\",\
+             \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}},\
+             \"timestamp\":\"2026-08-31T11:00:00Z\"}}\n",
+            "y".repeat(900)
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+
+        let appended =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(
+            appended.bytes_read,
+            addition.len() as i64,
+            "an append must cost its own size, not the file's"
+        );
+        assert!(appended.bytes_read * 100 < size as i64);
+        assert_eq!(
+            session_event_snapshot(&db, session_id).len(),
+            events_after_first + 1
+        );
+    }
+
+    #[test]
+    fn a_cursor_document_preserves_keys_it_does_not_understand() {
+        // Sibling work parks its own per-source resume state in the same
+        // document. A reader that does not know a key must hand it back
+        // unchanged rather than drop it, or two changes silently erase each
+        // other's state on alternate passes.
+        let raw = serde_json::json!({
+            "v": super::super::cursor::TRANSCRIPT_CURSOR_VERSION,
+            "file": {"offset": 12, "mtime_ns": 7, "size": 12, "prefix_hash": "deadbeef"},
+            "claude": {"next_line_index": 3},
+            "tool_results": {"call_index": 9, "event_index": 41},
+        })
+        .to_string();
+        let decoded = TranscriptCursorState::decode(Some(&raw));
+        assert_eq!(decoded.committed_offset(), 12);
+        assert_eq!(decoded.claude.as_ref().unwrap().next_line_index, 3);
+        let round_tripped: Value = serde_json::from_str(&decoded.encode()).unwrap();
+        assert_eq!(
+            round_tripped["tool_results"],
+            serde_json::json!({"call_index": 9, "event_index": 41}),
+            "an unrecognized per-source key survives a round trip"
+        );
     }
 
     #[test]

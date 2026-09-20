@@ -173,3 +173,61 @@ prompt:    SEARCH p USING INDEX part_session_idx (session_id=?)
 The selected-session assertions fail if `message` or `part` regresses to a
 full table scan. The prompt query may use a temporary B-tree to order the few
 parts belonging to the selected session; it never sorts unrelated history.
+
+
+## 2026-09-20 incremental transcript hydration
+
+Before this, a transcript that changed by one byte was re-read and re-parsed in
+full. The numbers that matter are therefore about *what a pass reads*, not
+about throughput: the win is asymptotic, not constant-factor.
+
+`hydrateSession` returns `bytesRead` and the figures below come from the tests
+that assert them, so they are checked on every CI pass rather than measured
+once and written down.
+
+| Pass | Bytes read |
+|---|---:|
+| First hydration of a transcript | the whole file |
+| Append of *n* bytes, then re-hydrate | *n* |
+| Append to a sidecar beside an unchanged parent | the sidecar's *n*, and nothing for the parent |
+| Nothing changed | 0 — the stamp short-circuit does not open the file |
+| Cursor rejected (truncated, replaced, rewritten head or tail) | the whole file, with a `HYDRATION_SOURCE_ROTATED` diagnostic |
+| First pass after a `HYDRATION_PARSER_VERSION` bump | the whole file, once |
+
+Validating a cursor on open costs two seeks and at most 128 KiB, independent of
+file size: `prefix_hash` covers a bounded window rather than the whole
+committed prefix (see `docs/session-catalog.md`).
+
+### Memory
+
+Peak RSS growth over one pass, measured with
+`getrusage(RUSAGE_SELF).ru_maxrss` on Linux (kilobytes there, bytes on macOS;
+`peak_rss_bytes` normalizes), sampled before and after so the figure is the
+growth of the process high-water mark:
+
+| Path | 100 MB transcript | 200 MB transcript |
+|---|---:|---:|
+| Incremental reader alone, no rows written | 0 bytes | — |
+| Incremental reader + per-record writes, autocommit | — | under 64 MiB (asserted) |
+| Incremental reader inside one `Immediate` transaction | ~52 MB (≈ 0.5 × file) | ~169 MB |
+
+The reader is O(1) in file size. The third row is the transaction, not the
+reader: a single transaction spanning a whole session accumulates its own state
+in proportion to what it writes. Bounding that term is chunked commits — scope
+2's "commit every `JSONL_CHUNK_LINES`" — which is deferred, because hydration's
+one-transaction-per-session boundary is what several existing rollback tests
+rely on and splitting it is a separate change.
+
+The 200 MB test is `#[ignore]`d, not because a CI runner cannot host the file
+but because `ru_maxrss` is a per-*process* high-water mark while `cargo test`
+runs the suite as threads of one process, so a neighbouring test's allocation
+would make it fail for reasons that have nothing to do with the reader. Run it
+alone:
+
+```text
+cargo test -p ai-hist --all-features --lib -- --ignored --exact \
+  --test-threads=1 \
+  ingest::hydrate::tests::reading_a_200mb_transcript_stays_under_a_memory_ceiling
+```
+
+The `bytesRead` assertions run on every CI pass at sizes that cost nothing.

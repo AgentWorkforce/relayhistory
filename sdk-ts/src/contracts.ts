@@ -178,6 +178,13 @@ export interface HydrateSessionResult {
     fileEdits: number;
     relatedSessions: number;
   };
+  /**
+   * Bytes read from provider files by this hydration. Zero for `unchanged`,
+   * and about the size of the append when a live transcript grew - the counter
+   * a watch loop reads to tell "the tail grew" from "the whole file was
+   * re-read".
+   */
+  bytesRead: number;
   relatedSessionIds: string[];
   diagnostics: HydrationDiagnostic[];
 }

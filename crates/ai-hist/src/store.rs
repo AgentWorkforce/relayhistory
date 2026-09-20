@@ -420,6 +420,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "sessions",
     "session_presences",
     "session_hydration_checkpoints",
+    "transcript_cursors",
     "session_identity_correlations",
     "session_relationships",
     "schema_migrations",
@@ -457,6 +458,20 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 ];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
+/// The byte-cursor columns hydration writes beside a checkpoint. A database
+/// created before incremental transcript hydration keeps the original ten
+/// columns, so these are added as ignore-if-present ALTERs and a fresh
+/// database gets the same shape from the CREATE TABLE above.
+///
+/// `parser_state_json` is the cursor itself; the other three are projections
+/// of it, declared here so a read-only handle over an older database is
+/// migrated rather than answered with `no such column`.
+const REQUIRED_HYDRATION_CURSOR_COLUMNS: &[(&str, &str)] = &[
+    ("committed_offset", "INTEGER NOT NULL DEFAULT 0"),
+    ("prefix_hash", "TEXT"),
+    ("dev_ino", "TEXT"),
+    ("parser_state_json", "TEXT"),
+];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
 /// so a database still carrying the v1 table is not current for any read.
@@ -659,6 +674,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     {
         return Ok(false);
     }
+    let cursor_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_hydration_checkpoints')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_HYDRATION_CURSOR_COLUMNS
+        .iter()
+        .all(|(needed, _)| cursor_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
     let relationship_columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('session_relationships')")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -832,7 +857,25 @@ CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
     records_parsed INTEGER NOT NULL DEFAULT 0,
     include_related INTEGER NOT NULL DEFAULT 1,
     updated_ms INTEGER NOT NULL,
+    committed_offset INTEGER NOT NULL DEFAULT 0,
+    prefix_hash TEXT,
+    dev_ino TEXT,
+    parser_state_json TEXT,
     PRIMARY KEY (source, session_id, location)
+);
+-- Byte cursors for every transcript that is not a session's own primary one:
+-- subagent sidecars, their `agent-*.meta.json`, and the files the global sync
+-- walk meets. Keyed by locator so a growing sidecar advances its own position
+-- instead of forcing its parent to be re-parsed. See ingest::cursor.
+CREATE TABLE IF NOT EXISTS transcript_cursors (
+    source TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    committed_offset INTEGER NOT NULL DEFAULT 0,
+    prefix_hash TEXT,
+    dev_ino TEXT,
+    parser_state_json TEXT,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, locator)
 );
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
     source TEXT NOT NULL,
@@ -878,6 +921,11 @@ END;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
+    ensure_columns(
+        conn,
+        "session_hydration_checkpoints",
+        REQUIRED_HYDRATION_CURSOR_COLUMNS,
+    )?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
     // already-current database remains cheap to check. The outer immediate
@@ -1118,23 +1166,32 @@ DROP TABLE session_relationships_v1;
 /// This avoids both guaranteed failing ALTERs and locale/version-sensitive
 /// matching on SQLite error strings.
 fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
-    let missing = |conn: &Connection| -> Result<Vec<&str>> {
-        let existing: HashSet<String> = conn
-            .prepare("SELECT name FROM pragma_table_info(?)")?
-            .query_map([table], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(required
-            .iter()
-            .copied()
-            .filter(|column| !existing.contains(*column))
-            .collect())
-    };
+    let declared: Vec<(&str, &str)> = required.iter().map(|column| (*column, "TEXT")).collect();
+    ensure_columns(conn, table, &declared)
+}
 
-    for column in missing(conn)? {
-        // `table` and `column` come exclusively from internal constant lists,
-        // never from user input.
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
-            .with_context(|| format!("adding column {table}.{column}"))?;
+/// Add any of `required` that `table` does not already have.
+///
+/// Each entry is `(name, declaration)`. SQLite has no `ADD COLUMN IF NOT
+/// EXISTS`, so the columns present are read first; a declaration may carry a
+/// type and a non-null default, which is why this is not folded into
+/// [`ensure_text_columns`].
+fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<()> {
+    let existing: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info(?)")?
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (column, declaration) in required
+        .iter()
+        .filter(|(column, _)| !existing.contains(*column))
+    {
+        // `table`, `column` and `declaration` come exclusively from internal
+        // constant lists, never from user input.
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )
+        .with_context(|| format!("adding column {table}.{column}"))?;
     }
     Ok(())
 }

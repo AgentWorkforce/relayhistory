@@ -314,6 +314,11 @@ export interface HydrateSessionResult {
   presence: string
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
+  /**
+   * Bytes read from provider files by this hydration. Zero when the session
+   * was unchanged; about the size of the append when a live transcript grew.
+   */
+  bytesRead: number
   relatedSessionIds: Array<string>
   diagnostics: Array<HydrationDiagnostic>
 }

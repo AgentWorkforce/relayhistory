@@ -268,6 +268,9 @@ pub(crate) fn apply_normalized(
         evidence.records.len() as i64,
         false,
         full,
+        // A remote connector delivers records, not a growing local file:
+        // there is no byte position in the source to resume from.
+        None,
     )?;
     tx.commit()?;
     let options = HydrateSessionOptions {

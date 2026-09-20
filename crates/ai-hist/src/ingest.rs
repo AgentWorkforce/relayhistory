@@ -4,7 +4,7 @@ use crate::{
     HistoryEntry, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod cursor;
 pub(crate) mod hydrate;
+pub(crate) mod incremental;
 
 use crate::diagnostics::*;
 use crate::discover;
@@ -1976,8 +1978,8 @@ struct CodexIngestOutcome {
 
 /// Cumulative token totals from a Codex `token_count` event
 /// (`info.total_token_usage`). `input` is inclusive of `cached_input`.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct CodexTokenTotals {
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CodexTokenTotals {
     input: i64,
     cached_input: i64,
     cache_write: i64,
@@ -2104,35 +2106,69 @@ fn ingest_codex_rollout(
     path: &Path,
     meta: &CodexSessionMeta,
 ) -> Result<CodexIngestOutcome> {
-    let file = fs::File::open(path)?;
+    let mut cursor = cursor::TranscriptCursorState::default();
+    Ok(ingest_codex_rollout_incremental(conn, path, meta, &mut cursor)?.0)
+}
+
+/// Index a Codex rollout from its cursor.
+///
+/// The committed position advances **only at a `task_complete` record**, which
+/// is where burn's `CommittedSnapshot` advances too. A Codex turn's token
+/// accounting is not final until the turn is: `token_count` carries cumulative
+/// totals, and the delta an assistant event is charged is measured against the
+/// baseline the previous snapshot left. Committing inside an open turn would
+/// freeze a baseline mid-turn and the next pass would attribute the turn's
+/// remaining spend against the wrong one.
+///
+/// Records of the open turn are still indexed as they are read — this is an
+/// evidence store, and a live session's events should be visible before its
+/// turn ends — but they are re-derived on the next pass from the last
+/// committed boundary, so the pass that sees the turn close is the one whose
+/// token attribution stands. Every insert on the path is an idempotent upsert
+/// keyed by provider-native identity, so re-reading that span rewrites the
+/// same rows.
+fn ingest_codex_rollout_incremental(
+    conn: &Connection,
+    path: &Path,
+    meta: &CodexSessionMeta,
+    cursor: &mut cursor::TranscriptCursorState,
+) -> Result<(CodexIngestOutcome, cursor::IncrementalPass)> {
     let session_id = meta.session_id.as_str();
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    let mut model: Option<String> = None;
-    let mut prev_totals: Option<CodexTokenTotals> = None;
-    let mut pending_delta: Option<CodexTokenTotals> = None;
-    let mut untokened_assistant_uid: Option<String> = None;
-    let mut saw_model_output = false;
-    let mut human_messages = codex::HumanMessageDeduper::default();
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    let mut line_index = 0usize;
+    let mut reader = cursor::TranscriptReader::open(path, cursor.file.as_ref())?;
+    let mut pass = cursor::IncrementalPass {
+        rotated: reader.rotated,
+        ..Default::default()
+    };
+    let resume = if reader.start_offset() == 0 {
+        cursor::CodexCursorState::default()
+    } else {
+        cursor.codex.clone().unwrap_or_default()
+    };
+    let start_offset = reader.start_offset();
+    let mut model: Option<String> = resume.model.clone();
+    let mut prev_totals: Option<CodexTokenTotals> = resume.prev_totals;
+    let mut pending_delta: Option<CodexTokenTotals> = resume.pending_delta;
+    let mut untokened_assistant_uid: Option<String> = resume.untokened_assistant_uid.clone();
+    let mut saw_model_output = resume.saw_model_output;
+    let mut human_messages =
+        codex::HumanMessageDeduper::restore(resume.previous_human_message.clone());
+    let mut line_index = resume.next_line_index;
+    // The committed shadow: the state as of the last `task_complete`, which is
+    // what is written back when the pass ends.
+    let mut committed = (reader.position(), resume.clone());
+    let mut line = String::new();
     loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            break;
-        }
         // A line without its newline is the half-written tail of a live
-        // session; the next sync re-reads the whole file.
-        if raw.last() != Some(&b'\n') {
+        // session; `next_line` withholds it and the next pass re-reads it.
+        if !reader.next_line(&mut line)? {
             break;
         }
         let index = line_index;
         line_index += 1;
-        let Ok(text) = std::str::from_utf8(&raw) else {
-            continue;
-        };
+        let text = line.as_str();
         let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
             continue;
         };
@@ -2295,6 +2331,18 @@ fn ingest_codex_rollout(
                         outcome.last_assistant_text =
                             Some(message.trim().chars().take(4096).collect());
                     }
+                    committed = (
+                        reader.position(),
+                        cursor::CodexCursorState {
+                            next_line_index: line_index,
+                            model: model.clone(),
+                            prev_totals,
+                            pending_delta,
+                            untokened_assistant_uid: untokened_assistant_uid.clone(),
+                            saw_model_output,
+                            previous_human_message: human_messages.remembered(),
+                        },
+                    );
                 }
                 "thread_settings_applied" => {
                     if let Some(m) = payload
@@ -2505,7 +2553,12 @@ fn ingest_codex_rollout(
             _ => {}
         }
     }
-    Ok(outcome)
+    let (offset, state) = committed;
+    pass.bytes_read = reader.position().saturating_sub(start_offset);
+    pass.records = line_index.saturating_sub(resume.next_line_index) as i64;
+    cursor.file = Some(reader.commit(offset)?);
+    cursor.codex = Some(state);
+    Ok((outcome, pass))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2639,29 +2692,41 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
-    // The v3 key forces one full re-scan on upgrade so exact remote/local ids
-    // are cached for bounded post-discovery correlation. The earlier v2 pass
-    // healed sidechains that had been attributed to their parent.
-    let mut session_state = state
-        .get("claude_sessions_v3")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    state.remove("claude_sessions");
-    state.remove("claude_sessions_v2");
+    // The `claude_sessions*` path -> stamp maps are retired. They recorded only
+    // *that* a file had changed, which left one answer available — re-read all
+    // of it — and they grew a JSON entry per transcript inside a single state
+    // blob rewritten on every sync. Byte cursors in `transcript_cursors`
+    // replace them: same per-file skip, but a file that did change is now
+    // resumed rather than restarted.
+    //
+    // Dropping the keys here is the one-time migration. No cursor exists for
+    // any transcript on the first sync after upgrading, so every file is read
+    // once from offset 0 — exactly what a stamp-map generation bump did — and
+    // from the second sync on, each file is skipped on a stat or resumed from
+    // its cursor.
+    for retired in [
+        "claude_sessions",
+        "claude_sessions_v2",
+        "claude_sessions_v3",
+    ] {
+        state.remove(retired);
+    }
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
-        let key = path.to_string_lossy().to_string();
-        let stamp = claude_sync_stamp(&path)?;
-        if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
-            && (claude_transcript_events_exist(conn, &path)?
-                || claude_sidecar_evidence_exists(conn, &path)?)
-        {
+        let indexed = claude_transcript_events_exist(conn, &path)?
+            || claude_sidecar_evidence_exists(conn, &path)?;
+        if indexed && claude_transcript_unchanged(conn, &path)? {
             continue;
         }
+        if !indexed {
+            // The cursor claims these bytes already produced rows and the rows
+            // are not there — a wiped database, or evidence a repair removed.
+            // Resuming from a false claim would leave the file looking
+            // consumed with nothing to show for it.
+            cursor::forget_locator_cursor(conn, "claude", &path)?;
+        }
         scanned += 1;
-        session_state.insert(key, json!(stamp));
         if let Some(meta) = scan_claude_session_file(&path)? {
             // A subagent sidecar carries the parent's `sessionId` but is not
             // that session: registering it would overwrite the parent's
@@ -2690,15 +2755,11 @@ fn sync_claude_session_metadata(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
-            ingest_claude_transcript(conn, &path)?;
+            incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
             record_claude_remote_relationship(conn, &meta)?;
             upserted += 1;
         }
     }
-    state.insert(
-        "claude_sessions_v3".to_string(),
-        Value::Object(session_state),
-    );
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -2710,17 +2771,24 @@ fn sync_claude_session_metadata(
 /// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
 /// child's type, name, model and spawn depth are recorded, so metadata that
 /// changes beside an untouched transcript is still new evidence and has to
-/// reach `session_relationships`. Hydration stamps its source snapshot by the
-/// same rule.
-fn claude_sync_stamp(path: &Path) -> Result<String> {
-    let mut stamp = file_stamp(path)?;
-    let metadata = hydrate::claude_subagent_meta_path(path);
-    if metadata.is_file() {
-        stamp.push('|');
-        stamp.push_str(&file_stamp(&metadata)?);
+/// reach `session_relationships`. It carries its own whole-file cursor, so it
+/// is checked here rather than folded into the transcript's stamp.
+fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
+    if !cursor::transcript_unchanged(conn, "claude", path)? {
+        return Ok(false);
     }
-    Ok(stamp)
+    let metadata = hydrate::claude_subagent_meta_path(path);
+    if metadata.is_file()
+        && !cursor::transcript_unchanged(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
+
+/// The cursor namespace for `agent-*.meta.json` sidecars. Not a catalog
+/// source: these files never become sessions, they only describe one.
+pub(crate) const CLAUDE_SUBAGENT_META_SOURCE: &str = "claude-subagent-meta";
 
 /// Whether an unchanged subagent sidecar has already been ingested.
 ///
@@ -3002,179 +3070,182 @@ fn ingest_claude_transcript_as(
     path: &Path,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    for (line_index, line) in text.lines().enumerate() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    let mut line_index = 0usize;
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let index = line_index;
+        line_index += 1;
+        let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
             continue;
         };
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
-        };
-        let session_id = attributed_session_id.unwrap_or(record_session_id);
-        // Subagent sidecar transcripts share the parent's sessionId with
-        // isSidechain rows. The subagent's assistant output is real session
-        // activity (text and token spend), but its user-role rows are the
-        // parent agent's own prompts and tool results — ingesting those
-        // manufactures fake human turns.
-        let sidechain = obj
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let skipped_sidechain = sidechain
-            && obj
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                != Some("assistant");
-        let uuid = obj.get("uuid").and_then(Value::as_str);
-        let message = obj.get("message").and_then(Value::as_object);
-        let fallback_uid = format!(
-            "{}:{}",
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session"),
-            line_index
-        );
-        let message_uuid = uuid
-            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
-            .unwrap_or(&fallback_uid);
-        // Heal what an earlier parser version wrote for this record: it
-        // attributed every sidechain row to the parent, and stored the rows
-        // this guard now skips. Re-reading the file removes the stale rows
-        // under the identity they were written with, so a re-parse moves them
-        // onto the child instead of duplicating them across both.
-        if session_id != record_session_id {
-            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
-        }
-        if skipped_sidechain {
-            delete_claude_record_rows(conn, session_id, message_uuid)?;
-            continue;
-        }
-        let cwd = obj.get("cwd").and_then(Value::as_str);
-        let project = cwd;
-        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-            .unwrap_or(0);
-        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
-        let message_role = message
+        ingest_claude_record(conn, path, attributed_session_id, index, obj)?;
+    }
+    Ok(())
+}
+
+/// Index one Claude transcript record.
+///
+/// Split out of the file walk so the whole-file and the incremental readers
+/// index a record identically: the only thing that may differ between them is
+/// which records they hand over, never what a record means. `line_index` is
+/// the record's absolute position in the file, because the fallback event
+/// identity for a record carrying neither `uuid` nor `message.id` is derived
+/// from it and has to survive a resume from a byte offset.
+fn ingest_claude_record(
+    conn: &Connection,
+    path: &Path,
+    attributed_session_id: Option<&str>,
+    line_index: usize,
+    obj: &Map<String, Value>,
+) -> Result<()> {
+    let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(()),
+    };
+    let session_id = attributed_session_id.unwrap_or(record_session_id);
+    // Subagent sidecar transcripts share the parent's sessionId with
+    // isSidechain rows. The subagent's assistant output is real session
+    // activity (text and token spend), but its user-role rows are the
+    // parent agent's own prompts and tool results — ingesting those
+    // manufactures fake human turns.
+    let sidechain = obj
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let skipped_sidechain = sidechain
+        && obj
+            .get("message")
             .and_then(|m| m.get("role"))
             .and_then(Value::as_str)
-            .or_else(|| obj.get("type").and_then(Value::as_str))
-            .unwrap_or("");
-        let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
-        let token_json = message
-            .and_then(|m| m.get("usage"))
-            .and_then(|v| serde_json::to_string(v).ok());
-        let Some(content) = message.and_then(|m| m.get("content")) else {
-            continue;
+            != Some("assistant");
+    let uuid = obj.get("uuid").and_then(Value::as_str);
+    let message = obj.get("message").and_then(Value::as_object);
+    let fallback_uid = format!(
+        "{}:{}",
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session"),
+        line_index
+    );
+    let message_uuid = uuid
+        .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
+        .unwrap_or(&fallback_uid);
+    // Heal what an earlier parser version wrote for this record: it
+    // attributed every sidechain row to the parent, and stored the rows
+    // this guard now skips. Re-reading the file removes the stale rows
+    // under the identity they were written with, so a re-parse moves them
+    // onto the child instead of duplicating them across both.
+    if session_id != record_session_id {
+        delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+    }
+    if skipped_sidechain {
+        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        return Ok(());
+    }
+    let cwd = obj.get("cwd").and_then(Value::as_str);
+    let project = cwd;
+    let git_branch = obj.get("gitBranch").and_then(Value::as_str);
+    let ts_ms = obj
+        .get("timestamp")
+        .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+        .unwrap_or(0);
+    let parent_id = obj.get("parentUuid").and_then(Value::as_str);
+    let message_role = message
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+    let model = message.and_then(|m| m.get("model")).and_then(Value::as_str);
+    let token_json = message
+        .and_then(|m| m.get("usage"))
+        .and_then(|v| serde_json::to_string(v).ok());
+    let Some(content) = message.and_then(|m| m.get("content")) else {
+        return Ok(());
+    };
+    if !sidechain
+        && message_role == "user"
+        && obj.get("isMeta").and_then(Value::as_bool) != Some(true)
+    {
+        let prompt = if let Some(text) = content.as_str() {
+            text.trim().to_string()
+        } else {
+            content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        if !sidechain
-            && message_role == "user"
-            && obj.get("isMeta").and_then(Value::as_bool) != Some(true)
-        {
-            let prompt = if let Some(text) = content.as_str() {
-                text.trim().to_string()
+        if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
+            insert_history(
+                conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.to_string()),
+                    project: project.map(str::to_string),
+                    prompt_hash: Some(prompt_hash(&prompt)),
+                    prompt,
+                    timestamp_ms: ts_ms,
+                },
+            )?;
+        }
+    }
+    if let Some(s) = content.as_str() {
+        if !s.trim().is_empty() {
+            let role = if message_role == "assistant" {
+                "assistant"
             } else {
-                content
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                "user"
             };
-            if !prompt.is_empty() && !discover::is_claude_control_prompt(&prompt) {
-                insert_history(
-                    conn,
-                    &HistoryEntry {
-                        id: 0,
-                        source: "claude".into(),
-                        session_id: Some(session_id.to_string()),
-                        project: project.map(str::to_string),
-                        prompt_hash: Some(prompt_hash(&prompt)),
-                        prompt,
-                        timestamp_ms: ts_ms,
-                    },
-                )?;
-            }
+            insert_session_event(
+                conn,
+                "claude",
+                session_id,
+                project,
+                cwd,
+                git_branch,
+                message_uuid,
+                parent_id,
+                ts_ms,
+                role,
+                "text",
+                Some(s),
+                model,
+                token_json.as_deref(),
+                &format!("{message_uuid}:0"),
+            )?;
         }
-        if let Some(s) = content.as_str() {
-            if !s.trim().is_empty() {
-                let role = if message_role == "assistant" {
-                    "assistant"
-                } else {
-                    "user"
-                };
-                insert_session_event(
-                    conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    role,
-                    "text",
-                    Some(s),
-                    model,
-                    token_json.as_deref(),
-                    &format!("{message_uuid}:0"),
-                )?;
-            }
-            continue;
-        }
-        let Some(blocks) = content.as_array() else {
-            continue;
-        };
-        for (block_index, block) in blocks.iter().enumerate() {
-            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-            let event_uid = format!("{message_uuid}:{block_index}");
-            match block_type {
-                "text" => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        if !text.trim().is_empty() {
-                            let role = if message_role == "assistant" {
-                                "assistant"
-                            } else {
-                                "user"
-                            };
-                            insert_session_event(
-                                conn,
-                                "claude",
-                                session_id,
-                                project,
-                                cwd,
-                                git_branch,
-                                message_uuid,
-                                parent_id,
-                                ts_ms,
-                                role,
-                                "text",
-                                Some(text),
-                                model,
-                                token_json.as_deref(),
-                                &event_uid,
-                            )?;
-                        }
-                    }
-                }
-                "thinking" => {
-                    let text = block
-                        .get("thinking")
-                        .or_else(|| block.get("text"))
-                        .and_then(Value::as_str);
-                    if text.is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    let Some(blocks) = content.as_array() else {
+        return Ok(());
+    };
+    for (block_index, block) in blocks.iter().enumerate() {
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+        let event_uid = format!("{message_uuid}:{block_index}");
+        match block_type {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        let role = if message_role == "assistant" {
+                            "assistant"
+                        } else {
+                            "user"
+                        };
                         insert_session_event(
                             conn,
                             "claude",
@@ -3185,21 +3256,22 @@ fn ingest_claude_transcript_as(
                             message_uuid,
                             parent_id,
                             ts_ms,
-                            "assistant",
-                            "thinking",
-                            text,
+                            role,
+                            "text",
+                            Some(text),
                             model,
                             token_json.as_deref(),
                             &event_uid,
                         )?;
                     }
                 }
-                "tool_use" => {
-                    let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                    let args = block.get("input").unwrap_or(&Value::Null);
-                    let target = pick_tool_target(name, args);
-                    let event_text = format_tool_event_text(name, target.as_deref(), args);
+            }
+            "thinking" => {
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
                         "claude",
@@ -3211,83 +3283,62 @@ fn ingest_claude_transcript_as(
                         parent_id,
                         ts_ms,
                         "assistant",
-                        "tool_use",
-                        Some(&event_text),
+                        "thinking",
+                        text,
                         model,
                         token_json.as_deref(),
                         &event_uid,
                     )?;
-                    if !tool_use_id.is_empty() && !name.is_empty() {
-                        let args_json =
-                            serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
-                        insert_tool_call(
-                            conn,
-                            "claude",
-                            session_id,
-                            message_uuid,
-                            tool_use_id,
-                            name,
-                            target.as_deref(),
-                            &args_json,
-                            None,
-                            ts_ms,
-                        )?;
-                        if is_file_edit_tool(name) {
-                            if let Some(file_path) = target.as_deref() {
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "claude",
-                                    session_id,
-                                    message_uuid,
-                                    tool_use_id,
-                                    file_path,
-                                    name,
-                                    ts_ms,
-                                    git_branch,
-                                    cwd,
-                                )?;
-                            }
-                        }
-                    }
                 }
-                "tool_result" => {
-                    let tool_use_id = block
-                        .get("tool_use_id")
-                        .or_else(|| block.get("toolUseId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let content = block.get("content").unwrap_or(&Value::Null);
-                    let text = materialize_tool_result_text(content);
-                    insert_session_event(
+            }
+            "tool_use" => {
+                let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = block.get("input").unwrap_or(&Value::Null);
+                let target = pick_tool_target(name, args);
+                let event_text = format_tool_event_text(name, target.as_deref(), args);
+                insert_session_event(
+                    conn,
+                    "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    "assistant",
+                    "tool_use",
+                    Some(&event_text),
+                    model,
+                    token_json.as_deref(),
+                    &event_uid,
+                )?;
+                if !tool_use_id.is_empty() && !name.is_empty() {
+                    let args_json =
+                        serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
+                    insert_tool_call(
                         conn,
                         "claude",
                         session_id,
-                        project,
-                        cwd,
-                        git_branch,
                         message_uuid,
-                        parent_id,
+                        tool_use_id,
+                        name,
+                        target.as_deref(),
+                        &args_json,
+                        None,
                         ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        text.as_deref(),
-                        model,
-                        token_json.as_deref(),
-                        &event_uid,
                     )?;
-                    let is_error = block.get("is_error").and_then(Value::as_bool);
-                    if !tool_use_id.is_empty() {
-                        if let Some(err) = is_error {
-                            set_tool_call_error(conn, "claude", session_id, tool_use_id, err)?;
-                        }
-                        if let Some(result) = find_tool_use_result(block) {
-                            update_file_edit_from_tool_result(
+                    if is_file_edit_tool(name) {
+                        if let Some(file_path) = target.as_deref() {
+                            upsert_file_edit_from_call(
                                 conn,
                                 "claude",
                                 session_id,
                                 message_uuid,
                                 tool_use_id,
-                                result,
+                                file_path,
+                                name,
                                 ts_ms,
                                 git_branch,
                                 cwd,
@@ -3295,8 +3346,53 @@ fn ingest_claude_transcript_as(
                         }
                     }
                 }
-                _ => {}
             }
+            "tool_result" => {
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .or_else(|| block.get("toolUseId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = block.get("content").unwrap_or(&Value::Null);
+                let text = materialize_tool_result_text(content);
+                insert_session_event(
+                    conn,
+                    "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_uuid,
+                    parent_id,
+                    ts_ms,
+                    "tool_result",
+                    "tool_result",
+                    text.as_deref(),
+                    model,
+                    token_json.as_deref(),
+                    &event_uid,
+                )?;
+                let is_error = block.get("is_error").and_then(Value::as_bool);
+                if !tool_use_id.is_empty() {
+                    if let Some(err) = is_error {
+                        set_tool_call_error(conn, "claude", session_id, tool_use_id, err)?;
+                    }
+                    if let Some(result) = find_tool_use_result(block) {
+                        update_file_edit_from_tool_result(
+                            conn,
+                            "claude",
+                            session_id,
+                            message_uuid,
+                            tool_use_id,
+                            result,
+                            ts_ms,
+                            git_branch,
+                            cwd,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -6719,12 +6815,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let key = named.to_string_lossy().to_string();
-        state
-            .get_mut("claude_sessions_v3")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+        // Recording the rewritten sidecar as fully consumed is what the
+        // retired `claude_sessions_v3` stamp map used to express; the cursor
+        // row says the same thing in the shape the walk now reads.
+        cursor::stamp_whole_file(&conn, "claude", &named).unwrap();
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         let rewritten = |conn: &Connection| -> i64 {
@@ -6801,18 +6895,14 @@ mod tests {
             [],
         )
         .unwrap();
-        let mut claude_sessions = Map::new();
         for path in [&parent, &named, &nameless] {
-            claude_sessions.insert(
-                path.to_string_lossy().to_string(),
-                json!(claude_sync_stamp(path).unwrap()),
-            );
+            cursor::stamp_whole_file(&conn, "claude", path).unwrap();
+            let meta = hydrate::claude_subagent_meta_path(path);
+            if meta.is_file() {
+                cursor::stamp_whole_file(&conn, CLAUDE_SUBAGENT_META_SOURCE, &meta).unwrap();
+            }
         }
         let mut state = Map::new();
-        state.insert(
-            "claude_sessions_v3".to_string(),
-            Value::Object(claude_sessions),
-        );
 
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
 
@@ -6870,7 +6960,8 @@ mod tests {
             path,
             r#"{"type":"user","uuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:00.000Z","message":{"role":"user","content":"please update auth"}}
 {"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:01.000Z","message":{"role":"assistant","model":"claude-test","usage":{"input_tokens":11,"output_tokens":22},"content":[{"type":"text","text":"I will update auth.ts"},{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/tmp/proj/auth.ts","old_string":"old","new_string":"new"}}]}}
-{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}"#,
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}
+"#,
         )
         .unwrap();
     }

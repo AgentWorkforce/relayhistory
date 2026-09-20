@@ -492,6 +492,102 @@ from `parser_version` (the full-ingest parser generation). Bumping it
 invalidates every stored stamp, so a scanner taught to extract a new field
 re-reads sources whose bytes never changed.
 
+### Transcript byte cursors
+
+Stamps answer *whether* a file changed. They cannot answer *where*, so any
+change meant re-reading the whole file — a live Claude session that appends two
+kilobytes made relayhistory re-parse every byte written before it, and a fleet
+machine's multi-hundred-megabyte transcript made that unaffordable.
+
+Every transcript now carries a **byte cursor**: the offset through which its
+database work has committed, the file generation that offset belongs to, and
+whatever per-source parser state a resumed pass cannot re-derive from the bytes
+it is about to read.
+
+| Where | Key | What it covers |
+|---|---|---|
+| `session_hydration_checkpoints` / `observation_hydration_checkpoints` | `(source, session_id, location)` | the session's own primary transcript |
+| `transcript_cursors` | `(source, locator)` | subagent sidecars, their `agent-*.meta.json`, child Codex rollouts, and the files the global sync walk meets |
+
+Both carry the same four columns. `parser_state_json` is the cursor document
+and the source of truth; `committed_offset`, `prefix_hash` and `dev_ino` are
+projections of it written in the same statement, so a cursor can be inspected
+without parsing JSON. A transcript reached from both directions — hydrated as a
+session and also walked by a global sync — holds two independent cursors over
+the same bytes. That is deliberate: each is one consumer's own committed
+position, and every insert on the path is an idempotent upsert keyed by
+provider-native identity, so a region read twice writes the same rows.
+
+A cursor is discarded and the file re-read from zero when
+
+```text
+inode changed || mtime < cursor.mtime || size < committed_offset
+  || prefix_hash mismatch
+```
+
+and the hydration result then carries a `HYDRATION_SOURCE_ROTATED` diagnostic.
+
+`prefix_hash` is **not** the hash of every byte before the offset. It is
+SHA-256 over a domain-separated header, the offset itself, the first 64 KiB of
+the file and the last 64 KiB before the offset. Hashing the whole prefix would
+be stronger, but it costs a read of the entire committed region on every open —
+a 200 MB read to discover that one kilobyte arrived, which is the cost cursors
+exist to remove. The window catches truncation and regrowth, replacement, a
+rewritten head and a rewritten tail. It does not catch an edit strictly between
+the two windows that preserves the total length and leaves mtime at or above
+the recorded one; no provider in this catalog rewrites a transcript's middle in
+place.
+
+### Messages that are still being written
+
+A Claude assistant message is written as several JSONL records over time, one
+per content block, and only the last carries a filled-in `stop_reason`. Records
+of a message whose `stop_reason` is present and `null` are **held and not
+indexed**, and the committed offset backs up to the first byte of the earliest
+held message, so the next pass reads it again and indexes it once, complete,
+with its usage. The held count is reported as `HYDRATION_IN_PROGRESS_MESSAGES`.
+
+A record with **no** `stop_reason` key at all is treated as finished, not as
+streaming: older record shapes and sidechain records omit the field, and
+deferring those would hold them back on every pass forever.
+
+Deferral is bounded — 8 MiB or 512 messages held — and past that the oldest
+held message is indexed as it stands, reported as
+`HYDRATION_IN_PROGRESS_OVERFLOW`. Memory stays bounded and the reader keeps
+making progress; the blocks that arrive later land as further rows under their
+own record identity rather than as corrections.
+
+Codex has no per-message completion marker, so its cursor follows the same rule
+burn's `CommittedSnapshot` does: the committed offset and parser state advance
+only at a `task_complete` record. A turn's token accounting is not final until
+the turn is, and committing inside an open turn would freeze a cumulative
+baseline mid-turn. The open turn's events are still indexed as they are read —
+this is an evidence store, and a live session should be visible before its turn
+ends — and re-derived on the next pass from the last committed boundary.
+
+### What an existing install does on the first sync after upgrading
+
+`HYDRATION_PARSER_VERSION` is 3. A checkpoint written by an earlier generation
+has no cursor, and the `claude_sessions*` path → stamp maps that the global sync
+walk used are dropped from the sync state file. So the first sync or hydration
+after upgrading **reads every transcript once, in full, from offset 0** —
+exactly what a stamp-map generation bump always did. From the second pass on,
+each file is either skipped on a `stat` and one indexed point query, or resumed
+from its cursor.
+
+`codex_rollouts_v5` is deliberately **not** retired. It is the marker for the
+selective user-message repair, which is a statement about the parser rather
+than about file positions, and it keeps working unchanged beside the cursors.
+
+### `bytesRead`
+
+`hydrateSession` now returns `bytesRead`: what that call actually read from
+provider files. Zero for an `unchanged` result, about the size of the append
+for an incremental one, and the whole file when a cursor was rejected or the
+parser generation changed. It is the number a watch loop reads to tell "the
+tail grew" from "the whole file was re-read". `HydrateSessionResult`'s contract
+version is 3.
+
 ---
 
 ## Concurrency

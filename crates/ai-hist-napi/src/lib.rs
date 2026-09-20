@@ -1054,6 +1054,9 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Bytes read from provider files by this hydration. Zero when the session
+    /// was unchanged; about the size of the append when a live transcript grew.
+    pub bytes_read: i64,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -1115,6 +1118,7 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
+        bytes_read: result.bytes_read,
         related_session_ids: result.related_session_ids,
         diagnostics: result
             .diagnostics
