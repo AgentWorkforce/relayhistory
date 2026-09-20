@@ -1,0 +1,139 @@
+{
+  "corpus_files": [
+    "codex/parent-thread-id"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/parent-thread-id",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "split this across two agents",
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "timestamp_ms": 1776643201000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [
+        "sess_parent_thread_child"
+      ],
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent`",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "2:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "2:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_parent_thread_child",
+      "source": "codex",
+      "text": "delegated: review the retry change",
+      "token_json": null,
+      "ts_ms": 1776643211000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_parent_thread_child",
+      "source": "codex",
+      "text": "The retry looks correct.",
+      "token_json": null,
+      "ts_ms": 1776643212000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "2:user_message",
+      "git_branch": "main",
+      "kind": "text",
+      "message_id": "2:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "text": "split this across two agents",
+      "token_json": null,
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:agent_message",
+      "git_branch": "main",
+      "kind": "text",
+      "message_id": "3:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "text": "Delegating the first half.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":100,\"input_tokens\":900,\"output_tokens\":60,\"reasoning_output_tokens\":10,\"total_tokens\":960}",
+      "ts_ms": 1776643202000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": "reviewer",
+      "child_has_events": 1,
+      "child_model": null,
+      "child_session_id": "sess_parent_thread_child",
+      "evidence_kind": "codex_session_meta",
+      "evidence_locator": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-10-sess_parent_thread_child.jsonl",
+      "evidence_ref": "sess_parent_thread_root",
+      "identity_status": "observed",
+      "parent_session_id": "sess_parent_thread_root",
+      "relationship": "delegated",
+      "relationship_uid": "child:sess_parent_thread_child",
+      "source": "codex",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776643210000
+    }
+  ],
+  "sessions": [
+    {
+      "agent_version": "0.148.0",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "split this across two agents",
+      "git_branch": "main",
+      "initial_commit": "1234567",
+      "last_activity_ms": 1776643203000,
+      "last_assistant_text": "Delegating the first half.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": "codex_cli_rs",
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-sess_parent_thread_root.jsonl",
+      "repo_url": "git@github.com:acme/project.git",
+      "session_id": "sess_parent_thread_root",
+      "source": "codex",
+      "source_stamp": "<n>:960|<n>:718",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

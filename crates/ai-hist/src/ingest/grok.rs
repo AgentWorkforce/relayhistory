@@ -262,13 +262,13 @@ pub(crate) fn content_text(content: &Value) -> Option<String> {
 /// Strip the `<user_query>` envelope Grok wraps a typed prompt in, so the
 /// stored prompt is what the person actually typed.
 pub(crate) fn unwrap_user_query(text: &str) -> String {
-    let Some(start) = text.find("<user_query>") else {
-        return text.trim().to_string();
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("<user_query>") else {
+        return trimmed.to_string();
     };
-    let rest = &text[start + "<user_query>".len()..];
-    match rest.find("</user_query>") {
-        Some(end) => rest[..end].trim().to_string(),
-        None => rest.trim().to_string(),
+    match rest.strip_suffix("</user_query>") {
+        Some(inner) => inner.trim().to_string(),
+        None => trimmed.to_string(),
     }
 }
 
@@ -836,6 +836,21 @@ mod tests {
             }
             other => panic!("expected a user record, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_embedded_user_query_tag_is_not_treated_as_the_envelope() {
+        let typed = "Compare a <user_query>x</user_query> element with HTML";
+        assert_eq!(unwrap_user_query(typed), typed);
+        assert_eq!(
+            unwrap_user_query("<user_query>ship it"),
+            "<user_query>ship it",
+            "an unmatched opener is the typed text, not a half-stripped remainder"
+        );
+        assert_eq!(
+            unwrap_user_query("  <user_query>ship it</user_query>  "),
+            "ship it"
+        );
     }
 
     #[test]

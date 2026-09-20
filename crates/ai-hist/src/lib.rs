@@ -24,6 +24,7 @@ workspace_mod!(observations);
 workspace_mod!(privacy);
 workspace_mod!(source_evidence);
 workspace_mod!(relationship_graph);
+workspace_mod!(continuity);
 mod ingest;
 mod relationship_capture;
 workspace_mod!(diagnostics);
@@ -51,7 +52,7 @@ pub mod git_sdk;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
 mod git_sdk;
 
-pub(crate) use paths::{default_opencode_db_path, home_dir};
+pub(crate) use paths::{home_dir, ProviderRoots};
 pub(crate) use relationship_capture::now_ms;
 #[cfg(feature = "unstable-internal")]
 pub use relationship_graph as relationships;
@@ -68,6 +69,7 @@ pub use store::*;
 #[cfg(not(feature = "unstable-internal"))]
 pub(crate) use store::*;
 
+pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
 pub use session_store::{
     Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
@@ -75,12 +77,17 @@ pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
-    HistoryEntry, SessionEvent, SessionFileEdit, SessionLocation, SessionScope, SessionToolCall,
+    HistoryEntry, SessionEvent, SessionEventCursor, SessionFileEdit, SessionLocation, SessionScope,
+    SessionToolCall, SessionUserTurn, SessionUserTurnBlock, SessionUserTurnPage,
 };
 
 #[cfg(feature = "unstable-internal")]
 #[doc(hidden)]
 pub mod internal {
+    pub use crate::continuity::{
+        pending_reasons as continuity_pending_reasons, reconcile as reconcile_continuity,
+        ContinuityEvidence, ContinuityReconciliation, CONTINUITY_UNRESOLVED,
+    };
     pub use crate::ingest::*;
     pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
     pub use crate::store::*;

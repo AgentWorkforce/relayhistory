@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   DatabaseOpenError, InvalidArgumentError, NATIVE_CONTRACT_VERSION, NativeContractMismatchError,
+  SESSION_EVIDENCE_CONTRACT_VERSION,
   SessionNotFoundError,
   UnsupportedOperationError, discoverSessions, getSessionFileEditsPage, getSessionToolCallsPage,
   hydrateSession, listSessionCatalogPage, recent, stats, sync,
@@ -19,10 +20,10 @@ test('missing database reads are explicit empty cache operations', async () => {
       contractVersion: 4, scope: 'local', sessions: [], nextCursor: null,
     });
     assert.deepEqual(await getSessionToolCallsPage('claude', 'missing', { dbPath }), {
-      contractVersion: 1, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
+      contractVersion: SESSION_EVIDENCE_CONTRACT_VERSION, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
     });
     assert.deepEqual(await getSessionFileEditsPage('claude', 'missing', { dbPath }), {
-      contractVersion: 1, source: 'claude', sessionId: 'missing', fileEdits: [], nextCursor: null,
+      contractVersion: SESSION_EVIDENCE_CONTRACT_VERSION, source: 'claude', sessionId: 'missing', fileEdits: [], nextCursor: null,
     });
     assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
     assert.deepEqual(await stats({ dbPath }), {

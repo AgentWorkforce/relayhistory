@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Bump whenever relationship object shapes or semantics require an SDK change.
-pub const SESSION_RELATIONSHIP_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_RELATIONSHIP_CONTRACT_VERSION: u32 = 2;
 
 pub const DEFAULT_TREE_MAX_DEPTH: u32 = 32;
 pub const MAX_TREE_MAX_DEPTH: u32 = 64;
@@ -26,10 +26,104 @@ pub const IDENTITY_OBSERVED: &str = "observed";
 /// Related evidence the provider records without a stable child identity.
 pub const IDENTITY_UNLINKED: &str = "unlinked";
 
+/// One session delegated work to another thread.
+pub const RELATIONSHIP_DELEGATED: &str = "delegated";
+/// A remote session materialized locally under a second identity.
+pub const RELATIONSHIP_MATERIALIZED_LOCAL: &str = "materialized_local";
+/// A later session carries on the same conversation as a prior one.
+pub const RELATIONSHIP_CONTINUATION: &str = "continuation";
+/// A branch taken from a shared origin conversation.
+pub const RELATIONSHIP_FORK: &str = "fork";
+/// A session explicitly resumed from a named prior session.
+pub const RELATIONSHIP_RESUME: &str = "resume";
+
+/// Kinds that describe one conversation carrying on as another, rather than
+/// one session delegating work to a different thread.
+///
+/// Traversal defaults exclude these, so a database that has never recorded a
+/// continuity edge answers exactly as it did before they existed.
+pub const CONTINUITY_RELATIONSHIPS: &[&str] = &[
+    RELATIONSHIP_CONTINUATION,
+    RELATIONSHIP_FORK,
+    RELATIONSHIP_RESUME,
+];
+
+/// Which recorded edges a lookup or traversal follows.
+///
+/// The default is deliberately *not* a whitelist of `delegated`: it is "every
+/// kind that is not a continuity kind", so `materialized_local` — and any
+/// delegation kind a future writer adds — keeps traversing as it always has.
+/// A whitelist would have silently dropped Claude remote-to-local
+/// materialization out of every tree on the day continuity shipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelationshipKinds(Option<Vec<String>>);
+
+impl RelationshipKinds {
+    /// Delegation edges only: everything except [`CONTINUITY_RELATIONSHIPS`].
+    pub fn delegation() -> Self {
+        Self(None)
+    }
+
+    /// Exactly the named kinds. An empty selection is the delegation default
+    /// rather than a filter matching nothing: "no kinds" from a caller means
+    /// unspecified, never "return nothing".
+    pub fn only<I, S>(kinds: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let kinds: Vec<String> = kinds.into_iter().map(Into::into).collect();
+        if kinds.is_empty() {
+            Self::delegation()
+        } else {
+            Self(Some(kinds))
+        }
+    }
+
+    /// Only the continuity kinds.
+    pub fn continuity() -> Self {
+        Self::only(CONTINUITY_RELATIONSHIPS.iter().copied())
+    }
+
+    /// Every recorded kind, delegation and continuity alike.
+    pub fn all() -> Self {
+        Self::only(
+            [RELATIONSHIP_DELEGATED, RELATIONSHIP_MATERIALIZED_LOCAL]
+                .into_iter()
+                .chain(CONTINUITY_RELATIONSHIPS.iter().copied()),
+        )
+    }
+
+    /// The `AND`-prefixed SQL fragment this selection contributes, with one
+    /// `?` per value from [`Self::bind_values`].
+    fn clause(&self) -> String {
+        match &self.0 {
+            None => {
+                let holes = vec!["?"; CONTINUITY_RELATIONSHIPS.len()].join(", ");
+                format!(" AND relationship NOT IN ({holes})")
+            }
+            Some(kinds) => {
+                let holes = vec!["?"; kinds.len()].join(", ");
+                format!(" AND relationship IN ({holes})")
+            }
+        }
+    }
+
+    fn bind_values(&self) -> Vec<rusqlite::types::Value> {
+        match &self.0 {
+            None => CONTINUITY_RELATIONSHIPS
+                .iter()
+                .map(|kind| (*kind).to_string().into())
+                .collect(),
+            Some(kinds) => kinds.iter().map(|kind| kind.clone().into()).collect(),
+        }
+    }
+}
+
 const RELATIONSHIP_COLUMNS: &str = "source, parent_session_id, child_session_id, relationship, \
      identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
      evidence_kind, evidence_locator, evidence_ref, child_has_events, \
-     spawned_at_ms, created_ms, relationship_uid";
+     spawned_at_ms, created_ms, relationship_uid, origin_session_id";
 
 /// Nulls sort last, matching the catalog's null-timestamps-at-the-tail
 /// convention. `relationship_uid` is unique per parent, so this is a total
@@ -56,6 +150,9 @@ pub struct SessionRelationship {
     pub spawned_at_ms: Option<i64>,
     pub created_ms: i64,
     pub relationship_uid: String,
+    /// The conversation a fork or continuation came from, when the provider
+    /// named one distinct from `parent_session_id`. Null for delegation.
+    pub origin_session_id: Option<String>,
 }
 
 impl SessionRelationship {
@@ -94,6 +191,11 @@ pub struct SessionRelationships {
     pub session_id: String,
     pub as_parent: Vec<SessionRelationship>,
     pub as_child: Vec<SessionRelationship>,
+    /// Continuity edges touching this session in either direction: the
+    /// resumes, forks and continuations that are not delegation. Kept out of
+    /// `as_parent` / `as_child` so a delegation-only consumer reads exactly
+    /// what it read before continuity existed.
+    pub continuity: Vec<SessionRelationship>,
     pub capabilities: RelationshipCapabilities,
     pub diagnostics: Vec<RelationshipDiagnostic>,
 }
@@ -114,10 +216,13 @@ pub struct SessionTreeNode {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionTreeOptions {
     pub max_depth: u32,
     pub max_nodes: u32,
+    /// Which edges the walk follows. Defaults to delegation only, so the
+    /// default tree of a delegation-only database is unchanged.
+    pub relationship_kinds: RelationshipKinds,
 }
 
 impl Default for SessionTreeOptions {
@@ -125,6 +230,7 @@ impl Default for SessionTreeOptions {
         Self {
             max_depth: DEFAULT_TREE_MAX_DEPTH,
             max_nodes: DEFAULT_TREE_MAX_NODES,
+            relationship_kinds: RelationshipKinds::delegation(),
         }
     }
 }
@@ -204,6 +310,7 @@ fn map_relationship(row: &Row<'_>) -> rusqlite::Result<SessionRelationship> {
         spawned_at_ms: row.get(13)?,
         created_ms: row.get(14)?,
         relationship_uid: row.get(15)?,
+        origin_session_id: row.get(16)?,
     })
 }
 
@@ -219,28 +326,64 @@ fn unlinked_diagnostic(relationship: &SessionRelationship) -> RelationshipDiagno
     }
 }
 
-/// Direct delegation relationships for one session, in both directions.
+/// Direct delegation relationships for one session, in both directions, plus
+/// the continuity edges that touch it.
 pub fn session_relationships(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<SessionRelationships> {
-    let as_parent = session_children(conn, source, session_id)?;
-    let as_child = session_parents(conn, source, session_id)?;
-    let diagnostics = as_parent
+    let kinds = RelationshipKinds::delegation();
+    let as_parent = session_children(conn, source, session_id, &kinds)?;
+    let as_child = session_parents(conn, source, session_id, &kinds)?;
+    let continuity = session_continuity_edges(conn, source, session_id)?;
+    let mut diagnostics: Vec<RelationshipDiagnostic> = as_parent
         .iter()
         .filter(|relationship| relationship.is_unlinked())
         .map(unlinked_diagnostic)
         .collect();
+    diagnostics.extend(crate::continuity::pending_diagnostics(
+        conn, source, session_id,
+    )?);
     Ok(SessionRelationships {
         contract_version: SESSION_RELATIONSHIP_CONTRACT_VERSION,
         source: source.to_string(),
         session_id: session_id.to_string(),
         as_parent,
         as_child,
+        continuity,
         capabilities: relationship_capabilities(source),
         diagnostics,
     })
+}
+
+/// Every continuity edge naming this session, whichever end it sits on.
+///
+/// A fork branch that shares its origin's provider identity has no child id
+/// of its own, so the origin side is the only queryable end; ordering by
+/// `(parent_session_id, relationship_uid)` keeps the answer a total order
+/// across both directions.
+pub fn session_continuity_edges(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<SessionRelationship>> {
+    let kinds = RelationshipKinds::continuity();
+    let sql = format!(
+        "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
+         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?){} \
+         ORDER BY parent_session_id ASC, relationship_uid ASC",
+        kinds.clause()
+    );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        source.to_string().into(),
+        session_id.to_string().into(),
+        session_id.to_string().into(),
+    ];
+    values.extend(kinds.bind_values());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), map_relationship)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Every recorded child of one parent, in the traversal's total order.
@@ -248,13 +391,20 @@ pub fn session_children(
     conn: &Connection,
     source: &str,
     parent_session_id: &str,
+    kinds: &RelationshipKinds,
 ) -> Result<Vec<SessionRelationship>> {
     let sql = format!(
         "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
-         WHERE source = ? AND parent_session_id = ? {CHILD_ORDER}"
+         WHERE source = ? AND parent_session_id = ?{} {CHILD_ORDER}",
+        kinds.clause()
     );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        source.to_string().into(),
+        parent_session_id.to_string().into(),
+    ];
+    values.extend(kinds.bind_values());
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![source, parent_session_id], map_relationship)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), map_relationship)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -265,16 +415,19 @@ pub fn session_children_page(
     parent_session_id: &str,
     limit: i64,
     after: Option<&RelationshipCursor>,
+    kinds: &RelationshipKinds,
 ) -> Result<SessionChildrenPage> {
     let limit = limit.clamp(1, MAX_CHILDREN_PAGE_LIMIT);
     let mut sql = format!(
         "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
-         WHERE source = ? AND parent_session_id = ?"
+         WHERE source = ? AND parent_session_id = ?{}",
+        kinds.clause()
     );
     let mut values: Vec<rusqlite::types::Value> = vec![
         source.to_string().into(),
         parent_session_id.to_string().into(),
     ];
+    values.extend(kinds.bind_values());
     if let Some(cursor) = after {
         match cursor.spawned_at_ms {
             // Still inside the timestamped region: the rest of that region
@@ -326,14 +479,21 @@ pub fn session_parents(
     conn: &Connection,
     source: &str,
     child_session_id: &str,
+    kinds: &RelationshipKinds,
 ) -> Result<Vec<SessionRelationship>> {
     let sql = format!(
         "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
-         WHERE source = ? AND child_session_id = ? \
-         ORDER BY parent_session_id ASC, relationship_uid ASC"
+         WHERE source = ? AND child_session_id = ?{} \
+         ORDER BY parent_session_id ASC, relationship_uid ASC",
+        kinds.clause()
     );
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        source.to_string().into(),
+        child_session_id.to_string().into(),
+    ];
+    values.extend(kinds.bind_values());
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![source, child_session_id], map_relationship)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), map_relationship)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -474,7 +634,12 @@ pub fn session_tree(
         // unlinked evidence is reported wherever it hangs, and the boundary
         // node's own child count is part of the answer either way.
         let mut linked = Vec::new();
-        for relationship in session_children(conn, source, &pending.session_id)? {
+        for relationship in session_children(
+            conn,
+            source,
+            &pending.session_id,
+            &options.relationship_kinds,
+        )? {
             if relationship.is_unlinked() {
                 diagnostics.push(unlinked_diagnostic(&relationship));
                 unlinked.push(relationship);
@@ -650,7 +815,7 @@ mod tests {
                 ..Edge::new("root", "early")
             },
         );
-        let children = session_children(&conn, "codex", "root").unwrap();
+        let children = session_children(&conn, "codex", "root", &RelationshipKinds::delegation()).unwrap();
         assert_eq!(
             children
                 .iter()
@@ -759,6 +924,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: DEFAULT_TREE_MAX_DEPTH,
                 max_nodes: 4,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -806,8 +972,8 @@ mod tests {
         assert_eq!(ids(&left), vec!["root", "a", "a1", "a2", "b"]);
         assert_eq!(left.nodes, right.nodes);
         assert_eq!(
-            session_children(&forward.1, "codex", "root").unwrap(),
-            session_children(&reverse.1, "codex", "root").unwrap()
+            session_children(&forward.1, "codex", "root", &RelationshipKinds::delegation()).unwrap(),
+            session_children(&reverse.1, "codex", "root", &RelationshipKinds::delegation()).unwrap()
         );
     }
 
@@ -832,7 +998,7 @@ mod tests {
             vec!["s1", "claude-child"]
         );
         assert_eq!(
-            session_parents(&conn, "codex", "claude-child")
+            session_parents(&conn, "codex", "claude-child", &RelationshipKinds::delegation())
                 .unwrap()
                 .len(),
             0
@@ -885,6 +1051,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: DEFAULT_TREE_MAX_DEPTH,
                 max_nodes: 100,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -912,6 +1079,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: 2,
                 max_nodes: DEFAULT_TREE_MAX_NODES,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -945,6 +1113,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: 1,
                 max_nodes: DEFAULT_TREE_MAX_NODES,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -985,6 +1154,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: 1,
                 max_nodes: DEFAULT_TREE_MAX_NODES,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -1021,6 +1191,7 @@ mod tests {
             &SessionTreeOptions {
                 max_depth: DEFAULT_TREE_MAX_DEPTH,
                 max_nodes: 3,
+                    relationship_kinds: RelationshipKinds::delegation(),
             },
         )
         .unwrap();
@@ -1054,7 +1225,7 @@ mod tests {
         let mut cursor = None;
         let mut pages = 0;
         loop {
-            let page = session_children_page(&conn, "codex", "root", 100, cursor.as_ref()).unwrap();
+            let page = session_children_page(&conn, "codex", "root", 100, cursor.as_ref(), &RelationshipKinds::delegation()).unwrap();
             pages += 1;
             seen.extend(
                 page.children
@@ -1069,7 +1240,7 @@ mod tests {
         assert_eq!(pages, 3);
         assert_eq!(seen.len(), 250);
         assert_eq!(seen.iter().collect::<HashSet<_>>().len(), 250);
-        let all = session_children(&conn, "codex", "root")
+        let all = session_children(&conn, "codex", "root", &RelationshipKinds::delegation())
             .unwrap()
             .into_iter()
             .map(|child| child.relationship_uid)

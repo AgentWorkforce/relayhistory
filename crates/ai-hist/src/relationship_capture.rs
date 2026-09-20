@@ -26,6 +26,44 @@ pub struct ObservedRelationship<'a> {
     pub evidence_ref: Option<&'a str>,
     pub child_has_events: bool,
     pub spawned_at_ms: Option<i64>,
+    /// The conversation a fork or continuation branched from, when the
+    /// provider named one distinct from the parent. `None` for delegation.
+    ///
+    /// Unlike the agent metadata above this is *assigned*, not merged: a
+    /// re-read that no longer finds a `sourceSessionId` is saying the origin
+    /// is gone, and coalescing would have kept the stale one forever.
+    /// Reconciliation rebuilds the whole row on every recapture, so there is
+    /// no thinner later observation for the merge to protect against.
+    pub origin_session_id: Option<&'a str>,
+    /// Overrides the derived dedupe key. Continuity edges need it: one
+    /// session can be both the continuation *and* the resume target of the
+    /// same parent, and two fork branches of one origin have no child id at
+    /// all, so `child:<id>` cannot key either case.
+    pub relationship_uid: Option<&'a str>,
+}
+
+/// A delegation observation, which is what every field but the continuity
+/// ones describes. Continuity writers fill the two extra fields explicitly.
+impl<'a> Default for ObservedRelationship<'a> {
+    fn default() -> Self {
+        Self {
+            source: "",
+            parent_session_id: "",
+            child_session_id: None,
+            relationship: crate::relationships::RELATIONSHIP_DELEGATED,
+            child_agent_type: None,
+            child_agent_name: None,
+            child_model: None,
+            spawn_depth: None,
+            evidence_kind: "",
+            evidence_locator: None,
+            evidence_ref: None,
+            child_has_events: false,
+            spawned_at_ms: None,
+            origin_session_id: None,
+            relationship_uid: None,
+        }
+    }
 }
 
 impl ObservedRelationship<'_> {
@@ -41,6 +79,9 @@ impl ObservedRelationship<'_> {
     /// unlinked evidence on its locator gives every sidecar its own row
     /// instead of collapsing them all into one.
     pub fn relationship_uid(&self) -> String {
+        if let Some(uid) = self.relationship_uid {
+            return uid.to_string();
+        }
         match self.child_session_id {
             Some(child) => format!("child:{child}"),
             None => format!(
@@ -68,12 +109,14 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
         conn.execute(
             "DELETE FROM session_relationships \
              WHERE source = ? AND parent_session_id = ? AND evidence_locator = ? \
-               AND identity_status = ?",
+               AND identity_status = ? AND relationship = ? AND relationship_uid != ?",
             params![
                 observed.source,
                 observed.parent_session_id,
                 locator,
                 crate::relationships::IDENTITY_UNLINKED,
+                observed.relationship,
+                observed.relationship_uid(),
             ],
         )?;
     }
@@ -82,8 +125,8 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
          (source, parent_session_id, relationship_uid, child_session_id, relationship, \
           identity_status, child_agent_type, child_agent_name, child_model, spawn_depth, \
           evidence_kind, evidence_locator, evidence_ref, child_has_events, \
-          spawned_at_ms, created_ms, updated_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          spawned_at_ms, created_ms, updated_ms, origin_session_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, parent_session_id, relationship_uid) DO UPDATE SET \
            child_session_id = excluded.child_session_id, \
            relationship     = excluded.relationship, \
@@ -97,6 +140,7 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
            evidence_ref     = COALESCE(excluded.evidence_ref,     session_relationships.evidence_ref), \
            child_has_events = excluded.child_has_events, \
            spawned_at_ms    = COALESCE(excluded.spawned_at_ms,    session_relationships.spawned_at_ms), \
+           origin_session_id = excluded.origin_session_id, \
            updated_ms       = excluded.updated_ms",
         params![
             observed.source,
@@ -116,6 +160,7 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
             observed.spawned_at_ms,
             now,
             now,
+            observed.origin_session_id,
         ],
     )?;
     Ok(())
@@ -156,6 +201,7 @@ mod tests {
             evidence_ref: None,
             child_has_events: child.is_some(),
             spawned_at_ms: Some(5),
+            ..ObservedRelationship::default()
         }
     }
 
@@ -200,7 +246,13 @@ mod tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         record_relationship(&conn, &observed("root", None, "/tmp/agent-a.jsonl")).unwrap();
         record_relationship(&conn, &observed("root", None, "/tmp/agent-b.jsonl")).unwrap();
-        let children = session_children(&conn, "claude", "root").unwrap();
+        let children = session_children(
+            &conn,
+            "claude",
+            "root",
+            &crate::relationships::RelationshipKinds::delegation(),
+        )
+        .unwrap();
         assert_eq!(children.len(), 2);
         assert!(children
             .iter()
@@ -225,7 +277,13 @@ mod tests {
         record_relationship(&conn, &observed("root", None, "/tmp/agent-b.jsonl")).unwrap();
         record_relationship(&conn, &observed("root", Some("abc"), "/tmp/agent-a.jsonl")).unwrap();
         record_relationship(&conn, &observed("root", Some("abc"), "/tmp/agent-a.jsonl")).unwrap();
-        let children = session_children(&conn, "claude", "root").unwrap();
+        let children = session_children(
+            &conn,
+            "claude",
+            "root",
+            &crate::relationships::RelationshipKinds::delegation(),
+        )
+        .unwrap();
         assert_eq!(children.len(), 2);
         let observed_child = children
             .iter()

@@ -1,0 +1,61 @@
+{
+  "corpus_files": [
+    "grok/full-session"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "grok/full-session",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "add a retry to the client",
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "looks good, now the test",
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "timestamp_ms": 1776643200001
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a complete grok session directory: `summary.json`, `chat_history.jsonl` (including a `synthetic_reason` turn), plus the `updates.jsonl`, `prompt_context.json`, `signals.json` and `subagents/` files no relayhistory parser reads yet",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "add a retry to the client",
+      "git_branch": "main",
+      "initial_commit": null,
+      "last_activity_ms": 1776643440000,
+      "last_assistant_text": "Added the test.",
+      "models_json": "[\"grok-code-fast-1\"]",
+      "originator": null,
+      "raw_path": "<home>/.grok/sessions/%2Ftmp%2Fproject/grok-00000001/chat_history.jsonl",
+      "repo_url": null,
+      "session_id": "grok-00000001",
+      "source": "grok",
+      "source_stamp": "<n>:984|<n>:293",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "grok",
+  "tool_calls": []
+}

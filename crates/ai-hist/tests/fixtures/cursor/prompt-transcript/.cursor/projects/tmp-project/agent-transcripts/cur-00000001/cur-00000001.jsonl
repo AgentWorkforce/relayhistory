@@ -1,0 +1,7 @@
+{"role":"user","message":{"content":"add a retry to the client"}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"on it"}]},"model":"composer-1"}
+{"role":"user","message":{"content":[{"type":"text","text":"now write the test"},{"type":"text","text":"ignored second block"}]}}
+{"role":"user","message":{"content":"<user_query>wrapped query</user_query>"}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_cursor_1","name":"edit_file","input":{"target_file":"src/client.ts"}}]}}
+{"role":"tool","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_cursor_1","content":"ok","is_error":false}]}}
+{"role":"user","message":{"content":"   "}}
