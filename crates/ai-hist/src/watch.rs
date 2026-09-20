@@ -234,7 +234,8 @@ fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
     roots.iter().any(|root| root.covers(&path))
 }
 
-/// The registration keys of every root `path` names, for a removal event.
+/// The registration keys of every root `path` names, for a removal or
+/// rename-away event.
 ///
 /// The event arrives in whichever spelling the backend reports, and a root
 /// answers to more than one — so the *root* decides whether this is its
@@ -976,17 +977,62 @@ impl WatchLoop {
 #[cfg(feature = "fs-events")]
 mod fs_events {
     use super::*;
-    use notify::event::EventKind;
+    use notify::event::{EventKind, ModifyKind, RenameMode};
     use notify::{RecursiveMode, Watcher};
 
     /// Whether an event can change transcript bytes or their names.
     ///
     /// Metadata-only modifications (permissions, ownership, timestamps) are
     /// noise to every source reader and must not bypass the fingerprint with a
-    /// forced sweep. Unknown modify kinds remain conservative and do wake it.
+    /// forced sweep. Unknown top-level and modify kinds remain conservative
+    /// and do wake it: a backend uses those when it cannot classify a real
+    /// mutation precisely.
     pub(super) fn event_can_change_evidence(kind: &EventKind) -> bool {
-        matches!(kind, EventKind::Create(_) | EventKind::Remove(_))
-            || matches!(kind, EventKind::Modify(modify) if !matches!(modify, notify::event::ModifyKind::Metadata(_)))
+        matches!(
+            kind,
+            EventKind::Any | EventKind::Other | EventKind::Create(_) | EventKind::Remove(_)
+        ) || matches!(kind, EventKind::Modify(modify) if !matches!(modify, ModifyKind::Metadata(_)))
+    }
+
+    /// Whether this event belongs to the watched evidence set.
+    ///
+    /// Rescan notices are global by definition: the backend is reporting that
+    /// paths were lost, and notify emits them with an empty path list. Unknown
+    /// pathless events are treated the same conservative way; a typed event
+    /// still has to name a path covered by one of the roots.
+    pub(super) fn event_matches_evidence(event: &notify::Event, roots: &[WatchRoot]) -> bool {
+        event.need_rescan()
+            || (event.paths.is_empty()
+                && matches!(event.kind, EventKind::Any | EventKind::Other))
+            || event
+                .paths
+                .iter()
+                .any(|path| event_matches_roots(path, roots))
+    }
+
+    /// Registrations a removal or rename-away invalidated.
+    ///
+    /// Rename modes preserve path direction: `From` and the first side of
+    /// `Both` remove the old name, while `To` only introduces a new one and
+    /// must not retire a live registration. FSEvents reports its one-sided
+    /// renames as `Any`, so that mode is conservatively source-like when it
+    /// names the registration itself. A rename below the root never matches
+    /// [`WatchRoot::registers_at`] and therefore cannot retire the root.
+    pub(super) fn lost_registration_keys(
+        event: &notify::Event,
+        roots: &[WatchRoot],
+    ) -> Vec<PathBuf> {
+        let paths: &[PathBuf] = match event.kind {
+            EventKind::Remove(_) => &event.paths,
+            EventKind::Modify(ModifyKind::Name(
+                RenameMode::From | RenameMode::Both | RenameMode::Any | RenameMode::Other,
+            )) => event.paths.first().map(std::slice::from_ref).unwrap_or(&[]),
+            _ => &[],
+        };
+        paths
+            .iter()
+            .flat_map(|path| removed_registration_keys(path, roots))
+            .collect()
     }
 
     /// Holds the OS-level watches open; dropping it stops them.
@@ -1205,29 +1251,18 @@ mod fs_events {
             // Metadata churn — an atime bump from a backup or an antivirus
             // scan — does not change the bytes a sweep would read. Filtering
             // here keeps wakeups honest on a noisy home directory.
-            if !event_can_change_evidence(&event.kind) {
+            if !event.need_rescan() && !event_can_change_evidence(&event.kind) {
                 return;
             }
             let (matched, removed) = {
                 let roots = depth_for_events.lock().expect("watch roots");
-                let matched = event
-                    .paths
-                    .iter()
-                    .any(|path| event_matches_roots(path, &roots));
+                let matched = event_matches_evidence(&event, &roots);
                 // A registered path that was removed takes its watch with it,
                 // whatever the name does afterwards. Recorded here because the
                 // backend will not say so again, and a `stat` later cannot
                 // tell a recreated directory from the original one when the
                 // filesystem reuses the inode number.
-                let removed = matches!(event.kind, EventKind::Remove(_))
-                    .then(|| {
-                        event
-                            .paths
-                            .iter()
-                            .flat_map(|path| removed_registration_keys(path, &roots))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let removed = lost_registration_keys(&event, &roots);
                 (matched, removed)
             };
             if !removed.is_empty() {
@@ -1431,6 +1466,8 @@ mod tests {
             AccessKind::Any
         )));
         for kind in [
+            EventKind::Any,
+            EventKind::Other,
             EventKind::Create(CreateKind::Any),
             EventKind::Modify(ModifyKind::Any),
             EventKind::Remove(RemoveKind::Any),
@@ -1440,6 +1477,60 @@ mod tests {
                 "{kind:?} can change evidence and must wake a forced sweep"
             );
         }
+    }
+
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn pathless_rescan_and_unknown_events_force_a_sweep() {
+        use notify::event::{EventKind, Flag};
+
+        let roots = vec![WatchRoot::tree("/home/u/.codex/sessions")];
+        let overflow = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(fs_events::event_matches_evidence(&overflow, &roots));
+        assert!(fs_events::event_matches_evidence(
+            &notify::Event::new(EventKind::Any),
+            &roots
+        ));
+
+        let outside = notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(PathBuf::from("/home/u/unrelated"));
+        assert!(!fs_events::event_matches_evidence(&outside, &roots));
+    }
+
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn rename_away_retires_only_the_source_registration() {
+        use notify::event::{EventKind, ModifyKind, RenameMode};
+
+        let root = PathBuf::from("/home/u/.codex/sessions");
+        let backup = PathBuf::from("/home/u/.codex/sessions-old");
+        let child = root.join("2026/rollout.jsonl");
+        let roots = vec![WatchRoot::tree(root.clone())];
+        let key = vec![root.clone()];
+
+        let from = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(root.clone());
+        assert_eq!(fs_events::lost_registration_keys(&from, &roots), key);
+
+        let both = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(root.clone())
+            .add_path(backup.clone());
+        assert_eq!(fs_events::lost_registration_keys(&both, &roots), key);
+
+        let into = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path(root.clone());
+        assert!(fs_events::lost_registration_keys(&into, &roots).is_empty());
+
+        let into_both = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(backup)
+            .add_path(root);
+        assert!(fs_events::lost_registration_keys(&into_both, &roots).is_empty());
+
+        let below = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+            .add_path(child);
+        assert!(fs_events::lost_registration_keys(&below, &roots).is_empty());
     }
 
     /// An interval large enough to overflow the clock must not kill the loop.

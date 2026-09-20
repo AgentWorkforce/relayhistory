@@ -2050,6 +2050,61 @@ fn a_sweep_that_failed_is_retried_not_dropped() {
     );
 }
 
+/// Moving a watched directory invalidates the watch just as deleting it does,
+/// but backends report that as `Modify(Name(...))`. The rename event must put
+/// the replacement name onto the short recovery cadence; the long backstop is
+/// deliberately disabled here so it cannot make the test pass.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_root_renamed_away_is_recovered_before_the_backstop() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let root = home.path().join("sessions");
+    let backup = home.path().join("sessions-old");
+    std::fs::create_dir_all(&root).expect("root");
+
+    let running = RunningLoop::reporting({
+        let root = root.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(root)])
+                .with_debounce_ms(50)
+                .with_slow_poll_ms(600_000)
+                .with_poll_interval_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    std::fs::rename(&root, &backup).expect("rename watched root away");
+    std::fs::create_dir_all(&root).expect("create replacement root");
+
+    // First consume the rename's own forced sweep. A later write must produce
+    // another one; otherwise this assertion could pass on the event that
+    // announced the loss rather than on the replacement registration.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(250)) {
+            Ok(true) => break,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "renaming the attached root drove no forced sweep"
+            ),
+        }
+    }
+    let drain_until = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < drain_until {
+        let _ = running.ticks.recv_timeout(Duration::from_millis(50));
+    }
+
+    std::fs::write(root.join("replacement.jsonl"), "{}\n").expect("write under replacement");
+    assert_eq!(
+        running.ticks.recv_timeout(ARRIVES_WITHIN),
+        Ok(true),
+        "the replacement root was not reattached on the recovery cadence"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
