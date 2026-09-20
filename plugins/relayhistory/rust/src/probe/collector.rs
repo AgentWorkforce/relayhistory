@@ -137,10 +137,10 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         "wrong destination"
     );
     capture(directory, &config.history_url)?;
-    deliver_captured(directory, config)
+    deliver_captured(directory, config, false)
 }
 
-pub fn deliver_captured(directory: &Path, config: &Config) -> Result<()> {
+pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
     ensure!(
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
@@ -165,7 +165,11 @@ pub fn deliver_captured(directory: &Path, config: &Config) -> Result<()> {
     let progress =
         super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
     let result = deliver(&db_path, config);
-    progress.finish(result.is_ok());
+    if before_exit {
+        progress.finish_before_exit(result.is_ok(), Duration::from_secs(5));
+    } else {
+        progress.finish(result.is_ok());
+    }
     let status = result?;
     println!(
         "Probe connected: {} records received, {} queued.",
@@ -263,7 +267,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
             capture_due = Instant::now() + Duration::from_secs(60);
             cycle(directory, &config)
         } else {
-            deliver_captured(directory, &config)
+            deliver_captured(directory, &config, false)
         };
         if result.is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");

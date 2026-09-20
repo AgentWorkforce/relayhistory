@@ -414,7 +414,7 @@ fn install(options: Install) -> Result<()> {
         }
     };
     drop(conn);
-    collector::deliver_captured(&directory, &config)?;
+    collector::deliver_captured(&directory, &config, true)?;
     if options.once {
         println!("One capture/delivery cycle completed.");
         return Ok(());
