@@ -18,6 +18,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   not exist are retried on the backstop — not on `--interval`, which may be an
   hour — so a provider installed after `watch` started becomes covered in
   seconds without a restart, while sweeps keep the cadence that was asked for.
+  Every configurable interval is bounded at seven days where it enters, so an
+  absurd `--debounce-ms` cannot stop capture on the first change event.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not
@@ -43,7 +45,8 @@ Notable changes to the native `ai-hist` CLI are documented here.
   covers the session's events, tool calls, file edits and catalog row, so
   structured evidence and a lost `sessions` row are guarded on the same terms
   as the transcript. It covers only what a sweep can put back — Claude
-  transcripts and Codex rollouts, both re-read when their session is short —
+  transcripts and Codex rollouts — including a delegated subagent, reached by
+  its own id rather than through a catalog row it deliberately never has —
   and a loss the sweep could not restore leaves the marker and the fingerprint
   stale rather than recording the shortfall as the new truth.
 - New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code

@@ -1698,6 +1698,69 @@ fn a_lost_catalog_row_is_restored_even_when_sessions_grew() {
     );
 }
 
+/// A delegated child is reached by a different name than its parent. It is
+/// deliberately never registered as a session, so the catalog join that finds
+/// a top-level transcript finds nothing for it — while its surviving events go
+/// on satisfying the existence check the stamp skip is guarded by. A short
+/// subagent would therefore be detected on every tick and repaired never,
+/// which turns "keep sweeping until it is restored" into a permanent full
+/// sweep for a loss the sweep can actually fix.
+#[test]
+fn a_claude_subagent_short_of_its_events_is_re_read() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_claude_delegation(home.path(), "parent-1", "child-1");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the loss is testable"
+    );
+
+    let before = session_event_count(&db, "child-1");
+    assert!(
+        before > 1,
+        "the sidecar must leave more than one event, or 'short' and 'empty' are the same test"
+    );
+    let events_before = event_count(&db);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child-1' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'claude' AND session_id = 'child-1')",
+        [],
+    )
+    .expect("delete one of the child's events");
+    conn.execute(
+        "INSERT INTO session_events \
+         (source, session_id, cwd, project, ts_ms, role, text, kind, event_uid) \
+         VALUES ('claude', 'sess-hook', '/tmp/hook', 'hook', 1, 'user', 'hi', 'text', 'uid-hook')",
+        [],
+    )
+    .expect("insert an unrelated event");
+    drop(conn);
+    assert_eq!(
+        event_count(&db),
+        events_before,
+        "the compensating insert must leave the total unchanged, or nothing is concealed"
+    );
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a short subagent must reopen the sweep"
+    );
+    assert_eq!(
+        session_event_count(&db, "child-1"),
+        before,
+        "the sweep must re-read the sidecar, not skip it on the events that survived"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired subagent must arm the fast path again, rather than sweeping forever"
+    );
+}
+
 /// Detection without repair is only safe if the marker refuses to move. A loss
 /// the sweep could not put back — the transcript itself is gone — must leave
 /// the marker where it was, or the short count becomes the new baseline and
@@ -2162,6 +2225,72 @@ fn write_codex_rollout(home: &Path, session_id: &str) -> PathBuf {
     );
     std::fs::write(&path, body).expect("write rollout");
     path
+}
+
+/// A parent transcript that delegates, and the subagent sidecar it spawned.
+/// The child's events are recorded under its own agent id, which is exactly
+/// the name the catalog never carries for it.
+fn write_claude_delegation(home: &Path, parent: &str, child: &str) -> PathBuf {
+    let project = home.join(".claude/projects/app");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join(format!("{parent}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            format_args!(
+                "{{\"sessionId\":\"{parent}\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\
+                 \"content\":\"human prompt\"}},\"timestamp\":\"2026-09-19T11:00:00Z\"}}"
+            ),
+            format_args!(
+                "{{\"sessionId\":\"{parent}\",\"uuid\":\"a1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\
+                 \"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\
+                 \"name\":\"Agent\",\"input\":{{\"prompt\":\"plan it\"}}}}]}},\
+                 \"timestamp\":\"2026-09-19T11:00:01Z\"}}"
+            ),
+        ),
+    )
+    .expect("write parent transcript");
+
+    let subagents = project.join(parent).join("subagents");
+    std::fs::create_dir_all(&subagents).expect("subagents dir");
+    let sidecar = subagents.join(format!("agent-{child}.jsonl"));
+    std::fs::write(
+        &sidecar,
+        format!(
+            "{}\n{}\n{}\n",
+            format_args!(
+                "{{\"sessionId\":\"{parent}\",\"agentId\":\"{child}\",\
+                 \"isSidechain\":true,\"uuid\":\"side-u\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\
+                 \"content\":\"delegated instruction\"}},\
+                 \"timestamp\":\"2026-09-19T11:00:02Z\"}}"
+            ),
+            format_args!(
+                "{{\"sessionId\":\"{parent}\",\"agentId\":\"{child}\",\
+                 \"isSidechain\":true,\"uuid\":\"side-a\",\"cwd\":\"/work/app\",\
+                 \"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\
+                 \"content\":\"child result\"}},\
+                 \"timestamp\":\"2026-09-19T11:00:03Z\"}}"
+            ),
+            format_args!(
+                "{{\"sessionId\":\"{parent}\",\"agentId\":\"{child}\",\
+                 \"isSidechain\":true,\"uuid\":\"side-b\",\"cwd\":\"/work/app\",\
+                 \"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\
+                 \"content\":\"second child result\"}},\
+                 \"timestamp\":\"2026-09-19T11:00:04Z\"}}"
+            ),
+        ),
+    )
+    .expect("write subagent transcript");
+    std::fs::write(
+        subagents.join(format!("agent-{child}.meta.json")),
+        "{\"agentType\":\"Plan\",\"description\":\"plan the work\",\
+         \"toolUseId\":\"toolu_1\",\"spawnDepth\":1,\"model\":\"opus\"}",
+    )
+    .expect("write subagent sidecar");
+    sidecar
 }
 
 fn history_prompt_count(db: &Path, prompt: &str) -> i64 {

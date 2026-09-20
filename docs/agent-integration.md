@@ -101,7 +101,11 @@ watch — and re-registers only the ones that changed. That work is on a
 deadline rather than on the tick that found the loop idle: every filesystem
 event ends the wait early, so a session writing a few times a second would
 otherwise postpone attaching a provider installed beside it for as long as it
-kept writing. The backstop also
+kept writing. Every interval the loop takes — `--debounce-ms`, `--interval`,
+the backstop — is bounded at seven days where it enters, because a duration
+added to an instant panics on a platform that cannot represent the sum, and a
+`--debounce-ms` in the billions would otherwise stop capture at the first
+change event with no sign that anything was wrong. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.
@@ -149,9 +153,11 @@ Two things make this cheap enough to leave running:
   leaves every total intact. Rows arriving between sweeps — the hook fast
   path, hydration — are growth rather than loss and still skip. The marker
   covers only what a sweep can put back: Claude transcripts and Codex
-  rollouts, both re-read when their session is short. Each entry covers that
-  session's events, tool calls, file edits and catalog row, since the same
-  re-read restores all four. `history` rows are
+  rollouts, re-read when their session is short — a delegated subagent too,
+  reached by its own id through the sidecar's relationship rather than through
+  a catalog row it deliberately never has. Each entry covers that session's
+  events, tool calls, file edits and catalog row, since the same re-read
+  restores all four. `history` rows are
   deliberately outside it — they come from cursor-backed flat logs sitting at
   EOF, which nothing replays, so counting them would disarm the fast path
   forever over a loss no sweep could undo. And a loss the sweep could *not*

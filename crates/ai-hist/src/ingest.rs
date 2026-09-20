@@ -3486,11 +3486,19 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
     Ok(exists != 0)
 }
 
-/// Whether this transcript owns a session the destination marker says is short.
+/// Whether this file owns a session the destination marker says is short.
 ///
-/// Keyed through `sessions.raw_path`, the same join the existence check uses,
-/// because the sweep reaches a Claude session by its file and the marker names
-/// it by its id.
+/// Two joins, because a Claude transcript is reached two ways. A top-level
+/// session is registered in the catalog, so `sessions.raw_path` names it — the
+/// same join the existence check uses. A delegated child is *deliberately*
+/// never registered as a session, so it has no catalog row at all and that
+/// join finds nothing; its identity lives in `session_relationships`, keyed by
+/// the sidecar's locator, which is also how `claude_sidecar_evidence_exists`
+/// reaches it. Asking only the first would leave a short subagent
+/// unrepairable while its surviving events went on satisfying the existence
+/// check — a loss the sweep can fix, detected on every tick and repaired
+/// never, which turns the "keep sweeping until it is restored" rule into a
+/// permanent full sweep.
 fn claude_transcript_needs_repair(
     conn: &Connection,
     path: &Path,
@@ -3500,8 +3508,13 @@ fn claude_transcript_needs_repair(
         return Ok(false);
     }
     let raw_path = path.to_string_lossy();
-    let mut statement =
-        conn.prepare("SELECT session_id FROM sessions WHERE source = 'claude' AND raw_path = ?")?;
+    let mut statement = conn.prepare(
+        "SELECT session_id FROM sessions \
+         WHERE source = 'claude' AND raw_path = ?1 \
+         UNION \
+         SELECT COALESCE(child_session_id, parent_session_id) FROM session_relationships \
+         WHERE source = 'claude' AND evidence_locator = ?1",
+    )?;
     let mut rows = statement.query([raw_path.as_ref()])?;
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(0)?;

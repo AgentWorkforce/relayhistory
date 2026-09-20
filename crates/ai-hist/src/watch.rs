@@ -43,6 +43,32 @@ use anyhow::Result;
 
 use crate::discover::{WatchDepth, WatchRoot};
 
+/// The longest any configurable interval may be.
+///
+/// `Instant + Duration` panics when the sum is not representable, and every
+/// interval here comes from a command line: `watch --debounce-ms
+/// 18446744073709551615` would start normally and die on the first change
+/// event. Bounding the values where they enter — rather than defending at each
+/// of the places they are later added to an instant — is what keeps that from
+/// depending on remembering. Seven days is far longer than any cadence this
+/// loop is for, and far below the platform's ceiling.
+pub const MAX_INTERVAL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// One configurable interval, bounded so it can be added to an `Instant`.
+fn bounded_ms(millis: u64) -> u64 {
+    millis.min(MAX_INTERVAL_MS)
+}
+
+/// `now` plus a configurable interval, never panicking.
+///
+/// Belt and braces over [`bounded_ms`]: a deadline that cannot be represented
+/// becomes *now*, so the worst case is work done earlier than asked rather
+/// than a loop that dies.
+fn deadline_after(now: Instant, millis: u64) -> Instant {
+    now.checked_add(Duration::from_millis(bounded_ms(millis)))
+        .unwrap_or(now)
+}
+
 /// Default coalescing window for filesystem-event bursts. Short enough that an
 /// interactive pause feels live, long enough to collapse the event burst from
 /// one tool result appending a multi-line transcript update.
@@ -269,8 +295,20 @@ impl WatchInner {
 
     /// Sleep for `duration`, returning early when the loop is stopped.
     fn sleep_unless_stopped(&self, duration: Duration) {
-        let deadline = Instant::now() + duration;
+        // Bounded before it reaches an `Instant`, because these durations come
+        // from the command line and the addition panics on a sum it cannot
+        // represent.
+        let duration = duration.min(Duration::from_millis(MAX_INTERVAL_MS));
         let mut wake = self.wake.lock().expect("watch wake state");
+        let Some(deadline) = Instant::now().checked_add(duration) else {
+            // Unreachable given the bound above. A platform whose clock cannot
+            // represent even that should wait for the stop signal rather than
+            // spin through zero-length sleeps.
+            while !wake.stopped {
+                wake = self.wake_cv.wait(wake).expect("watch wake state");
+            }
+            return;
+        };
         while !wake.stopped {
             let now = Instant::now();
             if now >= deadline {
@@ -414,17 +452,17 @@ impl WatchLoop {
     }
 
     pub fn with_debounce_ms(mut self, debounce_ms: u64) -> Self {
-        self.debounce_ms = debounce_ms;
+        self.debounce_ms = bounded_ms(debounce_ms);
         self
     }
 
     pub fn with_poll_interval_ms(mut self, poll_interval_ms: u64) -> Self {
-        self.poll_interval_ms = poll_interval_ms;
+        self.poll_interval_ms = bounded_ms(poll_interval_ms);
         self
     }
 
     pub fn with_slow_poll_ms(mut self, slow_poll_ms: u64) -> Self {
-        self.slow_poll_ms = slow_poll_ms;
+        self.slow_poll_ms = bounded_ms(slow_poll_ms);
         self
     }
 
@@ -538,8 +576,7 @@ impl WatchLoop {
         // the machine this loop exists for — one busy session writing every
         // couple of hundred milliseconds would postpone attaching a provider
         // installed beside it for as long as the writing lasts.
-        let mut next_reconcile =
-            std::time::Instant::now() + Duration::from_millis(self.slow_poll_ms);
+        let mut next_reconcile = deadline_after(Instant::now(), self.slow_poll_ms);
         while !self.inner.stopped() {
             let sweep_every = match self.current_driver() {
                 WatchDriver::FsEvents => self.slow_poll_ms,
@@ -575,9 +612,9 @@ impl WatchLoop {
             // a pending root stayed pending for as long as the writing lasted.
             // The deadline gives the same at-most-once-per-interval rate
             // without depending on how the loop woke up.
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= next_reconcile {
-                next_reconcile = now + Duration::from_millis(reconcile_every);
+                next_reconcile = deadline_after(now, reconcile_every);
                 if let Some(watch) = watcher.as_mut() {
                     // Re-derive first, then attach: a root can be new as a
                     // *name* (a project that grew a `.trajectories` directory)
@@ -998,6 +1035,55 @@ mod fs_events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interval large enough to overflow the clock must not kill the loop.
+    ///
+    /// `--debounce-ms` takes any `u64`, and `Instant + Duration` panics on a
+    /// sum it cannot represent, so the largest one starts the loop normally
+    /// and dies on the first change event — the shape of failure where the
+    /// configuration looks accepted and the capture silently stops.
+    #[test]
+    fn an_interval_too_large_for_the_clock_does_not_kill_the_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let loop_ = WatchLoop::new(Arc::new(|_| Ok(TickOutcome::default())))
+            .with_debounce_ms(u64::MAX)
+            .with_poll_interval_ms(u64::MAX)
+            .with_slow_poll_ms(u64::MAX);
+
+        // And the wait itself survives a duration that was never bounded,
+        // whatever a future caller does to the public fields.
+        let inner = loop_.inner.clone();
+        let entered = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let inner = inner.clone();
+            let entered = entered.clone();
+            std::thread::spawn(move || {
+                entered.store(true, Ordering::SeqCst);
+                inner.sleep_unless_stopped(Duration::from_millis(u64::MAX));
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the waiter never started");
+            std::thread::yield_now();
+        }
+        inner.request_stop();
+        assert!(
+            waiter.join().is_ok(),
+            "an unrepresentable deadline must not panic the waiting thread"
+        );
+
+        // Positive control on the bound itself: the value is clamped where it
+        // enters, so nothing downstream has to remember to defend. On a
+        // platform whose clock *can* represent `u64::MAX` milliseconds the
+        // wait above does not panic — it waits for 584 million years, which
+        // stops live capture just as thoroughly — so this is the assertion
+        // that holds everywhere.
+        assert_eq!(loop_.debounce_ms, MAX_INTERVAL_MS);
+        assert_eq!(loop_.poll_interval_ms, MAX_INTERVAL_MS);
+        assert_eq!(loop_.slow_poll_ms, MAX_INTERVAL_MS);
+    }
 
     /// Reconciliation must not re-register a root that is still live.
     ///
