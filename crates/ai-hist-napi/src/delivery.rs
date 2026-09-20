@@ -194,7 +194,7 @@ pub async fn history_delivery(
                     &conn,
                     &lease,
                     &acknowledgment,
-                    now_ms,
+                    &request_clock(now_ms, received),
                 )?)?,
                 Request::RecordFailure {
                     lease,
@@ -206,7 +206,7 @@ pub async fn history_delivery(
                     &lease,
                     failure,
                     retry_after_ms,
-                    now_ms,
+                    &request_clock(now_ms, received),
                 )?)?,
                 Request::PauseJob { job_id } => {
                     serde_json::to_value(core::pause_job(&conn, &job_id)?)?
