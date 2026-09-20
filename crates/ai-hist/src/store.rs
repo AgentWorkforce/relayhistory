@@ -4023,6 +4023,62 @@ mod tests {
         }
     }
 
+    /// Delivery is an optional feature, and that is what opens the hole. A
+    /// database can carry delivery tables and capture triggers from a
+    /// delivery-enabled build, then be opened by a `--no-default-features`
+    /// build: that build adds the new `session_events` columns, because the
+    /// migration is not delivery-gated, but it never rebuilds the triggers,
+    /// because `init_delivery_schema` is compiled out. On the next
+    /// delivery-enabled open the trigger names are all still present, so a
+    /// read-only fast path that checks names alone is satisfied, `init_db`
+    /// never reaches the rebuild, and delivery goes on reporting success while
+    /// the new fields never leave the machine.
+    ///
+    /// So a name is not enough: the payload has to be checked too.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_capture_trigger_with_an_outdated_payload_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale-trigger.db");
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+
+        let capture_sql = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' AND name='delivery_session_events_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Rewrite the trigger to the shape a build before the raw facts left
+        // behind: same name, payload one column short.
+        let omitted = "'turn_id',NEW.\"turn_id\"";
+        let sql = capture_sql(&conn);
+        assert!(
+            sql.contains(omitted),
+            "the payload must carry {omitted} before removing it, or this test proves nothing"
+        );
+        let stale_sql = sql.replace(&format!(",{omitted}"), "");
+        assert_ne!(stale_sql, sql);
+        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
+            .unwrap();
+        conn.execute_batch(&stale_sql).unwrap();
+
+        assert!(
+            !schema_is_current(&conn).unwrap(),
+            "a trigger whose payload predates a column its table has is not current"
+        );
+
+        // And the writable open repairs it, which is the point of saying so.
+        drop(conn);
+        let conn = open_db(&db_path).unwrap();
+        assert!(capture_sql(&conn).contains(omitted));
+        assert!(schema_is_current(&conn).unwrap());
+    }
+
     /// A legacy database predates the raw-fact columns, so its capture triggers
     /// never referenced them either; SQLite refuses to drop a column a trigger
     /// still names.

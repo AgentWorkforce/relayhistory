@@ -51,6 +51,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   before a captured table gained a column are now rebuilt rather than left in
   place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
   reporting successful delivery while silently emitting the old column list.
+  The read-only schema check validates each capture trigger's payload rather
+  than only its name, so a database that gained a column under a
+  `--no-default-features` build — which migrates the table but compiles the
+  rebuild out — is routed through the writable open that rebuilds the trigger
+  instead of passing a fast path the names alone satisfy.
   `session_events` also gains `raw_facts_version`, stamped by the local parser
   on every event it writes: plain `sync` runs one recorded backfill pass per
   provider and reads that column to pick the transcripts to re-read, telling a
