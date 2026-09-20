@@ -3488,6 +3488,36 @@ fn an_unavailable_known_archive_cannot_finish_malformed_marker_recovery() {
     );
 }
 
+#[test]
+fn a_removed_archive_with_a_healthy_marker_can_settle() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let rollout = write_codex_rollout(home.path(), "sess-removed-archive");
+    let archive_day = home.path().join(".codex/archived_sessions/2026/09/19");
+    std::fs::create_dir_all(&archive_day).expect("archive day");
+    let archived_rollout = archive_day.join(rollout.file_name().expect("rollout name"));
+    std::fs::rename(&rollout, &archived_rollout).expect("archive rollout");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+
+    let archive = home.path().join(".codex/archived_sessions");
+    let removed = home.path().join(".codex/archived_sessions.removed");
+    std::fs::rename(&archive, &removed).expect("remove archive");
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a healthy destination may establish the archive's absence as the new source baseline"
+    );
+
+    std::fs::rename(&removed, &archive).expect("restore archive");
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a returning archive changes the fingerprint and reopens the sweep"
+    );
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+}
+
 /// Rows arriving between sweeps — the hook fast path, hydration — are not a
 /// loss, and must not cost a full walk of every source. Only shrinkage is the
 /// signal.

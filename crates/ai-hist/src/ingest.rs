@@ -3072,7 +3072,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "codex")?;
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
-    if !walked_every_known_root {
+    if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
     if scanned > 0 {
@@ -4223,10 +4223,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     // before anything is recorded, so a run that could not see the archive
     // does not retire the one-time backfill pass over it.
     if !root.exists() {
-        if state
-            .get("claude_sessions_v3")
-            .and_then(Value::as_object)
-            .is_some_and(|known| state_names_files_under(known, root))
+        if repairs.repairs_all()
+            && state
+                .get("claude_sessions_v3")
+                .and_then(Value::as_object)
+                .is_some_and(|known| state_names_files_under(known, root))
         {
             coverage.note_unread();
         }
@@ -4389,7 +4390,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
-    if !walked_every_known_root {
+    if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
     if scanned > 0 {
