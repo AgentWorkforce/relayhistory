@@ -36,7 +36,10 @@ use napi_derive::napi;
 /// Bump whenever native object shapes or semantics require an SDK change.
 /// 16 adds `project_key` to catalog rows and session events, plus
 /// `project_key_method` on the catalog row and the `project_key` listing
-/// filter.
+/// filter, and the per-message raw provider facts on session events
+/// (`requestId`, `stopReason`, `agentVersion`, `isSidechain`, `isMeta`,
+/// `turnId`). Both landed under 16; an SDK that understands one understands
+/// the other.
 pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
@@ -267,6 +270,12 @@ pub struct NativeSessionEvent {
     pub model: Option<String>,
     pub token_json: Option<String>,
     pub event_uid: String,
+    pub request_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub agent_version: Option<String>,
+    pub is_sidechain: Option<bool>,
+    pub is_meta: Option<bool>,
+    pub turn_id: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -288,6 +297,12 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             model: event.model,
             token_json: event.token_json,
             event_uid: event.event_uid,
+            request_id: event.request_id,
+            stop_reason: event.stop_reason,
+            agent_version: event.agent_version,
+            is_sidechain: event.is_sidechain.map(|value| value != 0),
+            is_meta: event.is_meta.map(|value| value != 0),
+            turn_id: event.turn_id,
         }
     }
 }

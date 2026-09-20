@@ -234,6 +234,19 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   eventUid: string;
+  /**
+   * Per-message facts the provider recorded on the envelope, stored as it
+   * wrote them. `stopReason` is the verbatim wire string, never a normalized
+   * enum, and stays null while a turn is still in flight. `isSidechain` and
+   * `isMeta` are null when the provider did not say either way, which is not
+   * the same as false.
+   */
+  requestId: string | null;
+  stopReason: string | null;
+  agentVersion: string | null;
+  isSidechain: boolean | null;
+  isMeta: boolean | null;
+  turnId: string | null;
 }
 
 export interface EventCursor {

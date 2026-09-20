@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
+import { waitForPublishedPackages } from "./verify-published-plugins.mjs";
 
 const script = fileURLToPath(new URL("./verify-published-plugins.mjs", import.meta.url));
 
@@ -23,22 +24,128 @@ test("refuses a version that is not stable semver", () => {
   assert.match(result.stderr, /Usage: verify-published-plugins\.mjs <version>/);
 });
 
-test("covers every name the release publishes", async () => {
-  // The guarantee this step exists for: if a plugin or platform is added and
-  // its package never publishes, this must be what notices. Derived from the
-  // contract, so coverage cannot drift from what the release actually ships.
-  const expected = [];
-  for (const info of Object.values(plugins)) {
-    expected.push(packageName(info));
-    for (const platform of Object.keys(platforms)) {
-      expected.push(packageName(info, platform));
-    }
+const version = "0.19.0";
+const available = {
+  status: 0,
+  stdout: JSON.stringify({ version, repository: { url: "https://github.com/AgentWorkforce/relayhistory" } }),
+  stderr: "",
+};
+const quiet = { log: () => {}, sleep: async () => assert.fail("must not retry") };
+
+test("checks every published name at the exact release version", async () => {
+  const calls = [];
+  await waitForPublishedPackages(version, {
+    ...quiet,
+    runView: (name, requestedVersion) => {
+      calls.push([name, requestedVersion]);
+      return available;
+    },
+  });
+  const expected = Object.values(plugins).flatMap((info) => [
+    packageName(info),
+    ...Object.keys(platforms).map((platform) => packageName(info, platform)),
+  ]);
+  assert.deepEqual(calls, expected.map((name) => [name, version]));
+});
+
+test("accepts npm's singleton-array metadata format", async () => {
+  await waitForPublishedPackages(version, {
+    ...quiet,
+    runView: () => ({ ...available, stdout: `[${available.stdout}]` }),
+  });
+});
+
+test("waits for independently delayed helpers even when both JS packages are visible", async () => {
+  // Reproduce the four missing helpers from the 0.19.0 release. The two JS
+  // packages and all other platforms are already visible on the first pass.
+  const delayed = new Map([
+    ["@relayhistory/capture-darwin-arm64", 1],
+    ["@relayhistory/capture-darwin-x64", 2],
+    ["@relayhistory/provider-sources-linux-arm64-musl", 3],
+    ["@relayhistory/provider-sources-win32-x64-msvc", 4],
+  ]);
+  const calls = new Map();
+  const waits = [];
+  await waitForPublishedPackages(version, {
+    ...quiet,
+    attempts: 5,
+    delayMs: 7,
+    sleep: async (ms) => waits.push(ms),
+    runView: (name) => {
+      const count = (calls.get(name) ?? 0) + 1;
+      calls.set(name, count);
+      return count <= (delayed.get(name) ?? 0)
+        ? { status: 1, stdout: "", stderr: `npm error code ${count % 2 ? "E404" : "ETARGET"}` }
+        : available;
+    },
+  });
+  assert.deepEqual(waits, [7, 7, 7, 7]);
+  for (const [name, count] of calls) assert.equal(count, (delayed.get(name) ?? 0) + 1, name);
+});
+
+test("fails after bounded retries with the missing package and original npm error", async () => {
+  const missing = "@relayhistory/provider-sources-win32-x64-msvc";
+  let lookups = 0;
+  const waits = [];
+  await assert.rejects(waitForPublishedPackages(version, {
+    ...quiet,
+    attempts: 3,
+    delayMs: 1,
+    sleep: async (ms) => waits.push(ms),
+    runView: (name) => {
+      if (name !== missing) return available;
+      lookups += 1;
+      return { status: 1, stdout: "", stderr: "npm error code ETARGET\nNo matching version found" };
+    },
+  }), (error) => {
+    assert.match(error.message, /after 3 attempts/);
+    assert.ok(error.message.includes(`${missing}@${version}`));
+    assert.match(error.message, /npm error code ETARGET\nNo matching version found/);
+    assert.ok(!error.message.includes("capture-darwin"));
+    return true;
+  });
+  assert.equal(lookups, 3);
+  assert.deepEqual(waits, [1, 1]);
+});
+
+test("authentication and network errors fail immediately with npm diagnostics", async () => {
+  for (const code of ["E401", "E403", "ENOTFOUND"]) {
+    let calls = 0;
+    await assert.rejects(waitForPublishedPackages(version, {
+      ...quiet,
+      runView: () => {
+        calls += 1;
+        return { status: 1, stdout: "", stderr: `npm error code ${code}` };
+      },
+    }), new RegExp(`npm view @relayhistory/capture@0\\.19\\.0 failed.*\\n.*${code}`));
+    assert.equal(calls, 1);
   }
-  assert.equal(
-    expected.length,
-    Object.keys(plugins).length * (Object.keys(platforms).length + 1),
-  );
-  // Every expected name is scoped and versionless here; the script appends the
-  // release version before querying.
-  for (const name of expected) assert.match(name, /^@relayhistory\//);
+});
+
+test("process launch failures preserve the package context and original error", async () => {
+  const cause = new Error("spawnSync npm ENOENT");
+  await assert.rejects(waitForPublishedPackages(version, {
+    ...quiet,
+    runView: () => ({ status: null, error: cause }),
+  }), (error) => {
+    assert.equal(error.cause, cause);
+    assert.match(error.message, /@relayhistory\/capture@0\.19\.0.*ENOENT/);
+    return true;
+  });
+});
+
+test("invalid published manifests fail immediately instead of being treated as propagation", async () => {
+  for (const [stdout, message] of [
+    [JSON.stringify({ version: "0.18.9", repository: { url: "repo" } }), /wrong version/],
+    [JSON.stringify({ version }), /published without repository.url/],
+    ["not JSON", /@relayhistory\/capture@0\.19\.0: invalid JSON/],
+    ["[]", /expected exactly one manifest/],
+    [`[${available.stdout},${available.stdout}]`, /expected exactly one manifest/],
+    ["null", /invalid manifest/],
+  ]) {
+    await assert.rejects(waitForPublishedPackages(version, {
+      ...quiet,
+      runView: () => ({ status: 0, stdout, stderr: "" }),
+    }), message);
+  }
 });

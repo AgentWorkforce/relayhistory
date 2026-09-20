@@ -210,6 +210,12 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
     eventUid: String(value.eventUid),
+    requestId: nullableString(value.requestId),
+    stopReason: nullableString(value.stopReason),
+    agentVersion: nullableString(value.agentVersion),
+    isSidechain: nullableBoolean(value.isSidechain),
+    isMeta: nullableBoolean(value.isMeta),
+    turnId: nullableString(value.turnId),
   };
 }
 

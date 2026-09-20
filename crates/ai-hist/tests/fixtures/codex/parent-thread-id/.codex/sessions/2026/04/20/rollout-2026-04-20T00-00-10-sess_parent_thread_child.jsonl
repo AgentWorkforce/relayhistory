@@ -1,0 +1,4 @@
+{"timestamp":"2026-04-20T00:00:10.000Z","type":"session_meta","payload":{"id":"sess_parent_thread_child","parent_thread_id":"sess_parent_thread_root","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:10.000Z","cli_version":"0.148.0","thread_source":"subagent","source":{"subagent":{"other":"reviewer"}}}}
+{"timestamp":"2026-04-20T00:00:10.100Z","type":"turn_context","payload":{"turn_id":"turn_child_1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T00:00:11.000Z","type":"event_msg","payload":{"type":"user_message","message":"delegated: review the retry change"}}
+{"timestamp":"2026-04-20T00:00:12.000Z","type":"event_msg","payload":{"type":"agent_message","message":"The retry looks correct."}}

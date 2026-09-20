@@ -86,7 +86,14 @@ impl EvidenceKind {
         // if the emitter had vouched for them. Neither is trusted as final:
         // `refresh_project_identity`'s denormalization pass brings every event
         // back in line with its own session's key.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        //
+        // The per-message raw facts travel too, and are the adapter's to vouch
+        // for: they are what the provider wrote on the envelope, so a
+        // connector that read the transcript can report them. `raw_facts_version`
+        // is deliberately absent -- it records which local parser generation
+        // wrote a row, which is this database's bookkeeping and not something a
+        // remote emitter can speak to.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid,request_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
@@ -110,7 +117,10 @@ fn numeric(field: &str) -> bool {
     )
 }
 fn boolean(field: &str) -> bool {
-    matches!(field, "is_error" | "user_modified" | "child_has_events")
+    matches!(
+        field,
+        "is_error" | "user_modified" | "child_has_events" | "is_sidechain" | "is_meta"
+    )
 }
 
 /// Validate the complete response before opening a database or mutating history.

@@ -1,5 +1,6 @@
 //! Standalone Cloud collector. Reuses ai-hist capture/queue and the optional transport.
 mod collector;
+mod progress;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -260,7 +261,7 @@ fn install(options: Install) -> Result<()> {
         cloud::CloudBearerOptions {
             force_login: options.force_login,
             interactive: true,
-            client_name: "Agent Relay Probe",
+            client_name: "Agent Relay Session Recorder",
             announce: &mut |approval: &cloud::DeviceApproval| {
                 println!(
                     "Open this URL to authorize your computer:\n{}",
@@ -340,10 +341,7 @@ fn install(options: Install) -> Result<()> {
     cloud::save_auth(&session)?;
     let db_path = directory.join("history.db");
     println!("Preparing local session capture…");
-    ensure!(
-        ai_hist::sync_local_at(&db_path)?,
-        "capture did not complete"
-    );
+    collector::capture(&directory, &history_url)?;
     let conn = ai_hist::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
@@ -416,7 +414,7 @@ fn install(options: Install) -> Result<()> {
         }
     };
     drop(conn);
-    collector::cycle(&directory, &config)?;
+    collector::deliver_captured(&directory, &config, true)?;
     if options.once {
         println!("One capture/delivery cycle completed.");
         return Ok(());
