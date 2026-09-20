@@ -7,6 +7,8 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { SESSION_EVIDENCE_CONTRACT_VERSION } from './index.js';
+
 const run = promisify(execFile);
 const cli = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
 
@@ -326,7 +328,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--limit', '1', '--db', db, '--json', '--no-warning',
     ], { env });
     const page = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(page.contract_version, 2);
+    assert.equal(page.contract_version, SESSION_EVIDENCE_CONTRACT_VERSION);
     assert.equal(page.source, 'claude');
     assert.equal(page.session_id, 'claude-evidence');
     const calls = page.tool_calls as Array<Record<string, unknown>>;
@@ -350,7 +352,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--json', '--no-warning',
     ], { env });
     const editPage = JSON.parse(edits.stdout) as Record<string, unknown>;
-    assert.equal(editPage.contract_version, 2);
+    assert.equal(editPage.contract_version, SESSION_EVIDENCE_CONTRACT_VERSION);
     assert.deepEqual((editPage.file_edits as Array<Record<string, unknown>>).map((edit) => edit.file_path), ['/work/app/a.ts', '/work/app/b.ts']);
 
     const human = await run(process.execPath, [

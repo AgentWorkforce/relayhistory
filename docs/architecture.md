@@ -21,7 +21,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 16, catalog contract version 4, hydration contract version 3,
+version 17, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
 2, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
@@ -152,6 +152,8 @@ archive relocation.
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
+| `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
+| `SessionStore::session_user_turns_page` | none | bounded keyset page plus ordered block reads on one snapshot | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
@@ -159,6 +161,11 @@ archive relocation.
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
+
+A writable `SessionStore::open` migrates the database it opens; a read-only
+one cannot, so it refuses a database older than the shape this version reads
+and names the remedy, rather than handing back a store whose first read fails
+inside a query.
 
 No read operation invokes discovery or sync. A common cold start is:
 

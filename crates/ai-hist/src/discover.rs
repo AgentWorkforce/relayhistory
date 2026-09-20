@@ -1216,10 +1216,24 @@ impl ShallowSessionProvider for CursorProvider {
         // and reports nothing when the build did not write one. `models` is
         // read from `message.model` for the builds that write it; an empty
         // list means "not seen", never "no model".
-        let first_activity_ms = bounded.head_records().find_map(cursor_record_time);
+        let mut head_times = bounded.head_records().filter_map(cursor_record_time);
+        let first_activity_ms = head_times.next();
+        // For a transcript past the head budget the tail is a separate region,
+        // so a turn time that only appears in the head is unreachable from the
+        // tail scan. A long run of assistant and tool records after one dated
+        // human turn is the ordinary shape of that: the tail finds no tag,
+        // because only a human turn carries one, and falling straight to the
+        // mtime reported a session as having last spoken "now". Full ingestion
+        // disagrees — those records inherit the open turn's time — and because
+        // the discovery upsert merges `last_activity_ms` with `MAX`, the mtime
+        // would also re-expand a window a rebuild had just retracted. The last
+        // time the head could read is the best recorded evidence there is; the
+        // mtime stays for a transcript with no readable turn time at all.
+        let last_head_ms = head_times.last().or(first_activity_ms);
         let last_activity_ms = bounded
             .tail_records_rev()
             .find_map(cursor_record_time)
+            .or(last_head_ms)
             .or_else(|| crate::file_modified_ms(&path));
         let mut models = Vec::new();
         for model in bounded.head_records().filter_map(cursor_record_model) {

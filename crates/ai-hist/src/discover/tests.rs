@@ -809,6 +809,52 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     assert!(row.models.is_empty());
 }
 
+/// A turn time that only the head can see still sets the catalog's recency.
+///
+/// Reported by Devin as "head timestamp lost from recency". Past
+/// `HEAD_SCAN_MAX_BYTES` the tail is a separate region, so a transcript whose
+/// one dated human turn is followed by a long run of assistant and tool
+/// records has a tail with no `<timestamp>` in it — only a human turn carries
+/// one. `last_activity_ms` fell straight to the file mtime, so the catalog
+/// reported the session as having last spoken "now", while full ingestion had
+/// those records inheriting the open turn's time. Worse, the discovery upsert
+/// merges `last_activity_ms` with `MAX`, so that mtime would also re-expand a
+/// window a rebuild had just retracted.
+///
+/// Positive control: without the head fallback this failed at
+/// `a head-only turn time must outrank the mtime: left: Some(1750000400000),
+/// right: Some(1789587420000)` — the mtime, not the turn.
+#[test]
+fn cursor_recency_uses_a_turn_time_only_the_head_can_see() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // One dated human turn, then enough assistant prose to push the tail
+    // region past the head budget. The tail therefore holds only assistant
+    // records, none of which carries a tag.
+    let mut body = String::new();
+    body.push_str(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>start</user_query>"}]}}"#,
+    );
+    body.push('\n');
+    let filler = "x".repeat(2048);
+    while body.len() < (super::HEAD_SCAN_MAX_BYTES + super::TAIL_SCAN_MAX_BYTES) as usize * 2 {
+        body.push_str(&format!(
+            r#"{{"role":"assistant","message":{{"content":[{{"type":"text","text":"{filler}"}}]}}}}"#
+        ));
+        body.push('\n');
+    }
+    cursor_session(home.path(), "work-app", "cursor-head-time", &body, 1_750_000_400_000);
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-head-time");
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "a head-only turn time must outrank the mtime"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
 /// The catalog's `first_prompt` and the indexed `history` row are the same
 /// string for a turn Cursor split into several text blocks.
 ///
