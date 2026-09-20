@@ -45,7 +45,7 @@ fn claim(conn: &Connection, id: &str, now: i64) -> Option<ClaimedBatch> {
     for _ in 0..100 {
         let prep = prepare_batch(conn, id, now).unwrap();
         if prep.batch_id.is_some() {
-            return claim_batch(conn, id, "worker", 1000, now).unwrap();
+            return claim_batch(conn, id, "worker", 1000, &|| now).unwrap();
         }
         if prep.bootstrap_complete && prep.scanned_records == 0 {
             return None;
@@ -117,10 +117,10 @@ fn restart_after_remote_acceptance_preserves_batch_and_prepared_bytes() {
     .unwrap();
     drop(conn);
     let conn = open_db(&path).unwrap();
-    assert!(claim_batch(&conn, &job.job_id, "other", 1000, 500)
+    assert!(claim_batch(&conn, &job.job_id, "other", 1000, &|| 500)
         .unwrap()
         .is_none());
-    let retry = claim_batch(&conn, &job.job_id, "other", 1000, 1001)
+    let retry = claim_batch(&conn, &job.job_id, "other", 1000, &|| 1001)
         .unwrap()
         .unwrap();
     assert_eq!(retry.batch, first.batch);
@@ -165,11 +165,11 @@ fn partial_invalid_and_unsupported_acknowledgments_never_skip_holes() {
     let pending = acknowledge(&conn, &first.lease, &partial, &|| 1).unwrap();
     assert_eq!(pending.acknowledged_records, 0);
     assert_eq!(pending.pending_records, 2);
-    assert!(claim_batch(&conn, &job.job_id, "other", 1000, 2)
+    assert!(claim_batch(&conn, &job.job_id, "other", 1000, &|| 2)
         .unwrap()
         .is_none());
     retry_job(&conn, &job.job_id).unwrap();
-    let retry = claim_batch(&conn, &job.job_id, "other", 1000, 3)
+    let retry = claim_batch(&conn, &job.job_id, "other", 1000, &|| 3)
         .unwrap()
         .unwrap();
     assert_eq!(retry.batch, first.batch);
@@ -182,7 +182,7 @@ fn partial_invalid_and_unsupported_acknowledgments_never_skip_holes() {
     assert_eq!(blocked.failure.as_deref(), Some("unsupported_evidence"));
     assert_eq!(blocked.acknowledged_cursor, 0);
     retry_job(&conn, &job.job_id).unwrap();
-    let retry = claim_batch(&conn, &job.job_id, "other", 1000, 5)
+    let retry = claim_batch(&conn, &job.job_id, "other", 1000, &|| 5)
         .unwrap()
         .unwrap();
     acknowledge(&conn, &retry.lease, &ack(&retry), &|| 6).unwrap();
@@ -303,7 +303,7 @@ fn queued_exclusion_fences_workers_and_remaps_only_with_a_new_batch_id() {
     )
     .unwrap();
     assert!(acknowledge(&conn, &old.lease, &ack(&old), &|| 1).is_err());
-    let next = claim_batch(&conn, &job.job_id, "new", 1000, 2)
+    let next = claim_batch(&conn, &job.job_id, "new", 1000, &|| 2)
         .unwrap()
         .unwrap();
     assert_ne!(next.batch.batch_id, old.batch.batch_id);
@@ -323,7 +323,7 @@ fn pause_retains_capture_and_selection_changes_require_explicit_new_generation()
     let job = create_job(&conn, &config("one"), 0).unwrap();
     pause_job(&conn, &job.job_id).unwrap();
     event(&conn, "b", "while paused");
-    assert!(claim_batch(&conn, &job.job_id, "worker", 1000, 0)
+    assert!(claim_batch(&conn, &job.job_id, "worker", 1000, &|| 0)
         .unwrap()
         .is_none());
     let mut changed = config("one");
@@ -346,10 +346,10 @@ fn lease_renewal_prevents_overlap_and_stale_failure_cannot_change_progress() {
     let claim = claim(&conn, &job.job_id, 0).unwrap();
     let renewed = renew_lease(&conn, &claim.lease, 5000, &|| 500).unwrap();
     assert_eq!(renewed.expires_at_ms, 5500);
-    assert!(claim_batch(&conn, &job.job_id, "other", 1000, 1001)
+    assert!(claim_batch(&conn, &job.job_id, "other", 1000, &|| 1001)
         .unwrap()
         .is_none());
-    let next = claim_batch(&conn, &job.job_id, "other", 1000, 5501)
+    let next = claim_batch(&conn, &job.job_id, "other", 1000, &|| 5501)
         .unwrap()
         .unwrap();
     assert_eq!(next.batch, claim.batch);
@@ -580,7 +580,7 @@ fn dispatch_requires_immutable_payload_and_rechecks_privacy_after_mapping() {
     )
     .unwrap();
     assert!(validate_dispatch(&conn, &claim.lease, &|| 3).is_err());
-    assert!(claim_batch(&conn, &job.job_id, "other", 1000, 3)
+    assert!(claim_batch(&conn, &job.job_id, "other", 1000, &|| 3)
         .unwrap()
         .is_none());
     assert_eq!(status(&conn, &job.job_id).unwrap().suppressed_records, 1);
@@ -621,7 +621,7 @@ fn excluded_child_relationship_metadata_is_not_exported_through_its_parent() {
         true,
     )
     .unwrap();
-    assert!(claim_batch(&conn, &job.job_id, "next", 1000, 1)
+    assert!(claim_batch(&conn, &job.job_id, "next", 1000, &|| 1)
         .unwrap()
         .is_none());
     assert_eq!(status(&conn, &job.job_id).unwrap().suppressed_records, 1);
@@ -686,7 +686,7 @@ fn permanent_failure_cannot_resume_through_pause_without_explicit_retry() {
         assert!(pause_job(&conn, &job.job_id).is_err());
         assert!(resume_job(&conn, &job.job_id).is_err());
         assert_eq!(status(&conn, &job.job_id).unwrap(), blocked);
-        assert!(claim_batch(&conn, &job.job_id, "other", 1000, 100_000)
+        assert!(claim_batch(&conn, &job.job_id, "other", 1000, &|| 100_000)
             .unwrap()
             .is_none());
         // A paused row written by the previous buggy version also remains blocked.
@@ -699,7 +699,7 @@ fn permanent_failure_cannot_resume_through_pause_without_explicit_retry() {
         assert!(pause_job(&conn, &job.job_id).is_err());
         assert_eq!(status(&conn, &job.job_id).unwrap().failure, blocked.failure);
         retry_job(&conn, &job.job_id).unwrap();
-        let next = claim_batch(&conn, &job.job_id, "other", 1000, 2)
+        let next = claim_batch(&conn, &job.job_id, "other", 1000, &|| 2)
             .unwrap()
             .unwrap();
         assert_eq!(next.batch, first.batch);
