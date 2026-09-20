@@ -336,6 +336,65 @@ pub(crate) fn whole_file_cursor(path: &Path) -> Result<TranscriptFileCursor> {
     })
 }
 
+/// What validating a cursor's committed prefix decided, and what it cost.
+pub(crate) struct PrefixCheck {
+    /// The bytes behind the cursor are still the bytes on disk.
+    pub valid: bool,
+    /// Provider bytes this check read. Bounded: two windows, so at most
+    /// `2 * PREFIX_WINDOW_BYTES`, and zero for a cursor at offset 0.
+    pub bytes_read: u64,
+}
+
+impl PrefixCheck {
+    /// Nothing could be validated, and nothing was read to find that out.
+    const UNVALIDATED: Self = Self {
+        valid: false,
+        bytes_read: 0,
+    };
+}
+
+/// How many bytes validating a cursor at `offset` reads.
+fn prefix_window_bytes(offset: u64) -> u64 {
+    if offset == 0 {
+        0
+    } else {
+        2 * PREFIX_WINDOW_BYTES.min(offset)
+    }
+}
+
+/// Whether the bytes a cursor committed are still the bytes on disk.
+///
+/// The one place this question is answered, for every caller that is about to
+/// skip a file. Identity, length and mtime are cheap and they are not proof: a
+/// writer that restores timestamps, or a filesystem whose timestamp resolution
+/// puts two writes in the same tick, produces a rewritten file with an
+/// identical stat. Every skip path needs the same bounded window check, and
+/// none of them may advance parser state to get it.
+pub(crate) fn committed_prefix_matches(cursor: &TranscriptFileCursor, path: &Path) -> PrefixCheck {
+    let Ok(metadata) = path.metadata() else {
+        return PrefixCheck::UNVALIDATED;
+    };
+    let (device, inode) = file_identity(&metadata);
+    let identity_changed = cursor.device.is_some()
+        && device.is_some()
+        && (cursor.device, cursor.inode) != (device, inode);
+    if identity_changed
+        || metadata.len() < cursor.offset
+        || super::metadata_mtime_ns(&metadata) < cursor.mtime_ns
+    {
+        return PrefixCheck::UNVALIDATED;
+    }
+    let Ok(mut handle) = fs::File::open(path) else {
+        return PrefixCheck::UNVALIDATED;
+    };
+    let bytes_read = prefix_window_bytes(cursor.offset);
+    PrefixCheck {
+        valid: prefix_window_digest(&mut handle, cursor.offset)
+            .is_ok_and(|digest| digest == cursor.prefix_hash),
+        bytes_read,
+    }
+}
+
 /// Whether `path` is byte-for-byte where its cursor left it.
 ///
 /// This is the cheap skip the global sync walk makes per file: one indexed
@@ -374,12 +433,9 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     //
     // The same bounded window the cursor already stores, so this costs two
     // seeks and at most 128 KiB, and only on the files that were about to be
-    // skipped anyway.
-    let Ok(mut handle) = fs::File::open(path) else {
-        return Ok(false);
-    };
-    Ok(prefix_window_digest(&mut handle, file.offset)
-        .is_ok_and(|digest| digest == file.prefix_hash))
+    // skipped anyway. Shared with hydration's own skip path, which asks the
+    // same question about the same cursor.
+    Ok(committed_prefix_matches(file, path).valid)
 }
 
 /// Forget one locator-keyed cursor, so the next pass reads the file from zero.
@@ -490,6 +546,12 @@ pub(crate) struct TranscriptReader {
     quiesced: bool,
     device: Option<u64>,
     inode: Option<u64>,
+    /// The size and mtime observed when the file was opened, which is the
+    /// instant [`Self::unchanged_since_ms`] is stamped from. `commit` stats
+    /// the file again, and a stat that moved in between means the clock is
+    /// measuring a different file state than the one being stored.
+    opened_size: u64,
+    opened_mtime_ns: u64,
     /// The saved cursor was rejected and the file is being read from zero
     /// again. Hydration reports this as `HYDRATION_SOURCE_ROTATED`, because a
     /// caller watching a live file needs to know the difference between "1 KiB
@@ -567,6 +629,8 @@ impl TranscriptReader {
             position: offset,
             start_offset: offset,
             tail_bytes: 0,
+            opened_size: size,
+            opened_mtime_ns: mtime_ns,
             unchanged_since_ms,
             quiesced,
             device,
@@ -589,6 +653,15 @@ impl TranscriptReader {
     /// and so counted, even though the position did not advance over them.
     pub(crate) fn tail_bytes(&self) -> u64 {
         self.tail_bytes
+    }
+
+    /// Move the quiet-since stamp `ms` into the past.
+    ///
+    /// Tests need a pass whose walk outlasts the grace window without waiting
+    /// two minutes for one.
+    #[cfg(test)]
+    pub(crate) fn age_unchanged_since_for_test(&mut self, ms: i64) {
+        self.unchanged_since_ms -= ms;
     }
 
     pub(crate) fn position(&self) -> u64 {
@@ -663,6 +736,12 @@ impl TranscriptReader {
         loop {
             let read = self.reader.read(&mut chunk)?;
             if read == 0 {
+                // The file ends inside the record. Nothing is committed — a
+                // writer may still be producing it — but the bytes were read,
+                // in chunks, and a pass that walked 16 MiB to get here did not
+                // read nothing. Reported as tail bytes for the same reason an
+                // unterminated record's are: read, and not committed.
+                self.tail_bytes = drained;
                 return Ok(false);
             }
             if let Some(index) = chunk[..read].iter().position(|byte| *byte == b'\n') {
@@ -687,13 +766,30 @@ impl TranscriptReader {
     /// it again, and the Codex reader commits at the last `task_complete`.
     pub(crate) fn commit(&mut self, offset: u64) -> Result<TranscriptFileCursor> {
         let metadata = self.file.metadata()?;
+        let size = metadata.len();
+        let mtime_ns = super::metadata_mtime_ns(&metadata);
+        // The clock and the stat it is compared against have to come from the
+        // same instant. Stamping it at `open` while storing a stat taken here
+        // made the window cover the walk as well: a full re-parse of a large
+        // live transcript takes longer than the window on its own, so the next
+        // pass found a tail that had settled seconds ago already "still for
+        // two minutes" and released a message that was still streaming.
+        //
+        // A stat that moved during the pass restarts the clock. Erring this
+        // way costs one extra window before an abandoned message is released;
+        // erring the other way publishes half of a live one.
+        let unchanged_since_ms = if size == self.opened_size && mtime_ns == self.opened_mtime_ns {
+            self.unchanged_since_ms
+        } else {
+            now_ms()
+        };
         Ok(TranscriptFileCursor {
             offset,
             device: self.device,
             inode: self.inode,
-            mtime_ns: super::metadata_mtime_ns(&metadata),
-            size: metadata.len(),
-            unchanged_since_ms: self.unchanged_since_ms,
+            mtime_ns,
+            size,
+            unchanged_since_ms,
             prefix_hash: prefix_window_digest(&mut self.file, offset)?,
         })
     }

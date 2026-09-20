@@ -63,10 +63,13 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
-    /// Bytes this hydration read from provider files. Zero for an `unchanged`
-    /// result, and about the size of the append for an incremental one — the
-    /// counter a watch loop uses to tell "the tail grew" from "the whole file
-    /// was re-read".
+    /// Bytes this hydration read from provider files: the counter a watch loop
+    /// uses to tell "the tail grew" from "the whole file was re-read". About
+    /// the size of the append for an incremental pass, and small but **not
+    /// zero** for an `unchanged` one — deciding nothing changed means reading
+    /// head records and a bounded window of each cursor's committed prefix,
+    /// and a counter that omits the reads a pass could not avoid reports the
+    /// work that was optimised instead of the work that was done.
     pub bytes_read: i64,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
@@ -211,21 +214,48 @@ fn hydrate_session_at_with_home_and_connectors(
     // held records were never looked at again and the message was lost rather
     // than deferred.
     let holding_records = holds_unfinished_records(&conn, options, &snapshot)?;
-
-    if !holding_records
+    let stamp_matches = !holding_records
         && previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
         && previous
             .as_ref()
             .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
-        && (!options.include_related || previous.as_ref().is_some_and(|(_, _, included)| *included))
-        && target.discovery_state.as_deref() == Some("full")
-    {
+        && (!options.include_related
+            || previous.as_ref().is_some_and(|(_, _, included)| *included))
+        && target.discovery_state.as_deref() == Some("full");
+    // The stamp says the size and mtime are where they were. That is not the
+    // same claim as "these are the same bytes", and this shortcut returns
+    // before `TranscriptReader::open`, so the prefix hash the cursor stores
+    // never got a say. A rewritten file with a restored mtime was served from
+    // rows built out of bytes that no longer existed.
+    //
+    // Paid only when the stamp was about to skip the file. A pass that is
+    // going to read the transcript anyway validates the cursor inside
+    // `TranscriptReader::open`, and charging it a second window here would
+    // make a 1 KiB append cost 129 KiB.
+    let validated = if stamp_matches {
+        unchanged_cursor_check(&conn, options, &snapshot)?
+    } else {
+        UnchangedCursorCheck::default()
+    };
+    // Provider bytes this pass read: building the stamp, plus whatever
+    // validating the cursors against the files cost.
+    let provider_bytes = snapshot.scanned_bytes + validated.bytes_read;
+
+    if stamp_matches && validated.valid {
+        // Not an empty outcome: deciding nothing changed meant reading the
+        // root's head record, every sibling's head, each sidecar's metadata,
+        // and a bounded window of each cursor's committed prefix. Reporting
+        // zero for a pass that opened nine files is the same well-formed zero
+        // as "nothing was read", and a watch loop cannot tell them apart.
         return build_result(
             &conn,
             options,
             "unchanged",
             snapshot,
-            &IngestOutcome::default(),
+            &IngestOutcome {
+                bytes_read: provider_bytes,
+                ..IngestOutcome::default()
+            },
             started.elapsed().as_millis() as i64,
         );
     }
@@ -263,7 +293,7 @@ fn hydrate_session_at_with_home_and_connectors(
     )?;
     let mut indexed = indexed;
     // Stamping and identifying the source is work this hydration did.
-    indexed.bytes_read += snapshot.scanned_bytes;
+    indexed.bytes_read += provider_bytes;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
          WHERE source = ? AND session_id = ?",
@@ -1235,6 +1265,111 @@ fn source_snapshot(
         path: Some(path),
         claude_subagents: subagents,
         scanned_bytes,
+    })
+}
+
+/// What the skip path decided about this session's cursors, and what deciding
+/// it read.
+#[derive(Default)]
+struct UnchangedCursorCheck {
+    /// Every cursor consulted still describes the file it was written from.
+    valid: bool,
+    /// Provider bytes the validation windows read.
+    bytes_read: i64,
+}
+
+/// Whether the cursors behind this session still describe the files on disk.
+///
+/// Hydration's stamp shortcut and the sync walk's `transcript_unchanged` are
+/// the two places a file is skipped without being read, and they now ask the
+/// same question through the same helper: is the committed prefix still
+/// there? Neither advances parser state to answer it, and the cost is bounded
+/// — two windows per file, at most 128 KiB, paid only on the files that were
+/// about to be skipped.
+///
+/// Only the incremental readers have cursors to check. For the rest the stamp
+/// is still all there is, and claiming otherwise would turn every hydration of
+/// a Cursor or Grok session into a full re-read.
+fn unchanged_cursor_check(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    snapshot: &SourceSnapshot,
+) -> Result<UnchangedCursorCheck> {
+    if !matches!(options.source.as_str(), "claude" | "codex") {
+        return Ok(UnchangedCursorCheck {
+            valid: true,
+            bytes_read: 0,
+        });
+    }
+    let Some(path) = snapshot.path.as_deref() else {
+        return Ok(UnchangedCursorCheck {
+            valid: false,
+            bytes_read: 0,
+        });
+    };
+    let mut bytes_read = 0i64;
+    let session = load_cursor(
+        conn,
+        &CursorKey::Session {
+            source: &options.source,
+            session_id: &options.session_id,
+            location: "local",
+        },
+    )?;
+    // No recorded position is not a clean bill of health: there is nothing to
+    // validate against, so there is nothing to be confident about. One pass
+    // reads the file and writes the cursor, and the shortcut is available
+    // again from then on.
+    let Some(file) = session.file.as_ref() else {
+        return Ok(UnchangedCursorCheck {
+            valid: false,
+            bytes_read,
+        });
+    };
+    let check = crate::ingest::cursor::committed_prefix_matches(file, path);
+    bytes_read += check.bytes_read as i64;
+    if !check.valid {
+        return Ok(UnchangedCursorCheck {
+            valid: false,
+            bytes_read,
+        });
+    }
+    // A sidecar is a transcript like any other and carries the same hazard.
+    // Its cursor is keyed by path, and a sidecar that has never been read has
+    // none — the stamp still covers its arrival, so a missing cursor does not
+    // block the skip the way the session's own missing cursor does.
+    for evidence in &snapshot.claude_subagents {
+        for (source, file_path) in [
+            ("claude", evidence.path.clone()),
+            (
+                crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
+                claude_subagent_meta_path(&evidence.path),
+            ),
+        ] {
+            let locator = file_path.to_string_lossy().to_string();
+            let cursor = load_cursor(
+                conn,
+                &CursorKey::Locator {
+                    source,
+                    locator: &locator,
+                },
+            )?;
+            let Some(file) = cursor.file.as_ref() else {
+                continue;
+            };
+            let check = crate::ingest::cursor::committed_prefix_matches(file, &file_path);
+            bytes_read += check.bytes_read as i64;
+            if !check.valid {
+                return Ok(UnchangedCursorCheck {
+                    valid: false,
+                    bytes_read,
+                });
+            }
+        }
+    }
+    Ok(UnchangedCursorCheck {
+        valid: true,
+        bytes_read,
     })
 }
 
@@ -3248,7 +3383,14 @@ mod tests {
         let again =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(again.status, "unchanged");
-        assert_eq!(again.bytes_read, 0);
+        // Not zero: skipping the file means validating that the bytes behind
+        // its cursor are still the bytes on disk, which reads the two bounded
+        // windows the cursor's hash covers. Recomputed from the window size
+        // rather than pasted from a run.
+        assert_eq!(
+            again.bytes_read,
+            2 * super::cursor::PREFIX_WINDOW_BYTES.min(records.len() as u64) as i64
+        );
         assert_eq!(session_event_snapshot(&db, session_id).len(), 525);
 
         // When the newline and another record finally arrive, the pass rewinds
@@ -3388,7 +3530,12 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
                 .unwrap();
         assert_eq!(third.status, "unchanged");
-        assert_eq!(third.bytes_read, 0);
+        // The cursor covers the whole file, so its validation window is the
+        // file, read twice: the first window and the last are the same bytes.
+        assert_eq!(
+            third.bytes_read,
+            2 * super::cursor::PREFIX_WINDOW_BYTES.min(bytes.len() as u64) as i64
+        );
     }
 
     /// A Codex rollout's identity comes from its first record, so a hydration
@@ -4061,6 +4208,244 @@ mod tests {
         // Positive control: the tail was not committed, so the cursor has not
         // advanced over it and the next pass will read it again.
         assert!(appended.bytes_read > 2 * meta_line.len() as i64);
+    }
+
+    /// A rewrite with the same size and mtime is still a rewrite, and the
+    /// targeted hydration shortcut has to notice it too.
+    ///
+    /// The global sync walk got this check in round 3, through
+    /// `transcript_unchanged`. Hydration's own shortcut compares the
+    /// mtime-and-size stamp and returns *before* `TranscriptReader::open`, so
+    /// the prefix hash the cursor stores never got a say and a rewritten file
+    /// was served from rows built out of bytes that no longer exist.
+    #[test]
+    fn a_same_stat_rewrite_is_not_served_by_the_unchanged_shortcut() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-shortcut-rewrite";
+        let original = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"aaaaa\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let transcript = seed_claude_transcript(dir.path(), session_id, original.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let stamped = fs::metadata(&transcript).unwrap().modified().unwrap();
+
+        // Positive control: an untouched file still takes the shortcut. Without
+        // it, "the rewrite was not served from the cursor" would also be
+        // satisfied by a check that never returns `unchanged` at all.
+        let untouched =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(
+            untouched.status, "unchanged",
+            "an untouched transcript must still be skipped, or this test proves nothing"
+        );
+
+        // Same length, different bytes, timestamp put back — what a writer
+        // that preserves mtime, or a coarse filesystem clock, produces free.
+        let rewritten = original.replace("aaaaa", "bbbbb");
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&transcript, &rewritten).unwrap();
+        fs::File::open(&transcript)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&transcript).unwrap();
+        assert_eq!(metadata.len() as usize, original.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        let after =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_ne!(
+            after.status, "unchanged",
+            "a same-size, same-mtime rewrite must not be served from the cursor"
+        );
+        let texts: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("bbbbb")),
+            "the rewritten bytes must be what is served, got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("aaaaa")),
+            "evidence from the replaced bytes must not survive, got {texts:?}"
+        );
+    }
+
+    /// An unchanged pass still read the provider files that told it nothing
+    /// changed, and says so.
+    ///
+    /// `source_snapshot` reads the Codex root's `session_meta` and one head
+    /// record from every sibling rollout *before* the shortcut is evaluated —
+    /// that is how the stamp is built. Returning an empty outcome reported
+    /// `bytesRead: 0` for a pass that opened nine files, which is the same
+    /// well-formed zero as "nothing was read".
+    #[test]
+    fn an_unchanged_pass_reports_the_provider_reads_it_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        let root_body = concat!(
+            "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+        );
+        fs::write(&root, root_body).unwrap();
+        let mut sibling_head_bytes = 0i64;
+        let mut directory_bytes = 0i64;
+        for index in 0..8 {
+            let sibling = day.join(format!("rollout-other-{index}.jsonl"));
+            let head = format!(
+                "{{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                 \"payload\":{{\"id\":\"other-{index}\",\"cwd\":\"/work/app\"}}}}\n"
+            );
+            let body = format!(
+                "{head}{{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\
+                 \"payload\":{{\"type\":\"user_message\",\"message\":\"{}\"}}}}\n",
+                "q".repeat(4096)
+            );
+            fs::write(&sibling, body.as_bytes()).unwrap();
+            sibling_head_bytes += head.len() as i64;
+            directory_bytes += body.len() as i64;
+        }
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let second =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert_eq!(
+            second.status, "unchanged",
+            "the second pass must take the shortcut, or this test measures the wrong pass"
+        );
+        assert!(
+            second.bytes_read >= sibling_head_bytes,
+            "an unchanged pass read {sibling_head_bytes} bytes of sibling heads to \
+             decide it was unchanged, and reported bytes_read {}",
+            second.bytes_read
+        );
+        // Positive control: this is the head reads being counted, not the pass
+        // re-reading the transcripts it decided not to read.
+        assert!(
+            second.bytes_read < first.bytes_read,
+            "an unchanged pass must still read less than the pass that indexed \
+             the session: {} vs {}",
+            second.bytes_read,
+            first.bytes_read
+        );
+        assert!(second.bytes_read < directory_bytes);
+    }
+
+    /// A record drained for passing the ceiling was still read, so its bytes
+    /// are counted — without the cursor advancing over it.
+    ///
+    /// `drain_oversized_record` reaching EOF updated neither the position nor
+    /// the tail, so a 16 MiB tail walked past in fixed-size chunks was absent
+    /// from `bytes_read` entirely: the pass reported roughly the length of the
+    /// one small record before it.
+    #[test]
+    fn an_oversized_tail_is_counted_in_bytes_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-oversized-tail-bytes";
+        let small = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"small\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        // No newline: the file ends inside a record already past the ceiling.
+        let huge_tail = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"content\":\"{}\"",
+            "z".repeat(super::cursor::MAX_RECORD_BYTES as usize)
+        );
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!("{small}{huge_tail}").as_bytes(),
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        // A Claude transcript is walked twice — once for identity and
+        // metadata, once to index records — and each walk drains the tail, so
+        // each walk reports it. Counting a read once per read is what makes
+        // this counter mean anything.
+        assert_eq!(
+            result.bytes_read,
+            2 * (small.len() + huge_tail.len()) as i64,
+            "the drained tail was read in chunks and must be counted"
+        );
+        // Positive control: counting it did not commit it. The cursor stops
+        // before the record the file ends inside, so a writer still producing
+        // it is not skipped past.
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            small.len() as i64
+        );
+    }
+
+    /// The quiet-since clock and the stat it is paired with come from the same
+    /// instant.
+    ///
+    /// The clock was stamped when the reader opened and the size and mtime it
+    /// is compared against were taken at `commit`, so the window covered the
+    /// whole pass. A full re-parse of a large live transcript takes longer
+    /// than two minutes, and the next pass then found a tail that had settled
+    /// seconds ago already "still for the window" — and released a message
+    /// that was still being streamed.
+    #[test]
+    fn the_quiet_clock_restarts_when_the_file_changes_during_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grace.jsonl");
+        fs::write(&path, "first\n").unwrap();
+
+        // A pass whose walk outlasts the grace window. Ageing the open stamp
+        // stands in for the elapsed walk; sleeping would take two minutes to
+        // prove the same thing.
+        let mut reader = super::cursor::TranscriptReader::open(&path, None, None).unwrap();
+        reader.age_unchanged_since_for_test(super::cursor::QUIESCENT_GRACE_MS + 1);
+
+        // The writer appends while the pass is still walking, so the stat
+        // `commit` records is newer than the clock the pass opened with.
+        fs::write(&path, "first\nsecond\n").unwrap();
+        let committed = reader.commit(6).unwrap();
+        assert!(
+            now_ms().saturating_sub(committed.unchanged_since_ms)
+                < super::cursor::QUIESCENT_GRACE_MS,
+            "the clock must be stamped from the same instant as the stat it is paired with"
+        );
+
+        let next = super::cursor::TranscriptReader::open(&path, Some(&committed), None).unwrap();
+        assert!(
+            !next.quiesced(),
+            "a file that changed during the pass has not been still for the window"
+        );
+
+        // Positive control: a file that really has been still for the window
+        // still releases, so this is the clock being paired with its stat and
+        // not quiescence being switched off.
+        let mut quiet = committed.clone();
+        quiet.unchanged_since_ms = now_ms() - super::cursor::QUIESCENT_GRACE_MS - 1;
+        let released = super::cursor::TranscriptReader::open(&path, Some(&quiet), None).unwrap();
+        assert!(
+            released.quiesced(),
+            "a genuinely quiescent file must still release what it held"
+        );
     }
 
     #[test]

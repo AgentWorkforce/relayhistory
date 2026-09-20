@@ -708,11 +708,41 @@ than about file positions, and it keeps working unchanged beside the cursors.
 `hydrateSession` now returns `bytesRead`: what that call actually read from
 provider files, across every walk and every file it touched — and, when more
 than one source contributed, summed across them rather than taken from
-whichever one won the capability rank. Zero for an `unchanged` result, about the size of the append
-for an incremental one, and the whole file when a cursor was rejected or the
-parser generation changed. It is the number a watch loop reads to tell "the
-tail grew" from "the whole file was re-read". `HydrateSessionResult`'s contract
-version is 3.
+whichever one won the capability rank. About the size of the append for an
+incremental pass, the whole file when a cursor was rejected or the parser
+generation changed, and small but **not zero** for an `unchanged` one. It is
+the number a watch loop reads to tell "the tail grew" from "the whole file was
+re-read". `HydrateSessionResult`'s contract version is 3.
+
+Deciding a session is unchanged is not free and does not report as though it
+were. Building the stamp reads the Codex root's `session_meta`, one head record
+from every sibling rollout, and each Claude sidecar's head and metadata
+document; validating the cursors reads two bounded windows per file. Those
+bytes are in `bytesRead` on the unchanged path exactly as they are on every
+other. A counter that omits the reads a pass could not avoid reports the work
+that was optimised instead of the work that was done — and a well-formed zero
+is indistinguishable from a pass that really read nothing.
+
+### Skipping a file without reading it
+
+Two places skip a transcript on its stat: the sync walk's
+`transcript_unchanged` and targeted hydration's stamp shortcut. Both ask the
+same question through `committed_prefix_matches` — are the bytes behind the
+cursor still the bytes on disk? — because size, mtime and inode do not prove
+byte equality, and a writer that restores timestamps produced a rewrite that
+was skipped forever. Neither path advances parser state to answer it, and
+hydration pays the window only when the stamp was about to skip the file: a
+pass that is going to read the transcript anyway validates the same cursor
+inside `TranscriptReader::open`.
+
+### The quiescence clock
+
+`unchanged_since_ms` is stamped from the same instant as the size and mtime it
+is compared against. A pass stamps it at `open` and re-stats at `commit`, so a
+stat that moved during the walk restarts the clock: otherwise the grace window
+covered the walk as well, and a full re-parse of a large live transcript — on
+its own longer than the window — let the next pass treat a tail that settled
+seconds ago as abandoned and release a message that was still streaming.
 
 ---
 
