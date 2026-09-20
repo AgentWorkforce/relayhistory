@@ -163,6 +163,22 @@ pub(crate) fn apply_normalized(
     started: Instant,
 ) -> Result<HydrateSessionResult> {
     validate(key, &mut evidence)?;
+    // Plugin intake is an acquisition pass like any other, and it is the one
+    // that most often runs in a process that never exits. The Node addon
+    // serves request after request from one long-lived host, so without a
+    // pass boundary here the project-identity cache is whatever the *first*
+    // request happened to see: a repository that gains an `origin`, or has one
+    // changed, would be reconciled against a directory state hours old, and
+    // the stale answer is shaped exactly like a correct one.
+    //
+    // Opening the pass before the transaction, so the filesystem work does not
+    // happen under the write lock. The cache is process-global and this clears
+    // it for everyone, which is safe in both directions: a clear only ever
+    // discards entries, so a concurrent request re-reads the filesystem and
+    // gets an answer at least as fresh as the one it lost. What it cannot do
+    // is leave this request reading entries from before this request began,
+    // which is the property that matters.
+    crate::project_identity::begin_acquisition_pass();
     // Enforced here rather than asked of each connector.
     //
     // `ShallowSessionProvider::acquire` takes no `include_related`, and for
@@ -321,6 +337,15 @@ pub(crate) fn apply_normalized(
         include_related,
         full,
     )?;
+    // Inside the transaction that wrote the records, for the same reason the
+    // local hydration path does it: a snapshot supplies `session_events` rows
+    // whose `project_key` is whatever the emitting side happened to know --
+    // null from an older adapter, or a key that no longer matches the session
+    // -- and without this those events would be the one place in the database
+    // where the canonical identity is missing or stale. Committing first and
+    // refreshing later would serve that gap to every reader in between, and
+    // for an adapter that never reports again it would never close at all.
+    crate::store::refresh_project_identity(&tx)?;
     tx.commit()?;
     let options = HydrateSessionOptions {
         source: key.source.clone(),

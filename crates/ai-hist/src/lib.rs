@@ -13,6 +13,11 @@ macro_rules! workspace_mod {
     };
 }
 
+/// Canonical project identity shared with burn. Always public: an embedder
+/// that groups by project needs the same rules the ingest path stamps with,
+/// and a second implementation is exactly the drift this module exists to
+/// prevent.
+pub mod project_identity;
 mod store;
 workspace_mod!(storage);
 workspace_mod!(observations);

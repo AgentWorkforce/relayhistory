@@ -141,7 +141,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **3**
+Both operations carry `contract_version` — currently **4**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -152,7 +152,7 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "sessions": [
     {
@@ -173,6 +173,8 @@ One object, never a bare array, so the version travels with the payload:
       "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
       "source_stamp": "v2:1788042670103317900:569",
       "discovery_state": "shallow",
+      "project_key": "github.com/acme/api",
+      "project_key_method": "remote",
       "locations": ["local"],
       "from_cache": true
     }
@@ -188,6 +190,81 @@ One object, never a bare array, so the version travels with the payload:
 Keys are `snake_case`. `models`, `workspace_roots`, and `locations` are always
 arrays (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
+
+`project_key` is the canonical project identity: the `origin` remote
+canonicalized to `host/owner/repo`, or the working directory when no remote
+resolves. **Group by it rather than by `cwd`** — two checkouts, two worktrees
+or two subdirectories of one repository share a key but never share a path, and
+a path-keyed rollup splits them. `project_key_method` says how the key was
+arrived at, and the three are not interchangeable:
+
+| `project_key_method` | meaning |
+| --- | --- |
+| `remote` | canonicalized `origin` remote; comparable across machines |
+| `path` | no remote resolved, so the key is the directory and is only meaningful on the machine that produced it |
+| `inherited` | adopted from the delegating parent session, because the child's own directory resolved to nothing canonical |
+
+The rules match burn's `crates/relayburn-sdk/src/reader/git.rs` vector for
+vector, so `burn --group-by project` and a RelayHistory rollup agree on the
+same checkout. No `git` subprocess is involved: git's configuration is read
+directly, in the scopes and precedence git itself uses — system
+(`$GIT_CONFIG_SYSTEM` or `/etc/gitconfig`, unless `$GIT_CONFIG_NOSYSTEM`), then
+global (`$GIT_CONFIG_GLOBAL`, else **both** `$XDG_CONFIG_HOME/git/config` and
+`~/.gitconfig`, in that order — git reads both, and `git config --global
+--list` showing only the latter is about where git *writes*), then the
+repository's own, following a linked worktree's
+`gitdir:` pointer. `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`,
+`onbranch:`) are expanded at the position of their own line, so a value written
+before an include is overridden by it and one written after it wins — as git
+resolves them — and `url.<base>.insteadOf` rewrites are applied
+longest-prefix-first, as `git remote get-url` does. The outer scopes matter as
+much as the repository's own: the rewrite that makes `gh:Org/Repo.git`
+resolvable is almost always configured once in `~/.gitconfig` for the whole
+machine.
+
+For a linked worktree, `config` is read from the shared directory `commondir`
+names while `HEAD` is read from the worktree's own git directory, and
+`includeIf` conditions are evaluated against that same per-worktree directory.
+A worktree exists to be on a different branch from the checkout it shares a
+repository with, so asking the shared directory would answer about the wrong
+tree. When the shared config enables `extensions.worktreeConfig`, that
+worktree's `config.worktree` is read after the shared config, as git reads it.
+
+Both spellings of a subsection are understood: `[remote "origin"]` and the
+legacy `[remote.origin]` name the same remote, with git's differing case rules
+— the quoted subsection is case-sensitive, the dotted header folds entirely,
+so `[remote.ORIGIN]` is `origin` while `[remote "ORIGIN"]` is a different
+remote.
+
+A remote's URL is a list, not a single value: git accumulates every
+`remote.<name>.url` it reads, across scopes as well as within a file, and the
+remote *is* the head of that list — `git remote get-url origin` prints it while
+`git config --get remote.origin.url` prints the last. The canonical key follows
+`get-url`, so a repository with a mirror configured after its origin keys to
+the origin. An IPv6 authority keeps its brackets (`[2001:db8::1]/acme/app`), so
+an address is never cut at the first colon of its own body.
+
+One thing is deliberately left out: `includeIf "hasconfig:remote.*.url:"` is
+not evaluated, because its answer depends on how much configuration has been
+read so far. It cannot turn a resolvable remote into a wrong one — it only
+leaves a rewrite unapplied, which falls back to a path key.
+
+Both are `null` while a session's identity has not been resolved yet — a
+database that predates the columns migrates without inventing keys, and the
+next sync or hydration fills them. `null` means "not resolved", never "no
+project".
+
+A key is resolved from the working directory, or from a remote the provider
+recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
+never final: every sync reconsiders it, so a session whose checkout was deleted
+picks up the canonical key as soon as a recorded remote makes one available. A
+`remote` key is never downgraded.
+
+Filter a listing to one project with `ai-hist sessions list --project <key>`
+(SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
+key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
+and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
+the per-directory grouping.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
@@ -214,7 +291,7 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "locations_run": ["local"],
   "discovered": 2,
@@ -363,6 +440,12 @@ therefore remain scope-independent.
 What each adapter can actually extract from a cheap read. `✓` = populated when
 the provider recorded it; `–` = the provider does not expose it to a shallow
 read.
+
+This table covers *shallow discovery only*. The full-evidence picture — which
+record types each source captures, stores and exposes after `ai-hist sync` —
+is the capture matrix in [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix),
+which this table must stay consistent with.
 
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -625,6 +708,15 @@ as current.
 ---
 
 ## Adding a provider
+
+Providers are added **here and nowhere else**. RelayHistory is the single owner
+of acquiring, parsing and storing session evidence for every harness;
+downstream consumers read it through the `ai-hist` crate's `SessionStore`
+facade rather than writing a second parser. See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). That
+matrix has record types as rows and sources as columns, so a new or extended
+provider must add or update its source column in the same change, and satisfy
+the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
 Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
 
