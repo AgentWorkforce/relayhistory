@@ -1500,6 +1500,9 @@ pub(crate) struct IngestOutcome {
     pub deferral_overflowed: bool,
     /// Records skipped for passing the per-record ceiling.
     pub oversized_records: i64,
+    /// At least one transcript was rewritten while this hydration was reading
+    /// it, so that transcript's cursor was not advanced.
+    pub superseded: bool,
 }
 
 impl IngestOutcome {
@@ -1509,6 +1512,7 @@ impl IngestOutcome {
         self.in_progress.extend(pass.in_progress);
         self.rotated |= pass.rotated;
         self.deferral_overflowed |= pass.deferral_overflowed;
+        self.superseded |= pass.superseded;
         self.oversized_records += pass.oversized_records;
     }
 
@@ -2132,6 +2136,17 @@ fn build_result(
             records_parsed: Some(indexed.records),
         });
     }
+    if indexed.superseded {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_SOURCE_REWRITTEN".to_string(),
+            message: "a provider transcript was rewritten while this pass was reading it; \
+                      no cursor was recorded for it and the next pass reads it again"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: Some(snapshot.bytes),
+            records_parsed: Some(indexed.records),
+        });
+    }
     if !indexed.in_progress.is_empty() {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_IN_PROGRESS_MESSAGES".to_string(),
@@ -2710,6 +2725,17 @@ mod tests {
             .expect("a cursor holding records has a file position");
         file.unchanged_since_ms = now_ms() - super::cursor::QUIESCENT_GRACE_MS - 1;
         store_cursor(&conn, key, &cursor).unwrap();
+    }
+
+    /// Move a file's mtime forward by a second.
+    ///
+    /// A rewrite between two calls in the same test can land inside one
+    /// filesystem timestamp tick, which would make the fixture prove the
+    /// opposite of what it claims: that a rewrite with an *unchanged* stat is
+    /// caught. The tests that need a moved stat say so explicitly.
+    fn bump_mtime(path: &Path) {
+        let moved = fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(1);
+        fs::File::open(path).unwrap().set_modified(moved).unwrap();
     }
 
     fn session_cursor_key<'a>(session_id: &'a str) -> CursorKey<'a> {
@@ -4435,7 +4461,11 @@ mod tests {
         // The writer appends while the pass is still walking, so the stat
         // `commit` records is newer than the clock the pass opened with.
         fs::write(&path, "first\nsecond\n").unwrap();
-        let committed = reader.commit(6).unwrap();
+        // An append is not a rewrite, so this pass still publishes; what it
+        // must not carry forward is the clock it opened with.
+        let super::cursor::CommitOutcome::Published(committed) = reader.commit(6).unwrap() else {
+            panic!("an append during the pass still commits");
+        };
         assert!(
             now_ms().saturating_sub(committed.unchanged_since_ms)
                 < super::cursor::QUIESCENT_GRACE_MS,
@@ -4525,6 +4555,153 @@ mod tests {
         assert_ne!(
             after.status, "unchanged",
             "a same-size, same-mtime rewrite of a child must not be served from its cursor"
+        );
+    }
+
+    /// A cursor may only vouch for the bytes its rows came from.
+    ///
+    /// The reader stats the file at open and again at commit, and reads
+    /// records through a separate handle in between. Until now a stat that
+    /// moved during the walk only restarted the quiescence clock: the cursor
+    /// still stored the *new* stat and hashed the prefix from the file as it
+    /// was at commit. A record rewritten in place mid-walk therefore left a
+    /// row holding the old text and a cursor authenticating the new bytes —
+    /// and the next pass validated that cursor and read nothing, so the stale
+    /// row was permanent.
+    #[test]
+    fn a_rewrite_during_the_pass_is_not_blessed_by_the_cursor() {
+        use super::cursor::{CommitOutcome, TranscriptReader};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewritten.jsonl");
+        let original = "{\"uuid\":\"u1\",\"text\":\"old\"}\n";
+        fs::write(&path, original).unwrap();
+
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        reader.next_line(&mut line).unwrap();
+        assert!(line.contains("old"), "the pass read the original bytes");
+
+        // The provider rewrites that record in place — same length, so the
+        // size cannot betray it, and a new mtime because something wrote.
+        let rewritten = original.replace("old", "new");
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&path, &rewritten).unwrap();
+        bump_mtime(&path);
+
+        assert!(
+            matches!(
+                reader.commit(original.len() as u64).unwrap(),
+                CommitOutcome::Superseded
+            ),
+            "a cursor must not authenticate bytes its rows did not come from"
+        );
+
+        // Positive control: an append during the pass leaves everything this
+        // pass read where it was, so it still commits and still resumes.
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        reader.next_line(&mut line).unwrap();
+        let appended = format!("{rewritten}{{\"uuid\":\"u2\",\"text\":\"later\"}}\n");
+        fs::write(&path, &appended).unwrap();
+        bump_mtime(&path);
+        let CommitOutcome::Published(file) = reader.commit(rewritten.len() as u64).unwrap() else {
+            panic!("a plain append during the pass must still commit");
+        };
+        assert_eq!(file.offset, rewritten.len() as u64);
+    }
+
+    /// The whole path: a rewrite under a live pass records no cursor, and the
+    /// pass that follows corrects the row.
+    ///
+    /// Driven through the incremental pass rather than a whole hydration,
+    /// because a hydration walks the transcript twice and a hook that fired on
+    /// the first walk would have rewritten the file *before* the second walk
+    /// read it — a pass reading the new bytes correctly, which is not the
+    /// defect. The first version of this test made exactly that mistake and
+    /// reported no diagnostic for the right reason.
+    #[test]
+    fn a_transcript_rewritten_under_a_pass_is_read_again_and_corrected() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-rewritten-under-pass";
+        let transcript = dir.path().join("rewritten-under-pass.jsonl");
+        let original = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"old\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let rewritten = original.replace("\"content\":\"old\"", "\"content\":\"new\"");
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&transcript, original.as_bytes()).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+
+        // The writer rewrites the record in place after the records have been
+        // parsed and before the cursor is written — the one moment no test can
+        // otherwise reach. Once only: the pass that follows must find the file
+        // still.
+        let target = transcript.clone();
+        let bytes = rewritten.clone();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = std::sync::Arc::clone(&fired);
+        super::cursor::set_before_commit_hook_for_test(Some(Box::new(move || {
+            if armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            fs::write(&target, &bytes).unwrap();
+            bump_mtime(&target);
+        })));
+        let during = crate::ingest::incremental::ingest_claude_transcript_at_locator(
+            &conn,
+            &transcript,
+            None,
+        )
+        .unwrap();
+        super::cursor::set_before_commit_hook_for_test(None);
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the rewrite must land between the read and the commit, or this test proves nothing"
+        );
+
+        assert!(
+            during.superseded,
+            "a pass whose bytes moved under it records nothing and says so"
+        );
+        let locator = transcript.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        assert_eq!(
+            load_cursor(&conn, &key).unwrap().committed_offset(),
+            0,
+            "nothing may be recorded about a pass whose bytes moved under it"
+        );
+
+        // The next pass reads the same region again and upserts over the row
+        // the superseded pass left behind.
+        let after = crate::ingest::incremental::ingest_claude_transcript_at_locator(
+            &conn,
+            &transcript,
+            None,
+        )
+        .unwrap();
+        assert!(!after.superseded, "the file is still now");
+        assert_eq!(
+            load_cursor(&conn, &key).unwrap().committed_offset(),
+            rewritten.len() as i64,
+            "and a pass that was not interrupted records its position"
+        );
+        drop(conn);
+        let texts: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.3)
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("new")),
+            "the corrected bytes must reach the rows, got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("old")),
+            "the row from the superseded pass must not survive, got {texts:?}"
         );
     }
 

@@ -278,8 +278,17 @@ pub(crate) fn ingest_claude_transcript_incremental(
     };
     claude.resume_from = resume_from;
     claude.resume_line_index = resume_line_index;
-    cursor.file = Some(reader.commit(commit_offset)?);
-    cursor.claude = Some(claude);
+    // A pass whose file was rewritten under it records nothing at all — not
+    // the position, not the parser state. Its rows came from bytes that are no
+    // longer there, and the next pass reads the same region again and upserts
+    // over them.
+    match reader.commit(commit_offset)? {
+        CommitOutcome::Published(file) => {
+            cursor.file = Some(file);
+            cursor.claude = Some(claude);
+        }
+        CommitOutcome::Superseded => pass.superseded = true,
+    }
     Ok(pass)
 }
 

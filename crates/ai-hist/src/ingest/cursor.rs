@@ -531,6 +531,24 @@ pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 /// early publishes a partial one that nothing will take back.
 pub(crate) const QUIESCENT_GRACE_MS: i64 = 120_000;
 
+/// What a pass is allowed to record about where it got to.
+///
+/// A cursor says "the rows in the database came from the bytes up to here,
+/// and here is their hash". A pass whose file was rewritten underneath it can
+/// honour neither half: its rows hold the old bytes, and hashing the file now
+/// would authenticate the new ones. Such a pass records nothing, and the next
+/// one reads the region again and corrects the rows — every insert on this
+/// path is an idempotent upsert, so re-reading is always safe and publishing a
+/// cursor that does not describe its own rows is not.
+#[derive(Debug)]
+pub(crate) enum CommitOutcome {
+    /// The bytes behind the cursor are the bytes the pass read.
+    Published(TranscriptFileCursor),
+    /// The file changed under the pass in a way that can affect the bytes it
+    /// parsed. Nothing is recorded.
+    Superseded,
+}
+
 /// A transcript opened at its cursor.
 pub(crate) struct TranscriptReader {
     file: fs::File,
@@ -552,6 +570,16 @@ pub(crate) struct TranscriptReader {
     /// measuring a different file state than the one being stored.
     opened_size: u64,
     opened_mtime_ns: u64,
+    /// The bounded window over `[0, opened_size)` as it was when the file was
+    /// opened — the bytes this pass takes itself to be reading.
+    ///
+    /// `commit` recomputes it over the same region. A cursor is a claim that
+    /// the rows behind it came from the bytes it hashes, and the stat it
+    /// stores is taken at commit while the rows were parsed during the walk:
+    /// without this, a record rewritten in place mid-walk left a row saying
+    /// one thing and a cursor authenticating another, and the next pass
+    /// validated that cursor and read nothing.
+    opened_window: String,
     /// The saved cursor was rejected and the file is being read from zero
     /// again. Hydration reports this as `HYDRATION_SOURCE_ROTATED`, because a
     /// caller watching a live file needs to know the difference between "1 KiB
@@ -579,6 +607,10 @@ impl TranscriptReader {
         let mut rotated = false;
         let mut quiesced = false;
         let mut unchanged_since_ms = now_ms();
+        // Hashed once. When the saved cursor covers the whole file — the
+        // ordinary resume — the validation below hashes the same region, and
+        // reusing it keeps this to one bounded read.
+        let mut opened_window: Option<String> = None;
         // A cursor at offset 0 is still a cursor. It records the file's
         // identity, size and mtime, and those are what say whether anything
         // has been appended since the last pass. Reading it as "no cursor"
@@ -591,11 +623,14 @@ impl TranscriptReader {
                 let identity_changed = saved.device.is_some()
                     && device.is_some()
                     && (saved.device, saved.inode) != (device, inode);
+                let saved_window = prefix_window_digest(&mut file, saved.offset).ok();
+                if saved.offset == size {
+                    opened_window = saved_window.clone();
+                }
                 let valid = !identity_changed
                     && size >= saved.offset
                     && mtime_ns >= saved.mtime_ns
-                    && prefix_window_digest(&mut file, saved.offset)
-                        .is_ok_and(|digest| digest == saved.prefix_hash);
+                    && saved_window.as_deref() == Some(saved.prefix_hash.as_str());
                 if valid {
                     let stat_unchanged = size == saved.size && mtime_ns == saved.mtime_ns;
                     // Carry the stamp forward while nothing moves; restart it
@@ -621,6 +656,11 @@ impl TranscriptReader {
             None => 0,
         };
 
+        let opened_window = match opened_window {
+            Some(window) => window,
+            None => prefix_window_digest(&mut file, size)?,
+        };
+
         let mut handle = file.try_clone()?;
         handle.seek(std::io::SeekFrom::Start(offset))?;
         Ok(Self {
@@ -631,6 +671,7 @@ impl TranscriptReader {
             tail_bytes: 0,
             opened_size: size,
             opened_mtime_ns: mtime_ns,
+            opened_window,
             unchanged_since_ms,
             quiesced,
             device,
@@ -764,26 +805,46 @@ impl TranscriptReader {
     /// `offset` may be behind [`Self::position`]: the Claude reader commits
     /// before the earliest message still being written so the next pass reads
     /// it again, and the Codex reader commits at the last `task_complete`.
-    pub(crate) fn commit(&mut self, offset: u64) -> Result<TranscriptFileCursor> {
+    pub(crate) fn commit(&mut self, offset: u64) -> Result<CommitOutcome> {
+        #[cfg(test)]
+        run_before_commit_hook();
         let metadata = self.file.metadata()?;
         let size = metadata.len();
         let mtime_ns = super::metadata_mtime_ns(&metadata);
+        // A stat that moved during the pass restarts the quiescence clock as
+        // well: stamping it at `open` while storing a stat taken here made the
+        // window cover the walk, and a full re-parse of a large live
+        // transcript outlasts the window on its own.
+        let stat_moved = size != self.opened_size || mtime_ns != self.opened_mtime_ns;
+        if stat_moved {
+            // Something wrote to the file during the walk. An append leaves
+            // everything this pass read where it was; a rewrite does not, and
+            // the stat alone cannot tell them apart — same-length in-place
+            // edits are exactly the case that looks like nothing happened.
+            let (device, inode) = file_identity(&metadata);
+            let identity_changed = self.device.is_some()
+                && device.is_some()
+                && (self.device, self.inode) != (device, inode);
+            if identity_changed || size < offset || size < self.opened_size {
+                return Ok(CommitOutcome::Superseded);
+            }
+            // The same bounded window over the same region, so an append
+            // compares equal and an in-place rewrite within the window does
+            // not. Bounded in the same way the cursor's own hash is, and paid
+            // only when a writer touched the file mid-walk.
+            let window = prefix_window_digest(&mut self.file, self.opened_size)?;
+            if window != self.opened_window {
+                return Ok(CommitOutcome::Superseded);
+            }
+        }
         // The clock and the stat it is compared against have to come from the
-        // same instant. Stamping it at `open` while storing a stat taken here
-        // made the window cover the walk as well: a full re-parse of a large
-        // live transcript takes longer than the window on its own, so the next
-        // pass found a tail that had settled seconds ago already "still for
-        // two minutes" and released a message that was still streaming.
-        //
-        // A stat that moved during the pass restarts the clock. Erring this
-        // way costs one extra window before an abandoned message is released;
-        // erring the other way publishes half of a live one.
-        let unchanged_since_ms = if size == self.opened_size && mtime_ns == self.opened_mtime_ns {
-            self.unchanged_since_ms
-        } else {
+        // same instant.
+        let unchanged_since_ms = if stat_moved {
             now_ms()
+        } else {
+            self.unchanged_since_ms
         };
-        Ok(TranscriptFileCursor {
+        Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
             inode: self.inode,
@@ -791,7 +852,37 @@ impl TranscriptReader {
             size,
             unchanged_since_ms,
             prefix_hash: prefix_window_digest(&mut self.file, offset)?,
-        })
+        }))
+    }
+}
+
+// Run something between a pass's last read and its commit.
+//
+// The one moment this module has to get right is the one a test cannot
+// otherwise reach: a writer touching the file after the records have been
+// parsed and before the cursor is written. The seam exists only under
+// `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_commit_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+    BEFORE_COMMIT.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_before_commit_hook() {
+    let hook = BEFORE_COMMIT.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+        BEFORE_COMMIT.with(|slot| {
+            if slot.borrow().is_none() {
+                *slot.borrow_mut() = Some(hook);
+            }
+        });
     }
 }
 
@@ -921,4 +1012,7 @@ pub(crate) struct IncrementalPass {
     /// are real records under their own event identity, and the completion
     /// that follows lands as further rows rather than a correction.
     pub deferral_overflowed: bool,
+    /// The file was rewritten while this pass was reading it, so the pass
+    /// recorded no cursor and the next one reads the same region again.
+    pub superseded: bool,
 }

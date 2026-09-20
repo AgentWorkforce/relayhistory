@@ -2678,8 +2678,15 @@ fn ingest_codex_rollout_incremental(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes());
     pass.records = line_index.saturating_sub(resume.next_line_index) as i64;
-    cursor.file = Some(reader.commit(offset)?);
-    cursor.codex = Some(state);
+    // Rewritten under the pass: record nothing, and read the region again next
+    // time rather than blessing rows that came from bytes that are gone.
+    match reader.commit(offset)? {
+        cursor::CommitOutcome::Published(file) => {
+            cursor.file = Some(file);
+            cursor.codex = Some(state);
+        }
+        cursor::CommitOutcome::Superseded => pass.superseded = true,
+    }
     Ok((outcome, pass))
 }
 
@@ -3171,11 +3178,16 @@ pub(crate) fn scan_claude_session_file_resumed(
         .position()
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes());
-    *state = Some(cursor::ClaudeScanState {
-        file: Some(reader.commit(committed)?),
-        resume_from,
-        fold: fold.clone(),
-    });
+    // The metadata walk keeps its own position in the same document, and the
+    // same rule applies to it: a fold over bytes that were rewritten during
+    // the walk is not a fold anyone should resume from.
+    if let cursor::CommitOutcome::Published(file) = reader.commit(committed)? {
+        *state = Some(cursor::ClaudeScanState {
+            file: Some(file),
+            resume_from,
+            fold: fold.clone(),
+        });
+    }
     Ok((fold.finish(), bytes_read))
 }
 
