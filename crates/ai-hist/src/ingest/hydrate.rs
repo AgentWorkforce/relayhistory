@@ -1300,13 +1300,13 @@ fn ingest_claude(
     )?;
     ingest_claude_transcript(conn, path)?;
     record_claude_remote_relationship(conn, &meta, options.include_related)?;
-    // Continuity evidence is banked per transcript so reconciliation can run
-    // here, over one file, instead of only during a full sync holding every
-    // file at once. Whatever this file cannot resolve yet stays pending with
-    // its reason, and the hydration that indexes the missing record resolves
-    // it without this file being read again.
-    crate::continuity::capture_claude_transcript(conn, path)?;
-    crate::continuity::reconcile(conn, "claude")?;
+    if options.include_related {
+        // Bank this transcript's continuity evidence for reconciliation now.
+        // A request for this session alone leaves relationship evidence for
+        // a later hydration that includes related sessions.
+        crate::continuity::capture_claude_transcript(conn, path)?;
+        crate::continuity::reconcile(conn, "claude")?;
+    }
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     for evidence in subagents {
@@ -1523,12 +1523,11 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
             Some(&path.to_string_lossy()),
         )?;
     }
-    // Codex records continuity only when a producer writes the explicit
-    // fields on `session_meta`; a plain `codex resume` leaves nothing behind
-    // to read, so this is a no-op for it rather than a guess.
-    crate::continuity::capture_codex_rollout(conn, path)?;
-    crate::continuity::reconcile(conn, "codex")?;
     if options.include_related {
+        // Codex records continuity only when a producer writes explicit
+        // fields on `session_meta`; a plain `codex resume` leaves no signal.
+        crate::continuity::capture_codex_rollout(conn, path)?;
+        crate::continuity::reconcile(conn, "codex")?;
         ingest_codex_children(conn, options, path)?;
     }
     Ok(())
@@ -1788,13 +1787,13 @@ fn build_result(
             &options.session_id,
         )?);
     }
-    // Not gated on `include_related`: unresolved continuity is a fact about
-    // this session's own transcript, not about anything it delegated to.
-    diagnostics.extend(continuity_diagnostics(
-        conn,
-        &options.source,
-        &options.session_id,
-    )?);
+    if options.include_related {
+        diagnostics.extend(continuity_diagnostics(
+            conn,
+            &options.source,
+            &options.session_id,
+        )?);
+    }
     if options.source == "codex" && options.include_related && !snapshot.codex_relationship_complete
     {
         diagnostics.push(HydrationDiagnostic {
@@ -2724,7 +2723,7 @@ mod tests {
         fs::create_dir_all(claude.parent().unwrap()).unwrap();
         fs::write(
             &claude,
-            "{\"sessionId\":\"root-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            "{\"sessionId\":\"root-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"continuedFromSessionId\":\"prior-claude\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
         )
         .unwrap();
         let codex = dir
@@ -2734,7 +2733,7 @@ mod tests {
         fs::write(
             &codex,
             concat!(
-                "{\"timestamp\":\"2026-08-31T11:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root-2\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T11:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root-2\",\"cwd\":\"/work/app\",\"continuedFromSessionId\":\"prior-codex\"}}\n",
                 "{\"timestamp\":\"2026-08-31T11:00:01.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"prompt\"}}\n",
             ),
         )
@@ -2777,6 +2776,28 @@ mod tests {
                 "{}",
                 partial.message
             );
+            assert!(!alone
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("RELATIONSHIP_CONTINUITY_")));
+            let conn = open_db(&db).unwrap();
+            let banked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_continuity_evidence WHERE source = ?",
+                    [source],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let edges: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_relationships \
+                     WHERE source = ? AND relationship = 'continuation'",
+                    [source],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((banked, edges), (0, 0), "{source} thread-only");
+            drop(conn);
 
             // Asking for the related evidence restores the claim, and the same
             // provider is `full` again.
@@ -2788,6 +2809,16 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
+            let conn = open_db(&db).unwrap();
+            let parent: String = conn
+                .query_row(
+                    "SELECT parent_session_id FROM session_relationships \
+                     WHERE source = ? AND child_session_id = ? AND relationship = 'continuation'",
+                    params![source, session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent, format!("prior-{source}"));
         }
     }
 
