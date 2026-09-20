@@ -122,6 +122,52 @@ async function writeOpencodeStore(root, sessions, rng) {
 }
 
 /**
+ * Write one session of `source` and report where it landed and how big it is.
+ *
+ * Every provider goes through here, including the oversized hydration fixture,
+ * so `--sources` cannot be quietly widened by a special case.
+ */
+async function writeSession(plan, root, source, id, rng, { turns, baseMs }) {
+  if (source === "claude") {
+    const path = join(root, `.claude/projects/${plan.project}/${id}.jsonl`);
+    return { path, bytes: await write(path, claudeTranscript(plan, id, rng, { turns, baseMs })) };
+  }
+  if (source === "codex") {
+    const day = new Date(baseMs);
+    const path = join(
+      root,
+      `.codex/sessions/${day.getUTCFullYear()}/${String(day.getUTCMonth() + 1).padStart(2, "0")}/`
+      + `${String(day.getUTCDate()).padStart(2, "0")}/rollout-${id}.jsonl`,
+    );
+    return { path, bytes: await write(path, codexRollout(plan, id, rng, { turns, baseMs })) };
+  }
+  if (source === "cursor") {
+    const path = join(root, `.cursor/projects/${plan.project}/agent-transcripts/${id}/${id}.jsonl`);
+    return { path, bytes: await write(path, cursorTranscript(plan, id, rng, { turns, baseMs })) };
+  }
+  const { summary, chat } = grokSession(plan, id, rng, { turns, baseMs });
+  const directory = join(root, `.grok/sessions/%2Fwork%2Frelayhistory-bench/${id}`);
+  const bytes = (await write(join(directory, "summary.json"), summary))
+    + (await write(join(directory, "chat_history.jsonl"), chat));
+  return { path: join(directory, "chat_history.jsonl"), bytes };
+}
+
+/** What one session of `source` would occupy at `turns` turns, without writing it. */
+function sessionBytes(plan, source, id, rng, turns) {
+  const baseMs = BASE_MS;
+  const size = (text) => Buffer.byteLength(text, "utf8");
+  if (source === "claude") return size(claudeTranscript(plan, id, rng, { turns, baseMs }));
+  if (source === "codex") return size(codexRollout(plan, id, rng, { turns, baseMs }));
+  if (source === "cursor") return size(cursorTranscript(plan, id, rng, { turns, baseMs }));
+  const { summary, chat } = grokSession(plan, id, rng, { turns, baseMs });
+  return size(summary) + size(chat);
+}
+
+/** Largest first, then by id, so ties do not depend on write order. */
+const largestFirst = (left, right) => (right.bytes - left.bytes)
+  || (left.sessionId < right.sessionId ? -1 : 1);
+
+/**
  * Grow `root` to roughly `plan.targetBytes` by adding whole sessions round
  * robin across the requested file-backed sources. Session count is an outcome,
  * not an input, so a size target reproduces exactly.
@@ -137,19 +183,30 @@ export async function generateStore(plan, root) {
   let claudeHistory = "";
   let codexHistory = "";
 
-  // One oversized Claude transcript first: the hydration phases need a single
-  // session large enough for per-transcript cost to dominate.
+  /** Append this session to the provider's flat prompt log, where it has one. */
+  const recordHistoryLine = (source, id, baseMs) => {
+    if (source === "claude") claudeHistory += claudeHistoryLine(plan, id, rng, baseMs);
+    else if (source === "codex") codexHistory += codexHistoryLine(plan, id, rng, baseMs);
+  };
+
+  // One oversized transcript first: the hydration phases need a single session
+  // large enough for per-transcript cost to dominate. It belongs to the first
+  // source the plan asked for — writing a Claude transcript for a plan that did
+  // not request Claude would put a whole provider into the store, into the
+  // ingested byte count, and into the reported hydration target, while the
+  // report went on calling the run codex-only.
   if (plan.largeSessionBytes > 0) {
+    const source = fileSources[0];
     const id = "bench-large-0000";
-    // The per-turn byte cost is stable for a given plan, so measure one turn
+    // The per-turn byte cost is stable for a given plan, so measure four turns
     // and scale, then trim nothing: the manifest reports what landed.
-    const probe = claudeTranscript(plan, id, createRng(plan.seed), { turns: 4, baseMs: BASE_MS });
-    const perTurn = Buffer.byteLength(probe, "utf8") / 4;
+    const perTurn = sessionBytes(plan, source, id, createRng(plan.seed), 4) / 4;
     const turns = Math.max(1, Math.round(plan.largeSessionBytes / perTurn));
-    const path = join(root, `.claude/projects/${plan.project}/${id}.jsonl`);
-    const bytes = await write(path, claudeTranscript(plan, id, createRng(plan.seed + 1), { turns, baseMs: BASE_MS }));
-    claudeHistory += claudeHistoryLine(plan, id, rng, BASE_MS);
-    sessions.push({ source: "claude", sessionId: id, path, bytes, turns });
+    const { path, bytes } = await writeSession(
+      plan, root, source, id, createRng(plan.seed + 1), { turns, baseMs: BASE_MS },
+    );
+    recordHistoryLine(source, id, BASE_MS);
+    sessions.push({ source, sessionId: id, path, bytes, turns });
     written += bytes;
   }
 
@@ -159,36 +216,12 @@ export async function generateStore(plan, root) {
     const ordinal = Math.floor(index / fileSources.length);
     const id = `bench-${source}-${ordinal.toString().padStart(6, "0")}`;
     const baseMs = BASE_MS + index * 60_000;
-    if (source === "claude") {
-      const path = join(root, `.claude/projects/${plan.project}/${id}.jsonl`);
-      const bytes = await write(path, claudeTranscript(plan, id, rng, { baseMs }));
-      claudeHistory += claudeHistoryLine(plan, id, rng, baseMs);
-      sessions.push({ source, sessionId: id, path, bytes, turns: plan.turns });
-      written += bytes;
-    } else if (source === "codex") {
-      const day = new Date(baseMs);
-      const path = join(
-        root,
-        `.codex/sessions/${day.getUTCFullYear()}/${String(day.getUTCMonth() + 1).padStart(2, "0")}/` +
-        `${String(day.getUTCDate()).padStart(2, "0")}/rollout-${id}.jsonl`,
-      );
-      const bytes = await write(path, codexRollout(plan, id, rng, { baseMs }));
-      codexHistory += codexHistoryLine(plan, id, rng, baseMs);
-      sessions.push({ source, sessionId: id, path, bytes, turns: plan.turns });
-      written += bytes;
-    } else if (source === "cursor") {
-      const path = join(root, `.cursor/projects/${plan.project}/agent-transcripts/${id}/${id}.jsonl`);
-      const bytes = await write(path, cursorTranscript(plan, id, rng, { baseMs }));
-      sessions.push({ source, sessionId: id, path, bytes, turns: plan.turns });
-      written += bytes;
-    } else {
-      const { summary, chat } = grokSession(plan, id, rng, { baseMs });
-      const directory = join(root, `.grok/sessions/%2Fwork%2Frelayhistory-bench/${id}`);
-      const bytes = (await write(join(directory, "summary.json"), summary))
-        + (await write(join(directory, "chat_history.jsonl"), chat));
-      sessions.push({ source, sessionId: id, path: join(directory, "chat_history.jsonl"), bytes, turns: plan.turns });
-      written += bytes;
-    }
+    const { path, bytes } = await writeSession(
+      plan, root, source, id, rng, { turns: plan.turns, baseMs },
+    );
+    recordHistoryLine(source, id, baseMs);
+    sessions.push({ source, sessionId: id, path, bytes, turns: plan.turns });
+    written += bytes;
     index += 1;
   }
 
@@ -208,18 +241,22 @@ export async function generateStore(plan, root) {
   }
 
   const actual = await storeBytes(root);
-  // The hydration target is the largest Claude transcript, which is the
-  // oversized one when the plan asked for one.
-  const hydrationTarget = sessions
-    .filter((session) => session.source === "claude")
-    .sort((left, right) => right.bytes - left.bytes)[0] ?? sessions[0];
+  // The hydration target is the largest transcript in the store whatever
+  // provider wrote it, which is the oversized one when the plan asked for one.
+  // `hydrate_session` handles every file-backed source, so this does not have
+  // to be Claude.
+  const hydrationTarget = [...sessions].sort(largestFirst)[0] ?? null;
   const manifest = {
     generator: "scripts/gen-synthetic-history.mjs",
     plan,
     root,
     storeBytes: actual.bytes,
     storeFiles: actual.files,
-    sessionCount: sessions.length,
+    // File-backed sessions and the total. An OpenCode store's rows are
+    // sessions too; counting only the files understates every report built
+    // from this manifest.
+    fileSessionCount: sessions.length,
+    sessionCount: sessions.length + opencodeSessions,
     opencodeSessions,
     hydrationTarget: hydrationTarget
       ? {
@@ -231,9 +268,13 @@ export async function generateStore(plan, root) {
       : null,
     // The transcript an incremental sync appends to: the smallest Claude
     // transcript, so re-parsing it is not what the measurement is dominated by.
+    // Claude specifically, because `append_one_record` in the harness writes a
+    // Claude-shaped record and no other provider has an equivalent yet. A plan
+    // without Claude gets `null` here, and `unsupportedPhases` refuses
+    // `incremental_sync` for such a plan before anything is measured.
     incrementalTarget: sessions
       .filter((session) => session.source === "claude")
-      .sort((left, right) => left.bytes - right.bytes)[0] ?? null,
+      .sort((left, right) => largestFirst(right, left))[0] ?? null,
     sessions: sessions.map(({ source, sessionId, path, bytes }) => ({ source, sessionId, path, bytes })),
   };
   return manifest;

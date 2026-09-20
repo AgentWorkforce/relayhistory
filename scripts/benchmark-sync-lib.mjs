@@ -241,6 +241,43 @@ export function grokSession(plan, sessionId, rng, { turns = plan.turns, baseMs }
 // harness (`append_one_record` in `crates/ai-hist-cli/tests/sync_bench.rs`), so
 // that it lands outside the timed region and in the same process that times it.
 
+/**
+ * Phases that can only be measured against a Claude transcript, and why.
+ *
+ * `append_one_record` writes a Claude-shaped record; no other provider has an
+ * equivalent yet. Rather than let a Claude transcript be smuggled into a store
+ * that did not ask for one — which would put a whole provider into the ingested
+ * byte count while the report still called the run codex-only — a plan without
+ * Claude simply cannot run these.
+ */
+export const PHASE_SOURCE_REQUIREMENTS = {
+  incremental_sync: {
+    source: "claude",
+    reason:
+      "the harness appends a Claude-shaped record and no other provider has an equivalent",
+  },
+};
+
+/**
+ * Phases the requested plan cannot measure, as `{ phase, reason }`.
+ *
+ * Called before the store is generated: a combination that cannot be measured
+ * is refused up front rather than discovered as an empty path in the middle of
+ * a run.
+ */
+export function unsupportedPhases(plan, phases) {
+  const available = new Set(plan?.sources ?? []);
+  return (phases ?? []).flatMap((phase) => {
+    const requirement = PHASE_SOURCE_REQUIREMENTS[phase];
+    if (!requirement || available.has(requirement.source)) return [];
+    return [{
+      phase,
+      reason: `needs a \`${requirement.source}\` source (${requirement.reason}); `
+        + `this plan has ${[...available].join(", ") || "no sources"}`,
+    }];
+  });
+}
+
 // ---------------------------------------------------------------------------
 // reporting and the gate
 // ---------------------------------------------------------------------------

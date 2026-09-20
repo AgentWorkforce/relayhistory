@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,8 +14,9 @@ import {
   planStore,
   renderMarkdownTable,
   REPORT_COLUMNS,
+  unsupportedPhases,
 } from "./benchmark-sync-lib.mjs";
-import { generateStore } from "./gen-synthetic-history.mjs";
+import { generateStore, opencodeAvailable } from "./gen-synthetic-history.mjs";
 import { CALIBRATION_PHASE, PHASE_ORDER, findHarnessExecutable } from "./benchmark-sync.mjs";
 
 const thresholds = JSON.parse(
@@ -49,7 +50,11 @@ test("the manifest counts match what actually landed on disk", async () => {
     });
     const manifest = await generateStore(plan, join(root, "home"));
     assert.ok(manifest.storeBytes >= plan.targetBytes, "the store reached its target");
-    assert.equal(manifest.sessions.length, manifest.sessionCount);
+    assert.equal(manifest.fileSessionCount, manifest.sessions.length);
+    // The total is every session the store holds, not only the file-backed
+    // ones: an OpenCode store's rows are sessions too, and a count that leaves
+    // them out understates every report built from this manifest.
+    assert.equal(manifest.sessionCount, manifest.fileSessionCount + manifest.opencodeSessions);
     // Every source the plan asked for is represented, and the hydration target
     // is the largest Claude transcript rather than whichever landed first.
     const sources = new Set(manifest.sessions.map((session) => session.source));
@@ -63,6 +68,84 @@ test("the manifest counts match what actually landed on disk", async () => {
     const claudeProject = join(root, "home", ".claude/projects", plan.project);
     const entries = await readdir(claudeProject);
     assert.ok(entries.length > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the oversized session follows --sources instead of forcing Claude in", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sync-bench-sources-"));
+  try {
+    const plan = planStore({
+      seed: 5, targetBytes: 48 * 1024, turns: 2,
+      sources: ["codex"], largeSessionBytes: 24 * 1024,
+    });
+    const manifest = await generateStore(plan, join(root, "home"));
+    // A plan that did not ask for Claude must not get a Claude transcript: it
+    // would be ingested by `sync`, counted in the throughput, and reported as
+    // a codex-only measurement.
+    await assert.rejects(
+      () => stat(join(root, "home", ".claude")),
+      /ENOENT/,
+      "no Claude tree is written for a codex-only plan",
+    );
+    assert.ok(manifest.sessions.every((session) => session.source === "codex"));
+    assert.equal(manifest.hydrationTarget.source, "codex");
+    // The generator scales a turn count from a probe and trims nothing, so the
+    // oversized session lands near the request rather than on it. What has to
+    // hold is that it is close and that it dominates every other session —
+    // otherwise per-transcript cost is not what the hydration phases measure.
+    assert.ok(
+      manifest.hydrationTarget.bytes >= 0.9 * plan.largeSessionBytes,
+      `oversized session is ${manifest.hydrationTarget.bytes} B, wanted ~${plan.largeSessionBytes}`,
+    );
+    const others = manifest.sessions
+      .filter((session) => session.sessionId !== manifest.hydrationTarget.sessionId);
+    assert.ok(others.length > 0, "the plan also wrote ordinary sessions");
+    assert.ok(others.every((session) => session.bytes < manifest.hydrationTarget.bytes));
+    // `append_one_record` in the harness writes a Claude-shaped record and
+    // there is no codex equivalent, so this plan has no incremental target.
+    assert.equal(manifest.incrementalTarget, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a phase that needs Claude is refused before anything is measured", () => {
+  const codexOnly = planStore({ sources: ["codex"] });
+  const refused = unsupportedPhases(codexOnly, PHASE_ORDER);
+  assert.deepEqual(refused.map(({ phase }) => phase), ["incremental_sync"]);
+  assert.match(refused[0].reason, /needs a `claude` source/);
+  assert.match(refused[0].reason, /this plan has codex/);
+  // Everything else is provider-agnostic and must not be refused.
+  assert.deepEqual(
+    unsupportedPhases(codexOnly, PHASE_ORDER.filter((phase) => phase !== "incremental_sync")),
+    [],
+  );
+  assert.deepEqual(unsupportedPhases(planStore({}), PHASE_ORDER), []);
+  assert.deepEqual(unsupportedPhases(codexOnly, []), []);
+});
+
+test("OpenCode sessions are counted, not dropped from the total", async (t) => {
+  if (!(await opencodeAvailable())) {
+    t.skip("node:sqlite is unavailable on this Node; the OpenCode fixture cannot be written");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "sync-bench-opencode-"));
+  try {
+    const plan = planStore({
+      seed: 9, targetBytes: 48 * 1024, turns: 2,
+      sources: ["claude", "opencode"], largeSessionBytes: 0,
+    });
+    const manifest = await generateStore(plan, join(root, "home"));
+    assert.ok(manifest.opencodeSessions >= 10, "the OpenCode store was written");
+    assert.equal(manifest.fileSessionCount, manifest.sessions.length);
+    assert.equal(manifest.sessionCount, manifest.fileSessionCount + manifest.opencodeSessions);
+    assert.ok(
+      manifest.sessionCount > manifest.sessions.length,
+      "the total exceeds the file-backed list once an OpenCode store exists",
+    );
+    await stat(join(root, "home", ".local/share/opencode/opencode.db"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -224,7 +224,16 @@ input.
 
 `records` is the exact row delta across `history`, `session_events`,
 `tool_calls`, `file_edits` and `sessions`, counted from the database before and
-after — not a parser's own estimate. For the hydration phases it is the
+after — not a parser's own estimate.
+
+The oversized transcript the hydration phases target belongs to the first
+source `--sources` names, not always to Claude: slipping a Claude transcript
+into a store that did not ask for one would put a whole provider into the
+ingested byte count while the report still called the run codex-only.
+`incremental_sync` is the one phase that does require Claude, because the
+harness appends a Claude-shaped record and no other provider has an equivalent
+yet; asking for it without a Claude source is refused by name before any store
+is generated rather than surfacing as an empty path mid-run. For the hydration phases it is the
 `records_parsed` the hydration diagnostic reports.
 
 ### How peak RSS is measured

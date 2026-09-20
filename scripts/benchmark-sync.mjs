@@ -26,6 +26,7 @@ import {
   formatBytes,
   planStore,
   renderMarkdownTable,
+  unsupportedPhases,
 } from "./benchmark-sync-lib.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -162,6 +163,19 @@ function runPhase(phase, context) {
       ? `${context.manifest.hydrationTarget.source}:${context.manifest.hydrationTarget.sessionId}`
       : "",
   };
+  // The harness resolves these into paths. An empty one would surface as a
+  // confusing failure inside the timed region, so it stops here instead.
+  for (const [variable, needed] of [
+    ["AI_HIST_BENCH_APPEND", phase === "incremental_sync"],
+    ["AI_HIST_BENCH_SESSION", phase.startsWith("hydrate_")],
+  ]) {
+    if (needed && !env[variable]) {
+      throw new Error(
+        `phase ${phase} needs ${variable}, and the generated store produced none. `
+        + "Check the manifest's target for this phase.",
+      );
+    }
+  }
   const started = Date.now();
   const result = spawnSync(
     context.harness,
@@ -244,6 +258,16 @@ async function main(argv) {
     .filter(Boolean);
   for (const phase of phases) {
     if (!PHASE_ORDER.includes(phase)) throw new Error(`unknown phase ${phase}`);
+  }
+  // Refuse a phase/source combination before generating a store for it, so the
+  // answer is an error at the start rather than an empty path partway through.
+  const unsupported = unsupportedPhases(plan, phases);
+  if (unsupported.length > 0) {
+    throw new Error(
+      `this plan cannot measure ${unsupported.length} of the requested phases:\n`
+      + unsupported.map(({ phase, reason }) => `  - ${phase}: ${reason}`).join("\n")
+      + "\nAdd the source to --sources, or drop the phase from --phases.",
+    );
   }
   const repeat = Number(option(argv, "repeat", profile.repeat ?? 1));
   if (!Number.isSafeInteger(repeat) || repeat < 1) throw new Error("--repeat must be >= 1");
