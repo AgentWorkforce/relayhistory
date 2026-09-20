@@ -379,9 +379,28 @@ orders of magnitude larger.
 
 For the tiniest elapsed-time phases the thresholds file can also raise a ceiling
 for one named phase without loosening the others. Today `unchanged_sync` uses a
-120 ms phase-specific ceiling floor because healthy `ubuntu-latest` runs have
-already reached about 113 ms there; a lower ceiling measures runner jitter
+140 ms phase-specific ceiling floor; a lower ceiling measures runner jitter
 instead of a real no-op `watch` tick slowdown.
+
+It was 120 ms, set because healthy `ubuntu-latest` runs had already reached
+about 113 ms there. [#166](https://github.com/AgentWorkforce/relayhistory/issues/166)
+moved it to 140, and the reason is a store change rather than a slower no-op
+tick: making Cursor an event-level source means the synthetic store's Cursor
+transcripts now produce 192 `session_events` rows that no earlier release
+stored, so the database grows about 0.3 MiB and an unchanged tick reads about
+0.4 MiB more of it. On one machine, across four commits, the phase went ~100 ms
+on the pre-#166 main, ~102 ms with continuity relationships on top, and ~112 ms
+with #166 — and on a github-hosted `ubuntu-latest` (AMD EPYC 7763) the same head
+measured 125.3 ms. 120 gave about 6% of headroom over the runs it was set
+against; 140 keeps about 12% over the 125.3 ms worst case observed on the
+slowest CPU in the pool.
+
+The stored `ci-debug` baseline for the phase is still 51 ms and was **not**
+touched, because re-measuring it means running on the machine class the gate
+runs on. Raising the phase ceiling is the sanctioned move here — these floors
+"raise such a ceiling and never lower one" — but the baseline is now far enough
+from what the phase actually costs that it is worth a re-measure on
+`ubuntu-latest` the next time someone is in a position to take one.
 
 A phase that a profile names but that produced no measurement is a failure, not
 a skip. A run that measured nothing must not read as a pass.
