@@ -1797,6 +1797,28 @@ fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Resul
     Ok(exists != 0)
 }
 
+/// The stamp a previous run saved for one Grok session file.
+///
+/// An earlier build of this walk stored the stamp as a bare string. The shape
+/// now is an object that also carries the session id the file was indexed
+/// under, and both are read so an upgrade does not re-read the whole store.
+fn grok_state_stamp(entry: &Value) -> Option<&str> {
+    match entry {
+        Value::String(stamp) => Some(stamp.as_str()),
+        _ => entry.get("stamp").and_then(Value::as_str),
+    }
+}
+
+/// The session id a previous run indexed one Grok session file under, when it
+/// recorded one. `None` for a state file from the older shape, and for a file
+/// that held no session.
+fn grok_state_session(entry: &Value) -> Option<&str> {
+    entry
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
@@ -4010,14 +4032,38 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 continue;
             }
         };
-        if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
-            accounted += 1;
-            continue;
+        let recorded = grok_state.get(&key);
+        let recorded_stamp = recorded.and_then(grok_state_stamp).map(str::to_string);
+        let recorded_session = recorded.and_then(grok_state_session).map(str::to_string);
+        if recorded_stamp.as_deref() == Some(stamp.as_str()) {
+            // The stamp says the file has not changed. That is only half the
+            // question: `.sync-state.json` lives beside the database, so a
+            // deleted or rebuilt `history.db` keeps this file, and a stamp
+            // read on its own would answer "already indexed" for a session
+            // whose rows are gone -- until some file in the directory changes,
+            // which for a finished session is never. The Codex and Claude
+            // walks check the database for the same reason.
+            match recorded_session.as_deref() {
+                // Written by an older build that saved the stamp alone, so
+                // there is no session id to look the evidence up by. Trust
+                // the stamp, as that build did.
+                None => {
+                    accounted += 1;
+                    continue;
+                }
+                Some(id) if session_events_exist(conn, "grok", id)? => {
+                    accounted += 1;
+                    continue;
+                }
+                // Unchanged, and its evidence is missing: re-index it.
+                _ => {}
+            }
         }
         scanned += 1;
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
+                let session_id = session.session_id.clone();
                 // One session directory is one transaction: its evidence is
                 // replaced, not merged, and a reader must never see the gap
                 // between the two halves of that.
@@ -4026,12 +4072,15 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 tx.commit()?;
                 sessions += 1;
                 accounted += 1;
-                grok_state.insert(key, json!(stamp));
+                // The session id travels with the stamp so the next run can
+                // ask the database whether this evidence is still there.
+                grok_state.insert(key, json!({ "stamp": stamp, "session": session_id }));
             }
             Ok(None) => {
-                // Read fine, and there was no session in it.
+                // Read fine, and there was no session in it -- so there is no
+                // session id to check any future run against either.
                 accounted += 1;
-                grok_state.insert(key, json!(stamp));
+                grok_state.insert(key, json!({ "stamp": stamp }));
             }
             Err(error) => {
                 errors += 1;
@@ -5044,7 +5093,7 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     // that loss as the session's settled state until some file changes again.
     let updates_path = chat.with_file_name("updates.jsonl");
     let (updates, updates_present) = match fs::read_to_string(&updates_path) {
-        Ok(contents) => (grok::parse_updates(&contents), true),
+        Ok(contents) => (grok::parse_updates(&contents, &updates_path)?, true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             (grok::GrokUpdates::default(), false)
         }
@@ -5060,8 +5109,12 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let mut models: Vec<String> = Vec::new();
     let contents = fs::read_to_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for (number, row) in grok::jsonl_rows(&contents).enumerate() {
+        // A complete row that does not parse fails the read. The ingestion
+        // this feeds replaces the session's evidence, so dropping the row
+        // would commit a transcript that is missing a turn Grok did write --
+        // and save the stamp that stops the next run from looking again.
+        let Some(value) = grok::parse_jsonl_row(row, chat, number + 1)? else {
             continue;
         };
         if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
@@ -6417,6 +6470,14 @@ mod tests {
         assert_eq!(markers(), 2);
     }
 
+    /// The stamp sync saved for one Grok session file.
+    fn grok_saved_stamp<'a>(state: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+        state
+            .get(super::GROK_SYNC_STATE_KEY)?
+            .get(key)
+            .and_then(super::grok_state_stamp)
+    }
+
     /// Write a Grok session directory with no `updates.jsonl`, and answer with
     /// the transcript and the directory.
     fn grok_stream_fixture(home: &Path, id: &str) -> (PathBuf, PathBuf) {
@@ -6671,6 +6732,250 @@ mod tests {
         let error = super::sync_grok(&conn, &mut fresh, &root)
             .expect_err("a store that could account for nothing is a failed source");
         assert!(format!("{error:#}").contains("could not be read"));
+    }
+
+    /// What repeated prompts at one timestamp do to `history`, stated rather
+    /// than left to be discovered.
+    ///
+    /// `history` is keyed `UNIQUE(source, timestamp_ms, prompt)` and inserted
+    /// with `INSERT OR IGNORE`. Two turns with the same text at the same
+    /// millisecond are therefore one history row -- and `session_id` is not in
+    /// that key, so this holds across sessions and is a property of the shared
+    /// table, not of this parser: the positive control below shows two
+    /// different Claude sessions collapsing exactly the same way.
+    ///
+    /// Grok makes it visible rather than causing it. A session with no
+    /// `updates.jsonl` and no per-record times has one real timestamp --
+    /// `created_at` -- for every turn, so two `continue` turns collide where
+    /// another provider's per-record clock would separate them. The honest
+    /// answer is not to space them out by an artificial millisecond each:
+    /// that is precisely the synthesized `first_ts + index` ladder this work
+    /// deleted, and it would put a fabricated time in a ledger whose value is
+    /// that its times are real.
+    ///
+    /// So the transcript, which is keyed per record, keeps both turns, and the
+    /// prompt rollup keeps one. Widening the `history` key is a change to a
+    /// contract every provider shares (#198 and #199 rest on it too) and is
+    /// not this PR's to make; this test pins the behaviour so that whoever
+    /// does change it sees what Grok expects.
+    #[test]
+    fn repeated_prompts_at_one_timestamp_are_one_history_row_in_every_source() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-dup-0001");
+        fs::create_dir_all(&dir).unwrap();
+        // No `updates.jsonl`, and no record carries a time of its own, so
+        // every turn falls back to `created_at`.
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"content\":\"continue\"}\n",
+                "{\"type\":\"assistant\",\"content\":\"ok\"}\n",
+                "{\"type\":\"user\",\"content\":\"continue\"}\n",
+                "{\"type\":\"assistant\",\"content\":\"ok again\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-dup-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &home.path().join(".grok/sessions")).unwrap();
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE session_id = 'grok-dup-0001' AND role = 'user'"
+            ),
+            2,
+            "both turns are in the transcript, which is what replay reads"
+        );
+        let times: Vec<i64> = conn
+            .prepare(
+                "SELECT ts_ms FROM session_events \
+                 WHERE session_id = 'grok-dup-0001' AND role = 'user' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            times[0], times[1],
+            "the session records one real time, and both turns carry it unaltered"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM history WHERE source = 'grok'"),
+            1,
+            "the prompt rollup keys on (source, timestamp_ms, prompt), so they are one row"
+        );
+
+        // The positive control: the same collapse on a source with per-record
+        // times, proving the key and not the Grok parser is what does this.
+        let entry = |source: &str, session: &str| HistoryEntry {
+            id: 0,
+            source: source.into(),
+            session_id: Some(session.to_string()),
+            project: Some("/tmp/stream".into()),
+            prompt_hash: Some(prompt_hash("continue")),
+            prompt: "continue".into(),
+            timestamp_ms: times[0],
+        };
+        assert_eq!(
+            insert_history(&conn, &entry("claude", "claude-a")).unwrap(),
+            1,
+            "the first of the two is inserted, so the control can observe a difference"
+        );
+        assert_eq!(
+            insert_history(&conn, &entry("claude", "claude-b")).unwrap(),
+            0,
+            "a different Claude session collapses the same way; session_id is not in the key"
+        );
+    }
+
+    /// An unchanged file whose rows are gone is not an indexed session.
+    ///
+    /// `.sync-state.json` sits beside `history.db`, so deleting or rebuilding
+    /// the database leaves the state file behind. A stamp read on its own then
+    /// answers "already indexed" for a session with no rows at all, and goes
+    /// on answering it until some file in the directory changes -- which, for
+    /// a session the user has finished with, is never. The stamp has to be
+    /// checked against the database, the way the Codex and Claude walks
+    /// already check theirs.
+    #[test]
+    fn an_unchanged_session_whose_evidence_was_wiped_is_indexed_again() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, _dir) = grok_stream_fixture(home.path(), "grok-wipe-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let key = chat.to_string_lossy().to_string();
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let stamp = grok_saved_stamp(&state, &key).unwrap().to_string();
+
+        // The positive control: nothing was touched, the rows are there, and
+        // the run correctly does no work.
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 0);
+        assert!(super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+
+        // The database is rebuilt; the state file, living beside it, survives.
+        conn.execute("DELETE FROM session_events WHERE source = 'grok'", [])
+            .unwrap();
+        assert!(!super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(stamp.as_str()),
+            "the file has not changed, so the stamp still matches"
+        );
+
+        assert_eq!(
+            super::sync_grok(&conn, &mut state, &root).unwrap(),
+            1,
+            "an unchanged file with no rows behind it has to be read again"
+        );
+        assert!(super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+    }
+
+    /// A finished row that does not parse is a damaged file, not an empty one.
+    ///
+    /// Grok ingestion **replaces** a session's evidence: it deletes the stored
+    /// events and writes what it just read. Dropping an unparseable row would
+    /// therefore commit a transcript that is missing a turn Grok did write,
+    /// and then save the change stamp that stops the next run from ever
+    /// looking at the file again -- the loss becomes the session's settled
+    /// state. The read has to fail instead, so the previous transaction stands
+    /// and the stamp stays behind for a retry.
+    ///
+    /// The line that has *not* been newline-terminated is the one exception,
+    /// and the positive controls below hold it: a fragment Grok is still
+    /// writing is ignorable, and a valid rewrite still replaces.
+    #[test]
+    fn a_malformed_finished_row_fails_the_read_instead_of_erasing_the_session() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, _dir) = grok_stream_fixture(home.path(), "grok-mal-0001");
+        let (sibling, _) = grok_stream_fixture(home.path(), "grok-mal-0002");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let key = chat.to_string_lossy().to_string();
+        let events = |session: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 2);
+        let indexed = events("grok-mal-0001");
+        assert!(indexed > 0, "the session was indexed before it was damaged");
+        let first_stamp = grok_saved_stamp(&state, &key)
+            .expect("a healthy session is checkpointed")
+            .to_string();
+
+        // The one complete row of the transcript, damaged but still finished.
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\n").unwrap();
+        let damaged_stamp = grok_session_stamp(&chat).unwrap();
+        assert_ne!(
+            damaged_stamp, first_stamp,
+            "the rewrite has to look like a change, or the run would skip it"
+        );
+
+        let inserted = super::sync_grok(&conn, &mut state, &root)
+            .expect("the readable sibling accounts for itself; the source has not failed");
+        assert_eq!(inserted, 0, "nothing was indexed from the damaged session");
+        assert_eq!(
+            events("grok-mal-0001"),
+            indexed,
+            "the evidence from the last good read survives the failed one"
+        );
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(first_stamp.as_str()),
+            "the stamp does not advance over a read that failed, so the next run retries"
+        );
+
+        // Positive control one: a trailing fragment with no newline is a
+        // record still being written. It scans clean, and the finished rows
+        // before it are still indexed.
+        fs::write(
+            &sibling,
+            "{\"type\":\"user\",\"content\":\"finished\"}\n{\"type\":\"user\",\"cont",
+        )
+        .unwrap();
+        let scanned = super::scan_grok_session_file(&sibling)
+            .expect("an unfinished tail is not a damaged file")
+            .expect("the finished row is still a session");
+        assert_eq!(scanned.lines.len(), 1, "the fragment is skipped, not read");
+
+        // Positive control two: repair the transcript and the session is
+        // replaced, stamp and all.
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\"rewritten\"}\n").unwrap();
+        assert_eq!(
+            super::sync_grok(&conn, &mut state, &root).unwrap(),
+            2,
+            "the repaired session and the sibling control one rewrote both re-index"
+        );
+        assert_ne!(
+            grok_saved_stamp(&state, &key),
+            Some(first_stamp.as_str()),
+            "a read that worked does advance the stamp"
+        );
+        let text: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE session_id = ? AND role = 'user'",
+                ["grok-mal-0001"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("rewritten"), "unexpected content: {text}");
     }
 
     #[test]

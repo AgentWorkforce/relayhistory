@@ -61,8 +61,10 @@
 //! in the file. The previous parser stamped prompt *n* with
 //! `created_at + n` milliseconds, which is a fabricated fact.
 
+use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // chat_history.jsonl
@@ -533,13 +535,70 @@ impl GrokUpdates {
     }
 }
 
+/// One complete record of a JSONL file, or the unfinished tail.
+///
+/// The distinction is the whole point: a row that ends in a newline is a row
+/// Grok finished writing, so if it does not parse the file is damaged and the
+/// read has to fail. Only the final piece of the file can lack its newline,
+/// and that one may be a record still being written.
+pub(crate) struct JsonlRow<'a> {
+    pub(crate) text: &'a str,
+    /// The row was newline-terminated, so Grok finished writing it.
+    pub(crate) complete: bool,
+}
+
+/// Split a JSONL file into rows, saying for each whether it is complete.
+pub(crate) fn jsonl_rows(contents: &str) -> impl Iterator<Item = JsonlRow<'_>> {
+    contents
+        .split_inclusive('\n')
+        .map(|row| match row.strip_suffix('\n') {
+            Some(text) => JsonlRow {
+                text: text.strip_suffix('\r').unwrap_or(text),
+                complete: true,
+            },
+            // Only the final piece can lack its newline.
+            None => JsonlRow {
+                text: row,
+                complete: false,
+            },
+        })
+}
+
+/// Parse one JSONL row, failing the read when a *complete* row does not parse.
+///
+/// `Ok(None)` is a blank line, or an unterminated trailing fragment that does
+/// not parse -- a record Grok is still writing. A complete row that is not
+/// JSON is an error, because the caller is about to **replace** this session's
+/// stored evidence with what it read: silently dropping the row would commit a
+/// snapshot that is missing a turn Grok did write, and save a change stamp
+/// that stops the next run from ever looking again.
+///
+/// A trailing fragment that *does* parse is kept. Not every JSONL writer
+/// terminates its last line, and discarding a whole record over a missing
+/// newline would lose evidence just as surely.
+pub(crate) fn parse_jsonl_row(
+    row: JsonlRow<'_>,
+    path: &Path,
+    number: usize,
+) -> Result<Option<Value>> {
+    if row.text.trim().is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str(row.text) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if !row.complete => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("{}: line {number} is not valid JSON", path.display())),
+    }
+}
+
 /// Read `updates.jsonl` into the timing facts the join needs.
-pub(crate) fn parse_updates(contents: &str) -> GrokUpdates {
+pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> {
     let mut updates = GrokUpdates::default();
     let mut previous_kind: Option<UpdateKind> = None;
     let mut turn;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for (number, row) in jsonl_rows(contents).enumerate() {
+        let Some(value) = parse_jsonl_row(row, path, number + 1)? else {
             continue;
         };
         let params = value.get("params").unwrap_or(&Value::Null);
@@ -675,7 +734,7 @@ pub(crate) fn parse_updates(contents: &str) -> GrokUpdates {
         }
         previous_kind = Some(kind);
     }
-    updates
+    Ok(updates)
 }
 
 /// The time one whole `updates.jsonl` line recorded, for a caller that has the
@@ -814,6 +873,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// `parse_updates` for the timing tests, which all feed a well-formed
+    /// stream. The malformed-row contract has its own tests below.
+    fn parse_updates_ok(contents: &str) -> GrokUpdates {
+        parse_updates(contents, Path::new("updates.jsonl")).expect("a well-formed stream")
+    }
+
     #[test]
     fn a_user_record_keeps_only_what_the_person_typed() {
         let line = parse_chat_record(&json!({
@@ -908,12 +973,66 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_row_that_is_not_json_fails_the_read() {
+        let path = Path::new("updates.jsonl");
+        let chunk = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":1000}}}"#;
+
+        // The positive control first: the same stream, intact, is read.
+        let good = parse_updates(&format!("{chunk}\n"), path).expect("a finished row parses");
+        assert_eq!(good.agent_messages.len(), 1);
+
+        // One finished row that is not JSON fails the whole read, naming the
+        // line -- it must not come back as a stream that is merely shorter.
+        let error = parse_updates(&format!("{chunk}\n{{\"method\":\n"), path)
+            .expect_err("a finished row that is not JSON is a damaged file");
+        assert!(
+            format!("{error:#}").contains("line 2"),
+            "unexpected error: {error:#}"
+        );
+
+        // A blank line is not a damaged row.
+        let blank = parse_updates(&format!("{chunk}\n\n"), path).expect("a blank line is skipped");
+        assert_eq!(blank.agent_messages.len(), 1);
+    }
+
+    #[test]
+    fn an_unterminated_tail_is_read_when_it_parses_and_ignored_when_it_does_not() {
+        let path = Path::new("updates.jsonl");
+        let chunk = |kind: &str, ms: i64| {
+            format!(
+                r#"{{"method":"session/update","params":{{"update":{{"sessionUpdate":"{kind}"}},"_meta":{{"agentTimestampMs":{ms}}}}}}}"#
+            )
+        };
+        // Two rows of *different* kinds, so each is its own group: consecutive
+        // rows of one kind coalesce, which would hide whether the second was
+        // read at all.
+        let first = chunk("agent_message_chunk", 1000);
+        let tail = chunk("user_message_chunk", 2000);
+
+        // A record Grok has finished writing but not yet terminated is still a
+        // record. Dropping it over a missing newline would lose evidence just
+        // as surely as dropping a malformed one.
+        let whole = parse_updates(&format!("{first}\n{tail}"), path)
+            .expect("an unterminated tail that parses is not damage");
+        assert_eq!(whole.agent_messages.len(), 1);
+        assert_eq!(whole.user_messages.len(), 1, "the tail was read");
+        assert_eq!(whole.user_messages[0].ts_ms, Some(2000));
+
+        // Truncated mid-write, it is ignored rather than failing the read --
+        // the one case where an unparseable row is not evidence of damage.
+        let torn = parse_updates(&format!("{first}\n{{\"method\":\"ses"), path)
+            .expect("a half-written tail is a record still being written");
+        assert_eq!(torn.agent_messages.len(), 1);
+        assert!(torn.user_messages.is_empty());
+    }
+
+    #[test]
     fn a_field_named_in_milliseconds_is_never_rescaled() {
         // A field named `…Ms` is milliseconds even when it is small; running
         // it through the seconds/milliseconds inference would multiply a real
         // value by a thousand.
         let stream = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":1000}}}"#;
-        let updates = parse_updates(stream);
+        let updates = parse_updates_ok(stream);
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
     }
 
@@ -940,7 +1059,7 @@ mod tests {
             r#"{"timestamp":1789560001,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"two"}},"_meta":{"eventId":"b","agentTimestampMs":1789560001000,"turnStartMs":1789560000000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         assert_eq!(updates.agent_messages.len(), 1);
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1_789_560_000_000));
         assert_eq!(updates.agent_messages[0].event_id.as_deref(), Some("a"));
@@ -957,7 +1076,7 @@ mod tests {
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"b","agentTimestampMs":5000,"turnStartMs":5000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         assert_eq!(updates.agent_messages.len(), 2, "two turns, two messages");
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
         assert_eq!(updates.agent_messages[0].turn, 0);
@@ -976,7 +1095,7 @@ mod tests {
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"c","agentTimestampMs":1200,"turnStartMs":1000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         assert_eq!(updates.agent_messages.len(), 1);
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
         assert_eq!(updates.turns.len(), 1);
@@ -989,7 +1108,7 @@ mod tests {
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"failed"},"_meta":{"agentTimestampMs":2000,"turnStartMs":500}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         let timing = updates.tools.get("c1").expect("timing for c1");
         assert_eq!(timing.started_ms, Some(1000));
         assert_eq!(timing.finished_ms, Some(2000));
@@ -1005,7 +1124,7 @@ mod tests {
             r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","usage":{"totalTokens":99}},"_meta":{"agentTimestampMs":4000,"turnStartMs":3000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         assert_eq!(updates.turns.len(), 2);
         assert_eq!(updates.turns[0].total_tokens, Some(4242));
         // The proxy can fall between turns; nothing here treats that as an error.
@@ -1031,7 +1150,7 @@ mod tests {
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"next"}},"_meta":{"eventId":"c","agentTimestampMs":5000,"turnStartMs":1000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         // Two messages: the streamed one, and the one after it. Not three.
         assert_eq!(updates.agent_messages.len(), 2);
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
@@ -1057,7 +1176,7 @@ mod tests {
             r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":77},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
         ]
         .join("\n");
-        let updates = parse_updates(&stream);
+        let updates = parse_updates_ok(&stream);
         assert_eq!(updates.turns.len(), 1);
         assert_eq!(updates.turns[0].start_ms, Some(1000));
         assert_eq!(updates.turns[0].total_tokens, Some(77));
@@ -1068,7 +1187,7 @@ mod tests {
     fn an_uninterpreted_update_kind_is_counted_not_guessed_at() {
         let stream =
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"hook_execution"}}}"#;
-        let updates = parse_updates(stream);
+        let updates = parse_updates_ok(stream);
         assert_eq!(updates.unread_rows, 1);
         assert!(updates.agent_messages.is_empty());
     }
