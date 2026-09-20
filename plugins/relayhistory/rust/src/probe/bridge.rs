@@ -351,7 +351,7 @@ fn change(
     )?;
     let changed = (|| -> Result<()> {
         if was_running {
-            collector::stop(directory)?;
+            collector::stop_for_change(directory)?;
         }
         let _guard = lock(directory)?;
         recover(directory)?;
@@ -368,15 +368,29 @@ fn change(
         save_json(&directory.join("sharing-change.json"), &plan)?;
         apply_plan(directory, plan)
     })();
-    // Restore the collector even if a post-stop step fails. If a durable plan
-    // exists, start_background replays it before the collector can deliver.
-    let restart = if was_running && !collector::running(directory)? {
-        collector::start_background(directory)
-    } else {
-        Ok(())
-    };
-    restart?;
-    changed?;
+    // A child refuses to run while a durable change is pending. Finish its
+    // replay under collector.lock before launching the replacement process.
+    let restart = (|| -> Result<bool> {
+        if was_running && !collector::running(directory)? {
+            let recovered = prepare_restart(directory)?;
+            collector::start_background(directory)?;
+            return Ok(recovered);
+        }
+        Ok(false)
+    })();
+    match (changed, restart) {
+        (Err(change), Err(restart)) => {
+            return Err(anyhow::anyhow!(
+                "sharing change failed: {change:#}; collector restoration also failed: {restart:#}"
+            ))
+        }
+        // A transient apply failure can be fully resolved by replaying the
+        // durable plan before restart; report success once it is committed.
+        (Err(_), Ok(true)) => {}
+        (Err(change), Ok(false)) => return Err(change),
+        (Ok(()), Err(restart)) => return Err(restart),
+        (Ok(()), Ok(_)) => {}
+    }
     if let Some(mode) = requested {
         emit(json!({"sharing_mode":mode,"regenerated":true}));
     } else if include {
@@ -385,6 +399,12 @@ fn change(
         emit(json!({"excluded":keys,"regenerated":true}));
     }
     Ok(())
+}
+fn prepare_restart(directory: &Path) -> Result<bool> {
+    let _guard = lock(directory)?;
+    let pending = directory.join("sharing-change.json").exists();
+    recover(directory)?;
+    Ok(pending)
 }
 fn make_plan(
     conn: &Connection,
@@ -726,6 +746,33 @@ mod tests {
             1
         );
         assert!(!dir.path().join("sharing-change.json").exists());
+    }
+    #[test]
+    fn restart_replays_pending_change_before_child_launch() {
+        let (dir, config) = fixture(SharingMode::All);
+        let conn = db(dir.path()).unwrap();
+        let plan = make_plan(
+            &conn,
+            dir.path(),
+            config.clone(),
+            Some(SharingMode::Selected),
+            &[],
+            true,
+        )
+        .unwrap();
+        save_json(&dir.path().join("sharing-change.json"), &plan).unwrap();
+        delivery::cancel_job(&conn, &config.job_id).unwrap();
+
+        assert!(prepare_restart(dir.path()).unwrap());
+
+        assert!(!dir.path().join("sharing-change.json").exists());
+        let recovered = read_config(dir.path()).unwrap();
+        assert_eq!(mode(&recovered), SharingMode::Selected);
+        assert_eq!(excluded(&conn).unwrap().len(), 2);
+        assert_eq!(
+            delivery::status(&conn, &recovered.job_id).unwrap().state,
+            "active"
+        );
     }
     #[test]
     fn unknown_selection_is_rejected_before_any_generation_change() {

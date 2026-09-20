@@ -132,10 +132,6 @@ pub fn capture(directory: &Path, history_url: &str) -> Result<()> {
 }
 
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
-    ensure!(
-        destination::selected_account(Some(&config.history_url))? == config.delivery_account,
-        "wrong destination"
-    );
     let paused = {
         let conn = ai_hist::open_db(&directory.join("history.db"))?;
         delivery::status(&conn, &config.job_id)?.state == "paused"
@@ -146,6 +142,10 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
             "capture not complete"
         );
     } else {
+        ensure!(
+            destination::selected_account(Some(&config.history_url))? == config.delivery_account,
+            "wrong destination"
+        );
         capture(directory, &config.history_url)?;
     }
     deliver_captured(directory, config, false)
@@ -231,6 +231,15 @@ pub fn print_status(directory: &Path) -> Result<()> {
     Ok(())
 }
 pub fn stop(directory: &Path) -> Result<()> {
+    stop_with_timeout(directory, Some(Duration::from_secs(45)))
+}
+pub fn stop_for_change(directory: &Path) -> Result<()> {
+    // The durable stop request may outlive the normal CLI deadline. A sharing
+    // change must wait for the lock to be released before it can safely apply
+    // its plan and guarantee a replacement collector is started.
+    stop_with_timeout(directory, None)
+}
+fn stop_with_timeout(directory: &Path, timeout: Option<Duration>) -> Result<()> {
     if !running(directory)? {
         humanln!("Probe is stopped.");
         return Ok(());
@@ -244,16 +253,19 @@ pub fn stop(directory: &Path) -> Result<()> {
         &directory.join("stop.json"),
         &json!({"startup_id":startup_id}),
     )?;
-    for _ in 0..45 {
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    loop {
         if !running(directory)? {
             humanln!("Probe stopped.");
             return Ok(());
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(user_error(
+                "Stop was requested. The probe is finishing its current capture operation.",
+            ));
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
-    Err(user_error(
-        "Stop was requested. The probe is finishing its current capture operation.",
-    ))
 }
 pub(super) fn stop_requested(directory: &Path, startup_id: &str) -> bool {
     let matched = fs::read(directory.join("stop.json"))
@@ -396,6 +408,7 @@ pub fn start_background(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
         delivery::DeliveryJobConfig {
             destination_id: DESTINATION.into(),
@@ -405,6 +418,33 @@ mod tests {
             selection: selection(include_existing),
             limits: Default::default(),
         }
+    }
+    #[test]
+    fn sharing_stop_waits_for_collector_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("collector.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        save_json(
+            &dir.path().join("runtime.json"),
+            &json!({"startup_id":"test-run"}),
+        )
+        .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            FileExt::unlock(&lock).unwrap();
+        });
+
+        stop_for_change(dir.path()).unwrap();
+
+        release.join().unwrap();
+        assert!(stop_requested(dir.path(), "test-run"));
+        assert!(!running(dir.path()).unwrap());
     }
     /// Claim batches until one survives exclusion, and report its sessions.
     fn claim_sessions(conn: &Connection, job_id: &str) -> Vec<String> {
