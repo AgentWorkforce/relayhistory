@@ -170,3 +170,44 @@ test('catalog cursors retain tied session identities and hydration failure leave
     assert.deepEqual((await listSessionCatalogPage({ dbPath, scope: 'local', limit: 100 })).sessions, all.sessions);
   });
 });
+
+test('per-message raw provider facts reach the SDK unnormalized', async () => {
+  await withFixture(async ({ home, dbPath }) => {
+    const directory = join(home, '.claude', 'projects', '-work-facts');
+    await mkdir(directory, { recursive: true });
+    const common = { sessionId: 'facts-session', cwd: '/work/facts', version: '2.1.96' };
+    await writeFile(join(directory, 'facts-session.jsonl'), [
+      { ...common, type: 'user', uuid: 'facts-user', timestamp: '2026-09-01T10:00:00.000Z',
+        message: { role: 'user', content: 'contractneedle facts' } },
+      // Still in flight: no stop_reason, and the SDK must report that as null
+      // rather than inventing a terminal reason.
+      { ...common, type: 'assistant', uuid: 'facts-open', parentUuid: 'facts-user', requestId: 'req_open',
+        isSidechain: false, timestamp: '2026-09-01T10:00:01.000Z',
+        message: { role: 'assistant', stop_reason: null, content: [{ type: 'text', text: 'working' }] } },
+      { ...common, type: 'assistant', uuid: 'facts-done', parentUuid: 'facts-open', requestId: 'req_done',
+        isSidechain: false, timestamp: '2026-09-01T10:00:02.000Z',
+        message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'finished' }] } },
+    ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+
+    await discoverSessions({ dbPath, scope: 'local', sources: ['claude'] });
+    await hydrateSession({ source: 'claude', sessionId: 'facts-session', dbPath });
+
+    const events = await getSessionEvents('facts-session', { source: 'claude', dbPath });
+    assert.deepEqual(
+      events.map((event) => [event.requestId, event.stopReason, event.agentVersion, event.isSidechain]),
+      [
+        // The opening human turn records no flag at all, and a provider that
+        // never says either way leaves it null -- a different fact from false.
+        [null, null, '2.1.96', null],
+        ['req_open', null, '2.1.96', false],
+        ['req_done', 'end_turn', '2.1.96', false],
+      ],
+    );
+    assert.deepEqual(events.map((event) => event.isMeta), [null, null, null]);
+    assert.deepEqual(events.map((event) => event.turnId), [null, null, null]);
+
+    // A page carries the same shape as the whole-session read.
+    const page = await getSessionEventsPage('facts-session', { source: 'claude', dbPath });
+    assert.deepEqual(page.events, events);
+  });
+});

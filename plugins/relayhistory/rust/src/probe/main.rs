@@ -276,18 +276,22 @@ fn check_legacy_schedules(acknowledge_uninspected_schedules: bool) -> Result<()>
     }
     Ok(())
 }
-fn install(options: Install) -> Result<()> {
+fn validate_setup_mode(options: &Install, json: bool) -> Result<()> {
     ensure!(
-        !bridge::json_mode() || (!options.foreground && !options.once),
-        "JSON setup requires background mode"
+        !json || (!options.foreground && !options.once),
+        user_error("JSON setup requires background mode. Omit --once and --foreground.")
     );
     ensure!(
-        !bridge::json_mode()
+        !json
             || options.include_existing
             || options.new_sessions_only
             || options.selected_sessions_only,
-        "JSON setup requires an explicit sharing choice"
+        user_error("JSON setup requires an explicit sharing choice: --include-existing, --new-sessions-only, or --selected-sessions-only.")
     );
+    Ok(())
+}
+fn install(options: Install) -> Result<()> {
+    validate_setup_mode(&options, bridge::json_mode())?;
     let site = cloud::site_origin(&options.site_url)?;
     let api_url = cloud::cloud_api_url(Some(&format!("{site}/cloud")))?;
     for id in [options.account.as_deref(), options.workspace.as_deref()]
@@ -516,6 +520,34 @@ mod tests {
         ])
         .is_err());
     }
+    #[test]
+    fn json_setup_reports_specific_safe_validation_errors() {
+        for (extra, expected) in [
+            (vec!["--once", "--include-existing"], "background mode"),
+            (
+                vec!["--foreground", "--selected-sessions-only"],
+                "background mode",
+            ),
+            (vec![], "explicit sharing choice"),
+        ] {
+            let cli =
+                Cli::try_parse_from([vec!["probe", "cloud", "install", "--json"], extra].concat())
+                    .unwrap();
+            let Commands::Cloud {
+                command: CloudCommands::Install(options),
+            } = cli.command
+            else {
+                panic!("install expected")
+            };
+            let error = validate_setup_mode(&options, cli.json).unwrap_err();
+            assert!(error
+                .downcast_ref::<UserError>()
+                .unwrap()
+                .to_string()
+                .contains(expected));
+        }
+    }
+
     #[test]
     fn stop_requests_only_match_their_run_identity() {
         let directory = tempfile::tempdir().unwrap();

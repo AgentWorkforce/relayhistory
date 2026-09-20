@@ -2,9 +2,9 @@
 //! Sharing changes stop the collector and persist a replayable plan before
 //! replacing a delivery generation. An interrupted change fences startup until
 //! recovery completes, so it cannot accidentally broaden sharing.
-use super::{collector, lock, read_config, save_json, Config, Target};
+use super::{collector, lock, read_config, save_json, user_error, Config, Target};
 use ai_hist::delivery::{self, DeliveryJobConfig, SessionIdentity};
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use fs2::FileExt;
 use rusqlite::Connection;
@@ -215,7 +215,7 @@ pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let config = read_config(directory)?;
     ensure!(
         !directory.join("sharing-change.json").exists(),
-        "sharing update incomplete"
+        user_error("A sharing update is incomplete. Run start to recover it before retrying.")
     );
     let conn = db(directory)?;
     if paused {
@@ -259,7 +259,8 @@ fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<V
         let batch: delivery::HistoryExportBatch = serde_json::from_str(&payload)?;
         for record in batch.records {
             if let Some(id) = record.session_id {
-                pending.insert(
+                mark_pending(
+                    &mut pending,
                     SessionIdentity {
                         source: record.source,
                         session_id: id,
@@ -291,6 +292,16 @@ fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<V
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
+fn mark_pending(
+    pending: &mut HashMap<SessionIdentity, bool>,
+    identity: SessionIdentity,
+    leased: bool,
+) {
+    pending
+        .entry(identity)
+        .and_modify(|active| *active |= leased)
+        .or_insert(leased);
+}
 pub fn sharing(command: SharingCommand) -> Result<()> {
     match command {
         SharingCommand::Set(options) => {
@@ -308,8 +319,13 @@ struct ChangePlan {
     paused: bool,
 }
 fn parse_key(key: &str) -> Result<SessionIdentity> {
-    let (source, id) = key.split_once(':').context("invalid session key")?;
-    ensure!(!source.is_empty() && !id.is_empty(), "invalid session key");
+    let (source, id) = key
+        .split_once(':')
+        .ok_or_else(|| user_error("Invalid session key. Use SOURCE:ID from sessions list."))?;
+    ensure!(
+        !source.is_empty() && !id.is_empty(),
+        user_error("Invalid session key. Use SOURCE:ID from sessions list.")
+    );
     Ok(SessionIdentity {
         source: source.into(),
         session_id: id.into(),
@@ -326,24 +342,60 @@ fn change(
         .iter()
         .map(|key| parse_key(key))
         .collect::<Result<_>>()?;
-    collector::stop(directory)?;
-    let guard = lock(directory)?;
-    recover(directory)?;
+    // Reject stale keys while the collector is still running. Rebuild the plan
+    // under collector.lock after stopping so newly captured sessions are seen.
+    let was_running = collector::running(directory)?;
     let config = read_config(directory)?;
-    let conn = db(directory)?;
-    let plan = make_plan(
-        &conn,
+    make_plan(
+        &read_db(directory)?,
         directory,
         config,
         requested,
         &identities_requested,
         include,
     )?;
-    save_json(&directory.join("sharing-change.json"), &plan)?;
-    apply_plan(directory, plan)?;
-    drop(conn);
-    drop(guard);
-    collector::start_background(directory)?;
+    let changed = (|| -> Result<()> {
+        if was_running {
+            collector::stop_for_change(directory)?;
+        }
+        let _guard = lock(directory)?;
+        recover(directory)?;
+        let config = read_config(directory)?;
+        let conn = db(directory)?;
+        let plan = make_plan(
+            &conn,
+            directory,
+            config,
+            requested,
+            &identities_requested,
+            include,
+        )?;
+        save_json(&directory.join("sharing-change.json"), &plan)?;
+        apply_plan(directory, plan)
+    })();
+    // A child refuses to run while a durable change is pending. Finish its
+    // replay under collector.lock before launching the replacement process.
+    let restart = (|| -> Result<bool> {
+        if was_running && !collector::running(directory)? {
+            let recovered = prepare_restart(directory)?;
+            collector::start_background(directory)?;
+            return Ok(recovered);
+        }
+        Ok(false)
+    })();
+    match (changed, restart) {
+        (Err(change), Err(restart)) => {
+            return Err(anyhow::anyhow!(
+                "sharing change failed: {change:#}; collector restoration also failed: {restart:#}"
+            ))
+        }
+        // A transient apply failure can be fully resolved by replaying the
+        // durable plan before restart; report success once it is committed.
+        (Err(_), Ok(true)) => {}
+        (Err(change), Ok(false)) => return Err(change),
+        (Ok(()), Err(restart)) => return Err(restart),
+        (Ok(()), Ok(_)) => {}
+    }
     if let Some(mode) = requested {
         emit(json!({"sharing_mode":mode,"regenerated":true}));
     } else if include {
@@ -352,6 +404,12 @@ fn change(
         emit(json!({"excluded":keys,"regenerated":true}));
     }
     Ok(())
+}
+fn prepare_restart(directory: &Path) -> Result<bool> {
+    let _guard = lock(directory)?;
+    let pending = directory.join("sharing-change.json").exists();
+    recover(directory)?;
+    Ok(pending)
 }
 fn make_plan(
     conn: &Connection,
@@ -364,7 +422,7 @@ fn make_plan(
     let known = identities(conn)?;
     ensure!(
         identities_requested.iter().all(|id| known.contains(id)),
-        "unknown session"
+        user_error("Unknown session. Refresh sessions list and try again.")
     );
     let old = delivery::status(conn, &config.job_id)?;
     let mut selected = selected(directory)?;
@@ -531,6 +589,48 @@ mod tests {
     }
 
     #[test]
+    fn paused_capture_contention_is_not_an_offline_failure() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let conn = db(dir.path()).unwrap();
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        let sync_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("history.db.sync.lock"))
+            .unwrap();
+        sync_lock.lock_exclusive().unwrap();
+        collector::cycle(dir.path(), &config).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "paused"
+        );
+    }
+
+    #[test]
+    fn bridge_validation_errors_are_safe_and_actionable() {
+        for key in ["private-input", ":id", "codex:"] {
+            let error = parse_key(key).unwrap_err();
+            let safe = error.downcast_ref::<super::super::UserError>().unwrap();
+            assert!(safe.to_string().contains("SOURCE:ID"));
+            assert!(!safe.to_string().contains("private-input"));
+        }
+        let (dir, _) = fixture(SharingMode::Selected);
+        let error = change(dir.path(), None, &["codex:private-missing".into()], true).unwrap_err();
+        let safe = error.downcast_ref::<super::super::UserError>().unwrap();
+        assert!(safe.to_string().contains("Unknown session"));
+        assert!(!safe.to_string().contains("private-missing"));
+        save_json(&dir.path().join("sharing-change.json"), &json!({})).unwrap();
+        let error = pause(dir.path(), true).unwrap_err();
+        assert!(error
+            .downcast_ref::<super::super::UserError>()
+            .unwrap()
+            .to_string()
+            .contains("Run start"));
+    }
+
+    #[test]
     fn every_desktop_command_accepts_json_and_target_flags() {
         let target = ["--account", "account", "--workspace", "workspace", "--json"];
         for name in ["start", "status", "pause", "resume", "disconnect"] {
@@ -596,6 +696,25 @@ mod tests {
             selected(dir.path()).unwrap(),
             vec![parse_key("claude:old").unwrap()]
         );
+    }
+    #[test]
+    fn drain_rechecks_selected_mode_after_a_failed_capture() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let conn = db(dir.path()).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('codex','discovered')",
+            [],
+        )
+        .unwrap();
+        assert!(!excluded(&conn)
+            .unwrap()
+            .contains(&parse_key("codex:discovered").unwrap()));
+        // No destination credentials are installed in this fixture. Selection
+        // must be enforced before the drain reaches any transport setup.
+        let _ = collector::deliver_captured(dir.path(), &config, false);
+        assert!(excluded(&conn)
+            .unwrap()
+            .contains(&parse_key("codex:discovered").unwrap()));
     }
     #[test]
     fn including_a_session_regenerates_and_preserves_pause() {
@@ -676,22 +795,72 @@ mod tests {
         assert!(!dir.path().join("sharing-change.json").exists());
     }
     #[test]
-    fn unknown_selection_is_rejected_before_any_generation_change() {
-        let (dir, config) = fixture(SharingMode::Selected);
+    fn restart_replays_pending_change_before_child_launch() {
+        let (dir, config) = fixture(SharingMode::All);
         let conn = db(dir.path()).unwrap();
-        assert!(make_plan(
+        let plan = make_plan(
             &conn,
             dir.path(),
             config.clone(),
-            None,
-            &[parse_key("claude:missing").unwrap()],
-            true
+            Some(SharingMode::Selected),
+            &[],
+            true,
         )
-        .is_err());
+        .unwrap();
+        save_json(&dir.path().join("sharing-change.json"), &plan).unwrap();
+        delivery::cancel_job(&conn, &config.job_id).unwrap();
+
+        assert!(prepare_restart(dir.path()).unwrap());
+
+        assert!(!dir.path().join("sharing-change.json").exists());
+        let recovered = read_config(dir.path()).unwrap();
+        assert_eq!(mode(&recovered), SharingMode::Selected);
+        assert_eq!(excluded(&conn).unwrap().len(), 2);
+        assert_eq!(
+            delivery::status(&conn, &recovered.job_id).unwrap().state,
+            "active"
+        );
+    }
+    #[test]
+    fn unknown_selection_is_rejected_before_any_generation_change() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let conn = db(dir.path()).unwrap();
+        let collector_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("collector.lock"))
+            .unwrap();
+        collector_lock.lock_exclusive().unwrap();
+        assert!(collector::running(dir.path()).unwrap());
+        let error = change(dir.path(), None, &["claude:missing".into()], true).unwrap_err();
+        assert!(error.to_string().contains("Unknown session"));
+        assert!(!dir.path().join("stop.json").exists());
+        assert!(!dir.path().join("sharing-change.json").exists());
         assert_eq!(
             delivery::status(&conn, &config.job_id).unwrap().state,
             "active"
         );
+    }
+    #[test]
+    fn changing_a_stopped_install_does_not_start_a_collector() {
+        let (dir, _) = fixture(SharingMode::Selected);
+        assert!(!collector::running(dir.path()).unwrap());
+        change(dir.path(), None, &["claude:old".into()], true).unwrap();
+        assert!(!collector::running(dir.path()).unwrap());
+        assert!(!dir.path().join("runtime.json").exists());
+    }
+    #[test]
+    fn leased_batch_wins_over_pending_for_the_same_session() {
+        let id = parse_key("claude:old").unwrap();
+        for order in [[false, true], [true, false]] {
+            let mut pending = HashMap::new();
+            for leased in order {
+                mark_pending(&mut pending, id.clone(), leased);
+            }
+            assert_eq!(pending.get(&id), Some(&true));
+        }
     }
     #[test]
     fn queued_status_identifies_actual_pending_batch_sessions() {
