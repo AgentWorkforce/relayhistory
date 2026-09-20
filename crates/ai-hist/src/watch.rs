@@ -194,6 +194,22 @@ fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
     roots.iter().any(|root| root.covers(&path))
 }
 
+/// The registration keys of every root `path` names, for a removal event.
+///
+/// The event arrives in whichever spelling the backend reports, and a root
+/// answers to more than one — so the *root* decides whether this is its
+/// removal, and what comes back is the root's own key rather than the path
+/// that was reported. That is what keeps the recording side and the lookup
+/// side from drifting apart: there is one key, and it comes from here.
+fn removed_registration_keys(path: &Path, roots: &[WatchRoot]) -> Vec<PathBuf> {
+    let path = discover::watch_path(path);
+    roots
+        .iter()
+        .filter(|root| root.registers_at(&path))
+        .map(|root| root.registration_key().to_path_buf())
+        .collect()
+}
+
 #[derive(Default)]
 struct WakeState {
     /// A change signal is pending. Single-bit on purpose: a thousand events
@@ -815,26 +831,21 @@ mod fs_events {
             let watcher = &mut self.watcher;
             let mut stale = self.stale.lock().expect("stale roots");
             self.watched.retain_mut(|entry| {
-                let reported_gone = stale.remove(entry.root.registered_path());
-                let current = root_identity(entry.root.registered_path());
+                let reported_gone = stale.remove(entry.root.registration_key());
+                let current = root_identity(entry.root.registration_key());
                 if !reported_gone && current.is_some() && current == entry.identity {
                     return true;
                 }
                 // Best effort: the old watch may already be gone with its
                 // directory, and failing to drop it is not a reason to keep
                 // claiming it.
-                let _ = watcher.unwatch(
-                    entry
-                        .root
-                        .canonical_registered_path()
-                        .unwrap_or_else(|| entry.root.registered_path()),
-                );
+                let _ = watcher.unwatch(entry.root.registration_key());
                 if current.is_some() && register(watcher, &mut entry.root) {
                     // Same name, new directory object: re-registered against
                     // the one that is there now, and re-resolved with it — a
                     // symlinked root whose target moved is a new spelling as
                     // well as a new object.
-                    entry.identity = root_identity(entry.root.registered_path());
+                    entry.identity = root_identity(entry.root.registration_key());
                     resolved.push(entry.root.clone());
                     changed += 1;
                     return true;
@@ -869,7 +880,7 @@ mod fs_events {
                 }
                 resolved.push(root.clone());
                 watched.push(Registered {
-                    identity: root_identity(root.registered_path()),
+                    identity: root_identity(root.registration_key()),
                     root: root.clone(),
                 });
                 attached += 1;
@@ -932,14 +943,7 @@ mod fs_events {
                         event
                             .paths
                             .iter()
-                            .map(|path| discover::watch_path(path))
-                            .filter(|path| {
-                                // Either spelling, for the same reason the
-                                // match above takes either: a removal
-                                // reported under the resolved path is the
-                                // same removal.
-                                roots.iter().any(|root| root.registers_at(path))
-                            })
+                            .flat_map(|path| removed_registration_keys(path, &roots))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
@@ -961,7 +965,7 @@ mod fs_events {
             if register(&mut watcher, &mut root) {
                 known.push(root.clone());
                 watched.push(Registered {
-                    identity: root_identity(root.registered_path()),
+                    identity: root_identity(root.registration_key()),
                     root,
                 });
             } else {
@@ -1047,9 +1051,7 @@ mod fs_events {
         // that decides whether the root is coverable yet — and a file that
         // does not exist inside a directory that does is covered from the
         // start, which is the point of watching the parent.
-        let target = root
-            .canonical_registered_path()
-            .unwrap_or_else(|| root.registered_path());
+        let target = root.registration_key();
         if !target.exists() {
             return false;
         }

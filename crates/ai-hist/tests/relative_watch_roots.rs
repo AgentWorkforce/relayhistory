@@ -88,8 +88,16 @@ fn a_relative_file_root_matches_the_events_the_watcher_reports() {
     // filter until everything matches.
     forces_a_tick(&ticks, &nested, "a nested relative file root");
     forces_a_tick(&ticks, &absolute, "an absolute file root");
+
     // And the filter is still a filter: a sibling in the same directory is
-    // not one of these roots.
+    // not one of these roots. The loop has to be quiet before that can be
+    // asked. One `fs::write` is several filesystem events — a create, a
+    // modify, a close — and an event landing after the debounce window has
+    // opened deliberately re-arms it, so a single write legitimately produces
+    // more than one forced tick. A trailing tick from the write above would
+    // otherwise be read as the sibling's, which is exactly how this test
+    // failed in CI at `d6cf96b`.
+    settle(&ticks, "before the sibling write");
     std::fs::write("unrelated.json", "{}\n").expect("write a sibling");
     assert_eq!(
         ticks.recv_timeout(Duration::from_millis(800)),
@@ -117,5 +125,23 @@ fn forces_a_tick(ticks: &mpsc::Receiver<bool>, path: &Path, what: &str) {
                 path.display()
             ),
         }
+    }
+}
+
+/// Wait until the loop has stopped ticking, so what follows is about the next
+/// write and nothing before it.
+///
+/// Bounded in both directions: each wait is several debounce windows, so a
+/// trailing event has time to arrive and be swept, and the whole settle has a
+/// deadline, so a loop that never goes quiet fails the test rather than
+/// hanging it. Reaching quiet is itself an assertion — a loop that kept
+/// ticking after one write would be a defect of its own.
+fn settle(ticks: &mpsc::Receiver<bool>, when: &str) {
+    let deadline = Instant::now() + ARRIVES_WITHIN;
+    while ticks.recv_timeout(Duration::from_millis(400)).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the loop never went quiet {when}"
+        );
     }
 }

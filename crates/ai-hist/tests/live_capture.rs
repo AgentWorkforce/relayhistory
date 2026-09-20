@@ -78,6 +78,30 @@ impl RunningLoop {
     fn next_tick(&self) -> Result<bool, RecvTimeoutError> {
         self.ticks.recv_timeout(ARRIVES_WITHIN)
     }
+
+    /// Wait until the loop has stopped ticking, so what follows is about the
+    /// next write and nothing before it.
+    ///
+    /// One `fs::write` is not one filesystem event: creating a file yields a
+    /// create *and* a modify, and an event landing after the debounce window
+    /// has opened deliberately re-arms it, so a single write legitimately
+    /// drives more than one forced tick. An assertion that nothing happens
+    /// has to start from quiet, or it reads the previous write's second tick
+    /// as the thing it was watching for.
+    ///
+    /// Bounded in both directions: each wait is several debounce windows, so
+    /// a trailing event has time to arrive and be swept, and the whole settle
+    /// has a deadline, so a loop that never goes quiet fails the test rather
+    /// than hanging it.
+    fn settle(&self, when: &str) {
+        let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+        while self.ticks.recv_timeout(Duration::from_millis(400)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never went quiet {when}"
+            );
+        }
+    }
 }
 
 impl Drop for RunningLoop {
@@ -949,7 +973,11 @@ fn a_root_reached_through_a_symlink_matches_its_own_events() {
     );
 
     // Positive control: the filter is still a filter. A sibling of the root,
-    // not under it, drives nothing.
+    // not under it, drives nothing — asked from quiet, because the write
+    // above was a *create* and produced two events, and its second tick would
+    // otherwise be read as this one's. That is how this test failed in CI at
+    // `4f2a1b9` while passing locally.
+    running.settle("after the write under the root");
     std::fs::write(dir.path().join("real/unrelated.jsonl"), "{}\n").expect("write beside it");
     assert_eq!(
         running.ticks.recv_timeout(Duration::from_millis(800)),

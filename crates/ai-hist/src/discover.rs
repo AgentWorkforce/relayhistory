@@ -525,6 +525,23 @@ impl WatchRoot {
         })
     }
 
+    /// The one key this root's registration is known by.
+    ///
+    /// Everything that looks a registration up by path — registering it,
+    /// dropping it, recording that the backend reported it gone, and asking
+    /// whether it was — has to use this and only this. Two keys for one
+    /// registration is how a removal gets recorded under a spelling the
+    /// lookup does not use, and a root then stays "watched" over a watch the
+    /// kernel has already dropped.
+    ///
+    /// The resolved spelling once the filesystem has been asked, because that
+    /// is what is registered; the lexical one until then, when there is
+    /// nothing else to go on.
+    pub fn registration_key(&self) -> &Path {
+        self.canonical_registered_path()
+            .unwrap_or_else(|| self.registered_path())
+    }
+
     /// Whether `path` is one of the spellings this root registers under.
     pub fn registers_at(&self, path: &Path) -> bool {
         self.registered_path() == path || self.canonical_registered_path() == Some(path)
