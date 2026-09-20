@@ -93,6 +93,11 @@ struct SourceSnapshot {
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
+    /// Bytes read to stamp and identify the source: the Codex `session_meta`
+    /// line, the resumed sidecar metadata walks. Every provider read a
+    /// hydration cannot avoid belongs in `bytesRead`, or the counter measures
+    /// the walk that was optimised rather than the work that was done.
+    scanned_bytes: i64,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -191,7 +196,7 @@ fn hydrate_session_at_with_home_and_connectors(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
-    let snapshot = source_snapshot(options, &target, home)?;
+    let snapshot = source_snapshot(&conn, options, &target, home)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -205,16 +210,7 @@ fn hydrate_session_at_with_home_and_connectors(
     // whether a pass runs at all, so leaving it to fire here would mean the
     // held records were never looked at again and the message was lost rather
     // than deferred.
-    let holding_records = load_cursor(
-        &conn,
-        &CursorKey::Session {
-            source: &options.source,
-            session_id: &options.session_id,
-            location: "local",
-        },
-    )?
-    .claude
-    .is_some_and(|claude| !claude.in_progress.is_empty());
+    let holding_records = holds_unfinished_records(&conn, options, &snapshot)?;
 
     if !holding_records
         && previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
@@ -256,7 +252,7 @@ fn hydrate_session_at_with_home_and_connectors(
     } else {
         TranscriptCursorState::default()
     };
-    let indexed = ingest_selected(
+    let indexed: IngestOutcome = ingest_selected(
         &tx,
         options,
         &target,
@@ -265,6 +261,9 @@ fn hydrate_session_at_with_home_and_connectors(
         &mut cursor,
         snapshot.records,
     )?;
+    let mut indexed = indexed;
+    // Stamping and identifying the source is work this hydration did.
+    indexed.bytes_read += snapshot.scanned_bytes;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
          WHERE source = ? AND session_id = ?",
@@ -1078,6 +1077,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
 }
 
 fn source_snapshot(
+    conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     home: &Path,
@@ -1157,6 +1157,7 @@ fn source_snapshot(
             records: 0,
             path: Some(path),
             claude_subagents: Vec::new(),
+            scanned_bytes: 0,
         });
     }
 
@@ -1189,9 +1190,17 @@ fn source_snapshot(
     } else {
         file_stamp(&path)?
     };
+    let mut scanned_bytes = 0i64;
+    if options.source == "codex" {
+        // Identity comes from the rollout's first record, and reading it is
+        // unavoidable work this hydration did.
+        scanned_bytes += read_codex_session_meta_counted(&path)?.1 as i64;
+    }
     let mut subagents = Vec::new();
     if options.source == "claude" && options.include_related {
-        subagents = claude_subagents(&path, &options.session_id)?;
+        let (found, sidecar_bytes) = claude_subagents(conn, &path, &options.session_id)?;
+        subagents = found;
+        scanned_bytes += sidecar_bytes as i64;
         for evidence in &subagents {
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
@@ -1220,7 +1229,55 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_subagents: subagents,
+        scanned_bytes,
     })
+}
+
+/// Whether any transcript this session is built from ended its last pass with
+/// records held back.
+///
+/// The session's own transcript is not the only one that defers: every Claude
+/// sidecar keeps its parser state in its own locator-keyed cursor, and a
+/// sidecar that held an unfinished message needs a pass to run before it can
+/// release those records. Consulting only the session cursor meant the
+/// unchanged shortcut returned first and the child's message stayed unindexed
+/// for as long as nothing else about the session changed.
+fn holds_unfinished_records(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    snapshot: &SourceSnapshot,
+) -> Result<bool> {
+    let session = load_cursor(
+        conn,
+        &CursorKey::Session {
+            source: &options.source,
+            session_id: &options.session_id,
+            location: "local",
+        },
+    )?;
+    if session
+        .claude
+        .is_some_and(|claude| !claude.in_progress.is_empty())
+    {
+        return Ok(true);
+    }
+    for evidence in &snapshot.claude_subagents {
+        let locator = evidence.path.to_string_lossy().to_string();
+        let sidecar = load_cursor(
+            conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &locator,
+            },
+        )?;
+        if sidecar
+            .claude
+            .is_some_and(|claude| !claude.in_progress.is_empty())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> {
@@ -1588,18 +1645,43 @@ pub(crate) fn claude_subagent_evidence(
 /// `collect_matching_files` is recursive, so this reaches both the flat
 /// `agent-*.jsonl` layout and `<parentSessionId>/subagents/agent-*.jsonl`, and
 /// returns them sorted by path so ingestion is deterministic.
-fn claude_subagents(transcript: &Path, session_id: &str) -> Result<Vec<ClaudeSubagentEvidence>> {
+/// Returns the evidence and the bytes the enumeration read.
+///
+/// Every sidecar's metadata walk resumes from that sidecar's own locator
+/// cursor. Scanning each one from byte zero on every hydration was the same
+/// whole-file read the parent transcript no longer does, multiplied by the
+/// number of children — and equally invisible, because none of it reached
+/// `bytesRead`. The walk cannot be replaced with a bounded head read: a child
+/// is sometimes named by an `agentId` on a record well into the file, which
+/// `a_child_named_only_by_a_later_record_still_links` pins.
+fn claude_subagents(
+    conn: &Connection,
+    transcript: &Path,
+    session_id: &str,
+) -> Result<(Vec<ClaudeSubagentEvidence>, u64)> {
     let Some(directory) = transcript.parent() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     let mut evidence = Vec::new();
+    let mut bytes_read = 0u64;
     for candidate in collect_matching_files(directory, "agent-", "jsonl")? {
         if candidate == transcript {
             continue;
         }
+        let locator = candidate.to_string_lossy().to_string();
+        let key = CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let mut cursor = load_cursor(conn, &key)?;
+        let mut scan = cursor.claude.clone().unwrap_or_default().scan;
+        let (meta, read) = scan_claude_session_file_resumed(&candidate, &mut scan)?;
+        bytes_read += read;
+        cursor.claude.get_or_insert_with(Default::default).scan = scan;
+        store_cursor(conn, &key, &cursor)?;
         // A subagent transcript's records carry the PARENT's sessionId, which
         // is what ties this file to the session being hydrated.
-        let Some(meta) = scan_claude_session_file(&candidate).ok().flatten() else {
+        let Some(meta) = meta else {
             continue;
         };
         if meta.session_id != session_id {
@@ -1607,13 +1689,13 @@ fn claude_subagents(transcript: &Path, session_id: &str) -> Result<Vec<ClaudeSub
         }
         evidence.push(claude_subagent_evidence(candidate, &meta));
     }
-    Ok(evidence)
+    Ok((evidence, bytes_read))
 }
 
+/// The first parseable record of a transcript, from a bounded read of its
+/// head rather than the whole file.
 fn first_claude_record(path: &Path) -> Option<Value> {
-    let text = fs::read_to_string(path).ok()?;
-    text.lines()
-        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+    read_leading_records(path, 1).ok()?.0.into_iter().next()
 }
 
 /// Where the `agent-<agentId>.meta.json` sidecar sits beside a subagent
@@ -2770,9 +2852,10 @@ mod tests {
 
         let grown =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
-        // Only the sidecar's new line is read. The parent transcript, which
-        // did not change, contributes nothing to this number.
-        assert_eq!(grown.bytes_read, addition.len() as i64);
+        // Only the sidecar's new line is read, by its metadata walk and its
+        // record walk. The parent transcript, which did not change,
+        // contributes nothing to this number.
+        assert_eq!(grown.bytes_read, 2 * addition.len() as i64);
         assert_eq!(
             session_event_snapshot(&db, "child-1")
                 .iter()
@@ -3201,6 +3284,311 @@ mod tests {
                 .unwrap();
         assert_eq!(third.status, "unchanged");
         assert_eq!(third.bytes_read, 0);
+    }
+
+    /// A Codex rollout's identity comes from its first record, so a hydration
+    /// that only needs the tail must not read the head-to-tail file.
+    ///
+    /// The twin of the Claude metadata scan, and hidden the same way:
+    /// `read_codex_session_meta` did `fs::read_to_string` and then took
+    /// `lines().next()`, so the call looked bounded at the call site while a
+    /// kilobyte appended to a large rollout still read all of it — and
+    /// `bytes_read` reported the kilobyte, because it counted the cursor's
+    /// work rather than the hydration's.
+    #[test]
+    fn a_codex_append_does_not_re_read_the_rollout_for_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-big.jsonl");
+        let meta_line = "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                         \"payload\":{\"id\":\"big\",\"cwd\":\"/work/app\"}}\n";
+        let mut body = String::from(meta_line);
+        for index in 0..2000 {
+            body.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\
+                 \"payload\":{{\"type\":\"agent_message\",\"message\":\"answer {index} {}\"}}}}\n",
+                "z".repeat(512)
+            ));
+        }
+        body.push_str(
+            "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\
+             \"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+        );
+        fs::write(&rollout, &body).unwrap();
+        let size = body.len() as i64;
+        assert!(size > 1_000_000, "the rollout must dwarf the append");
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "big", Some(&rollout));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("codex", "big"), dir.path()).unwrap();
+        assert_eq!(first.status, "hydrated");
+        // The whole rollout, plus the one metadata line read from its head.
+        assert_eq!(first.bytes_read, size + meta_line.len() as i64);
+
+        let addition = format!(
+            "{{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"event_msg\",\
+             \"payload\":{{\"type\":\"agent_message\",\"message\":\"{}\"}}}}\n\
+             {{\"timestamp\":\"2026-08-31T10:00:04Z\",\"type\":\"event_msg\",\
+             \"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}}}\n",
+            "y".repeat(900)
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+
+        let appended =
+            hydrate_session_at_with_home(&db, &options("codex", "big"), dir.path()).unwrap();
+        // The append, plus the same one metadata line. Not the rollout.
+        assert_eq!(
+            appended.bytes_read,
+            addition.len() as i64 + meta_line.len() as i64
+        );
+        // Positive control: the counter is capable of reporting the whole
+        // file, and did so on the first pass, so a bounded second reading is
+        // a fact about the read rather than about the counter.
+        assert!(first.bytes_read > 100 * appended.bytes_read);
+    }
+
+    /// A message held back at byte zero is still released once the writer
+    /// stops.
+    ///
+    /// Quiescence was only computed for a saved cursor whose offset was above
+    /// zero, which reads "the cursor is at the start" as "there is no cursor".
+    /// A transcript whose *first* record is the unfinished one therefore
+    /// committed offset zero, and every later pass ignored the cursor, never
+    /// saw the file go quiet, and deferred the same record again — while the
+    /// held-records check kept forcing those passes to run. The message was
+    /// never indexed and the session never became `unchanged`.
+    #[test]
+    fn a_message_held_at_offset_zero_is_still_released_when_the_writer_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-zero-offset";
+        let only_record = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"a-1\",\"cwd\":\"/work/app\",\
+             \"type\":\"assistant\",\"message\":{{\"id\":\"msg_only\",\"role\":\"assistant\",\
+             \"stop_reason\":null,\"content\":[{{\"type\":\"text\",\"text\":\"streaming\"}}]}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let transcript = seed_claude_transcript(dir.path(), session_id, only_record.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(diagnostic(&first, "HYDRATION_IN_PROGRESS_MESSAGES").is_some());
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 0);
+        assert_eq!(stored_cursor(&db, session_id).committed_offset(), 0);
+
+        // Nothing changes. The writer is gone.
+        let second =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_ne!(second.status, "unchanged");
+        assert_eq!(
+            session_event_snapshot(&db, session_id).len(),
+            1,
+            "a message held at offset zero must still be released"
+        );
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            only_record.len() as i64
+        );
+
+        // And it settles rather than re-running forever.
+        let third =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(third.status, "unchanged");
+    }
+
+    /// An unterminated trailing record is still subject to deferral.
+    ///
+    /// The unterminated-tail rule was added so a complete transcript's last
+    /// record is not lost, and it indexed the record as soon as it parsed —
+    /// without asking whether the record belonged to a message still being
+    /// written. That skipped deferral exactly where a file is most likely to
+    /// be mid-write: the tail. The record was written out, `in_progress`
+    /// stayed empty, and no later pass held or completed it.
+    #[test]
+    fn an_unterminated_in_progress_record_is_deferred_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-unterminated-live";
+        let prompt = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+             \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"go\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        // Complete JSON, no trailing newline, and still streaming.
+        let streaming = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"a-1\",\"cwd\":\"/work/app\",\
+             \"type\":\"assistant\",\"message\":{{\"id\":\"msg_live\",\"role\":\"assistant\",\
+             \"stop_reason\":null,\"content\":[{{\"type\":\"text\",\"text\":\"thinking\"}}]}},\
+             \"timestamp\":\"2026-08-31T10:00:01Z\"}}"
+        );
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!("{prompt}{streaming}").as_bytes(),
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let held = diagnostic(&first, "HYDRATION_IN_PROGRESS_MESSAGES")
+            .expect("an unterminated streaming record is held, not written");
+        assert!(held.message.contains("msg_live"), "{}", held.message);
+        let uids: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        // Positive control: the prompt before it *was* indexed, so this is
+        // deferral rather than a pass that read nothing.
+        assert_eq!(uids, vec!["u-1:0".to_string()]);
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            prompt.len() as i64,
+            "the cursor must not advance past a record it held"
+        );
+
+        // The writer stops without ever terminating the line.
+        let second =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(diagnostic(&second, "HYDRATION_IN_PROGRESS_MESSAGES").is_none());
+        let uids: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(uids, vec!["a-1:0".to_string(), "u-1:0".to_string()]);
+    }
+
+    /// A sidecar that held a message back gets the pass it needs to release
+    /// it, even though nothing about the session changed.
+    ///
+    /// Sidecars keep their parser state in their own locator-keyed cursors.
+    /// The unchanged shortcut consulted only the session's cursor, so a child
+    /// message deferred by a sidecar stayed unindexed for as long as nothing
+    /// else about the session moved.
+    #[test]
+    fn a_sidecar_holding_a_message_still_gets_a_pass_to_release_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-sidecar-held";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"parent\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"agentId\":\"child-1\",\"isSidechain\":true,\
+                 \"uuid\":\"s-1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+                 \"message\":{{\"id\":\"msg_child\",\"role\":\"assistant\",\"stop_reason\":null,\
+                 \"content\":[{{\"type\":\"text\",\"text\":\"child streaming\"}}]}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(diagnostic(&first, "HYDRATION_IN_PROGRESS_MESSAGES").is_some());
+        assert_eq!(session_event_snapshot(&db, "child-1").len(), 0);
+        // Positive control: the parent's own record did land, so the pass ran.
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 1);
+
+        // Nothing changes anywhere. The shortcut must not fire while the
+        // sidecar is still holding records.
+        let second =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_ne!(
+            second.status, "unchanged",
+            "a sidecar holding records must still get a pass"
+        );
+        assert_eq!(
+            session_event_snapshot(&db, "child-1")
+                .into_iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            vec!["s-1:0".to_string()]
+        );
+
+        let third =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(third.status, "unchanged");
+    }
+
+    /// Enumerating sidecars resumes their metadata walks.
+    #[test]
+    fn a_growing_sidecar_is_not_re_identified_from_byte_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-sidecar-scan";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"parent\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
+        let mut body = String::new();
+        for index in 0..2000 {
+            body.push_str(&format!(
+                "{{\"sessionId\":\"{session_id}\",\"agentId\":\"child-1\",\"isSidechain\":true,\
+                 \"uuid\":\"s-{index}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+                 \"message\":{{\"id\":\"m-{index}\",\"role\":\"assistant\",\
+                 \"stop_reason\":\"end_turn\",\"content\":\"{}\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n",
+                "z".repeat(512)
+            ));
+        }
+        fs::write(&sidecar, &body).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(first.bytes_read > body.len() as i64);
+
+        let addition = format!(
+            "{{\"sessionId\":\"{session_id}\",\"agentId\":\"child-1\",\"isSidechain\":true,\
+             \"uuid\":\"s-tail\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+             \"message\":{{\"id\":\"m-tail\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\
+             \"content\":\"{}\"}},\"timestamp\":\"2026-08-31T10:00:02Z\"}}\n",
+            "y".repeat(400)
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&sidecar).unwrap();
+        write!(file, "{addition}").unwrap();
+        drop(file);
+
+        let appended =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        // The sidecar's metadata walk and its record walk each read the
+        // appended record, and nothing reads the sidecar from the start.
+        assert_eq!(appended.bytes_read, 2 * addition.len() as i64);
+        assert!(first.bytes_read > 100 * appended.bytes_read);
     }
 
     #[test]

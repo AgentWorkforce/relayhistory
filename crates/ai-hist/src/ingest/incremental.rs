@@ -99,7 +99,15 @@ pub(crate) fn ingest_claude_transcript_incremental(
     // re-reads from zero; the per-source state that went with the old position
     // describes bytes that are no longer there.
     let mut claude = if reader.start_offset() == 0 {
-        ClaudeCursorState::default()
+        // The metadata walk keeps its own position and its own fold, and
+        // rotation is something it detects for itself. Dropping its state here
+        // because *this* walk restarted left the global sync re-deriving a
+        // transcript's identity from byte zero on every append: it stored the
+        // scan, then this reloaded the same row and wrote a default over it.
+        ClaudeCursorState {
+            scan: saved_claude.scan.clone(),
+            ..Default::default()
+        }
     } else {
         saved_claude.clone()
     };
@@ -134,30 +142,33 @@ pub(crate) fn ingest_claude_transcript_incremental(
         };
         let index = line_index;
         line_index += 1;
-        if kind == ReadRecord::Unterminated {
-            // A record with no newline is indexed only if it is complete JSON.
-            // A half-written line is not, and a writer appends a line at a
-            // time, so parsing is the available evidence that the provider
-            // finished saying this. The cursor remembers where it began, so a
-            // file that grows is re-read from here rather than resumed after a
-            // record the reader only half saw.
-            if let Some(obj) = serde_json::from_str::<Value>(line.trim_end())
-                .ok()
-                .and_then(|value| value.as_object().cloned())
-            {
-                pass.records += 1;
-                ingest_claude_record(conn, path, attributed_session_id, index, &obj)?;
-                unterminated = Some((line_start, index));
-            }
+        // A record with no newline is considered only if it is complete
+        // JSON. A half-written line is not, and a writer appends a line at a
+        // time, so parsing is the available evidence that the provider
+        // finished saying this.
+        let parsed = serde_json::from_str::<Value>(line.trim_end()).ok();
+        if kind == ReadRecord::Unterminated && parsed.is_none() {
             break;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+        let Some(value) = parsed else {
             continue;
         };
         let Some(obj) = value.as_object() else {
+            if kind == ReadRecord::Unterminated {
+                break;
+            }
             continue;
         };
         pass.records += 1;
+        // An unterminated record goes through the same deferral decision as
+        // any other. Indexing it on the spot because it parsed wrote a live
+        // assistant line with `stop_reason: null` straight out, left
+        // `in_progress` empty, and let the cursor advance past a message that
+        // was still being written — deferral was skipped precisely where the
+        // file is most likely to be mid-write.
+        if kind == ReadRecord::Unterminated {
+            unterminated = Some((line_start, index));
+        }
         match claude_message_progress(obj) {
             Some((message_id, complete)) => {
                 if let Some(entry) = deferred.get_mut(&message_id) {
@@ -192,6 +203,9 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 }
             }
             None => ingest_claude_record(conn, path, attributed_session_id, index, obj)?,
+        }
+        if kind == ReadRecord::Unterminated {
+            break;
         }
         while deferred_bytes > CLAUDE_DEFERRED_BYTES_CAP
             || deferred.len() > CLAUDE_DEFERRED_MESSAGE_CAP

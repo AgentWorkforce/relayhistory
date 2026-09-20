@@ -1890,37 +1890,83 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
 /// (`thread_source`, or the object form of `payload.source` *together with* an
 /// explicit parent) and excluded from session registration. A standalone
 /// guardian carries `source.subagent` without a parent and stays discoverable.
-fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
-    let first = fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.lines().next().map(str::to_string))
-        .unwrap_or_default();
-    if first.trim().is_empty() {
-        return Ok(None);
+/// How far into a file a bounded head read will look, however few records it
+/// has found. Callers set their own record limit; this one stops a file whose
+/// first record is enormous, or whose leading lines are all unparseable, from
+/// turning a bounded read back into a whole-file read.
+const LEADING_BYTE_LIMIT: u64 = 1024 * 1024;
+
+/// The first complete records of a JSONL file, and the bytes that cost.
+///
+/// For metadata that lives at the head of a transcript — a Codex
+/// `session_meta` line, the record that dates a Claude sidecar — reading the
+/// whole file to use its first line is the same defect as scanning a whole
+/// transcript to hydrate its tail, and it hides in the same place: the caller
+/// writes `.lines().next()` and looks bounded while the read is not. A
+/// trailing record with no newline counts, because the head of a one-record
+/// file is that record.
+fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut values = Vec::new();
+    let mut raw = Vec::new();
+    let mut bytes_read = 0u64;
+    while values.len() < limit && bytes_read < LEADING_BYTE_LIMIT {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read += read as u64;
+        if let Ok(value) = serde_json::from_slice::<Value>(trim_ascii_end(&raw)) {
+            values.push(value);
+        }
     }
-    let value: Value = match serde_json::from_str(&first) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
+    Ok((values, bytes_read))
+}
+
+fn trim_ascii_end(raw: &[u8]) -> &[u8] {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
+fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
+    Ok(read_codex_session_meta_counted(path)?.0)
+}
+
+/// Codex session metadata, and the bytes reading it cost.
+///
+/// A rollout's identity is its **first** record, so this reads one line rather
+/// than the file. It used to `read_to_string` a rollout that reaches hundreds
+/// of megabytes on a fleet machine and then take `lines().next()`, so a
+/// kilobyte appended to one still read all of it before the cursor reached the
+/// tail — the Codex twin of the whole-file Claude metadata scan, and invisible
+/// for the same reason: `bytes_read` counted the cursor's work, not this.
+fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMeta>, u64)> {
+    let (values, bytes_read) = read_leading_records(path, 1)?;
+    let meta = values.first().and_then(codex_session_meta_from_record);
+    Ok((meta, bytes_read))
+}
+
+/// Interpret one `session_meta` record. Pure, so the bounded reader above is
+/// the only thing that decides how much of the file is touched.
+fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return Ok(None);
+        return None;
     }
     let payload_value = value.get("payload");
     let payload = payload_value.and_then(Value::as_object);
-    let Some(session_id) = payload
+    let session_id = payload
         .and_then(|p| p.get("id"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(cwd) = payload
+        .filter(|s| !s.is_empty())?;
+    let cwd = payload
         .and_then(|p| p.get("cwd"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|s| !s.is_empty())?;
     let git_branch = payload
         .and_then(|p| p.get("git"))
         .and_then(Value::as_object)
@@ -1954,7 +2000,7 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_iso_ms);
-    Ok(Some(CodexSessionMeta {
+    Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
@@ -1963,7 +2009,7 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
         parent_thread_id,
         subagent_label,
         meta_ts_ms,
-    }))
+    })
 }
 
 #[derive(Default)]
@@ -3002,16 +3048,6 @@ impl ClaudeMetaFold {
             agent_id: self.agent_id.clone(),
         })
     }
-}
-
-/// Walk a whole Claude transcript for its identity and metadata.
-///
-/// Callers that hold a cursor should use [`scan_claude_session_file_resumed`]
-/// instead; this one exists for the paths that have no cursor to resume from
-/// and deliberately reads everything.
-fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
-    let mut state = None;
-    Ok(scan_claude_session_file_resumed(path, &mut state)?.0)
 }
 
 /// Walk only the records that have arrived since `state` was written.
@@ -6967,6 +7003,85 @@ mod tests {
     /// `record_relationship` merges with COALESCE, so even a re-ingest read an
     /// absent agent type as "nothing new to say" rather than as "that is no
     /// longer true".
+    /// A global sync keeps the metadata walk's position across the record
+    /// walk that follows it.
+    ///
+    /// Both walks share one locator-keyed cursor row. The sync stored the
+    /// scan, then `ingest_claude_transcript_at_locator` reloaded that row and,
+    /// on any pass that started at offset zero, wrote a default over
+    /// `claude` — taking the scan with it. Hydration happened to put its scan
+    /// back afterwards; sync never did, so every sync re-derived a
+    /// transcript's identity from byte zero however little had arrived.
+    #[test]
+    fn a_sync_keeps_the_metadata_walk_position_across_the_record_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-scan.jsonl");
+        let body = "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"s-scan\",\
+                    \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:00.000Z\",\
+                    \"message\":{\"role\":\"user\",\"content\":\"first\"}}\n";
+        fs::write(&path, body).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let key = cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &path.to_string_lossy(),
+        };
+        let scan = cursor::load_cursor(&conn, &key)
+            .unwrap()
+            .claude
+            .and_then(|claude| claude.scan)
+            .expect("the sync must leave the metadata walk's position behind");
+        assert_eq!(
+            scan.file.map(|file| file.offset),
+            Some(body.len() as u64),
+            "the metadata walk committed through the whole file"
+        );
+        // Positive control: the fold really did run and identify the session,
+        // so a surviving cursor is not an empty one.
+        assert_eq!(scan.fold.session_id.as_deref(), Some("s-scan"));
+
+        // A second sync over an appended file resumes rather than restarting.
+        let addition = "{\"type\":\"user\",\"uuid\":\"u2\",\"sessionId\":\"s-scan\",\
+                        \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:01.000Z\",\
+                        \"message\":{\"role\":\"user\",\"content\":\"second\"}}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        write!(file, "{addition}").unwrap();
+        drop(file);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let mut resumed = cursor::load_cursor(&conn, &key)
+            .unwrap()
+            .claude
+            .and_then(|claude| claude.scan)
+            .expect("the metadata walk position survives the second sync too");
+        assert_eq!(
+            resumed.file.as_ref().map(|file| file.offset),
+            Some((body.len() + addition.len()) as u64)
+        );
+
+        // And reading it again now costs only what a further append adds.
+        let tail = "{\"type\":\"user\",\"uuid\":\"u3\",\"sessionId\":\"s-scan\",\
+                    \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:02.000Z\",\
+                    \"message\":{\"role\":\"user\",\"content\":\"third\"}}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{tail}").unwrap();
+        drop(file);
+        let mut state_holder = Some(resumed.clone());
+        let (_, bytes_read) = scan_claude_session_file_resumed(&path, &mut state_holder).unwrap();
+        assert_eq!(bytes_read, tail.len() as u64);
+        // Positive control: the same call from no state reads the whole file,
+        // so the bounded figure is a fact about resumption.
+        resumed.file = None;
+        let mut from_zero = None;
+        let (_, whole) = scan_claude_session_file_resumed(&path, &mut from_zero).unwrap();
+        assert_eq!(whole, (body.len() + addition.len() + tail.len()) as u64);
+    }
+
     #[test]
     fn a_deleted_metadata_sidecar_stops_describing_its_child() {
         let dir = tempfile::tempdir().unwrap();

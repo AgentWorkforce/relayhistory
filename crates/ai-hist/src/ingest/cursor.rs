@@ -440,8 +440,15 @@ impl TranscriptReader {
 
         let mut rotated = false;
         let mut quiesced = false;
+        // A cursor at offset 0 is still a cursor. It records the file's
+        // identity, size and mtime, and those are what say whether anything
+        // has been appended since the last pass. Reading it as "no cursor"
+        // because its offset happened to be zero meant a pass that held back
+        // the file's *first* record could never see the file go quiet, so it
+        // deferred the same records forever and the message was never
+        // indexed — while `holding_records` kept forcing the pass to run.
         let offset = match saved {
-            Some(saved) if saved.offset > 0 => {
+            Some(saved) => {
                 let identity_changed = saved.device.is_some()
                     && device.is_some()
                     && (saved.device, saved.inode) != (device, inode);
@@ -456,11 +463,14 @@ impl TranscriptReader {
                         .filter(|rewind| *rewind <= saved.offset)
                         .unwrap_or(saved.offset)
                 } else {
-                    rotated = true;
+                    // Nothing to rotate away from at offset zero: the cursor
+                    // claimed no committed work, so re-reading is not a
+                    // correction and reporting one would be noise.
+                    rotated = saved.offset > 0;
                     0
                 }
             }
-            _ => 0,
+            None => 0,
         };
 
         let mut handle = file.try_clone()?;

@@ -607,6 +607,43 @@ kilobyte appended to a 200 MB transcript still cost a 200 MB read, and
 `bytesRead` reported the kilobyte — the shape of a success, computed over one
 of the two walks. `bytesRead` is now the total across both.
 
+The same trap caught three more reads, all of them a whole file behind a call
+that looked bounded:
+
+| Read | Was | Is |
+|---|---|---|
+| Codex rollout identity | `read_to_string`, then `lines().next()` | one record from the head |
+| Claude sidecar enumeration | every sidecar scanned from byte zero, every hydration | each sidecar's metadata walk resumes from its own cursor |
+| A sidecar's first record | `read_to_string`, then `find_map` | a bounded head read |
+
+**Every provider read a hydration cannot avoid is in `bytesRead`.** A counter
+that omits one is worse than no counter: it reports the work that was
+optimised instead of the work that was done, and the omitted read is exactly
+the one nobody is watching.
+
+### One deferral state machine
+
+Three separate defects turned out to be the same state machine seen from three
+sides, so it is written down once:
+
+- **A cursor at offset 0 is still a cursor.** It records the file's identity,
+  size and mtime, which is what says whether anything has been appended.
+  Reading "offset is zero" as "there is no cursor" meant a pass that held back
+  a file's *first* record could never see the file go quiet, and deferred the
+  same record forever.
+- **An unterminated trailing record goes through the same deferral decision as
+  any other record.** Indexing it because it parsed skipped deferral precisely
+  at the tail, where a file is most likely to be mid-write.
+- **Every transcript that defers gets a pass to release what it held.** The
+  session's own cursor is not the only one: each Claude sidecar keeps its
+  parser state in its own locator-keyed cursor, and the unchanged shortcut
+  consults all of them.
+
+A transcript's two walks share one cursor row, and the record walk never
+touches the metadata walk's state — including when the record walk restarts
+from zero, because rotation is something the metadata walk detects for
+itself.
+
 ### What an existing install does on the first sync after upgrading
 
 `HYDRATION_PARSER_VERSION` is 3. A checkpoint written by an earlier generation

@@ -189,6 +189,8 @@ once and written down.
 |---|---:|
 | First hydration of a transcript | the whole file |
 | Append of *n* bytes, then re-hydrate | 2*n* — the metadata walk and the record walk each read the appended region |
+| Codex: append of *n* bytes, then re-hydrate | *n* + one `session_meta` record from the head |
+| Append to a sidecar | 2*n* for that sidecar; the parent is not read |
 | Append to a sidecar beside an unchanged parent | the sidecar's *n*, and nothing for the parent |
 | Deleted metadata sidecar | the transcript is re-read and the metadata it owned is cleared |
 | Nothing changed | 0 — the stamp short-circuit does not open the file |
