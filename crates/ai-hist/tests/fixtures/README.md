@@ -142,7 +142,8 @@ source without deciding which one fails the test.
 
 | Fixture | Origin | Corpus files | Quirk it encodes |
 | --- | --- | --- | --- |
-| `grok/full-session` | relayhistory | `grok/full-session` | a complete grok session directory: `summary.json`, `chat_history.jsonl` (including a `synthetic_reason` turn), plus the `updates.jsonl`, `prompt_context.json`, `signals.json` and `subagents/` files no relayhistory parser reads yet |
+| `grok/full-session` | relayhistory | `grok/full-session` | older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/` |
+| `grok/events-session` | relayhistory | `grok/events-session` | documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json` |
 
 ### `opencode`
 

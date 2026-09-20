@@ -194,7 +194,6 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
     let mut index = 0;
     while index < lines.len() {
         let raw = lines[index];
-        let line = raw.trim();
         let mut header: Option<String> = None;
         // Matched against the *raw* line, not the trimmed one. A unified-diff
         // context line is its content prefixed with a space, so
@@ -219,18 +218,23 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
         // previous hunk is still open, though, so "not in a hunk" cannot be
         // the whole rule either. What separates them is what comes next: a
         // header pair is followed by `@@`, hunk content is not.
-        if !envelope && header.is_none() && line.starts_with("--- ") {
+        // Matched against the raw line, same as the envelope markers: a
+        // unified-diff context line is its content prefixed with a space, so
+        // ` --- a/quoted.rs` is a nested diff being quoted, not a header.
+        // Trimming made the following ` +++` / ` @@` look like a real pair
+        // and opened a phantom file.
+        if !envelope && header.is_none() && raw.starts_with("--- ") {
             let opens_a_hunk = lines
                 .get(index + 2)
-                .is_some_and(|after| after.trim_start().starts_with("@@"));
+                .is_some_and(|after| after.starts_with("@@"));
             if let Some(next) = lines
                 .get(index + 1)
-                .map(|next| next.trim())
+                .copied()
                 .filter(|_| !in_hunk || opens_a_hunk)
             {
                 if let Some(rest) = next.strip_prefix("+++ ") {
                     header = Some(unified_diff_path(rest).unwrap_or_else(|| {
-                        unified_diff_path(line.strip_prefix("--- ").unwrap_or_default())
+                        unified_diff_path(raw.strip_prefix("--- ").unwrap_or_default())
                             .unwrap_or_default()
                     }));
                 }
@@ -268,7 +272,7 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
         }
         // `@@` opens a hunk; everything after it is content until the next
         // file header.
-        if line.starts_with("@@") {
+        if raw.starts_with("@@") {
             in_hunk = true;
         }
         if let Some((_, body)) = current.as_mut() {
@@ -818,6 +822,37 @@ mod tests {
         assert!(!files[2].patch.contains("*** End Patch"));
         // `patch_target` still names one thing, for `tool_calls.target`.
         assert_eq!(patch_target(patch), Some("src/a.rs".to_string()));
+    }
+
+    /// A unified-diff *context* line quoting a nested diff is its content
+    /// prefixed with a space. Matching `---` / `+++` / `@@` on the trimmed
+    /// line treated that quotation as a real header pair and split the edit.
+    ///
+    /// Reported by Cursor Bugbot. Positive control: with the pair matched
+    /// against trimmed lines this failed with
+    /// `left: ["notes.md", "quoted.rs"], right: ["notes.md"]`.
+    #[test]
+    fn a_context_line_quoting_a_nested_unified_diff_does_not_open_a_file() {
+        let patch = concat!(
+            "--- a/notes.md\n",
+            "+++ b/notes.md\n",
+            "@@\n",
+            "-before\n",
+            " --- a/quoted.rs\n",
+            " +++ b/quoted.rs\n",
+            " @@\n",
+            "+after\n"
+        );
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        assert!(
+            files[0].patch.contains(" --- a/quoted.rs") && files[0].patch.contains("+after"),
+            "the quoted nested diff must stay with the real file: {:?}",
+            files[0].patch
+        );
     }
 
     #[test]

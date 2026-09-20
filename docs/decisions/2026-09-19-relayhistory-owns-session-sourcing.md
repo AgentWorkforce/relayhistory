@@ -16,7 +16,7 @@ Two repositories parse the same harness logs today, with no shared code.
 | Claude Code | `ingest_claude_transcript_as` (`src/ingest.rs`) | `reader/claude.rs` + `claude/{incremental,parent_chain,relationships,tool_results,subagents}` |
 | Codex       | `ingest_codex_rollout` (`src/ingest.rs`)        | `reader/codex.rs` + `codex/incremental.rs`                                                    |
 | OpenCode    | `sync_opencode_session` (`src/store.rs`)        | `reader/opencode.rs`                                                                          |
-| Cursor      | `ingest_cursor_line` (`src/ingest.rs`)          | not supported                                                                                 |
+| Cursor      | `ingest_cursor_transcript` (`src/ingest.rs`)    | not supported                                                                                 |
 | Grok        | `ingest_grok_session` (`src/ingest.rs`)         | not supported                                                                                 |
 
 burn has no dependency on relayhistory. relayhistory already defers cost to

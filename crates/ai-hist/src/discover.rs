@@ -1330,10 +1330,12 @@ impl ShallowSessionProvider for GrokProvider {
     fn source(&self) -> &'static str {
         "grok"
     }
-    /// The local parser reads user prompts only; Grok's chat files expose no
-    /// tool calls, file edits or delegation to this reader.
+    /// The directory parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of. Grok still
+    /// records no per-turn billing tokens; that absence is a diagnostic, not a
+    /// missing evidence kind, so capability follows this table.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[EvidenceKind::History]
+        FULL_SESSION_KINDS
     }
 
     fn enumerate(
@@ -1360,12 +1362,20 @@ impl ShallowSessionProvider for GrokProvider {
     ) -> Result<Option<ShallowSession>> {
         let chat = PathBuf::from(&candidate.locator);
         let summary_path = chat.with_file_name("summary.json");
-        let summary = if summary_path.is_file() {
-            scan.note_open();
-            scan.note_bytes(fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
-            crate::read_grok_summary(&summary_path)
-        } else {
-            None
+        // Absent vs unreadable vs present: `is_file()` collapses the first two
+        // into "no summary", which would name the session from its folder and
+        // strand identity the way ingest already refuses to. `read_grok_summary`
+        // fails an unreadable or malformed file and only falls back when the
+        // sidecar is genuinely not there.
+        let summary = match crate::read_grok_summary(&summary_path)? {
+            Some(value) => {
+                scan.note_open();
+                if let Ok(metadata) = fs::metadata(&summary_path) {
+                    scan.note_bytes(metadata.len());
+                }
+                Some(value)
+            }
+            None => None,
         };
         let fallback_session = chat
             .parent()
@@ -1396,16 +1406,29 @@ impl ShallowSessionProvider for GrokProvider {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let first_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("created_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms);
-        let last_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("updated_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms)
+        // `updates.jsonl` is where Grok records real per-event times;
+        // `summary.json` records only when the session was opened and last
+        // touched, and a session restored from a checkpoint carries a
+        // `created_at` older than anything it did. Read the stream's first and
+        // last record from the same bounded head/tail scan every other adapter
+        // uses, and fall back to the summary when there is no stream.
+        let (stream_first, stream_last) =
+            grok_update_bounds(scan, &chat.with_file_name("updates.jsonl"))?;
+        let first_activity_ms = stream_first.or_else(|| {
+            summary
+                .as_ref()
+                .and_then(|s| s.get("created_at"))
+                .and_then(Value::as_str)
+                .and_then(crate::parse_iso_ms)
+        });
+        let last_activity_ms = stream_last
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .and_then(|s| s.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .and_then(crate::parse_iso_ms)
+            })
             .or_else(|| crate::file_modified_ms(&chat));
         let mut models = Vec::new();
         push_unique(
@@ -1441,6 +1464,35 @@ impl ShallowSessionProvider for GrokProvider {
             ..Default::default()
         }))
     }
+}
+
+/// The first and last times `updates.jsonl` recorded.
+///
+/// Both are `None` when there is no readable stream or when its bounding
+/// records carried no time — Grok's own absence, reported as such rather than
+/// replaced with a file mtime here.
+fn grok_update_bounds(
+    scan: &ScanEnv<'_>,
+    updates: &Path,
+) -> Result<(Option<i64>, Option<i64>)> {
+    match fs::metadata(updates) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", updates.display()))
+        }
+        Ok(metadata) if !metadata.is_file() => return Ok((None, None)),
+        Ok(_) => {}
+    }
+    let bounded = read_bounded_jsonl(scan, updates)?;
+    let first = bounded
+        .head_records()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    let last = bounded
+        .tail_records_rev()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    Ok((first, last))
 }
 
 // ---------------------------------------------------------------------------
@@ -2457,10 +2509,12 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = CASE \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.first_activity_ms, sessions.first_activity_ms) \
              WHEN excluded.first_activity_ms IS NULL THEN sessions.first_activity_ms \
              WHEN sessions.first_activity_ms IS NULL THEN excluded.first_activity_ms \
              ELSE MIN(sessions.first_activity_ms, excluded.first_activity_ms) END, \
          last_activity_ms = CASE \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.last_activity_ms, sessions.last_activity_ms) \
              WHEN excluded.last_activity_ms IS NULL THEN sessions.last_activity_ms \
              WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
              ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
@@ -2488,11 +2542,13 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
 /// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed, and never downgrades
-/// a fully indexed row to `'shallow'` — including a row from a database that
-/// predates `discovery_state`, whose NULL readers deliberately interpret as
-/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
-/// stamp.
+/// `first_activity_ms` past what a fuller pass observed for append-only
+/// providers, and never downgrades a fully indexed row to `'shallow'` —
+/// including a row from a database that predates `discovery_state`, whose NULL
+/// readers deliberately interpret as `'full'`. Grok is the exception on the
+/// activity bounds: a session directory is a replacement snapshot, so a later
+/// compaction can move the start forward and the end backward. A shallow
+/// rescan of such a row still refreshes its metadata and stamp.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the

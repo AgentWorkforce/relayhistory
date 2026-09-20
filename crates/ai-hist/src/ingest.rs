@@ -1,7 +1,7 @@
 use crate::{
-    default_db_path, insert_history, now_ms, open_db, open_db_readonly, parse_cursor_text,
-    prompt_hash, schema_is_catalog_read_current, sync_opencode_db, sync_opencode_session,
-    HistoryEntry, SessionLocation, SessionScope,
+    default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
+    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
+    sync_opencode_session, HistoryEntry, SessionLocation, SessionMarker, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -16,7 +16,9 @@ use std::time::Duration;
 
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod grok;
 pub(crate) mod hydrate;
+pub(crate) mod jsonl;
 pub(crate) mod tool_result_facts;
 
 use crate::diagnostics::*;
@@ -1117,6 +1119,7 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts_v4", "codex_rollouts_v5"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
+    ("grok_sessions", GROK_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -1128,6 +1131,54 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
 /// `HYDRATION_PARSER_VERSION` alone only repairs sessions somebody hydrates by
 /// name; plain `sync` would keep skipping the rest forever.
 const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v2";
+
+/// Byte cursor covering every complete record currently in `transcript`.
+///
+/// Targeted hydration re-reads the whole file and does not otherwise touch
+/// `.sync-state.json`. Without this, a later incremental sync resumes from
+/// the offset it had before hydration and re-inserts untimed prompts under
+/// the new mtime.
+pub(crate) fn record_cursor_hydrate_checkpoint(db_path: &Path, transcript: &Path) -> Result<()> {
+    let state_path = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".sync-state.json");
+    let mut source = CompleteJsonlReader::open(transcript, None)
+        .with_context(|| format!("open Cursor transcript {}", transcript.display()))?;
+    let mut line = String::new();
+    let mut consumed = source.position;
+    while let Some(position) = source
+        .next_line(&mut line)
+        .with_context(|| format!("read Cursor transcript {}", transcript.display()))?
+    {
+        consumed = position;
+    }
+    let cursor = source
+        .committed_cursor(consumed, true)
+        .with_context(|| format!("validate Cursor transcript {}", transcript.display()))?;
+    let mut cursor_state = Map::new();
+    cursor_state.insert(transcript.to_string_lossy().into_owned(), cursor.to_value());
+    let mut ours = Map::new();
+    ours.insert(
+        CURSOR_SYNC_STATE_KEY.to_string(),
+        Value::Object(cursor_state),
+    );
+    checkpoint_sync_state(&state_path, &ours);
+    Ok(())
+}
+
+/// Where plain `sync` remembers the change stamp of each Grok session
+/// directory it has already read.
+///
+/// Renaming the key is how a session that has not changed on disk gets re-read
+/// after a parser upgrade: the old map is retired, every session directory
+/// looks unseen again, and sessions that only ever produced prompts are
+/// re-indexed into `session_events`, `tool_calls`, `file_edits`,
+/// `session_markers` and `session_relationships` — with the timestamps
+/// `updates.jsonl` recorded, in place of the synthesized ones the previous
+/// parser wrote. Bumping `HYDRATION_PARSER_VERSION` alone only repairs
+/// sessions somebody hydrates by name.
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v1";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -2234,6 +2285,80 @@ fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Resul
         "SELECT EXISTS(SELECT 1 FROM session_relationships \
          WHERE source = 'codex' AND child_session_id = ? LIMIT 1)",
         [child_session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// The stamp a previous run saved for one Grok session file.
+///
+/// An earlier build of this walk stored the stamp as a bare string. The shape
+/// now is an object that also carries the session id the file was indexed
+/// under, and both are read so an upgrade does not re-read the whole store.
+fn grok_state_stamp(entry: &Value) -> Option<&str> {
+    match entry {
+        Value::String(stamp) => Some(stamp.as_str()),
+        _ => entry.get("stamp").and_then(Value::as_str),
+    }
+}
+
+/// The session id a previous run indexed one Grok session file under, when it
+/// recorded one. `None` for a state file from the older shape, and for a file
+/// that held no session.
+fn grok_state_session(entry: &Value) -> Option<&str> {
+    entry
+        .get("session")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether the run that last indexed this file wrote any evidence for it.
+///
+/// `None` for a state entry written before this was recorded; the caller then
+/// falls back to asking the database, which self-heals on the next re-read.
+fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
+    entry.get("evidence").and_then(Value::as_bool)
+}
+
+/// Whether any Grok-owned evidence is stored for a session.
+///
+/// Every table this ingestion writes, because a Grok session need not produce
+/// events: one made only of `system` lines, synthetic turns or encrypted
+/// reasoning is stored entirely as markers, and one whose transcript is empty
+/// but whose `subagents/` directory names a child has only a relationship.
+/// Asking about a subset would call such a session unindexed on every run.
+fn grok_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    if session_events_exist(conn, "grok", session_id)? {
+        return Ok(true);
+    }
+    for statement in [
+        "SELECT EXISTS(SELECT 1 FROM session_markers \
+         WHERE source = 'grok' AND session_id = ? LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'grok' AND parent_session_id = ? \
+           AND evidence_kind = 'grok_subagent_dir' LIMIT 1)",
+    ] {
+        let exists: i64 = conn.query_row(statement, params![session_id], |row| row.get(0))?;
+        if exists != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the catalog row this ingestion writes is still there.
+///
+/// The one thing every Grok ingestion produces, whatever the transcript held.
+/// It is the right question only for a session recorded as having written no
+/// evidence: for such a session the catalog row is the whole of what indexing
+/// it produced, so its presence and "is it indexed" are the same question.
+/// For a session that did write evidence it would be too weak, because
+/// discovery writes catalog rows too and one could stand over missing rows.
+fn grok_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions \
+         WHERE source = 'grok' AND session_id = ? LIMIT 1)",
+        params![session_id],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
@@ -5506,6 +5631,12 @@ fn scan_cursor_transcript_with(
         }
     }
     after_read(jsonl);
+    let saved_offset = saved
+        .and_then(FileCursor::decode)
+        .map(|decoded| match decoded {
+            DecodedFileCursor::Typed(cursor) => cursor.offset,
+            DecodedFileCursor::Legacy(offset) => offset,
+        });
     let opened_cursor = source.cursor.to_value();
     // The generation comes from the cursor this scan commits, whose prefix
     // hash is the digest of the bytes the reader *actually read* — not a
@@ -5565,7 +5696,17 @@ fn scan_cursor_transcript_with(
         // longer exists, and only a queued transcript gets re-scanned and
         // rebuilt. Leaving it unqueued would keep that evidence until some
         // later sync happened to find new bytes.
-        advanced: consumed != offset || replaced_mid_scan,
+        //
+        // `replaced_mid_scan` catches a rewrite the reader noticed *while*
+        // reading. A rewrite to empty is noticed in `open` instead: the saved
+        // cursor had a positive offset, the file is now shorter, and the
+        // reader starts at zero with both offsets equal, so neither
+        // `consumed != offset` nor `reset_cursor` fires. The checkpoint
+        // still advances (the opened cursor is a new generation), and
+        // without this the obsolete rows stay.
+        advanced: consumed != offset
+            || replaced_mid_scan
+            || (offset == 0 && saved_offset.is_some_and(|previous| previous > 0)),
         resumed_from: offset,
         consumed_through: consumed,
         // Re-checked by the index phase, because a replacement can still land
@@ -5606,6 +5747,19 @@ pub(crate) struct CursorGeneration {
 pub(crate) fn cursor_generation(path: &Path, through: u64) -> Result<Option<CursorGeneration>> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("identify Cursor transcript {}", path.display()))?;
+    if !metadata.is_file() {
+        // `Ok(None)` means a regular file shrank below the scanned prefix.
+        // A directory's `len` is often smaller than that prefix (especially
+        // on macOS), so the length check would call this a truncation and
+        // rebuild. Open it so the I/O error names what it actually is.
+        fs::File::open(path)
+            .and_then(|mut file| file.read(&mut [0u8; 1]).map(|_| ()))
+            .with_context(|| format!("identify Cursor transcript {}", path.display()))?;
+        anyhow::bail!(
+            "identify Cursor transcript {}: not a regular file",
+            path.display()
+        );
+    }
     let (device, inode) = metadata_identity(&metadata);
     if metadata.len() < through {
         return Ok(None);
@@ -5770,29 +5924,33 @@ fn prepare_cursor_sync(
     })
 }
 
-/// The timestamp a previous pass stored for the record at `record_offset`.
+/// Timestamps a previous pass stored, keyed by the record's byte offset.
 ///
 /// Every event derived from one record shares that record's byte offset as the
-/// prefix of its `event_uid`, so any one of them answers the question. The
-/// prefix is compared with `substr` rather than `LIKE` because an offset is
-/// digits but the separator is not, and `LIKE` would treat `_` as a wildcard.
-fn stored_cursor_record_ts(
+/// prefix of its `event_uid` (`"{offset}:{block}"`), so the first event at
+/// each offset answers the question. Loaded once per incremental pass because
+/// a `substr(event_uid, …)` predicate cannot use the uid index.
+fn stored_cursor_record_timestamps(
     conn: &Connection,
     session_id: &str,
-    record_offset: u64,
-) -> Result<Option<i64>> {
-    let prefix = record_offset.to_string();
-    use rusqlite::OptionalExtension as _;
-    Ok(conn
-        .query_row(
-            "SELECT ts_ms FROM session_events \
-             WHERE source = 'cursor' AND session_id = ? \
-               AND substr(event_uid, 1, length(?) + 1) = ? || ':' \
-             ORDER BY id LIMIT 1",
-            params![session_id, prefix, prefix],
-            |row| row.get(0),
-        )
-        .optional()?)
+) -> Result<HashMap<u64, i64>> {
+    let mut stored = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT event_uid, ts_ms FROM session_events \
+         WHERE source = 'cursor' AND session_id = ? ORDER BY id",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    while let Some(row) = rows.next()? {
+        let uid: String = row.get(0)?;
+        let ts: i64 = row.get(1)?;
+        if let Some(offset) = uid
+            .split_once(':')
+            .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
+        {
+            stored.entry(offset).or_insert(ts);
+        }
+    }
+    Ok(stored)
 }
 
 /// Drop every row a previous read of this Cursor transcript produced.
@@ -5883,6 +6041,15 @@ pub(crate) fn ingest_cursor_transcript(
         .with_context(|| format!("read Cursor transcript {}", path.display()))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
+    // One query for the session, keyed by record offset. The per-record
+    // `substr(event_uid, …)` lookup cannot use the uid index, so an advanced
+    // sync of a long untimed transcript would otherwise scan events once per
+    // old record.
+    let stored_ts = if history_from_offset > 0 {
+        stored_cursor_record_timestamps(conn, session_id)?
+    } else {
+        HashMap::new()
+    };
     // The last turn time seen while walking forward, inherited by the records
     // that answer that turn.
     let mut turn_ts: Option<i64> = None;
@@ -5977,7 +6144,7 @@ pub(crate) fn ingest_cursor_transcript(
                 // re-reading keeps the stamp it already has; only records at or
                 // past the resumed offset take the current mtime.
                 if record_offset < history_from_offset {
-                    match stored_cursor_record_ts(conn, session_id, record_offset)? {
+                    match stored_ts.get(&record_offset).copied() {
                         Some(stored) => stored,
                         None => {
                             ts_is_guessed = true;
@@ -6031,7 +6198,11 @@ pub(crate) fn ingest_cursor_transcript(
                         continue;
                     }
                     if !is_user {
-                        outcome.last_assistant_text = Some(text.clone());
+                        // Same 4096-character cap discovery writes. Hydrating a
+                        // long reply used to store the full block and rewrite
+                        // the catalog summary the agreement test exists to keep
+                        // stable.
+                        outcome.last_assistant_text = Some(crate::discover::excerpt(&text));
                     }
                     emitted_evidence = true;
                     insert_session_event(
@@ -6334,7 +6505,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         return Ok(0);
     }
     let mut grok_state = state
-        .get("grok_sessions")
+        .get(GROK_SYNC_STATE_KEY)
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -6342,30 +6513,124 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     let mut scanned = 0;
     let mut sessions = 0;
     let mut errors = 0;
+    // Sessions this run could **account for**: indexed now, or confirmed
+    // unchanged against a stamp it read successfully. Not the same as
+    // `sessions`, which counts only what was indexed — a store that is fully
+    // synced indexes nothing on every later run, and using that count to
+    // decide whether the source failed would fail it forever over one
+    // unreadable sibling.
+    let mut accounted = 0;
     for chat in capture_files(
         "grok",
         collect_matching_files(root, "chat_history", "jsonl")?,
     ) {
         let key = chat.to_string_lossy().to_string();
-        let stamp = grok_session_stamp(&chat)?;
-        if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
-            continue;
+        // One unreadable session directory does not stop the rest, and it does
+        // not update its saved stamp either: the next run tries again. It is
+        // counted as looked at, so the run says so — a stamp that fails
+        // closed and is then reported as nothing at all is the silence the
+        // strictness exists to prevent.
+        let stamp = match grok_session_stamp(&chat) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                scanned += 1;
+                errors += 1;
+                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+                continue;
+            }
+        };
+        let recorded = grok_state.get(&key);
+        let recorded_stamp = recorded.and_then(grok_state_stamp).map(str::to_string);
+        let recorded_session = recorded.and_then(grok_state_session).map(str::to_string);
+        let recorded_evidence = recorded.and_then(grok_state_had_evidence);
+        if recorded_stamp.as_deref() == Some(stamp.as_str()) {
+            // The stamp says the file has not changed. That is only half the
+            // question: `.sync-state.json` lives beside the database, so a
+            // deleted or rebuilt `history.db` keeps this file, and a stamp
+            // read on its own would answer "already indexed" for a session
+            // whose rows are gone -- until some file in the directory changes,
+            // which for a finished session is never. The Codex and Claude
+            // walks check the database for the same reason.
+            //
+            // The other half of that is knowing what "its rows" means for
+            // *this* session. Not every Grok session produces `session_events`
+            // -- one made only of `system` lines, synthetic turns or encrypted
+            // reasoning is stored entirely as markers, and one with an empty
+            // transcript and a `subagents/` entry only a relationship -- so
+            // asking only about events would find nothing and re-read such a
+            // session on every run, forever. The answer is not to guess from
+            // the tables but to record what the indexing run actually
+            // produced, and then to ask about that.
+            match (recorded_session.as_deref(), recorded_evidence) {
+                // Written by an older build that saved the stamp alone, so
+                // there is no session id to look the evidence up by. Trust
+                // the stamp, as that build did.
+                (None, _) => {
+                    accounted += 1;
+                    continue;
+                }
+                // The run that indexed it wrote no evidence rows at all. It
+                // still wrote a catalog row -- every ingestion does -- so
+                // that is what there is to check, and it is enough: a session
+                // with no evidence *is* its catalog row. Skipping without
+                // asking anything is what let an empty session disappear for
+                // good when the database was rebuilt.
+                (Some(id), Some(false)) if grok_catalog_row_exists(conn, id)? => {
+                    accounted += 1;
+                    continue;
+                }
+                (Some(id), Some(true) | None) if grok_evidence_exists(conn, id)? => {
+                    accounted += 1;
+                    continue;
+                }
+                // Unchanged, and what it did write is missing: re-index it.
+                _ => {}
+            }
         }
         scanned += 1;
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
-                inserted += ingest_grok_session(conn, &session, &raw_path)?;
+                let session_id = session.session_id.clone();
+                // One session directory is one transaction: its evidence is
+                // replaced, not merged, and a reader must never see the gap
+                // between the two halves of that.
+                let tx = conn.unchecked_transaction()?;
+                let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
+                inserted += outcome.prompts;
+                tx.commit()?;
+                // Whether this session has any evidence to go looking for on
+                // a later run. A session stored entirely as markers has no
+                // events; one whose transcript is empty but whose
+                // `subagents/` directory names a child has only a
+                // relationship. Every writer this ingestion drives has to be
+                // counted here, or a later run asks about a table this
+                // session never filled and re-reads it for ever.
+                let had_evidence =
+                    outcome.events > 0 || outcome.markers > 0 || outcome.relationships > 0;
                 sessions += 1;
-                grok_state.insert(key, json!(stamp));
+                accounted += 1;
+                // The session id travels with the stamp so the next run can
+                // ask the database whether this evidence is still there, and
+                // `evidence` says whether there was any to ask about.
+                grok_state.insert(
+                    key,
+                    json!({ "stamp": stamp, "session": session_id, "evidence": had_evidence }),
+                );
             }
             Ok(None) => {
-                grok_state.insert(key, json!(stamp));
+                // Read fine, and there was no session in it -- so there is no
+                // session id to check any future run against either.
+                accounted += 1;
+                grok_state.insert(key, json!({ "stamp": stamp }));
             }
-            Err(_) => errors += 1,
+            Err(error) => {
+                errors += 1;
+                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+            }
         }
     }
-    state.insert("grok_sessions".to_string(), Value::Object(grok_state));
+    state.insert(GROK_SYNC_STATE_KEY.to_string(), Value::Object(grok_state));
     if scanned > 0 {
         let suffix = if errors > 0 {
             format!(" ({errors} errors)")
@@ -6374,51 +6639,825 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         };
         sync_note!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
     }
+    // A store where nothing could be read is a failed source, not an empty
+    // one: the caller records it and the run says so. A store where something
+    // failed and something else was accounted for stays a success, so the
+    // sessions that did read keep their saved stamps -- otherwise one
+    // unreadable directory would send every future run back over the whole
+    // store, and a fully synced store would fail this source on every run
+    // from then on.
+    if errors > 0 && accounted == 0 {
+        anyhow::bail!(
+            "{errors} Grok session(s) could not be read and none were indexed; \
+             the unreadable directories are named above"
+        );
+    }
     Ok(inserted)
 }
 
-fn ingest_grok_session(conn: &Connection, session: &GrokSession, raw_path: &str) -> Result<usize> {
+/// What indexing one Grok session directory produced, and what its own records
+/// could not establish.
+///
+/// The fallback counters are not diagnostics of *this* run: they are how many
+/// facts Grok did not write down, which is what a caller has to be told before
+/// it trusts a timestamp.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GrokIngestOutcome {
+    pub prompts: usize,
+    pub events: usize,
+    pub tool_calls: usize,
+    pub file_edits: usize,
+    pub markers: usize,
+    pub relationships: usize,
+    /// Subagent metadata files that named no child session id.
+    pub unlinked_subagents: usize,
+    /// `Task`-style calls in the transcript. Grok names no child in the call
+    /// itself, so these produce a tool call and never a relationship row.
+    pub subagent_calls: usize,
+    /// Records whose time came from their turn's `turnStartMs`.
+    pub turn_start_fallbacks: usize,
+    /// Records that inherited the previous record's time.
+    pub inherited_fallbacks: usize,
+    /// Records stamped with the session's `created_at`.
+    pub session_start_fallbacks: usize,
+    pub encrypted_reasoning: usize,
+    pub unread_update_rows: usize,
+    /// The session directory had no `updates.jsonl` at all.
+    pub missing_updates: bool,
+    /// The stream was there and established no timing at all — no turn, no
+    /// message group, no tool. Distinct from `missing_updates`, because the
+    /// two want different answers: a session Grok wrote no updates for is
+    /// normal, and a stream this parser could not use is a gap in coverage
+    /// worth knowing about.
+    pub updates_yielded_no_timing: bool,
+    /// The newest `turn_completed` context snapshot, for the caller's report.
+    pub context_total_tokens: Option<i64>,
+}
+
+/// Index one Grok session directory: prompts, events, tools, edits, markers
+/// and subagent delegations.
+fn ingest_grok_session(
+    conn: &Connection,
+    session: &GrokSession,
+    raw_path: &str,
+) -> Result<GrokIngestOutcome> {
+    const SOURCE: &str = "grok";
+    let sid = session.session_id.as_str();
+    let project = session.cwd.as_deref();
+    let branch = session.git_branch.as_deref();
+    replace_grok_session_evidence(conn, sid)?;
+    let mut outcome = GrokIngestOutcome {
+        missing_updates: !session.updates_present,
+        updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
+        unread_update_rows: session.updates.unread_rows,
+        context_total_tokens: session
+            .updates
+            .turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.total_tokens),
+        ..Default::default()
+    };
+
+    let mut user_ordinal = 0usize;
+    let mut message_ordinal = 0usize;
+    let mut thought_ordinal = 0usize;
+    let mut first_prompt: Option<String> = None;
+    // Chat-side turn index: `None` until the first typed prompt, because the
+    // system preamble belongs to no turn.
+    let mut turn: Option<usize> = None;
+    let mut inherited: Option<i64> = None;
+    // Where each turn's context-token snapshot is recorded: the turn's last
+    // assistant prose event, or — for a turn whose whole answer was tool calls
+    // and no prose, which is an ordinary Grok turn — its last tool-use event.
+    // Keeping the two separate means a tool call after a message does not
+    // displace the message, and a turn with no message still has a tail.
+    let mut turn_tail: HashMap<usize, String> = HashMap::new();
+    let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
+
+    for (idx, line) in session.lines.iter().enumerate() {
+        // Looked up on use rather than cached: a record that establishes
+        // which turn it is in (a prose chunk that joined to a group) changes
+        // the answer for the rest of its own branch, and a cached value would
+        // hand it the *previous* turn's start as its fallback.
+        let turn_start = |turn: Option<usize>| {
+            turn.and_then(|turn| session.updates.turns.get(turn))
+                .and_then(|timing| timing.start_ms)
+        };
+        match &line.record {
+            grok::GrokRecord::System { text } => {
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    None,
+                    turn_start(turn),
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    &SessionMarker {
+                        source: SOURCE.into(),
+                        session_id: sid.to_string(),
+                        marker_uid: format!("r{idx}"),
+                        kind: "system".into(),
+                        ts_ms: Some(ts),
+                        text: text.as_deref().map(truncate_marker_text),
+                        detail_json: None,
+                    },
+                )?;
+            }
+            grok::GrokRecord::User { text, synthetic } => {
+                let Some(text) = text else { continue };
+                if *synthetic {
+                    // Grok injected this turn; nobody typed it. Recording it as
+                    // a user message would put words in a person's mouth, so it
+                    // is kept as a marker carrying the reason Grok gave.
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        None,
+                        turn_start(turn),
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    outcome.markers += insert_session_marker(
+                        conn,
+                        &SessionMarker {
+                            source: SOURCE.into(),
+                            session_id: sid.to_string(),
+                            marker_uid: format!("r{idx}"),
+                            kind: "synthetic_turn".into(),
+                            ts_ms: Some(ts),
+                            text: Some(truncate_marker_text(text)),
+                            detail_json: session
+                                .synthetic_reasons
+                                .get(&idx)
+                                .map(|reason| json!({ "synthetic_reason": reason }).to_string()),
+                        },
+                    )?;
+                    // A marker is still a record with a place in the file, so
+                    // the next record with no time of its own inherits *this*
+                    // one's, not that of whatever came before it.
+                    inherited = Some(ts);
+                    continue;
+                }
+                let group = session.updates.user_messages.get(user_ordinal);
+                user_ordinal += 1;
+                // `updates.jsonl` numbers the turns; the chat-side counter is
+                // only the fallback for a session whose stream is missing.
+                turn =
+                    Some(group.map_or_else(|| turn.map_or(0, |turn| turn + 1), |group| group.turn));
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    group.and_then(|group| group.ts_ms),
+                    turn_start(turn),
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                if first_prompt.is_none() {
+                    first_prompt = Some(crate::discover::excerpt(text));
+                }
+                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "user",
+                    "text",
+                    Some(text),
+                    None,
+                    None,
+                    &uid,
+                    None,
+                    RawMessageFacts::default(),
+                )?;
+                outcome.events += 1;
+                outcome.prompts += insert_history(
+                    conn,
+                    &HistoryEntry {
+                        id: 0,
+                        source: SOURCE.into(),
+                        session_id: Some(sid.to_string()),
+                        project: session.cwd.clone(),
+                        prompt_hash: Some(prompt_hash(text)),
+                        prompt: text.clone(),
+                        timestamp_ms: ts,
+                    },
+                )?;
+            }
+            grok::GrokRecord::Reasoning { summary, encrypted } => {
+                // Every reasoning record occupies an `agent_thoughts` ordinal,
+                // including encrypted-only traces with no readable summary.
+                // Skipping that consume handed the next thought the encrypted
+                // record's chunk — its timestamp and event id.
+                let group = session.updates.agent_thoughts.get(thought_ordinal);
+                thought_ordinal += 1;
+                if let Some(group) = group {
+                    turn = Some(group.turn);
+                }
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    group.and_then(|group| group.ts_ms),
+                    turn_start(turn),
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                let Some(summary) = summary else {
+                    if *encrypted {
+                        // The trace exists but is opaque. Recording the fact
+                        // that Grok thought here is honest; inventing readable
+                        // thinking for it would not be.
+                        outcome.encrypted_reasoning += 1;
+                        outcome.markers += insert_session_marker(
+                            conn,
+                            &SessionMarker {
+                                source: SOURCE.into(),
+                                session_id: sid.to_string(),
+                                marker_uid: format!("r{idx}"),
+                                kind: "encrypted_reasoning".into(),
+                                ts_ms: Some(ts),
+                                text: None,
+                                detail_json: None,
+                            },
+                        )?;
+                    }
+                    continue;
+                };
+                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "assistant",
+                    "thinking",
+                    Some(summary),
+                    None,
+                    None,
+                    &uid,
+                    None,
+                    RawMessageFacts::default(),
+                )?;
+                outcome.events += 1;
+            }
+            grok::GrokRecord::Assistant { text, model, calls } => {
+                if let Some(text) = text {
+                    let group = session.updates.agent_messages.get(message_ordinal);
+                    message_ordinal += 1;
+                    if let Some(group) = group {
+                        turn = Some(group.turn);
+                    }
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        group.and_then(|group| group.ts_ms),
+                        turn_start(turn),
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    inherited = Some(ts);
+                    let uid =
+                        grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        branch,
+                        &uid,
+                        None,
+                        ts,
+                        "assistant",
+                        "text",
+                        Some(text),
+                        model.as_deref(),
+                        None,
+                        &uid,
+                        None,
+                        RawMessageFacts::default(),
+                    )?;
+                    outcome.events += 1;
+                    if let Some(turn) = turn {
+                        turn_tail.insert(turn, uid);
+                    }
+                }
+                for (nth, call) in calls.iter().enumerate() {
+                    let tool_use_id = call.id.clone().unwrap_or_else(|| format!("r{idx}:t{nth}"));
+                    let timing = session.updates.tools.get(&tool_use_id);
+                    // A tool call joins by id, so its turn is known exactly.
+                    // The transcript-side cursor is only the fallback, and it
+                    // must not displace a matched call's own turn.
+                    let call_turn = timing.and_then(|timing| timing.turn).or(turn);
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        timing.and_then(|timing| timing.started_ms),
+                        turn_start(call_turn),
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    inherited = Some(ts);
+                    let target = grok::pick_tool_target(&call.name, &call.arguments);
+                    let uid = format!("tool:{tool_use_id}");
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        branch,
+                        &uid,
+                        None,
+                        ts,
+                        "assistant",
+                        "tool_use",
+                        Some(&format_tool_event_text(
+                            &call.name,
+                            target.as_deref(),
+                            &call.arguments,
+                        )),
+                        model.as_deref(),
+                        None,
+                        &uid,
+                        None,
+                        RawMessageFacts::default(),
+                    )?;
+                    outcome.events += 1;
+                    // `updates.jsonl` knows which turn the call belongs to even
+                    // when the transcript side does not, because the call is
+                    // joined by id.
+                    if let Some(call_turn) = call_turn {
+                        turn_tool_tail.insert(call_turn, uid.clone());
+                    }
+                    insert_tool_call(
+                        conn,
+                        SOURCE,
+                        sid,
+                        &uid,
+                        &tool_use_id,
+                        &call.name,
+                        target.as_deref(),
+                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        None,
+                        ts,
+                    )?;
+                    outcome.tool_calls += 1;
+                    if grok::is_subagent_tool(&call.name) {
+                        outcome.subagent_calls += 1;
+                    }
+                    if grok::is_file_edit_tool(&call.name) {
+                        if let Some(path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                SOURCE,
+                                sid,
+                                &uid,
+                                &tool_use_id,
+                                path,
+                                &call.name,
+                                ts,
+                                branch,
+                                project,
+                            )?;
+                            outcome.file_edits += 1;
+                        }
+                    }
+                }
+            }
+            grok::GrokRecord::ToolResult {
+                call_id,
+                text,
+                is_error,
+            } => {
+                let tool_use_id = call_id.clone().unwrap_or_else(|| format!("r{idx}:result"));
+                let timing = session.updates.tools.get(&tool_use_id);
+                // Paired by id with its call, so the result belongs to the
+                // call's turn whatever the transcript cursor says.
+                let result_turn = timing.and_then(|timing| timing.turn).or(turn);
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    timing.and_then(|timing| timing.finished_ms),
+                    turn_start(result_turn),
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                // Grok records failure in two places and neither is always
+                // present: the result's own `is_error`, and the terminal
+                // `status` on the tool call's last ACP update.
+                let failed = is_error.unwrap_or(false)
+                    || timing
+                        .and_then(|timing| timing.status.as_deref())
+                        .is_some_and(|status| {
+                            matches!(status, "failed" | "error" | "cancelled" | "canceled")
+                        });
+                let uid = format!("result:{tool_use_id}");
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "tool_result",
+                    "tool_result",
+                    text.as_deref(),
+                    None,
+                    None,
+                    &uid,
+                    None,
+                    RawMessageFacts::default(),
+                )?;
+                outcome.events += 1;
+                if failed || is_error.is_some() {
+                    set_tool_call_error(conn, SOURCE, sid, &tool_use_id, failed)?;
+                }
+            }
+            grok::GrokRecord::Other => {}
+        }
+    }
+
+    // The context-token proxy, on the turn's final assistant message. It is
+    // stored with its source named so a consumer can see that it is a context
+    // snapshot and not billed usage: Grok logs no per-turn input/output token
+    // counts, and none are estimated here.
+    for (turn, timing) in session.updates.turns.iter().enumerate() {
+        let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
+        let (Some(total), Some(uid)) = (timing.total_tokens, tail) else {
+            continue;
+        };
+        let token_json = json!({
+            "context_total_tokens": total,
+            "source": "updates.jsonl",
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE session_events SET token_json = ? \
+             WHERE source = 'grok' AND session_id = ? AND event_uid = ?",
+            params![token_json, sid, uid],
+        )?;
+    }
+
+    ingest_grok_session_extras(conn, session, &mut outcome)?;
+    refresh_grok_incoming_relationships(conn, sid)?;
+
     upsert_session(
         conn,
-        &session.session_id,
-        "grok",
-        session.cwd.as_deref(),
-        session.git_branch.as_deref(),
+        sid,
+        SOURCE,
+        project,
+        branch,
         session.first_ts,
         session.last_ts,
         session.last_assistant_text.as_deref(),
         Some(raw_path),
     )?;
-    let mut inserted = 0;
-    for (idx, prompt) in session.prompts.iter().enumerate() {
-        inserted += insert_history(
+    // `upsert_session` merges: it takes MIN/MAX of the activity bounds and
+    // keeps the old `last_assistant_text` when the new read has none. That is
+    // right for an append-only transcript and wrong for a snapshot — after a
+    // compaction the directory says the session now ends earlier, or ran no
+    // model at all, and the merge would keep reporting yesterday's end time
+    // and yesterday's model forever. So the fields the snapshot owns are
+    // assigned from it, empty values included, while every other provider
+    // keeps the monotonic merge.
+    conn.execute(
+        "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
+         last_assistant_text = ?, models_json = ?, first_prompt = ? \
+         WHERE source = 'grok' AND session_id = ?",
+        params![
+            session.first_ts,
+            session.last_ts,
+            session.last_assistant_text.as_deref(),
+            (!session.models.is_empty())
+                .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
+            first_prompt.as_deref(),
+            sid,
+        ],
+    )?;
+    Ok(outcome)
+}
+
+/// Clear the evidence this session's files own, so a read is a replacement
+/// rather than a merge.
+///
+/// A Grok read is always a whole-directory read, and Grok **rewrites**
+/// `chat_history.jsonl` in place on a format upgrade or a compaction. So the
+/// files are a snapshot, not an append-only log: a tool call that is no longer
+/// in the transcript, a checkpoint whose file was removed, a `subagents/`
+/// entry that is gone — none of them happened, as far as the current evidence
+/// goes. Upserting alone would leave every one of them in the database
+/// forever, and a reader cannot tell a stale row from a live one.
+///
+/// Scope is deliberately narrow. Rows are deleted only where `source =
+/// 'grok'` and this session owns them; a relationship is deleted only where
+/// this session is the **parent** and the evidence came from its own
+/// `subagents/` directory, so another session's record of *this* session as a
+/// child is untouched. The caller runs inside a transaction, so the window
+/// where the evidence is missing is never observable.
+fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
+    for statement in [
+        "DELETE FROM session_events WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM tool_calls WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM file_edits WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM session_markers WHERE source = 'grok' AND session_id = ?",
+    ] {
+        conn.execute(statement, params![session_id])?;
+    }
+    // `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
+    // `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
+    // attributed to whichever session was indexed first. Deleting this
+    // session's rows outright would therefore delete a prompt that another,
+    // unchanged session still has -- it would vanish from search with nothing
+    // to say it had ever been there, and nothing would ever put it back,
+    // because that session's own files never change again.
+    //
+    // So a row this session no longer owns is **re-attributed** rather than
+    // skipped. Skipping was the other option and is worse: it would leave the
+    // row filed under a session that no longer contains the prompt, which is
+    // a false statement about provenance, and would leave it undeletable --
+    // the only session that could ever clean it up is the one that no longer
+    // evidences it. Re-attribution moves the row to a session whose stored
+    // events actually carry that prompt at that moment, so the row stays true
+    // and stays owned.
+    conn.execute(
+        "UPDATE history AS h SET            session_id = (SELECT e.session_id FROM session_events e                          WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                            AND e.session_id <> h.session_id                            AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                          ORDER BY e.session_id LIMIT 1),            project = (SELECT e.project FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                       ORDER BY e.session_id LIMIT 1)          WHERE h.source = 'grok' AND h.session_id = ?            AND EXISTS(SELECT 1 FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
+        params![session_id],
+    )?;
+    for statement in [
+        // What is left is this session's alone. A prompt's identity is
+        // `(source, timestamp_ms, prompt)`, and every Grok prompt written
+        // before this parser carried a timestamp synthesized as
+        // `created_at + index`; merging would keep the fabricated ones
+        // forever.
+        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM session_relationships WHERE source = 'grok' \
+         AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
+    ] {
+        conn.execute(statement, params![session_id])?;
+    }
+    Ok(())
+}
+
+/// Tell this session's parents whether it is addressable yet.
+///
+/// A parent's `subagents/` directory can be read before its child has ever
+/// been indexed — sync walks the store in whatever order the filesystem hands
+/// it back, and the child may not even exist on disk yet. The edge is recorded
+/// then with `child_has_events = 0`, and nothing would ever correct it,
+/// because refreshing it requires re-reading the *parent*. So the child does
+/// it when it is indexed, in both directions: a session whose events were
+/// replaced by a read that produced none says so too.
+fn refresh_grok_incoming_relationships(conn: &Connection, session_id: &str) -> Result<()> {
+    let has_events = session_events_exist(conn, "grok", session_id)?;
+    conn.execute(
+        "UPDATE session_relationships SET child_has_events = ?, updated_ms = ? \
+         WHERE source = 'grok' AND child_session_id = ? AND child_has_events <> ?",
+        params![has_events, now_ms(), session_id, has_events],
+    )?;
+    Ok(())
+}
+
+/// The session-level files beside the transcript: `signals.json`,
+/// `prompt_context.json`, `compaction_checkpoints/` and `subagents/`.
+fn ingest_grok_session_extras(
+    conn: &Connection,
+    session: &GrokSession,
+    outcome: &mut GrokIngestOutcome,
+) -> Result<()> {
+    const SOURCE: &str = "grok";
+    let sid = session.session_id.as_str();
+    if let Some(signals) = &session.signals {
+        outcome.markers += insert_session_marker(
             conn,
-            &HistoryEntry {
-                id: 0,
-                source: "grok".into(),
-                session_id: Some(session.session_id.clone()),
-                project: session.cwd.clone(),
-                prompt_hash: Some(prompt_hash(prompt)),
-                prompt: prompt.clone(),
-                timestamp_ms: session.first_ts + idx as i64,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: "signals".into(),
+                kind: "signals".into(),
+                ts_ms: session.updates.last_ms.or(Some(session.last_ts)),
+                text: Some(grok_signals_summary(signals)),
+                detail_json: Some(Value::Object(signals.raw.clone()).to_string()),
             },
         )?;
     }
-    Ok(inserted)
+    // The AGENTS.md snapshot itself is not copied into the database: it is the
+    // project's file, not session evidence. Its path and content hash are, so
+    // a later consumer can tell whether two sessions ran with the same
+    // instructions.
+    if let Some(context) = &session.prompt_context {
+        outcome.markers += insert_session_marker(
+            conn,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: "prompt_context".into(),
+                kind: "prompt_context".into(),
+                ts_ms: None,
+                text: Some(context.path.clone()),
+                detail_json: Some(
+                    json!({
+                        "path": context.path,
+                        "sha256": context.sha256,
+                        "bytes": context.bytes,
+                    })
+                    .to_string(),
+                ),
+            },
+        )?;
+    }
+    for checkpoint in &session.compactions {
+        outcome.markers += insert_session_marker(
+            conn,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: format!("compaction:{}", checkpoint.name),
+                kind: "compaction_boundary".into(),
+                ts_ms: checkpoint.ts_ms,
+                text: Some(checkpoint.locator.clone()),
+                detail_json: checkpoint.detail_json.clone(),
+            },
+        )?;
+    }
+    for subagent in &session.subagents {
+        if subagent.metadata.child_session_id.is_none() {
+            outcome.unlinked_subagents += 1;
+        }
+        record_relationship(
+            conn,
+            &ObservedRelationship {
+                source: SOURCE,
+                parent_session_id: sid,
+                child_session_id: subagent.metadata.child_session_id.as_deref(),
+                relationship: "delegated",
+                child_agent_type: subagent.metadata.agent_type.as_deref(),
+                child_agent_name: subagent.metadata.agent_name.as_deref(),
+                child_model: subagent.metadata.model.as_deref(),
+                spawn_depth: Some(1),
+                evidence_kind: "grok_subagent_dir",
+                evidence_locator: Some(&subagent.locator),
+                evidence_ref: None,
+                // Whether the child is addressable is a fact about the child,
+                // not a default. `session_tree` reads this stored flag rather
+                // than probing, so a hard-coded `false` renders an indexed
+                // child as an empty node.
+                child_has_events: match subagent.metadata.child_session_id.as_deref() {
+                    Some(child) => session_events_exist(conn, SOURCE, child)?,
+                    None => false,
+                },
+                spawned_at_ms: subagent.metadata.spawned_at_ms,
+                origin_session_id: None,
+                relationship_uid: None,
+            },
+        )?;
+        outcome.relationships += 1;
+    }
+    Ok(())
+}
+
+/// The counters `signals.json` records, as one readable line. The file's own
+/// object is kept verbatim in the marker's `detail_json`; this is the part a
+/// person reads.
+fn grok_signals_summary(signals: &grok::GrokSignals) -> String {
+    let mut parts = Vec::new();
+    if let Some(turns) = signals.turn_count {
+        parts.push(format!("turns={turns}"));
+    }
+    if let Some(compactions) = signals.compaction_count {
+        parts.push(format!("compactions={compactions}"));
+    }
+    if let Some(tokens) = signals.context_tokens_used {
+        parts.push(format!("context_tokens_used={tokens}"));
+    }
+    parts.join(" ")
+}
+
+/// Where one record's timestamp came from, counting every step below an exact
+/// match so the caller can report how much of the timeline Grok did not write.
+fn resolve_grok_ts(
+    own: Option<i64>,
+    matched: Option<i64>,
+    turn_start: Option<i64>,
+    inherited: Option<i64>,
+    session_start: i64,
+    outcome: &mut GrokIngestOutcome,
+) -> i64 {
+    if let Some(ts) = own.or(matched) {
+        return ts;
+    }
+    if let Some(ts) = turn_start {
+        outcome.turn_start_fallbacks += 1;
+        return ts;
+    }
+    if let Some(ts) = inherited {
+        outcome.inherited_fallbacks += 1;
+        return ts;
+    }
+    outcome.session_start_fallbacks += 1;
+    session_start
+}
+
+/// A record's event identity: the ACP `eventId` of the update it joined to
+/// when there is one, and its position in `chat_history.jsonl` otherwise.
+///
+/// `chat_history.jsonl` writes no record id at all, so without the join the
+/// only identity available is positional. Grok rebuilds that file on a format
+/// upgrade, which renumbers it; an `eventId` survives that, which is why it is
+/// preferred.
+fn grok_event_uid(event_id: Option<&str>, index: usize) -> String {
+    match event_id {
+        Some(id) => format!("ev:{id}"),
+        None => format!("r{index}"),
+    }
+}
+
+/// Markers carry an excerpt, not a transcript: the full text is already in the
+/// file the marker's session points at.
+fn truncate_marker_text(text: &str) -> String {
+    text.chars().take(512).collect()
 }
 
 fn grok_session_stamp(chat: &Path) -> Result<String> {
-    let mut stamp = file_stamp(chat)?;
-    let summary = chat.with_file_name("summary.json");
-    if summary.exists() {
-        stamp.push('|');
-        stamp.push_str(&file_stamp(&summary)?);
-    }
-    Ok(stamp)
+    Ok(grok_source_inventory(chat)?.stamp)
 }
+
+/// The files beside `chat_history.jsonl` that get their own readable marker in
+/// the stamp. `updates.jsonl` is here because it carries every timestamp: a
+/// session whose transcript is unchanged but whose update stream grew still
+/// has new evidence.
+const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
+
+/// The remaining files `ingest_grok_session` reads. They are folded into one
+/// digest rather than appended, so a session with many checkpoints does not
+/// grow an unbounded stamp.
+const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json"];
+
+/// The directories `ingest_grok_session` reads, entry by entry.
+const GROK_DIGESTED_DIRECTORIES: &[&str] = &["compaction_checkpoints", "subagents"];
 
 /// [`grok_session_stamp`] plus the recency hint, with one stat per file.
 pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
+    let inventory = grok_source_inventory(chat)?;
+    Ok((inventory.stamp, inventory.modified_ms))
+}
+
+/// What one Grok session directory holds, from its metadata alone.
+///
+/// Every field here comes from a `stat`: no file's contents are read. That is
+/// the difference between a scan that costs one syscall per file and one that
+/// parses every update stream in the store — discovery stamps every candidate
+/// on every run, and a session's stream is routinely megabytes. The record
+/// count is deliberately *not* here; see [`grok_source_records`].
+///
+/// `bytes` still describes **everything the read consumes**, not just the
+/// transcript: a 10 KB `chat_history.jsonl` beside a 2 MB `updates.jsonl` is a
+/// 2 MB read, and a length is metadata.
+pub(crate) struct GrokSourceInventory {
+    pub stamp: String,
+    pub modified_ms: Option<i64>,
+    pub bytes: i64,
+}
+
+/// The change stamp of one Grok session directory, over **every** file its
+/// ingestion reads.
+///
+/// Discovery, plain `sync` and targeted hydration all take their stamp from
+/// here, so no one of them can decide a session is unchanged on evidence the
+/// others would have re-read. A stamp that covered only the transcript, the
+/// summary and the update stream let a new `compaction_checkpoints/` entry, an
+/// edited `signals.json` or a new `subagents/` entry land after the last
+/// update row and never be read at all.
+///
+/// The two directories are listed, not stat-ed: a directory's own mtime moves
+/// when an entry is added or removed, but not when an entry's contents change.
+///
+/// The same walk produces the stamp and the byte count, and
+/// [`grok_source_records`] walks the same list, so the numbers a hydration
+/// reports can never describe a different set of files from the one its change
+/// stamp covers.
+pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> {
     let metadata = chat.metadata()?;
     anyhow::ensure!(
         metadata.is_file(),
@@ -6426,25 +7465,161 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
         chat.display()
     );
     let mut stamp = stamp_of(&metadata);
-    if let Ok(summary) = chat.with_file_name("summary.json").metadata() {
+    let mut modified = modified_ms_of(&metadata);
+    let mut bytes = metadata.len() as i64;
+    let freshen = |candidate: Option<i64>, modified: &mut Option<i64>| {
+        if let Some(candidate) = candidate {
+            *modified = Some(modified.map_or(candidate, |current| current.max(candidate)));
+        }
+    };
+    for name in GROK_STAMPED_SIBLINGS {
+        let path = chat.with_file_name(name);
+        let Some(sibling) = grok_entry_metadata(&path)? else {
+            continue;
+        };
         stamp.push('|');
-        stamp.push_str(&stamp_of(&summary));
+        stamp.push_str(&stamp_of(&sibling));
+        // `updates.jsonl` is appended on every turn, so it — not the
+        // transcript — is usually the freshest signal of activity.
+        freshen(modified_ms_of(&sibling), &mut modified);
+        bytes += sibling.len() as i64;
     }
-    Ok((stamp, modified_ms_of(&metadata)))
+    let mut digest = Sha256::new();
+    for sibling in GROK_DIGESTED_SIBLINGS {
+        let path = chat.with_file_name(sibling);
+        let Some(found) = grok_entry_metadata(&path)? else {
+            continue;
+        };
+        digest.update(format!("{sibling}={}\n", stamp_of(&found)));
+        freshen(modified_ms_of(&found), &mut modified);
+        bytes += found.len() as i64;
+    }
+    for directory in GROK_DIGESTED_DIRECTORIES {
+        // Sorted, so the digest describes the directory's contents rather than
+        // the order the filesystem happened to hand them back.
+        let mut entries = read_dir_files(&chat.with_file_name(directory))?;
+        entries.sort();
+        for entry in entries {
+            let found = entry
+                .metadata()
+                .with_context(|| format!("stat Grok entry {}", entry.display()))?;
+            let name = entry
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            digest.update(format!("{directory}/{name}={}\n", stamp_of(&found)));
+            freshen(modified_ms_of(&found), &mut modified);
+            bytes += found.len() as i64;
+        }
+    }
+    // Sixteen hex characters of SHA-256: enough that two different sets of
+    // extra files colliding is not a failure mode worth designing against,
+    // short enough that the stamp stays readable in a diagnostic.
+    stamp.push_str(&format!("|x:{:.16}", format!("{:x}", digest.finalize())));
+    Ok(GrokSourceInventory {
+        stamp,
+        modified_ms: modified,
+        bytes,
+    })
 }
 
+/// How many records a Grok session directory holds — the content pass.
+///
+/// Separate from [`grok_source_inventory`] because it is the expensive half:
+/// it reads every byte of `chat_history.jsonl` and `updates.jsonl`. Only a
+/// hydration that is actually going to parse the session calls it. Discovery,
+/// plain `sync` and a hydration that decides nothing changed all stamp from
+/// metadata and never open a file, which is what makes the unchanged
+/// short-circuit worth taking.
+///
+/// One per complete JSONL record in the two streams, plus **one per whole-file
+/// JSON sidecar** — `summary.json`, `signals.json`, `prompt_context.json`, and
+/// each `compaction_checkpoints/` and `subagents/` entry. A sidecar is one
+/// document: the read either parsed it or did not, and counting it as zero
+/// would make a directory of fifty checkpoints look like no work at all. A
+/// `.jsonl` entry inside those directories is counted by record, as the older
+/// Grok layout writes subagent transcripts that way.
+pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
+    let mut records = hydrate::complete_jsonl_records(chat)?;
+    for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
+        let path = chat.with_file_name(name);
+        if grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
+            records += grok_record_count(&path)?;
+        }
+    }
+    for directory in GROK_DIGESTED_DIRECTORIES {
+        let mut entries = read_dir_files(&chat.with_file_name(directory))?;
+        entries.sort();
+        for entry in entries {
+            records += grok_record_count(&entry)?;
+        }
+    }
+    Ok(records)
+}
+
+/// How many records one file in a Grok session directory contributes: its
+/// complete JSONL records, or one, for a whole-file JSON document.
+fn grok_record_count(path: &Path) -> Result<i64> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+        hydrate::complete_jsonl_records(path)
+    } else {
+        Ok(1)
+    }
+}
+
+/// One `compaction_checkpoints/` entry.
+struct GrokCompaction {
+    /// The entry's file name, which is its identity within the session.
+    name: String,
+    locator: String,
+    ts_ms: Option<i64>,
+    detail_json: Option<String>,
+}
+
+/// One `subagents/` entry.
+struct GrokSubagentEvidence {
+    locator: String,
+    metadata: grok::GrokSubagent,
+}
+
+/// The `prompt_context.json` Grok rendered the system prompt from, identified
+/// rather than copied.
+struct GrokPromptContext {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+/// One Grok session directory, read.
 struct GrokSession {
     session_id: String,
     cwd: Option<String>,
     git_branch: Option<String>,
     first_ts: i64,
     last_ts: i64,
+    /// `summary.json`'s `created_at`, the last-resort timestamp.
+    created_ms: i64,
     last_assistant_text: Option<String>,
-    prompts: Vec<String>,
+    models: Vec<String>,
+    lines: Vec<grok::GrokChatLine>,
+    /// `synthetic_reason` by record index, kept out of the parsed record so
+    /// the record enum stays about content.
+    synthetic_reasons: HashMap<usize, String>,
+    updates: grok::GrokUpdates,
+    /// Whether `updates.jsonl` was there at all. Distinct from
+    /// `updates.is_empty()`, which says only that nothing in the file parsed
+    /// as a timing structure this parser understands: a stream of rows it does
+    /// not interpret is a stream that exists, and reporting it as missing
+    /// would tell a caller the wrong thing about the session.
+    updates_present: bool,
+    signals: Option<grok::GrokSignals>,
+    prompt_context: Option<GrokPromptContext>,
+    compactions: Vec<GrokCompaction>,
+    subagents: Vec<GrokSubagentEvidence>,
 }
 
 fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
-    let summary = read_grok_summary(&chat.with_file_name("summary.json"));
+    let summary = read_grok_summary(&chat.with_file_name("summary.json"))?;
     let fallback_session = chat
         .parent()
         .and_then(|p| p.file_name())
@@ -6457,6 +7632,9 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback_session)
         .to_string();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
     let cwd = summary
         .as_ref()
         .and_then(|s| s.pointer("/info/cwd").or_else(|| s.get("git_root_dir")))
@@ -6482,42 +7660,336 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .and_then(parse_iso_ms)
         .unwrap_or(created_ms);
 
-    let mut prompts = Vec::new();
+    // Three states, not two. A stream that is **not there** is a session Grok
+    // wrote no ACP updates for, and its events fall back to what the
+    // transcript says. A stream that is there but **cannot be read** is a
+    // failure: taking it as absent would replace exact event times with
+    // fallbacks, drop the token snapshots, and — because the change stamp was
+    // computed from metadata that is still perfectly readable — checkpoint
+    // that loss as the session's settled state until some file changes again.
+    let updates_path = chat.with_file_name("updates.jsonl");
+    let (updates, updates_present) = match fs::read_to_string(&updates_path) {
+        Ok(contents) => (grok::parse_updates(&contents, &updates_path)?, true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (grok::GrokUpdates::default(), false)
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read Grok updates {}", updates_path.display()))
+        }
+    };
+
+    let mut lines = Vec::new();
+    let mut synthetic_reasons = HashMap::new();
     let mut last_assistant_text = None;
+    let mut models: Vec<String> = Vec::new();
     let contents = fs::read_to_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for (number, row) in jsonl::rows(&contents).enumerate() {
+        // A complete row that does not parse fails the read. The ingestion
+        // this feeds replaces the session's evidence, so dropping the row
+        // would commit a transcript that is missing a turn Grok did write --
+        // and save the stamp that stops the next run from looking again.
+        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
             continue;
         };
-        if let Some(text) = grok_chat_text(&value, "user") {
-            prompts.push(text);
+        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
+            synthetic_reasons.insert(lines.len(), reason.to_string());
         }
-        if let Some(text) = grok_chat_text(&value, "assistant") {
-            last_assistant_text = Some(text.chars().take(4096).collect());
+        let parsed = grok::parse_chat_record(&value);
+        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
+            if let Some(text) = text {
+                last_assistant_text = Some(text.chars().take(4096).collect::<String>());
+            }
+            if let Some(model) = model {
+                if !models.iter().any(|seen| seen == model) {
+                    models.push(model.clone());
+                }
+            }
+        }
+        lines.push(parsed);
+    }
+    if models.is_empty() {
+        if let Some(model) = summary
+            .as_ref()
+            .and_then(|s| s.pointer("/info/model").or_else(|| s.get("model")))
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            models.push(model.to_string());
         }
     }
-    if session_id.is_empty() {
-        return Ok(None);
-    }
-    let last_ts = if prompts.is_empty() {
-        updated_ms
-    } else {
-        created_ms + prompts.len() as i64 - 1
+
+    let directory = chat.parent().map(Path::to_path_buf);
+    // A `signals.json` that exists but does not parse is still a fact about
+    // the session, so the marker is written from its existence and the counters
+    // are simply absent. Collapsing that into "no signals" would delete the
+    // marker a previous read wrote and record nothing in its place.
+    let signals = match directory.as_deref() {
+        Some(dir) => match read_json_file(&dir.join("signals.json"))? {
+            GrokSidecar::Absent => None,
+            GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
+            GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
+        },
+        None => None,
     };
+    let prompt_context = match directory.as_deref() {
+        Some(dir) => read_grok_prompt_context(&dir.join("prompt_context.json"))?,
+        None => None,
+    };
+    let (compactions, subagents) = match directory.as_deref() {
+        Some(dir) => (
+            read_grok_compactions(&dir.join("compaction_checkpoints"))?,
+            read_grok_subagents(&dir.join("subagents"))?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    // Real recorded times first, in this order: the update stream, then any
+    // timestamp the transcript's own records carried, then `summary.json`.
+    // Nothing here is derived from a record's position in the file.
+    let record_times: Vec<i64> = lines.iter().filter_map(|line| line.ts_ms).collect();
+    let first_ts = updates
+        .first_ms
+        .or_else(|| record_times.iter().copied().min())
+        .unwrap_or(created_ms);
+    let last_ts = updates
+        .last_ms
+        .or_else(|| record_times.iter().copied().max())
+        .unwrap_or(updated_ms)
+        .max(first_ts);
+
     Ok(Some(GrokSession {
         session_id,
         cwd,
         git_branch,
-        first_ts: created_ms,
+        first_ts,
         last_ts,
+        created_ms,
         last_assistant_text,
-        prompts,
+        models,
+        lines,
+        synthetic_reasons,
+        updates,
+        updates_present,
+        signals,
+        prompt_context,
+        compactions,
+        subagents,
     }))
 }
 
-pub(crate) fn read_grok_summary(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+/// What a read of one Grok sidecar found.
+///
+/// The three states are not interchangeable, and collapsing any two of them
+/// loses evidence:
+///
+/// * **Absent** — Grok never wrote this file. There is nothing to record.
+/// * **Unparsed** — the file is there and this parser cannot interpret it: a
+///   half-written document, or a shape nobody has characterized yet. The
+///   *existence* is evidence, so the caller still records the entry, with no
+///   detail. Deleting the previous marker and writing nothing would report a
+///   session that had never had one.
+/// * **Read** — the document, parsed.
+///
+/// An I/O failure is none of these: it is an error, so a file that cannot be
+/// read never masquerades as a file that is not there.
+enum GrokSidecar {
+    Absent,
+    Unparsed,
+    Read(Value),
+}
+
+impl GrokSidecar {
+    /// The parsed document, if there is one.
+    fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Read(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+fn read_json_file(path: &Path) -> Result<GrokSidecar> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(GrokSidecar::Absent),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok sidecar {}", path.display()))
+        }
+    };
+    Ok(match serde_json::from_str(&contents) {
+        Ok(value) => GrokSidecar::Read(value),
+        Err(_) => GrokSidecar::Unparsed,
+    })
+}
+
+/// The metadata of a file a Grok read consumes: `None` when it is not there,
+/// an error when it is there and cannot be stat-ed.
+///
+/// The `Ok(_) => continue` this replaces was the same silent-absence bug one
+/// level down: a `summary.json` or `updates.jsonl` that could not be stat-ed
+/// dropped out of the change stamp, making an unreadable file indistinguishable
+/// from a missing one.
+fn grok_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match path.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("stat Grok file {}", path.display())),
+    }
+}
+
+/// Identify `prompt_context.json` without copying it: the path, its SHA-256
+/// and its size are enough to tell two sessions' instruction snapshots apart.
+///
+/// Absent is `None`; unreadable is an error. Taking a permission failure for
+/// absence would delete the marker this session already had and then save the
+/// stamp, so every later run would agree the directory was unchanged and the
+/// snapshot would stay gone.
+fn read_grok_prompt_context(path: &Path) -> Result<Option<GrokPromptContext>> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read Grok prompt context {}", path.display()))
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&contents);
+    Ok(Some(GrokPromptContext {
+        path: path.to_string_lossy().to_string(),
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: contents.len() as u64,
+    }))
+}
+
+/// Every readable entry in `compaction_checkpoints/`, oldest name first.
+///
+/// An entry that parses as nothing is still a compaction: the directory entry
+/// itself is the evidence, so the marker is written with no detail rather than
+/// dropped.
+fn read_grok_compactions(dir: &Path) -> Result<Vec<GrokCompaction>> {
+    let mut checkpoints = Vec::new();
+    for path in read_dir_files(dir)? {
+        let parsed = read_json_file(&path)?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        checkpoints.push(GrokCompaction {
+            ts_ms: parsed
+                .value()
+                .and_then(grok::compaction_timestamp_ms)
+                .or_else(|| timestamp_from_name(&name)),
+            detail_json: parsed.value().map(ToString::to_string),
+            locator: path.to_string_lossy().to_string(),
+            name,
+        });
+    }
+    checkpoints.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(checkpoints)
+}
+
+/// Every readable entry in `subagents/`.
+fn read_grok_subagents(dir: &Path) -> Result<Vec<GrokSubagentEvidence>> {
+    let mut found = Vec::new();
+    for path in read_dir_files(dir)? {
+        found.push(GrokSubagentEvidence {
+            metadata: read_json_file(&path)?
+                .value()
+                .map(grok::parse_subagent)
+                .unwrap_or_default(),
+            locator: path.to_string_lossy().to_string(),
+        });
+    }
+    found.sort_by(|left, right| left.locator.cmp(&right.locator));
+    Ok(found)
+}
+
+/// The regular files in one of a Grok session's sidecar directories.
+///
+/// A directory that is not there is empty — Grok writes `subagents/` only for
+/// a session that spawned one. **Anything else is an error**, and has to be,
+/// because this list is what the change stamp covers and what the replacement
+/// snapshot is built from: a permission or I/O failure read as "empty" would
+/// stamp the session as having no checkpoints and then delete the ones already
+/// stored, reporting success. The read has to fail so the surrounding
+/// transaction rolls back and the prior evidence survives.
+///
+/// A single entry that has vanished between the listing and the stat is
+/// skipped rather than fatal: the next run will not see it either.
+fn read_dir_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok directory {}", dir.display()))
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("read Grok directory entry under {}", dir.display()))?
+            .path();
+        // `metadata` follows the link, so an entry that cannot be resolved --
+        // a symlink loop, an unreadable mount -- is an error here rather than
+        // a silently absent file.
+        match path.metadata() {
+            Ok(metadata) if metadata.is_file() => files.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat Grok entry {}", path.display()))
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// A checkpoint file named after the moment it was taken, e.g.
+/// `1789560090000.json`. Only used when the file itself records no time.
+fn timestamp_from_name(name: &str) -> Option<i64> {
+    let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+    grok::timestamp_value_ms(&json!(digits.parse::<i64>().ok()?))
+}
+
+/// `summary.json`, parsed.
+///
+/// `None` covers two cases that share an answer: the file is not there, or it
+/// is there and does not parse. Both leave identity to the path layout, which
+/// is the documented degrade. An I/O failure does **not** share that answer —
+/// a session whose summary cannot be read would otherwise be indexed under its
+/// directory name with a `created_at` taken from an mtime, silently becoming a
+/// different session from the one already in the catalog.
+/// `summary.json`, with malformed treated as an error rather than as absence.
+///
+/// This sidecar is the one exception to "malformed but present is evidence",
+/// and the reason is that it does not carry detail -- it carries **identity**.
+/// `info.id` becomes the session id, which keys every evidence row and scopes
+/// every delete a replacing read performs. When a malformed summary fell back
+/// to the directory name, a session caught mid-write was stored under
+/// `<encoded-cwd-folder>`; once the file was repaired the next read stored the
+/// same session under its real id, and the first set of rows -- catalog row,
+/// events, markers, history -- was left behind for ever, keyed to an id no
+/// read would ever name again. Nothing would delete them, because deletes are
+/// scoped by the id that produced them.
+///
+/// So a present-but-unparseable summary fails the session read: the previous
+/// transaction stands, the stamp is left unsaved, and the next run tries again
+/// once the file changes. Absence keeps the directory-name fallback, because
+/// a session directory with no summary at all is a real shape and its folder
+/// name is the only identity there is.
+pub(crate) fn read_grok_summary(path: &Path) -> Result<Option<Value>> {
+    match read_json_file(path)? {
+        GrokSidecar::Absent => Ok(None),
+        GrokSidecar::Read(value) => Ok(Some(value)),
+        GrokSidecar::Unparsed => anyhow::bail!(
+            "{}: summary.json is present but not valid JSON, and it carries the session identity; \
+             refusing to index this session under its directory name",
+            path.display()
+        ),
+    }
 }
 
 pub(crate) fn grok_project_from_path(chat: &Path) -> Option<String> {
@@ -6579,6 +8051,17 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    // The same unwrapping the full read does. Discovery and hydration write
+    // the *same* prompt to different columns -- `sessions.first_prompt` and
+    // `history.prompt` -- so a wrapper stripped in one and kept in the other
+    // shows a person the `<user_query>` envelope in the catalog and the typed
+    // prompt in the transcript, for one session, with nothing to say which is
+    // the prompt.
+    let text = if role == "user" {
+        grok::unwrap_user_query(&text)
+    } else {
+        text
+    };
     (!text.is_empty()).then_some(text)
 }
 
@@ -7368,6 +8851,1344 @@ mod tests {
     /// The v4->v5 migration drops `codex_rollouts_v4` from the in-memory map, but
     /// the merge only folds in the keys a run *has*, so on its own that deletion
     /// never reaches disk: the retired map is reloaded and rewritten forever.
+    /// A Grok session a previous release already consumed must be re-read
+    /// once, and must come back with evidence instead of prompts alone.
+    ///
+    /// The change stamp of that session is unchanged on disk, so nothing but
+    /// retiring the sync-state key can make `sync` look at it again — and the
+    /// prompts it wrote with synthesized timestamps must be replaced, not
+    /// joined by a second copy carrying the real ones.
+    /// Build a Grok session directory from raw lines and index it.
+    fn ingest_grok_lines(home: &Path, chat: &str, updates: &str) -> Connection {
+        let dir = home.join(".grok/sessions/%2Ftmp%2Ffallback/grok-fb-0001");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), chat).unwrap();
+        fs::write(dir.join("updates.jsonl"), updates).unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            br#"{"info":{"id":"grok-fb-0001","cwd":"/tmp/fallback"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.join("history.db")).unwrap();
+        let chat_path = dir.join("chat_history.jsonl");
+        let session = super::scan_grok_session_file(&chat_path).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat_path.to_string_lossy()).unwrap();
+        conn
+    }
+
+    fn grok_event_time(conn: &Connection, text: &str) -> i64 {
+        conn.query_row(
+            "SELECT ts_ms FROM session_events WHERE source = 'grok' AND text = ?",
+            params![text],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// An assistant message with no recorded time of its own falls back to
+    /// **its own** turn's start. Resolving against a turn index captured
+    /// before the message told us which turn it was in hands it the previous
+    /// turn's start — a time from before the person had even asked.
+    #[test]
+    fn an_untimed_assistant_message_falls_back_to_its_own_turns_start() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"assistant","content":"answer one"}"#,
+                // The second turn is the model continuing on its own: Grok
+                // wrote no user record for it, so the chat side never learns
+                // the turn advanced and only the matched group knows.
+                r#"{"type":"assistant","content":"answer two"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":2500,"turnStartMs":1000}}}"#,
+                // The second turn opens with the model continuing: the chunk
+                // says which turn it belongs to, and records no time of its
+                // own — which is the only reason the fallback is reached.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"ev_late","turnStartMs":5000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        // The positive control: the first turn's events are exact, so the
+        // second one's fallback is the only thing under test.
+        assert_eq!(grok_event_time(&conn, "first"), 1000);
+        assert_eq!(grok_event_time(&conn, "answer one"), 2000);
+
+        assert_eq!(
+            grok_event_time(&conn, "answer two"),
+            5000,
+            "an untimed reply belongs to the turn it answered, not the one before it"
+        );
+    }
+
+    /// A marker is a record with a place in the file: the next record with no
+    /// time of its own inherits the marker's, not that of whatever preceded
+    /// it.
+    #[test]
+    fn a_marker_carries_its_time_forward_to_the_next_untimed_record() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first","timestamp_ms":1000}"#,
+                r#"{"type":"user","content":"injected","synthetic_reason":"compaction","timestamp_ms":2000}"#,
+                r#"{"type":"assistant","content":"after the marker"}"#,
+                "",
+            ]
+            .join("\n"),
+            "",
+        );
+        // The positive control: the marker really was stored at 2000, so the
+        // event below inherits a time that exists rather than a default.
+        let marker: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_markers WHERE source = 'grok' AND kind = 'synthetic_turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 2000);
+        assert_eq!(
+            grok_event_time(&conn, "after the marker"),
+            2000,
+            "the nearest preceding record is the marker, not the prompt before it"
+        );
+    }
+
+    /// Reasoning and tools join their update the same way prose does, so they
+    /// have to adopt the turn that match establishes. A model-initiated turn
+    /// has no user record to advance the transcript-side cursor, so without
+    /// that the fallback dates them from before the turn began.
+    #[test]
+    fn untimed_reasoning_and_tools_fall_back_to_their_own_turns_start() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"reasoning","summary":"thinking in turn zero"}"#,
+                r#"{"type":"assistant","content":"answer one"}"#,
+                // The model continues on its own: no user record opens turn 1.
+                r#"{"type":"reasoning","summary":"thinking in turn one"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_late","name":"Shell","arguments":{"command":"ls"}}]}"#,
+                r#"{"type":"tool_result","tool_call_id":"call_late","content":"done"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":2500,"turnStartMs":1000}}}"#,
+                // Turn 1 opens on the model's own thinking, and none of its
+                // rows records a time of its own.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"ev_think","turnStartMs":5000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_late"},"_meta":{"turnStartMs":5000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call_late","status":"completed"},"_meta":{"turnStartMs":5000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        // The positive control: turn 0 is exact, so only the fallbacks below
+        // are under test.
+        assert_eq!(grok_event_time(&conn, "first"), 1000);
+        assert_eq!(grok_event_time(&conn, "thinking in turn zero"), 1100);
+        assert_eq!(grok_event_time(&conn, "answer one"), 2000);
+
+        assert_eq!(
+            grok_event_time(&conn, "thinking in turn one"),
+            5000,
+            "a thought belongs to the turn its group names, not the previous one"
+        );
+        let tool_times: Vec<i64> = conn
+            .prepare(
+                "SELECT ts_ms FROM session_events WHERE source = 'grok' \
+                   AND event_uid IN ('tool:call_late', 'result:call_late') ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            tool_times,
+            vec![5000, 5000],
+            "a call and its result join by id, so their turn is known exactly"
+        );
+    }
+
+    /// Encrypted-only reasoning still occupies an `agent_thoughts` ordinal.
+    /// Leaving that cursor unmoved handed the next readable thought the
+    /// encrypted record's timestamp and event id.
+    #[test]
+    fn encrypted_reasoning_consumes_its_thought_chunk_ordinal() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"reasoning","encrypted_content":"opaque"}"#,
+                r#"{"type":"reasoning","summary":"visible thought"}"#,
+                r#"{"type":"assistant","content":"done"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                // A new turnStartMs starts a second thought group. Consecutive
+                // chunks in the same turn would merge into one group, which
+                // would not exercise the ordinal join this test is about.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"ev_visible","agentTimestampMs":2000,"turnStartMs":2000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":3000,"turnStartMs":2000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let encrypted: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_markers WHERE source = 'grok' AND kind = 'encrypted_reasoning'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            encrypted, 1100,
+            "the opaque trace uses its own chunk's time"
+        );
+        assert_eq!(
+            grok_event_time(&conn, "visible thought"),
+            2000,
+            "the next thought must not inherit the encrypted chunk"
+        );
+        let uid: String = conn
+            .query_row(
+                "SELECT event_uid FROM session_events WHERE source = 'grok' AND text = 'visible thought'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uid, "ev:ev_visible");
+    }
+
+    /// `sessions.first_prompt` is a bounded catalog excerpt. Hydration must
+    /// not overwrite discovery's 4,096-character field with the full prompt.
+    #[test]
+    fn grok_first_prompt_is_the_bounded_catalog_excerpt() {
+        let home = tempfile::tempdir().unwrap();
+        let long = "x".repeat(crate::discover::EXCERPT_MAX_CHARS + 80);
+        let conn = ingest_grok_lines(
+            home.path(),
+            &format!("{{\"type\":\"user\",\"content\":\"<user_query>{long}</user_query>\"}}\n"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                "\n",
+            ),
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.chars().count(), crate::discover::EXCERPT_MAX_CHARS);
+        let history: String = conn
+            .query_row(
+                "SELECT prompt FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            history.chars().count(),
+            crate::discover::EXCERPT_MAX_CHARS + 80,
+            "the transcript keeps the full prompt; only the catalog excerpt is bounded"
+        );
+    }
+
+    /// A directory that cannot be read is not an empty directory.
+    ///
+    /// The read is a replacement: an unreadable `compaction_checkpoints/`
+    /// taken as empty would stamp the session as having no checkpoints and
+    /// then delete the ones already stored, reporting success. It has to fail
+    /// so the transaction rolls back.
+    #[test]
+    fn an_unreadable_sidecar_directory_fails_instead_of_erasing_the_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fbroken/grok-brk-0001");
+        fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            b"{\"type\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            br#"{"info":{"id":"grok-brk-0001","cwd":"/tmp/broken"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("compaction_checkpoints/1700000000000.json"),
+            br#"{"created_at":"2026-01-01T00:10:00.000Z"}"#,
+        )
+        .unwrap();
+        let chat = dir.join("chat_history.jsonl");
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        let markers = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'grok' AND kind = 'compaction_boundary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let prompts = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(markers(), 1);
+        assert_eq!(prompts(), 1);
+
+        // An entry that `read_dir` lists and `stat` cannot resolve: a symlink
+        // to itself is ELOOP on every platform that has symlinks.
+        let loop_entry = dir.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        // The stamp fails rather than describing a directory it could not read.
+        assert!(super::grok_session_stamp(&chat).is_err());
+
+        // And so does the read, so nothing is replaced.
+        let scanned = super::scan_grok_session_file(&chat);
+        assert!(scanned.is_err(), "an unreadable entry must not scan clean");
+        assert_eq!(markers(), 1, "the stored checkpoint marker must survive");
+        assert_eq!(prompts(), 1);
+
+        // Positive control: with the entry readable the same paths succeed and
+        // the second checkpoint is indexed, so the failure above is the
+        // unreadable entry and not the extra file.
+        fs::remove_file(&loop_entry).unwrap();
+        fs::write(&loop_entry, br#"{"created_at":"2026-01-01T00:20:00.000Z"}"#).unwrap();
+        assert!(super::grok_session_stamp(&chat).is_ok());
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert_eq!(markers(), 2);
+    }
+
+    /// The stamp sync saved for one Grok session file.
+    fn grok_saved_stamp<'a>(state: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+        state
+            .get(super::GROK_SYNC_STATE_KEY)?
+            .get(key)
+            .and_then(super::grok_state_stamp)
+    }
+
+    /// Write a Grok session directory with no `updates.jsonl`, and answer with
+    /// the transcript and the directory.
+    fn grok_stream_fixture(home: &Path, id: &str) -> (PathBuf, PathBuf) {
+        let dir = home.join(".grok/sessions/%2Ftmp%2Fstream").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            format!("{{\"type\":\"user\",\"content\":\"hello from {id}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            format!(
+                r#"{{"info":{{"id":"{id}","cwd":"/tmp/stream"}},"created_at":"2026-01-01T00:00:00.000Z"}}"#
+            ),
+        )
+        .unwrap();
+        (dir.join("chat_history.jsonl"), dir)
+    }
+
+    /// An `updates.jsonl` that exists and cannot be read is a failure, not an
+    /// absent stream.
+    ///
+    /// Taking it as absent would replace every exact event time with a
+    /// fallback and drop the token snapshots — and the change stamp, computed
+    /// from metadata that is still perfectly readable, would then checkpoint
+    /// that loss as the session's settled state until some file changes again.
+    #[test]
+    fn an_unreadable_update_stream_fails_instead_of_dating_events_from_fallbacks() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-str-0001");
+
+        // The positive control first: with no stream at all the session reads
+        // clean and simply reports that there is none.
+        let absent = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        assert!(!absent.updates_present);
+
+        let stream = dir.join("updates.jsonl");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&stream, &stream).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let scanned = super::scan_grok_session_file(&chat);
+        assert!(
+            scanned.is_err(),
+            "an unreadable update stream must not scan as an absent one"
+        );
+
+        // And once it is readable, the same path succeeds and the stream is
+        // present — so the failure was the unreadable file, not its existence.
+        fs::remove_file(&stream).unwrap();
+        fs::write(
+            &stream,
+            br#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}
+"#,
+        )
+        .unwrap();
+        let read = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        assert!(read.updates_present);
+        assert_eq!(read.first_ts, 1000);
+    }
+
+    /// "Nothing in it parsed" is not "it is not there". A stream of rows this
+    /// parser does not interpret is a stream that exists, and a caller told it
+    /// is missing would look for a file that is sitting right there.
+    #[test]
+    fn a_stream_of_rows_the_parser_cannot_use_is_present_not_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-str-0002");
+        fs::write(
+            dir.join("updates.jsonl"),
+            b"{\"hello\":\"world\"}\n{\"another\":\"row\"}\n",
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert!(
+            !outcome.missing_updates,
+            "the file exists; it just said nothing this parser understands"
+        );
+        assert!(outcome.updates_yielded_no_timing);
+        assert_eq!(outcome.unread_update_rows, 2);
+
+        // The positive control: with the file removed, it really is missing.
+        fs::remove_file(dir.join("updates.jsonl")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert!(outcome.missing_updates);
+        assert!(!outcome.updates_yielded_no_timing);
+        assert_eq!(outcome.unread_update_rows, 0);
+    }
+
+    /// A stamp that fails closed has to be *reported*. Round four stopped one
+    /// unreadable directory from failing the whole Grok pass; on its own that
+    /// turned a store whose only session is unreadable into a silent success —
+    /// the strictness produced an error and then swallowed it.
+    #[test]
+    fn a_store_whose_only_session_is_unreadable_reports_the_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let (_chat, dir) = grok_stream_fixture(home.path(), "grok-sil-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        // The positive control: a healthy store syncs and reports nothing.
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        assert!(state.contains_key(super::GROK_SYNC_STATE_KEY));
+
+        fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        let loop_entry = dir.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let mut state = Map::new();
+        let error = super::sync_grok(&conn, &mut state, &root)
+            .expect_err("a store that could read nothing is a failed source");
+        assert!(
+            format!("{error:#}").contains("could not be read"),
+            "unexpected error: {error:#}"
+        );
+
+        // …and a store where something still worked keeps its progress rather
+        // than failing wholesale, so one broken directory cannot send every
+        // later run back over the whole store.
+        let (_second, _) = grok_stream_fixture(home.path(), "grok-sil-0002");
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let saved = state[super::GROK_SYNC_STATE_KEY].as_object().unwrap();
+        assert_eq!(saved.len(), 1, "only the readable session is checkpointed");
+    }
+
+    /// Every sidecar read obeys the same three-way rule: absent is nothing,
+    /// malformed-but-present is evidence, unreadable is an error.
+    ///
+    /// The malformed case is the one that is easy to get wrong in the safe
+    /// direction: collapsing it into "absent" deletes the marker a previous
+    /// read wrote and records nothing in its place, so a session that *had* a
+    /// `prompt_context` or `signals` file looks like one that never did.
+    #[test]
+    fn a_malformed_sidecar_is_evidence_and_an_unreadable_one_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-side-0001");
+        fs::write(
+            dir.join("signals.json"),
+            br#"{"contextTokensUsed":10,"turnCount":2,"compactionCount":1}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("prompt_context.json"), br#"{"files":[]}"#).unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let index = |conn: &Connection| {
+            let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+            super::ingest_grok_session(conn, &session, &chat.to_string_lossy()).unwrap()
+        };
+        let marker = |conn: &Connection, kind: &str| -> Option<(Option<String>, Option<String>)> {
+            conn.query_row(
+                "SELECT text, detail_json FROM session_markers \
+                 WHERE source = 'grok' AND kind = ?",
+                params![kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+        };
+
+        // The positive control: parsed, both markers carry their detail.
+        index(&conn);
+        let signals = marker(&conn, "signals").expect("a signals marker");
+        assert_eq!(
+            signals.0.as_deref(),
+            Some("turns=2 compactions=1 context_tokens_used=10")
+        );
+        assert!(signals.1.unwrap().contains("contextTokensUsed"));
+        assert!(marker(&conn, "prompt_context").is_some());
+
+        // Half-written: still a session that has a signals file, recorded with
+        // no counters rather than deleted.
+        fs::write(dir.join("signals.json"), b"{\"contextTokensUsed\":").unwrap();
+        index(&conn);
+        let signals = marker(&conn, "signals").expect("a malformed signals file is still evidence");
+        assert_eq!(signals.0.as_deref(), Some(""));
+        assert_eq!(signals.1.as_deref(), Some("{}"));
+
+        // Absent: nothing to record, and the read is clean.
+        fs::remove_file(dir.join("signals.json")).unwrap();
+        index(&conn);
+        assert!(marker(&conn, "signals").is_none());
+        assert!(marker(&conn, "prompt_context").is_some());
+
+        // Unreadable: an error, so the transaction rolls back and the
+        // prompt_context marker this session already had survives.
+        let context = dir.join("prompt_context.json");
+        fs::remove_file(&context).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&context, &context).unwrap();
+        #[cfg(not(unix))]
+        return;
+        assert!(super::scan_grok_session_file(&chat).is_err());
+        assert!(
+            marker(&conn, "prompt_context").is_some(),
+            "a failed read must leave the previous evidence alone"
+        );
+        // …and an unreadable summary.json does not quietly re-identify the
+        // session from its directory name either.
+        fs::remove_file(&context).unwrap();
+        let summary = dir.join("summary.json");
+        fs::remove_file(&summary).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&summary, &summary).unwrap();
+        assert!(super::scan_grok_session_file(&chat).is_err());
+    }
+
+    /// A fully synced store indexes nothing on every later run. Deciding
+    /// whether the source failed from "sessions indexed" therefore fails it
+    /// forever over one unreadable sibling; the count has to be "sessions this
+    /// run could account for".
+    #[test]
+    fn an_unchanged_session_still_accounts_for_itself_when_a_sibling_is_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let (_chat, healthy) = grok_stream_fixture(home.path(), "grok-acc-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+
+        // A second session that cannot be read, beside one that is now
+        // unchanged. The store is still healthy enough to report.
+        let (_broken, broken) = grok_stream_fixture(home.path(), "grok-acc-0002");
+        fs::create_dir_all(broken.join("compaction_checkpoints")).unwrap();
+        let loop_entry = broken.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let inserted = super::sync_grok(&conn, &mut state, &root)
+            .expect("an unchanged session accounts for itself; the source has not failed");
+        assert_eq!(inserted, 0, "nothing new was indexed, and that is fine");
+        assert_eq!(
+            state[super::GROK_SYNC_STATE_KEY].as_object().unwrap().len(),
+            1,
+            "the healthy session keeps its checkpoint and the broken one gets none"
+        );
+
+        // The positive control from round five still holds: with *only* the
+        // unreadable session in the store, the source fails.
+        fs::remove_dir_all(&healthy).unwrap();
+        let mut fresh = Map::new();
+        let error = super::sync_grok(&conn, &mut fresh, &root)
+            .expect_err("a store that could account for nothing is a failed source");
+        assert!(format!("{error:#}").contains("could not be read"));
+    }
+
+    /// What repeated prompts at one timestamp do to `history`, stated rather
+    /// than left to be discovered.
+    ///
+    /// `history` is keyed `UNIQUE(source, timestamp_ms, prompt)` and inserted
+    /// with `INSERT OR IGNORE`. Two turns with the same text at the same
+    /// millisecond are therefore one history row -- and `session_id` is not in
+    /// that key, so this holds across sessions and is a property of the shared
+    /// table, not of this parser: the positive control below shows two
+    /// different Claude sessions collapsing exactly the same way.
+    ///
+    /// Grok makes it visible rather than causing it. A session with no
+    /// `updates.jsonl` and no per-record times has one real timestamp --
+    /// `created_at` -- for every turn, so two `continue` turns collide where
+    /// another provider's per-record clock would separate them. The honest
+    /// answer is not to space them out by an artificial millisecond each:
+    /// that is precisely the synthesized `first_ts + index` ladder this work
+    /// deleted, and it would put a fabricated time in a ledger whose value is
+    /// that its times are real.
+    ///
+    /// So the transcript, which is keyed per record, keeps both turns, and the
+    /// prompt rollup keeps one. Widening the `history` key is a change to a
+    /// contract every provider shares (#198 and #199 rest on it too) and is
+    /// not this PR's to make; this test pins the behaviour so that whoever
+    /// does change it sees what Grok expects.
+    #[test]
+    fn repeated_prompts_at_one_timestamp_are_one_history_row_in_every_source() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-dup-0001");
+        fs::create_dir_all(&dir).unwrap();
+        // No `updates.jsonl`, and no record carries a time of its own, so
+        // every turn falls back to `created_at`.
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"content\":\"continue\"}\n",
+                "{\"type\":\"assistant\",\"content\":\"ok\"}\n",
+                "{\"type\":\"user\",\"content\":\"continue\"}\n",
+                "{\"type\":\"assistant\",\"content\":\"ok again\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-dup-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &home.path().join(".grok/sessions")).unwrap();
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE session_id = 'grok-dup-0001' AND role = 'user'"
+            ),
+            2,
+            "both turns are in the transcript, which is what replay reads"
+        );
+        let times: Vec<i64> = conn
+            .prepare(
+                "SELECT ts_ms FROM session_events \
+                 WHERE session_id = 'grok-dup-0001' AND role = 'user' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            times[0], times[1],
+            "the session records one real time, and both turns carry it unaltered"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM history WHERE source = 'grok'"),
+            1,
+            "the prompt rollup keys on (source, timestamp_ms, prompt), so they are one row"
+        );
+
+        // The positive control: the same collapse on a source with per-record
+        // times, proving the key and not the Grok parser is what does this.
+        let entry = |source: &str, session: &str| HistoryEntry {
+            id: 0,
+            source: source.into(),
+            session_id: Some(session.to_string()),
+            project: Some("/tmp/stream".into()),
+            prompt_hash: Some(prompt_hash("continue")),
+            prompt: "continue".into(),
+            timestamp_ms: times[0],
+        };
+        assert_eq!(
+            insert_history(&conn, &entry("claude", "claude-a")).unwrap(),
+            1,
+            "the first of the two is inserted, so the control can observe a difference"
+        );
+        assert_eq!(
+            insert_history(&conn, &entry("claude", "claude-b")).unwrap(),
+            0,
+            "a different Claude session collapses the same way; session_id is not in the key"
+        );
+    }
+
+    /// Replacing one session must not delete another session's prompt.
+    ///
+    /// This is the shared `history` key -- `UNIQUE(source, timestamp_ms,
+    /// prompt)`, no `session_id` -- surfacing a third time, and the one place
+    /// where it costs data rather than just collapsing a count. Two Grok
+    /// sessions both containing `continue` at the same millisecond are **one**
+    /// history row, attributed to whichever was indexed first. Grok ingestion
+    /// replaces a session's evidence, and deleting that session's history rows
+    /// outright took the shared row with it: the other session's prompt
+    /// disappeared from search although nothing about it had changed, and
+    /// nothing would ever put it back, because its own files never change
+    /// again.
+    ///
+    /// The row is **re-attributed**, not skipped. Skipping would leave it
+    /// filed under a session that no longer contains the prompt -- untrue, and
+    /// undeletable, since the only session that could clean it up is the one
+    /// that no longer evidences it. Re-attribution moves it to a session whose
+    /// stored events carry that prompt now, so the row stays both true and
+    /// owned.
+    #[test]
+    fn replacing_a_session_leaves_a_prompt_another_session_still_has() {
+        let home = tempfile::tempdir().unwrap();
+        let write = |id: &str, prompts: &[&str]| {
+            let dir = home.path().join(".grok/sessions/%2Ftmp%2Fshared").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let transcript: String = prompts
+                .iter()
+                .map(|prompt| format!("{{\"type\":\"user\",\"content\":\"{prompt}\"}}\n"))
+                .collect();
+            fs::write(dir.join("chat_history.jsonl"), transcript).unwrap();
+            // The same `created_at` for both, so their untimed prompts land on
+            // the same millisecond -- which is exactly how this happens in the
+            // field, for a session with no `updates.jsonl`.
+            fs::write(
+                dir.join("summary.json"),
+                format!(
+                    r#"{{"info":{{"id":"{id}","cwd":"/tmp/shared"}},"created_at":"2026-01-01T00:00:00.000Z"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let root = home.path().join(".grok/sessions");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let prompts = |session: &str| -> Vec<String> {
+            conn.prepare(
+                "SELECT prompt FROM history WHERE source = 'grok' AND session_id = ? \
+                 ORDER BY prompt",
+            )
+            .unwrap()
+            .query_map(params![session], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        // A is indexed first, so A wins the shared row; B's identical prompt
+        // is ignored on insert. `only-a` is A's alone.
+        write("grok-shared-a", &["continue", "only-a"]);
+        write("grok-shared-b", &["continue", "only-b"]);
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            prompts("grok-shared-a"),
+            vec!["continue".to_string(), "only-a".to_string()],
+            "A owns the shared row because it was indexed first"
+        );
+        assert_eq!(
+            prompts("grok-shared-b"),
+            vec!["only-b".to_string()],
+            "B's identical prompt was ignored on insert; that is the setup"
+        );
+
+        // A is compacted: the shared prompt is gone from its transcript, and
+        // so is `only-a`.
+        write("grok-shared-a", &["after-compaction"]);
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+
+        // B never changed, and B still contains `continue`. It has to still
+        // be findable -- under B, since B is what evidences it now.
+        assert_eq!(
+            prompts("grok-shared-b"),
+            vec!["continue".to_string(), "only-b".to_string()],
+            "B's prompt must survive a replacement of A, re-attributed to B"
+        );
+
+        // The positive control: a prompt only A had is gone. Without this the
+        // fix could simply be "never delete history".
+        let all: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'grok' ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !all.iter().any(|prompt| prompt == "only-a"),
+            "a prompt only the replaced session had is gone: {all:?}"
+        );
+        assert!(
+            all.iter().any(|prompt| prompt == "after-compaction"),
+            "and the replacement's own prompt is there: {all:?}"
+        );
+        let orphaned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok' AND session_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphaned, 0,
+            "re-attribution must find a real owner, never null one out"
+        );
+    }
+
+    /// A half-written `summary.json` must not invent a session id.
+    ///
+    /// `summary.json` is the one sidecar that carries **identity** rather than
+    /// detail: `info.id` becomes the session id, which keys every evidence row
+    /// and scopes every delete a replacing read performs. Falling back to the
+    /// directory name when the file was present but unparseable -- a summary
+    /// caught mid-write -- stored the whole transcript under the encoded-cwd
+    /// folder name. Once the file was repaired the next read stored the same
+    /// session under its real id, and the first set of rows was stranded: no
+    /// read would ever name that id again, and deletes are scoped by the id
+    /// that produced them, so nothing would ever remove them.
+    ///
+    /// So the three-way rule from round seven applies here with malformed on
+    /// the failing side: **absent** keeps the directory-name fallback (a
+    /// session directory with no summary is a real shape, and its folder name
+    /// is the only identity there is), while **present-but-unparseable** fails
+    /// the read, leaving the previous evidence and the stamp alone.
+    #[test]
+    fn a_malformed_summary_fails_rather_than_naming_the_session_after_its_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/local-folder/grok-phantom-0001");
+        fs::create_dir_all(&dir).unwrap();
+        let chat = dir.join("chat_history.jsonl");
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        let summary = dir.join("summary.json");
+        let valid = r#"{"info":{"id":"grok-123","cwd":"/tmp/phantom"},"created_at":"2026-01-01T00:00:00.000Z"}"#;
+        fs::write(&summary, valid).unwrap();
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let ids = || -> Vec<String> {
+            conn.prepare(
+                "SELECT session_id FROM sessions WHERE source = 'grok' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        // Positive control one: a valid summary indexes under its own id.
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(ids(), vec!["grok-123".to_string()]);
+        let key = chat.to_string_lossy().to_string();
+        let stamp = grok_saved_stamp(&state, &key).unwrap().to_string();
+
+        // The summary is caught mid-write.
+        fs::write(&summary, "{\"info\":{\"id\":").unwrap();
+        let error = match super::scan_grok_session_file(&chat) {
+            Err(error) => error,
+            Ok(_) => panic!("a summary that carries identity and does not parse is a failed read"),
+        };
+        assert!(
+            format!("{error:#}").contains("summary.json"),
+            "unexpected error: {error:#}"
+        );
+
+        super::sync_grok(&conn, &mut state, &root)
+            .expect_err("the only session in the store could not be read");
+        assert_eq!(
+            ids(),
+            vec!["grok-123".to_string()],
+            "no session is invented from the folder name, and the good rows stay"
+        );
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(stamp.as_str()),
+            "the stamp does not advance over a failed read, so a repair is picked up"
+        );
+
+        // Repaired, and it is still the same session -- no second identity.
+        fs::write(&summary, valid).unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(ids(), vec!["grok-123".to_string()]);
+
+        // Positive control two: with no summary at all, the directory name is
+        // still the identity. Without this the fix could be "always fail
+        // without a summary", which would stop indexing a real Grok shape.
+        fs::remove_file(&summary).unwrap();
+        let mut fresh = Map::new();
+        super::sync_grok(&conn, &mut fresh, &root).unwrap();
+        assert!(
+            ids().contains(&"grok-phantom-0001".to_string()),
+            "an absent summary still falls back to the directory name: {:?}",
+            ids()
+        );
+    }
+
+    /// A session with no events and no markers is still an indexed session.
+    ///
+    /// Round eight recorded whether the indexing run wrote any evidence, so a
+    /// session that wrote none would not be re-read for ever looking for rows
+    /// it never had. But it then skipped such a session *without asking the
+    /// database anything at all* -- and "wrote no evidence" was measured from
+    /// events and markers only. Two things fall through that:
+    ///
+    /// - a Grok session whose transcript is empty but whose `subagents/`
+    ///   directory names a child writes a **relationship**, and was recorded
+    ///   as having written nothing;
+    /// - every ingestion writes a **catalog row**, and nothing checked it.
+    ///
+    /// `.sync-state.json` survives a rebuilt `history.db`, so after a rebuild
+    /// the stamp matched, the entry said "no evidence", the run skipped, and
+    /// neither the catalog row nor the relationship ever came back -- for a
+    /// finished session directory, permanently.
+    #[test]
+    fn an_empty_session_with_a_subagent_survives_a_rebuilt_database() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-void-0001");
+        fs::create_dir_all(dir.join("subagents")).unwrap();
+        // A transcript with nothing in it that becomes an event or a marker.
+        fs::write(dir.join("chat_history.jsonl"), "").unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-void-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("subagents/agent-review.json"),
+            r#"{"session_id":"grok-void-child","agent_type":"review","spawned_at":"2026-01-01T00:01:00.000Z"}"#,
+        )
+        .unwrap();
+        let root = home.path().join(".grok/sessions");
+        let db_path = home.path().join("history.db");
+
+        let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
+            let one = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+            (
+                one("SELECT COUNT(*) FROM sessions WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_relationships WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_events WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'"),
+            )
+        };
+
+        let conn = open_db(&db_path).unwrap();
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let (sessions, relationships, events, markers) = counts(&conn);
+        assert_eq!(
+            (events, markers),
+            (0, 0),
+            "the fixture must write neither, or it does not test the case"
+        );
+        assert_eq!(sessions, 1, "but indexing it did write a catalog row");
+        assert_eq!(relationships, 1, "and the subagent relationship");
+
+        // The positive control: with the database intact, the unchanged
+        // session is skipped -- the round-eight behaviour this must not undo.
+        let relationship_ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM session_relationships WHERE source = 'grok' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let after: Vec<i64> = conn
+            .prepare("SELECT rowid FROM session_relationships WHERE source = 'grok' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            after, relationship_ids,
+            "an unchanged session whose rows are present is still skipped"
+        );
+
+        // The database is rebuilt. The state file, living beside it, survives
+        // -- and the session directory will never change again.
+        drop(conn);
+        fs::remove_file(&db_path).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(counts(&conn), (0, 0, 0, 0), "the rebuild really is empty");
+
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let (sessions, relationships, _, _) = counts(&conn);
+        assert_eq!(sessions, 1, "the catalog row has to come back");
+        assert_eq!(relationships, 1, "and so does the relationship");
+    }
+
+    /// A session whose only evidence is markers is an indexed session.
+    ///
+    /// Round seven stopped trusting an unchanged stamp on its own, by asking
+    /// the database whether the session's rows were still there. Asking only
+    /// about `session_events` was too narrow: Grok writes events for user,
+    /// assistant, tool and readable-reasoning records, and a session made only
+    /// of `system` lines, synthetic turns or encrypted reasoning lands in
+    /// `session_markers` alone. Such a session answered "not indexed" on every
+    /// later sync and was re-read in full every time -- a fix that made the
+    /// hot path do the thing it was added to prevent.
+    ///
+    /// So the indexing run records whether it wrote any evidence, and the
+    /// check asks about the tables Grok actually writes.
+    #[test]
+    fn a_session_stored_only_as_markers_is_not_re_read_every_sync() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-mark-0001");
+        fs::create_dir_all(&dir).unwrap();
+        // `system` and encrypted reasoning: markers, and not one event.
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                "{\"type\":\"system\",\"content\":\"session opened\"}\n",
+                "{\"type\":\"reasoning\",\"encrypted_content\":\"b64\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-mark-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            count("SELECT COUNT(*) FROM session_events WHERE source = 'grok'"),
+            0,
+            "the fixture must produce no events, or it does not test the case"
+        );
+        let markers = count("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'");
+        assert!(markers > 0, "but it does produce markers");
+
+        // The second sync must skip it. `sync_grok` returns prompts, which are
+        // zero either way here, so the re-read is detected by the markers
+        // being deleted and rewritten rather than left alone.
+        let marker_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM session_markers WHERE source = 'grok' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let after: Vec<i64> = conn
+            .prepare("SELECT id FROM session_markers WHERE source = 'grok' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            after, marker_ids,
+            "an unchanged marker-only session must be skipped, not deleted and rewritten"
+        );
+
+        // The positive control: round seven's case still holds. Wipe the
+        // evidence and the same unchanged session is read again.
+        conn.execute("DELETE FROM session_markers WHERE source = 'grok'", [])
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert!(
+            count("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'") > 0,
+            "a session with no stored evidence at all is still re-read"
+        );
+    }
+
+    /// An unchanged file whose rows are gone is not an indexed session.
+    ///
+    /// `.sync-state.json` sits beside `history.db`, so deleting or rebuilding
+    /// the database leaves the state file behind. A stamp read on its own then
+    /// answers "already indexed" for a session with no rows at all, and goes
+    /// on answering it until some file in the directory changes -- which, for
+    /// a session the user has finished with, is never. The stamp has to be
+    /// checked against the database, the way the Codex and Claude walks
+    /// already check theirs.
+    #[test]
+    fn an_unchanged_session_whose_evidence_was_wiped_is_indexed_again() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, _dir) = grok_stream_fixture(home.path(), "grok-wipe-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let key = chat.to_string_lossy().to_string();
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let stamp = grok_saved_stamp(&state, &key).unwrap().to_string();
+
+        // The positive control: nothing was touched, the rows are there, and
+        // the run correctly does no work.
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 0);
+        assert!(super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+
+        // The database is rebuilt; the state file, living beside it, survives.
+        conn.execute("DELETE FROM session_events WHERE source = 'grok'", [])
+            .unwrap();
+        assert!(!super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(stamp.as_str()),
+            "the file has not changed, so the stamp still matches"
+        );
+
+        assert_eq!(
+            super::sync_grok(&conn, &mut state, &root).unwrap(),
+            1,
+            "an unchanged file with no rows behind it has to be read again"
+        );
+        assert!(super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
+    }
+
+    /// A finished row that does not parse is a damaged file, not an empty one.
+    ///
+    /// Grok ingestion **replaces** a session's evidence: it deletes the stored
+    /// events and writes what it just read. Dropping an unparseable row would
+    /// therefore commit a transcript that is missing a turn Grok did write,
+    /// and then save the change stamp that stops the next run from ever
+    /// looking at the file again -- the loss becomes the session's settled
+    /// state. The read has to fail instead, so the previous transaction stands
+    /// and the stamp stays behind for a retry.
+    ///
+    /// The line that has *not* been newline-terminated is the one exception,
+    /// and the positive controls below hold it: a fragment Grok is still
+    /// writing is ignorable, and a valid rewrite still replaces.
+    #[test]
+    fn a_malformed_finished_row_fails_the_read_instead_of_erasing_the_session() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, _dir) = grok_stream_fixture(home.path(), "grok-mal-0001");
+        let (sibling, _) = grok_stream_fixture(home.path(), "grok-mal-0002");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let key = chat.to_string_lossy().to_string();
+        let events = |session: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 2);
+        let indexed = events("grok-mal-0001");
+        assert!(indexed > 0, "the session was indexed before it was damaged");
+        let first_stamp = grok_saved_stamp(&state, &key)
+            .expect("a healthy session is checkpointed")
+            .to_string();
+
+        // The one complete row of the transcript, damaged but still finished.
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\n").unwrap();
+        let damaged_stamp = grok_session_stamp(&chat).unwrap();
+        assert_ne!(
+            damaged_stamp, first_stamp,
+            "the rewrite has to look like a change, or the run would skip it"
+        );
+
+        let inserted = super::sync_grok(&conn, &mut state, &root)
+            .expect("the readable sibling accounts for itself; the source has not failed");
+        assert_eq!(inserted, 0, "nothing was indexed from the damaged session");
+        assert_eq!(
+            events("grok-mal-0001"),
+            indexed,
+            "the evidence from the last good read survives the failed one"
+        );
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(first_stamp.as_str()),
+            "the stamp does not advance over a read that failed, so the next run retries"
+        );
+
+        // Positive control one: a trailing fragment with no newline is a
+        // record still being written. It scans clean, and the finished rows
+        // before it are still indexed.
+        fs::write(
+            &sibling,
+            "{\"type\":\"user\",\"content\":\"finished\"}\n{\"type\":\"user\",\"cont",
+        )
+        .unwrap();
+        let scanned = super::scan_grok_session_file(&sibling)
+            .expect("an unfinished tail is not a damaged file")
+            .expect("the finished row is still a session");
+        assert_eq!(scanned.lines.len(), 1, "the fragment is skipped, not read");
+
+        // Positive control two: repair the transcript and the session is
+        // replaced, stamp and all.
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\"rewritten\"}\n").unwrap();
+        assert_eq!(
+            super::sync_grok(&conn, &mut state, &root).unwrap(),
+            2,
+            "the repaired session and the sibling control one rewrote both re-index"
+        );
+        assert_ne!(
+            grok_saved_stamp(&state, &key),
+            Some(first_stamp.as_str()),
+            "a read that worked does advance the stamp"
+        );
+        let text: String = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE session_id = ? AND role = 'user'",
+                ["grok-mal-0001"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("rewritten"), "unexpected content: {text}");
+    }
+
+    #[test]
+    fn retiring_the_grok_state_key_re_reads_a_session_sync_already_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let session = home.join(".grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001");
+        fs::create_dir_all(&session).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/grok/events-session/.grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001");
+        for name in ["chat_history.jsonl", "updates.jsonl", "summary.json"] {
+            fs::copy(fixture.join(name), session.join(name)).unwrap();
+        }
+        let db_path = home.join("history.db");
+        let chat = session.join("chat_history.jsonl");
+
+        // What the previous release left behind: the old state key, and a
+        // prompt stamped `created_at + index`.
+        let mut previous = Map::new();
+        previous.insert(
+            "grok_sessions".into(),
+            json!({ chat.to_string_lossy(): grok_session_stamp(&chat).unwrap() }),
+        );
+        save_sync_state(&home.join(".sync-state.json"), &previous).unwrap();
+        {
+            let conn = open_db(&db_path).unwrap();
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "grok".into(),
+                    session_id: Some("grok-evt-0001".into()),
+                    project: Some("/tmp/demo".into()),
+                    prompt_hash: None,
+                    prompt: "add a retry to the http client".into(),
+                    timestamp_ms: 1_789_560_000_000,
+                },
+            )
+            .unwrap();
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "grok".into(),
+                    session_id: Some("grok-evt-0001".into()),
+                    project: Some("/tmp/demo".into()),
+                    prompt_hash: None,
+                    prompt: "now a test".into(),
+                    // The fabricated one: one millisecond after the first.
+                    timestamp_ms: 1_789_560_000_001,
+                },
+            )
+            .unwrap();
+        }
+
+        sync_local_at_with_home(&db_path, home).unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        let prompts: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, timestamp_ms FROM history WHERE source = 'grok' ORDER BY timestamp_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                (
+                    "add a retry to the http client".to_string(),
+                    1_789_560_000_000
+                ),
+                ("now a test".to_string(), 1_789_560_120_000),
+            ],
+            "the synthesized timestamp must be replaced, not duplicated"
+        );
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "the re-read must produce events");
+
+        let state = load_sync_state(&home.join(".sync-state.json")).unwrap();
+        assert!(state.contains_key(GROK_SYNC_STATE_KEY));
+        assert!(
+            !state.contains_key("grok_sessions"),
+            "the retired key must be gone from disk, not just from memory"
+        );
+
+        // Steady state: the second run reads nothing and changes nothing.
+        sync_local_at_with_home(&db_path, home).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, events);
+    }
+
     #[test]
     fn retired_state_keys_are_deleted_from_disk_not_just_from_memory() {
         let dir = tempfile::tempdir().unwrap();
@@ -8636,6 +11457,52 @@ mod tests {
         );
         let events = crate::session_events(&conn, "s-rewrite", Some("cursor")).unwrap();
         assert_eq!(events.len(), 2, "stale events survived the rewrite");
+    }
+
+    /// An empty rewrite is still a rewrite. `open` notices the file is shorter
+    /// than the saved cursor and starts at offset 0; both offsets are then
+    /// zero, so `advanced` used to stay false, the checkpoint advanced, and
+    /// the old tool calls stayed.
+    ///
+    /// Positive control: without queuing a restart from a previously advanced
+    /// cursor this failed with `stale tool calls survived the empty rewrite:
+    /// left: 1, right: 0`.
+    #[test]
+    fn rewriting_a_cursor_transcript_empty_clears_the_old_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-empty",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>do it</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"a.rs"}}]}}"#,
+                "\n"
+            ),
+        );
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-empty"), 1);
+        assert_eq!(cursor_row_count(&conn, "history", "s-empty"), 1);
+
+        fs::write(&transcript, "").unwrap();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        assert_eq!(
+            cursor_row_count(&conn, "tool_calls", "s-empty"),
+            0,
+            "stale tool calls survived the empty rewrite"
+        );
+        assert_eq!(
+            cursor_row_count(&conn, "history", "s-empty"),
+            0,
+            "stale prompts survived the empty rewrite"
+        );
+        assert_eq!(cursor_row_count(&conn, "session_events", "s-empty"), 0);
+        assert_eq!(cursor_row_count(&conn, "file_edits", "s-empty"), 0);
     }
 
     /// Group B, targeted hydration: the same rebuild guarantee.
