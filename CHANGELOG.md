@@ -19,7 +19,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   hour — so a provider installed after `watch` started becomes covered in
   seconds without a restart, while sweeps keep the cadence that was asked for.
   Every configurable interval is bounded at seven days where it enters, so an
-  absurd `--debounce-ms` cannot stop capture on the first change event.
+  absurd `--debounce-ms` cannot stop capture on the first change event. Watch
+  roots and event paths are resolved to one absolute spelling, so a root given
+  relatively matches the events the watcher reports for it.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not

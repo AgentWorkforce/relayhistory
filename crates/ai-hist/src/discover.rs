@@ -404,11 +404,44 @@ pub enum WatchDepth {
     Tree,
 }
 
+/// One path in the single spelling every comparison uses.
+///
+/// A watch root and a backend event have to be comparable, and they arrive
+/// spelled differently: a root can be given relatively (`TRAJECTORY_ROOT=
+/// trajectory.json`), while the backend reports what it was registered
+/// with — so a relative root and an absolute event never match and the file
+/// is watched but never seen to change. The fix is not to compare cleverly
+/// but to hold one spelling: every root is absolute from the moment it is
+/// built, so the registration is absolute too, and an event path is put
+/// through the same function before it is matched.
+///
+/// Lexical, not canonical: `.` and `..` are resolved textually and symlinks
+/// are left alone. Resolving symlinks would mean a filesystem call per event
+/// and a different answer for a root whose target moves; textual resolution
+/// is the same answer on both sides, which is what matching needs.
+pub(crate) fn watch_path(path: &Path) -> PathBuf {
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
+}
+
 impl WatchRoot {
     /// Watch this path and everything under it.
     pub fn tree(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            path: watch_path(&path.into()),
             depth: WatchDepth::Tree,
         }
     }
@@ -416,7 +449,7 @@ impl WatchRoot {
     /// Watch only this directory's own entries.
     pub fn directory(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            path: watch_path(&path.into()),
             depth: WatchDepth::Directory,
         }
     }
@@ -424,7 +457,7 @@ impl WatchRoot {
     /// Watch only this one file, through its parent directory.
     pub fn file(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            path: watch_path(&path.into()),
             depth: WatchDepth::File,
         }
     }
@@ -434,20 +467,13 @@ impl WatchRoot {
     /// Only a [`WatchDepth::File`] root differs from the path it names: it is
     /// registered through its parent directory.
     ///
-    /// A bare relative name has an *empty* parent rather than no parent —
-    /// `Path::new("trajectory.json").parent()` is `Some("")` — and the empty
-    /// path exists nowhere, so registering it fails and the root sits in
-    /// `pending` for the life of the process while its source is only ever
-    /// polled. The directory that name is relative to is the working
-    /// directory, so that is what gets registered. A nested relative path and
-    /// an absolute one already name their parent and are unchanged.
+    /// The path is already absolute — [`watch_path`] made it so when the root
+    /// was built — so the parent is a real directory rather than the empty
+    /// path a bare relative name would have yielded, and the backend reports
+    /// events under it in the same spelling the root holds.
     pub fn registered_path(&self) -> &Path {
         match self.depth {
-            WatchDepth::File => match self.path.parent() {
-                Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
-                Some(parent) => parent,
-                None => self.path.as_path(),
-            },
+            WatchDepth::File => self.path.parent().unwrap_or(self.path.as_path()),
             _ => self.path.as_path(),
         }
     }

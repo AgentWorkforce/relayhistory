@@ -105,7 +105,14 @@ kept writing. Every interval the loop takes — `--debounce-ms`, `--interval`,
 the backstop — is bounded at seven days where it enters, because a duration
 added to an instant panics on a platform that cannot represent the sum, and a
 `--debounce-ms` in the billions would otherwise stop capture at the first
-change event with no sign that anything was wrong. The backstop also
+change event with no sign that anything was wrong.
+
+A root given relatively — `TRAJECTORY_ROOT=trajectory.json` — is resolved
+against the working directory when it is built, and every event path is put
+through the same resolution before it is matched. Both sides then hold one
+spelling: a root that kept a relative name would register successfully, be
+reported as watched, and never match the absolute path the watcher reports for
+it, so the file would be watched and never seen to change. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.

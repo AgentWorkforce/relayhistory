@@ -5442,27 +5442,38 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
-    /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and its parent is
-    /// the empty path rather than no path at all. Registering the empty path
-    /// fails every existence check, so such a root would sit in `pending`
-    /// forever and its trajectories would only ever be found by the backstop.
+    /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative
+    /// root has to end up in the same spelling as the events the watcher
+    /// reports for it — otherwise it registers, never matches, and its
+    /// trajectories are only ever found by the backstop.
+    ///
+    /// This is the cheap half of that property. The half with teeth is
+    /// `tests/relative_watch_roots.rs`, which puts a real watcher's own event
+    /// paths through the filter: a test that supplies its own path cannot see
+    /// a disagreement between the two.
     #[test]
-    fn a_bare_relative_file_root_is_registered_through_the_working_directory() {
+    fn a_relative_file_root_is_resolved_against_the_working_directory() {
+        let cwd = std::env::current_dir().expect("current dir");
         let bare = super::trajectory_watch_root(PathBuf::from("trajectory.json"));
         assert_eq!(bare.depth, crate::discover::WatchDepth::File);
-        assert_eq!(bare.registered_path(), Path::new("."));
-        assert!(bare.covers(Path::new("trajectory.json")));
+        assert_eq!(bare.path, cwd.join("trajectory.json"));
+        assert_eq!(bare.registered_path(), cwd.as_path());
+        assert!(bare.covers(&cwd.join("trajectory.json")));
         assert!(
-            !bare.covers(Path::new("other.json")),
-            "registering the working directory must not widen what the root covers"
+            !bare.covers(&cwd.join("other.json")),
+            "resolving the root must not widen what it covers"
         );
 
-        // Positive controls: the paths that already named a parent keep it,
-        // so the fix is confined to the case that had none.
+        // Positive controls: a nested relative path keeps its own parent, and
+        // an absolute one is left exactly as it was given.
         let nested = super::trajectory_watch_root(PathBuf::from("runs/trajectory.json"));
-        assert_eq!(nested.registered_path(), Path::new("runs"));
+        assert_eq!(nested.registered_path(), cwd.join("runs"));
         let absolute = super::trajectory_watch_root(PathBuf::from("/home/someone/trajectory.json"));
         assert_eq!(absolute.registered_path(), Path::new("/home/someone"));
+        // And a path that names its own directory resolves to the same root
+        // as the plain spelling, since the two mean the same file.
+        let dotted = super::trajectory_watch_root(PathBuf::from("./runs/../trajectory.json"));
+        assert_eq!(dotted.path, bare.path);
     }
 
     /// A `TRAJECTORY_ROOT` naming one JSON file must not promote its parent —

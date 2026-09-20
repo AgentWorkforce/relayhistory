@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::discover::{WatchDepth, WatchRoot};
+use crate::discover::{self, WatchDepth, WatchRoot};
 
 /// The longest any configurable interval may be.
 ///
@@ -186,7 +186,12 @@ pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 /// fingerprint. Filtering by the depth the root asked for makes the two
 /// backends agree, and on inotify it is simply a no-op the kernel already did.
 fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
-    roots.iter().any(|root| root.covers(path))
+    // The event's own spelling is never compared. Roots are absolute from the
+    // moment they are built, and a backend reports whatever it was registered
+    // with — including a `.` component that survives the join — so both sides
+    // go through the same normalisation before they are compared at all.
+    let path = discover::watch_path(path);
+    roots.iter().any(|root| root.covers(&path))
 }
 
 #[derive(Default)]
@@ -878,12 +883,12 @@ mod fs_events {
                         event
                             .paths
                             .iter()
+                            .map(|path| discover::watch_path(path))
                             .filter(|path| {
                                 roots
                                     .iter()
                                     .any(|root| root.registered_path() == path.as_path())
                             })
-                            .cloned()
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
