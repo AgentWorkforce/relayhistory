@@ -1830,16 +1830,41 @@ fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
 
 /// Whether any Grok-owned evidence is stored for a session.
 ///
-/// Both tables, because a Grok session need not produce events: one made only
-/// of `system` lines, synthetic turns or encrypted reasoning is stored
-/// entirely as markers, and asking only about events would call it unindexed
-/// on every run.
+/// Every table this ingestion writes, because a Grok session need not produce
+/// events: one made only of `system` lines, synthetic turns or encrypted
+/// reasoning is stored entirely as markers, and one whose transcript is empty
+/// but whose `subagents/` directory names a child has only a relationship.
+/// Asking about a subset would call such a session unindexed on every run.
 fn grok_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
     if session_events_exist(conn, "grok", session_id)? {
         return Ok(true);
     }
-    let exists: i64 = conn.query_row(
+    for statement in [
         "SELECT EXISTS(SELECT 1 FROM session_markers \
+         WHERE source = 'grok' AND session_id = ? LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+         WHERE source = 'grok' AND parent_session_id = ? \
+           AND evidence_kind = 'grok_subagent_dir' LIMIT 1)",
+    ] {
+        let exists: i64 = conn.query_row(statement, params![session_id], |row| row.get(0))?;
+        if exists != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the catalog row this ingestion writes is still there.
+///
+/// The one thing every Grok ingestion produces, whatever the transcript held.
+/// It is the right question only for a session recorded as having written no
+/// evidence: for such a session the catalog row is the whole of what indexing
+/// it produced, so its presence and "is it indexed" are the same question.
+/// For a session that did write evidence it would be too weak, because
+/// discovery writes catalog rows too and one could stand over missing rows.
+fn grok_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions \
          WHERE source = 'grok' AND session_id = ? LIMIT 1)",
         params![session_id],
         |row| row.get(0),
@@ -4076,10 +4101,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             // The other half of that is knowing what "its rows" means for
             // *this* session. Not every Grok session produces `session_events`
             // -- one made only of `system` lines, synthetic turns or encrypted
-            // reasoning is stored entirely as markers -- so asking only about
-            // events would find nothing and re-read such a session on every
-            // run, forever. The answer is not to guess from the tables but to
-            // record what the indexing run actually produced.
+            // reasoning is stored entirely as markers, and one with an empty
+            // transcript and a `subagents/` entry only a relationship -- so
+            // asking only about events would find nothing and re-read such a
+            // session on every run, forever. The answer is not to guess from
+            // the tables but to record what the indexing run actually
+            // produced, and then to ask about that.
             match (recorded_session.as_deref(), recorded_evidence) {
                 // Written by an older build that saved the stamp alone, so
                 // there is no session id to look the evidence up by. Trust
@@ -4088,18 +4115,21 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                     accounted += 1;
                     continue;
                 }
-                // The run that indexed it wrote no evidence rows at all, so
-                // their absence now is not information. Trust the stamp.
-                (Some(_), Some(false)) => {
+                // The run that indexed it wrote no evidence rows at all. It
+                // still wrote a catalog row -- every ingestion does -- so
+                // that is what there is to check, and it is enough: a session
+                // with no evidence *is* its catalog row. Skipping without
+                // asking anything is what let an empty session disappear for
+                // good when the database was rebuilt.
+                (Some(id), Some(false)) if grok_catalog_row_exists(conn, id)? => {
                     accounted += 1;
                     continue;
                 }
-                (Some(id), _) if grok_evidence_exists(conn, id)? => {
+                (Some(id), Some(true) | None) if grok_evidence_exists(conn, id)? => {
                     accounted += 1;
                     continue;
                 }
-                // Unchanged, and the evidence it did write is missing:
-                // re-index it.
+                // Unchanged, and what it did write is missing: re-index it.
                 _ => {}
             }
         }
@@ -4115,11 +4145,15 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
                 inserted += outcome.prompts;
                 tx.commit()?;
-                // Whether this session has any evidence to go looking for on a
-                // later run. A session stored entirely as markers has no
-                // events; one whose transcript yields no usable record at all
-                // has neither, and for it the question does not arise.
-                let had_evidence = outcome.events > 0 || outcome.markers > 0;
+                // Whether this session has any evidence to go looking for on
+                // a later run. A session stored entirely as markers has no
+                // events; one whose transcript is empty but whose
+                // `subagents/` directory names a child has only a
+                // relationship. Every writer this ingestion drives has to be
+                // counted here, or a later run asks about a table this
+                // session never filled and re-reads it for ever.
+                let had_evidence =
+                    outcome.events > 0 || outcome.markers > 0 || outcome.relationships > 0;
                 sessions += 1;
                 accounted += 1;
                 // The session id travels with the stamp so the next run can
@@ -4687,10 +4721,35 @@ fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<
         "DELETE FROM tool_calls WHERE source = 'grok' AND session_id = ?",
         "DELETE FROM file_edits WHERE source = 'grok' AND session_id = ?",
         "DELETE FROM session_markers WHERE source = 'grok' AND session_id = ?",
-        // A prompt's identity is `(source, timestamp_ms, prompt)`, and every
-        // Grok prompt written before this parser carried a timestamp
-        // synthesized as `created_at + index`; merging would keep the
-        // fabricated ones forever.
+    ] {
+        conn.execute(statement, params![session_id])?;
+    }
+    // `history` is keyed `(source, timestamp_ms, prompt)` and inserted with
+    // `INSERT OR IGNORE`, so a prompt two sessions both contain is **one row**,
+    // attributed to whichever session was indexed first. Deleting this
+    // session's rows outright would therefore delete a prompt that another,
+    // unchanged session still has -- it would vanish from search with nothing
+    // to say it had ever been there, and nothing would ever put it back,
+    // because that session's own files never change again.
+    //
+    // So a row this session no longer owns is **re-attributed** rather than
+    // skipped. Skipping was the other option and is worse: it would leave the
+    // row filed under a session that no longer contains the prompt, which is
+    // a false statement about provenance, and would leave it undeletable --
+    // the only session that could ever clean it up is the one that no longer
+    // evidences it. Re-attribution moves the row to a session whose stored
+    // events actually carry that prompt at that moment, so the row stays true
+    // and stays owned.
+    conn.execute(
+        "UPDATE history AS h SET            session_id = (SELECT e.session_id FROM session_events e                          WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                            AND e.session_id <> h.session_id                            AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                          ORDER BY e.session_id LIMIT 1),            project = (SELECT e.project FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt                       ORDER BY e.session_id LIMIT 1)          WHERE h.source = 'grok' AND h.session_id = ?            AND EXISTS(SELECT 1 FROM session_events e                       WHERE e.source = 'grok' AND e.role = 'user' AND e.kind = 'text'                         AND e.session_id <> h.session_id                         AND e.ts_ms = h.timestamp_ms AND e.text = h.prompt)",
+        params![session_id],
+    )?;
+    for statement in [
+        // What is left is this session's alone. A prompt's identity is
+        // `(source, timestamp_ms, prompt)`, and every Grok prompt written
+        // before this parser carried a timestamp synthesized as
+        // `created_at + index`; merging would keep the fabricated ones
+        // forever.
         "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
         "DELETE FROM session_relationships WHERE source = 'grok' \
          AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
@@ -6890,6 +6949,217 @@ mod tests {
             0,
             "a different Claude session collapses the same way; session_id is not in the key"
         );
+    }
+
+    /// Replacing one session must not delete another session's prompt.
+    ///
+    /// This is the shared `history` key -- `UNIQUE(source, timestamp_ms,
+    /// prompt)`, no `session_id` -- surfacing a third time, and the one place
+    /// where it costs data rather than just collapsing a count. Two Grok
+    /// sessions both containing `continue` at the same millisecond are **one**
+    /// history row, attributed to whichever was indexed first. Grok ingestion
+    /// replaces a session's evidence, and deleting that session's history rows
+    /// outright took the shared row with it: the other session's prompt
+    /// disappeared from search although nothing about it had changed, and
+    /// nothing would ever put it back, because its own files never change
+    /// again.
+    ///
+    /// The row is **re-attributed**, not skipped. Skipping would leave it
+    /// filed under a session that no longer contains the prompt -- untrue, and
+    /// undeletable, since the only session that could clean it up is the one
+    /// that no longer evidences it. Re-attribution moves it to a session whose
+    /// stored events carry that prompt now, so the row stays both true and
+    /// owned.
+    #[test]
+    fn replacing_a_session_leaves_a_prompt_another_session_still_has() {
+        let home = tempfile::tempdir().unwrap();
+        let write = |id: &str, prompts: &[&str]| {
+            let dir = home.path().join(".grok/sessions/%2Ftmp%2Fshared").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let transcript: String = prompts
+                .iter()
+                .map(|prompt| format!("{{\"type\":\"user\",\"content\":\"{prompt}\"}}\n"))
+                .collect();
+            fs::write(dir.join("chat_history.jsonl"), transcript).unwrap();
+            // The same `created_at` for both, so their untimed prompts land on
+            // the same millisecond -- which is exactly how this happens in the
+            // field, for a session with no `updates.jsonl`.
+            fs::write(
+                dir.join("summary.json"),
+                format!(
+                    r#"{{"info":{{"id":"{id}","cwd":"/tmp/shared"}},"created_at":"2026-01-01T00:00:00.000Z"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let root = home.path().join(".grok/sessions");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let prompts = |session: &str| -> Vec<String> {
+            conn.prepare(
+                "SELECT prompt FROM history WHERE source = 'grok' AND session_id = ? \
+                 ORDER BY prompt",
+            )
+            .unwrap()
+            .query_map(params![session], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        // A is indexed first, so A wins the shared row; B's identical prompt
+        // is ignored on insert. `only-a` is A's alone.
+        write("grok-shared-a", &["continue", "only-a"]);
+        write("grok-shared-b", &["continue", "only-b"]);
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            prompts("grok-shared-a"),
+            vec!["continue".to_string(), "only-a".to_string()],
+            "A owns the shared row because it was indexed first"
+        );
+        assert_eq!(
+            prompts("grok-shared-b"),
+            vec!["only-b".to_string()],
+            "B's identical prompt was ignored on insert; that is the setup"
+        );
+
+        // A is compacted: the shared prompt is gone from its transcript, and
+        // so is `only-a`.
+        write("grok-shared-a", &["after-compaction"]);
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+
+        // B never changed, and B still contains `continue`. It has to still
+        // be findable -- under B, since B is what evidences it now.
+        assert_eq!(
+            prompts("grok-shared-b"),
+            vec!["continue".to_string(), "only-b".to_string()],
+            "B's prompt must survive a replacement of A, re-attributed to B"
+        );
+
+        // The positive control: a prompt only A had is gone. Without this the
+        // fix could simply be "never delete history".
+        let all: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'grok' ORDER BY prompt")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !all.iter().any(|prompt| prompt == "only-a"),
+            "a prompt only the replaced session had is gone: {all:?}"
+        );
+        assert!(
+            all.iter().any(|prompt| prompt == "after-compaction"),
+            "and the replacement's own prompt is there: {all:?}"
+        );
+        let orphaned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok' AND session_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphaned, 0,
+            "re-attribution must find a real owner, never null one out"
+        );
+    }
+
+    /// A session with no events and no markers is still an indexed session.
+    ///
+    /// Round eight recorded whether the indexing run wrote any evidence, so a
+    /// session that wrote none would not be re-read for ever looking for rows
+    /// it never had. But it then skipped such a session *without asking the
+    /// database anything at all* -- and "wrote no evidence" was measured from
+    /// events and markers only. Two things fall through that:
+    ///
+    /// - a Grok session whose transcript is empty but whose `subagents/`
+    ///   directory names a child writes a **relationship**, and was recorded
+    ///   as having written nothing;
+    /// - every ingestion writes a **catalog row**, and nothing checked it.
+    ///
+    /// `.sync-state.json` survives a rebuilt `history.db`, so after a rebuild
+    /// the stamp matched, the entry said "no evidence", the run skipped, and
+    /// neither the catalog row nor the relationship ever came back -- for a
+    /// finished session directory, permanently.
+    #[test]
+    fn an_empty_session_with_a_subagent_survives_a_rebuilt_database() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-void-0001");
+        fs::create_dir_all(dir.join("subagents")).unwrap();
+        // A transcript with nothing in it that becomes an event or a marker.
+        fs::write(dir.join("chat_history.jsonl"), "").unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-void-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("subagents/agent-review.json"),
+            r#"{"session_id":"grok-void-child","agent_type":"review","spawned_at":"2026-01-01T00:01:00.000Z"}"#,
+        )
+        .unwrap();
+        let root = home.path().join(".grok/sessions");
+        let db_path = home.path().join("history.db");
+
+        let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
+            let one = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+            (
+                one("SELECT COUNT(*) FROM sessions WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_relationships WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_events WHERE source = 'grok'"),
+                one("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'"),
+            )
+        };
+
+        let conn = open_db(&db_path).unwrap();
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let (sessions, relationships, events, markers) = counts(&conn);
+        assert_eq!(
+            (events, markers),
+            (0, 0),
+            "the fixture must write neither, or it does not test the case"
+        );
+        assert_eq!(sessions, 1, "but indexing it did write a catalog row");
+        assert_eq!(relationships, 1, "and the subagent relationship");
+
+        // The positive control: with the database intact, the unchanged
+        // session is skipped -- the round-eight behaviour this must not undo.
+        let relationship_ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM session_relationships WHERE source = 'grok' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let after: Vec<i64> = conn
+            .prepare("SELECT rowid FROM session_relationships WHERE source = 'grok' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            after, relationship_ids,
+            "an unchanged session whose rows are present is still skipped"
+        );
+
+        // The database is rebuilt. The state file, living beside it, survives
+        // -- and the session directory will never change again.
+        drop(conn);
+        fs::remove_file(&db_path).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(counts(&conn), (0, 0, 0, 0), "the rebuild really is empty");
+
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let (sessions, relationships, _, _) = counts(&conn);
+        assert_eq!(sessions, 1, "the catalog row has to come back");
+        assert_eq!(relationships, 1, "and so does the relationship");
     }
 
     /// A session whose only evidence is markers is an indexed session.
