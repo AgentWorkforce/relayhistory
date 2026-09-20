@@ -177,6 +177,17 @@ CREATE TABLE IF NOT EXISTS file_edits (
     cwd TEXT,
     UNIQUE(source, session_id, tool_use_id)
 );
+CREATE TABLE IF NOT EXISTS session_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    marker_uid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ts_ms INTEGER,
+    text TEXT,
+    detail_json TEXT,
+    UNIQUE(source, session_id, marker_uid)
+);
 CREATE TABLE IF NOT EXISTS session_commit_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
@@ -422,6 +433,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_hydration_checkpoints",
     "session_identity_correlations",
     "session_relationships",
+    "session_markers",
     "schema_migrations",
     "discovery_skips",
 ];
@@ -546,10 +558,12 @@ const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_presences",
     "delete_session_hydration_state",
     "delete_session_identity_correlations",
+    "delete_session_markers",
 ];
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    "session_markers_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -864,6 +878,13 @@ BEGIN
     DELETE FROM session_identity_correlations
     WHERE source = OLD.source AND local_session_id = OLD.session_id;
 END;
+CREATE TRIGGER IF NOT EXISTS delete_session_markers
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM session_markers
+    WHERE source = OLD.source AND session_id = OLD.session_id;
+END;
+INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');
 "#,
     )?;
     // `sessions` predates the shallow catalog. Databases created by an older
@@ -1437,6 +1458,78 @@ pub fn upsert_session_presence(
         discovery_state
     ])?;
     Ok(())
+}
+
+/// One non-conversational fact a provider recorded about a session: a
+/// compaction boundary, a system preamble, an opaque reasoning trace.
+///
+/// A marker is deliberately not a `session_events` row. `session_events` is
+/// the transcript — things said, tools called, results returned — and forcing
+/// "the context was compacted here" into it would mean choosing a `role` and a
+/// `kind` that are both untrue. Markers carry no role and their `ts_ms` is
+/// nullable, because a provider may record that something happened without
+/// recording when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMarker {
+    pub source: String,
+    pub session_id: String,
+    /// Stable per-session identity, so re-reading the same evidence upserts.
+    pub marker_uid: String,
+    pub kind: String,
+    pub ts_ms: Option<i64>,
+    pub text: Option<String>,
+    /// The provider's own fields for this marker, verbatim.
+    pub detail_json: Option<String>,
+}
+
+/// Record one marker, replacing what a previous read of the same evidence
+/// wrote.
+pub fn insert_session_marker(conn: &Connection, marker: &SessionMarker) -> Result<usize> {
+    let changed = conn.execute(
+        "INSERT INTO session_markers \
+         (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
+         kind = excluded.kind, ts_ms = excluded.ts_ms, text = excluded.text, \
+         detail_json = excluded.detail_json",
+        params![
+            marker.source,
+            marker.session_id,
+            marker.marker_uid,
+            marker.kind,
+            marker.ts_ms,
+            marker.text,
+            marker.detail_json,
+        ],
+    )?;
+    Ok(changed)
+}
+
+/// Every marker recorded for one session, oldest known time first. Markers
+/// with no recorded time sort last, in insertion order.
+pub fn session_markers(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<SessionMarker>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, session_id, marker_uid, kind, ts_ms, text, detail_json \
+         FROM session_markers WHERE source = ? AND session_id = ? \
+         ORDER BY ts_ms IS NULL, ts_ms, id",
+    )?;
+    let rows = stmt.query_map(params![source, session_id], |row| {
+        Ok(SessionMarker {
+            source: row.get(0)?,
+            session_id: row.get(1)?,
+            marker_uid: row.get(2)?,
+            kind: row.get(3)?,
+            ts_ms: row.get(4)?,
+            text: row.get(5)?,
+            detail_json: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<usize> {
@@ -3561,6 +3654,84 @@ mod tests {
 
         init_db(&conn).unwrap();
         assert!(!retired_indexes_present(&conn).unwrap());
+    }
+
+    /// `session_markers` has to reach a database written before it existed,
+    /// and a read-only handle must refuse to serve that database until it
+    /// does — otherwise the first read of a Grok compaction boundary fails
+    /// with `no such table` instead of migrating. The migration is additive:
+    /// nothing already in the database is touched.
+    #[test]
+    fn session_markers_migrate_onto_a_database_that_predates_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-markers.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, last_activity_ms)                  VALUES ('kept-1', 'grok', 7)",
+                [],
+            )
+            .unwrap();
+            // Rewind the database to before this change shipped.
+            conn.execute_batch(
+                "DROP TRIGGER delete_session_markers;
+                 DROP TABLE session_markers;
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v1';",
+            )
+            .unwrap();
+            assert!(
+                !schema_is_current(&conn).unwrap(),
+                "a database without session_markers must not be served read-only"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        insert_session_marker(
+            &conn,
+            &SessionMarker {
+                source: "grok".into(),
+                session_id: "kept-1".into(),
+                marker_uid: "compaction:1.json".into(),
+                kind: "compaction_boundary".into(),
+                ts_ms: Some(11),
+                text: None,
+                detail_json: None,
+            },
+        )
+        .unwrap();
+        // Re-reading the same evidence updates the row rather than adding one.
+        insert_session_marker(
+            &conn,
+            &SessionMarker {
+                source: "grok".into(),
+                session_id: "kept-1".into(),
+                marker_uid: "compaction:1.json".into(),
+                kind: "compaction_boundary".into(),
+                ts_ms: Some(12),
+                text: Some("second read".into()),
+                detail_json: None,
+            },
+        )
+        .unwrap();
+        let markers = session_markers(&conn, "grok", "kept-1").unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].ts_ms, Some(12));
+        assert_eq!(markers[0].text.as_deref(), Some("second read"));
+        // The row that was already there survived the migration untouched.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions WHERE session_id = 'kept-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 7);
+
+        // Deleting the session takes its markers with it.
+        conn.execute("DELETE FROM sessions WHERE session_id = 'kept-1'", [])
+            .unwrap();
+        assert!(session_markers(&conn, "grok", "kept-1").unwrap().is_empty());
     }
 
     /// The catalog columns must reach a database that predates them, and a

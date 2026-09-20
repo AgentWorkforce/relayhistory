@@ -325,7 +325,7 @@ read.
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – | – (never) | mtime-derived | ✓ | – | – | – | – | – | – |
-| **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
+| **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
@@ -336,7 +336,14 @@ Delegation is a separate capability, reported on every relationship result as
 |---|---|---|---|---|
 | **codex** | always | ✓ | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
-| **cursor**, **grok**, **opencode**, **relay** | never | – | – | – |
+| **grok** | sometimes | ✓ | ✓ | ✓ |
+| **cursor**, **opencode**, **relay** | never | – | – | – |
+
+Grok is `sometimes` for the same shape of reason: a `subagents/` metadata
+entry that records a child session id links to a child session in the normal
+sessions tree, and one that does not is stored as unlinked evidence. The id is
+never taken from the entry's file name. A `Task` call inside the transcript
+names no child at all. See ["grok"](#grok).
 
 Claude is `sometimes` because a subagent transcript carries the *parent's*
 `sessionId` on every record; the child's own identity is the per-child
@@ -368,9 +375,204 @@ How each adapter works:
   Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
   always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
   the project directory name.
-- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
-  both timestamps come from `summary.json`; the first prompt comes from the head
-  of `chat_history.jsonl`, skipping synthetic reminder turns.
+<a id="grok"></a>
+
+- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd` and
+  branch come from `summary.json`; the first prompt comes from the head of
+  `chat_history.jsonl`, skipping synthetic reminder turns; both activity
+  timestamps come from the first and last record of `updates.jsonl` when it is
+  there, and from `summary.json`'s `created_at` / `updated_at` when it is not.
+  Full hydration reads the whole directory — transcript, update stream,
+  signals, compaction checkpoints and subagent metadata. Details below.
+
+  ### What Grok writes, and where relayhistory reads it
+
+  A Grok Build session directory holds `summary.json`, `updates.jsonl`,
+  `chat_history.jsonl`, `system_prompt.txt`, `prompt_context.json`,
+  `tool_definitions.json`, `plan.json`, `rewind_points.jsonl`, `signals.json`
+  and `feedback.jsonl`, plus the directories `compaction_checkpoints/` and
+  `subagents/`. RelayHistory reads six of those and ignores the rest.
+
+  **`chat_history.jsonl` has the content; `updates.jsonl` has the time.** Grok's
+  own guide calls `updates.jsonl` "the authoritative conversation log that
+  drives `/resume`", and `chat_history.jsonl` carries no timestamps at all, so
+  the two are joined:
+
+  1. A record that carries its own `timestamp` uses it. The documented Grok
+     Build shape has none; an older layout does.
+  2. Tool calls and results join **by id** — `tool_calls[].id` and
+     `tool_result.tool_call_id` against `toolCallId` on a `tool_call` /
+     `tool_call_update` row. Exact.
+  3. Prose joins **by ordinal**: the *n*-th non-synthetic `user` record takes
+     the time of the *n*-th `user_message_chunk` group, and likewise
+     `assistant` prose against `agent_message_chunk` and `reasoning` summaries
+     against `agent_thought_chunk`. Consecutive rows of one kind are one group,
+     because Grok streams a message in chunks.
+  4. What is left takes its turn's `turnStartMs`, then the nearest preceding
+     record's time, then `summary.json`'s `created_at`. Every step below an
+     exact match is counted and reported as a `GROK_TIMESTAMP_FROM_TURN`
+     hydration diagnostic.
+
+  **No timestamp is derived from a record's position in the file.** Until this
+  landed, Grok prompt *n* was stamped `created_at + n` milliseconds: a
+  fabricated ordering, in a ledger whose value is that it does not fabricate.
+  A session with no update stream and no record timestamps now gives its
+  events the one time Grok did record, and says so, rather than spreading them
+  a millisecond apart.
+
+  ### Record shapes
+
+  | Field | Status | What RelayHistory does |
+  |---|---|---|
+  | `chat_history.jsonl` line = `{"type", "content"}` | **Corroborated** by Grok's own user guide and three independent adapters | One `session_events` row per record |
+  | types `system`, `user`, `assistant`, `tool_result`, `backend_tool_call`, `reasoning` | **Corroborated** | `user` → user/text + `history`; `assistant` → assistant/text; `reasoning` → assistant/thinking; `tool_result` → tool_result; `system` → a `system` marker |
+  | `user` prompt wrapped in `<user_query>…</user_query>` | **Corroborated** | Stripped, so the stored prompt is what the person typed |
+  | `synthetic_reason` on a `user` record | **Corroborated** | Kept out of `history` (unchanged) **and** out of `session_events`; recorded as a `synthetic_turn` marker carrying the reason, because nobody typed it |
+  | `assistant.model_id` | **Corroborated** | `session_events.model`, and `sessions.models_json` |
+  | `assistant.tool_calls[] = {id, name, arguments}` | **Corroborated**; explicitly *not* an OpenAI `function` wrapper | One assistant/tool_use event and one `tool_calls` row each, keyed on the provider's `id` |
+  | `tool_result = {tool_call_id, content}` | **Corroborated** | A tool_result event paired to the call by id |
+  | `tool_result.is_error` | **Inferred** — the failure signal is documented on the ACP `tool_call_update` `status` | Both are read; either marks `tool_calls.is_error` |
+  | `reasoning.summary` / `reasoning.encrypted_content` | **Corroborated** ("reasoning is encrypted_content") | The summary is the thinking text; an encrypted-only record becomes an `encrypted_reasoning` marker and is never given invented text |
+  | `updates.jsonl` envelope `{timestamp, method, params:{sessionId, update:{sessionUpdate,…}, _meta:{eventId, agentTimestampMs}}}` | **Corroborated** by three independent adapters | The timing source for the join; `eventId` also becomes the event's identity |
+  | envelope `method` `session/update` **or** `_x.ai/session/update` | **Corroborated** | Both read; the method is not required to be either |
+  | kinds `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `turn_completed`, `hook_execution`, `retry_state` | **Corroborated** | The first five and `turn_completed` are read; the rest are counted and reported as `GROK_UPDATES_ROWS_UNREAD` |
+  | `timestamp` in epoch **seconds**, `agentTimestampMs` in **milliseconds** | **Corroborated** | A field named `…Ms` is read as milliseconds; a bare `timestamp` is scaled if it is below 10¹² |
+  | `turnStartMs` | **Stated in [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)** from burn #489; not seen in a public sample | Read from `params.update`, `params._meta` or the envelope; the turn's fallback time |
+  | `turn_completed.totalTokens` | **Stated in #167**, and corroborated as a `turn_completed`-borne total | `token_json = {"context_total_tokens": n, "source": "updates.jsonl"}` on the turn's last assistant message |
+  | `turn_completed.usage.{inputTokens, outputTokens, cachedReadTokens, reasoningTokens, costUsdTicks, modelUsage}` | **Reported by two community adapters for recent builds**, and contradicted by #167's "Grok does not log per-turn input/output tokens" | **Not read.** See "Usage" below |
+  | `summary.json` `info.id`, `info.cwd`, `info.model`, `git_root_dir`, `head_branch`, `created_at`, `updated_at` | **Corroborated** | Identity, project, branch, model and the fallback timestamps |
+  | `summary.json` parent-session references for forked/restored sessions | **Corroborated** (named in the guide, field spelling unknown) | **Not read yet** — no field name to read |
+  | `signals.json` `contextTokensUsed`, `turnCount`, `compactionCount` | **Stated in #167**; the guide says the file holds "token usage and tool/turn counters" | A `signals` marker whose `detail_json` is the file verbatim |
+  | `prompt_context.json` | **Corroborated** ("inputs the system prompt was rendered from") | A `prompt_context` marker with the path, SHA-256 and size. The AGENTS.md body is never copied into the database |
+  | `compaction_checkpoints/<entry>` | **Corroborated** as a directory; the entry's own fields are **unverified** | One `compaction_boundary` marker per entry, timed from `created_at`/`timestamp`/`turnStartMs` or the entry's numeric file name, with the parsed file in `detail_json` |
+  | `subagents/<entry>` | **Corroborated** as "per-subagent metadata; child sessions live in the normal sessions tree"; the entry's own fields are **unverified** | One `session_relationships` row per entry, `evidence_kind = "grok_subagent_dir"` |
+  | `system_prompt.txt`, `tool_definitions.json`, `plan.json`, `rewind_points.jsonl`, `feedback.jsonl` | **Corroborated** as present | Not read |
+
+  Tool names observed by burn #489 are `Shell`, `Read`, `Write`,
+  `StrReplace`/`Edit`, `Grep`, `Glob`, `Task`, `WebSearch`/`WebFetch` and
+  `CallMcpTool`. `Write`, `StrReplace`, `Edit` and their snake_case and
+  `functions.`-namespaced spellings produce `file_edits` rows; the edit is
+  recorded when the call is made, as it is for Claude, so a call that later
+  failed is a `file_edits` row whose `tool_calls` row carries `is_error`.
+  `Shell` records only its command, so no file is attributed to it.
+
+  ### Usage: a context proxy, never billing
+
+  Grok logs **no per-turn input/output token counts** (burn #489). The one
+  token fact recorded here is `updates.jsonl`'s `totalTokens`, stored as
+  `{"context_total_tokens": n, "source": "updates.jsonl"}` so a consumer can
+  see both the number and what it is. It is a context-window snapshot: it
+  **decreases** after a compaction, and summing it across turns is meaningless.
+  Every Grok hydration therefore reports `GROK_USAGE_CONTEXT_PROXY_ONLY`,
+  present or not. Nothing here estimates tokens — that is burn's job, from its
+  own estimator and `xai` pricing.
+
+  Two community adapters report that recent Grok builds *do* write a
+  `turn_completed.usage` breakdown (`inputTokens`, `outputTokens`,
+  `cachedReadTokens`, `reasoningTokens`, `costUsdTicks`, `modelUsage`). That
+  contradicts #167, and neither claim was checked against a real session here,
+  so **nothing is read from it**: recording a number this repo cannot vouch for
+  is exactly the failure this parser exists to stop. Confirming it is the first
+  item on the checklist below.
+
+  ### Identity and re-reads
+
+  `chat_history.jsonl` writes no record id. An event that joined to an update
+  is keyed on that update's ACP `eventId` (`ev:<id>`), which survives the
+  rebuild Grok performs on a format upgrade; an event that did not is keyed on
+  its record index (`r<n>`), which does not. Tool calls and results are keyed
+  on the provider's own call id (`tool:<id>`, `result:<id>`). `history` is
+  rebuilt for the session on every read, because a prompt's identity includes
+  its timestamp and the timestamps the previous parser wrote were synthesized.
+
+  ### Delegation
+
+  `relationship_capabilities("grok").stableChildIdentity` is **`sometimes`**,
+  for the same reason as Claude's: a `subagents/` entry that records a child
+  session id is a linked delegation, and the child session lives in the normal
+  sessions tree; one that does not is stored as unlinked evidence, and the
+  child id is never taken from the file name. A `Task`-style call in the
+  transcript names no child at all — it is a `tool_calls` row, reported as
+  `GROK_SUBAGENT_SPAWN_UNLINKED`, and it never invents a relationship row.
+
+  ### Verification status
+
+  Grok was **not installed** on the machine this adapter was written on, so no
+  real `~/.grok/sessions/**` directory was read. The fixtures under
+  `crates/ai-hist/tests/fixtures/grok/` reproduce the shapes the sources below
+  describe. Everything marked **Corroborated** above is stated by at least one
+  source that read a real session; everything marked **Stated in #167** comes
+  from burn #489's format research, which this repo did not re-derive;
+  everything marked **unverified** is a shape nobody public has published.
+
+  A maintainer with Grok Build installed can confirm or correct all of it in a
+  few minutes:
+
+  ```sh
+  S=~/.grok/sessions/<encoded-cwd>/<session-id>
+
+  # 1. Which record types and fields chat_history.jsonl really writes.
+  jq -r '.type' "$S/chat_history.jsonl" | sort | uniq -c
+  jq -r 'to_entries[].key' "$S/chat_history.jsonl" | sort | uniq -c
+  # 2. Tool calls: {id, name, arguments}, or something else?
+  jq -c 'select(.tool_calls) | .tool_calls[0]' "$S/chat_history.jsonl" | head -3
+  # 3. Does a tool_result carry is_error?
+  jq -c 'select(.type=="tool_result") | {keys: keys}' "$S/chat_history.jsonl" | head -3
+  # 4. Which sessionUpdate kinds the stream carries, and how often.
+  jq -r '.params.update.sessionUpdate' "$S/updates.jsonl" | sort | uniq -c
+  # 5. Does turnStartMs exist, and where?
+  jq -c 'select(.params._meta.turnStartMs or .params.update.turnStartMs) | {meta: .params._meta, update: .params.update}' "$S/updates.jsonl" | head -2
+  # 6. THE IMPORTANT ONE: what a turn_completed actually carries.
+  jq -c 'select(.params.update.sessionUpdate=="turn_completed") | .params.update' "$S/updates.jsonl" | head -3
+  #    If that prints inputTokens/outputTokens, this repo is under-recording
+  #    usage on purpose and issue #167 needs correcting — say so there.
+  # 7. What signals.json, a compaction checkpoint and a subagent entry hold.
+  jq -c . "$S/signals.json"
+  jq -c . "$S/compaction_checkpoints/"* | head -2
+  jq -c . "$S/subagents/"* | head -2
+  # 8. Does summary.json name a parent for a forked or restored session?
+  jq -c 'with_entries(select(.key|test("parent|fork|restore";"i")))' "$S/summary.json"
+  ```
+
+  Sources consulted (all public, September 2026):
+
+  - [`xai-org/grok-build`, `docs/user-guide/17-sessions.md`](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/17-sessions.md)
+    — the vendor's own description of the session directory: every file name
+    above, `updates.jsonl` as "the authoritative conversation log that drives
+    `/resume`", `prompt_context.json` as "inputs the system prompt was rendered
+    from", `signals.json` as "token usage and tool/turn counters",
+    `subagents/` as "per-subagent metadata; child sessions live in the normal
+    sessions tree", and "per-turn token and cost totals are available through
+    `grok usage`".
+  - [tenequm/pond #171](https://github.com/tenequm/pond/issues/171) — an
+    adapter built on `updates.jsonl` *because* `chat_history.jsonl` "lacks
+    per-row timestamps and undergoes in-place rebuilds"; the envelope shape,
+    the chunk-coalescing rule, and correlating tool calls by ACP id.
+  - [DrazThan/hermon #105](https://github.com/DrazThan/hermon/issues/105) —
+    `tool_calls` as `{id, name, arguments}` "not OpenAI-style wrappers",
+    `tool_result` as `{type, tool_call_id, content}`, and percent-decoded
+    project directories.
+  - [ferraroroberto/app-launcher #1012](https://github.com/ferraroroberto/app-launcher/issues/1012)
+    — the envelope verbatim, both `method` spellings, and the kind list
+    `user_message_chunk` / `agent_thought_chunk` / `agent_message_chunk` /
+    `turn_completed` / `hook_execution`.
+  - [princess-pi/wtft #184](https://github.com/princess-pi/wtft/issues/184) —
+    `updates.jsonl` as the authoritative parse source, one turn spanning many
+    events, and `costUsdTicks` at 10¹⁰ ticks per USD.
+  - [telemetry-dev/stats #8](https://github.com/telemetry-dev/stats/pull/8) and
+    [BrokkAi/mjolnir #989](https://github.com/BrokkAi/mjolnir/issues/989) — the
+    `turn_completed.usage` breakdown recent builds are reported to write. Read
+    here as a **contradiction to resolve**, not as a licence to record tokens.
+  - [paperboytm/spool #512](https://github.com/paperboytm/spool/issues/512) and
+    [Ishannaik/agent-sweep #219](https://github.com/Ishannaik/agent-sweep/pull/219)
+    — independent confirmation of the directory layout and of
+    `{type, content}` records, the latter verified against a real Windows
+    install.
+  - [AgentWorkforce/burn #489](https://github.com/AgentWorkforce/burn/issues/489),
+    via [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) — the
+    original format research: no per-turn `input_tokens`/`output_tokens`, a
+    `totalTokens` context proxy that decreases on compaction, the models
+    `grok-composer-2.5-fast` and `grok-build`, and the tool-name list.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
   `~/.local/share/opencode/opencode.db`). Discovery opens the live store with
   SQLite read-only and `query_only` enforcement, then holds one deferred read
@@ -475,7 +677,7 @@ Each connector presence stores a `source_stamp` —
 | Source | Change marker |
 |---|---|
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
-| grok | the chat file's marker, `\|`, the `summary.json` marker |
+| grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker |
 | opencode | `{database identity}:{schema version}:{time_created}:{time_updated}` |
 | relay | `{newest synced timestamp}:{synced row count}` |
 

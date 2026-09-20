@@ -1,0 +1,13 @@
+{
+  "info": {
+    "id": "grok-evt-0001",
+    "cwd": "/tmp/demo",
+    "model": "grok-4-build"
+  },
+  "git_root_dir": "/tmp/demo",
+  "head_branch": "feat/http-retry",
+  "created_at": "2026-09-16T12:00:00.000Z",
+  "updated_at": "2026-09-16T12:02:18.000Z",
+  "title": "add a retry to the http client",
+  "message_count": 17
+}

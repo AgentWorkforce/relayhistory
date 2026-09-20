@@ -863,6 +863,70 @@ fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
     );
 }
 
+/// `summary.json` says when the session was opened and last touched;
+/// `updates.jsonl` says when it actually did things. The stream wins, and a
+/// session restored from a checkpoint — whose `created_at` predates its own
+/// first event — is the case that makes the difference visible.
+#[test]
+fn grok_activity_comes_from_the_update_stream_when_there_is_one() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-stream",
+        r#"{"info":{"id":"grok-stream","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:30:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-stream/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789560138,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":9210},"_meta":{"agentTimestampMs":1789560138000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-stream");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_560_138_000));
+}
+
+/// A session whose update stream grew has new evidence even when the
+/// transcript is byte-identical, so the change stamp has to cover it.
+#[test]
+fn grok_rescan_sees_a_grown_update_stream() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-grow",
+        r#"{"info":{"id":"grok-grow","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"hey\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-grow/updates.jsonl");
+    write(&updates, "{}\n");
+    set_mtime(&updates, 1_750_000_500_000);
+    discover(&conn, home.path(), &only(&["grok"]));
+
+    write(&updates, "{}\n{}\n");
+    set_mtime(&updates, 1_750_000_900_000);
+    let second = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(second.summary.skipped_unchanged, 0);
+    assert_eq!(second.summary.counters.shallow_reads, 1);
+}
+
 #[test]
 fn grok_rescan_is_stamp_guarded() {
     let conn = catalog();

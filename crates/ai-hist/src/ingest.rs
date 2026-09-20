@@ -1,7 +1,7 @@
 use crate::{
-    default_db_path, insert_history, now_ms, open_db, open_db_readonly, parse_cursor_text,
-    prompt_hash, schema_is_catalog_read_current, sync_opencode_db, sync_opencode_session,
-    HistoryEntry, SessionLocation, SessionScope,
+    default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
+    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
+    sync_opencode_session, HistoryEntry, SessionLocation, SessionMarker, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) mod codex;
+pub(crate) mod grok;
 pub(crate) mod hydrate;
 
 use crate::diagnostics::*;
@@ -773,7 +774,21 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
     ("codex_rollouts_v3", "codex_rollouts_v5"),
     ("codex_rollouts_v4", "codex_rollouts_v5"),
+    ("grok_sessions", GROK_SYNC_STATE_KEY),
 ];
+
+/// Where plain `sync` remembers the change stamp of each Grok session
+/// directory it has already read.
+///
+/// Renaming the key is how a session that has not changed on disk gets re-read
+/// after a parser upgrade: the old map is retired, every session directory
+/// looks unseen again, and sessions that only ever produced prompts are
+/// re-indexed into `session_events`, `tool_calls`, `file_edits`,
+/// `session_markers` and `session_relationships` — with the timestamps
+/// `updates.jsonl` recorded, in place of the synthesized ones the previous
+/// parser wrote. Bumping `HYDRATION_PARSER_VERSION` alone only repairs
+/// sessions somebody hydrates by name.
+const GROK_SYNC_STATE_KEY: &str = "grok_events_v1";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -3964,7 +3979,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         return Ok(0);
     }
     let mut grok_state = state
-        .get("grok_sessions")
+        .get(GROK_SYNC_STATE_KEY)
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -3982,7 +3997,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
-                inserted += ingest_grok_session(conn, &session, &raw_path)?;
+                inserted += ingest_grok_session(conn, &session, &raw_path)?.prompts;
                 sessions += 1;
                 grok_state.insert(key, json!(stamp));
             }
@@ -3992,7 +4007,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             Err(_) => errors += 1,
         }
     }
-    state.insert("grok_sessions".to_string(), Value::Object(grok_state));
+    state.insert(GROK_SYNC_STATE_KEY.to_string(), Value::Object(grok_state));
     if scanned > 0 {
         let suffix = if errors > 0 {
             format!(" ({errors} errors)")
@@ -4004,45 +4019,627 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     Ok(inserted)
 }
 
-fn ingest_grok_session(conn: &Connection, session: &GrokSession, raw_path: &str) -> Result<usize> {
+/// What indexing one Grok session directory produced, and what its own records
+/// could not establish.
+///
+/// The fallback counters are not diagnostics of *this* run: they are how many
+/// facts Grok did not write down, which is what a caller has to be told before
+/// it trusts a timestamp.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GrokIngestOutcome {
+    pub prompts: usize,
+    pub events: usize,
+    pub tool_calls: usize,
+    pub file_edits: usize,
+    pub markers: usize,
+    pub relationships: usize,
+    /// Subagent metadata files that named no child session id.
+    pub unlinked_subagents: usize,
+    /// `Task`-style calls in the transcript. Grok names no child in the call
+    /// itself, so these produce a tool call and never a relationship row.
+    pub subagent_calls: usize,
+    /// Records whose time came from their turn's `turnStartMs`.
+    pub turn_start_fallbacks: usize,
+    /// Records that inherited the previous record's time.
+    pub inherited_fallbacks: usize,
+    /// Records stamped with the session's `created_at`.
+    pub session_start_fallbacks: usize,
+    pub encrypted_reasoning: usize,
+    pub unread_update_rows: usize,
+    /// The session directory had no readable `updates.jsonl`.
+    pub missing_updates: bool,
+    /// The newest `turn_completed` context snapshot, for the caller's report.
+    pub context_total_tokens: Option<i64>,
+}
+
+/// Index one Grok session directory: prompts, events, tools, edits, markers
+/// and subagent delegations.
+fn ingest_grok_session(
+    conn: &Connection,
+    session: &GrokSession,
+    raw_path: &str,
+) -> Result<GrokIngestOutcome> {
+    const SOURCE: &str = "grok";
+    let sid = session.session_id.as_str();
+    let project = session.cwd.as_deref();
+    let branch = session.git_branch.as_deref();
+    // A prompt's identity is `(source, timestamp_ms, prompt)` and every Grok
+    // prompt written before this parser carried a timestamp synthesized as
+    // `created_at + index`. Merging into those rows would keep the fabricated
+    // ones forever, so the session's prompts are rebuilt from the file.
+    conn.execute(
+        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
+        params![sid],
+    )?;
+    let mut outcome = GrokIngestOutcome {
+        missing_updates: session.updates.is_empty(),
+        unread_update_rows: session.updates.unread_rows,
+        context_total_tokens: session
+            .updates
+            .turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.total_tokens),
+        ..Default::default()
+    };
+
+    let mut user_ordinal = 0usize;
+    let mut message_ordinal = 0usize;
+    let mut thought_ordinal = 0usize;
+    // Chat-side turn index: `None` until the first typed prompt, because the
+    // system preamble belongs to no turn.
+    let mut turn: Option<usize> = None;
+    let mut inherited: Option<i64> = None;
+    // The last assistant prose event of each turn, which is where that turn's
+    // context-token snapshot is recorded.
+    let mut turn_tail: HashMap<usize, String> = HashMap::new();
+
+    for (idx, line) in session.lines.iter().enumerate() {
+        let turn_start = turn
+            .and_then(|turn| session.updates.turns.get(turn))
+            .and_then(|timing| timing.start_ms);
+        match &line.record {
+            grok::GrokRecord::System { text } => {
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    None,
+                    turn_start,
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                outcome.markers += insert_session_marker(
+                    conn,
+                    &SessionMarker {
+                        source: SOURCE.into(),
+                        session_id: sid.to_string(),
+                        marker_uid: format!("r{idx}"),
+                        kind: "system".into(),
+                        ts_ms: Some(ts),
+                        text: text.as_deref().map(truncate_marker_text),
+                        detail_json: None,
+                    },
+                )?;
+            }
+            grok::GrokRecord::User { text, synthetic } => {
+                let Some(text) = text else { continue };
+                if *synthetic {
+                    // Grok injected this turn; nobody typed it. Recording it as
+                    // a user message would put words in a person's mouth, so it
+                    // is kept as a marker carrying the reason Grok gave.
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        None,
+                        turn_start,
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    outcome.markers += insert_session_marker(
+                        conn,
+                        &SessionMarker {
+                            source: SOURCE.into(),
+                            session_id: sid.to_string(),
+                            marker_uid: format!("r{idx}"),
+                            kind: "synthetic_turn".into(),
+                            ts_ms: Some(ts),
+                            text: Some(truncate_marker_text(text)),
+                            detail_json: session
+                                .synthetic_reasons
+                                .get(&idx)
+                                .map(|reason| json!({ "synthetic_reason": reason }).to_string()),
+                        },
+                    )?;
+                    continue;
+                }
+                let group = session.updates.user_messages.get(user_ordinal);
+                user_ordinal += 1;
+                // `updates.jsonl` numbers the turns; the chat-side counter is
+                // only the fallback for a session whose stream is missing.
+                turn =
+                    Some(group.map_or_else(|| turn.map_or(0, |turn| turn + 1), |group| group.turn));
+                let turn_start = turn
+                    .and_then(|turn| session.updates.turns.get(turn))
+                    .and_then(|timing| timing.start_ms);
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    group.and_then(|group| group.ts_ms),
+                    turn_start,
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "user",
+                    "text",
+                    Some(text),
+                    None,
+                    None,
+                    &uid,
+                )?;
+                outcome.events += 1;
+                outcome.prompts += insert_history(
+                    conn,
+                    &HistoryEntry {
+                        id: 0,
+                        source: SOURCE.into(),
+                        session_id: Some(sid.to_string()),
+                        project: session.cwd.clone(),
+                        prompt_hash: Some(prompt_hash(text)),
+                        prompt: text.clone(),
+                        timestamp_ms: ts,
+                    },
+                )?;
+            }
+            grok::GrokRecord::Reasoning { summary, encrypted } => {
+                let Some(summary) = summary else {
+                    if *encrypted {
+                        // The trace exists but is opaque. Recording the fact
+                        // that Grok thought here is honest; inventing readable
+                        // thinking for it would not be.
+                        outcome.encrypted_reasoning += 1;
+                        let ts = resolve_grok_ts(
+                            line.ts_ms,
+                            None,
+                            turn_start,
+                            inherited,
+                            session.created_ms,
+                            &mut outcome,
+                        );
+                        outcome.markers += insert_session_marker(
+                            conn,
+                            &SessionMarker {
+                                source: SOURCE.into(),
+                                session_id: sid.to_string(),
+                                marker_uid: format!("r{idx}"),
+                                kind: "encrypted_reasoning".into(),
+                                ts_ms: Some(ts),
+                                text: None,
+                                detail_json: None,
+                            },
+                        )?;
+                    }
+                    continue;
+                };
+                let group = session.updates.agent_thoughts.get(thought_ordinal);
+                thought_ordinal += 1;
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    group.and_then(|group| group.ts_ms),
+                    turn_start,
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "assistant",
+                    "thinking",
+                    Some(summary),
+                    None,
+                    None,
+                    &uid,
+                )?;
+                outcome.events += 1;
+            }
+            grok::GrokRecord::Assistant { text, model, calls } => {
+                if let Some(text) = text {
+                    let group = session.updates.agent_messages.get(message_ordinal);
+                    message_ordinal += 1;
+                    if let Some(group) = group {
+                        turn = Some(group.turn);
+                    }
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        group.and_then(|group| group.ts_ms),
+                        turn_start,
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    inherited = Some(ts);
+                    let uid =
+                        grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        branch,
+                        &uid,
+                        None,
+                        ts,
+                        "assistant",
+                        "text",
+                        Some(text),
+                        model.as_deref(),
+                        None,
+                        &uid,
+                    )?;
+                    outcome.events += 1;
+                    if let Some(turn) = turn {
+                        turn_tail.insert(turn, uid);
+                    }
+                }
+                for (nth, call) in calls.iter().enumerate() {
+                    let tool_use_id = call.id.clone().unwrap_or_else(|| format!("r{idx}:t{nth}"));
+                    let timing = session.updates.tools.get(&tool_use_id);
+                    let ts = resolve_grok_ts(
+                        line.ts_ms,
+                        timing.and_then(|timing| timing.started_ms),
+                        turn_start,
+                        inherited,
+                        session.created_ms,
+                        &mut outcome,
+                    );
+                    inherited = Some(ts);
+                    let target = grok::pick_tool_target(&call.name, &call.arguments);
+                    let uid = format!("tool:{tool_use_id}");
+                    insert_session_event(
+                        conn,
+                        SOURCE,
+                        sid,
+                        project,
+                        project,
+                        branch,
+                        &uid,
+                        None,
+                        ts,
+                        "assistant",
+                        "tool_use",
+                        Some(&format_tool_event_text(
+                            &call.name,
+                            target.as_deref(),
+                            &call.arguments,
+                        )),
+                        model.as_deref(),
+                        None,
+                        &uid,
+                    )?;
+                    outcome.events += 1;
+                    insert_tool_call(
+                        conn,
+                        SOURCE,
+                        sid,
+                        &uid,
+                        &tool_use_id,
+                        &call.name,
+                        target.as_deref(),
+                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        None,
+                        ts,
+                    )?;
+                    outcome.tool_calls += 1;
+                    if grok::is_subagent_tool(&call.name) {
+                        outcome.subagent_calls += 1;
+                    }
+                    if grok::is_file_edit_tool(&call.name) {
+                        if let Some(path) = target.as_deref() {
+                            upsert_file_edit_from_call(
+                                conn,
+                                SOURCE,
+                                sid,
+                                &uid,
+                                &tool_use_id,
+                                path,
+                                &call.name,
+                                ts,
+                                branch,
+                                project,
+                            )?;
+                            outcome.file_edits += 1;
+                        }
+                    }
+                }
+            }
+            grok::GrokRecord::ToolResult {
+                call_id,
+                text,
+                is_error,
+            } => {
+                let tool_use_id = call_id.clone().unwrap_or_else(|| format!("r{idx}:result"));
+                let timing = session.updates.tools.get(&tool_use_id);
+                let ts = resolve_grok_ts(
+                    line.ts_ms,
+                    timing.and_then(|timing| timing.finished_ms),
+                    turn_start,
+                    inherited,
+                    session.created_ms,
+                    &mut outcome,
+                );
+                inherited = Some(ts);
+                // Grok records failure in two places and neither is always
+                // present: the result's own `is_error`, and the terminal
+                // `status` on the tool call's last ACP update.
+                let failed = is_error.unwrap_or(false)
+                    || timing
+                        .and_then(|timing| timing.status.as_deref())
+                        .is_some_and(|status| {
+                            matches!(status, "failed" | "error" | "cancelled" | "canceled")
+                        });
+                let uid = format!("result:{tool_use_id}");
+                insert_session_event(
+                    conn,
+                    SOURCE,
+                    sid,
+                    project,
+                    project,
+                    branch,
+                    &uid,
+                    None,
+                    ts,
+                    "tool_result",
+                    "tool_result",
+                    text.as_deref(),
+                    None,
+                    None,
+                    &uid,
+                )?;
+                outcome.events += 1;
+                if failed || is_error.is_some() {
+                    set_tool_call_error(conn, SOURCE, sid, &tool_use_id, failed)?;
+                }
+            }
+            grok::GrokRecord::Other => {}
+        }
+    }
+
+    // The context-token proxy, on the turn's final assistant message. It is
+    // stored with its source named so a consumer can see that it is a context
+    // snapshot and not billed usage: Grok logs no per-turn input/output token
+    // counts, and none are estimated here.
+    for (turn, timing) in session.updates.turns.iter().enumerate() {
+        let (Some(total), Some(uid)) = (timing.total_tokens, turn_tail.get(&turn)) else {
+            continue;
+        };
+        let token_json = json!({
+            "context_total_tokens": total,
+            "source": "updates.jsonl",
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE session_events SET token_json = ? \
+             WHERE source = 'grok' AND session_id = ? AND event_uid = ?",
+            params![token_json, sid, uid],
+        )?;
+    }
+
+    ingest_grok_session_extras(conn, session, &mut outcome)?;
+
     upsert_session(
         conn,
-        &session.session_id,
-        "grok",
-        session.cwd.as_deref(),
-        session.git_branch.as_deref(),
+        sid,
+        SOURCE,
+        project,
+        branch,
         session.first_ts,
         session.last_ts,
         session.last_assistant_text.as_deref(),
         Some(raw_path),
     )?;
-    let mut inserted = 0;
-    for (idx, prompt) in session.prompts.iter().enumerate() {
-        inserted += insert_history(
+    if !session.models.is_empty() {
+        conn.execute(
+            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
+            params![
+                serde_json::to_string(&session.models).unwrap_or_default(),
+                sid
+            ],
+        )?;
+    }
+    Ok(outcome)
+}
+
+/// The session-level files beside the transcript: `signals.json`,
+/// `prompt_context.json`, `compaction_checkpoints/` and `subagents/`.
+fn ingest_grok_session_extras(
+    conn: &Connection,
+    session: &GrokSession,
+    outcome: &mut GrokIngestOutcome,
+) -> Result<()> {
+    const SOURCE: &str = "grok";
+    let sid = session.session_id.as_str();
+    if let Some(signals) = &session.signals {
+        outcome.markers += insert_session_marker(
             conn,
-            &HistoryEntry {
-                id: 0,
-                source: "grok".into(),
-                session_id: Some(session.session_id.clone()),
-                project: session.cwd.clone(),
-                prompt_hash: Some(prompt_hash(prompt)),
-                prompt: prompt.clone(),
-                timestamp_ms: session.first_ts + idx as i64,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: "signals".into(),
+                kind: "signals".into(),
+                ts_ms: session.updates.last_ms.or(Some(session.last_ts)),
+                text: Some(grok_signals_summary(signals)),
+                detail_json: Some(Value::Object(signals.raw.clone()).to_string()),
             },
         )?;
     }
-    Ok(inserted)
+    // The AGENTS.md snapshot itself is not copied into the database: it is the
+    // project's file, not session evidence. Its path and content hash are, so
+    // a later consumer can tell whether two sessions ran with the same
+    // instructions.
+    if let Some(context) = &session.prompt_context {
+        outcome.markers += insert_session_marker(
+            conn,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: "prompt_context".into(),
+                kind: "prompt_context".into(),
+                ts_ms: None,
+                text: Some(context.path.clone()),
+                detail_json: Some(
+                    json!({
+                        "path": context.path,
+                        "sha256": context.sha256,
+                        "bytes": context.bytes,
+                    })
+                    .to_string(),
+                ),
+            },
+        )?;
+    }
+    for checkpoint in &session.compactions {
+        outcome.markers += insert_session_marker(
+            conn,
+            &SessionMarker {
+                source: SOURCE.into(),
+                session_id: sid.to_string(),
+                marker_uid: format!("compaction:{}", checkpoint.name),
+                kind: "compaction_boundary".into(),
+                ts_ms: checkpoint.ts_ms,
+                text: Some(checkpoint.locator.clone()),
+                detail_json: checkpoint.detail_json.clone(),
+            },
+        )?;
+    }
+    for subagent in &session.subagents {
+        if subagent.metadata.child_session_id.is_none() {
+            outcome.unlinked_subagents += 1;
+        }
+        record_relationship(
+            conn,
+            &ObservedRelationship {
+                source: SOURCE,
+                parent_session_id: sid,
+                child_session_id: subagent.metadata.child_session_id.as_deref(),
+                relationship: "delegated",
+                child_agent_type: subagent.metadata.agent_type.as_deref(),
+                child_agent_name: subagent.metadata.agent_name.as_deref(),
+                child_model: subagent.metadata.model.as_deref(),
+                spawn_depth: Some(1),
+                evidence_kind: "grok_subagent_dir",
+                evidence_locator: Some(&subagent.locator),
+                evidence_ref: None,
+                child_has_events: false,
+                spawned_at_ms: subagent.metadata.spawned_at_ms,
+            },
+        )?;
+        outcome.relationships += 1;
+    }
+    Ok(())
+}
+
+/// The counters `signals.json` records, as one readable line. The file's own
+/// object is kept verbatim in the marker's `detail_json`; this is the part a
+/// person reads.
+fn grok_signals_summary(signals: &grok::GrokSignals) -> String {
+    let mut parts = Vec::new();
+    if let Some(turns) = signals.turn_count {
+        parts.push(format!("turns={turns}"));
+    }
+    if let Some(compactions) = signals.compaction_count {
+        parts.push(format!("compactions={compactions}"));
+    }
+    if let Some(tokens) = signals.context_tokens_used {
+        parts.push(format!("context_tokens_used={tokens}"));
+    }
+    parts.join(" ")
+}
+
+/// Where one record's timestamp came from, counting every step below an exact
+/// match so the caller can report how much of the timeline Grok did not write.
+fn resolve_grok_ts(
+    own: Option<i64>,
+    matched: Option<i64>,
+    turn_start: Option<i64>,
+    inherited: Option<i64>,
+    session_start: i64,
+    outcome: &mut GrokIngestOutcome,
+) -> i64 {
+    if let Some(ts) = own.or(matched) {
+        return ts;
+    }
+    if let Some(ts) = turn_start {
+        outcome.turn_start_fallbacks += 1;
+        return ts;
+    }
+    if let Some(ts) = inherited {
+        outcome.inherited_fallbacks += 1;
+        return ts;
+    }
+    outcome.session_start_fallbacks += 1;
+    session_start
+}
+
+/// A record's event identity: the ACP `eventId` of the update it joined to
+/// when there is one, and its position in `chat_history.jsonl` otherwise.
+///
+/// `chat_history.jsonl` writes no record id at all, so without the join the
+/// only identity available is positional. Grok rebuilds that file on a format
+/// upgrade, which renumbers it; an `eventId` survives that, which is why it is
+/// preferred.
+fn grok_event_uid(event_id: Option<&str>, index: usize) -> String {
+    match event_id {
+        Some(id) => format!("ev:{id}"),
+        None => format!("r{index}"),
+    }
+}
+
+/// Markers carry an excerpt, not a transcript: the full text is already in the
+/// file the marker's session points at.
+fn truncate_marker_text(text: &str) -> String {
+    text.chars().take(512).collect()
 }
 
 fn grok_session_stamp(chat: &Path) -> Result<String> {
     let mut stamp = file_stamp(chat)?;
-    let summary = chat.with_file_name("summary.json");
-    if summary.exists() {
-        stamp.push('|');
-        stamp.push_str(&file_stamp(&summary)?);
+    for sibling in GROK_STAMPED_SIBLINGS {
+        let path = chat.with_file_name(sibling);
+        if path.exists() {
+            stamp.push('|');
+            stamp.push_str(&file_stamp(&path)?);
+        }
     }
     Ok(stamp)
 }
+
+/// The files beside `chat_history.jsonl` whose change has to re-trigger a
+/// read. `updates.jsonl` is here because it carries every timestamp: a session
+/// whose transcript is unchanged but whose update stream grew still has new
+/// evidence.
+const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
 
 /// [`grok_session_stamp`] plus the recency hint, with one stat per file.
 pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
@@ -4053,21 +4650,65 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
         chat.display()
     );
     let mut stamp = stamp_of(&metadata);
-    if let Ok(summary) = chat.with_file_name("summary.json").metadata() {
+    let mut modified = modified_ms_of(&metadata);
+    for sibling in GROK_STAMPED_SIBLINGS {
+        let Ok(sibling) = chat.with_file_name(sibling).metadata() else {
+            continue;
+        };
         stamp.push('|');
-        stamp.push_str(&stamp_of(&summary));
+        stamp.push_str(&stamp_of(&sibling));
+        // `updates.jsonl` is appended on every turn, so it — not the
+        // transcript — is usually the freshest signal of activity.
+        if let (Some(current), Some(other)) = (modified, modified_ms_of(&sibling)) {
+            modified = Some(current.max(other));
+        }
     }
-    Ok((stamp, modified_ms_of(&metadata)))
+    Ok((stamp, modified))
 }
 
+/// One `compaction_checkpoints/` entry.
+struct GrokCompaction {
+    /// The entry's file name, which is its identity within the session.
+    name: String,
+    locator: String,
+    ts_ms: Option<i64>,
+    detail_json: Option<String>,
+}
+
+/// One `subagents/` entry.
+struct GrokSubagentEvidence {
+    locator: String,
+    metadata: grok::GrokSubagent,
+}
+
+/// The `prompt_context.json` Grok rendered the system prompt from, identified
+/// rather than copied.
+struct GrokPromptContext {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+/// One Grok session directory, read.
 struct GrokSession {
     session_id: String,
     cwd: Option<String>,
     git_branch: Option<String>,
     first_ts: i64,
     last_ts: i64,
+    /// `summary.json`'s `created_at`, the last-resort timestamp.
+    created_ms: i64,
     last_assistant_text: Option<String>,
-    prompts: Vec<String>,
+    models: Vec<String>,
+    lines: Vec<grok::GrokChatLine>,
+    /// `synthetic_reason` by record index, kept out of the parsed record so
+    /// the record enum stays about content.
+    synthetic_reasons: HashMap<usize, String>,
+    updates: grok::GrokUpdates,
+    signals: Option<grok::GrokSignals>,
+    prompt_context: Option<GrokPromptContext>,
+    compactions: Vec<GrokCompaction>,
+    subagents: Vec<GrokSubagentEvidence>,
 }
 
 fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
@@ -4084,6 +4725,9 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback_session)
         .to_string();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
     let cwd = summary
         .as_ref()
         .and_then(|s| s.pointer("/info/cwd").or_else(|| s.get("git_root_dir")))
@@ -4109,38 +4753,177 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .and_then(parse_iso_ms)
         .unwrap_or(created_ms);
 
-    let mut prompts = Vec::new();
+    let updates = match fs::read_to_string(chat.with_file_name("updates.jsonl")) {
+        Ok(contents) => grok::parse_updates(&contents),
+        Err(_) => grok::GrokUpdates::default(),
+    };
+
+    let mut lines = Vec::new();
+    let mut synthetic_reasons = HashMap::new();
     let mut last_assistant_text = None;
+    let mut models: Vec<String> = Vec::new();
     let contents = fs::read_to_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(text) = grok_chat_text(&value, "user") {
-            prompts.push(text);
+        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
+            synthetic_reasons.insert(lines.len(), reason.to_string());
         }
-        if let Some(text) = grok_chat_text(&value, "assistant") {
-            last_assistant_text = Some(text.chars().take(4096).collect());
+        let parsed = grok::parse_chat_record(&value);
+        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
+            if let Some(text) = text {
+                last_assistant_text = Some(text.chars().take(4096).collect::<String>());
+            }
+            if let Some(model) = model {
+                if !models.iter().any(|seen| seen == model) {
+                    models.push(model.clone());
+                }
+            }
+        }
+        lines.push(parsed);
+    }
+    if models.is_empty() {
+        if let Some(model) = summary
+            .as_ref()
+            .and_then(|s| s.pointer("/info/model").or_else(|| s.get("model")))
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            models.push(model.to_string());
         }
     }
-    if session_id.is_empty() {
-        return Ok(None);
-    }
-    let last_ts = if prompts.is_empty() {
-        updated_ms
-    } else {
-        created_ms + prompts.len() as i64 - 1
-    };
+
+    let directory = chat.parent().map(Path::to_path_buf);
+    let signals = directory
+        .as_deref()
+        .and_then(|dir| read_json_file(&dir.join("signals.json")))
+        .as_ref()
+        .map(grok::parse_signals);
+    let prompt_context = directory
+        .as_deref()
+        .and_then(|dir| read_grok_prompt_context(&dir.join("prompt_context.json")));
+    let compactions = directory
+        .as_deref()
+        .map(|dir| read_grok_compactions(&dir.join("compaction_checkpoints")))
+        .unwrap_or_default();
+    let subagents = directory
+        .as_deref()
+        .map(|dir| read_grok_subagents(&dir.join("subagents")))
+        .unwrap_or_default();
+
+    // Real recorded times first, in this order: the update stream, then any
+    // timestamp the transcript's own records carried, then `summary.json`.
+    // Nothing here is derived from a record's position in the file.
+    let record_times: Vec<i64> = lines.iter().filter_map(|line| line.ts_ms).collect();
+    let first_ts = updates
+        .first_ms
+        .or_else(|| record_times.iter().copied().min())
+        .unwrap_or(created_ms);
+    let last_ts = updates
+        .last_ms
+        .or_else(|| record_times.iter().copied().max())
+        .unwrap_or(updated_ms)
+        .max(first_ts);
+
     Ok(Some(GrokSession {
         session_id,
         cwd,
         git_branch,
-        first_ts: created_ms,
+        first_ts,
         last_ts,
+        created_ms,
         last_assistant_text,
-        prompts,
+        models,
+        lines,
+        synthetic_reasons,
+        updates,
+        signals,
+        prompt_context,
+        compactions,
+        subagents,
     }))
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Identify `prompt_context.json` without copying it: the path, its SHA-256
+/// and its size are enough to tell two sessions' instruction snapshots apart.
+fn read_grok_prompt_context(path: &Path) -> Option<GrokPromptContext> {
+    let contents = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&contents);
+    Some(GrokPromptContext {
+        path: path.to_string_lossy().to_string(),
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: contents.len() as u64,
+    })
+}
+
+/// Every readable entry in `compaction_checkpoints/`, oldest name first.
+///
+/// An entry that parses as nothing is still a compaction: the directory entry
+/// itself is the evidence, so the marker is written with no detail rather than
+/// dropped.
+fn read_grok_compactions(dir: &Path) -> Vec<GrokCompaction> {
+    let mut checkpoints: Vec<GrokCompaction> = read_dir_files(dir)
+        .into_iter()
+        .map(|path| {
+            let parsed = read_json_file(&path);
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            GrokCompaction {
+                ts_ms: parsed
+                    .as_ref()
+                    .and_then(grok::compaction_timestamp_ms)
+                    .or_else(|| timestamp_from_name(&name)),
+                detail_json: parsed.as_ref().map(ToString::to_string),
+                locator: path.to_string_lossy().to_string(),
+                name,
+            }
+        })
+        .collect();
+    checkpoints.sort_by(|left, right| left.name.cmp(&right.name));
+    checkpoints
+}
+
+/// Every readable entry in `subagents/`.
+fn read_grok_subagents(dir: &Path) -> Vec<GrokSubagentEvidence> {
+    let mut found: Vec<GrokSubagentEvidence> = read_dir_files(dir)
+        .into_iter()
+        .map(|path| GrokSubagentEvidence {
+            metadata: read_json_file(&path)
+                .as_ref()
+                .map(grok::parse_subagent)
+                .unwrap_or_default(),
+            locator: path.to_string_lossy().to_string(),
+        })
+        .collect();
+    found.sort_by(|left, right| left.locator.cmp(&right.locator));
+    found
+}
+
+fn read_dir_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// A checkpoint file named after the moment it was taken, e.g.
+/// `1789560090000.json`. Only used when the file itself records no time.
+fn timestamp_from_name(name: &str) -> Option<i64> {
+    let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+    grok::timestamp_value_ms(&json!(digits.parse::<i64>().ok()?))
 }
 
 pub(crate) fn read_grok_summary(path: &Path) -> Option<Value> {
@@ -4974,6 +5757,115 @@ mod tests {
     /// The v4->v5 migration drops `codex_rollouts_v4` from the in-memory map, but
     /// the merge only folds in the keys a run *has*, so on its own that deletion
     /// never reaches disk: the retired map is reloaded and rewritten forever.
+    /// A Grok session a previous release already consumed must be re-read
+    /// once, and must come back with evidence instead of prompts alone.
+    ///
+    /// The change stamp of that session is unchanged on disk, so nothing but
+    /// retiring the sync-state key can make `sync` look at it again — and the
+    /// prompts it wrote with synthesized timestamps must be replaced, not
+    /// joined by a second copy carrying the real ones.
+    #[test]
+    fn retiring_the_grok_state_key_re_reads_a_session_sync_already_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let session = home.join(".grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001");
+        fs::create_dir_all(&session).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/grok/events-session/.grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001");
+        for name in ["chat_history.jsonl", "updates.jsonl", "summary.json"] {
+            fs::copy(fixture.join(name), session.join(name)).unwrap();
+        }
+        let db_path = home.join("history.db");
+        let chat = session.join("chat_history.jsonl");
+
+        // What the previous release left behind: the old state key, and a
+        // prompt stamped `created_at + index`.
+        let mut previous = Map::new();
+        previous.insert(
+            "grok_sessions".into(),
+            json!({ chat.to_string_lossy(): grok_session_stamp(&chat).unwrap() }),
+        );
+        save_sync_state(&home.join(".sync-state.json"), &previous).unwrap();
+        {
+            let conn = open_db(&db_path).unwrap();
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "grok".into(),
+                    session_id: Some("grok-evt-0001".into()),
+                    project: Some("/tmp/demo".into()),
+                    prompt_hash: None,
+                    prompt: "add a retry to the http client".into(),
+                    timestamp_ms: 1_789_560_000_000,
+                },
+            )
+            .unwrap();
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "grok".into(),
+                    session_id: Some("grok-evt-0001".into()),
+                    project: Some("/tmp/demo".into()),
+                    prompt_hash: None,
+                    prompt: "now a test".into(),
+                    // The fabricated one: one millisecond after the first.
+                    timestamp_ms: 1_789_560_000_001,
+                },
+            )
+            .unwrap();
+        }
+
+        sync_local_at_with_home(&db_path, home).unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        let prompts: Vec<(String, i64)> = conn
+            .prepare("SELECT prompt, timestamp_ms FROM history WHERE source = 'grok' ORDER BY timestamp_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                (
+                    "add a retry to the http client".to_string(),
+                    1_789_560_000_000
+                ),
+                ("now a test".to_string(), 1_789_560_120_000),
+            ],
+            "the synthesized timestamp must be replaced, not duplicated"
+        );
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "the re-read must produce events");
+
+        let state = load_sync_state(&home.join(".sync-state.json")).unwrap();
+        assert!(state.contains_key(GROK_SYNC_STATE_KEY));
+        assert!(
+            !state.contains_key("grok_sessions"),
+            "the retired key must be gone from disk, not just from memory"
+        );
+
+        // Steady state: the second run reads nothing and changes nothing.
+        sync_local_at_with_home(&db_path, home).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, events);
+    }
+
     #[test]
     fn retired_state_keys_are_deleted_from_disk_not_just_from_memory() {
         let dir = tempfile::tempdir().unwrap();

@@ -11,7 +11,16 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 when Grok sessions stopped being prompt-only: an already
+/// indexed Grok session re-parses once and gains `session_events`,
+/// `tool_calls`, `file_edits`, `session_markers`, subagent relationships and
+/// the timestamps `updates.jsonl` recorded — in place of the `created_at +
+/// index` ones the previous parser synthesized. Plain `sync` needs the same
+/// push, which is why the `grok_sessions` sync-state key was retired for
+/// `grok_events_v1` in the same change: a parser version alone only reaches
+/// sessions somebody hydrates by name.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -204,7 +213,7 @@ fn hydrate_session_at_with_home_and_connectors(
     // has a provider-native uniqueness key, so interruption followed by retry is
     // safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ingest_selected(
+    let source_diagnostics = ingest_selected(
         &tx,
         options,
         &target,
@@ -265,12 +274,13 @@ fn hydrate_session_at_with_home_and_connectors(
     } else {
         "hydrated"
     };
-    build_result(
+    build_result_with(
         &conn,
         options,
         status,
         snapshot,
         started.elapsed().as_millis() as i64,
+        source_diagnostics,
     )
 }
 
@@ -1195,21 +1205,25 @@ fn complete_jsonl_records(path: &Path) -> Result<i64> {
     Ok(records)
 }
 
+/// Index the selected session and hand back whatever the provider's own
+/// records could not establish, as diagnostics the caller reports verbatim.
 fn ingest_selected(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
-) -> Result<()> {
+) -> Result<Vec<HydrationDiagnostic>> {
     match options.source.as_str() {
-        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents),
-        "codex" => ingest_codex(conn, options, path.unwrap()),
-        "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
+        "claude" => {
+            ingest_claude(conn, options, path.unwrap(), claude_subagents).map(|()| Vec::new())
+        }
+        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| Vec::new()),
+        "cursor" => ingest_cursor(conn, options, target, path.unwrap()).map(|()| Vec::new()),
         "grok" => ingest_grok(conn, options, path.unwrap()),
         "opencode" => {
             sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
-            Ok(())
+            Ok(Vec::new())
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
@@ -1575,7 +1589,11 @@ fn ingest_cursor(
     )
 }
 
-fn ingest_grok(conn: &Connection, options: &HydrateSessionOptions, path: &Path) -> Result<()> {
+fn ingest_grok(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+) -> Result<Vec<HydrationDiagnostic>> {
     let session = scan_grok_session_file(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
@@ -1588,8 +1606,101 @@ fn ingest_grok(conn: &Connection, options: &HydrateSessionOptions, path: &Path) 
             "Grok source identity does not match the catalog row",
         ));
     }
-    ingest_grok_session(conn, &session, &path.to_string_lossy())?;
-    Ok(())
+    let outcome = ingest_grok_session(conn, &session, &path.to_string_lossy())?;
+    Ok(grok_diagnostics(&outcome))
+}
+
+/// What a Grok session directory could not establish on its own.
+///
+/// Every code here describes an absence in Grok's records, not a failure of
+/// this run. `GROK_USAGE_CONTEXT_PROXY_ONLY` is unconditional because it is
+/// true of every Grok session: the harness logs no per-turn billing tokens at
+/// all, and a consumer that reads `token_json` has to be told that before it
+/// adds the numbers up.
+fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    };
+    let mut diagnostics = vec![diagnostic(
+        "GROK_USAGE_CONTEXT_PROXY_ONLY",
+        match outcome.context_total_tokens {
+            Some(total) => format!(
+                "grok records no per-turn input/output tokens; the only token fact is the \
+                 updates.jsonl context-window snapshot (latest: {total}), which can decrease \
+                 on compaction and is not billing usage"
+            ),
+            None => "grok records no per-turn input/output tokens, and this session's \
+                     updates.jsonl carried no totalTokens snapshot either"
+                .to_string(),
+        },
+    )];
+    if outcome.missing_updates {
+        diagnostics.push(diagnostic(
+            "GROK_UPDATES_STREAM_MISSING",
+            "grok chat_history.jsonl carries no timestamps and this session has no readable \
+             updates.jsonl; event times fall back to summary.json"
+                .to_string(),
+        ));
+    }
+    let fallbacks = outcome.turn_start_fallbacks + outcome.inherited_fallbacks;
+    if fallbacks > 0 || outcome.session_start_fallbacks > 0 {
+        diagnostics.push(diagnostic(
+            "GROK_TIMESTAMP_FROM_TURN",
+            format!(
+                "{fallbacks} record(s) took their turn's recorded start or the preceding \
+                 record's time, and {} took the session's created_at, because updates.jsonl \
+                 recorded no time of their own",
+                outcome.session_start_fallbacks
+            ),
+        ));
+    }
+    if outcome.encrypted_reasoning > 0 {
+        diagnostics.push(diagnostic(
+            "GROK_REASONING_ENCRYPTED",
+            format!(
+                "{} reasoning record(s) carried only an encrypted trace and no readable \
+                 summary; each is recorded as an encrypted_reasoning marker rather than as \
+                 thinking text",
+                outcome.encrypted_reasoning
+            ),
+        ));
+    }
+    if outcome.subagent_calls > 0 {
+        diagnostics.push(diagnostic(
+            "GROK_SUBAGENT_SPAWN_UNLINKED",
+            format!(
+                "{} subagent spawn call(s) in the transcript name no child session; the \
+                 delegation is visible as a tool call, and only a subagents/ metadata entry \
+                 can link it",
+                outcome.subagent_calls
+            ),
+        ));
+    }
+    if outcome.unlinked_subagents > 0 {
+        diagnostics.push(diagnostic(
+            "GROK_SUBAGENT_METADATA_UNLINKED",
+            format!(
+                "{} subagents/ entry(ies) recorded no child session id; the delegation is \
+                 stored as unlinked evidence and the child is not independently addressable",
+                outcome.unlinked_subagents
+            ),
+        ));
+    }
+    if outcome.unread_update_rows > 0 {
+        diagnostics.push(diagnostic(
+            "GROK_UPDATES_ROWS_UNREAD",
+            format!(
+                "{} updates.jsonl row(s) carried a sessionUpdate this parser does not \
+                 interpret (plan, hook_execution, retry_state, …) and were skipped",
+                outcome.unread_update_rows
+            ),
+        ));
+    }
+    diagnostics
 }
 
 fn build_result(
@@ -1598,6 +1709,18 @@ fn build_result(
     status: &str,
     snapshot: SourceSnapshot,
     duration_ms: i64,
+) -> Result<HydrateSessionResult> {
+    build_result_with(conn, options, status, snapshot, duration_ms, Vec::new())
+}
+
+/// [`build_result`] plus the diagnostics this run's provider parser produced.
+fn build_result_with(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    status: &str,
+    snapshot: SourceSnapshot,
+    duration_ms: i64,
+    source_diagnostics: Vec<HydrationDiagnostic>,
 ) -> Result<HydrateSessionResult> {
     let related_session_ids = if options.include_related {
         related_ids(conn, &options.source, &options.session_id)?
@@ -1626,6 +1749,7 @@ fn build_result(
         source_bytes: Some(snapshot.bytes),
         records_parsed: Some(snapshot.records),
     }];
+    diagnostics.extend(source_diagnostics);
     if options.include_related {
         diagnostics.extend(unlinked_diagnostics(
             conn,
@@ -2074,6 +2198,480 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// One `tool_calls` row as the Grok assertions read it back:
+    /// `(tool_use_id, name, target, is_error, ts_ms)`.
+    type RecordedToolCall = (String, String, Option<String>, Option<i64>, i64);
+
+    /// Copy a checked-in Grok session fixture to where a real install would
+    /// put it, and answer with the transcript inside it.
+    fn grok_fixture_home(home: &Path, fixture: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/grok")
+            .join(fixture);
+        copy_tree(&root, home);
+        let mut found = Vec::new();
+        collect_chat_history(home, &mut found);
+        found.sort();
+        found.pop().expect("a staged chat_history.jsonl")
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        for entry in fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    fn collect_chat_history(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_chat_history(&path, found);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+            {
+                found.push(path);
+            }
+        }
+    }
+
+    /// The acceptance evidence for #167: real times, tools, results, an edit
+    /// and a compaction boundary, from one documented-shape session.
+    #[test]
+    fn grok_hydration_stamps_prompts_with_the_times_updates_jsonl_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(result.status, "hydrated");
+
+        let conn = open_db(&db).unwrap();
+        // Both prompts carry the exact `agentTimestampMs` of their
+        // `user_message_chunk`, not `created_at + index` (which would have
+        // produced 1789560000000 and 1789560000001).
+        let prompts: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT prompt, timestamp_ms FROM history \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001' ORDER BY timestamp_ms",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                (
+                    "add a retry to the http client".to_string(),
+                    1_789_560_000_000
+                ),
+                ("now a test".to_string(), 1_789_560_120_000),
+            ]
+        );
+        // The synthetic turn stays out of `history`, as it always has.
+        assert!(!prompts
+            .iter()
+            .any(|(prompt, _)| prompt.contains("context window compacted")));
+
+        // The `<user_query>` envelope is stripped, and the prompt is what the
+        // person typed.
+        assert!(!prompts[0].0.contains("user_query"));
+
+        // Every prose record, tool call and tool result joined to a time
+        // `updates.jsonl` recorded. Three records in this transcript have no
+        // counterpart in the ACP stream at all — the system preamble, the
+        // injected synthetic turn and the trailing encrypted reasoning — and
+        // the fallback they took is reported rather than passed off as
+        // recorded.
+        let fallback = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "GROK_TIMESTAMP_FROM_TURN")
+            .expect("the fallback diagnostic");
+        assert!(
+            fallback.message.starts_with("2 record(s)") && fallback.message.contains("and 1 took"),
+            "{}",
+            fallback.message
+        );
+        // …and the context-proxy honesty diagnostic is always present.
+        let usage = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "GROK_USAGE_CONTEXT_PROXY_ONLY")
+            .expect("the usage diagnostic");
+        assert!(usage.message.contains("no per-turn input/output tokens"));
+
+        let session: (Option<i64>, Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms, last_assistant_text, models_json \
+                 FROM sessions WHERE source = 'grok' AND session_id = 'grok-evt-0001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(session.0, Some(1_789_560_000_000));
+        assert_eq!(session.1, Some(1_789_560_138_000));
+        assert_eq!(session.2.as_deref(), Some("The test fails; fixing next."));
+        assert_eq!(session.3.as_deref(), Some(r#"["grok-4-build"]"#));
+    }
+
+    #[test]
+    fn grok_hydration_indexes_tools_results_edits_and_a_compaction_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert!(result.evidence.events > 0, "{:?}", result.evidence);
+
+        let conn = open_db(&db).unwrap();
+        let calls: Vec<RecordedToolCall> = conn
+            .prepare(
+                "SELECT tool_use_id, name, target, is_error, ts_ms FROM tool_calls \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001' ORDER BY ts_ms",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "call_shell_1".to_string(),
+                    "Shell".to_string(),
+                    Some("rg -n retry src/http.ts".to_string()),
+                    None,
+                    1_789_560_007_000,
+                ),
+                (
+                    "call_edit_1".to_string(),
+                    "StrReplace".to_string(),
+                    Some("/tmp/demo/src/http.ts".to_string()),
+                    None,
+                    1_789_560_014_000,
+                ),
+                (
+                    "call_write_1".to_string(),
+                    "Write".to_string(),
+                    Some("/tmp/demo/test/http.test.ts".to_string()),
+                    None,
+                    1_789_560_129_000,
+                ),
+                (
+                    // `is_error` comes from the result record *and* the
+                    // terminal `status: failed` on the ACP update.
+                    "call_shell_2".to_string(),
+                    "Shell".to_string(),
+                    Some("npm test".to_string()),
+                    Some(1),
+                    1_789_560_133_000,
+                ),
+            ]
+        );
+
+        // Every call has a `tool_result` event paired to it by call id, timed
+        // from the call's own `tool_call_update`.
+        let results: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT event_uid, ts_ms FROM session_events \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001' \
+                   AND kind = 'tool_result' ORDER BY ts_ms",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            results,
+            vec![
+                ("result:call_shell_1".to_string(), 1_789_560_011_000),
+                ("result:call_edit_1".to_string(), 1_789_560_019_000),
+                ("result:call_write_1".to_string(), 1_789_560_131_000),
+                ("result:call_shell_2".to_string(), 1_789_560_135_000),
+            ]
+        );
+
+        let edits: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT tool_name, file_path FROM file_edits \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001' ORDER BY ts_ms",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            edits,
+            vec![
+                (
+                    "StrReplace".to_string(),
+                    "/tmp/demo/src/http.ts".to_string()
+                ),
+                (
+                    "Write".to_string(),
+                    "/tmp/demo/test/http.test.ts".to_string()
+                ),
+            ]
+        );
+
+        // The reasoning summary is thinking; the encrypted-only trace is not.
+        let thinking: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'grok' \
+                   AND session_id = 'grok-evt-0001' AND kind = 'thinking'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            thinking,
+            vec!["Read the client first, then add a bounded retry around the fetch call."]
+        );
+
+        let markers = crate::session_markers(&conn, "grok", "grok-evt-0001").unwrap();
+        let kinds: Vec<&str> = markers.iter().map(|marker| marker.kind.as_str()).collect();
+        assert!(kinds.contains(&"compaction_boundary"), "{kinds:?}");
+        assert!(kinds.contains(&"system"), "{kinds:?}");
+        assert!(kinds.contains(&"synthetic_turn"), "{kinds:?}");
+        assert!(kinds.contains(&"encrypted_reasoning"), "{kinds:?}");
+        assert!(kinds.contains(&"prompt_context"), "{kinds:?}");
+        let compaction = markers
+            .iter()
+            .find(|marker| marker.kind == "compaction_boundary")
+            .unwrap();
+        assert_eq!(compaction.ts_ms, Some(1_789_560_090_000));
+        let signals = markers
+            .iter()
+            .find(|marker| marker.kind == "signals")
+            .unwrap();
+        assert_eq!(
+            signals.text.as_deref(),
+            Some("turns=2 compactions=1 context_tokens_used=9210")
+        );
+
+        // The context-window proxy is recorded per turn, named as a proxy, on
+        // the turn's last assistant message — and it legitimately falls after
+        // the compaction.
+        let tokens: Vec<String> = conn
+            .prepare(
+                "SELECT token_json FROM session_events WHERE source = 'grok' \
+                   AND session_id = 'grok-evt-0001' AND token_json IS NOT NULL ORDER BY ts_ms",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                r#"{"context_total_tokens":18432,"source":"updates.jsonl"}"#,
+                r#"{"context_total_tokens":9210,"source":"updates.jsonl"}"#,
+            ]
+        );
+
+        // The subagents/ entry names its child, so the delegation is linked.
+        let relationship: (Option<String>, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT child_session_id, identity_status, evidence_kind, child_agent_type \
+                 FROM session_relationships WHERE source = 'grok' \
+                   AND parent_session_id = 'grok-evt-0001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(relationship.0.as_deref(), Some("grok-evt-0001-review"));
+        assert_eq!(relationship.1, "observed");
+        assert_eq!(relationship.2, "grok_subagent_dir");
+        assert_eq!(relationship.3.as_deref(), Some("reviewer"));
+
+        // Re-hydrating the unchanged directory duplicates nothing.
+        let again =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(again.status, "unchanged");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_events WHERE source = 'grok'), \
+                        (SELECT COUNT(*) FROM tool_calls WHERE source = 'grok'), \
+                        (SELECT COUNT(*) FROM file_edits WHERE source = 'grok'), \
+                        (SELECT COUNT(*) FROM history WHERE source = 'grok')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts.1, 4);
+        assert_eq!(counts.2, 2);
+        assert_eq!(counts.3, 2);
+        assert_eq!(counts.0 as u64, result.evidence.events);
+    }
+
+    /// The older layout #192 captured: per-record timestamps, `tool_use`
+    /// blocks inside `content`, and an `updates.jsonl` that is not an ACP
+    /// stream. Nothing about it may fall back to `created_at + index` either.
+    #[test]
+    fn grok_hydration_reads_the_record_timestamped_layout_without_an_acp_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "full-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-00000001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-00000001"), dir.path())
+                .unwrap();
+        let conn = open_db(&db).unwrap();
+        let prompts: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT prompt, timestamp_ms FROM history WHERE source = 'grok' \
+                 ORDER BY timestamp_ms",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                ("add a retry to the client".to_string(), 1_776_643_200_000),
+                ("looks good, now the test".to_string(), 1_776_643_320_000),
+            ]
+        );
+        // A `tool_use` block inside `content` is still a tool call, and its
+        // file is still an edit.
+        let calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        let edit: String = conn
+            .query_row(
+                "SELECT file_path FROM file_edits WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edit, "/tmp/project/src/client.ts");
+        // This layout's `updates.jsonl` is not an ACP stream, so it reports
+        // the absence instead of pretending the rows were read.
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "GROK_UPDATES_ROWS_UNREAD"),
+            "{:?}",
+            result.diagnostics
+        );
+        // `usage.input_tokens` in that layout is unverified invention, so no
+        // token fact is recorded from it.
+        let tokens: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'grok' AND token_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 0);
+    }
+
+    /// A session with no `updates.jsonl` and no per-record timestamps: the
+    /// prompts still may not be spread one millisecond apart.
+    #[test]
+    fn grok_hydration_without_any_recorded_time_reports_it_rather_than_inventing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fbare/grok-bare-0001");
+        fs::create_dir_all(&session_dir).unwrap();
+        let chat = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            "{\"type\":\"user\",\"content\":\"first\"}\n{\"type\":\"user\",\"content\":\"second\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"id":"grok-bare-0001","cwd":"/tmp/bare"},"created_at":"2026-09-16T12:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-bare-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-bare-0001"), dir.path())
+                .unwrap();
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "GROK_UPDATES_STREAM_MISSING"),
+            "{:?}",
+            result.diagnostics
+        );
+        let conn = open_db(&db).unwrap();
+        let stamps: Vec<i64> = conn
+            .prepare("SELECT ts_ms FROM session_events WHERE source = 'grok' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // Both events carry the one time Grok actually recorded. The old
+        // parser would have written 1789560000000 and 1789560000001 — an
+        // ordering it had no evidence for.
+        assert_eq!(stamps, vec![1_789_560_000_000, 1_789_560_000_000]);
+        // Two prompts one millisecond apart used to be two `history` rows;
+        // sharing a timestamp, they are still two rows, because the prompt
+        // text is part of the key.
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 2);
     }
 
     fn options(source: &str, session_id: &str) -> HydrateSessionOptions {

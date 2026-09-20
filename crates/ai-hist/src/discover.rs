@@ -1183,16 +1183,29 @@ impl ShallowSessionProvider for GrokProvider {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let first_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("created_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms);
-        let last_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("updated_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms)
+        // `updates.jsonl` is where Grok records real per-event times;
+        // `summary.json` records only when the session was opened and last
+        // touched, and a session restored from a checkpoint carries a
+        // `created_at` older than anything it did. Read the stream's first and
+        // last record from the same bounded head/tail scan every other adapter
+        // uses, and fall back to the summary when there is no stream.
+        let (stream_first, stream_last) =
+            grok_update_bounds(scan, &chat.with_file_name("updates.jsonl"))?;
+        let first_activity_ms = stream_first.or_else(|| {
+            summary
+                .as_ref()
+                .and_then(|s| s.get("created_at"))
+                .and_then(Value::as_str)
+                .and_then(crate::parse_iso_ms)
+        });
+        let last_activity_ms = stream_last
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .and_then(|s| s.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .and_then(crate::parse_iso_ms)
+            })
             .or_else(|| crate::file_modified_ms(&chat));
         let mut models = Vec::new();
         push_unique(
@@ -1228,6 +1241,30 @@ impl ShallowSessionProvider for GrokProvider {
             ..Default::default()
         }))
     }
+}
+
+/// The first and last times `updates.jsonl` recorded.
+///
+/// Both are `None` when there is no readable stream or when its bounding
+/// records carried no time — Grok's own absence, reported as such rather than
+/// replaced with a file mtime here.
+fn grok_update_bounds(
+    scan: &ScanEnv<'_>,
+    updates: &Path,
+) -> Result<(Option<i64>, Option<i64>)> {
+    if !updates.is_file() {
+        return Ok((None, None));
+    }
+    let bounded = read_bounded_jsonl(scan, updates)?;
+    let first = bounded
+        .head_records()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    let last = bounded
+        .tail_records_rev()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    Ok((first, last))
 }
 
 // ---------------------------------------------------------------------------
