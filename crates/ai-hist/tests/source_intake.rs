@@ -284,7 +284,7 @@ fn remote_claude_hydration_preserves_the_provider_request_identity() -> Result<(
     // And the point of carrying them: one request, one total.
     let page = ai_hist::session_requests_page(&conn, "claude", "s", 50, None)?;
     assert_eq!(page.requests.len(), 1);
-    assert_eq!(page.requests[0].request_key, "req_remote");
+    assert_eq!(page.requests[0].request_key, "request-id:req_remote");
     assert!(page.requests[0].diagnostics.is_empty());
     let summary = ai_hist::session_usage_summary(&conn, "claude", "s")?
         .expect("a hydrated session has a summary");

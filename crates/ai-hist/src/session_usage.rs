@@ -8,11 +8,11 @@
 //! query; the benefit is that an entire class of stale-cache bug does not
 //! exist.
 //!
-//! `request_key` is the upstream request id when the store has one and the
-//! message id otherwise. Today it is always the message id: capturing
-//! Claude's `requestId` is the raw-facts issue's job, and
-//! [`RequestKeySource`] is on the wire already so the day it lands a consumer
-//! can tell a real request key from a fallback without a contract break.
+//! `request_key` is the provider's own request identity — its `request_id`,
+//! else its `provider_message_id` — falling back to the stored record id when
+//! it recorded neither. It is namespace-qualified (`request-id:req_1`),
+//! because those namespaces are separate and can carry the same text, and
+//! [`RequestKeySource`] names the namespace so nobody has to parse the key.
 use crate::usage::{normalize_usage_str, NormalizedUsage, UsageAccounting};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -39,6 +39,21 @@ pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 1;
 /// from a source that spreads requests across records is reported with the
 /// `unresolved-request-identity` diagnostic rather than quietly summed.
 ///
+/// The key is **namespace-qualified** — `request-id:req_1`, not `req_1` —
+/// because those three namespaces are separate and can carry the same text. A
+/// bare value grouped one call whose `request_id` is `msg_1` together with an
+/// older call whose `provider_message_id` is `msg_1`, producing a single
+/// request with one usage blob standing for two; and because the two blobs
+/// then disagree, it read as corruption rather than as two good measurements.
+/// Qualifying makes the key unique on its own, which is what a field called a
+/// key has to be, and `request_key_source` still names the namespace without
+/// anyone parsing the key.
+///
+/// `message_ids` is a JSON array rather than a joined string. A provider id
+/// may contain a comma; joining on one and splitting it back turned `part,1`
+/// into two ids matching nothing, so the request lost the tool calls keyed on
+/// it.
+///
 /// `usage_variants` counts the *distinct* non-null `token_json` blobs in a
 /// group. Claude copies the same blob onto every record of one request, so
 /// the expected value is 1; anything higher means the copies disagree and the
@@ -48,13 +63,17 @@ pub(crate) const SESSION_REQUESTS_VIEW_DDL: &str = "CREATE VIEW session_requests
 SELECT
     e.source AS source,
     e.session_id AS session_id,
-    COALESCE(NULLIF(e.request_id, ''), NULLIF(e.provider_message_id, ''), e.message_id) AS request_key,
+    CASE
+        WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
+        WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
+        ELSE 'record-id:' || e.message_id
+    END AS request_key,
     CASE
         WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id'
         WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id'
         ELSE 'record-id'
     END AS request_key_source,
-    group_concat(DISTINCT e.message_id) AS message_ids,
+    json_group_array(DISTINCT e.message_id) AS message_ids,
     NULL AS provider,
     MIN(e.id) AS id,
     MIN(e.ts_ms) AS first_ts_ms,
@@ -69,7 +88,11 @@ FROM session_events e
 WHERE e.role = 'assistant'
   AND e.message_id IS NOT NULL
   AND e.message_id <> ''
-GROUP BY e.source, e.session_id, COALESCE(NULLIF(e.request_id, ''), NULLIF(e.provider_message_id, ''), e.message_id)";
+GROUP BY e.source, e.session_id, CASE
+        WHEN NULLIF(e.request_id, '') IS NOT NULL THEN 'request-id:' || e.request_id
+        WHEN NULLIF(e.provider_message_id, '') IS NOT NULL THEN 'provider-message-id:' || e.provider_message_id
+        ELSE 'record-id:' || e.message_id
+    END";
 
 /// Whether the stored view is the one this build would create.
 ///
@@ -298,18 +321,13 @@ fn row_to_raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
         session_id: row.get(2)?,
         request_key: row.get(3)?,
         request_key_source: row.get(4)?,
-        // `group_concat` joins on a comma. Provider message ids never
-        // contain one, and an empty element is dropped rather than becoming
-        // an id nothing matches.
+        // A JSON array, decoded rather than split on a delimiter: a
+        // provider id may contain a comma, and the join/split round trip
+        // turned `part,1` into two ids that match nothing.
         message_ids: row
             .get::<_, Option<String>>(5)?
-            .map(|joined| {
-                joined
-                    .split(',')
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str::<Vec<String>>(encoded).ok())
             .unwrap_or_default(),
         provider: row.get(6)?,
         model: row.get(7)?,
@@ -696,7 +714,7 @@ mod tests {
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert_eq!(page.requests.len(), 1);
         let request = &page.requests[0];
-        assert_eq!(request.request_key, "msg_multi_1");
+        assert_eq!(request.request_key, "provider-message-id:msg_multi_1");
         assert_eq!(
             request.request_key_source,
             RequestKeySource::ProviderMessageId
@@ -738,6 +756,104 @@ mod tests {
             raw_row_sum, 172,
             "the per-block copies really are duplicated"
         );
+    }
+
+    /// A provider id may contain a comma. Joining the group's message ids
+    /// with one and splitting on it again turns `part,1` into two ids that
+    /// match nothing, so the request loses the tool calls that are keyed on
+    /// it.
+    #[test]
+    fn a_message_id_containing_a_comma_survives_the_group() {
+        let conn = db();
+        event(
+            &conn,
+            "claude",
+            "s1",
+            "part,1",
+            1,
+            "assistant",
+            "tool_use",
+            None,
+            Some(r#"{"input_tokens":5,"output_tokens":6}"#),
+            "part,1:0",
+        );
+        conn.execute(
+            "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
+             VALUES ('claude', 's1', 'part,1', 'toolu_comma', 'Bash', 1)",
+            [],
+        )
+        .unwrap();
+        let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].message_ids, vec!["part,1".to_string()]);
+        assert_eq!(
+            page.requests[0].tool_use_ids,
+            vec!["toolu_comma".to_string()],
+            "the tool call still matches its request"
+        );
+    }
+
+    /// Two identity namespaces can carry the same text. Collapsing them into
+    /// one untagged key merges two API calls into a single request with one
+    /// usage blob — and the two blobs disagreeing then reads as corruption
+    /// rather than as two perfectly good measurements.
+    #[test]
+    fn the_same_text_in_two_identity_namespaces_is_two_requests() {
+        let conn = db();
+        // One call the provider gave a request id of `msg_1`...
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, request_id, ts_ms, role, kind, text, token_json, event_uid) \
+             VALUES ('claude', 's1', 'rec-a', 'msg_1', 1, 'assistant', 'text', 'x', \
+                     '{\"input_tokens\":1,\"output_tokens\":10}', 'rec-a:0')",
+            [],
+        )
+        .unwrap();
+        // ...and an older call whose *message* id happens to be `msg_1`.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, provider_message_id, ts_ms, role, kind, text, token_json, event_uid) \
+             VALUES ('claude', 's1', 'rec-b', 'msg_1', 2, 'assistant', 'text', 'x', \
+                     '{\"input_tokens\":2,\"output_tokens\":20}', 'rec-b:0')",
+            [],
+        )
+        .unwrap();
+
+        let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 2, "two namespaces, two requests");
+        let mut sources: Vec<&str> = page
+            .requests
+            .iter()
+            .map(|request| request.request_key_source.as_str())
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(sources, vec!["provider-message-id", "request-id"]);
+
+        // Each keeps its own measurement rather than one blob standing for both.
+        let mut outputs: Vec<u64> = page
+            .requests
+            .iter()
+            .map(|request| request.usage.as_ref().unwrap().output_tokens)
+            .collect();
+        outputs.sort_unstable();
+        assert_eq!(outputs, vec![10, 20]);
+
+        // And the keys they are exposed under do not collide.
+        let mut keys: Vec<&str> = page
+            .requests
+            .iter()
+            .map(|request| request.request_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "two requests must not share one key");
+
+        let summary = session_usage_summary(&conn, "claude", "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.request_count, 2);
+        assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 30);
+        assert!(summary.diagnostics.is_empty());
     }
 
     #[test]
@@ -927,7 +1043,7 @@ mod tests {
         );
         let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
         assert_eq!(page.requests.len(), 1);
-        assert_eq!(page.requests[0].request_key, "m1");
+        assert_eq!(page.requests[0].request_key, "provider-message-id:m1");
     }
 
     #[test]
@@ -959,7 +1075,9 @@ mod tests {
             }
         }
         seen.sort();
-        let mut expected: Vec<String> = (0..7).map(|index| format!("m{index}")).collect();
+        let mut expected: Vec<String> = (0..7)
+            .map(|index| format!("provider-message-id:m{index}"))
+            .collect();
         expected.sort();
         assert_eq!(seen, expected);
         let summary = session_usage_summary(&conn, "claude", "s1")

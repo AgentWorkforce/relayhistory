@@ -99,7 +99,7 @@ test('a request page collapses one message into one request with normalized usag
     assert.equal(page.contractVersion, SESSION_USAGE_CONTRACT_VERSION);
     assert.equal(page.source, 'claude');
     assert.equal(page.sessionId, CLAUDE_SESSION);
-    const multiBlock = page.requests.find((request) => request.requestKey === 'req_1') as SessionRequest;
+    const multiBlock = page.requests.find((request) => request.requestKey === 'request-id:req_1') as SessionRequest;
     assert.ok(multiBlock, 'the three-block message is one request');
     assert.equal(multiBlock.requestKeySource, 'request-id');
     // One record carrying three content blocks: one message id, three events.
@@ -136,7 +136,7 @@ test('an absent output count reads as zero with the coverage flag that says so',
   const { dbPath, cleanup } = await seededDatabase();
   try {
     const requests = await getSessionRequests('claude', CLAUDE_SESSION, { dbPath });
-    const partial = requests.find((request) => request.requestKey === 'req_2') as SessionRequest;
+    const partial = requests.find((request) => request.requestKey === 'request-id:req_2') as SessionRequest;
     assert.ok(partial);
     const usage = partial.usage;
     assert.ok(usage);
@@ -246,7 +246,9 @@ test('the request iterator walks every page and both halves of the identity are 
     for await (const request of sessionRequests('claude', CLAUDE_SESSION, { dbPath, limit: 1 })) {
       walked.push(request.requestKey);
     }
-    assert.deepEqual(walked.sort(), ['req_1', 'req_2']);
+    // Namespace-qualified, so a key is unique even when two identity
+    // namespaces carry the same text.
+    assert.deepEqual(walked.sort(), ['request-id:req_1', 'request-id:req_2']);
 
     for (const [source, sessionId] of [['claude', ''], ['', CLAUDE_SESSION], ['claude', ' padded ']] as const) {
       await assert.rejects(

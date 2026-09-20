@@ -75,7 +75,7 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
     assert_eq!(page.requests.len(), 1);
     let request = &page.requests[0];
-    assert_eq!(request.request_key, "req_1");
+    assert_eq!(request.request_key, "request-id:req_1");
     assert_eq!(request.request_key_source, RequestKeySource::RequestId);
     assert_eq!(request.model.as_deref(), Some("claude-opus-4-7"));
     assert_eq!(request.message_ids.len(), 3);
@@ -118,7 +118,11 @@ fn request_ids_differing_only_in_whitespace_stay_distinct() {
         .map(|request| request.request_key.as_str())
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec![" req_pad ", "req_pad"]);
+    assert_eq!(
+        keys,
+        vec!["request-id: req_pad ", "request-id:req_pad"],
+        "the qualified keys stay distinct, padding and all"
+    );
     assert!(page
         .requests
         .iter()
@@ -143,7 +147,10 @@ fn a_turn_without_a_request_id_groups_on_the_provider_message_id() {
     let conn = claude_store("claude/multi-block-turn-no-request-id.jsonl");
     let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
     assert_eq!(page.requests.len(), 1);
-    assert_eq!(page.requests[0].request_key, "msg_multi_1");
+    assert_eq!(
+        page.requests[0].request_key,
+        "provider-message-id:msg_multi_1"
+    );
     assert_eq!(
         page.requests[0].request_key_source,
         RequestKeySource::ProviderMessageId
@@ -347,6 +354,44 @@ fn an_invalid_codex_counter_is_refused_rather_than_read_as_zero() {
             .diagnostics
             .contains(&UsageDiagnostic::UnnormalizableUsage));
     }
+}
+
+/// A snapshot that cannot be differenced is a transient glitch, exactly like
+/// a regressed one — and must be treated like one.
+///
+/// Refusing on the spot consumed the assistant event that was waiting for its
+/// measurement, so the next *valid* snapshot had nowhere to land: the turn
+/// was marked unreadable and its real delta went to a different request, or
+/// nowhere at all. The provider did report that turn's usage; it just said
+/// something unreadable first.
+///
+/// Because the baseline is deliberately left untouched on a bad snapshot, the
+/// next advancing snapshot already covers the whole span, so the number is
+/// recoverable and the turn must get it.
+#[test]
+fn a_bad_snapshot_followed_by_a_good_one_still_measures_the_waiting_turn() {
+    let conn = codex_store("codex/counter-recovers.jsonl");
+    let page = session_requests_page(&conn, "codex", "sess_codex_recovers", 50, None).unwrap();
+    assert_eq!(page.requests.len(), 1, "one turn, one request");
+    let request = &page.requests[0];
+    assert!(
+        request.diagnostics.is_empty(),
+        "the glitch was superseded, so nothing is left to report: {:?}",
+        request.diagnostics
+    );
+    let usage = request
+        .usage
+        .as_ref()
+        .expect("the later valid snapshot measures this turn");
+    assert_eq!(usage.output_tokens, 200);
+    assert_eq!(usage.input_tokens, 2000);
+    assert_eq!(usage.cache_read_tokens, 1000);
+
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_recovers")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 200);
+    assert!(summary.diagnostics.is_empty());
 }
 
 /// A counter above `i64::MAX` is still a valid `u64`, so the parser keeps it

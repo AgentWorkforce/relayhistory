@@ -2196,6 +2196,9 @@ pub(crate) fn ingest_codex_rollout(
     let mut model: Option<String> = None;
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut pending_usage: Option<PendingCodexUsage> = None;
+    // The last snapshot that could not be differenced, held in case no later
+    // one measures the span it belongs to.
+    let mut unusable_snapshot: Option<String> = None;
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
@@ -2343,17 +2346,23 @@ pub(crate) fn ingest_codex_rollout(
                     };
                     let Some(totals) = CodexTokenTotals::from_usage(usage) else {
                         // A counter that is not a non-negative integer cannot
-                        // be differenced. Keep the provider's object so the
-                        // session API answers with an explicit normalization
-                        // error, and leave the baseline untouched so a later
-                        // good snapshot still measures from a real point.
-                        attach_codex_usage(
-                            conn,
-                            session_id,
-                            &mut pending_usage,
-                            &mut untokened_assistant_uid,
-                            PendingCodexUsage::Unusable(usage.to_string()),
-                        )?;
+                        // be differenced — which is the same situation as a
+                        // regressed snapshot below, and gets the same
+                        // treatment: change nothing.
+                        //
+                        // Attaching the refusal here would consume the
+                        // assistant event still waiting for its measurement,
+                        // so the next *valid* snapshot would have nowhere to
+                        // land and the turn the provider did report would be
+                        // marked unreadable while its real delta went
+                        // elsewhere. The baseline is untouched, so that next
+                        // snapshot's delta already covers this whole span;
+                        // the number is recoverable and the turn must get it.
+                        //
+                        // It is only remembered, and only surfaces at the end
+                        // of the rollout if nothing ever superseded it — see
+                        // the flush after the loop.
+                        unusable_snapshot = Some(usage.to_string());
                         continue;
                     };
                     match prev_totals {
@@ -2372,6 +2381,9 @@ pub(crate) fn ingest_codex_rollout(
                             let baseline = prev_totals.unwrap_or_default();
                             let measured = totals.minus(&baseline);
                             prev_totals = Some(totals);
+                            // This delta spans the unreadable snapshot too,
+                            // so there is no longer anything to report.
+                            unusable_snapshot = None;
                             let next = match measured {
                                 Some(delta) => match pending_usage.take() {
                                     Some(pending) => pending.merged(delta, usage),
@@ -2608,6 +2620,19 @@ pub(crate) fn ingest_codex_rollout(
             },
             _ => {}
         }
+    }
+    // Nothing superseded it: the turn still waiting for a measurement is the
+    // one the unreadable snapshot belonged to, so the refusal surfaces there
+    // rather than being dropped. With no turn waiting, every turn already has
+    // a real delta and the glitch measured nothing anyone is missing.
+    if let Some(raw) = unusable_snapshot {
+        attach_codex_usage(
+            conn,
+            session_id,
+            &mut pending_usage,
+            &mut untokened_assistant_uid,
+            PendingCodexUsage::Unusable(raw),
+        )?;
     }
     Ok(outcome)
 }

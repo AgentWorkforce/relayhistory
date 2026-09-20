@@ -72,7 +72,8 @@ differences consecutive strictly-advancing snapshots into per-request deltas and
 attaches each to the nearest assistant event, so summing a session's deltas
 reproduces its final cumulative total. A snapshot that repeats or goes backwards
 is not a delta: the prior baseline is kept, so the next advancing snapshot
-covers exactly the spend since it.
+covers exactly the spend since it. A snapshot that cannot be read at all is
+treated the same way — see below.
 
 Counters are read as non-negative integers and differenced with checked
 arithmetic. A snapshot carrying a counter that is negative, fractional, or
@@ -82,6 +83,14 @@ reports `USAGE_NON_INTEGER_COUNTER` rather than a delta of zeros that is
 indistinguishable from a reported zero. A counter above `i64::MAX` is still a
 valid count and is preserved; it is refused later, at the JavaScript boundary
 that genuinely cannot carry it.
+
+An unreadable snapshot is a transient glitch, like a regressed one, and does
+not decide anything about the turn waiting for its measurement. It is held,
+not attached: because the baseline is untouched, the next advancing snapshot's
+delta already spans it, and that delta goes to the waiting turn. The refusal
+surfaces only at the end of the rollout, on a turn that never received a
+measurement at all — so a provider that says something unreadable and then
+reports the real figure still charges the right turn the right number.
 
 `input_tokens` in a Codex record stays *inclusive* of `cached_input_tokens`
 even after differencing. Normalization makes it exclusive, so a consumer that
@@ -100,6 +109,15 @@ call by the number of records it was split across.
   (Claude's `requestId`) first, then `provider_message_id` (`message.id`), and
   the event's `message_id` only as a last resort. `requestKeySource` says which
   of the three was used.
+- The key is **namespace-qualified** — `request-id:req_1`, not `req_1`. Those
+  three namespaces are separate and can carry the same text, and a bare value
+  merged one call whose `request_id` was `msg_1` with an older call whose
+  `provider_message_id` was `msg_1` into a single request with one usage blob
+  standing for two. Qualifying keeps the key unique on its own;
+  `requestKeySource` still names the namespace without parsing it.
+- `messageIds` is a list, carried across the boundary as a JSON array. A
+  provider id may contain a comma, so it is never joined into one string and
+  split back.
 - `message_id` is **not** a request identity. It holds the JSONL record's own
   `uuid`, and one Claude request is written as several records with different
   uuids. A request keyed on it, from a source that spreads requests across
