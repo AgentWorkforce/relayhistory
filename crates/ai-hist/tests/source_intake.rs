@@ -307,6 +307,72 @@ fn expanding_coverage_without_new_rows_is_not_an_unchanged_result() -> Result<()
     Ok(())
 }
 
+/// The mirror of the widening case. The accumulated snapshot kinds only ever
+/// grow, so comparing against them catches an acquisition that covers more and
+/// misses one that covers less: a later `include_related: false` pass reports
+/// `partial` while still calling itself `unchanged`, and a consumer that skips
+/// work on `unchanged` keeps the earlier `full` ranking.
+#[test]
+fn narrowing_coverage_is_not_an_unchanged_result_either() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    let all_kinds = vec![
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::FileEdit,
+        EvidenceKind::Relationship,
+    ];
+
+    let full = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        all_kinds.clone(),
+        full_session_records(),
+        Some(true),
+    )?;
+    assert_eq!(full.capability, "full");
+
+    // Control: the identical pass again is genuinely unchanged.
+    let repeated = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        all_kinds,
+        full_session_records(),
+        Some(true),
+    )?;
+    assert_eq!(repeated.status, "unchanged");
+
+    // Same stamp, same rows, but this acquisition declined delegation. The
+    // accumulated set still contains it, so only comparing against that would
+    // call this unchanged while the capability drops.
+    let narrowed = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ],
+        full_session_records()
+            .into_iter()
+            .filter(|record| record.kind != EvidenceKind::Relationship)
+            .collect(),
+        Some(false),
+    )?;
+    assert_eq!(narrowed.capability, "partial");
+    assert_ne!(
+        narrowed.status, "unchanged",
+        "coverage narrowed and the capability fell, so the result is not unchanged"
+    );
+    Ok(())
+}
+
 /// The checkpoint records what the acquisition did. Storing a literal `false`
 /// made it disagree with a hydration that did index delegation.
 #[test]

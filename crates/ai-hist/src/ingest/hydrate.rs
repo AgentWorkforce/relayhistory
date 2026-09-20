@@ -1281,7 +1281,7 @@ fn ingest_claude(
         Some(&path.to_string_lossy()),
     )?;
     ingest_claude_transcript(conn, path)?;
-    record_claude_remote_relationship(conn, &meta)?;
+    record_claude_remote_relationship(conn, &meta, options.include_related)?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     for evidence in subagents {
@@ -1502,6 +1502,63 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
     Ok(())
 }
 
+/// Rollout files that could hold a child of a session started in `directory`.
+///
+/// Codex partitions rollouts by the date a session started, so a child spawned
+/// minutes later can land in the next day's directory -- scanning only the
+/// parent's own directory silently loses it while Codex declares full
+/// relationship coverage, which is a complete claim over a child nobody looked
+/// for.
+///
+/// A child cannot start before its parent, so the eligible set is the parent's
+/// date directory and every later one. Bounding the walk that way keeps it
+/// proportional to what was recorded after this session rather than to the
+/// whole store, and keeps the coverage claim earned: everything eligible is
+/// inspected. Directory names are zero-padded, so ordering them as text orders
+/// them by date.
+fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
+    let Some(root) = directory
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return collect_matching_files(directory, "rollout-", "jsonl");
+    };
+    let Some(from) = date_key(directory) else {
+        return collect_matching_files(directory, "rollout-", "jsonl");
+    };
+    let mut days = Vec::new();
+    for year in sorted_dirs(root)? {
+        for month in sorted_dirs(&year)? {
+            for day in sorted_dirs(&month)? {
+                if date_key(&day).is_some_and(|key| key >= from) {
+                    days.push(day);
+                }
+            }
+        }
+    }
+    if days.is_empty() {
+        days.push(directory.to_path_buf());
+    }
+    let mut candidates = Vec::new();
+    for day in days {
+        candidates.extend(collect_matching_files(&day, "rollout-", "jsonl")?);
+    }
+    Ok(candidates)
+}
+
+/// `YYYY/MM/DD` for a rollout date directory, as a sortable string.
+fn date_key(day: &Path) -> Option<String> {
+    let name = |path: &Path| {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+    };
+    let month = day.parent()?;
+    let year = month.parent()?;
+    Some(format!("{}/{}/{}", name(year)?, name(month)?, name(day)?))
+}
+
 fn ingest_codex_children(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -1526,7 +1583,7 @@ fn codex_children(root_path: &Path, parent_session_id: &str) -> Result<Vec<PathB
         return Ok(Vec::new());
     };
     let mut children_by_parent: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    for candidate in collect_matching_files(directory, "rollout-", "jsonl")? {
+    for candidate in codex_child_candidates(directory)? {
         if candidate == root_path {
             continue;
         }
@@ -1730,6 +1787,15 @@ fn partial_coverage_diagnostic(
     if coverage.is_empty() || missing.is_empty() {
         return None;
     }
+    // The opt-out explains an absent `relationship`, and only when this source
+    // would otherwise have produced one. A prompt-only provider is missing four
+    // kinds because its parser never reads them, and blaming the request for
+    // that sends the reader looking for an option to change instead of at the
+    // provider.
+    let declined = !options.include_related
+        && missing.contains(&EvidenceKind::Relationship)
+        && crate::discover::declared_evidence_kinds(&options.source)
+            .contains(&EvidenceKind::Relationship);
     Some(HydrationDiagnostic {
         code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
         message: format!(
@@ -1737,10 +1803,10 @@ fn partial_coverage_diagnostic(
             options.source,
             crate::source_evidence::join_kinds(coverage),
             crate::source_evidence::join_kinds(&missing),
-            if options.include_related {
-                ""
-            } else {
+            if declined {
                 " (include_related is off, so delegation evidence is not read)"
+            } else {
+                ""
             },
         ),
         duration_ms: None,
@@ -2634,6 +2700,183 @@ mod tests {
             ]),
             "full"
         );
+    }
+
+    fn relationship_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    /// Declining related evidence has to reach *every* path that writes a
+    /// relationship, not just the ones named after delegation. A Claude
+    /// transcript carrying `remoteSessionId` records a `materialized_local`
+    /// edge into `session_relationships` -- the same table the `Relationship`
+    /// kind is defined over -- so writing it while reporting no relationship
+    /// coverage leaves the result and the database disagreeing.
+    #[test]
+    fn declining_related_evidence_skips_the_claude_materialization_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join(".claude/projects/app/local-1.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            "{\"sessionId\":\"local-1\",\"remoteSessionId\":\"session_01remote\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "local-1", Some(&transcript));
+        // The remote counterpart is already known, which is what makes the
+        // materialization edge eligible to be written at all.
+        conn.execute(
+            "INSERT INTO session_presences (source, session_id, location, discovery_state) \
+             VALUES ('claude', 'session_01remote', 'remote', 'shallow')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut request = options("claude", "local-1");
+        request.include_related = false;
+        let declined = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert!(!declined.coverage.contains(&EvidenceKind::Relationship));
+        assert_eq!(
+            relationship_rows(&open_db(&db).unwrap()),
+            0,
+            "a declined acquisition wrote a relationship it reported not covering"
+        );
+
+        // Control: asking for related evidence still records the edge, so the
+        // assertion above is about the option and not about a transcript whose
+        // remote counterpart was never linkable.
+        request.include_related = true;
+        let requested = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert!(requested.coverage.contains(&EvidenceKind::Relationship));
+        assert_eq!(relationship_rows(&open_db(&db).unwrap()), 1);
+    }
+
+    fn codex_rollout(path: &Path, id: &str, parent: Option<&str>, ts: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = match parent {
+            Some(parent) => format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"parent_thread_id\":\"{parent}\",\"cwd\":\"/work/app\",\"source\":{{\"subagent\":{{\"other\":\"guardian\"}}}}}}}}\n"
+            ),
+            None => format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/work/app\"}}}}\n"
+            ),
+        };
+        fs::write(
+            path,
+            format!(
+                "{meta}{{\"timestamp\":\"{ts}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{id} prompt\"}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Codex rollouts are partitioned by the date they started, so a child
+    /// spawned after midnight lands in the next day's directory. Scanning only
+    /// the parent's own directory never finds it, while Codex declares full
+    /// relationship coverage and the result reports `full` -- a complete claim
+    /// over a child nobody looked for.
+    #[test]
+    fn codex_children_are_found_across_the_date_directory_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join(".codex/sessions");
+        let root = sessions.join("2026/09/20/rollout-root.jsonl");
+        codex_rollout(&root, "root", None, "2026-09-20T23:59:00Z");
+        // Same day: the case that already worked, kept as the control.
+        codex_rollout(
+            &sessions.join("2026/09/20/rollout-same-day.jsonl"),
+            "same-day",
+            Some("root"),
+            "2026-09-20T23:59:30Z",
+        );
+        // Minutes later, but the calendar turned over.
+        codex_rollout(
+            &sessions.join("2026/09/21/rollout-after-midnight.jsonl"),
+            "after-midnight",
+            Some("root"),
+            "2026-09-21T00:00:30Z",
+        );
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert!(
+            result.related_session_ids.contains(&"same-day".to_string()),
+            "the same-day child is still found: {:?}",
+            result.related_session_ids
+        );
+        assert!(
+            result
+                .related_session_ids
+                .contains(&"after-midnight".to_string()),
+            "a child that started after midnight is in the next date directory: {:?}",
+            result.related_session_ids
+        );
+        // Codex declares relationship coverage, so the acquisition has to be
+        // able to reach every eligible child for `full` to be earned.
+        assert!(result.coverage.contains(&EvidenceKind::Relationship));
+        assert_eq!(result.capability, "full");
+    }
+
+    /// The opt-out explains an absent `relationship` and nothing else. A
+    /// prompt-only source is missing four kinds because its parser never reads
+    /// them, and blaming the request for that sends the reader looking for an
+    /// option to change instead of at the provider.
+    #[test]
+    fn the_partial_diagnostic_blames_the_opt_out_only_for_what_it_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cursor_transcript(dir.path(), "cursor-4", "cursor prompt");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cursor-4", Some(&transcript));
+        drop(conn);
+
+        let mut request = options("cursor", "cursor-4");
+        request.include_related = false;
+        let prompt_only = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        let message = prompt_only
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+            .expect("a prompt-only hydration names its missing kinds")
+            .message
+            .clone();
+        assert!(
+            !message.contains("include_related"),
+            "cursor has no relationship parser, so the opt-out did not remove it: {message}"
+        );
+
+        // Control: a source that does declare delegation, with the same flag
+        // off, still attributes the absence to the request.
+        let claude = dir.path().join(".claude/projects/app/claude-4.jsonl");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        fs::write(
+            &claude,
+            "{\"sessionId\":\"claude-4\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "claude-4", Some(&claude));
+        drop(conn);
+        let mut request = options("claude", "claude-4");
+        request.include_related = false;
+        let declined = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert!(declined
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+            .expect("claude declined delegation and says so")
+            .message
+            .contains("include_related is off"));
     }
 
     /// The declared table is what `build_result` computes from, so it is

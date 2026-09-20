@@ -105,7 +105,13 @@ struct ManagedRecord {
 #[derive(Default, Serialize, Deserialize)]
 struct RecordSnapshot {
     format: String,
+    /// Everything this connector has ever covered. Only grows: not covering a
+    /// kind does not withdraw the records an earlier pass contributed.
     covered_kinds: Vec<EvidenceKind>,
+    /// What the *last* acquisition covered. The accumulated set above cannot
+    /// answer whether this pass narrowed, because it never shrinks.
+    #[serde(default)]
+    acquired_kinds: Option<Vec<EvidenceKind>>,
     records: Vec<ManagedRecord>,
 }
 fn read_snapshot(conn: &Connection, key: &ObservationKey) -> Result<RecordSnapshot> {
@@ -134,6 +140,9 @@ fn read_snapshot(conn: &Connection, key: &ObservationKey) -> Result<RecordSnapsh
             Ok(RecordSnapshot {
                 format: "records".into(),
                 covered_kinds: vec![EvidenceKind::SessionEvent],
+                // A migrated snapshot never recorded what its last acquisition
+                // covered, so the next pass cannot prove it was unchanged.
+                acquired_kinds: None,
                 records,
             })
         }
@@ -256,7 +265,7 @@ pub(crate) fn apply_normalized(
     }
     let mut own = snapshots.remove(&owner(key)).unwrap_or_default();
     let prior_records = own.records.clone();
-    let prior_kinds = own.covered_kinds.clone();
+    let prior_kinds = own.acquired_kinds.take();
     own.format = "records".into();
     own.records
         .retain(|item| !evidence.covered_kinds.contains(&item.record.kind));
@@ -274,11 +283,16 @@ pub(crate) fn apply_normalized(
     own.records
         .sort_by_cached_key(|item| item.record.identity());
     // Coverage is part of the result, not just bookkeeping: an acquisition that
-    // covers a kind the last one did not changes the capability even when it
-    // adds no row -- the session simply has none of that kind. Reporting that
-    // as `unchanged` invites a consumer to skip the upgrade it just asked for.
+    // covers a different set from the last one changes the capability even when
+    // it adds or removes no row. Compared against the *last acquisition's* set
+    // rather than the accumulated one, which only grows and so can only ever
+    // notice widening -- a later narrowing pass would report `partial` while
+    // calling itself `unchanged`, and a consumer that skips work on `unchanged`
+    // would keep the earlier `full` ranking. A snapshot written before this
+    // field existed has no previous set to compare, so it is not unchanged.
+    own.acquired_kinds = Some(evidence.covered_kinds.clone());
     let unchanged = own.records == prior_records
-        && own.covered_kinds == prior_kinds
+        && prior_kinds.as_deref() == Some(evidence.covered_kinds.as_slice())
         && previous.as_ref().is_some_and(|checkpoint| {
             checkpoint.source_stamp.as_deref() == Some(&evidence.source_stamp)
         });

@@ -2723,7 +2723,9 @@ fn sync_claude_session_metadata(
                 Some(&path.to_string_lossy()),
             )?;
             ingest_claude_transcript(conn, &path)?;
-            record_claude_remote_relationship(conn, &meta)?;
+            // Global sync is not scoped to one thread, so it indexes the
+            // materialization edge like every other kind.
+            record_claude_remote_relationship(conn, &meta, true)?;
             upserted += 1;
         }
     }
@@ -2937,7 +2939,18 @@ pub(crate) fn reconcile_claude_remote_relationships(conn: &Connection) -> Result
     Ok(())
 }
 
-fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+/// Correlate a local transcript with the remote session it materialized from.
+///
+/// `include_related` gates only the `session_relationships` write. The identity
+/// correlation is a fact about the selected session itself -- which remote id
+/// it carries -- and appears in no reported relationship field, so recording it
+/// keeps `reconcile_claude_remote_relationships` able to link the pair later
+/// without this acquisition claiming evidence it was told not to gather.
+fn record_claude_remote_relationship(
+    conn: &Connection,
+    meta: &ClaudeSessionMeta,
+    include_related: bool,
+) -> Result<()> {
     let Some(remote_id) = meta.remote_session_id.as_deref() else {
         return Ok(());
     };
@@ -2959,7 +2972,11 @@ fn record_claude_remote_relationship(conn: &Connection, meta: &ClaudeSessionMeta
         [remote_id],
         |row| row.get(0),
     )?;
-    if remote_exists {
+    // A `materialized_local` edge lands in `session_relationships`, the table
+    // the `Relationship` kind is defined over, so writing one for a request
+    // that declined related evidence leaves the result reporting no
+    // relationship coverage over a database that has some.
+    if remote_exists && include_related {
         record_claude_materialized_relationship(conn, remote_id, &meta.session_id)?;
     }
     Ok(())
