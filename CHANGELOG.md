@@ -21,7 +21,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not
-  re-registered on every tick. `watch --remote` installs
+  re-registered on every tick. Reconciliation runs on an absolute deadline
+  rather than when the wait expires, so a busy session writing every few
+  hundred milliseconds cannot postpone attaching the roots beside it. `watch --remote` installs
   no local roots, so local writes cannot drive remote connector traffic.
 - `sync` now short-circuits on a stat-only source fingerprint folded over
   everything the sweep reads — the enumerated transcripts, the Claude subagent

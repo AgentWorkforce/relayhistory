@@ -500,12 +500,18 @@ const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex"];
 /// guardable. `catalog` is the `sessions` row itself: losing it is not an
 /// evidence loss but a *catalog* loss, and discovery would otherwise skip the
 /// source whose stamp still matched and leave the row missing.
+///
+/// Counts are unsigned on purpose. A count cannot be negative, so a marker
+/// that carries one is corrupt — and under a `>=` comparison a negative stored
+/// count is satisfied by *anything*, which would turn a corrupt marker into a
+/// blanket licence to skip the sweep. Unsigned makes that unrepresentable, and
+/// the parser rejects it, so a corrupt marker reads as unknown and sweeps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SessionHoldings {
-    events: i64,
-    tool_calls: i64,
-    file_edits: i64,
-    catalog: i64,
+    events: u64,
+    tool_calls: u64,
+    file_edits: u64,
+    catalog: u64,
 }
 
 impl SessionHoldings {
@@ -540,7 +546,11 @@ impl SessionHoldings {
 /// session.
 fn destination_generation(conn: &Connection) -> Result<String> {
     let holdings = session_holdings(conn)?;
-    let mut marker = String::from(DESTINATION_MARKER_VERSION);
+    // The entry count comes first so that a truncated marker is detectable.
+    // Without it, a marker cut short reads as a *shorter* one — and an empty
+    // database legitimately produces no entries at all, so "no entries" could
+    // not otherwise be told from "the entries are missing".
+    let mut marker = format!("{DESTINATION_MARKER_VERSION} n{}", holdings.len());
     for (session, held) in holdings {
         marker.push_str(&format!(
             " {session:016x}={}.{}.{}.{}",
@@ -551,7 +561,7 @@ fn destination_generation(conn: &Connection) -> Result<String> {
 }
 
 /// Which count in [`SessionHoldings`] one grouped read fills in.
-type HoldingField = fn(&mut SessionHoldings) -> &mut i64;
+type HoldingField = fn(&mut SessionHoldings) -> &mut u64;
 
 /// Every session the marker is answerable for, keyed by the hash the marker
 /// stores.
@@ -584,7 +594,9 @@ fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>>
         while let Some(row) = rows.next()? {
             let source: String = row.get(0)?;
             let session_id: String = row.get(1)?;
-            let count: i64 = row.get(2)?;
+            // `COUNT(*)` is never negative; a driver that somehow produced
+            // one must not become a marker entry that covers everything.
+            let count = u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0);
             // Hashed rather than spelled out: the marker is rewritten with
             // every sweep and read on every tick, and a session's identity
             // only has to be *distinguishable*, not recoverable. 64 bits keeps
@@ -610,12 +622,15 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
     if parts.next()? != DESTINATION_MARKER_VERSION {
         return None;
     }
+    let expected = parts.next()?.strip_prefix('n')?.parse::<usize>().ok()?;
     let mut sessions = BTreeMap::new();
     for part in parts {
         let (session, held) = part.split_once('=')?;
         let session = u64::from_str_radix(session, 16).ok()?;
         let mut counts = held.split('.');
-        let mut next = || counts.next()?.parse::<i64>().ok();
+        // Unsigned: `-1` is a parse error rather than a count that every
+        // current value satisfies.
+        let mut next = || counts.next()?.parse::<u64>().ok();
         let held = SessionHoldings {
             events: next()?,
             tool_calls: next()?,
@@ -630,6 +645,9 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
         if sessions.insert(session, held).is_some() {
             return None;
         }
+    }
+    if sessions.len() != expected {
+        return None;
     }
     Some(DestinationMarker { sessions })
 }

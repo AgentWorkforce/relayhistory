@@ -532,6 +532,14 @@ impl WatchLoop {
         // When the loop last swept on its own cadence, so that waking early
         // to reconcile does not also sweep early.
         let mut last_poll_sweep = std::time::Instant::now();
+        // When reconciliation is next due, as an absolute instant. It has to
+        // be absolute: every filesystem event ends the wait early, so a
+        // reconciliation gated on the wait *expiring* is starved by exactly
+        // the machine this loop exists for — one busy session writing every
+        // couple of hundred milliseconds would postpone attaching a provider
+        // installed beside it for as long as the writing lasts.
+        let mut next_reconcile =
+            std::time::Instant::now() + Duration::from_millis(self.slow_poll_ms);
         while !self.inner.stopped() {
             let sweep_every = match self.current_driver() {
                 WatchDriver::FsEvents => self.slow_poll_ms,
@@ -560,10 +568,16 @@ impl WatchLoop {
             if self.inner.stopped() {
                 break;
             }
-            // Only on a backstop tick: retrying on every filesystem event
-            // would hammer the watcher during a burst, and a root appearing is
-            // not something an event on another root tells us about.
-            if trigger == TickTrigger::Poll {
+            // On a deadline rather than on the trigger. Reconciling on every
+            // wake would hammer the watcher during a burst, which is why this
+            // used to run only when the wait expired — but an event ends the
+            // wait early, so under sustained writes that moment never came and
+            // a pending root stayed pending for as long as the writing lasted.
+            // The deadline gives the same at-most-once-per-interval rate
+            // without depending on how the loop woke up.
+            let now = std::time::Instant::now();
+            if now >= next_reconcile {
+                next_reconcile = now + Duration::from_millis(reconcile_every);
                 if let Some(watch) = watcher.as_mut() {
                     // Re-derive first, then attach: a root can be new as a
                     // *name* (a project that grew a `.trajectories` directory)
@@ -579,6 +593,8 @@ impl WatchLoop {
                         self.publish_status(Some(&*watch));
                     }
                 }
+            }
+            if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
                 // wait was deliberately shortened above, so a loop that was
                 // not woken early behaves exactly as before.

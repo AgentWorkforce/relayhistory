@@ -97,7 +97,11 @@ sweeps stay on the hour it was given. That tick also re-checks each
 registration against the directory it was made against — a watch is bound to
 the directory object, not to its name, so a root deleted and recreated
 (`rm -rf ~/.codex/sessions`, then the next session) has a live name and a dead
-watch — and re-registers only the ones that changed. The backstop also
+watch — and re-registers only the ones that changed. That work is on a
+deadline rather than on the tick that found the loop idle: every filesystem
+event ends the wait early, so a session writing a few times a second would
+otherwise postpone attaching a provider installed beside it for as long as it
+kept writing. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.

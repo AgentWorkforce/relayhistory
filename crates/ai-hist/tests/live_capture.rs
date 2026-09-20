@@ -720,6 +720,108 @@ fn an_uncovered_root_is_retried_on_the_backstop_not_the_user_interval() {
     }
 }
 
+/// Reconciliation must not depend on the loop running out of things to do.
+///
+/// Every filesystem event ends the wait early, so a reconciliation that only
+/// happens when the wait *expires* is starved by exactly the machine live
+/// capture exists for: one session writing a few times a second postpones
+/// attaching every pending root for as long as it keeps writing, and a
+/// provider installed in that window — or a rollout written to it and cleaned
+/// up again — is missed entirely.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_busy_root_does_not_starve_another_root_of_its_reconciliation() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let busy = home.path().join(".codex/sessions");
+    std::fs::create_dir_all(&busy).expect("busy root");
+    let late = home.path().join(".claude/projects");
+
+    let running = RunningLoop::reporting({
+        let busy = busy.clone();
+        let late = late.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![
+                    ai_hist::discover::WatchRoot::tree(busy),
+                    ai_hist::discover::WatchRoot::tree(late),
+                ])
+                .with_debounce_ms(50)
+                // The backstop, which the writes below are faster than.
+                .with_slow_poll_ms(400)
+                .with_poll_interval_ms(400)
+        }
+    });
+    assert_eq!(
+        running.watch.status().expect("status").pending,
+        vec![late.clone()],
+        "the root that does not exist yet is the one pending"
+    );
+
+    // Keep one watched root busy at well under the backstop interval, so the
+    // wait never expires while this runs.
+    let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let written = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let busy = busy.clone();
+        let writing = writing.clone();
+        let written = written.clone();
+        std::thread::spawn(move || {
+            let mut index = 0u64;
+            while writing.load(Ordering::SeqCst) {
+                index += 1;
+                if std::fs::write(busy.join(format!("busy-{index}.jsonl")), "{}\n").is_ok() {
+                    written.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    // Positive control: the writer is real and its events reach the loop, so a
+    // failure below is starvation rather than a watcher that never worked.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "the busy root drove no forced sweep"
+            ),
+        }
+    }
+
+    std::fs::create_dir_all(&late).expect("install the second provider");
+
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while !running
+        .watch
+        .status()
+        .expect("status")
+        .watched
+        .contains(&late)
+    {
+        if std::time::Instant::now() >= deadline {
+            writing.store(false, Ordering::SeqCst);
+            let _ = writer.join();
+            panic!(
+                "a root stayed pending while another root was written to ({} writes): {:?}",
+                written.load(Ordering::SeqCst),
+                running.watch.status()
+            );
+        }
+        std::thread::yield_now();
+    }
+
+    writing.store(false, Ordering::SeqCst);
+    let _ = writer.join();
+    assert!(
+        written.load(Ordering::SeqCst) > 4,
+        "the busy root must have been written to throughout, or nothing was starving anything"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
@@ -1679,6 +1781,75 @@ fn history_rows_are_outside_the_repair_guard() {
     );
 }
 
+/// A count cannot be negative, and a marker that carries one is corrupt. The
+/// danger is specific: under the `current >= stored` rule a negative stored
+/// count is satisfied by *every* current value, so a corrupted marker would
+/// not merely be wrong — it would be a blanket licence to skip the sweep over
+/// evidence that is actually missing. It has to read as unknown instead.
+///
+/// The entry is mutated in place, keeping the session hash the sweep wrote, so
+/// the corrupt count lands on a session that really exists. A made-up hash
+/// would never match one and the rule would not be exercised at all.
+#[test]
+fn a_negative_count_in_the_marker_does_not_license_a_skip() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_codex_rollout(home.path(), "sess-negative");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the marker matters"
+    );
+
+    let before = codex_event_count(&db, "sess-negative");
+    assert!(before > 0);
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-negative'",
+        [],
+    )
+    .expect("delete the events");
+    drop(conn);
+
+    let state_path = home.path().join(".sync-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read sync state"))
+            .expect("parse sync state");
+    let marker = state["destination_generation"]
+        .as_str()
+        .expect("a stored marker")
+        .to_string();
+    let corrupted = marker
+        .split(' ')
+        .map(|part| match part.split_once('=') {
+            Some((session, _)) => format!("{session}=-1.-1.-1.-1"),
+            None => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_ne!(
+        corrupted, marker,
+        "positive control: the marker must have had an entry to corrupt"
+    );
+    state["destination_generation"] = serde_json::Value::from(corrupted);
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize sync state"),
+    )
+    .expect("write sync state");
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a marker carrying a negative count must sweep, not skip"
+    );
+    assert_eq!(
+        codex_event_count(&db, "sess-negative"),
+        before,
+        "and the sweep it forced must restore the evidence that was missing"
+    );
+}
+
 /// The sweep stores an empty marker when it could not measure the destination,
 /// and a database written by another build may store anything at all. Reading
 /// one has to mean "unknown, go and sweep" — a panic here kills the watch tick
@@ -1687,12 +1858,28 @@ fn history_rows_are_outside_the_repair_guard() {
 fn an_unreadable_destination_marker_sweeps_instead_of_panicking() {
     for marker in [
         serde_json::Value::from(""),
-        serde_json::Value::from("v2"),
-        serde_json::Value::from("v2 s1"),
-        serde_json::Value::from("v2 sx h1"),
-        serde_json::Value::from("v2 s1 h1 notanentry"),
-        serde_json::Value::from("v2 s1 h1 zzzz=1"),
-        serde_json::Value::from("v1 s1 h1"),
+        serde_json::Value::from("v4"),
+        // Shaped like this build's marker, and wrong in one way each.
+        serde_json::Value::from("v4 n1"),
+        serde_json::Value::from("v4 nx abcdef0123456789=1.0.0.1"),
+        serde_json::Value::from("v4 n1 notanentry"),
+        serde_json::Value::from("v4 n1 zzzz=1.2.3.4"),
+        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3"),
+        serde_json::Value::from("v4 n1 abcdef0123456789=1.2.3.4.5"),
+        serde_json::Value::from("v4 n1 abcdef0123456789=1.x.3.4"),
+        // Truncated: the count is what makes this distinguishable from a
+        // database that legitimately holds fewer sessions.
+        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1"),
+        // A negative count is the dangerous one: under a `>=` comparison it is
+        // satisfied by every current value, so a corrupt marker would license
+        // a skip over missing evidence rather than a sweep.
+        serde_json::Value::from("v4 n1 abcdef0123456789=-1.0.0.1"),
+        serde_json::Value::from("v4 n1 abcdef0123456789=0.0.0.-1"),
+        // An entry repeated is not something the grouped reads can produce.
+        serde_json::Value::from("v4 n2 abcdef0123456789=1.0.0.1 abcdef0123456789=2.0.0.1"),
+        // Markers from the shapes this one replaced.
+        serde_json::Value::from("v3 s1 h1"),
+        serde_json::Value::from("v2 s1:e1:r1:h1"),
         serde_json::Value::from(":::"),
         serde_json::Value::from(7),
     ] {
