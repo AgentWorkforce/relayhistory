@@ -555,6 +555,23 @@ pub(crate) fn parse_updates(contents: &str) -> GrokUpdates {
         };
         let kind = update_kind(raw_kind);
         let ts_ms = envelope_timestamp_ms(&value, params, update, meta);
+        if kind == UpdateKind::Other {
+            // A kind this parser does not interpret is not a break in the
+            // conversation. Grok interleaves `plan`, `hook_execution` and
+            // `retry_state` rows into a streaming message, and treating one as
+            // a boundary would split that message into two chunk groups --
+            // which shifts every later ordinal join by one and hands the
+            // following user, assistant and thinking events somebody else's
+            // timestamp. So it updates the session's time bounds, which are a
+            // real fact about it, and touches nothing else: not the turn,
+            // not `previous_kind`.
+            updates.unread_rows += 1;
+            if let Some(ts) = ts_ms {
+                updates.first_ms = Some(updates.first_ms.map_or(ts, |first| first.min(ts)));
+                updates.last_ms = Some(updates.last_ms.map_or(ts, |last| last.max(ts)));
+            }
+            continue;
+        }
         let turn_start_ms = first_number(&[
             update.get("turnStartMs"),
             meta.get("turnStartMs"),
@@ -648,7 +665,8 @@ pub(crate) fn parse_updates(contents: &str) -> GrokUpdates {
                     current.end_ms = ts_ms.or(current.end_ms);
                 }
             }
-            UpdateKind::Other => updates.unread_rows += 1,
+            // Handled above, before any turn or coalescing state was touched.
+            UpdateKind::Other => {}
         }
         previous_kind = Some(kind);
     }
@@ -953,6 +971,56 @@ mod tests {
         assert_eq!(updates.turns[1].total_tokens, Some(99));
         assert_eq!(updates.user_messages.len(), 2);
         assert_eq!(updates.user_messages[1].turn, 1);
+    }
+
+    /// Grok interleaves `plan`, `hook_execution` and `retry_state` rows into
+    /// a streaming message. A kind this parser does not interpret is not a
+    /// break in the conversation: treating one as a boundary splits a message
+    /// into two groups, and every later ordinal join then reads one group too
+    /// far and hands the next message somebody else's timestamp.
+    #[test]
+    fn a_skipped_update_kind_does_not_split_a_streamed_message() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"one "}},"_meta":{"eventId":"a","agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"plan","entries":[]},"_meta":{"eventId":"p","agentTimestampMs":1500,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"two"}},"_meta":{"eventId":"b","agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+            // A tool call is a real boundary, so what follows it is a second
+            // message. The `plan` row above is not.
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1"},"_meta":{"agentTimestampMs":3000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"next"}},"_meta":{"eventId":"c","agentTimestampMs":5000,"turnStartMs":1000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates(&stream);
+        // Two messages: the streamed one, and the one after it. Not three.
+        assert_eq!(updates.agent_messages.len(), 2);
+        assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
+        assert_eq!(updates.agent_messages[0].event_id.as_deref(), Some("a"));
+        // The second assistant record must get 5000. With the plan row
+        // counted as a boundary it would get 2000 -- the middle of the first
+        // message -- and everything after it would be wrong too.
+        assert_eq!(updates.agent_messages[1].ts_ms, Some(5000));
+        assert_eq!(updates.unread_rows, 1);
+        // The skipped row is still real activity, so it still bounds the
+        // session; it just does not divide it.
+        assert_eq!(updates.first_ms, Some(1000));
+        assert_eq!(updates.last_ms, Some(5000));
+        assert_eq!(updates.turns.len(), 1);
+    }
+
+    /// A skipped row carrying a `turnStartMs` must not open a turn either.
+    #[test]
+    fn a_skipped_update_kind_does_not_open_a_turn() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"hook_execution"},"_meta":{"agentTimestampMs":10,"turnStartMs":10}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":77},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates(&stream);
+        assert_eq!(updates.turns.len(), 1);
+        assert_eq!(updates.turns[0].start_ms, Some(1000));
+        assert_eq!(updates.turns[0].total_tokens, Some(77));
+        assert_eq!(updates.user_messages[0].turn, 0);
     }
 
     #[test]

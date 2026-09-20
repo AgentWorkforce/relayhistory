@@ -3,7 +3,7 @@
 use super::*;
 use crate::observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ pub struct HydrationEvidence {
     pub related_sessions: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HydrationDiagnostic {
     pub code: String,
     pub message: String,
@@ -199,12 +199,20 @@ fn hydrate_session_at_with_home_and_connectors(
         && (!options.include_related || previous.as_ref().is_some_and(|(_, _, included)| *included))
         && target.discovery_state.as_deref() == Some("full")
     {
-        return build_result(
+        // What the provider's own records could not establish is a fact
+        // about the stored evidence, not about this run. A reader of an
+        // `unchanged` result is looking at exactly the rows the parse-path
+        // reader saw, so it has to be told the same things about them --
+        // above all that a token count it can see is a context proxy and not
+        // billing usage.
+        let cached_diagnostics = stored_source_diagnostics(&conn, options)?;
+        return build_result_with(
             &conn,
             options,
             "unchanged",
             snapshot,
             started.elapsed().as_millis() as i64,
+            cached_diagnostics,
         );
     }
 
@@ -238,13 +246,14 @@ fn hydrate_session_at_with_home_and_connectors(
     let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
     tx.execute(
         "INSERT INTO session_hydration_checkpoints \
-         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms) \
-         VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms, source_diagnostics_json) \
+         VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, location) DO UPDATE SET \
            source_stamp = excluded.source_stamp, parser_version = excluded.parser_version, \
            last_event_at_ms = excluded.last_event_at_ms, source_bytes = excluded.source_bytes, \
            records_parsed = excluded.records_parsed, include_related = excluded.include_related, \
-           updated_ms = excluded.updated_ms",
+           updated_ms = excluded.updated_ms, \
+           source_diagnostics_json = excluded.source_diagnostics_json",
         params![
             options.source,
             options.session_id,
@@ -255,6 +264,7 @@ fn hydrate_session_at_with_home_and_connectors(
             snapshot.records,
             options.include_related,
             now_ms(),
+            serde_json::to_string(&source_diagnostics).ok(),
         ],
     )?;
     let local_observation=local_observation.unwrap_or(SessionObservation{key:local_key,raw_locator:target.locator.clone(),source_stamp:tx.query_row("SELECT source_stamp FROM session_presences WHERE source=? AND session_id=? AND location='local'",params![options.source,options.session_id],|row|row.get(0)).optional()?.flatten(),discovery_state:"shallow".into(),access_state:"available".into(),updated_ms:now_ms()});
@@ -1205,6 +1215,56 @@ fn complete_jsonl_records(path: &Path) -> Result<i64> {
     Ok(records)
 }
 
+/// The provider diagnostics a previous parse of this session recorded.
+///
+/// A checkpoint written before they were persisted has none, so a provider
+/// that has something true to say about *any* stored session says it from the
+/// evidence instead. Reporting nothing would be the worst answer: the caller
+/// cannot tell "no caveats" from "caveats not loaded".
+fn stored_source_diagnostics(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+) -> Result<Vec<HydrationDiagnostic>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT source_diagnostics_json FROM session_hydration_checkpoints \
+             WHERE source = ? AND session_id = ? AND location = 'local'",
+            params![options.source, options.session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(stored) = stored {
+        if let Ok(diagnostics) = serde_json::from_str::<Vec<HydrationDiagnostic>>(&stored) {
+            return Ok(diagnostics);
+        }
+    }
+    if options.source == "grok" {
+        return Ok(vec![grok_usage_diagnostic(stored_grok_context_tokens(
+            conn,
+            &options.session_id,
+        )?)]);
+    }
+    Ok(Vec::new())
+}
+
+/// The newest context-window snapshot already stored for a Grok session.
+fn stored_grok_context_tokens(conn: &Connection, session_id: &str) -> Result<Option<i64>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT token_json FROM session_events \
+             WHERE source = 'grok' AND session_id = ? AND token_json IS NOT NULL \
+             ORDER BY ts_ms DESC, id DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(stored
+        .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
+        .and_then(|token| token.get("context_total_tokens").and_then(Value::as_i64)))
+}
+
 /// Index the selected session and hand back whatever the provider's own
 /// records could not establish, as diagnostics the caller reports verbatim.
 fn ingest_selected(
@@ -1617,17 +1677,13 @@ fn ingest_grok(
 /// true of every Grok session: the harness logs no per-turn billing tokens at
 /// all, and a consumer that reads `token_json` has to be told that before it
 /// adds the numbers up.
-fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
-    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
-        code: code.to_string(),
-        message,
-        duration_ms: None,
-        source_bytes: None,
-        records_parsed: None,
-    };
-    let mut diagnostics = vec![diagnostic(
-        "GROK_USAGE_CONTEXT_PROXY_ONLY",
-        match outcome.context_total_tokens {
+/// The one thing that is true of **every** Grok session, parsed or cached:
+/// the harness writes no per-turn billing tokens, so the only token fact
+/// stored is a context-window snapshot that can go down as well as up.
+fn grok_usage_diagnostic(context_total_tokens: Option<i64>) -> HydrationDiagnostic {
+    HydrationDiagnostic {
+        code: "GROK_USAGE_CONTEXT_PROXY_ONLY".to_string(),
+        message: match context_total_tokens {
             Some(total) => format!(
                 "grok records no per-turn input/output tokens; the only token fact is the \
                  updates.jsonl context-window snapshot (latest: {total}), which can decrease \
@@ -1637,7 +1693,21 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
                      updates.jsonl carried no totalTokens snapshot either"
                 .to_string(),
         },
-    )];
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    }
+}
+
+fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
+    let diagnostic = |code: &str, message: String| HydrationDiagnostic {
+        code: code.to_string(),
+        message,
+        duration_ms: None,
+        source_bytes: None,
+        records_parsed: None,
+    };
+    let mut diagnostics = vec![grok_usage_diagnostic(outcome.context_total_tokens)];
     if outcome.missing_updates {
         diagnostics.push(diagnostic(
             "GROK_UPDATES_STREAM_MISSING",
@@ -1703,17 +1773,9 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
     diagnostics
 }
 
-fn build_result(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    status: &str,
-    snapshot: SourceSnapshot,
-    duration_ms: i64,
-) -> Result<HydrateSessionResult> {
-    build_result_with(conn, options, status, snapshot, duration_ms, Vec::new())
-}
-
-/// [`build_result`] plus the diagnostics this run's provider parser produced.
+/// Assemble the result, including the diagnostics the provider's parser
+/// produced this run — or, on a read that parsed nothing, the ones a previous
+/// parse of the same evidence recorded.
 fn build_result_with(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -2672,6 +2734,412 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompts, 2);
+    }
+
+    /// Grok **rewrites** `chat_history.jsonl` in place, so a read is a
+    /// replacement snapshot and not an append. Evidence whose source record is
+    /// gone from the rewritten directory has to go with it.
+    ///
+    /// The positive control is in the same assertions: the evidence that is
+    /// still in the files must still be in the database, so the test cannot
+    /// pass by deleting everything.
+    #[test]
+    fn grok_re_ingestion_drops_the_evidence_the_rewritten_directory_no_longer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let session_dir = chat.parent().unwrap().to_path_buf();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert!(grok_has_tool_call(&conn, "call_shell_2"));
+        assert!(grok_has_event(&conn, "tool:call_write_1"));
+        assert!(grok_has_file_edit(&conn, "/tmp/demo/test/http.test.ts"));
+        assert_eq!(grok_marker_count(&conn, "compaction_boundary"), 1);
+        assert_eq!(grok_relationship_count(&conn), 1);
+
+        // Grok rebuilds the transcript: the failing `npm test` call and the
+        // `Write` that preceded it are gone, the checkpoint file was pruned,
+        // and so was the subagent entry. The first prompt and its Shell call
+        // survive, and every record has shifted position in the file.
+        let rewritten = fs::read_to_string(&chat)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.contains("call_write_1")
+                    && !line.contains("call_shell_2")
+                    && !line.contains("now a test")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&chat, rewritten).unwrap();
+        fs::remove_file(session_dir.join("compaction_checkpoints/1789560090000.json")).unwrap();
+        fs::remove_file(session_dir.join("subagents/agent-review.json")).unwrap();
+
+        let again =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(again.status, "updated");
+
+        // Gone from the files, gone from the evidence.
+        assert!(!grok_has_tool_call(&conn, "call_shell_2"));
+        assert!(!grok_has_tool_call(&conn, "call_write_1"));
+        assert!(!grok_has_event(&conn, "tool:call_write_1"));
+        assert!(!grok_has_event(&conn, "result:call_shell_2"));
+        assert!(!grok_has_file_edit(&conn, "/tmp/demo/test/http.test.ts"));
+        assert_eq!(grok_marker_count(&conn, "compaction_boundary"), 0);
+        assert_eq!(grok_relationship_count(&conn), 0);
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 1);
+
+        // Still in the files, still in the evidence — including the rows whose
+        // positional `r{idx}` identity moved when the file was rewritten.
+        assert!(grok_has_tool_call(&conn, "call_shell_1"));
+        assert!(grok_has_tool_call(&conn, "call_edit_1"));
+        assert!(grok_has_event(&conn, "result:call_edit_1"));
+        assert!(grok_has_file_edit(&conn, "/tmp/demo/src/http.ts"));
+        assert_eq!(grok_marker_count(&conn, "system"), 1);
+        assert_eq!(grok_marker_count(&conn, "prompt_context"), 1);
+        // One system marker, not two: the rewrite moved it from record 0 to
+        // record 0, but an `r{idx}` that shifted would otherwise duplicate.
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            markers, 5,
+            "system, synthetic_turn, encrypted_reasoning, prompt_context, signals"
+        );
+    }
+
+    /// A Grok turn whose whole answer is tool calls — no prose at all — is an
+    /// ordinary turn, and its context snapshot has to land somewhere. When the
+    /// snapshot was only ever attached to a prose event, that turn's
+    /// `totalTokens` was silently dropped.
+    #[test]
+    fn a_turn_answered_only_with_tool_calls_still_records_its_context_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Ftools/grok-tools-0001");
+        fs::create_dir_all(&session_dir).unwrap();
+        let chat = session_dir.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>run the tests</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"","model_id":"grok-4-build","tool_calls":[{"id":"call_only_1","name":"Shell","arguments":{"command":"npm test"}}]}"#,
+                "\n",
+                r#"{"type":"tool_result","tool_call_id":"call_only_1","content":"all green"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            br#"{"info":{"id":"grok-tools-0001","cwd":"/tmp/tools"},"created_at":"2026-09-16T12:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"u1","agentTimestampMs":1789560000000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_only_1"},"_meta":{"agentTimestampMs":1789560002000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call_only_1","status":"completed"},"_meta":{"agentTimestampMs":1789560004000,"turnStartMs":1789560000000}}}"#,
+                "\n",
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":4242},"_meta":{"agentTimestampMs":1789560005000,"turnStartMs":1789560000000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-tools-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-tools-0001"), dir.path())
+                .unwrap();
+        let conn = open_db(&db).unwrap();
+        let recorded: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT event_uid, token_json FROM session_events \
+                 WHERE source = 'grok' AND token_json IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            vec![(
+                "tool:call_only_1".to_string(),
+                r#"{"context_total_tokens":4242,"source":"updates.jsonl"}"#.to_string(),
+            )],
+            "the turn's only assistant event is its tool use"
+        );
+        // Positive control: the caveat quotes the same number, so the snapshot
+        // was really read and not defaulted.
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("latest: 4242")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    /// A relationship recorded by somebody else about this session is not this
+    /// session's to delete.
+    #[test]
+    fn grok_re_ingestion_keeps_a_relationship_another_session_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        crate::record_relationship(
+            &conn,
+            &crate::ObservedRelationship {
+                source: "grok",
+                parent_session_id: "grok-parent-0000",
+                child_session_id: Some("grok-evt-0001"),
+                relationship: "delegated",
+                child_agent_type: None,
+                child_agent_name: None,
+                child_model: None,
+                spawn_depth: Some(1),
+                evidence_kind: "grok_subagent_dir",
+                evidence_locator: Some("/elsewhere/subagents/child.json"),
+                evidence_ref: None,
+                child_has_events: false,
+                spawned_at_ms: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let parents: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_relationships \
+                 WHERE source = 'grok' AND parent_session_id = 'grok-parent-0000'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parents, 1, "this session does not own its parent's record");
+        assert_eq!(grok_relationship_count(&conn), 1);
+    }
+
+    /// A new `compaction_checkpoints/` entry, an edited `signals.json` or a
+    /// new `subagents/` entry is new evidence even when the transcript and the
+    /// update stream are byte-identical.
+    #[test]
+    fn grok_hydration_re_reads_when_only_an_extra_file_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let session_dir = chat.parent().unwrap().to_path_buf();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert_eq!(grok_marker_count(&conn, "compaction_boundary"), 1);
+        // Positive control: with nothing touched, the read really is skipped.
+        let untouched =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(untouched.status, "unchanged");
+
+        fs::write(
+            session_dir.join("compaction_checkpoints/1789560200000.json"),
+            br#"{"created_at":"2026-09-16T12:03:20.000Z","reason":"manual"}"#,
+        )
+        .unwrap();
+        let after_checkpoint =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(after_checkpoint.status, "updated");
+        assert_eq!(grok_marker_count(&conn, "compaction_boundary"), 2);
+
+        fs::write(
+            session_dir.join("signals.json"),
+            br#"{"contextTokensUsed":9210,"turnCount":3,"compactionCount":2,"toolFailures":1}"#,
+        )
+        .unwrap();
+        let after_signals =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(after_signals.status, "updated");
+        let signals = crate::session_markers(&conn, "grok", "grok-evt-0001")
+            .unwrap()
+            .into_iter()
+            .find(|marker| marker.kind == "signals")
+            .unwrap();
+        assert_eq!(
+            signals.text.as_deref(),
+            Some("turns=3 compactions=2 context_tokens_used=9210")
+        );
+
+        fs::write(
+            session_dir.join("subagents/agent-second.json"),
+            br#"{"session_id":"grok-evt-0001-second","agent_type":"tester"}"#,
+        )
+        .unwrap();
+        let after_subagent =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(after_subagent.status, "updated");
+        assert_eq!(grok_relationship_count(&conn), 2);
+    }
+
+    /// The caveats belong to the stored evidence, not to the run that parsed
+    /// it: a reader of an `unchanged` result sees the same rows and has to be
+    /// told the same things about them.
+    #[test]
+    fn unchanged_grok_hydration_still_reports_what_grok_does_not_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let parsed =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        let cached =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(parsed.status, "hydrated");
+        assert_eq!(cached.status, "unchanged");
+
+        let codes = |result: &HydrateSessionResult| {
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.starts_with("GROK_"))
+                .map(|diagnostic| (diagnostic.code.clone(), diagnostic.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            codes(&parsed)
+                .iter()
+                .any(|(code, _)| code == "GROK_USAGE_CONTEXT_PROXY_ONLY"),
+            "{:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(
+            codes(&cached),
+            codes(&parsed),
+            "a cached read must report exactly what the parse reported"
+        );
+        assert!(codes(&cached)
+            .iter()
+            .any(|(_, message)| message.contains("latest: 9210")));
+    }
+
+    /// A checkpoint written before the diagnostics were persisted must not
+    /// leave a Grok session looking caveat-free.
+    #[test]
+    fn a_pre_existing_checkpoint_still_reports_the_grok_usage_caveat() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        // What an older release left behind: a checkpoint with no diagnostics.
+        conn.execute(
+            "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
+             WHERE source = 'grok'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let cached =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(cached.status, "unchanged");
+        let usage = cached
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "GROK_USAGE_CONTEXT_PROXY_ONLY")
+            .expect("the usage caveat, rebuilt from the stored rows");
+        // Rebuilt from the stored `token_json`, not from a parse.
+        assert!(usage.message.contains("latest: 9210"), "{}", usage.message);
+    }
+
+    fn grok_has_tool_call(conn: &Connection, tool_use_id: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE source = 'grok' AND tool_use_id = ?)",
+            params![tool_use_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn grok_has_event(conn: &Connection, event_uid: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = 'grok' AND event_uid = ?)",
+            params![event_uid],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn grok_has_file_edit(conn: &Connection, file_path: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_edits WHERE source = 'grok' AND file_path = ?)",
+            params![file_path],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn grok_marker_count(conn: &Connection, kind: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_markers WHERE source = 'grok' AND kind = ?",
+            params![kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn grok_relationship_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_relationships \
+             WHERE source = 'grok' AND parent_session_id = 'grok-evt-0001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn options(source: &str, session_id: &str) -> HydrateSessionOptions {

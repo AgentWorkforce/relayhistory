@@ -3997,7 +3997,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
-                inserted += ingest_grok_session(conn, &session, &raw_path)?.prompts;
+                // One session directory is one transaction: its evidence is
+                // replaced, not merged, and a reader must never see the gap
+                // between the two halves of that.
+                let tx = conn.unchecked_transaction()?;
+                inserted += ingest_grok_session(&tx, &session, &raw_path)?.prompts;
+                tx.commit()?;
                 sessions += 1;
                 grok_state.insert(key, json!(stamp));
             }
@@ -4063,14 +4068,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    // A prompt's identity is `(source, timestamp_ms, prompt)` and every Grok
-    // prompt written before this parser carried a timestamp synthesized as
-    // `created_at + index`. Merging into those rows would keep the fabricated
-    // ones forever, so the session's prompts are rebuilt from the file.
-    conn.execute(
-        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
-        params![sid],
-    )?;
+    replace_grok_session_evidence(conn, sid)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: session.updates.is_empty(),
         unread_update_rows: session.updates.unread_rows,
@@ -4090,9 +4088,13 @@ fn ingest_grok_session(
     // system preamble belongs to no turn.
     let mut turn: Option<usize> = None;
     let mut inherited: Option<i64> = None;
-    // The last assistant prose event of each turn, which is where that turn's
-    // context-token snapshot is recorded.
+    // Where each turn's context-token snapshot is recorded: the turn's last
+    // assistant prose event, or — for a turn whose whole answer was tool calls
+    // and no prose, which is an ordinary Grok turn — its last tool-use event.
+    // Keeping the two separate means a tool call after a message does not
+    // displace the message, and a turn with no message still has a tail.
     let mut turn_tail: HashMap<usize, String> = HashMap::new();
+    let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
 
     for (idx, line) in session.lines.iter().enumerate() {
         let turn_start = turn
@@ -4340,6 +4342,12 @@ fn ingest_grok_session(
                         &uid,
                     )?;
                     outcome.events += 1;
+                    // `updates.jsonl` knows which turn the call belongs to even
+                    // when the transcript side does not, because the call is
+                    // joined by id.
+                    if let Some(call_turn) = timing.and_then(|timing| timing.turn).or(turn) {
+                        turn_tool_tail.insert(call_turn, uid.clone());
+                    }
                     insert_tool_call(
                         conn,
                         SOURCE,
@@ -4432,7 +4440,8 @@ fn ingest_grok_session(
     // snapshot and not billed usage: Grok logs no per-turn input/output token
     // counts, and none are estimated here.
     for (turn, timing) in session.updates.turns.iter().enumerate() {
-        let (Some(total), Some(uid)) = (timing.total_tokens, turn_tail.get(&turn)) else {
+        let tail = turn_tail.get(&turn).or_else(|| turn_tool_tail.get(&turn));
+        let (Some(total), Some(uid)) = (timing.total_tokens, tail) else {
             continue;
         };
         let token_json = json!({
@@ -4470,6 +4479,42 @@ fn ingest_grok_session(
         )?;
     }
     Ok(outcome)
+}
+
+/// Clear the evidence this session's files own, so a read is a replacement
+/// rather than a merge.
+///
+/// A Grok read is always a whole-directory read, and Grok **rewrites**
+/// `chat_history.jsonl` in place on a format upgrade or a compaction. So the
+/// files are a snapshot, not an append-only log: a tool call that is no longer
+/// in the transcript, a checkpoint whose file was removed, a `subagents/`
+/// entry that is gone — none of them happened, as far as the current evidence
+/// goes. Upserting alone would leave every one of them in the database
+/// forever, and a reader cannot tell a stale row from a live one.
+///
+/// Scope is deliberately narrow. Rows are deleted only where `source =
+/// 'grok'` and this session owns them; a relationship is deleted only where
+/// this session is the **parent** and the evidence came from its own
+/// `subagents/` directory, so another session's record of *this* session as a
+/// child is untouched. The caller runs inside a transaction, so the window
+/// where the evidence is missing is never observable.
+fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
+    for statement in [
+        "DELETE FROM session_events WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM tool_calls WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM file_edits WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM session_markers WHERE source = 'grok' AND session_id = ?",
+        // A prompt's identity is `(source, timestamp_ms, prompt)`, and every
+        // Grok prompt written before this parser carried a timestamp
+        // synthesized as `created_at + index`; merging would keep the
+        // fabricated ones forever.
+        "DELETE FROM history WHERE source = 'grok' AND session_id = ?",
+        "DELETE FROM session_relationships WHERE source = 'grok' \
+         AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
+    ] {
+        conn.execute(statement, params![session_id])?;
+    }
+    Ok(())
 }
 
 /// The session-level files beside the transcript: `signals.json`,
@@ -4624,25 +4669,41 @@ fn truncate_marker_text(text: &str) -> String {
 }
 
 fn grok_session_stamp(chat: &Path) -> Result<String> {
-    let mut stamp = file_stamp(chat)?;
-    for sibling in GROK_STAMPED_SIBLINGS {
-        let path = chat.with_file_name(sibling);
-        if path.exists() {
-            stamp.push('|');
-            stamp.push_str(&file_stamp(&path)?);
-        }
-    }
-    Ok(stamp)
+    Ok(grok_source_stamp(chat)?.0)
 }
 
-/// The files beside `chat_history.jsonl` whose change has to re-trigger a
-/// read. `updates.jsonl` is here because it carries every timestamp: a session
-/// whose transcript is unchanged but whose update stream grew still has new
-/// evidence.
+/// The files beside `chat_history.jsonl` that get their own readable marker in
+/// the stamp. `updates.jsonl` is here because it carries every timestamp: a
+/// session whose transcript is unchanged but whose update stream grew still
+/// has new evidence.
 const GROK_STAMPED_SIBLINGS: &[&str] = &["summary.json", "updates.jsonl"];
+
+/// The remaining files `ingest_grok_session` reads. They are folded into one
+/// digest rather than appended, so a session with many checkpoints does not
+/// grow an unbounded stamp.
+const GROK_DIGESTED_SIBLINGS: &[&str] = &["signals.json", "prompt_context.json"];
+
+/// The directories `ingest_grok_session` reads, entry by entry.
+const GROK_DIGESTED_DIRECTORIES: &[&str] = &["compaction_checkpoints", "subagents"];
 
 /// [`grok_session_stamp`] plus the recency hint, with one stat per file.
 pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
+    grok_source_stamp(chat)
+}
+
+/// The change stamp of one Grok session directory, over **every** file its
+/// ingestion reads.
+///
+/// Discovery, plain `sync` and targeted hydration all take their stamp from
+/// here, so no one of them can decide a session is unchanged on evidence the
+/// others would have re-read. A stamp that covered only the transcript, the
+/// summary and the update stream let a new `compaction_checkpoints/` entry, an
+/// edited `signals.json` or a new `subagents/` entry land after the last
+/// update row and never be read at all.
+///
+/// The two directories are listed, not stat-ed: a directory's own mtime moves
+/// when an entry is added or removed, but not when an entry's contents change.
+fn grok_source_stamp(chat: &Path) -> Result<(String, Option<i64>)> {
     let metadata = chat.metadata()?;
     anyhow::ensure!(
         metadata.is_file(),
@@ -4651,6 +4712,11 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
     );
     let mut stamp = stamp_of(&metadata);
     let mut modified = modified_ms_of(&metadata);
+    let freshen = |candidate: Option<i64>, modified: &mut Option<i64>| {
+        if let Some(candidate) = candidate {
+            *modified = Some(modified.map_or(candidate, |current| current.max(candidate)));
+        }
+    };
     for sibling in GROK_STAMPED_SIBLINGS {
         let Ok(sibling) = chat.with_file_name(sibling).metadata() else {
             continue;
@@ -4659,10 +4725,37 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
         stamp.push_str(&stamp_of(&sibling));
         // `updates.jsonl` is appended on every turn, so it — not the
         // transcript — is usually the freshest signal of activity.
-        if let (Some(current), Some(other)) = (modified, modified_ms_of(&sibling)) {
-            modified = Some(current.max(other));
+        freshen(modified_ms_of(&sibling), &mut modified);
+    }
+    let mut digest = Sha256::new();
+    for sibling in GROK_DIGESTED_SIBLINGS {
+        let Ok(found) = chat.with_file_name(sibling).metadata() else {
+            continue;
+        };
+        digest.update(format!("{sibling}={}\n", stamp_of(&found)));
+        freshen(modified_ms_of(&found), &mut modified);
+    }
+    for directory in GROK_DIGESTED_DIRECTORIES {
+        // Sorted, so the digest describes the directory's contents rather than
+        // the order the filesystem happened to hand them back.
+        let mut entries = read_dir_files(&chat.with_file_name(directory));
+        entries.sort();
+        for entry in entries {
+            let Ok(found) = entry.metadata() else {
+                continue;
+            };
+            let name = entry
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            digest.update(format!("{directory}/{name}={}\n", stamp_of(&found)));
+            freshen(modified_ms_of(&found), &mut modified);
         }
     }
+    // Sixteen hex characters of SHA-256: enough that two different sets of
+    // extra files colliding is not a failure mode worth designing against,
+    // short enough that the stamp stays readable in a diagnostic.
+    stamp.push_str(&format!("|x:{:.16}", format!("{:x}", digest.finalize())));
     Ok((stamp, modified))
 }
 

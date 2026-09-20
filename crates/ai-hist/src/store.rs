@@ -467,6 +467,12 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "source_stamp",
     "discovery_state",
 ];
+/// What a provider's parser reported about the session, kept with the
+/// checkpoint so a later read that parses nothing can still report it. A
+/// diagnostic like "this harness records no billing tokens" is a standing
+/// fact about the stored evidence, not about the run that happened to parse
+/// it.
+const REQUIRED_HYDRATION_CHECKPOINT_COLUMNS: &[&str] = &["source_diagnostics_json"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
@@ -663,6 +669,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     {
         return Ok(false);
     }
+    let checkpoint_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_hydration_checkpoints')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_HYDRATION_CHECKPOINT_COLUMNS
+        .iter()
+        .all(|needed| checkpoint_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
     let presence_columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('session_presences')")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -846,6 +862,7 @@ CREATE TABLE IF NOT EXISTS session_hydration_checkpoints (
     records_parsed INTEGER NOT NULL DEFAULT 0,
     include_related INTEGER NOT NULL DEFAULT 1,
     updated_ms INTEGER NOT NULL,
+    source_diagnostics_json TEXT,
     PRIMARY KEY (source, session_id, location)
 );
 CREATE TABLE IF NOT EXISTS session_identity_correlations (
@@ -899,6 +916,11 @@ INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
+    ensure_text_columns(
+        conn,
+        "session_hydration_checkpoints",
+        REQUIRED_HYDRATION_CHECKPOINT_COLUMNS,
+    )?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
     // already-current database remains cheap to check. The outer immediate

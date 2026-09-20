@@ -413,6 +413,13 @@ How each adapter works:
      exact match is counted and reported as a `GROK_TIMESTAMP_FROM_TURN`
      hydration diagnostic.
 
+  An update kind this parser does not interpret (`plan`, `hook_execution`,
+  `retry_state`) is **not** a boundary in that join. Grok interleaves those
+  rows into a streaming message, and counting one as a break would split the
+  message into two groups — after which every later ordinal join reads one
+  group too far and hands the next message somebody else's timestamp. Such a
+  row still bounds the session's activity; it just does not divide it.
+
   **No timestamp is derived from a record's position in the file.** Until this
   landed, Grok prompt *n* was stamped `created_at + n` milliseconds: a
   fabricated ordering, in a ledger whose value is that it does not fabricate.
@@ -460,8 +467,10 @@ How each adapter works:
 
   Grok logs **no per-turn input/output token counts** (burn #489). The one
   token fact recorded here is `updates.jsonl`'s `totalTokens`, stored as
-  `{"context_total_tokens": n, "source": "updates.jsonl"}` so a consumer can
-  see both the number and what it is. It is a context-window snapshot: it
+  `{"context_total_tokens": n, "source": "updates.jsonl"}` on that turn's last
+  assistant event — its last message, or, for a turn answered entirely with
+  tool calls, its last tool use — so a consumer can see both the number and
+  what it is. It is a context-window snapshot: it
   **decreases** after a compaction, and summing it across turns is meaningless.
   Every Grok hydration therefore reports `GROK_USAGE_CONTEXT_PROXY_ONLY`,
   present or not. Nothing here estimates tokens — that is burn's job, from its
@@ -481,9 +490,39 @@ How each adapter works:
   is keyed on that update's ACP `eventId` (`ev:<id>`), which survives the
   rebuild Grok performs on a format upgrade; an event that did not is keyed on
   its record index (`r<n>`), which does not. Tool calls and results are keyed
-  on the provider's own call id (`tool:<id>`, `result:<id>`). `history` is
-  rebuilt for the session on every read, because a prompt's identity includes
-  its timestamp and the timestamps the previous parser wrote were synthesized.
+  on the provider's own call id (`tool:<id>`, `result:<id>`).
+
+  **A Grok read is a replacement, not a merge.** Grok rewrites
+  `chat_history.jsonl` in place on a format upgrade or a compaction, and prunes
+  `compaction_checkpoints/` and `subagents/`, so the directory is a snapshot of
+  what the session *currently* says happened. Every read therefore clears this
+  session's Grok-owned evidence — `session_events`, `tool_calls`, `file_edits`,
+  `session_markers`, `history` and the relationships whose evidence is this
+  session's own `subagents/` directory — inside the same transaction that
+  rebuilds it. Upserting alone would leave a tool call that is no longer in the
+  transcript, a checkpoint whose file was deleted, and every row whose `r<n>`
+  identity shifted when the file was rewritten, sitting in the database
+  forever with nothing to distinguish them from live evidence. A relationship
+  another session recorded about *this* one is not this session's to delete,
+  and is left alone.
+
+  The change stamp covers **every file the read consumes**: the transcript, the
+  summary and the update stream each keep a readable marker, and
+  `signals.json`, `prompt_context.json` and the sorted contents of
+  `compaction_checkpoints/` and `subagents/` are folded into one digest (so a
+  session with many checkpoints does not grow an unbounded stamp). Discovery,
+  plain `sync` and targeted hydration all take the same stamp from the same
+  function, so none of them can call a session unchanged on evidence the others
+  would have re-read — a new checkpoint written after the last update row is
+  new evidence, and is read as such.
+
+  A hydration that parses nothing still reports what Grok does not record: the
+  provider diagnostics are stored with the hydration checkpoint and replayed on
+  an `unchanged` result. An `unchanged` reader is looking at exactly the rows a
+  parsing reader saw, so it is told the same things about them — above all that
+  a token count it can see is a context proxy and not billing usage. A
+  checkpoint written before those were persisted has none stored, and the usage
+  caveat is rebuilt from the stored `token_json` instead.
 
   ### Delegation
 
@@ -677,7 +716,7 @@ Each connector presence stores a `source_stamp` —
 | Source | Change marker |
 |---|---|
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
-| grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker |
+| grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker, `\|x:`, a digest over `signals.json`, `prompt_context.json` and the sorted entries of `compaction_checkpoints/` and `subagents/` |
 | opencode | `{database identity}:{schema version}:{time_created}:{time_updated}` |
 | relay | `{newest synced timestamp}:{synced row count}` |
 
