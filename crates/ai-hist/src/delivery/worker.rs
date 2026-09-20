@@ -424,7 +424,7 @@ impl Worker<'_> {
             job_id,
             &self.options.worker_id,
             self.options.lease_ms,
-            (self.clock)(),
+            self.clock,
         )?
         else {
             return Ok(Step::Idle);
