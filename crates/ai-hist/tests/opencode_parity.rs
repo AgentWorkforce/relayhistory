@@ -672,6 +672,13 @@ fn a_compaction_part_records_one_boundary_marker() {
 /// `rchar` counts cached reads too, which is what we want: a copy of the
 /// provider store is a copy whether or not it came off the disk.
 #[cfg(target_os = "linux")]
+/// Bytes this *process* has read.
+///
+/// Process-wide on purpose, unlike the crate's unit-test probe: this binary
+/// runs one `#[test]`, so there is no sibling test to pollute the sample, and
+/// sync and discovery do their work on worker threads whose reads a per-thread
+/// counter would miss. What is being bounded here is all the reading the
+/// operation causes, wherever it happens.
 fn bytes_read() -> Option<u64> {
     let io = fs::read_to_string("/proc/self/io").ok()?;
     io.lines()

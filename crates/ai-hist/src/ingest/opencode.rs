@@ -2001,8 +2001,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_settled_tree_is_stamped_without_reading_it() {
-        fn bytes_read() -> u64 {
-            fs::read_to_string("/proc/self/io")
+        /// Bytes the *calling thread* has read.
+        ///
+        /// `/proc/self/io` counts the whole process, and `cargo test` runs a
+        /// crate's unit tests as parallel threads in one process — so a sample
+        /// taken from it includes whatever every other test happened to read
+        /// in between. That is not a flake to widen the bound for: it made
+        /// this test red in CI at `73998 bytes for a 262225-byte part`, and
+        /// none of those bytes were this test's. It passed on earlier heads
+        /// only because the interleaving happened to be quiet, which is the
+        /// worse half of the problem.
+        ///
+        /// `/proc/thread-self/io` is the same counters for this thread alone
+        /// (Linux 3.17+), so the sample measures the work under test and
+        /// nothing else.
+        fn thread_bytes_read() -> u64 {
+            rchar("/proc/thread-self/io")
+        }
+        /// The process-wide counter, kept only as the control below.
+        fn process_bytes_read() -> u64 {
+            rchar("/proc/self/io")
+        }
+        fn rchar(path: &str) -> u64 {
+            fs::read_to_string(path)
                 .unwrap()
                 .lines()
                 .find_map(|line| line.strip_prefix("rchar:"))
@@ -2021,16 +2042,31 @@ mod tests {
         fs::write(&part, &body).unwrap();
         let size = body.len() as u64;
 
+        // Control for the probe itself: the stamp's own reads must be visible
+        // to it, or "it read nothing" would be worth nothing.
         let recent = std::time::SystemTime::now();
         pin_mtime(&part, recent);
-        let before = bytes_read();
+        let before = thread_bytes_read();
         stamp_json_tree_session(&session_file, "ses_io").unwrap();
-        let while_recent = bytes_read() - before;
+        let while_recent = thread_bytes_read() - before;
+
+        // The measurement under test, taken with a neighbour thread reading
+        // between the two samples on purpose -- that interleaving is exactly
+        // what a process-wide counter cannot tell apart from the stamp's own
+        // reads.
+        let noise = dir.path().join("noise.bin");
+        let noise_bytes = 4 * 1024 * 1024u64;
+        fs::write(&noise, vec![0u8; noise_bytes as usize]).unwrap();
 
         pin_mtime(&part, recent - std::time::Duration::from_secs(600));
-        let before = bytes_read();
+        let before_thread = thread_bytes_read();
+        let before_process = process_bytes_read();
+        std::thread::spawn(move || fs::read(&noise).unwrap())
+            .join()
+            .unwrap();
         stamp_json_tree_session(&session_file, "ses_io").unwrap();
-        let once_settled = bytes_read() - before;
+        let once_settled = thread_bytes_read() - before_thread;
+        let neighbour = process_bytes_read() - before_process;
 
         assert!(
             while_recent >= size,
@@ -2041,6 +2077,14 @@ mod tests {
             once_settled < size / 4,
             "a settled file must be stat-only: {once_settled} bytes for a \
              {size}-byte part"
+        );
+        // Positive control for the isolation: the process-wide counter did
+        // move, by the neighbour's whole file. Had the sample above been taken
+        // from it, this test would have measured that instead.
+        assert!(
+            neighbour >= noise_bytes,
+            "the neighbour must actually have read, or the isolation is \
+             untested: {neighbour} bytes"
         );
     }
 
