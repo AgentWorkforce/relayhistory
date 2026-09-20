@@ -5499,8 +5499,34 @@ fn timestamp_from_name(name: &str) -> Option<i64> {
 /// a session whose summary cannot be read would otherwise be indexed under its
 /// directory name with a `created_at` taken from an mtime, silently becoming a
 /// different session from the one already in the catalog.
+/// `summary.json`, with malformed treated as an error rather than as absence.
+///
+/// This sidecar is the one exception to "malformed but present is evidence",
+/// and the reason is that it does not carry detail -- it carries **identity**.
+/// `info.id` becomes the session id, which keys every evidence row and scopes
+/// every delete a replacing read performs. When a malformed summary fell back
+/// to the directory name, a session caught mid-write was stored under
+/// `<encoded-cwd-folder>`; once the file was repaired the next read stored the
+/// same session under its real id, and the first set of rows -- catalog row,
+/// events, markers, history -- was left behind for ever, keyed to an id no
+/// read would ever name again. Nothing would delete them, because deletes are
+/// scoped by the id that produced them.
+///
+/// So a present-but-unparseable summary fails the session read: the previous
+/// transaction stands, the stamp is left unsaved, and the next run tries again
+/// once the file changes. Absence keeps the directory-name fallback, because
+/// a session directory with no summary at all is a real shape and its folder
+/// name is the only identity there is.
 pub(crate) fn read_grok_summary(path: &Path) -> Result<Option<Value>> {
-    Ok(read_json_file(path)?.value().cloned())
+    match read_json_file(path)? {
+        GrokSidecar::Absent => Ok(None),
+        GrokSidecar::Read(value) => Ok(Some(value)),
+        GrokSidecar::Unparsed => anyhow::bail!(
+            "{}: summary.json is present but not valid JSON, and it carries the session identity; \
+             refusing to index this session under its directory name",
+            path.display()
+        ),
+    }
 }
 
 pub(crate) fn grok_project_from_path(chat: &Path) -> Option<String> {
@@ -5562,6 +5588,17 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    // The same unwrapping the full read does. Discovery and hydration write
+    // the *same* prompt to different columns -- `sessions.first_prompt` and
+    // `history.prompt` -- so a wrapper stripped in one and kept in the other
+    // shows a person the `<user_query>` envelope in the catalog and the typed
+    // prompt in the transcript, for one session, with nothing to say which is
+    // the prompt.
+    let text = if role == "user" {
+        grok::unwrap_user_query(&text)
+    } else {
+        text
+    };
     (!text.is_empty()).then_some(text)
 }
 
@@ -7063,6 +7100,98 @@ mod tests {
         assert_eq!(
             orphaned, 0,
             "re-attribution must find a real owner, never null one out"
+        );
+    }
+
+    /// A half-written `summary.json` must not invent a session id.
+    ///
+    /// `summary.json` is the one sidecar that carries **identity** rather than
+    /// detail: `info.id` becomes the session id, which keys every evidence row
+    /// and scopes every delete a replacing read performs. Falling back to the
+    /// directory name when the file was present but unparseable -- a summary
+    /// caught mid-write -- stored the whole transcript under the encoded-cwd
+    /// folder name. Once the file was repaired the next read stored the same
+    /// session under its real id, and the first set of rows was stranded: no
+    /// read would ever name that id again, and deletes are scoped by the id
+    /// that produced them, so nothing would ever remove them.
+    ///
+    /// So the three-way rule from round seven applies here with malformed on
+    /// the failing side: **absent** keeps the directory-name fallback (a
+    /// session directory with no summary is a real shape, and its folder name
+    /// is the only identity there is), while **present-but-unparseable** fails
+    /// the read, leaving the previous evidence and the stamp alone.
+    #[test]
+    fn a_malformed_summary_fails_rather_than_naming_the_session_after_its_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/local-folder/grok-phantom-0001");
+        fs::create_dir_all(&dir).unwrap();
+        let chat = dir.join("chat_history.jsonl");
+        fs::write(&chat, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        let summary = dir.join("summary.json");
+        let valid = r#"{"info":{"id":"grok-123","cwd":"/tmp/phantom"},"created_at":"2026-01-01T00:00:00.000Z"}"#;
+        fs::write(&summary, valid).unwrap();
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let ids = || -> Vec<String> {
+            conn.prepare(
+                "SELECT session_id FROM sessions WHERE source = 'grok' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        // Positive control one: a valid summary indexes under its own id.
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(ids(), vec!["grok-123".to_string()]);
+        let key = chat.to_string_lossy().to_string();
+        let stamp = grok_saved_stamp(&state, &key).unwrap().to_string();
+
+        // The summary is caught mid-write.
+        fs::write(&summary, "{\"info\":{\"id\":").unwrap();
+        let error = match super::scan_grok_session_file(&chat) {
+            Err(error) => error,
+            Ok(_) => panic!("a summary that carries identity and does not parse is a failed read"),
+        };
+        assert!(
+            format!("{error:#}").contains("summary.json"),
+            "unexpected error: {error:#}"
+        );
+
+        super::sync_grok(&conn, &mut state, &root)
+            .expect_err("the only session in the store could not be read");
+        assert_eq!(
+            ids(),
+            vec!["grok-123".to_string()],
+            "no session is invented from the folder name, and the good rows stay"
+        );
+        assert_eq!(
+            grok_saved_stamp(&state, &key),
+            Some(stamp.as_str()),
+            "the stamp does not advance over a failed read, so a repair is picked up"
+        );
+
+        // Repaired, and it is still the same session -- no second identity.
+        fs::write(&summary, valid).unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(ids(), vec!["grok-123".to_string()]);
+
+        // Positive control two: with no summary at all, the directory name is
+        // still the identity. Without this the fix could be "always fail
+        // without a summary", which would stop indexing a real Grok shape.
+        fs::remove_file(&summary).unwrap();
+        let mut fresh = Map::new();
+        super::sync_grok(&conn, &mut fresh, &root).unwrap();
+        assert!(
+            ids().contains(&"grok-phantom-0001".to_string()),
+            "an absent summary still falls back to the directory name: {:?}",
+            ids()
         );
     }
 

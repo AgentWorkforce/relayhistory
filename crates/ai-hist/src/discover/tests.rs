@@ -899,6 +899,65 @@ fn grok_activity_comes_from_the_update_stream_when_there_is_one() {
     assert_eq!(row.last_activity_ms, Some(1_789_560_138_000));
 }
 
+/// Discovery strips the `<user_query>` envelope, because hydration does.
+///
+/// Grok wraps a typed prompt in `<user_query>…</user_query>`. The full read
+/// unwraps it; the shallow read did not, so `sessions.first_prompt` held the
+/// XML envelope while `history.prompt` held the typed text -- for the *same*
+/// prompt of the *same* session. Catalog search and the session list showed
+/// the wrapper, and nothing said which of the two was the prompt.
+#[test]
+fn grok_discovery_unwraps_a_user_query_envelope_exactly_as_hydration_does() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-wrapped",
+        r#"{"info":{"id":"grok-wrapped","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"<user_query>ship it</user_query>\"}\n",
+        1_750_000_500_000,
+    );
+    // The positive control, in the same store: a prompt with no envelope is
+    // passed through untouched, so the fix cannot be "strip angle brackets".
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-plain",
+        r#"{"info":{"id":"grok-plain","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ship it\"}\n",
+        1_750_000_500_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(
+        found.row("grok-wrapped").first_prompt.as_deref(),
+        Some("ship it"),
+        "the catalog stores what the person typed, not Grok's envelope"
+    );
+    assert_eq!(
+        found.row("grok-plain").first_prompt.as_deref(),
+        Some("ship it"),
+        "and an unwrapped prompt is unchanged"
+    );
+
+    // And the two readers agree, so they cannot drift apart again: the
+    // record interpretation the full read uses gives the same answer.
+    let wrapped = serde_json::json!({
+        "type": "user",
+        "content": "<user_query>ship it</user_query>",
+    });
+    let line = crate::ingest::grok::parse_chat_record(&wrapped);
+    match line.record {
+        crate::ingest::grok::GrokRecord::User { text, .. } => assert_eq!(
+            text.as_deref(),
+            found.row("grok-wrapped").first_prompt.as_deref(),
+            "shallow and full reads must store the same prompt"
+        ),
+        other => panic!("expected a user record, got {other:?}"),
+    }
+}
+
 /// A session whose update stream grew has new evidence even when the
 /// transcript is byte-identical, so the change stamp has to cover it.
 #[test]
