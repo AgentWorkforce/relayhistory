@@ -181,6 +181,15 @@ export async function listSessionCatalogPage(
   options: ListCatalogOptions = {},
 ): Promise<SessionCatalogPage> {
   const scope = options.scope ?? 'local';
+  // An empty or whitespace-only key is never a real project and would match
+  // nothing; failing loudly beats returning a well-formed empty page that
+  // reads as "this project has no sessions".
+  if (options.projectKey !== undefined && options.projectKey.trim() === '') {
+    throw new InvalidArgumentError(
+      'projectKey must not be empty',
+      'INVALID_ARGUMENT',
+    );
+  }
   return nativeCall(async (native) => {
     const page = await native.listSessionCatalogPage({
       ...options,
@@ -633,6 +642,7 @@ export async function stats(options: StatsOptions = {}): Promise<Stats> {
         project: String(item.project),
         count: Number(item.count),
       })),
+      groupedBy: result.groupedBy === 'cwd' ? 'cwd' : 'project_key',
       firstTimestampMs:
         typeof result.firstTimestampMs === 'number' ? result.firstTimestampMs : null,
       lastTimestampMs: typeof result.lastTimestampMs === 'number' ? result.lastTimestampMs : null,

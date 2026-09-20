@@ -392,6 +392,10 @@ impl SyncSourceReport {
 }
 
 fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
+    // See `begin_acquisition_pass`: the resolver's cache is sound only within
+    // one pass, and a long-lived host (watch, the Node addon, a desktop app)
+    // runs many passes without restarting.
+    crate::project_identity::begin_acquisition_pass();
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -495,6 +499,11 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         &shallow_providers(),
         |_| {},
     )?;
+    // After discovery, not before: shallow discovery is what fills in `cwd`
+    // and `repo_url` for sessions a provider's history file mentions without
+    // describing, and inheritance needs every relationship this run recorded
+    // to already be in the ledger.
+    refresh_project_identity_after_sync(conn);
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done. Best
     // effort: a concurrent reader pinning an old snapshot blocks a full
@@ -619,7 +628,30 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         &remote::SourceConnectorSelection::new(Vec::new())?,
         |_| {},
     )?;
+    refresh_project_identity_after_sync(&conn);
     Ok(true)
+}
+
+/// Recompute canonical project identity at the end of a sync, reporting rather
+/// than failing.
+///
+/// The evidence rows are already committed by this point, and every key here
+/// is *derived* from them: the next run recomputes whatever this one could not
+/// write. Failing the whole sync over it would turn a run that did its real
+/// work into a reported failure — the same argument [`checkpoint_sync_state`]
+/// makes for its bookkeeping write, and the reason a contended database still
+/// reports partial success rather than an error.
+///
+/// Deliberately not silent. A skip that printed nothing would leave project
+/// keys stuck at NULL with no trace of why, and "nothing to do" and "could not
+/// write" would look identical from the outside.
+fn refresh_project_identity_after_sync(conn: &Connection) {
+    if let Err(error) = crate::store::refresh_project_identity(conn) {
+        eprintln!(
+            "ai-hist: could not refresh canonical project identity: {error:#} \
+             (project keys stay as they were; the next sync retries)"
+        );
+    }
 }
 
 /// Synchronize local providers, or read the current snapshot when another sync owns the lock.
@@ -3659,14 +3691,62 @@ fn insert_session_event(
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     let blank = ToolResultFacts::default();
     let facts = facts.unwrap_or(&blank);
+    // Stamp `project_key` as the row is inserted rather than sweeping for it
+    // afterwards. An UPDATE over `session_events` is a change every
+    // durable-delivery subscriber has to be told about, so a sweep would
+    // journal a second upsert for every event of every session on every sync.
+    //
+    // The owning session's key is preferred when the row already exists,
+    // because it may be stronger than anything derivable here (a Codex
+    // `repository_url`, or a key inherited from a delegating parent). But it
+    // is not depended on: the Codex walk writes a rollout's events *before*
+    // upserting its session, and a delegated thread never gets a catalog row
+    // at all, so a lookup alone would leave those events null and hand them
+    // straight back to the sweep this design exists to avoid. Resolving the
+    // cwd is the fallback, and it agrees with what `upsert_session` will store
+    // for the same directory, so the ordinary case converges with no rewrite.
+    //
+    // On conflict the order is the same but the stored value comes second, so
+    // a re-ingest can only ever improve the key. The cwd fallback is last
+    // precisely because it is the weakest: for a delegated child there is no
+    // `sessions` row to consult, and its stored key is the parent's, inherited
+    // by the denormalizing pass. Preferring the incoming value there -- which
+    // is what a plain `COALESCE(excluded.project_key, ...)` does now that the
+    // fallback makes it non-null -- would overwrite a canonical repository key
+    // with a machine-local path on every re-ingest, and hand every one of
+    // those events back to the sweep to fix, journalling a second delivery
+    // upsert each time.
+    //
+    // The *method* is stamped beside the key, always from the same arm that
+    // produced it. It is what tells a later pass whether this row worked its
+    // key out from its own directory or was lent one, and a row that carries a
+    // key with no method is indistinguishable from one that was never
+    // resolved: the denormalizing pass would then replace a delegated
+    // thread's own repository with its delegator's, on every sync, forever.
+    let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
+    let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
+    let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+         (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?1, ?2, ?3, \
+           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), \
+           CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
+                THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
+                ELSE ?16 END, \
+           ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+           ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
-         project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
+         project=excluded.project, \
+         project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
+         project_key_method=CASE \
+           WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
+             THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
+           WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
+           ELSE ?16 END, \
+         cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
          model=excluded.model, token_json=excluded.token_json, \
          tool_use_id=excluded.tool_use_id, payload_bytes=excluded.payload_bytes, \
@@ -3690,6 +3770,8 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            resolved_key,
+            resolved_method,
             facts.tool_use_id,
             facts.payload_bytes,
             facts.payload_truncated.map(i64::from),
@@ -3943,11 +4025,20 @@ pub(crate) fn upsert_session(
     last_assistant_text: Option<&str>,
     raw_path: Option<&str>,
 ) -> Result<()> {
+    // Canonical project identity, derived once per session from the cwd the
+    // provider recorded. Resolution is cached per directory, so the repeated
+    // upserts a growing transcript produces cost one filesystem walk in total.
+    let (project_key, project_key_method) = match crate::project_identity::identity_for(cwd, None) {
+        Some((key, method)) => (Some(key), Some(method.as_str().to_string())),
+        None => (None, None),
+    };
+    let project_key_merge = crate::store::project_key_merge_sql();
     conn.execute(
-        "INSERT INTO sessions \
-         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'full') \
+        &format!("INSERT INTO sessions \
+         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, discovery_state) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'full') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
+         {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms), \
@@ -3955,7 +4046,7 @@ pub(crate) fn upsert_session(
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
          raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
          parser_version = excluded.parser_version, \
-         discovery_state = 'full'",
+         discovery_state = 'full'"),
         params![
             session_id,
             source,
@@ -3965,6 +4056,8 @@ pub(crate) fn upsert_session(
             last_ts,
             last_assistant_text,
             raw_path,
+            project_key,
+            project_key_method,
         ],
     )?;
     crate::upsert_session_presence(

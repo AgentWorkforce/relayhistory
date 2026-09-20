@@ -41,6 +41,7 @@ import type {
   SessionEvent,
   SessionUserTurn,
   SessionUserTurnBlock,
+  ProjectKeyMethod,
   EventCursor,
   EventsPageOptions,
   SessionEventsPage,
@@ -111,6 +112,18 @@ export function catalogCursor(value: unknown): CatalogCursor | null {
   };
 }
 
+/**
+ * Narrow a native `projectKeyMethod` to the documented set.
+ *
+ * An unrecognized value becomes null rather than being passed through: a
+ * consumer branching on `'remote'` must not be handed a fourth case it has
+ * never seen, and a silently widened union is exactly the shape a contract
+ * mismatch takes.
+ */
+export function projectKeyMethod(value: unknown): ProjectKeyMethod | null {
+  return value === 'remote' || value === 'path' || value === 'inherited' ? value : null;
+}
+
 export function catalogSession(value: UnknownRecord): CatalogSession {
   return {
     source: String(value.source) as CatalogSource,
@@ -130,6 +143,8 @@ export function catalogSession(value: UnknownRecord): CatalogSession {
     rawPath: nullableString(value.rawPath),
     sourceStamp: nullableString(value.sourceStamp),
     discoveryState: value.discoveryState === 'shallow' ? 'shallow' : 'full',
+    projectKey: nullableString(value.projectKey),
+    projectKeyMethod: projectKeyMethod(value.projectKeyMethod),
     fromCache: value.fromCache === true,
     locations: Array.isArray(value.locations)
       ? value.locations.filter(
@@ -182,6 +197,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     source: String(value.source) as Source,
     sessionId: String(value.sessionId),
     project: nullableString(value.project),
+    projectKey: nullableString(value.projectKey),
     cwd: nullableString(value.cwd),
     gitBranch: nullableString(value.gitBranch),
     messageId: nullableString(value.messageId),
