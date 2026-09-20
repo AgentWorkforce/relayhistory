@@ -353,7 +353,14 @@ impl WatchInner {
                 // ~debounce cadence instead of a wait for quiet.
                 wake.pending = false;
                 drop(wake);
-                self.sleep_unless_stopped(debounce);
+                // Cut short by a lost registration, because on a busy tree
+                // this window is where the loop spends nearly all of its
+                // time: a removal landing inside it would otherwise wait out
+                // the rest of the window *and* the sweep that follows before
+                // the watch is put back, which is the whole of the gap a
+                // short session occupies. The bit itself is left set; the
+                // caller takes it and reconciles before it sweeps.
+                self.sleep_through_debounce(debounce);
                 return (!self.stopped()).then_some(TickTrigger::FsEvent);
             }
             let (next, result) = self
@@ -370,8 +377,21 @@ impl WatchInner {
         }
     }
 
-    /// Sleep for `duration`, returning early when the loop is stopped.
-    fn sleep_unless_stopped(&self, duration: Duration) {
+    /// Take the lost-registration bit, if one is set.
+    ///
+    /// Read on every wake rather than only on the wake it caused: a removal
+    /// reported while the loop was inside its debounce window, or inside a
+    /// sweep, has to be acted on by the iteration that comes out of it and
+    /// not by the one after the next sweep.
+    fn take_registration_lost(&self) -> bool {
+        let mut wake = self.wake.lock().expect("watch wake state");
+        std::mem::take(&mut wake.registration_lost)
+    }
+
+    /// Sleep out the debounce window, returning early when the loop is
+    /// stopped or a registration has been reported lost.
+    fn sleep_through_debounce(&self, duration: Duration) {
+        let done = |wake: &WakeState| wake.stopped || wake.registration_lost;
         // Bounded before it reaches an `Instant`, because these durations come
         // from the command line and the addition panics on a sum it cannot
         // represent.
@@ -381,12 +401,12 @@ impl WatchInner {
             // Unreachable given the bound above. A platform whose clock cannot
             // represent even that should wait for the stop signal rather than
             // spin through zero-length sleeps.
-            while !wake.stopped {
+            while !done(&wake) {
                 wake = self.wake_cv.wait(wake).expect("watch wake state");
             }
             return;
         };
-        while !wake.stopped {
+        while !done(&wake) {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -723,14 +743,19 @@ impl WatchLoop {
             // without depending on how the loop woke up.
             let now = Instant::now();
             let refresh_due = now >= next_refresh;
+            // Taken here, on whatever wake came out of the wait, rather than
+            // only on the wake a removal caused: a removal reported while the
+            // loop was inside its debounce window leaves the bit set behind a
+            // wake that says `FsEvent`, and putting the watch back has to
+            // happen before the sweep that wake is for, not after it.
+            let registration_lost =
+                trigger == TickTrigger::RegistrationLost || self.inner.take_registration_lost();
             // A reported removal makes the check due now. The backend will
             // not say so twice, and waiting out the backstop means a
             // recreated directory is unwatched for up to `slow_poll_ms` —
             // long enough for a short session to be written there and cleaned
             // up again with nothing to show for it.
-            let check_due = refresh_due
-                || now >= next_check
-                || trigger == TickTrigger::RegistrationLost;
+            let check_due = refresh_due || now >= next_check || registration_lost;
             if refresh_due {
                 next_refresh = deadline_after(now, refresh_every);
             }
@@ -741,15 +766,25 @@ impl WatchLoop {
                     // rather than merely new on disk, and only the caller
                     // knows how to look for those. Only on the backstop,
                     // because this is the expensive half.
+                    //
+                    // Counted in with the reconciliation below, because a
+                    // root adopted while its directory does not exist yet is
+                    // a hole in the coverage this loop reports and
+                    // `reconcile` has nothing to say about one it cannot
+                    // attach. Publishing on its count alone left `--status`
+                    // claiming full coverage for a provider the loop had
+                    // taken on and could not watch.
+                    let mut changed = 0usize;
                     if refresh_due {
                         if let Some(refresh) = &self.roots_refresh {
-                            watch.adopt(refresh());
+                            changed += watch.adopt(refresh());
                         }
                     }
                     // Reconciles rather than only retrying: a root can be
                     // lost after a successful registration, not just before
                     // one.
-                    if watch.reconcile() > 0 {
+                    changed += watch.reconcile();
+                    if changed > 0 {
                         self.publish_status(Some(&*watch));
                     }
                 }
@@ -885,9 +920,21 @@ mod fs_events {
         /// registration from a dead one needs the identity.
         watched: Vec<Registered>,
         pending: Vec<WatchRoot>,
-        /// A root that *was* attached is uncovered now, so it is being
-        /// retried on the recovery cadence rather than on the backstop.
-        recovering: bool,
+        /// The roots that *were* attached and are uncovered now, so they
+        /// are being retried on the recovery cadence rather than on the
+        /// backstop.
+        ///
+        /// Per root, not a flag: `pending` also holds roots that have never
+        /// existed — `~/.claude/projects` on a machine without Claude — and
+        /// those may never attach at all. A flag cleared only when `pending`
+        /// empties would hold the short cadence open for the rest of the run
+        /// after a single recreate, stat-ing every root four times a second
+        /// on exactly the long-lived watch the backstop exists to keep cheap.
+        /// Keyed by the root's own path, which is how `adopt` and the
+        /// callback's copy identify a root too, and which — unlike the
+        /// registration key — does not change under it when a symlinked root
+        /// is re-resolved on the way back in.
+        recovering: HashSet<PathBuf>,
         /// Registered paths the backend reported as removed, shared with the
         /// event callback. A watch dies with the directory it names, and the
         /// name can come back over a *different* object — or over one the
@@ -903,7 +950,7 @@ mod fs_events {
     impl FsWatch {
         /// Whether a registration that once existed is waiting to be re-made.
         pub(super) fn recovering(&self) -> bool {
-            self.recovering
+            !self.recovering.is_empty()
         }
 
         pub(super) fn watched(&self) -> Vec<PathBuf> {
@@ -1001,16 +1048,15 @@ mod fs_events {
             }
             // Anything that falls out of `watched` here was attached a moment
             // ago, which is what makes it a recovery rather than a root that
-            // has never existed.
-            self.recovering |= !lost.is_empty();
+            // has never existed. `retry_pending` takes each one back out as it
+            // re-attaches, so the short cadence lasts exactly as long as the
+            // recovery does and not as long as the emptiest root in `pending`.
             for root in lost {
+                self.recovering.insert(root.path.clone());
                 self.pending.push(root);
                 changed += 1;
             }
             let attached = self.retry_pending();
-            if self.pending.is_empty() {
-                self.recovering = false;
-            }
             changed + attached
         }
 
@@ -1023,11 +1069,13 @@ mod fs_events {
             let mut attached = 0usize;
             let watcher = &mut self.watcher;
             let watched = &mut self.watched;
+            let recovering = &mut self.recovering;
             let mut resolved = Vec::new();
             self.pending.retain_mut(|root| {
                 if !register(watcher, root) {
                     return true;
                 }
+                recovering.remove(&root.path);
                 resolved.push(root.clone());
                 watched.push(Registered {
                     identity: root_identity(root.registered_path()),
@@ -1138,7 +1186,7 @@ mod fs_events {
             watcher,
             watched,
             pending,
-            recovering: false,
+            recovering: HashSet::new(),
             stale,
             depth,
         })
@@ -1311,7 +1359,7 @@ mod tests {
             let entered = entered.clone();
             std::thread::spawn(move || {
                 entered.store(true, Ordering::SeqCst);
-                inner.sleep_unless_stopped(Duration::from_millis(u64::MAX));
+                inner.sleep_through_debounce(Duration::from_millis(u64::MAX));
             })
         };
         let deadline = Instant::now() + Duration::from_secs(10);

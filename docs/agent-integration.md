@@ -101,7 +101,15 @@ a watch the backend reports as lost is re-made when the report arrives, and
 retried four times a second until it is back. A directory that is deleted and
 recreated — a session's cleanup, then the next session — is otherwise
 unwatched for up to the backstop, which is long enough to miss the whole of a
-short session. That tick also
+short session. The report arrives while the loop is debouncing more often than
+not, so it ends that window and is acted on before the sweep the window was
+opening; waiting for the window and then the sweep is the same gap again. The
+four-times-a-second retry is per root and lasts only until the roots that were
+attached are attached again — a provider that has never been installed stays
+pending on the backstop instead of holding the short cadence open for the life
+of the run. A root a refresher takes on while its directory does not exist yet
+is reported as pending as soon as it is adopted, so `--status` does not claim
+coverage the loop does not have. That tick also
 re-checks each registration against the directory it was made against — a watch is bound to
 the directory object, not to its name, so a root deleted and recreated
 (`rm -rf ~/.codex/sessions`, then the next session) has a live name and a dead

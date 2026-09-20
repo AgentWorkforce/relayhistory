@@ -39,7 +39,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   re-registered on every tick. A registration the backend reports as gone is
   acted on when the report arrives and retried four times a second until it is
   back, rather than waiting out the backstop — long enough for a whole short
-  session to be written to a recreated directory and cleaned up unseen. Reconciliation runs on an absolute deadline
+  session to be written to a recreated directory and cleaned up unseen. That
+  report cuts the debounce window short and is acted on before the sweep the
+  window was opening, because on a busy tree the window is where the loop
+  spends nearly all of its time. The faster retry lasts exactly as long as the
+  recovery does: a root that has *never* existed — a provider that is not
+  installed — stays pending on the backstop and no longer holds the short
+  cadence open for the rest of the run. A root taken on by a refresher while
+  its directory does not exist yet is reported as pending straight away,
+  rather than only once it becomes watchable. Reconciliation runs on an absolute deadline
   rather than when the wait expires, so a busy session writing every few
   hundred milliseconds cannot postpone attaching the roots beside it. `watch --remote` installs
   no local roots, so local writes cannot drive remote connector traffic.

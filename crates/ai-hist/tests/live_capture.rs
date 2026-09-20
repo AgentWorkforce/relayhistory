@@ -1405,6 +1405,333 @@ fn a_root_recreated_between_backstops_is_watched_without_waiting_for_one() {
     );
 }
 
+/// The recovery cadence is per *root*, not one flag over all of them.
+///
+/// `pending` holds two kinds of root that look alike and are not: one that was
+/// attached and lost its directory, which has to come back in milliseconds,
+/// and one that has never existed — `~/.claude/projects` on a machine where
+/// Claude is not installed — which may never come back at all. A single
+/// "recovering" flag cleared only when `pending` empties conflates them: one
+/// recreate anywhere pins the loop to the 250 ms recovery cadence for the rest
+/// of the run, stat-ing every root four times a second forever, on exactly the
+/// long-lived `watch --interval 3600` the backstop exists to keep cheap.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_recovered_root_does_not_hold_the_recovery_cadence_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lost = dir.path().join("sessions");
+    std::fs::create_dir_all(&lost).expect("the root that will be lost");
+    // Not created until the last phase: this provider is not installed, which
+    // is the ordinary state of half the roots on a real machine.
+    let never = dir.path().join("projects");
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
+    let running = RunningLoop::reporting({
+        let lost = lost.clone();
+        let never = never.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![
+                    ai_hist::discover::WatchRoot::tree(lost.clone()),
+                    ai_hist::discover::WatchRoot::tree(never.clone()),
+                ])
+                // Only the backstop calls this, so it doubles as the test's
+                // view of where the backstop boundary is — which is what lets
+                // the windows below be measured from a known starting point
+                // rather than from wherever the loop happened to be.
+                .with_roots_refresh(Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    vec![
+                        ai_hist::discover::WatchRoot::tree(lost.clone()),
+                        ai_hist::discover::WatchRoot::tree(never.clone()),
+                    ]
+                }))
+                .with_debounce_ms(50)
+                // The backstop, far enough above the 250 ms recovery cadence
+                // that a window can be several times one and a fraction of the
+                // other.
+                .with_slow_poll_ms(3_000)
+                // The user's interval, an hour in miniature.
+                .with_poll_interval_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+    assert_eq!(
+        running.watch.status().expect("status").pending,
+        vec![never.clone()],
+        "the root that has never existed is the one pending"
+    );
+
+    // Phase 1, the positive control: a root that *was* attached is retried on
+    // the recovery cadence, not on the backstop.
+    std::fs::remove_dir_all(&lost).expect("remove the attached root");
+    await_status(
+        &running,
+        "a removed root was never reported pending",
+        |status| status.pending.contains(&lost),
+    );
+    // From a backstop boundary, so the re-attach below cannot be the backstop
+    // arriving early.
+    await_refresh(&refreshes, "before recreating the lost root");
+    std::fs::create_dir_all(&lost).expect("recreate the lost root");
+    await_status_within(
+        &running,
+        Duration::from_millis(1_200),
+        "a root lost and recreated was not retried on the recovery cadence",
+        |status| status.watched.contains(&lost),
+    );
+
+    // Phase 2, the finding: the recovery is over — every root that was
+    // attached is attached again — so the loop must be back on the backstop,
+    // even though the root that never existed is still pending.
+    await_refresh(&refreshes, "before installing the late provider");
+    std::fs::create_dir_all(&never).expect("install the late provider");
+    let until = std::time::Instant::now() + Duration::from_millis(1_200);
+    while std::time::Instant::now() < until {
+        assert!(
+            !running
+                .watch
+                .status()
+                .expect("status")
+                .watched
+                .contains(&never),
+            "a root that never attached held the recovery cadence open after \
+             another root recovered: {:?}",
+            running.watch.status()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // And the control on that negative: the slower cadence still attaches it,
+    // so the assertion above is about *when* and not about never.
+    await_status(
+        &running,
+        "the late provider was never attached at all",
+        |status| status.watched.contains(&never),
+    );
+}
+
+/// A root adopted before its directory exists is a hole in the loop's
+/// coverage, and the caller has to be told about it.
+///
+/// `adopt` is the only thing that knows a root is new; `reconcile` has nothing
+/// to say about one it cannot attach. Publishing only on `reconcile`'s count
+/// means `ai-hist watch --status` reports full coverage — no pending roots at
+/// all — for a provider the loop has taken on and cannot yet watch, which is
+/// precisely the state a user checks the status to find.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_root_adopted_before_it_exists_is_reported_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let present = dir.path().join("sessions");
+    std::fs::create_dir_all(&present).expect("the root that is there from the start");
+    let late = dir.path().join("projects");
+    let arrives = dir.path().join("rollouts");
+
+    let stage = Arc::new(AtomicUsize::new(0));
+    let staged = stage.clone();
+    let running = RunningLoop::reporting({
+        let present = present.clone();
+        let late = late.clone();
+        let arrives = arrives.clone();
+        move |watch| {
+            let first = present.clone();
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(first)])
+                .with_roots_refresh(Arc::new(move || {
+                    let mut roots = vec![ai_hist::discover::WatchRoot::tree(present.clone())];
+                    if staged.load(Ordering::SeqCst) >= 1 {
+                        roots.push(ai_hist::discover::WatchRoot::tree(late.clone()));
+                    }
+                    if staged.load(Ordering::SeqCst) >= 2 {
+                        roots.push(ai_hist::discover::WatchRoot::tree(arrives.clone()));
+                    }
+                    roots
+                }))
+                .with_debounce_ms(50)
+                .with_slow_poll_ms(300)
+                .with_poll_interval_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+    assert!(
+        running.watch.status().expect("status").pending.is_empty(),
+        "nothing is pending while the only root is attached: {:?}",
+        running.watch.status()
+    );
+
+    // The finding: a root the refresher introduced, whose directory is not
+    // there yet.
+    stage.store(1, Ordering::SeqCst);
+    await_status(
+        &running,
+        "a root adopted before its directory existed was never reported pending",
+        |status| status.pending.contains(&late),
+    );
+
+    // Positive control: a root the refresher introduces that *does* exist is
+    // published as watched, so the publish above is about coverage and not
+    // about publishing everything twice.
+    std::fs::create_dir_all(&arrives).expect("the root that is there when adopted");
+    stage.store(2, Ordering::SeqCst);
+    await_status(
+        &running,
+        "a root adopted after its directory existed was never reported watched",
+        |status| status.watched.contains(&arrives),
+    );
+}
+
+/// A lost registration has to be acted on when it is reported, including when
+/// the loop is inside its debounce window — which, on the machine live capture
+/// exists for, is where the loop spends most of its time.
+///
+/// The debounce sleep honours only the stop signal, so a removal landing
+/// inside the window waits out the rest of it *and* the forced sweep that
+/// follows before the registration is put back. That is the whole of the gap a
+/// session's `rm -rf ~/.codex/sessions` and immediate restart occupies, so the
+/// prompt-recovery fix did not cover the case it was written for on a busy
+/// tree.
+///
+/// Every sweep here is held on a permit, so the assertion is about ordering
+/// rather than about speed: with the sweep blocked, a loop that reconciles
+/// only after sweeping never reconciles at all.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_registration_lost_inside_the_debounce_window_is_put_back_before_the_sweep() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let busy = dir.path().join("busy");
+    let root = dir.path().join("sessions");
+    std::fs::create_dir_all(&busy).expect("the busy root");
+    std::fs::create_dir_all(&root).expect("the root that will be lost");
+
+    let (ticks, ticks_rx) = mpsc::channel();
+    let (entered, entered_rx) = mpsc::channel();
+    let (permits, permits_rx) = mpsc::channel::<()>();
+    let permits_rx = Arc::new(Mutex::new(permits_rx));
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_for_tick = armed.clone();
+    let tick: TickFn = Arc::new(move |force| {
+        let _ = ticks.send(force);
+        if armed_for_tick.load(Ordering::SeqCst) {
+            let _ = entered.send(());
+            // Bounded, and generously: a permit that never comes must fail
+            // the assertion that is waiting for it, not wedge the teardown
+            // that follows the failure.
+            let _ = permits_rx
+                .lock()
+                .expect("permits")
+                .recv_timeout(Duration::from_secs(25));
+        }
+        Ok(TickOutcome::default())
+    });
+    let running = RunningLoop::start(
+        {
+            let busy = busy.clone();
+            let root = root.clone();
+            move |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(true)
+                    .with_roots(vec![
+                        ai_hist::discover::WatchRoot::tree(busy),
+                        ai_hist::discover::WatchRoot::tree(root),
+                    ])
+                    // The debounce window, long enough to hold a removal and
+                    // short enough to keep the test quick.
+                    .with_debounce_ms(1_500)
+                    // Nothing here may depend on a backstop tick.
+                    .with_poll_interval_ms(600_000)
+                    .with_slow_poll_ms(600_000)
+            }
+        },
+        tick,
+    );
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // Positive control: the watch on the root works before anything is taken
+    // away from it.
+    std::fs::write(root.join("rollout-1.jsonl"), "{}\n").expect("write under the root");
+    assert_eq!(
+        ticks_rx.recv_timeout(ARRIVES_WITHIN),
+        Ok(true),
+        "a write under the root must drive a forced sweep"
+    );
+
+    // Put the loop somewhere known: inside a sweep, blocked on a permit.
+    armed.store(true, Ordering::SeqCst);
+    std::fs::write(busy.join("busy-1.jsonl"), "{}\n").expect("write under the busy root");
+    entered_rx
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the gated sweep never started");
+    // Releasing it returns the loop to the wait with nothing pending, so the
+    // next write is what opens the next debounce window.
+    permits.send(()).expect("release the gated sweep");
+    std::fs::write(busy.join("busy-2.jsonl"), "{}\n").expect("write under the busy root again");
+    // Positioning only, a fifth of the window: the removal below has to land
+    // inside it, and nothing is asserted about this interval.
+    std::thread::sleep(Duration::from_millis(300));
+
+    std::fs::remove_dir_all(&root).expect("remove the watched root");
+
+    // The finding. Bounded by less than the window that is left, so a loop
+    // that waits the window out fails here even though the sweep after it
+    // would have reconciled; and the sweep after it is blocked on a permit
+    // that never comes, so a loop that reconciles only after sweeping fails
+    // here too.
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    while !running
+        .watch
+        .status()
+        .expect("status")
+        .pending
+        .contains(&root)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a registration lost inside the debounce window waited for the \
+             window and the sweep after it: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+
+    // And the coverage that follows is real: recreated, re-attached on the
+    // recovery cadence, and a write under it drives a sweep again.
+    std::fs::create_dir_all(&root).expect("recreate the root");
+    for _ in 0..16 {
+        let _ = permits.send(());
+    }
+    armed.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while !running
+        .watch
+        .status()
+        .expect("status")
+        .watched
+        .contains(&root)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recreated root was never watched again: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+    while ticks_rx.recv_timeout(Duration::from_millis(2_200)).is_ok() {}
+    std::fs::write(root.join("rollout-2.jsonl"), "{}\n").expect("write under the new root");
+    assert_eq!(
+        ticks_rx.recv_timeout(ARRIVES_WITHIN),
+        Ok(true),
+        "the re-attached root must drive a forced sweep: {:?}",
+        running.watch.status()
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
@@ -3101,4 +3428,50 @@ fn session_event_count(db: &Path, session_id: &str) -> i64 {
         |row| row.get(0),
     )
     .expect("count session events")
+}
+
+/// Wait for a published status to satisfy `want`, or fail saying what it was.
+#[cfg(feature = "fs-events")]
+fn await_status(
+    running: &RunningLoop,
+    what: &str,
+    want: impl Fn(&ai_hist::watch::DriverStatus) -> bool,
+) {
+    await_status_within(running, ARRIVES_WITHIN, what, want);
+}
+
+/// The same, bounded by `window` — used where the *cadence* is the thing under
+/// test and the window is a fraction of the cadence that must not apply.
+#[cfg(feature = "fs-events")]
+fn await_status_within(
+    running: &RunningLoop,
+    window: Duration,
+    what: &str,
+    want: impl Fn(&ai_hist::watch::DriverStatus) -> bool,
+) {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        let status = running.watch.status().expect("status");
+        if want(&status) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}: {status:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait for the next backstop refresh, so what follows is measured from a
+/// known point in the backstop's cycle rather than from wherever the loop
+/// happened to be.
+#[cfg(feature = "fs-events")]
+fn await_refresh(refreshes: &Arc<AtomicUsize>, when: &str) {
+    let seen = refreshes.load(Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while refreshes.load(Ordering::SeqCst) == seen {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the backstop never came round {when}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
