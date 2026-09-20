@@ -539,7 +539,9 @@ export function expectedHydrationCapability(
  *
  * Evidence counts take the maximum and coverage takes the union, because the
  * merged result reports what *either* presence indexed; the remaining
- * scalar fields come from the richer of the two.
+ * scalar fields come from the presence that performed the strongest work;
+ * equal statuses select the richer presence. This keeps `status`, `presence`
+ * and `indexedThrough` describing the same acquisition.
  */
 export function combineHydration(
   previous: HydrateSessionResult | undefined,
@@ -552,8 +554,8 @@ export function combineHydration(
   // presence chosen for its capability. A first hydration outranks an update,
   // which outranks a repeat; a capability-limited result did no indexing.
   const statusRank = { hydrated: 3, updated: 2, unchanged: 1, capability_limited: 0 };
-  const status = statusRank[next.status] > statusRank[previous.status]
-    ? next.status : previous.status;
+  const selected = statusRank[next.status] > statusRank[previous.status] ? next
+    : statusRank[next.status] < statusRank[previous.status] ? previous : best;
   // Taking only the winner's coverage would understate a merge whose other
   // half indexed a kind the winner does not.
   const coverage = EVIDENCE_KINDS.filter(
@@ -585,11 +587,10 @@ export function combineHydration(
     });
   }
   return {
-    ...best,
+    ...selected,
     // Derived from the union rather than carried off `best`, which is spread
     // above: an individual `partial` no longer describes the merged coverage.
     capability: mergedHydrationCapability(coverage, [previous, next]),
-    status,
     evidence: {
       prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
       events: Math.max(previous.evidence.events, next.evidence.events),

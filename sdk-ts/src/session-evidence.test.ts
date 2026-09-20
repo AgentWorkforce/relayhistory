@@ -465,10 +465,22 @@ test('merging complementary partial presences yields a capability the union supp
 });
 
 test('merged status reports work from either presence regardless of capability or fold order', () => {
-  const unchanged = { ...hydrationPart('full', FULL_SESSION_KINDS), status: 'unchanged' as const };
-  const updated = { ...hydrationPart('partial', ['history']), status: 'updated' as const };
-  assert.equal(combineHydration(unchanged, updated).status, 'updated');
-  assert.equal(combineHydration(updated, unchanged).status, 'updated');
+  const unchanged = {
+    ...hydrationPart('full', FULL_SESSION_KINDS), status: 'unchanged' as const,
+    presence: 'local' as const,
+    indexedThrough: { sourceStamp: 'local-v1', lastEventAtMs: 1 },
+  };
+  const updated = {
+    ...hydrationPart('partial', ['history']), status: 'updated' as const,
+    presence: 'remote' as const,
+    indexedThrough: { sourceStamp: 'remote-v2', lastEventAtMs: 2 },
+  };
+  for (const merged of [combineHydration(unchanged, updated), combineHydration(updated, unchanged)]) {
+    assert.equal(merged.status, 'updated');
+    assert.equal(merged.presence, 'remote');
+    assert.deepEqual(merged.indexedThrough, updated.indexedThrough);
+    assert.equal(merged.capability, 'full');
+  }
 
   const hydrated = { ...hydrationPart('partial', ['tool_call']), status: 'hydrated' as const };
   assert.equal(combineHydration(updated, hydrated).status, 'hydrated');
