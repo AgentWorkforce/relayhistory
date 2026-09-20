@@ -628,6 +628,31 @@ between lines: `read_until` appends until a newline or EOF, so a budget
 consulted only before starting another line lets one record the size of the
 file allocate the size of the file.
 
+A record is read under a ceiling of its own. `read_until` extends its buffer
+until a newline or EOF, so any cap checked *around* the call — the 8 MiB
+deferral budget, for instance — can only ever notice an allocation that
+already happened. One record over `MAX_RECORD_BYTES` (16 MiB) is drained past
+in fixed-size chunks, never held, and reported as
+`HYDRATION_OVERSIZED_RECORDS`; a record that large is evidence of corruption
+rather than of a long turn.
+
+Record bytes are decoded strictly. `from_utf8_lossy` turns an invalid byte
+inside a JSON string into U+FFFD and leaves the syntax valid, so a corrupted
+record parsed cleanly and was indexed as though the replacement character were
+what the provider wrote. A record that is not valid UTF-8 now takes the same
+path as one that is not valid JSON: skipped.
+
+**Releasing deferred records waits out a grace window, not one observation.**
+A model pauses between streamed records constantly — thinking, running a tool,
+waiting on a network call — and those pauses are routinely longer than the
+interval between two hydrations. Releasing on the first pass that sees an
+unchanged file therefore fires during ordinary operation and publishes half a
+message that nothing will retract. The cursor carries `unchanged_since_ms`,
+and records are released only once the file has been still for
+`QUIESCENT_GRACE_MS` (two minutes). The asymmetry justifies erring long:
+releasing late costs latency on a genuinely abandoned message, releasing early
+publishes a partial one.
+
 A cheap "has this changed?" check that compares only size, mtime and inode is
 not enough to skip a file. A writer that restores timestamps, or a filesystem
 whose clock puts both writes in one tick, produces a rewrite with an identical

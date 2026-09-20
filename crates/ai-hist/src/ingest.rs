@@ -2235,8 +2235,20 @@ fn ingest_codex_rollout_incremental(
     loop {
         // A line without its newline is the half-written tail of a live
         // session; the next pass re-reads it.
-        if reader.next_line(&mut line)? != Some(cursor::ReadRecord::Terminated) {
-            break;
+        match reader.next_line(&mut line)? {
+            Some(cursor::ReadRecord::Terminated) => {}
+            // Over the record ceiling. It was never held, and a terminated
+            // one is behind the reader, so the walk carries on past it.
+            Some(cursor::ReadRecord::Oversized { terminated: true }) => {
+                pass.oversized_records += 1;
+                line_index += 1;
+                continue;
+            }
+            Some(cursor::ReadRecord::Oversized { terminated: false }) => {
+                pass.oversized_records += 1;
+                break;
+            }
+            _ => break,
         }
         let index = line_index;
         line_index += 1;
@@ -2626,7 +2638,14 @@ fn ingest_codex_rollout_incremental(
         }
     }
     let (offset, state) = committed;
-    pass.bytes_read = reader.position().saturating_sub(start_offset);
+    // The tail `next_line` consumed was read, whether or not the position
+    // advanced over it. Leaving it out made an unterminated Codex tail
+    // invisible in the counter, which is the same omission this counter has
+    // had to be corrected for elsewhere.
+    pass.bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes());
     pass.records = line_index.saturating_sub(resume.next_line_index) as i64;
     cursor.file = Some(reader.commit(offset)?);
     cursor.codex = Some(state);

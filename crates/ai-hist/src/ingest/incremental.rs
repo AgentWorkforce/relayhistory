@@ -140,6 +140,19 @@ pub(crate) fn ingest_claude_transcript_incremental(
         let Some(kind) = reader.next_line(&mut line)? else {
             break;
         };
+        if let ReadRecord::Oversized { terminated } = kind {
+            // Skipped, not held: the ceiling exists so one record cannot cost
+            // the file's size in memory, and holding it to decide would be
+            // the thing it prevents. A record whose end has not arrived is
+            // left uncommitted so a writer still producing it is not skipped
+            // past.
+            pass.oversized_records += 1;
+            if terminated {
+                line_index += 1;
+                continue;
+            }
+            break;
+        }
         let index = line_index;
         // A record with no newline is considered only if it is complete
         // JSON. A half-written line is not, and a writer appends a line at a

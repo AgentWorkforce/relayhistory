@@ -118,6 +118,14 @@ pub(crate) struct TranscriptFileCursor {
     pub mtime_ns: u64,
     /// The file's size when this cursor was written, for diagnostics.
     pub size: u64,
+    /// When this file was first observed at its current size and mtime.
+    ///
+    /// Carried forward across passes that see no change, so "the writer has
+    /// stopped" is a statement about elapsed time rather than about two
+    /// consecutive observations, which two quick passes during a model's
+    /// pause would otherwise satisfy. See [`QUIESCENT_GRACE_MS`].
+    #[serde(default)]
+    pub unchanged_since_ms: i64,
     /// See the module docs: a bounded window, not the whole prefix.
     pub prefix_hash: String,
 }
@@ -255,6 +263,11 @@ impl TranscriptCursorState {
 }
 
 /// Hash the bounded validation window for `[0, offset)`. See the module docs.
+/// A record's text, or `None` when its bytes are not valid UTF-8.
+fn decode_record(raw: &[u8]) -> Option<&str> {
+    std::str::from_utf8(raw).ok()
+}
+
 fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"relayhistory/transcript-prefix/v1\0");
@@ -316,6 +329,9 @@ pub(crate) fn whole_file_cursor(path: &Path) -> Result<TranscriptFileCursor> {
         inode,
         mtime_ns: super::metadata_mtime_ns(&metadata),
         size,
+        // A whole-file stamp is about "have these bytes changed", not about
+        // waiting for a writer, so it carries no quiet-since observation.
+        unchanged_since_ms: 0,
         prefix_hash: prefix_window_digest(&mut file, size)?,
     })
 }
@@ -418,7 +434,46 @@ pub(crate) enum ReadRecord {
     /// and leaves the decision to the caller, and the position does not
     /// advance past it.
     Unterminated,
+    /// The record passed [`MAX_RECORD_BYTES`] before it ended. Nothing is
+    /// handed over — the point is not to hold it — and the caller skips it.
+    /// `terminated` says whether its newline was found while draining: when
+    /// it was, the bytes are behind the reader and the position advanced past
+    /// them; when it was not, the file simply ends mid-record and the
+    /// position stays put so a writer still working on it is not skipped past.
+    Oversized { terminated: bool },
 }
+
+/// The largest single record a transcript reader will hold in memory.
+///
+/// `read_until` extends its buffer until it finds a newline or reaches EOF, so
+/// every budget checked *around* the call is advisory: the Claude deferral cap
+/// of 8 MiB, for instance, could only ever notice that an allocation had
+/// already happened. A transcript containing one 500 MiB record made the
+/// reader allocate 500 MiB whatever the caps said.
+///
+/// 16 MiB is well above any record a provider writes — a tool result carrying
+/// a large file read is a few MiB at the outside — and well under the ceiling
+/// the memory test asserts, so a record over it is evidence of corruption or
+/// of a file that is not a transcript, not of an unusually chatty turn.
+pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How long a transcript must sit unchanged before records held back for a
+/// message still being written are released.
+///
+/// Deferral is a bet that the provider will finish the message, and the only
+/// evidence available that it will not is that the file has stopped changing.
+/// But a model pauses between streamed records all the time — thinking,
+/// running a tool, waiting on a network call — and those pauses are routinely
+/// longer than the interval between two hydrations. Releasing on the first
+/// pass that sees an unchanged file therefore fires during ordinary
+/// operation, indexes half a message, and cannot retract it when the rest
+/// arrives.
+///
+/// Two minutes is longer than a pause between content blocks and shorter than
+/// a session anyone is waiting on. The asymmetry justifies erring long:
+/// releasing late costs latency on a genuinely abandoned message, releasing
+/// early publishes a partial one that nothing will take back.
+pub(crate) const QUIESCENT_GRACE_MS: i64 = 120_000;
 
 /// A transcript opened at its cursor.
 pub(crate) struct TranscriptReader {
@@ -428,6 +483,8 @@ pub(crate) struct TranscriptReader {
     start_offset: u64,
     /// Bytes of an unterminated trailing record handed to the caller.
     tail_bytes: u64,
+    /// The `unchanged_since_ms` this pass will write back.
+    unchanged_since_ms: i64,
     /// The file is byte-for-byte where its cursor left it, so nothing has been
     /// appended since the last pass and whatever wrote it has stopped.
     quiesced: bool,
@@ -459,6 +516,7 @@ impl TranscriptReader {
 
         let mut rotated = false;
         let mut quiesced = false;
+        let mut unchanged_since_ms = now_ms();
         // A cursor at offset 0 is still a cursor. It records the file's
         // identity, size and mtime, and those are what say whether anything
         // has been appended since the last pass. Reading it as "no cursor"
@@ -477,7 +535,16 @@ impl TranscriptReader {
                     && prefix_window_digest(&mut file, saved.offset)
                         .is_ok_and(|digest| digest == saved.prefix_hash);
                 if valid {
-                    quiesced = size == saved.size && mtime_ns == saved.mtime_ns;
+                    let stat_unchanged = size == saved.size && mtime_ns == saved.mtime_ns;
+                    // Carry the stamp forward while nothing moves; restart it
+                    // the moment anything does.
+                    unchanged_since_ms = if stat_unchanged && saved.unchanged_since_ms > 0 {
+                        saved.unchanged_since_ms
+                    } else {
+                        now_ms()
+                    };
+                    quiesced = stat_unchanged
+                        && now_ms().saturating_sub(unchanged_since_ms) >= QUIESCENT_GRACE_MS;
                     rewind_to
                         .filter(|rewind| *rewind <= saved.offset)
                         .unwrap_or(saved.offset)
@@ -500,6 +567,7 @@ impl TranscriptReader {
             position: offset,
             start_offset: offset,
             tail_bytes: 0,
+            unchanged_since_ms,
             quiesced,
             device,
             inode,
@@ -544,17 +612,72 @@ impl TranscriptReader {
     pub(crate) fn next_line(&mut self, line: &mut String) -> Result<Option<ReadRecord>> {
         line.clear();
         let mut raw = Vec::new();
-        let read = self.reader.read_until(b'\n', &mut raw)?;
+        // The cap is on the reader, not on a check around it: `read_until`
+        // extends `raw` until it finds a newline or reaches EOF, so a budget
+        // consulted afterwards can only observe an allocation that already
+        // happened.
+        let read = (&mut self.reader)
+            .take(MAX_RECORD_BYTES)
+            .read_until(b'\n', &mut raw)?;
         if read == 0 {
             return Ok(None);
         }
-        line.push_str(&String::from_utf8_lossy(&raw));
         if raw.last() != Some(&b'\n') {
+            if read as u64 == MAX_RECORD_BYTES {
+                // Over the ceiling. Get past it without ever holding it: drop
+                // what was read and walk to the newline in fixed-size chunks.
+                drop(raw);
+                let terminated = self.drain_oversized_record()?;
+                return Ok(Some(ReadRecord::Oversized { terminated }));
+            }
+            // A genuine tail: the file ends here, under the ceiling.
+            let Some(text) = decode_record(&raw) else {
+                self.tail_bytes = read as u64;
+                return Ok(Some(ReadRecord::Unterminated));
+            };
+            line.push_str(text);
             self.tail_bytes = read as u64;
             return Ok(Some(ReadRecord::Unterminated));
         }
+        // A record that is not valid UTF-8 is a malformed record. Repairing it
+        // into replacement characters kept the JSON syntactically valid and
+        // indexed corrupted text as though it were what the provider wrote;
+        // leaving `line` empty routes it through the same skip a JSON parse
+        // failure takes.
+        if let Some(text) = decode_record(&raw) {
+            line.push_str(text);
+        }
         self.position += read as u64;
         Ok(Some(ReadRecord::Terminated))
+    }
+
+    /// Walk past a record that exceeded [`MAX_RECORD_BYTES`], in fixed-size
+    /// chunks, and say whether its newline was found.
+    ///
+    /// Advancing the position is only correct once the record is behind the
+    /// reader. A file that simply ends mid-record may still be being written,
+    /// so its bytes stay uncommitted and the next pass meets them again.
+    fn drain_oversized_record(&mut self) -> Result<bool> {
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut drained = MAX_RECORD_BYTES;
+        loop {
+            let read = self.reader.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(false);
+            }
+            if let Some(index) = chunk[..read].iter().position(|byte| *byte == b'\n') {
+                drained += index as u64 + 1;
+                self.position += drained;
+                // Anything after the newline in this chunk belongs to the next
+                // record, so start again from the byte after it.
+                let resume = self.position;
+                self.reader
+                    .get_mut()
+                    .seek(std::io::SeekFrom::Start(resume))?;
+                return Ok(true);
+            }
+            drained += read as u64;
+        }
     }
 
     /// The cursor to store for a pass that committed through `offset`.
@@ -570,6 +693,7 @@ impl TranscriptReader {
             inode: self.inode,
             mtime_ns: super::metadata_mtime_ns(&metadata),
             size: metadata.len(),
+            unchanged_since_ms: self.unchanged_since_ms,
             prefix_hash: prefix_window_digest(&mut self.file, offset)?,
         })
     }
@@ -692,6 +816,10 @@ pub(crate) struct IncrementalPass {
     pub in_progress: Vec<String>,
     /// The cursor was discarded and the file re-read from zero.
     pub rotated: bool,
+    /// Records that passed `MAX_RECORD_BYTES` and were skipped rather than
+    /// held. Reported, because a skipped record is evidence that did not
+    /// arrive and silence would make it look like it never existed.
+    pub oversized_records: i64,
     /// Deferral hit its memory ceiling and an unfinished message was indexed
     /// early rather than held. Progress is preferred to purity here: the rows
     /// are real records under their own event identity, and the completion

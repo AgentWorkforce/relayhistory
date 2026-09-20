@@ -1351,6 +1351,8 @@ pub(crate) struct IngestOutcome {
     /// Deferral hit its memory ceiling somewhere and indexed an unfinished
     /// message early.
     pub deferral_overflowed: bool,
+    /// Records skipped for passing the per-record ceiling.
+    pub oversized_records: i64,
 }
 
 impl IngestOutcome {
@@ -1360,6 +1362,7 @@ impl IngestOutcome {
         self.in_progress.extend(pass.in_progress);
         self.rotated |= pass.rotated;
         self.deferral_overflowed |= pass.deferral_overflowed;
+        self.oversized_records += pass.oversized_records;
     }
 
     fn absorb_outcome(&mut self, other: IngestOutcome) {
@@ -1368,6 +1371,7 @@ impl IngestOutcome {
         self.in_progress.extend(other.in_progress);
         self.rotated |= other.rotated;
         self.deferral_overflowed |= other.deferral_overflowed;
+        self.oversized_records += other.oversized_records;
     }
 }
 
@@ -1994,6 +1998,21 @@ fn build_result(
             records_parsed: Some(indexed.in_progress.len() as i64),
         });
     }
+    if indexed.oversized_records > 0 {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_OVERSIZED_RECORDS".to_string(),
+            message: format!(
+                "{} record(s) passed the {} byte per-record ceiling and were skipped; \
+                 a record that large is evidence of corruption rather than of an \
+                 unusually long turn",
+                indexed.oversized_records,
+                crate::ingest::cursor::MAX_RECORD_BYTES
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: Some(indexed.oversized_records),
+        });
+    }
     if indexed.deferral_overflowed {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_IN_PROGRESS_OVERFLOW".to_string(),
@@ -2526,6 +2545,32 @@ mod tests {
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == code)
+    }
+
+    /// Put a cursor's quiet-since stamp far enough back that the next pass
+    /// treats the file as abandoned.
+    ///
+    /// Reaching into the stored stamp rather than sleeping keeps these tests
+    /// deterministic and instant: the rule under test is "the file has been
+    /// still for longer than the grace window", and the window's length is
+    /// not what any of them is about.
+    fn age_past_grace(db: &Path, key: &CursorKey<'_>) {
+        let conn = open_db(db).unwrap();
+        let mut cursor = load_cursor(&conn, key).unwrap();
+        let file = cursor
+            .file
+            .as_mut()
+            .expect("a cursor holding records has a file position");
+        file.unchanged_since_ms = now_ms() - super::cursor::QUIESCENT_GRACE_MS - 1;
+        store_cursor(&conn, key, &cursor).unwrap();
+    }
+
+    fn session_cursor_key<'a>(session_id: &'a str) -> CursorKey<'a> {
+        CursorKey::Session {
+            source: "claude",
+            session_id,
+            location: "local",
+        }
     }
 
     fn stored_cursor(db: &Path, session_id: &str) -> TranscriptCursorState {
@@ -3307,10 +3352,24 @@ mod tests {
             .iter()
             .any(|row| row.0.starts_with("u-asst-2")));
 
-        // Nothing appended. The writer is gone, so the next pass stops waiting
-        // for a completion that is not coming. A session with a message still
-        // held is never reported `unchanged`, which is what lets this pass run
-        // at all.
+        // Nothing appended, but a model that pauses between streamed records
+        // has not stopped writing, so an immediate second pass keeps waiting.
+        let paused =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert!(
+            diagnostic(&paused, "HYDRATION_IN_PROGRESS_MESSAGES").is_some(),
+            "a pause shorter than the grace window is not an abandoned message"
+        );
+        assert!(!session_event_snapshot(&db, INCOMPLETE_SESSION)
+            .iter()
+            .any(|row| row.0.starts_with("u-asst-2")));
+
+        // Once the file has been still for longer than the grace window the
+        // writer really is gone, and the held records are released. A session
+        // with records still held is never reported `unchanged`, which is what
+        // lets this pass run at all.
+        age_past_grace(&db, &session_cursor_key(INCOMPLETE_SESSION));
         let second =
             hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
                 .unwrap();
@@ -3432,7 +3491,9 @@ mod tests {
         assert_eq!(session_event_snapshot(&db, session_id).len(), 0);
         assert_eq!(stored_cursor(&db, session_id).committed_offset(), 0);
 
-        // Nothing changes. The writer is gone.
+        // Nothing changes, and the writer has been still long enough to say
+        // so. The point of this test is the offset, not the window.
+        age_past_grace(&db, &session_cursor_key(session_id));
         let second =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_ne!(second.status, "unchanged");
@@ -3504,7 +3565,9 @@ mod tests {
             "the cursor must not advance past a record it held"
         );
 
-        // The writer stops without ever terminating the line.
+        // The writer stops without ever terminating the line, and stays
+        // stopped for longer than the grace window.
+        age_past_grace(&db, &session_cursor_key(session_id));
         let second =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert!(diagnostic(&second, "HYDRATION_IN_PROGRESS_MESSAGES").is_none());
@@ -3561,7 +3624,16 @@ mod tests {
         assert_eq!(session_event_snapshot(&db, session_id).len(), 1);
 
         // Nothing changes anywhere. The shortcut must not fire while the
-        // sidecar is still holding records.
+        // sidecar is still holding records, and the sidecar's own cursor is
+        // what has to age out before they are released.
+        let locator = sidecar.to_string_lossy().to_string();
+        age_past_grace(
+            &db,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &locator,
+            },
+        );
         let second =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_ne!(
@@ -3770,6 +3842,225 @@ mod tests {
             )
             .unwrap();
         assert_eq!(agent_type.as_deref(), Some("Plan"));
+    }
+
+    /// One enormous record must not cost the file's size in memory.
+    ///
+    /// `read_until` extends its buffer until a newline or EOF, so the Claude
+    /// deferral cap could only ever notice an allocation that had already
+    /// happened. Both readers used it, so a transcript with one 500 MiB
+    /// record made the reader allocate 500 MiB whatever the caps said. The
+    /// ceiling is now on the reader.
+    #[test]
+    fn a_record_over_the_ceiling_is_skipped_rather_than_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-oversized";
+        // Under the ceiling, valid, and indexed: the positive control that
+        // makes "skipped" a fact about the size rather than about the reader.
+        let small = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"small\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let huge = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"{}\"}},\
+             \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n",
+            "z".repeat(super::cursor::MAX_RECORD_BYTES as usize)
+        );
+        let after = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-3\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"after\"}},\
+             \"timestamp\":\"2026-08-31T10:00:02Z\"}}\n"
+        );
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!("{small}{huge}{after}").as_bytes(),
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let before = peak_rss_bytes();
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let growth = peak_rss_bytes().saturating_sub(before);
+
+        // The records either side of it are indexed; the oversized one is not.
+        let uids: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(uids, vec!["u-1:0".to_string(), "u-3:0".to_string()]);
+
+        let skipped = diagnostic(&result, "HYDRATION_OVERSIZED_RECORDS")
+            .expect("a skipped record is reported, not silently dropped");
+        assert_eq!(skipped.records_parsed, Some(1));
+
+        // Never held: the record is 16 MiB and the ceiling is the only thing
+        // between it and the allocator.
+        assert!(
+            growth < super::cursor::MAX_RECORD_BYTES,
+            "hydration grew peak RSS by {growth} bytes over a {} byte record",
+            super::cursor::MAX_RECORD_BYTES
+        );
+    }
+
+    /// The same ceiling, on a record the file ends inside.
+    #[test]
+    fn an_oversized_unterminated_record_leaves_the_cursor_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-oversized-tail";
+        let small = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"small\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        // No newline: the file ends in the middle of a record that is already
+        // past the ceiling.
+        let huge_tail = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"content\":\"{}\"",
+            "z".repeat(super::cursor::MAX_RECORD_BYTES as usize)
+        );
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!("{small}{huge_tail}").as_bytes(),
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert!(diagnostic(&result, "HYDRATION_OVERSIZED_RECORDS").is_some());
+        // Positive control: the complete record before it landed.
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 1);
+        // The cursor stops before the record the file ends inside, so a writer
+        // still producing it is not skipped past.
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            small.len() as i64
+        );
+    }
+
+    /// Bytes that are not valid UTF-8 are a malformed record, not text to
+    /// repair.
+    ///
+    /// `from_utf8_lossy` turned an invalid byte inside a JSON string into
+    /// U+FFFD while leaving the syntax valid, so a corrupted record parsed
+    /// cleanly and was indexed as though the replacement character were what
+    /// the provider wrote.
+    #[test]
+    fn a_record_with_invalid_utf8_is_skipped_rather_than_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-invalid-utf8";
+        let mut bytes = Vec::new();
+        // Valid, and multi-byte, so the control proves strict decoding did not
+        // simply reject everything non-ASCII.
+        bytes.extend_from_slice(
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/w\",\"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\"héllo wörld — ok\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        // The invalid byte sits *inside* a string, so lossy decoding produces
+        // a record that is still valid JSON — which is the whole danger. A
+        // record that would be malformed either way proves nothing about how
+        // it was decoded, and an earlier draft of this test made exactly that
+        // mistake and passed against the defect.
+        let prefix = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"bad"
+        );
+        let suffix = "\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n";
+        bytes.extend_from_slice(prefix.as_bytes());
+        bytes.push(0xFF);
+        bytes.extend_from_slice(suffix.as_bytes());
+        // Prove the fixture is what the test claims: replacing the invalid
+        // byte the way `from_utf8_lossy` would gives a record that parses.
+        let repaired = format!("{prefix}{}{suffix}", char::REPLACEMENT_CHARACTER);
+        assert!(
+            serde_json::from_str::<Value>(repaired.trim_end()).is_ok(),
+            "the lossy form of this record must be valid JSON, or the test \
+             cannot tell strict decoding from a parse failure"
+        );
+        let transcript = seed_claude_transcript(dir.path(), session_id, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let rows = session_event_snapshot(&db, session_id);
+        let uids: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["u-1:0"],
+            "a record with an invalid byte must be skipped, not repaired"
+        );
+        // Positive control: the multi-byte record survived intact, so strict
+        // decoding rejected the invalid bytes rather than everything.
+        assert!(rows[0].3.contains("héllo wörld — ok"), "{:?}", rows[0]);
+        // And nothing was written with a replacement character.
+        assert!(!rows.iter().any(|row| row.3.contains('\u{FFFD}')));
+    }
+
+    /// A Codex rollout's unterminated tail was read, so it is counted.
+    ///
+    /// `bytes_read` was computed from the reader's position, which by design
+    /// does not advance over a tail the pass declines to commit — so the bytes
+    /// `next_line` had already consumed went unreported. The same omission
+    /// this counter has had to be corrected for three times elsewhere.
+    #[test]
+    fn a_codex_unterminated_tail_is_counted_in_bytes_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-tail.jsonl");
+        let meta_line = "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                         \"payload\":{\"id\":\"tail\",\"cwd\":\"/work/app\"}}\n";
+        let complete = format!(
+            "{meta_line}{{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\
+             \"payload\":{{\"type\":\"user_message\",\"message\":\"first\"}}}}\n\
+             {{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\
+             \"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}}}\n"
+        );
+        fs::write(&rollout, &complete).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "tail", Some(&rollout));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("codex", "tail"), dir.path()).unwrap();
+        assert_eq!(
+            first.bytes_read,
+            complete.len() as i64 + 2 * meta_line.len() as i64
+        );
+
+        // A half-written record arrives with no newline. The pass reads it,
+        // declines to commit it, and must still report having read it.
+        let tail = "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"event_ms";
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        write!(file, "{tail}").unwrap();
+        drop(file);
+
+        let appended =
+            hydrate_session_at_with_home(&db, &options("codex", "tail"), dir.path()).unwrap();
+        assert_eq!(
+            appended.bytes_read,
+            tail.len() as i64 + 2 * meta_line.len() as i64,
+            "an unterminated tail the reader consumed must appear in bytes_read"
+        );
+        // Positive control: the tail was not committed, so the cursor has not
+        // advanced over it and the next pass will read it again.
+        assert!(appended.bytes_read > 2 * meta_line.len() as i64);
     }
 
     #[test]
