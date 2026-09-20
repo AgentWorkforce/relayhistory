@@ -651,6 +651,15 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
 
     // A batch that really was taken is still refused. `claim_batch` bumps the
     // fence, which is what the check now rests on.
+    //
+    // The takeover is a precondition, not something to check for and step
+    // around: guarding the assertion on `stolen.is_some()` would let a
+    // regression that stops the second worker claiming anything at all make
+    // this test pass without testing its subject. It is deterministic here --
+    // the failure above took `attempts` to 1, so the backoff is 2000 ms plus
+    // at most 400 ms of jitter, well inside the 10 s horizon below, and the
+    // batch is `retry_wait` under an `active` job, which is what `claim_batch`
+    // requires.
     let stolen = claim_batch(
         &fixture.conn,
         &job.job_id,
@@ -658,20 +667,23 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
         30,
         system_clock() + 10_000,
     )
-    .unwrap();
-    if stolen.is_some() {
-        assert!(
-            record_failure(
-                &fixture.conn,
-                &claim.lease,
-                DeliveryFailure::Transient,
-                None,
-                system_clock(),
-            )
-            .is_err(),
-            "a fenced lease must not be able to move another worker's state"
-        );
-    }
+    .unwrap()
+    .expect("a retry_wait batch is claimable once its backoff has passed");
+    assert_ne!(
+        stolen.lease.fence, claim.lease.fence,
+        "a takeover bumps the fence; that is the whole ownership proof"
+    );
+    assert!(
+        record_failure(
+            &fixture.conn,
+            &claim.lease,
+            DeliveryFailure::Transient,
+            None,
+            system_clock(),
+        )
+        .is_err(),
+        "a fenced lease must not be able to move another worker's state"
+    );
 }
 
 /// The fence proves ownership only for as long as the transaction that read
