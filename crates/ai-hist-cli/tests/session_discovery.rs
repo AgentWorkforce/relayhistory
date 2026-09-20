@@ -106,7 +106,7 @@ fn discover_streams_jsonl_rows_then_a_summary() {
 
     let summary = lines.last().expect("a summary line");
     assert_eq!(summary["type"], "summary");
-    assert_eq!(summary["contract_version"], 3);
+    assert_eq!(summary["contract_version"], 4);
     assert_eq!(summary["scope"], "local");
     assert_eq!(summary["discovered"], 2);
     assert_eq!(summary["skipped_unchanged"], 0);
@@ -162,7 +162,7 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["contract_version"], 3);
+    assert_eq!(payload["contract_version"], 4);
     assert_eq!(payload["scope"], "local");
     let sessions = payload["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 2);
@@ -660,4 +660,132 @@ fn installed_credentials_do_not_compose_remote_sources_into_local_cli() {
         .iter()
         .filter(|row| row.get("session_id").is_some())
         .all(|row| row["locations"] == serde_json::json!(["local"])));
+}
+
+/// The canonical project key reaches the CLI's JSON contract, and
+/// `--project` selects on it.
+///
+/// Asserted from outside the library because the key is only useful if a
+/// consumer can both read it off a row and ask for that project back. Two
+/// checkouts of one repository are discovered from different directories: a
+/// filter that matched on the path would return one of them, which is the
+/// fragmentation this key exists to end.
+#[test]
+fn catalog_rows_carry_a_canonical_project_key_and_can_be_filtered_by_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("history.db");
+    let checkout = |name: &str, origin: &str| -> std::path::PathBuf {
+        let dir = temp.path().join("work").join(name);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(
+            dir.join(".git").join("config"),
+            format!("[remote \"origin\"]\n\turl = {origin}\n"),
+        )
+        .unwrap();
+        dir
+    };
+    let one = checkout("proj", "git@github.com:Org/Repo.git");
+    let two = checkout("proj-elsewhere", "https://github.com/Org/Repo");
+    // A third session in a directory that is not a repository at all.
+    let plain = temp.path().join("work").join("loose");
+    fs::create_dir_all(&plain).unwrap();
+
+    for (index, (id, cwd)) in [("one", &one), ("two", &two), ("loose", &plain)]
+        .into_iter()
+        .enumerate()
+    {
+        write(
+            &temp
+                .path()
+                .join(format!(".codex/sessions/2026/06/21/rollout-{id}.jsonl")),
+            &format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-06-21T11:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": {"id": id, "cwd": cwd.to_string_lossy()},
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-06-21T11:00:03.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "prompt"},
+                }),
+            ),
+            1_750_000_000_000 + index as u64 * 1_000,
+        );
+    }
+
+    assert!(isolated(&temp, &db_path, &["sessions", "discover"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let listed = isolated(&temp, &db_path, &["sessions", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let rows = payload["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let key_of = |id: &str| -> (String, String) {
+        let row = rows
+            .iter()
+            .find(|row| row["session_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {rows:#?}"));
+        (
+            row["project_key"].as_str().unwrap().to_string(),
+            row["project_key_method"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(
+        key_of("one"),
+        ("github.com/Org/Repo".into(), "remote".into())
+    );
+    assert_eq!(
+        key_of("two"),
+        ("github.com/Org/Repo".into(), "remote".into()),
+        "two checkouts of one repository must share a key"
+    );
+    assert_eq!(
+        key_of("loose"),
+        (plain.to_string_lossy().to_string(), "path".into()),
+        "a directory with no remote falls back to itself and says so"
+    );
+
+    let filtered = isolated(
+        &temp,
+        &db_path,
+        &[
+            "sessions",
+            "list",
+            "--json",
+            "--project",
+            "github.com/Org/Repo",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered: Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    let mut ids: Vec<&str> = filtered["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["session_id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["one", "two"],
+        "--project must select both checkouts and exclude the unrelated session"
+    );
 }

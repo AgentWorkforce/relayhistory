@@ -37,16 +37,35 @@ struct Spec {
     columns: &'static str,
     required: &'static str,
     key: &'static str,
+    /// Columns that travel with the record but are not the adapter's to
+    /// vouch for: canonical state this database derives for itself.
+    ///
+    /// They are written back into the row *inside* the same transaction that
+    /// stores the adapter's snapshot, so comparing them against the snapshot
+    /// asks whether this database edited its own derived field — to which the
+    /// answer is always yes, and the consequence is that the connector is
+    /// protected against its own record. Ownership is about the fields the
+    /// adapter reports, so only those are compared.
+    derived: &'static str,
 }
 impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
-        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt"},
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,stop_reason,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
-        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id"},
-        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
-        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},
-        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method"},
+        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
+        // `project_key` travels with the event so a snapshot round-trips the
+        // canonical identity the emitting side resolved, and `project_key_method`
+        // with it so the receiving side can tell a key the emitter resolved for
+        // itself from one it was lent. A key that arrives without a method
+        // ranks below every stated one, so an older adapter's events are
+        // improved by the first pass that knows better rather than defended as
+        // if the emitter had vouched for them. Neither is trusted as final:
+        // `refresh_project_identity`'s denormalization pass brings every event
+        // back in line with its own session's key.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,stop_reason,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
+        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
+        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
+        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method",derived:""},
     }
     }
 }
@@ -233,11 +252,22 @@ impl EvidenceRecord {
     }
     /// Whether the canonical row still equals this adapter-owned projection.
     /// Local ingestion can write directly; a changed value revokes remote ownership.
+    ///
+    /// [`Spec::derived`] columns are left out of the comparison. They are
+    /// rewritten by `refresh_project_identity` in the same transaction that
+    /// stores the snapshot they are compared against, so including them makes
+    /// every enriched record look externally edited — and an adapter whose own
+    /// event was enriched then loses it: its updates stop landing and the
+    /// records it drops are never deleted, while it goes on reporting into a
+    /// row it no longer owns. The fields still travel in the record, because a
+    /// snapshot should round-trip what the emitting side knew; they are simply
+    /// not evidence about who owns the row.
     pub fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
+        let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
         let mut values = vec![];
-        for column in spec.columns.split(',') {
+        for column in spec.columns.split(',').filter(|c| !derived.contains(c)) {
             clauses.push(format!("{column} IS ?"));
             values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null)));
         }

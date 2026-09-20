@@ -1,8 +1,8 @@
 use ai_hist::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_tool_calls, untag_session, HistoryEntry, QueryFilter,
-    SOURCE_CHOICES,
+    session_file_edits, session_tool_calls, untag_session, HistoryEntry, ProjectGrouping,
+    QueryFilter, SOURCE_CHOICES,
 };
 pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -168,6 +168,11 @@ enum Command {
         scope: SessionScopeArgs,
         #[arg(long)]
         tag: Option<String>,
+        /// Group `top_projects` by the raw working directory instead of the
+        /// canonical project key. The default merges two checkouts of one
+        /// repository; this restores the pre-#175 per-directory grouping.
+        #[arg(long)]
+        by_cwd: bool,
         #[arg(long)]
         json: bool,
     },
@@ -329,6 +334,12 @@ enum SessionsAction {
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
+        /// Restrict to one canonical project key, as `project_key` reports it:
+        /// `host/owner/repo` (for example `github.com/AgentWorkforce/relayhistory`),
+        /// or the working directory for a checkout with no git remote. Exact
+        /// match — this is the key, not a path or a search term.
+        #[arg(long)]
+        project: Option<String>,
         /// Maximum rows (default 50). Must not be negative.
         #[arg(long)]
         limit: Option<i64>,
@@ -719,8 +730,18 @@ pub fn run() -> Result<()> {
                 json,
             )
         }
-        Command::Stats { scope, tag, json } => {
-            print_stats(&conn, scope.resolve(), tag.as_deref(), json)
+        Command::Stats {
+            scope,
+            tag,
+            by_cwd,
+            json,
+        } => {
+            let grouping = if by_cwd {
+                ProjectGrouping::Cwd
+            } else {
+                ProjectGrouping::ProjectKey
+            };
+            print_stats(&conn, scope.resolve(), tag.as_deref(), grouping, json)
         }
         Command::Tag {
             session_id,
@@ -975,6 +996,7 @@ pub fn run() -> Result<()> {
             SessionsAction::List {
                 scope,
                 source,
+                project,
                 limit,
                 before_ms,
                 after_source,
@@ -1009,6 +1031,7 @@ pub fn run() -> Result<()> {
                         limit,
                         before_ms,
                         after,
+                        project_key: project,
                     },
                 )?;
                 print_session_catalog(&page, json)
@@ -1607,6 +1630,7 @@ fn print_stats(
     conn: &Connection,
     scope: SessionScope,
     tag: Option<&str>,
+    grouping: ProjectGrouping,
     as_json: bool,
 ) -> Result<()> {
     let tag_norm = tag.map(normalize_tag_name);
@@ -1632,10 +1656,14 @@ fn print_stats(
         .iter()
         .cloned()
         .collect::<serde_json::Map<_, _>>();
-    let project_where = format!("{where_sql} AND project IS NOT NULL");
+    let project_key = grouping.expression();
+    let project_where = format!("{where_sql} AND {project_key} IS NOT NULL");
     let top_projects = query_pairs(
         conn,
-        &format!("SELECT project, COUNT(*) FROM history h {project_where} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"),
+        &format!(
+            "SELECT {project_key}, COUNT(*) FROM history h {project_where} \
+             GROUP BY {project_key} ORDER BY COUNT(*) DESC LIMIT 10"
+        ),
         &params_vec,
     )?
     .into_iter()
@@ -1653,6 +1681,10 @@ fn print_stats(
                 "total": total,
                 "by_source": by_source,
                 "top_projects": top_projects,
+                // Which key `top_projects` is bucketed by. A consumer that
+                // reads counts without reading this cannot tell a canonical
+                // repository rollup from a per-directory one.
+                "grouped_by": grouping.as_str(),
                 "first_timestamp_ms": first,
                 "last_timestamp_ms": last,
                 "tag": tag_norm,
@@ -1681,7 +1713,7 @@ fn print_stats(
         println!("\nDate range:");
         println!("  {} to {}", format_date(first), format_date(last));
     }
-    println!("\nTop 10 projects:");
+    println!("\nTop 10 projects (by {}):", grouping.as_str());
     for item in top_projects {
         println!(
             "  {:>6}  {}",
@@ -3104,6 +3136,7 @@ mod tests {
         assert!(super::is_read_only(&super::Command::Stats {
             scope: super::SessionScopeArgs::default(),
             tag: None,
+            by_cwd: false,
             json: false
         }));
         assert!(super::is_read_only(&super::Command::Show {

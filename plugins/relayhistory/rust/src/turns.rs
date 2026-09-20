@@ -235,7 +235,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
-                project TEXT, cwd TEXT, git_branch TEXT,
+                project TEXT, project_key TEXT, cwd TEXT, git_branch TEXT,
                 message_id TEXT, parent_id TEXT,
                 ts_ms INTEGER NOT NULL,
                 role TEXT NOT NULL,
