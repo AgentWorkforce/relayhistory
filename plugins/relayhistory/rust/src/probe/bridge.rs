@@ -2,9 +2,9 @@
 //! Sharing changes stop the collector and persist a replayable plan before
 //! replacing a delivery generation. An interrupted change fences startup until
 //! recovery completes, so it cannot accidentally broaden sharing.
-use super::{collector, lock, read_config, save_json, Config, Target};
+use super::{collector, lock, read_config, save_json, user_error, Config, Target};
 use ai_hist::delivery::{self, DeliveryJobConfig, SessionIdentity};
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use fs2::FileExt;
 use rusqlite::Connection;
@@ -215,7 +215,7 @@ pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let config = read_config(directory)?;
     ensure!(
         !directory.join("sharing-change.json").exists(),
-        "sharing update incomplete"
+        user_error("A sharing update is incomplete. Run start to recover it before retrying.")
     );
     let conn = db(directory)?;
     if paused {
@@ -319,8 +319,13 @@ struct ChangePlan {
     paused: bool,
 }
 fn parse_key(key: &str) -> Result<SessionIdentity> {
-    let (source, id) = key.split_once(':').context("invalid session key")?;
-    ensure!(!source.is_empty() && !id.is_empty(), "invalid session key");
+    let (source, id) = key
+        .split_once(':')
+        .ok_or_else(|| user_error("Invalid session key. Use SOURCE:ID from sessions list."))?;
+    ensure!(
+        !source.is_empty() && !id.is_empty(),
+        user_error("Invalid session key. Use SOURCE:ID from sessions list.")
+    );
     Ok(SessionIdentity {
         source: source.into(),
         session_id: id.into(),
@@ -417,7 +422,7 @@ fn make_plan(
     let known = identities(conn)?;
     ensure!(
         identities_requested.iter().all(|id| known.contains(id)),
-        "unknown session"
+        user_error("Unknown session. Refresh sessions list and try again.")
     );
     let old = delivery::status(conn, &config.job_id)?;
     let mut selected = selected(directory)?;
@@ -581,6 +586,48 @@ mod tests {
         save_json(&dir.join("sharing-change.json"), &plan).unwrap();
         recover(dir).unwrap();
         read_config(dir).unwrap()
+    }
+
+    #[test]
+    fn paused_capture_contention_is_not_an_offline_failure() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let conn = db(dir.path()).unwrap();
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        let sync_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("history.db.sync.lock"))
+            .unwrap();
+        sync_lock.lock_exclusive().unwrap();
+        collector::cycle(dir.path(), &config).unwrap();
+        assert_eq!(
+            delivery::status(&conn, &config.job_id).unwrap().state,
+            "paused"
+        );
+    }
+
+    #[test]
+    fn bridge_validation_errors_are_safe_and_actionable() {
+        for key in ["private-input", ":id", "codex:"] {
+            let error = parse_key(key).unwrap_err();
+            let safe = error.downcast_ref::<super::super::UserError>().unwrap();
+            assert!(safe.to_string().contains("SOURCE:ID"));
+            assert!(!safe.to_string().contains("private-input"));
+        }
+        let (dir, _) = fixture(SharingMode::Selected);
+        let error = change(dir.path(), None, &["codex:private-missing".into()], true).unwrap_err();
+        let safe = error.downcast_ref::<super::super::UserError>().unwrap();
+        assert!(safe.to_string().contains("Unknown session"));
+        assert!(!safe.to_string().contains("private-missing"));
+        save_json(&dir.path().join("sharing-change.json"), &json!({})).unwrap();
+        let error = pause(dir.path(), true).unwrap_err();
+        assert!(error
+            .downcast_ref::<super::super::UserError>()
+            .unwrap()
+            .to_string()
+            .contains("Run start"));
     }
 
     #[test]
@@ -788,7 +835,7 @@ mod tests {
         collector_lock.lock_exclusive().unwrap();
         assert!(collector::running(dir.path()).unwrap());
         let error = change(dir.path(), None, &["claude:missing".into()], true).unwrap_err();
-        assert!(error.to_string().contains("unknown session"));
+        assert!(error.to_string().contains("Unknown session"));
         assert!(!dir.path().join("stop.json").exists());
         assert!(!dir.path().join("sharing-change.json").exists());
         assert_eq!(

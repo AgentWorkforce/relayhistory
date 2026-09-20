@@ -88,6 +88,13 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
         instance_id: Some(INSTANCE.into()),
         acknowledge_uninspected_schedules: config.acknowledge_uninspected_schedules,
     };
+    deliver_with_receiver(db_path, config, &receiver)
+}
+fn deliver_with_receiver(
+    db_path: &Path,
+    config: &Config,
+    receiver: &dyn worker::Receiver,
+) -> Result<delivery::DeliveryStatus> {
     let options = worker::DrainOptions {
         job_ids: Some(vec![config.job_id.clone()]),
         // A cycle stays bounded so a stop request and the heartbeat are never
@@ -97,7 +104,7 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
     };
     let result = worker::drain(
         db_path,
-        &worker::SingleReceiver::new(DESTINATION, INSTANCE, &receiver),
+        &worker::SingleReceiver::new(DESTINATION, INSTANCE, receiver),
         &options,
         &worker::system_clock,
         &|| STOP.load(Ordering::Relaxed),
@@ -107,6 +114,11 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
         .into_iter()
         .find(|job| job.job_id == config.job_id)
         .context("delivery job missing")?;
+    // Pause can arrive while a batch is in flight. It is a successful user
+    // control action, even if it invalidated that batch's lease.
+    if status.state == "paused" {
+        return Ok(status);
+    }
     if status.state != "active" {
         return Err(user_error(
             "Delivery needs attention. Reconnect with --force-login if credentials have expired.",
@@ -137,10 +149,9 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         delivery::status(&conn, &config.job_id)?.state == "paused"
     };
     if paused {
-        ensure!(
-            ai_hist::sync_local_at(&directory.join("history.db"))?,
-            "capture not complete"
-        );
+        // Another sync owns capture when this returns false. The paused
+        // collector can retry next cycle without reporting an offline error.
+        ai_hist::sync_local_at(&directory.join("history.db"))?;
     } else {
         ensure!(
             destination::selected_account(Some(&config.history_url))? == config.delivery_account,
@@ -282,7 +293,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     let _lock = lock(directory)?;
     ensure!(
         !directory.join("sharing-change.json").exists(),
-        "sharing update incomplete"
+        user_error("A sharing update is incomplete. Run start to recover it before retrying.")
     );
     let config = read_config(directory)?;
     std::env::set_var("RELAYHISTORY_HOME", directory);
@@ -419,6 +430,81 @@ mod tests {
             limits: Default::default(),
         }
     }
+    #[test]
+    fn pause_during_drain_is_successful_without_acknowledging_the_batch() {
+        struct PausingReceiver<'a> {
+            conn: &'a Connection,
+            job_id: &'a str,
+            sent: std::cell::Cell<bool>,
+        }
+        impl worker::Receiver for PausingReceiver<'_> {
+            fn mapping_version(&self) -> &str {
+                destination::MAPPING_VERSION
+            }
+            fn supported_kinds(&self) -> &[&str] {
+                &["history", "session_event", "session"]
+            }
+            fn supports_tombstones(&self) -> bool {
+                true
+            }
+            fn prepare(
+                &self,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<worker::PreparedBody, worker::ReceiverFailure> {
+                Ok(worker::PreparedBody {
+                    content_type: "application/json".into(),
+                    body: "{}".into(),
+                })
+            }
+            fn send(
+                &self,
+                _: &delivery::PreparedPayload,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<delivery::DeliveryAcknowledgment, worker::ReceiverFailure>
+            {
+                self.sent.set(true);
+                delivery::pause_job(self.conn, self.job_id).unwrap();
+                Err(delivery::DeliveryFailure::Transient.into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let conn = ai_hist::open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','in-flight')",
+            [],
+        )
+        .unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        let receiver = PausingReceiver {
+            conn: &conn,
+            job_id: &config.job_id,
+            sent: std::cell::Cell::new(false),
+        };
+        let status = deliver_with_receiver(&db_path, &config, &receiver).unwrap();
+        assert!(receiver.sent.get());
+        assert_eq!(status.state, "paused");
+        assert_eq!(status.acknowledged_records, 0);
+        assert!(status.pending_records > 0);
+        delivery::cancel_job(&conn, &config.job_id).unwrap();
+        assert!(deliver_with_receiver(&db_path, &config, &receiver).is_err());
+    }
+
     #[test]
     fn sharing_stop_waits_for_collector_lock_release() {
         let dir = tempfile::tempdir().unwrap();
