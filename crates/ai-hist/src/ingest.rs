@@ -812,30 +812,72 @@ fn record_raw_facts_backfill(
     state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
 }
 
+/// Whether `key`, a sync-state path, names a file inside `root`.
+fn path_key_is_under(key: &str, root: &Path) -> bool {
+    let prefix = root.to_string_lossy();
+    key.len() > prefix.len()
+        && key.starts_with(prefix.as_ref())
+        && key[prefix.len()..].starts_with(std::path::MAIN_SEPARATOR)
+}
+
 /// Whether the sync state already names transcripts under `root`.
 ///
 /// This is what distinguishes an archive that is *unavailable* on this run --
 /// an unmounted home, a profile directory that has not been created yet, an
 /// external drive, a sync client that has not pulled the tree down -- from one
 /// that simply does not exist for this install. The first makes the walk
-/// complete over nothing while the rows it should have repaired are still
-/// there; the second has nothing to repair. Only the first may hold the
-/// generation back, or an install that never had an `archived_sessions` tree
-/// would keep re-probing forever.
-///
-/// A root that is unavailable can be *present and empty*, not only missing --
-/// a mount point exists whether or not anything is mounted on it -- so the
-/// walks pair this with "and this run saw none of them". An archive whose
-/// files the user really deleted leaves the pass pending, which costs nothing:
-/// there are no files left for it to probe, and the first one to appear
-/// completes it.
+/// complete over files whose rows still need repairing; the second has nothing
+/// to repair. Only the first may hold the generation back, or an install that
+/// never had an `archived_sessions` tree would keep re-probing forever.
 fn state_names_files_under(known: &Map<String, Value>, root: &Path) -> bool {
-    let prefix = root.to_string_lossy();
-    known.keys().any(|key| {
-        key.len() > prefix.len()
-            && key.starts_with(prefix.as_ref())
-            && key[prefix.len()..].starts_with(std::path::MAIN_SEPARATOR)
-    })
+    known.keys().any(|key| path_key_is_under(key, root))
+}
+
+/// The paths under `root` that the stamp map names and this walk did not see.
+///
+/// Availability is per file, not per root. A root can be readable while part
+/// of it is not -- a partially mounted archive, a sync client that has pulled
+/// down some of a tree -- and then "the walk returned at least one file" says
+/// nothing about the ones it did not return. Their rows are still there and
+/// still null.
+fn unobserved_known_paths(
+    known: &Map<String, Value>,
+    root: &Path,
+    observed: &[PathBuf],
+) -> Vec<String> {
+    let observed: HashSet<String> = observed
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    known
+        .keys()
+        .filter(|key| path_key_is_under(key, root) && !observed.contains(*key))
+        .cloned()
+        .collect()
+}
+
+/// Forget the stamps of files this run could not see, and report that the walk
+/// did not cover them.
+///
+/// Two things have to happen, and each is insufficient alone. The generation
+/// is withheld, because a run that did not see a file has not backfilled it.
+/// And the file's stamp is dropped, because a stamp is a claim that the file
+/// is unchanged since we last read it, and a file that vanished and came back
+/// is not something this process watched -- skipping it on that stale stamp is
+/// exactly how its rows would keep null facts after the archive returns.
+///
+/// Dropping the stamp is also what keeps a genuinely deleted file cheap. It
+/// holds the pass open for one more sync, then it is no longer a path the
+/// state knows about and the generation is recorded normally, instead of the
+/// pass staying pending for the life of the install.
+fn forget_unobserved_paths(known: &mut Map<String, Value>, missing: Vec<String>) -> bool {
+    if missing.is_empty() {
+        return true;
+    }
+    for key in missing {
+        known.remove(&key);
+    }
+    false
 }
 
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
@@ -1664,13 +1706,16 @@ fn sync_codex_rollouts(
             continue;
         }
         let rollouts = collect_matching_files(&root, "rollout-", "jsonl")?;
-        // Existing but showing none of the rollouts it is known to hold: a
-        // mount point that is present while its contents are not, a sync
-        // client that has not pulled the tree down yet. `root.exists()` alone
-        // cannot tell that from a reachable archive, and calling it walked
-        // retires the pass over files that are still there and still null.
-        if known_here && rollouts.is_empty() {
-            walked_every_known_root = false;
+        // A readable root is not a fully readable root. A partially mounted
+        // archive, or a sync client part way through pulling a tree down,
+        // returns some of the rollouts the stamp map names and not others, and
+        // the ones it did not return are still there and still null. So the
+        // question is asked per path, not per root.
+        if known_here {
+            let missing = unobserved_known_paths(&seen, &root, &rollouts);
+            if !forget_unobserved_paths(&mut seen, missing) {
+                walked_every_known_root = false;
+            }
         }
         for rollout in rollouts {
             let key = rollout.to_string_lossy().to_string();
@@ -2780,14 +2825,14 @@ fn sync_claude_session_metadata(
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
-    // Same question the codex walk asks of its two roots: does this run see
-    // the transcripts the stamp map says are here? A project tree that exists
-    // but is empty while the map names files in it is one whose contents this
-    // run could not read, and recording the generation over it would retire
-    // the one-time backfill for good.
-    let knew_transcripts = !session_state.is_empty();
+    // Same question the codex walk asks of its roots, and asked the same way:
+    // per path, because a project tree can be readable while part of it is
+    // not. A transcript the stamp map names that this run did not see has rows
+    // that are still there and still null, so it withholds the generation and
+    // loses the stamp this run can no longer vouch for.
     let transcripts = collect_matching_files(root, "", "jsonl")?;
-    let walked_every_known_root = !knew_transcripts || !transcripts.is_empty();
+    let missing = unobserved_known_paths(&session_state, root, &transcripts);
+    let walked_every_known_root = forget_unobserved_paths(&mut session_state, missing);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in transcripts {
@@ -7238,6 +7283,192 @@ mod tests {
             .unwrap()
             .set_modified(modified)
             .unwrap();
+    }
+
+    /// A readable root is not a fully readable root. A partially mounted
+    /// archive returns some of the rollouts the stamp map names and not
+    /// others, and "the walk returned at least one file" says nothing about
+    /// the ones it did not return: their rows are still there and still null.
+    #[test]
+    fn a_partially_visible_codex_archive_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/archived_sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = |id: &str| day.join(format!("rollout-2026-04-20T05-00-00-{id}.jsonl"));
+        let lines = |id: &str| {
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{{"id":"{0}","cwd":"/tmp/project"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:00.100Z","type":"turn_context","payload":{{"turn_id":"turn_{0}","cwd":"/tmp/project","model":"gpt-5.4"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{{"type":"user_message","message":"run it"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-04-20T05:00:02.000Z","type":"event_msg","payload":{{"type":"agent_message","message":"done"}}}}"#,
+                    "\n",
+                ),
+                id
+            )
+        };
+        fs::write(rollout("sess_a"), lines("sess_a")).unwrap();
+        fs::write(rollout("sess_b"), lines("sess_b")).unwrap();
+
+        let turn_id = |conn: &Connection, id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT turn_id FROM session_events \
+                 WHERE source='codex' AND session_id=? AND event_uid='3:agent_message'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn, "sess_a"), Some("turn_sess_a".into()));
+        assert_eq!(turn_id(&conn, "sess_b"), Some("turn_sess_b".into()));
+        let b_modified = rollout("sess_b").metadata().unwrap().modified().unwrap();
+
+        // Half the archive is visible. The root is readable and the walk
+        // returns `sess_a`, so nothing about the root itself is suspicious --
+        // but `sess_b` is exactly as unreadable as if the whole mount were
+        // missing, and its rows are just as null.
+        blank_raw_message_facts(&conn, "codex");
+        blank_raw_message_facts_state(&mut state);
+        fs::remove_file(rollout("sess_b")).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn, "sess_a"), Some("turn_sess_a".into()));
+        assert!(
+            state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a run that saw only part of a known archive has not done the pass"
+        );
+
+        // Back, unchanged. Its stamp was dropped when the walk could not see
+        // it, so it is read afresh rather than skipped on a stamp nothing
+        // watched, and its facts land.
+        restore_unchanged(&rollout("sess_b"), &lines("sess_b"), b_modified);
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(turn_id(&conn, "sess_b"), Some("turn_sess_b".into()));
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// The Claude walk asks the same question of its project tree.
+    #[test]
+    fn a_partially_visible_claude_root_does_not_retire_the_backfill_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = |id: &str| root.join(format!("{id}.jsonl"));
+        let lines = |id: &str| {
+            format!(
+                concat!(
+                    r#"{{"type":"user","uuid":"u1","sessionId":"{0}","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{{"role":"user","content":"run it"}}}}"#,
+                    "\n",
+                    r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"{0}","cwd":"/tmp/project","isSidechain":false,"requestId":"req_{0}","version":"2.1.96","timestamp":"2026-04-20T00:00:01.000Z","message":{{"role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{{"type":"text","text":"done"}}]}}}}"#,
+                    "\n",
+                ),
+                id
+            )
+        };
+        fs::write(transcript("sess-a"), lines("sess-a")).unwrap();
+        fs::write(transcript("sess-b"), lines("sess-b")).unwrap();
+
+        let request_id = |conn: &Connection, id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT request_id FROM session_events \
+                 WHERE source='claude' AND session_id=? AND event_uid='a1:0'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        assert_eq!(request_id(&conn, "sess-a"), Some("req_sess-a".into()));
+        assert_eq!(request_id(&conn, "sess-b"), Some("req_sess-b".into()));
+        let b_modified = transcript("sess-b").metadata().unwrap().modified().unwrap();
+
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        fs::remove_file(transcript("sess-b")).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        assert_eq!(request_id(&conn, "sess-a"), Some("req_sess-a".into()));
+        assert!(
+            state.get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "a run that saw only part of a known project tree has not done the pass"
+        );
+
+        restore_unchanged(&transcript("sess-b"), &lines("sess-b"), b_modified);
+        sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+        assert_eq!(request_id(&conn, "sess-b"), Some("req_sess-b".into()));
+        assert_eq!(
+            state
+                .get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION)
+        );
+    }
+
+    /// A file the user really deleted must not hold the pass open for the life
+    /// of the install. Its stamp is dropped when the walk cannot see it, so it
+    /// costs exactly one more sync and then stops being a path the state knows
+    /// about.
+    #[test]
+    fn a_deleted_rollout_holds_the_backfill_pass_open_for_one_sync_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let kept = day.join("rollout-2026-04-20T05-00-00-sess_kept.jsonl");
+        let gone = day.join("rollout-2026-04-20T05-00-00-sess_gone.jsonl");
+        for (path, id) in [(&kept, "sess_kept"), (&gone, "sess_gone")] {
+            fs::write(
+                path,
+                format!(
+                    concat!(
+                        r#"{{"timestamp":"2026-04-20T05:00:00.000Z","type":"session_meta","payload":{{"id":"{0}","cwd":"/tmp/project"}}}}"#, "\n",
+                        r#"{{"timestamp":"2026-04-20T05:00:01.000Z","type":"event_msg","payload":{{"type":"user_message","message":"run it"}}}}"#, "\n",
+                    ),
+                    id
+                ),
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+
+        blank_raw_message_facts_state(&mut state);
+        fs::remove_file(&gone).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert!(
+            state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "the first run after the file vanished cannot know it is gone"
+        );
+
+        // Nothing changed on disk, but the deleted rollout is no longer a path
+        // the state knows about, so the pass finishes.
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            state
+                .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION),
+            "a deleted file must not hold the pass open for the life of the install"
+        );
     }
 
     /// A mount point exists whether or not anything is mounted on it. An

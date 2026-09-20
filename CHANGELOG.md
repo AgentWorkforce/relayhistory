@@ -64,10 +64,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   local transcript can never stamp those. Claude selects sidecar transcripts
   through `session_relationships.evidence_locator` as well as
   `sessions.raw_path`, since a subagent sidecar has no catalog row of its own,
-  and the generation is recorded only when every archive root the sync state
-  already names was readable on that run — a walk that saw none of the files a
-  root is known to hold, whether the root was missing or present but empty,
-  would otherwise retire the pass having read nothing.
+  and the generation is recorded only when this run saw every file the sync
+  state already names, since a walk that could not read them has not
+  backfilled them. Availability is judged per file rather than per root: a
+  partially mounted archive returns some known paths and not others. A known
+  path this run did not see also loses its stamp, so a file that comes back is
+  read afresh instead of skipped on a stamp nothing watched — which is also
+  what keeps a genuinely deleted file cheap, costing one further sync rather
+  than leaving the pass pending forever.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

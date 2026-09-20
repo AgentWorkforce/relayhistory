@@ -365,12 +365,16 @@ generation recorded in the sync state (`claude_raw_message_facts`,
 `codex_raw_message_facts`), written only after a walk completes **and only when
 every archive root the state already names was present on that run**, so the
 backfill runs exactly once, an interrupted sync retries it, and a walk that
-could not read an archive does not retire it having seen nothing. "Present" is
-not enough for that check: a mount point exists whether or not anything is
-mounted on it, so a root that shows none of the files the state names counts as
-unavailable too. A root the state never knew about — an install with no
-`.codex/archived_sessions` — is not a missing archive and does not hold the pass
-open. Claude reaches a subagent
+could not read the files it was meant to repair does not retire it. That check
+is per file, not per root: a mount point exists whether or not anything is
+mounted on it, and a partially mounted archive returns some of the paths the
+state names and not others. A path this run did not see withholds the
+generation **and** loses its stamp, so if it comes back it is read afresh rather
+than skipped on a stamp nothing watched. Dropping the stamp is also what bounds
+the deleted-file case: it costs one further sync, after which the path is no
+longer one the state knows about. A root the state never knew about — an install
+with no `.codex/archived_sessions` — is not a missing archive and does not hold
+the pass open. Claude reaches a subagent
 sidecar's rows through `session_relationships.evidence_locator`, because a
 sidecar never gets a `sessions` row of its own.
 
