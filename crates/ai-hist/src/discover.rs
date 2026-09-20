@@ -59,8 +59,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use crate::project_identity::ProjectKeyMethod;
 use crate::{
-    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -71,7 +73,9 @@ use serde_json::Value;
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
 /// payloads changes in a way a consumer must notice.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
+/// 4 adds `project_key` / `project_key_method` to every catalog row and the
+/// `project_key` filter to the listing.
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -157,6 +161,15 @@ pub struct ShallowSession {
     pub initial_commit: Option<String>,
     /// Extra workspace roots, when the provider records them. Observed.
     pub workspace_roots: Vec<String>,
+    /// Canonical project identity: the `origin` remote canonicalized to
+    /// `host/owner/repo`, or the working directory when no remote resolves.
+    /// **Derived** — see [`crate::project_identity`]. `None` only while the
+    /// row has neither a `cwd` nor a `repo_url` to derive one from.
+    pub project_key: Option<String>,
+    /// How [`ShallowSession::project_key`] was arrived at: `remote`, `path`,
+    /// or `inherited` from a delegating parent. Read this rather than
+    /// guessing from whether the key looks like a path.
+    pub project_key_method: Option<String>,
     /// Path of the provider file or database this row came from, when local.
     pub raw_path: Option<String>,
     /// Change stamp of the raw source at scan time, `v{scanner}:{provider stamp}`.
@@ -254,6 +267,12 @@ impl CounterCell {
 pub struct DiscoveryEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: PathBuf,
+    /// Claude Code configuration root.
+    pub claude_config_dir: PathBuf,
+    /// Codex state root.
+    pub codex_home: PathBuf,
+    /// Grok state root.
+    pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     conn: &'a Connection,
@@ -261,11 +280,22 @@ pub struct DiscoveryEnv<'a> {
 }
 
 impl<'a> DiscoveryEnv<'a> {
-    /// Build an environment from the process environment (`HOME`, `OPENCODE_DB`).
+    /// Build an environment from the process environment.
     pub fn new(conn: &'a Connection) -> Self {
+        let roots = crate::ProviderRoots::from_env(crate::home_dir());
+        Self::with_provider_roots(conn, roots)
+    }
+
+    pub(crate) fn with_provider_roots(
+        conn: &'a Connection,
+        roots: crate::ProviderRoots,
+    ) -> Self {
         Self {
-            home: crate::home_dir(),
-            opencode_db: crate::default_opencode_db_path(),
+            home: roots.home,
+            claude_config_dir: roots.claude,
+            codex_home: roots.codex,
+            grok_home: roots.grok,
+            opencode_db: roots.opencode_db,
             conn,
             counters: CounterCell::default(),
         }
@@ -275,12 +305,29 @@ impl<'a> DiscoveryEnv<'a> {
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
-        Self {
-            home,
-            opencode_db,
+        Self::with_provider_roots(conn, crate::ProviderRoots::from_home(home, opencode_db))
+    }
+
+    /// Build an environment with every provider root supplied explicitly.
+    pub fn with_all_roots(
+        conn: &'a Connection,
+        home: PathBuf,
+        claude_config_dir: PathBuf,
+        codex_home: PathBuf,
+        grok_home: PathBuf,
+        opencode_db: PathBuf,
+    ) -> Self {
+        Self::with_provider_roots(
             conn,
-            counters: CounterCell::default(),
-        }
+            crate::ProviderRoots {
+                home,
+                claude: claude_config_dir,
+                codex: codex_home,
+                grok: grok_home,
+                opencode_db,
+                use_env_roots: false,
+            },
+        )
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -295,6 +342,9 @@ impl<'a> DiscoveryEnv<'a> {
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
             home: &self.home,
+            claude_config_dir: &self.claude_config_dir,
+            codex_home: &self.codex_home,
+            grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
             counters: &self.counters,
         }
@@ -329,6 +379,12 @@ impl<'a> DiscoveryEnv<'a> {
 pub struct ScanEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: &'a Path,
+    /// Claude Code configuration root.
+    pub claude_config_dir: &'a Path,
+    /// Codex state root.
+    pub codex_home: &'a Path,
+    /// Grok state root.
+    pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     counters: &'a CounterCell,
@@ -405,6 +461,21 @@ pub trait ShallowSessionProvider: Sync {
 
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
+    /// Which evidence kinds this source's local parser is *able* to produce.
+    ///
+    /// Declared, not measured: it is the ceiling on what a completed local
+    /// hydration can have indexed, and it is a property of the adapter rather
+    /// than of any one session or database — the same shape as
+    /// [`crate::relationship_capabilities`]. Hydration derives its reported
+    /// `capability` from it, so a prompt-only provider reports `partial`
+    /// instead of claiming `full` over evidence it never parses.
+    ///
+    /// The default is "nothing declared", which reports `partial`. A new
+    /// adapter therefore understates its coverage until someone writes the
+    /// list down, rather than silently overstating it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
     /// Where this adapter's evidence lives. Local file-backed adapters keep
     /// the default; remote connectors (see [`crate::remote`]) override it, and
     /// the engine records their presences and stamps under that location.
@@ -466,6 +537,30 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
         Box::new(OpencodeProvider::default()),
         Box::new(RelayProvider),
     ]
+}
+
+/// Declared local evidence coverage for one source, resolved from the shallow
+/// provider registry.
+///
+/// A pure table: it opens nothing, so it answers the same way for a source
+/// whose database is missing, and a source with no registered adapter (or one
+/// that has not declared its kinds) declares nothing.
+pub fn declared_evidence_kinds(source: &str) -> &'static [EvidenceKind] {
+    shallow_providers()
+        .iter()
+        .find(|provider| provider.source() == source)
+        .map_or(&[][..], |provider| provider.evidence_kinds())
+}
+
+/// The `FULL_SESSION_KINDS` a source's local parser does not produce, in the
+/// canonical order. Empty means the source's declared coverage is complete.
+pub fn missing_evidence_kinds(source: &str) -> Vec<EvidenceKind> {
+    let declared = declared_evidence_kinds(source);
+    FULL_SESSION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !declared.contains(kind))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +803,11 @@ impl ShallowSessionProvider for ClaudeProvider {
     fn source(&self) -> &'static str {
         "claude"
     }
+    /// The transcript parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -716,7 +816,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
+            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "jsonl")?,
             crate::file_stamp_and_modified,
         )
     }
@@ -878,6 +978,11 @@ impl ShallowSessionProvider for CodexProvider {
     fn source(&self) -> &'static str {
         "codex"
     }
+    /// The rollout parser writes prompts, events, tool calls, file edits and
+    /// child-thread relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -886,8 +991,8 @@ impl ShallowSessionProvider for CodexProvider {
     ) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for root in [
-            env.home.join(".codex/sessions"),
-            env.home.join(".codex/archived_sessions"),
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
         ] {
             files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
         }
@@ -1029,6 +1134,11 @@ impl ShallowSessionProvider for CursorProvider {
     fn source(&self) -> &'static str {
         "cursor"
     }
+    /// The local parser reads user prompts only. Cursor's store exposes no
+    /// assistant turns, tool calls, file edits or delegation to this reader.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
+    }
 
     fn enumerate(
         &self,
@@ -1122,6 +1232,11 @@ impl ShallowSessionProvider for GrokProvider {
     fn source(&self) -> &'static str {
         "grok"
     }
+    /// The local parser reads user prompts only; Grok's chat files expose no
+    /// tool calls, file edits or delegation to this reader.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
+    }
 
     fn enumerate(
         &self,
@@ -1131,7 +1246,7 @@ impl ShallowSessionProvider for GrokProvider {
         file_candidates(
             "grok",
             crate::collect_matching_files(
-                &env.home.join(".grok/sessions"),
+                &env.grok_home.join("sessions"),
                 "chat_history",
                 "jsonl",
             )?,
@@ -1387,6 +1502,11 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
     fn source(&self) -> &'static str {
         "opencode"
+    }
+    /// The session-keyed query reads user text parts only; assistant turns,
+    /// tool calls and file edits in OpenCode's store are not read.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
     }
 
     fn enumerate(
@@ -1649,6 +1769,11 @@ impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
     }
+    /// Relay rows are enumerated out of already-ingested `history`; there is no
+    /// relay parser, and targeted hydration is unsupported for it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
 
     fn enumerate(
         &self,
@@ -1757,7 +1882,7 @@ fn file_candidates(
 const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, \
+     discovery_state, project_key, project_key_method, \
      CASE \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
         AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
@@ -1795,7 +1920,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
         discovery_state: row
             .get::<_, Option<String>>(16)?
             .unwrap_or_else(|| "full".to_string()),
-        locations: json_string_list(row.get(17)?),
+        project_key: row.get(17)?,
+        project_key_method: row.get(18)?,
+        locations: json_string_list(row.get(19)?),
         from_cache: true,
     })
 }
@@ -1834,6 +1961,12 @@ pub struct CatalogListOptions {
     pub before_ms: Option<i64>,
     /// Precise continuation from the previous page's `next_cursor`.
     pub after: Option<CatalogCursor>,
+    /// Restrict to one canonical project identity, as
+    /// [`ShallowSession::project_key`] spells it (`host/owner/repo`, or the
+    /// working directory for a checkout with no remote). Exact match, not a
+    /// prefix: `github.com/org/repo` and `github.com/org/repo-fork` are
+    /// different projects.
+    pub project_key: Option<String>,
 }
 
 /// One page of the catalog plus the cursor that continues it.
@@ -1878,6 +2011,10 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
         for source in &options.sources {
             args.push(Box::new(source.clone()));
         }
+    }
+    if let Some(project_key) = options.project_key.as_ref() {
+        sql.push_str(" AND project_key = ?");
+        args.push(Box::new(project_key.clone()));
     }
     match options.after.as_ref() {
         // Everything strictly after the cursor in the catalog's total order.
@@ -2102,15 +2239,123 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// Re-resolve the project identity of a row served straight from the catalog.
+///
+/// The stamp shortcut is right about everything the transcript says and wrong
+/// about the one field derived from the filesystem beside it. A session first
+/// seen before its checkout had an `origin` would otherwise keep its path key
+/// on every later pass, because the transcript never changes and so the row is
+/// never reconsidered.
+///
+/// This runs where the row is read rather than as a sweep at the end of the
+/// pass, because the row is *streamed*: `on_row` hands it to the caller as
+/// soon as the window is decided, so a later correction would fix the catalog
+/// and still have emitted the stale value — the JSONL a consumer parses would
+/// disagree with the database it came from.
+///
+/// For the same reason, the answer it streams must be the answer the
+/// end-of-pass refresh will store, so a cached child that is about to inherit
+/// its parent's repository is given that key here rather than the path its own
+/// directory resolves to.
+///
+/// Only a key that is absent, a path, or inherited can change, and an
+/// inherited one only for the child's own `remote`. A `remote` key is never
+/// touched, and inheritance is never traded for a path. The write is skipped
+/// entirely when the answer is the one already stored, which is the usual
+/// case: these are reconsidered because they *might* be upgradable, and almost
+/// never are.
+fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    let stored = row.project_key_method.as_deref();
+    if stored == Some(ProjectKeyMethod::Remote.as_str()) {
+        // The strongest answer there is. Nothing this function can learn
+        // improves on it, so do not even touch the filesystem.
+        return Ok(());
+    }
+    let resolved =
+        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref());
+    let candidate = match resolved {
+        // The session's own repository beats anything borrowed.
+        Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
+        // Anything weaker has to be weighed against what the end-of-pass
+        // refresh is about to do to this row. Deciding that here, and not only
+        // in the pass, is what keeps the row this function streams equal to
+        // the row the pass will store: a consumer reading
+        // `sessions discover --json` beside the catalog must not be told two
+        // different projects.
+        //
+        // `inheritable_parent_project_key` is asked even when this row already
+        // holds a borrowed key, because the key it borrowed can go stale — the
+        // same refresh may promote its parent to a `remote` of its own, and
+        // pass 2 then lends the new one down.
+        weaker => {
+            match crate::store::inheritable_parent_project_key(
+                conn,
+                &row.source,
+                &row.session_id,
+            )? {
+                Some(parent) => Some((parent, ProjectKeyMethod::Inherited)),
+                // An inherited key is borrowed, so it outranks a path: a child
+                // whose directory still resolves to nothing canonical keeps
+                // the parent's repository, which is the point of inheriting it.
+                None if stored == Some(ProjectKeyMethod::Inherited.as_str()) => None,
+                None => weaker,
+            }
+        }
+    };
+    let Some((key, method)) = candidate else {
+        return Ok(());
+    };
+    if row.project_key.as_deref() == Some(key.as_str()) && stored == Some(method.as_str()) {
+        return Ok(());
+    }
+    // The same precedence the merge and the refresh pass apply, as a guard:
+    // this runs outside any transaction, so a hydrate or a concurrent sync may
+    // have settled the row since it was read.
+    let changed = conn.execute(
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
+         WHERE source = ?3 AND session_id = ?4 \
+           AND (project_key IS NULL \
+                OR project_key_method = 'path' \
+                OR (project_key_method = 'inherited' \
+                    AND ?2 IN ('remote', 'inherited')))",
+        params![key, method.as_str(), row.source, row.session_id],
+    )?;
+    if changed == 0 {
+        // Refused: someone else knows better. Stream what the catalog holds
+        // rather than what this function wanted it to hold — an emitted key no
+        // row anywhere agrees with is worse than a stale one, because nothing
+        // downstream can tell it is wrong.
+        if let Some((key, method)) = conn
+            .query_row(
+                "SELECT project_key, project_key_method FROM sessions \
+                 WHERE source = ?1 AND session_id = ?2",
+                params![row.source, row.session_id],
+                |stored| Ok((stored.get(0)?, stored.get(1)?)),
+            )
+            .optional()?
+        {
+            row.project_key = key;
+            row.project_key_method = method;
+        }
+        return Ok(());
+    }
+    row.project_key = Some(key);
+    row.project_key_method = Some(method.as_str().to_string());
+    Ok(())
+}
+
 static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
+    let project_key_merge = crate::store::project_key_merge_sql();
     format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
+          project_key, project_key_method, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
+         {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = CASE \
@@ -2225,6 +2470,28 @@ fn upsert_shallow_session_in_transaction(
         session.source_stamp.as_deref(),
         Some(&session.discovery_state),
     )?;
+    // One resolution per upsert, from the shallow row's own observations. A
+    // provider-recorded remote (codex's `session_meta.payload.git`) is
+    // preferred over walking the working directory, which may no longer exist
+    // by the time the transcript is read. Resolving here rather than in each
+    // provider's shallow reader keeps every source on one code path.
+    let resolved = session.project_key.clone().map(|key| {
+        (
+            key,
+            session
+                .project_key_method
+                .clone()
+                .unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().to_string()),
+        )
+    });
+    let resolved = resolved.or_else(|| {
+        crate::project_identity::identity_for(session.cwd.as_deref(), session.repo_url.as_deref())
+            .map(|(key, method)| (key, method.as_str().to_string()))
+    });
+    let (project_key, project_key_method) = match resolved {
+        Some((key, method)) => (Some(key), Some(method)),
+        None => (None, None),
+    };
     let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
@@ -2249,6 +2516,8 @@ fn upsert_shallow_session_in_transaction(
                 SessionLocation::Local => "local",
                 SessionLocation::Remote => "remote",
             },
+            project_key,
+            project_key_method,
         ],
         row_to_session,
     )?;
@@ -2527,6 +2796,11 @@ pub fn discover_sessions_with_provider_refs(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
+    // A pass is the unit over which the filesystem is treated as fixed, so it
+    // is also the unit the project-identity cache may span. A host that stays
+    // up across many passes must not keep answering from a checkout's state at
+    // the first one.
+    crate::project_identity::begin_acquisition_pass();
     let mut identities = std::collections::HashSet::new();
     for provider in providers {
         observation_key(*provider, provider.source(), "validation").validate()?;
@@ -2668,9 +2942,14 @@ pub fn discover_sessions_with_provider_refs(
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
             let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(cached) =
+            if let Some(mut cached) =
                 cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
             {
+                // Before the row is queued for emission, not after the pass:
+                // `on_row` streams these to the caller as they are decided, so
+                // correcting the catalog at the end of the pass would still
+                // have handed every consumer the stale key.
+                upgrade_cached_project_identity(conn, &mut cached)?;
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
@@ -2958,6 +3237,24 @@ pub fn discover_sessions_with_provider_refs(
         }
     }
 
+    // A candidate whose bytes have not changed is served from the catalog
+    // without ever reaching `upsert_shallow_session_in_transaction`, so the
+    // stamp shortcut is also a shortcut past project-identity resolution. A
+    // session first discovered before its checkout had an `origin` would then
+    // keep its path key on every later `sessions discover`, no matter how many
+    // times it ran: the transcript is unchanged, so the row is never revisited.
+    //
+    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
+    // path key is not final for, and probes before writing, so a pass with
+    // nothing to upgrade stays read-only. Reporting rather than failing, for
+    // the same reason the sync path does: the rows this discovery wrote are
+    // already committed, and every key here is derived from them.
+    if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+        eprintln!(
+            "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+             (project keys stay as they were; the next pass retries)"
+        );
+    }
     summary.counters = env.counters();
     Ok(summary)
 }

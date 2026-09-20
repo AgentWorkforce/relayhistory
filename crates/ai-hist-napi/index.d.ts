@@ -58,6 +58,8 @@ export interface NativeSessionEvent {
   source: string
   sessionId: string
   project?: string
+  /** Canonical project identity, denormalized from the owning session. */
+  projectKey?: string
   cwd?: string
   gitBranch?: string
   messageId?: string
@@ -69,6 +71,12 @@ export interface NativeSessionEvent {
   model?: string
   tokenJson?: string
   eventUid: string
+  requestId?: string
+  stopReason?: string
+  agentVersion?: string
+  isSidechain?: boolean
+  isMeta?: boolean
+  turnId?: string
 }
 export interface EventCursor {
   tsMs: number
@@ -161,6 +169,12 @@ export interface NativeStats {
   total: number
   bySource: Array<SourceCount>
   byProject: Array<ProjectCount>
+  /**
+   * Which key `by_project` is bucketed by: `project_key` or `cwd`. Read it
+   * rather than assuming -- the two produce different counts for the same
+   * database.
+   */
+  groupedBy: string
   firstTimestampMs?: number
   lastTimestampMs?: number
 }
@@ -168,6 +182,11 @@ export interface StatsOptions {
   scope?: string
   dbPath?: string
   tag?: string
+  /**
+   * Bucket `by_project` by the raw working directory instead of the
+   * canonical project key. Defaults to false.
+   */
+  byCwd?: boolean
 }
 /** Full-text search of indexed history. Never discovers or syncs implicitly. */
 export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
@@ -206,6 +225,13 @@ export interface CatalogSession {
   rawPath?: string
   sourceStamp?: string
   discoveryState: string
+  /**
+   * Canonical project identity: `host/owner/repo`, or the working
+   * directory when no git remote resolves.
+   */
+  projectKey?: string
+  /** `remote`, `path`, or `inherited`. */
+  projectKeyMethod?: string
   locations: Array<string>
   fromCache: boolean
 }
@@ -221,6 +247,11 @@ export interface ListCatalogOptions {
   limit?: number
   beforeMs?: number
   after?: CatalogCursor
+  /**
+   * Exact canonical project key (`host/owner/repo`, or the working
+   * directory when the checkout has no remote).
+   */
+  projectKey?: string
 }
 export interface SessionCatalogPage {
   contractVersion: number
@@ -314,6 +345,12 @@ export interface HydrateSessionResult {
   presence: string
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
+  /**
+   * Evidence kinds this hydration can have indexed, as wire names
+   * (`history`, `session_event`, `tool_call`, `file_edit`,
+   * `relationship`, `commit_link`).
+   */
+  coverage: Array<string>
   relatedSessionIds: Array<string>
   diagnostics: Array<HydrationDiagnostic>
 }

@@ -13,6 +13,11 @@ macro_rules! workspace_mod {
     };
 }
 
+/// Canonical project identity shared with burn. Always public: an embedder
+/// that groups by project needs the same rules the ingest path stamps with,
+/// and a second implementation is exactly the drift this module exists to
+/// prevent.
+pub mod project_identity;
 mod store;
 workspace_mod!(storage);
 workspace_mod!(observations);
@@ -47,7 +52,7 @@ pub mod git_sdk;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
 mod git_sdk;
 
-pub(crate) use paths::{default_opencode_db_path, home_dir};
+pub(crate) use paths::{home_dir, ProviderRoots};
 pub(crate) use relationship_capture::now_ms;
 #[cfg(feature = "unstable-internal")]
 pub use relationship_graph as relationships;
@@ -64,6 +69,7 @@ pub use store::*;
 #[cfg(not(feature = "unstable-internal"))]
 pub(crate) use store::*;
 
+pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
 pub use session_store::{
     Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };

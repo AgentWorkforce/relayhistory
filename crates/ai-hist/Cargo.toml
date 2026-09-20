@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist"
-version = "0.18.8"
+version = "0.19.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -40,6 +40,10 @@ fs2 = "0.4"
 tempfile = "3"
 
 [[test]]
+name = "fixture_corpus"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "delivery_worker"
 required-features = ["delivery", "unstable-internal"]
 
@@ -64,8 +68,24 @@ name = "session_continuity"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "env_roots"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "session_relationships"
 required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity_discovery"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_key_delivery"
+required-features = ["delivery", "unstable-internal"]
 
 [[test]]
 name = "source_intake"
@@ -77,4 +97,8 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "sync_silence"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "claude_rewrite_retention"
 required-features = ["unstable-internal"]

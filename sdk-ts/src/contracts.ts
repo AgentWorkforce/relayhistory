@@ -1,5 +1,7 @@
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
-import type { Source, CatalogSource, SessionScope, SessionLocation } from './sdk-common.js';
+import type {
+  Source, CatalogSource, EvidenceKind, SessionScope, SessionLocation,
+} from './sdk-common.js';
 export interface HistoryEntry {
   id: number;
   source: Source;
@@ -36,6 +38,16 @@ export interface CatalogCursor {
   sessionId: string;
 }
 
+/**
+ * How a `projectKey` was resolved.
+ *
+ * - `remote` — canonicalized `origin` remote; comparable across machines.
+ * - `path` — no remote resolved, so the key is the working directory and is
+ *   only meaningful on the machine that produced it.
+ * - `inherited` — adopted from the delegating parent session.
+ */
+export type ProjectKeyMethod = 'remote' | 'path' | 'inherited';
+
 export interface CatalogSession {
   source: CatalogSource;
   sessionId: string;
@@ -54,6 +66,14 @@ export interface CatalogSession {
   rawPath: string | null;
   sourceStamp: string | null;
   discoveryState: 'shallow' | 'full';
+  /**
+   * Canonical project identity: the `origin` remote canonicalized to
+   * `host/owner/repo`, or the working directory when no remote resolves.
+   * Group by this, not by `cwd` — two checkouts of one repository share it.
+   */
+  projectKey: string | null;
+  /** How `projectKey` was arrived at. `path` keys are machine-local. */
+  projectKeyMethod: ProjectKeyMethod | null;
   fromCache: boolean;
   locations: SessionLocation[];
 }
@@ -65,6 +85,8 @@ export interface ListCatalogOptions {
   limit?: number;
   beforeMs?: number;
   after?: CatalogCursor;
+  /** Exact canonical project key; not a prefix and not a path search. */
+  projectKey?: string;
 }
 
 export interface SessionCatalogPage {
@@ -164,6 +186,11 @@ export interface HydrateSessionResult {
   source: CatalogSource;
   sessionId: string;
   status: 'hydrated' | 'updated' | 'unchanged' | 'capability_limited';
+  /**
+   * `full` only when every kind in `FULL_SESSION_KINDS` appears in
+   * {@link HydrateSessionResult.coverage}. Derived from the provider's
+   * declared coverage, never asserted by the local path.
+   */
   capability: 'full' | 'partial' | 'shallow_only';
   discoveryState: 'shallow' | 'full';
   presence: SessionLocation;
@@ -178,6 +205,13 @@ export interface HydrateSessionResult {
     fileEdits: number;
     relatedSessions: number;
   };
+  /**
+   * The evidence kinds this hydration could have indexed, in canonical order.
+   * A zero count for a covered kind means the session has none of it; a kind
+   * absent from this list means no parser on this path ever looked, and a
+   * `HYDRATION_PARTIAL_COVERAGE` diagnostic names the ones that are missing.
+   */
+  coverage: EvidenceKind[];
   relatedSessionIds: string[];
   diagnostics: HydrationDiagnostic[];
 }
@@ -187,6 +221,8 @@ export interface SessionEvent {
   source: Source;
   sessionId: string;
   project: string | null;
+  /** Canonical project identity, denormalized from the owning session. */
+  projectKey: string | null;
   cwd: string | null;
   gitBranch: string | null;
   messageId: string | null;
@@ -198,6 +234,19 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   eventUid: string;
+  /**
+   * Per-message facts the provider recorded on the envelope, stored as it
+   * wrote them. `stopReason` is the verbatim wire string, never a normalized
+   * enum, and stays null while a turn is still in flight. `isSidechain` and
+   * `isMeta` are null when the provider did not say either way, which is not
+   * the same as false.
+   */
+  requestId: string | null;
+  stopReason: string | null;
+  agentVersion: string | null;
+  isSidechain: boolean | null;
+  isMeta: boolean | null;
+  turnId: string | null;
 }
 
 export interface EventCursor {
@@ -462,14 +511,24 @@ export interface Stats {
   total: number;
   bySource: Partial<Record<Source, number>>;
   byProject: Array<{ project: string; count: number }>;
+  /**
+   * Which key `byProject` is bucketed by. `project_key` merges two checkouts
+   * of one repository; `cwd` is the historical per-directory grouping. Read
+   * it — the same database gives different counts under each.
+   */
+  groupedBy: ProjectGrouping;
   firstTimestampMs: number | null;
   lastTimestampMs: number | null;
 }
+
+export type ProjectGrouping = 'project_key' | 'cwd';
 
 export interface StatsOptions {
   dbPath?: string;
   scope?: SessionScope;
   tag?: string;
+  /** Bucket `byProject` by working directory instead of project key. */
+  byCwd?: boolean;
 }
 export interface SyncOptions extends SourceConnectorOptions {
   dbPath?: string;

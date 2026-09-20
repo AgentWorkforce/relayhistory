@@ -235,13 +235,15 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
-                project TEXT, cwd TEXT, git_branch TEXT,
+                project TEXT, project_key TEXT, cwd TEXT, git_branch TEXT,
                 message_id TEXT, parent_id TEXT,
                 ts_ms INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
-                event_uid TEXT NOT NULL
+                event_uid TEXT NOT NULL,
+                request_id TEXT, stop_reason TEXT, agent_version TEXT,
+                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
             );",
         )
         .unwrap();

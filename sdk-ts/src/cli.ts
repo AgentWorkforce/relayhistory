@@ -46,7 +46,7 @@ class CliExit extends Error {
 
 type PackageMetadata = { version?: string };
 
-export const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
   'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
@@ -388,6 +388,9 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
   io.stdout(`${value.source}/${value.sessionId}: ${value.status}\n`);
   io.stdout(
+    `capability: ${value.capability} (coverage: ${value.coverage.join(', ') || 'none'})\n`,
+  );
+  io.stdout(
     `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
     `${value.evidence.toolCalls} tool call(s), ${value.evidence.fileEdits} file edit(s)\n`,
   );
@@ -688,7 +691,8 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   out: { flags: '--out <file>', description: 'Write to this file instead of standard output.' },
   'poll-ms': { flags: '--poll-ms <ms>', description: 'Delivery poll interval, in milliseconds.' },
   pretty: { flags: '--pretty', description: 'Render aligned, colourized rows.' },
-  project: { flags: '--project <path>', description: 'Only sessions from this project directory.' },
+  'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
+  project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
   remote: { flags: '--remote', description: 'Read only remote history.' },
   selection: { flags: '--selection <file>', description: 'Export selection file.' },
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
@@ -736,7 +740,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
     },
     allowed: [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
-      'json', 'limit', 'local', 'pretty', 'remote', 'source',
+      'json', 'limit', 'local', 'pretty', 'project', 'remote', 'source',
     ] }],
   ['sessions discover', { name: 'sessions discover', description: 'Find coding-agent sessions and index the new ones.',
     surface: ['discover'], positionals: [0, 0],
@@ -797,7 +801,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
     allowed: ['all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens'] }],
   ['stats', { name: 'stats', description: 'Summarize what the history store holds.', surface: ['stats'],
     positionals: [0, 0], readsLocalStore: true,
-    allowed: ['all', 'db', 'json', 'local', 'remote', 'tag'] }],
+    allowed: ['all', 'by-cwd', 'db', 'json', 'local', 'remote', 'tag'] }],
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
   ['sync', { name: 'sync', description: 'Index new sessions from every configured source.', surface: ['sync'],
@@ -989,7 +993,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     const page = await listSessionCatalogPage({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
-      after: catalogCursorFlag(args),
+      after: catalogCursorFlag(args), projectKey: textFlag(args, 'project'),
     });
     if (args.flags.has('pretty')) {
       const color = options.color && process.env.NO_COLOR === undefined;
@@ -1073,7 +1077,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     return runPack(io, args, subcommand, rest, json);
   }
   if (command === 'stats') {
-    output(io, await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
+    output(io, await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag'), byCwd: args.flags.has('by-cwd') || undefined }), json);
     return 0;
   }
   if (command === 'sync') {

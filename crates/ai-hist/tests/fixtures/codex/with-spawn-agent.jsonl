@@ -1,0 +1,12 @@
+{"timestamp":"2026-04-23T00:00:00.000Z","type":"session_meta","payload":{"id":"sess_spawn_1","cwd":"/tmp/project","timestamp":"2026-04-23T00:00:00.000Z","cli_version":"0.121.0"}}
+{"timestamp":"2026-04-23T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_spawn_1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-23T00:00:00.150Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"investigate the failing test"}]}}
+{"timestamp":"2026-04-23T00:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_spawn_1"}}
+{"timestamp":"2026-04-23T00:00:00.500Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"subagent_type\":\"investigator\",\"description\":\"find why test_x fails\"}","call_id":"call_spawn_1"}}
+{"timestamp":"2026-04-23T00:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_spawn_1","output":"{\"agent_id\":\"agent_inv_42\",\"status\":\"started\"}"}}
+{"timestamp":"2026-04-23T00:00:02.000Z","type":"event_msg","payload":{"type":"subagent_message_complete","call_id":"call_spawn_1","agent_id":"agent_inv_42","success":true}}
+{"timestamp":"2026-04-23T00:00:02.500Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo done\"}","call_id":"call_exec_a"}}
+{"timestamp":"2026-04-23T00:00:02.700Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_exec_a","turn_id":"turn_spawn_1","exit_code":0}}
+{"timestamp":"2026-04-23T00:00:02.800Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_exec_a","output":"done\n"}}
+{"timestamp":"2026-04-23T00:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":300,"reasoning_output_tokens":50,"total_tokens":2350}}}}
+{"timestamp":"2026-04-23T00:00:03.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_spawn_1"}}

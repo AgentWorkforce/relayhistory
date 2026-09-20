@@ -21,13 +21,34 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 15, catalog contract version 3, hydration contract version 2,
-session-relationship contract version 1, and session evidence contract version
-1, normalizes nullable fields, maps native errors, and supplies pagination
+version 16, catalog contract version 4, hydration contract version 3,
+session-relationship contract version 2, and session evidence contract version
+2, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
+
+## Session sourcing ownership
+
+RelayHistory is the single owner of acquiring, parsing and storing session
+evidence for every harness. Downstream consumers — including
+[`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
+pricing, cost and analytics — read that evidence through the `ai-hist` crate's
+`SessionStore` facade rather than parsing harness logs themselves. New harnesses
+are added here and nowhere else.
+
+`ai-hist` is an in-process crate, so that buys one writer *implementation*, not
+one writer process: a consumer that calls `sync`, `hydrate` or `watch` holds a
+read-write connection in its own process, while every mutation still goes
+through this crate's schema, migrations, sync lock, hydration locks and WAL busy
+handler.
+
+See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
+decision, the rejected alternatives and the per-source capture matrix, and
+[`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
+must expose.
 
 ## Optional services and package boundaries
 
@@ -86,6 +107,37 @@ for that connector. JavaScript source and destination plugins use the public SDK
 and do not open SQLite. Optional Rust compatibility implementations depend on
 public core storage operations; they do not move transport or credential
 dependencies back into the local engine. See [source plugins](remote-connectors.md).
+
+## Evidence retention
+
+Provider files are not the source of truth for what was already observed. A
+re-parse of the same provider file never deletes evidence an earlier parse
+stored for the same session: local re-ingests upsert by provider-native
+identity (Claude records carry their `uuid` into every derived `event_uid`),
+so rows the rewritten file no longer contains are left untouched in
+`session_events`, `tool_calls`, `file_edits` and `history`. Records without
+provider identity derive a content-hash fallback instead of a line index, so
+a compaction that drops the prefix or inserts summary rows cannot shift
+survivors onto earlier rows' identities. Byte-identical id-less rows share
+that identity by design: an ordinal would be positional identity by another
+name. Pre-upgrade positional leftovers heal onto a re-attributed record
+only on a unique full-record match — event text, timestamp, role, kind,
+model and token spend, or a session-unique tool use id — otherwise they
+stay preserved. Claude Code
+rewrites a transcript in place on resume/compact, and the compacted file is
+routinely missing assistant turns the pre-compaction file contained; those
+turns stay queryable. The only local deletion path is a targeted heal that
+names its exact rows (sidechain re-attribution moving a delegated thread's
+records onto the child). Retention/compaction deletion of a large database is
+explicit and opt-in, never a side effect of re-parsing. Codex rollout events
+are keyed by line position rather than provider identity, so the pinned
+guarantee there covers relocation (the `sessions/` to `archived_sessions/`
+move re-ingests under the same session id with no loss or duplication);
+content-stable identity for prefix-dropping rollout rewrites is future work
+for incremental hydration. `crates/ai-hist/tests/claude_rewrite_retention.rs`
+pins all of this: in-place compaction through `sync` and through targeted
+`hydrateSession`, an mtime-only rewrite at identical size, and the Codex
+archive relocation.
 
 ## Operation semantics
 

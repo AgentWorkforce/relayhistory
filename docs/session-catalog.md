@@ -34,13 +34,67 @@ const sessions = await listSessionCatalog({ limit: 100 });
 await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
 ```
 
-Hydration requires the catalog row, never invokes discovery or global sync,
-and upgrades `discoveryState` to `full` only when the connector returned all
-available evidence. Here `full` means indexed through the returned source
-stamp, not that a live coding session has ended. Partial remote connectors
-remain `shallow` and report their capability explicitly. File providers
-validate the saved locator against the expected provider root; OpenCode uses
-session-keyed queries against its live read-only database.
+Hydration requires the catalog row and never invokes discovery or global sync.
+It upgrades `discoveryState` to `full` when the acquisition it was asked for
+was indexed through its recorded source stamp. `full` is therefore a statement
+about discovery being complete for that request, not that a live coding
+session has ended, and not that every evidence kind exists: kinds the request
+never acquired -- including ones declined by an option such as
+`includeRelated: false` -- are described by `coverage` and `capability` below,
+which is where a consumer looks to find out what was left out. A remote
+connector that could not return its evidence at all stays `shallow` and reports
+its capability explicitly. File providers validate the saved locator against
+the expected provider root; OpenCode uses session-keyed queries against its
+live read-only database.
+
+`capability` and `coverage` answer a different question from `discoveryState`,
+and hydration contract 3 made the local path compute both rather than assert
+them. `coverage` lists the evidence kinds the selected provider's parser can
+produce; `capability` is `full` only when that list contains every kind in
+`FULL_SESSION_KINDS` (`history`, `session_event`, `tool_call`, `file_edit`,
+`relationship`), and `partial` otherwise, with a `HYDRATION_PARTIAL_COVERAGE`
+diagnostic naming the missing ones. A zero count for a *covered* kind means
+this session has none of it; a kind absent from `coverage` means nothing
+looked. So a completed Cursor hydration reports:
+
+```json
+{
+  "capability": "partial",
+  "coverage": ["history"],
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor evidence covers history; this hydration produces no session_event, tool_call, file_edit, relationship" }]
+}
+```
+
+Coverage is narrowed by the request as well as by the provider.
+`includeRelated: false` asks for the selected thread alone, and hydration
+honours that literally -- Claude subagent sidecars are not walked and Codex
+child rollouts are not read -- so `relationship` drops out of `coverage` and a
+Claude or Codex session hydrated that way reports `partial`. That is the
+difference between "this session has no delegation" and "nothing looked"; the
+diagnostic says which by naming `include_related`.
+
+Codex child acquisition reads the selected session's date directory and the
+following date in both the active and archived rollout stores, which finds
+children spawned across midnight or moved between stores without making an
+old session scan years of newer rollouts. If later date directories exist in
+either store, the
+bounded search may miss delayed descendants; the result omits `relationship`
+from `coverage`, reports `partial`, and includes
+`HYDRATION_BOUNDED_RELATIONSHIPS`. A full sync can index relationships across
+the archive.
+
+A source plugin declares its own `coverage` the same way, and the same
+distinction applies to it: `covered_kinds` names what the acquisition
+*examined*, so a complete export of a session that has no file edits still
+covers `file_edit` and reports `full`. A connector also receives
+`includeRelated` and must omit `relationship` from both its coverage and its
+records when it is `false` -- otherwise a `scope: 'all'` merge would union the
+kind back in and report `full` despite the opt-out.
+
+`discoveryState` stays `full` for that row: it records that the session was
+indexed through its recorded source stamp, which is what the unchanged
+short-circuit reads. A parser upgrade still forces a re-parse, because the
+stored `parser_version` is checked independently of `discoveryState`.
 
 Codex child rollouts, and Claude subagent transcripts whose records carry a
 per-child `agentId`, retain their provider-native IDs and are linked through
@@ -97,7 +151,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **3**
+Both operations carry `contract_version` — currently **4**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -108,7 +162,7 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "sessions": [
     {
@@ -129,6 +183,8 @@ One object, never a bare array, so the version travels with the payload:
       "raw_path": "/Users/you/.codex/sessions/2026/06/21/rollout-codex.jsonl",
       "source_stamp": "v2:1788042670103317900:569",
       "discovery_state": "shallow",
+      "project_key": "github.com/acme/api",
+      "project_key_method": "remote",
       "locations": ["local"],
       "from_cache": true
     }
@@ -144,6 +200,81 @@ One object, never a bare array, so the version travels with the payload:
 Keys are `snake_case`. `models`, `workspace_roots`, and `locations` are always
 arrays (possibly empty); every other absent value is `null`, never an invented
 placeholder or an empty string.
+
+`project_key` is the canonical project identity: the `origin` remote
+canonicalized to `host/owner/repo`, or the working directory when no remote
+resolves. **Group by it rather than by `cwd`** — two checkouts, two worktrees
+or two subdirectories of one repository share a key but never share a path, and
+a path-keyed rollup splits them. `project_key_method` says how the key was
+arrived at, and the three are not interchangeable:
+
+| `project_key_method` | meaning |
+| --- | --- |
+| `remote` | canonicalized `origin` remote; comparable across machines |
+| `path` | no remote resolved, so the key is the directory and is only meaningful on the machine that produced it |
+| `inherited` | adopted from the delegating parent session, because the child's own directory resolved to nothing canonical |
+
+The rules match burn's `crates/relayburn-sdk/src/reader/git.rs` vector for
+vector, so `burn --group-by project` and a RelayHistory rollup agree on the
+same checkout. No `git` subprocess is involved: git's configuration is read
+directly, in the scopes and precedence git itself uses — system
+(`$GIT_CONFIG_SYSTEM` or `/etc/gitconfig`, unless `$GIT_CONFIG_NOSYSTEM`), then
+global (`$GIT_CONFIG_GLOBAL`, else **both** `$XDG_CONFIG_HOME/git/config` and
+`~/.gitconfig`, in that order — git reads both, and `git config --global
+--list` showing only the latter is about where git *writes*), then the
+repository's own, following a linked worktree's
+`gitdir:` pointer. `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`,
+`onbranch:`) are expanded at the position of their own line, so a value written
+before an include is overridden by it and one written after it wins — as git
+resolves them — and `url.<base>.insteadOf` rewrites are applied
+longest-prefix-first, as `git remote get-url` does. The outer scopes matter as
+much as the repository's own: the rewrite that makes `gh:Org/Repo.git`
+resolvable is almost always configured once in `~/.gitconfig` for the whole
+machine.
+
+For a linked worktree, `config` is read from the shared directory `commondir`
+names while `HEAD` is read from the worktree's own git directory, and
+`includeIf` conditions are evaluated against that same per-worktree directory.
+A worktree exists to be on a different branch from the checkout it shares a
+repository with, so asking the shared directory would answer about the wrong
+tree. When the shared config enables `extensions.worktreeConfig`, that
+worktree's `config.worktree` is read after the shared config, as git reads it.
+
+Both spellings of a subsection are understood: `[remote "origin"]` and the
+legacy `[remote.origin]` name the same remote, with git's differing case rules
+— the quoted subsection is case-sensitive, the dotted header folds entirely,
+so `[remote.ORIGIN]` is `origin` while `[remote "ORIGIN"]` is a different
+remote.
+
+A remote's URL is a list, not a single value: git accumulates every
+`remote.<name>.url` it reads, across scopes as well as within a file, and the
+remote *is* the head of that list — `git remote get-url origin` prints it while
+`git config --get remote.origin.url` prints the last. The canonical key follows
+`get-url`, so a repository with a mirror configured after its origin keys to
+the origin. An IPv6 authority keeps its brackets (`[2001:db8::1]/acme/app`), so
+an address is never cut at the first colon of its own body.
+
+One thing is deliberately left out: `includeIf "hasconfig:remote.*.url:"` is
+not evaluated, because its answer depends on how much configuration has been
+read so far. It cannot turn a resolvable remote into a wrong one — it only
+leaves a rewrite unapplied, which falls back to a path key.
+
+Both are `null` while a session's identity has not been resolved yet — a
+database that predates the columns migrates without inventing keys, and the
+next sync or hydration fills them. `null` means "not resolved", never "no
+project".
+
+A key is resolved from the working directory, or from a remote the provider
+recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
+never final: every sync reconsiders it, so a session whose checkout was deleted
+picks up the canonical key as soon as a recorded remote makes one available. A
+`remote` key is never downgraded.
+
+Filter a listing to one project with `ai-hist sessions list --project <key>`
+(SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
+key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
+and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
+the per-directory grouping.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
@@ -170,7 +301,7 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 3,
+  "contract_version": 4,
   "scope": "local",
   "locations_run": ["local"],
   "discovered": 2,
@@ -320,6 +451,12 @@ What each adapter can actually extract from a cheap read. `✓` = populated when
 the provider recorded it; `–` = the provider does not expose it to a shallow
 read.
 
+This table covers *shallow discovery only*. The full-evidence picture — which
+record types each source captures, stores and exposes after `ai-hist sync` —
+is the capture matrix in [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix),
+which this table must stay consistent with.
+
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
@@ -328,6 +465,77 @@ read.
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (if present) | – | – | – | – | – |
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
+
+Evidence coverage is the hydration-side version of that matrix: what each
+local parser writes, and therefore the `coverage` a completed local hydration
+reports. It is declared per adapter (`ShallowSessionProvider::evidence_kinds`),
+so a provider that grows a parser flips one entry and the reported capability
+follows.
+
+| Source | `history` | `session_event` | `tool_call` | `file_edit` | `relationship` | `capability` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
+| **cursor** | ✓ | – | – | – | – | `partial` |
+| **grok** | ✓ | – | – | – | – | `partial` |
+| **opencode** | ✓ | – | – | – | – | `partial` |
+| **relay** | – | – | – | – | – | targeted hydration unsupported |
+
+### Per-message raw facts on `session_events`
+
+The envelope facts a harness records per message or per API request, kept
+verbatim on every event so a consumer can group, price and time turns without
+re-reading the transcript. `stop_reason` is the provider's own wire string,
+never a normalized enum, and its *absence* is the signal that a turn is still
+in flight.
+
+| Source | `request_id` | `stop_reason` | `agent_version` | `is_sidechain` | `is_meta` | `turn_id` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
+| **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
+| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+
+A null is "the provider did not record it", which is not the same as `false`
+or as an empty string: a Claude record with no `isSidechain` key stores null,
+while `"isSidechain": false` stores `0`.
+
+Because of that, none of the six can answer "was this row indexed before the
+facts existed?" -- a real record legitimately has no `request_id`, no
+`stop_reason` and no `turn_id`, and Codex records none of the other three.
+`raw_facts_version` answers it instead: the local parser stamps it on every
+event it writes, so a full sync can pick out the transcripts whose rows predate
+the facts and re-read them. It is bookkeeping rather than a provider fact and is
+not part of the session-event evidence spec, so a row an installed source
+adapter contributed is permanently unstamped.
+
+That is why the column selects files but does not bound the work. Local and
+remote observations of one session share `(source, session_id)`, so a contributed
+row would otherwise hold an unchanged local transcript off the stamp fast path on
+every sync while never being stamped itself. What ends the work is a per-provider
+generation recorded in the sync state (`claude_raw_message_facts`,
+`codex_raw_message_facts`), written only after a walk completes **and only when
+every archive root the state already names was present on that run**, so the
+backfill runs exactly once, an interrupted sync retries it, and a walk that
+could not read the files it was meant to repair does not retire it. That check
+is per file, not per root: a mount point exists whether or not anything is
+mounted on it, and a partially mounted archive returns some of the paths the
+state names and not others. A path this run did not see withholds the
+generation **and** loses its stamp, so if it comes back it is read afresh rather
+than skipped on a stamp nothing watched. Dropping the stamp is also what bounds
+the deleted-file case: it costs one further sync, after which the path is no
+longer one the state knows about. Removing the entry from the in-memory map is
+not enough to achieve that — the checkpoint merge folds a run's keys over
+what is on disk and has no way to express a delete, so a dropped path would
+come back on every write. The run carries the removals as an instruction the
+merge applies and then discards. A transcript that is enumerated but cannot be
+read counts as unobserved too, not as an empty one — the parsers read with
+`unwrap_or_default()`, so without that check a file that became unreadable
+between the walk and the read would be stamped as seen. A root the state never knew about — an install
+with no `.codex/archived_sessions` — is not a missing archive and does not hold
+the pass open. Claude reaches a subagent
+sidecar's rows through `session_relationships.evidence_locator`, because a
+sidecar never gets a `sessions` row of its own.
 
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
@@ -347,7 +555,8 @@ unlinked evidence and the child id is left null — it is never taken from the
 
 How each adapter works:
 
-- **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
+- **claude** — `$CLAUDE_CONFIG_DIR/projects/**/*.jsonl` (default
+  `~/.claude/projects/**/*.jsonl`). Head for identity, `cwd`,
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
@@ -357,8 +566,9 @@ How each adapter works:
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet.
-- **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
-  `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
+- **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
+  `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
+  is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Subagent threads are real
   rollouts but not user sessions, so they are excluded — exactly as the full
@@ -368,7 +578,8 @@ How each adapter works:
   Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
   always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
   the project directory name.
-- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
+- **grok** — `$GROK_HOME/sessions/<encoded-path>/<id>/` (default
+  `~/.grok/sessions/<encoded-path>/<id>/`). Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
@@ -567,6 +778,15 @@ as current.
 
 ## Adding a provider
 
+Providers are added **here and nowhere else**. RelayHistory is the single owner
+of acquiring, parsing and storing session evidence for every harness;
+downstream consumers read it through the `ai-hist` crate's `SessionStore`
+facade rather than writing a second parser. See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). That
+matrix has record types as rows and sources as columns, so a new or extended
+provider must add or update its source column in the same change, and satisfy
+the record types in [`sourcing-contract.md`](sourcing-contract.md).
+
 Every entry in `SOURCE_CHOICES` must be covered by **exactly one** of:
 
 - an adapter in `shallow_providers()` — implement `ShallowSessionProvider`
@@ -585,6 +805,31 @@ never be presented as a session.
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
+
+### Add a fixture and a snapshot
+
+A provider is not added until its log shape is in the checked-in corpus. Add at
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
+in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
+quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
+generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+
+```sh
+UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
+```
+
+`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
+the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
+documented fixture exemption for a source that has no provider log on disk
+(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
+`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
+without being described, and `no_orphaned_snapshots` stops a snapshot from
+outliving its fixture.
+
+The snapshots are the *current* extraction, gaps included — they are the
+review artifact for a parser change, not a statement of intent. Facts a
+provider's logs contain that relayhistory does not capture yet are written as
+`#[ignore = "closed by #<issue>"]` tests in the same file.
 
 ---
 

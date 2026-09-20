@@ -1,7 +1,7 @@
 use super::{lock, read_config, save_json, user_error, Config};
 use ai_hist::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
-use relayhistory_plugin::{cloud, destination};
+use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
 use std::{
@@ -57,8 +57,7 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
     let snapshot = conn.unchecked_transaction()?;
     let mut identities = Vec::new();
     loop {
-        let page =
-            ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
+        let page = ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
         if page.is_empty() {
             break;
         }
@@ -89,6 +88,13 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
         instance_id: Some(INSTANCE.into()),
         acknowledge_uninspected_schedules: config.acknowledge_uninspected_schedules,
     };
+    deliver_with_receiver(db_path, config, &receiver)
+}
+fn deliver_with_receiver(
+    db_path: &Path,
+    config: &Config,
+    receiver: &dyn worker::Receiver,
+) -> Result<delivery::DeliveryStatus> {
     let options = worker::DrainOptions {
         job_ids: Some(vec![config.job_id.clone()]),
         // A cycle stays bounded so a stop request and the heartbeat are never
@@ -98,7 +104,7 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
     };
     let result = worker::drain(
         db_path,
-        &worker::SingleReceiver::new(DESTINATION, INSTANCE, &receiver),
+        &worker::SingleReceiver::new(DESTINATION, INSTANCE, receiver),
         &options,
         &worker::system_clock,
         &|| STOP.load(Ordering::Relaxed),
@@ -108,6 +114,11 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
         .into_iter()
         .find(|job| job.job_id == config.job_id)
         .context("delivery job missing")?;
+    // Pause can arrive while a batch is in flight. It is a successful user
+    // control action, even if it invalidated that batch's lease.
+    if status.state == "paused" {
+        return Ok(status);
+    }
     if status.state != "active" {
         return Err(user_error(
             "Delivery needs attention. Reconnect with --force-login if credentials have expired.",
@@ -123,22 +134,58 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
     }
     Ok(status)
 }
+pub fn capture(directory: &Path, history_url: &str) -> Result<()> {
+    let progress = super::progress::Monitor::start(directory, history_url, None);
+    let result =
+        ai_hist::sync_local_at_with_progress(&directory.join("history.db"), progress.observer());
+    progress.finish(matches!(result, Ok(true)));
+    ensure!(result?, "capture not complete");
+    Ok(())
+}
+
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
+    let paused = {
+        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        delivery::status(&conn, &config.job_id)?.state == "paused"
+    };
+    if paused {
+        // Another sync owns capture when this returns false. The paused
+        // collector can retry next cycle without reporting an offline error.
+        ai_hist::sync_local_at(&directory.join("history.db"))?;
+    } else {
+        ensure!(
+            destination::selected_account(Some(&config.history_url))? == config.delivery_account,
+            "wrong destination"
+        );
+        capture(directory, &config.history_url)?;
+    }
+    deliver_captured(directory, config, false)
+}
+
+pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
+    // Every drain must apply selected-mode exclusions, including retries after
+    // a failed capture. Never reach the delivery worker with an unvetted row.
+    super::bridge::enforce_selection(directory, config)?;
+    {
+        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        if delivery::status(&conn, &config.job_id)?.state == "paused" {
+            return Ok(());
+        }
+    }
     ensure!(
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
     );
     let db_path = directory.join("history.db");
-    ensure!(
-        ai_hist::sync_local_at(&db_path)?,
-        "capture not complete"
-    );
     // The receiver rejects a batch whose account or mapping does not match, but
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
     {
         let conn = ai_hist::open_db(&db_path)?;
         let job = delivery::status(&conn, &config.job_id)?;
+        if job.state == "paused" {
+            return Ok(());
+        }
         ensure!(
             job.config.account_id == config.delivery_account
                 && job.config.mapping_version == destination::MAPPING_VERSION,
@@ -149,24 +196,27 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     // its verdict is a generic permission refusal. Name the cause here first so
     // the user sees which uploader to stop instead of a reconnect suggestion.
     super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-    let status = deliver(&db_path, config)?;
-    let token = cloud::access_token(Some(&config.history_url))?;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(15))
-        .build();
-    agent
-        .post(&format!("{}/v1/onboarding/heartbeat", config.history_url))
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|_| user_error("Could not confirm the connection with Cloud."))?;
-    println!(
+    let progress =
+        super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
+    let result = deliver(&db_path, config);
+    if before_exit {
+        let connected =
+            progress.finish_before_exit(result.is_ok(), super::progress::COMPLETION_TIMEOUT);
+        if result.is_ok() {
+            ensure!(connected, user_error("Cloud connection could not be confirmed. Check the endpoint and retry; local data remains queued."));
+        }
+    } else {
+        progress.finish(result.is_ok());
+    }
+    let status = result?;
+    humanln!(
         "Probe connected: {} records received, {} queued.",
-        status.acknowledged_records, status.pending_records
+        status.acknowledged_records,
+        status.pending_records
     );
     Ok(())
 }
-fn running(directory: &Path) -> Result<bool> {
+pub(super) fn running(directory: &Path) -> Result<bool> {
     if !directory.join("collector.lock").exists() {
         return Ok(false);
     }
@@ -181,7 +231,7 @@ fn running(directory: &Path) -> Result<bool> {
     }
 }
 pub fn print_status(directory: &Path) -> Result<()> {
-    println!(
+    humanln!(
         "{}",
         if running(directory)? {
             "Probe is running."
@@ -192,8 +242,17 @@ pub fn print_status(directory: &Path) -> Result<()> {
     Ok(())
 }
 pub fn stop(directory: &Path) -> Result<()> {
+    stop_with_timeout(directory, Some(Duration::from_secs(45)))
+}
+pub fn stop_for_change(directory: &Path) -> Result<()> {
+    // The durable stop request may outlive the normal CLI deadline. A sharing
+    // change must wait for the lock to be released before it can safely apply
+    // its plan and guarantee a replacement collector is started.
+    stop_with_timeout(directory, None)
+}
+fn stop_with_timeout(directory: &Path, timeout: Option<Duration>) -> Result<()> {
     if !running(directory)? {
-        println!("Probe is stopped.");
+        humanln!("Probe is stopped.");
         return Ok(());
     }
     let runtime: serde_json::Value =
@@ -205,16 +264,19 @@ pub fn stop(directory: &Path) -> Result<()> {
         &directory.join("stop.json"),
         &json!({"startup_id":startup_id}),
     )?;
-    for _ in 0..45 {
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    loop {
         if !running(directory)? {
-            println!("Probe stopped.");
+            humanln!("Probe stopped.");
             return Ok(());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(user_error(
+                "Stop was requested. The probe is finishing its current capture operation.",
+            ));
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    Err(user_error(
-        "Stop was requested. The probe is finishing its current capture operation.",
-    ))
 }
 pub(super) fn stop_requested(directory: &Path, startup_id: &str) -> bool {
     let matched = fs::read(directory.join("stop.json"))
@@ -228,8 +290,12 @@ extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
-    let config = read_config(directory)?;
     let _lock = lock(directory)?;
+    ensure!(
+        !directory.join("sharing-change.json").exists(),
+        user_error("A sharing update is incomplete. Run start to recover it before retrying.")
+    );
+    let config = read_config(directory)?;
     std::env::set_var("RELAYHISTORY_HOME", directory);
     #[cfg(unix)]
     unsafe {
@@ -250,8 +316,22 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &directory.join("runtime.json"),
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":true}),
     )?;
+    let mut capture_due = Instant::now();
     while !stop_requested(directory, startup_id) {
-        if cycle(directory, &config).is_err() {
+        let result = if Instant::now() >= capture_due {
+            capture_due = Instant::now() + Duration::from_secs(60);
+            cycle(directory, &config)
+        } else {
+            deliver_captured(directory, &config, false)
+        };
+        save_json(
+            &directory.join("cycle.json"),
+            &json!({
+                "at_ms":now(), "ok":result.is_ok(),
+                "message":if result.is_err() { Some("Sync paused or offline. Retrying; local data remains queued.") } else { None }
+            }),
+        )?;
+        if result.is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");
         }
         for _ in 0..20 {
@@ -317,12 +397,14 @@ pub fn start_background(directory: &Path) -> Result<()> {
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
             .is_some_and(|value| value["startup_id"] == startup_id && value["ready"] == true);
         if ready {
-            println!("Probe is running in the background. You can close this terminal.");
-            println!("Run setup again after restarting the computer.");
+            humanln!("Probe is running in the background. You can close this terminal.");
+            humanln!("Run setup again after restarting the computer.");
             let config = read_config(directory)?;
-            println!(
+            humanln!(
                 "Stop: agent-relay-probe stop --site-url {} --workspace {} --account {}",
-                config.site_url, config.workspace_id, config.account_id
+                config.site_url,
+                config.workspace_id,
+                config.account_id
             );
             return Ok(());
         }
@@ -337,6 +419,7 @@ pub fn start_background(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
         delivery::DeliveryJobConfig {
             destination_id: DESTINATION.into(),
@@ -346,6 +429,108 @@ mod tests {
             selection: selection(include_existing),
             limits: Default::default(),
         }
+    }
+    #[test]
+    fn pause_during_drain_is_successful_without_acknowledging_the_batch() {
+        struct PausingReceiver<'a> {
+            conn: &'a Connection,
+            job_id: &'a str,
+            sent: std::cell::Cell<bool>,
+        }
+        impl worker::Receiver for PausingReceiver<'_> {
+            fn mapping_version(&self) -> &str {
+                destination::MAPPING_VERSION
+            }
+            fn supported_kinds(&self) -> &[&str] {
+                &["history", "session_event", "session"]
+            }
+            fn supports_tombstones(&self) -> bool {
+                true
+            }
+            fn prepare(
+                &self,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<worker::PreparedBody, worker::ReceiverFailure> {
+                Ok(worker::PreparedBody {
+                    content_type: "application/json".into(),
+                    body: "{}".into(),
+                })
+            }
+            fn send(
+                &self,
+                _: &delivery::PreparedPayload,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<delivery::DeliveryAcknowledgment, worker::ReceiverFailure>
+            {
+                self.sent.set(true);
+                delivery::pause_job(self.conn, self.job_id).unwrap();
+                Err(delivery::DeliveryFailure::Transient.into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let conn = ai_hist::open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','in-flight')",
+            [],
+        )
+        .unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        let receiver = PausingReceiver {
+            conn: &conn,
+            job_id: &config.job_id,
+            sent: std::cell::Cell::new(false),
+        };
+        let status = deliver_with_receiver(&db_path, &config, &receiver).unwrap();
+        assert!(receiver.sent.get());
+        assert_eq!(status.state, "paused");
+        assert_eq!(status.acknowledged_records, 0);
+        assert!(status.pending_records > 0);
+        delivery::cancel_job(&conn, &config.job_id).unwrap();
+        assert!(deliver_with_receiver(&db_path, &config, &receiver).is_err());
+    }
+
+    #[test]
+    fn sharing_stop_waits_for_collector_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("collector.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        save_json(
+            &dir.path().join("runtime.json"),
+            &json!({"startup_id":"test-run"}),
+        )
+        .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            FileExt::unlock(&lock).unwrap();
+        });
+
+        stop_for_change(dir.path()).unwrap();
+
+        release.join().unwrap();
+        assert!(stop_requested(dir.path(), "test-run"));
+        assert!(!running(dir.path()).unwrap());
     }
     /// Claim batches until one survives exclusion, and report its sessions.
     fn claim_sessions(conn: &Connection, job_id: &str) -> Vec<String> {
@@ -380,8 +565,7 @@ mod tests {
             )
             .unwrap();
         }
-        let baseline =
-            ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
+        let baseline = ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
         // The same identities carried inline would exceed the 64 KiB cap that
         // create_job enforces on a delivery configuration.
         assert!(serde_json::to_vec(&baseline).unwrap().len() > 65_536);

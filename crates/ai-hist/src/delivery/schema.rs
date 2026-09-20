@@ -303,6 +303,25 @@ END;
         };
         let insert_shadow = shadow("NEW", "NULL");
         let before_shadow = shadow("OLD", &old_payload);
+        // A capture trigger embeds the column list the table had when it was
+        // created. `CREATE TRIGGER IF NOT EXISTS` leaves that in place, so a
+        // table that later gains a column keeps being captured in the old
+        // shape: delivery goes on reporting success while the new field never
+        // reaches the destination. Rebuild any trigger whose payload no longer
+        // matches the table it captures.
+        let stale: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",
+            rusqlite::params![format!("delivery_{name}_insert"), new_payload.as_str()],
+            |row| row.get(0),
+        )?;
+        if stale {
+            for operation in ["insert", "update", "delete"] {
+                conn.execute_batch(&format!(
+                    "DROP TRIGGER IF EXISTS delivery_{name}_{operation};"
+                ))?;
+            }
+        }
         conn.execute_batch(&format!(r#"
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_insert AFTER INSERT ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
@@ -339,6 +358,33 @@ END;
     Ok(())
 }
 
+/// Whether a retained capture trigger still emits the column list its table
+/// has now.
+///
+/// Trigger *names* are what [`schema_is_current`] can check cheaply, but a
+/// name says nothing about the payload: a trigger embeds the column list its
+/// table had when it was created. Delivery is an optional feature, and that is
+/// what opens the hole -- a database can carry delivery tables and triggers
+/// from a delivery-enabled build, be opened by a `--no-default-features` build
+/// that adds a column without compiling the rebuild in, and then come back to
+/// a delivery-enabled build whose fast path the names alone satisfy. The
+/// rebuild is never reached and delivery goes on reporting success while the
+/// new field never leaves the machine.
+///
+/// Asked the same way the rebuild in `init_schema` asks it, so the two cannot
+/// disagree about what "current" means.
+fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> {
+    let name = table.name;
+    let payload = table.payload(conn, "NEW")?;
+    let stale: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",
+        rusqlite::params![format!("delivery_{name}_insert"), payload.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(!stale)
+}
+
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     let mut names = Vec::new();
     for table in TABLES {
@@ -373,37 +419,14 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     if count as usize != names.len() {
         return Ok(false);
     }
-    // Present is not the same as correct. A trigger created before one of its
-    // table's columns existed still has the right name, so checking names
-    // alone would keep a database on a capture that silently omits that
-    // column. See `drop_triggers_that_predate_a_column`.
+    // A trigger can carry the right name and a payload that predates a column
+    // its table has since gained; see `capture_payload_is_current`.
     for table in TABLES {
-        if !capture_covers_every_column(conn, table)? {
+        if !capture_payload_is_current(conn, table)? {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn capture_covers_every_column(conn: &Connection, table: &Table) -> Result<bool> {
-    let name = table.name;
-    let Some(sql): Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-            [format!("delivery_{name}_insert")],
-            |row| row.get(0),
-        )
-        .optional()?
-    else {
-        return Ok(false);
-    };
-    let columns = conn
-        .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns
-        .iter()
-        .all(|column| sql.contains(&format!("'{column}',NEW.\"{column}\""))))
 }
 
 #[cfg(test)]

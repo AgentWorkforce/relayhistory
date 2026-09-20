@@ -846,18 +846,44 @@ jobs:
           PY
       - name: cargo publish dry-run
         run: cargo publish --dry-run -p ai-hist --allow-dirty --locked
-      - name: Publish to crates.io
+      - name: Check whether this version is already on crates.io
+        id: crate-gate
         if: ${{ !inputs.dry_run }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          if curl -sf "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
-            echo "ai-hist ${VERSION} already exists on crates.io; skip"
-            exit 0
-          fi
-          # Dry-run already compiled the package. Skip verify so the registry
-          # token is not present while Cargo runs repository-controlled scripts.
+          # crates.io 403s requests without a User-Agent. Treat only 200/404 as
+          # known; any other status or a transport error must fail this gate
+          # rather than look like "not published" and retry cargo publish.
+          status="$(
+            curl -sS -o /dev/null -w "%{http_code}" \
+              -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
+              "https://crates.io/api/v1/crates/ai-hist/${VERSION}"
+          )"
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "ai-hist ${VERSION} already exists on crates.io; skip"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io lookup returned HTTP ${status}; not publishing"
+              exit 1
+              ;;
+          esac
+      - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run && steps.crate-gate.outputs.exists != 'true' }}
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run && steps.crate-gate.outputs.exists != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Dry-run already compiled the package. The token is the short-lived
+          # crates.io credential minted from GitHub OIDC above, not a repo secret.
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
   plugins:

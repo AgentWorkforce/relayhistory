@@ -5,6 +5,9 @@
     "prebenchmark": "npm --prefix sdk-ts install --ignore-scripts",
     "benchmark": "npm --prefix sdk-ts run benchmark --",
     "prebenchmark:hydration": "npm --prefix sdk-ts install --ignore-scripts",
-    "benchmark:hydration": "npm --prefix sdk-ts run benchmark:hydration --"
+    "benchmark:hydration": "npm --prefix sdk-ts run benchmark:hydration --",
+    "benchmark:sync": "node scripts/benchmark-sync.mjs",
+    "benchmark:sync:gate": "node scripts/benchmark-sync.mjs --gate",
+    "gen:synthetic-history": "node scripts/gen-synthetic-history.mjs"
   }
 }

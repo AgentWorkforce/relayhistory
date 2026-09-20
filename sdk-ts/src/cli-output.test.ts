@@ -49,7 +49,7 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
     assert.deepEqual(sessions.map((line) => line.source).sort(), ['claude', 'codex']);
     assert.ok(sessions.every((line) => JSON.stringify(line.locations) === '["local"]'));
     assert.equal(lines.at(-1)?.type, 'summary');
-    assert.equal(lines.at(-1)?.contract_version, 3);
+    assert.equal(lines.at(-1)?.contract_version, 4);
     assert.equal(lines.at(-1)?.scope, 'local');
     assert.equal('sessions' in (lines.at(-1) ?? {}), false);
 
@@ -66,6 +66,74 @@ test('sessions discover preserves repeated sources and emits JSONL', async () =>
       cli, 'search', 'indexed prompt', '--db', join(root, 'history.db'), '--json', '--no-warning',
     ], { env: { ...process.env, HOME: home, USERPROFILE: home } });
     assert.deepEqual((JSON.parse(searched.stdout) as Array<Record<string, unknown>>)[0]?.locations, ['local']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('the Node CLI filters by canonical project key and groups stats by it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-project-'));
+  const home = join(root, 'home');
+  const db = join(root, 'history.db');
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  // Two checkouts of one repository plus an unrelated directory. Under a
+  // path-keyed filter the first two are different projects; the whole point of
+  // the key is that they are not.
+  const checkout = async (name: string, origin: string | null): Promise<string> => {
+    const dir = join(root, 'work', name);
+    await mkdir(join(dir, '.git'), { recursive: true });
+    await writeFile(join(dir, '.git', 'config'),
+      origin ? `[remote "origin"]\n\turl = ${origin}\n` : '[core]\n\tbare = false\n');
+    return dir;
+  };
+  const one = await checkout('proj', 'git@github.com:Org/Repo.git');
+  const two = await checkout('proj-elsewhere', 'https://github.com/Org/Repo');
+  const loose = await checkout('loose', null);
+  const day = join(home, '.codex', 'sessions', '2026', '09', '19');
+  await mkdir(day, { recursive: true });
+  for (const [id, cwd] of [['one', one], ['two', two], ['loose', loose]] as const) {
+    await writeFile(join(day, `rollout-${id}.jsonl`), [
+      JSON.stringify({ timestamp: '2026-09-19T11:00:00.000Z', type: 'session_meta', payload: { id, cwd } }),
+      JSON.stringify({ timestamp: '2026-09-19T11:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: `${id} prompt` } }),
+      '',
+    ].join('\n'));
+  }
+  try {
+    await run(process.execPath, [cli, 'sync', '--db', db, '--json', '--no-warning'], { env });
+
+    // The CLI's JSON surface is snake_case, unlike the SDK objects it wraps.
+    type Row = Record<string, unknown>;
+    type Page = { sessions: Row[] };
+    type StatsJson = { grouped_by: string; by_project: Array<{ project: string; count: number }> };
+
+    const listed = await run(process.execPath, [cli, 'sessions', 'list', '--db', db, '--json', '--no-warning'], { env });
+    const rows = (JSON.parse(listed.stdout) as Page).sessions;
+    const keyed = Object.fromEntries(rows.map((row) => [row.session_id, row.project_key]));
+    assert.equal(keyed.one, 'github.com/Org/Repo');
+    assert.equal(keyed.two, 'github.com/Org/Repo');
+    assert.equal(keyed.loose, loose, 'a directory with no remote falls back to itself');
+    assert.equal(rows.find((row) => row.session_id === 'one')?.project_key_method, 'remote');
+
+    const filtered = await run(process.execPath, [
+      cli, 'sessions', 'list', '--db', db, '--json', '--project', 'github.com/Org/Repo', '--no-warning',
+    ], { env });
+    const selected = (JSON.parse(filtered.stdout) as Page).sessions
+      .map((row) => row.session_id).sort();
+    assert.deepEqual(selected, ['one', 'two'],
+      '--project must select both checkouts of the repository and nothing else');
+
+    const canonical = await run(process.execPath, [cli, 'stats', '--db', db, '--json', '--no-warning'], { env });
+    const byKey = JSON.parse(canonical.stdout) as StatsJson;
+    assert.equal(byKey.grouped_by, 'project_key');
+    assert.equal(byKey.by_project.find((row) => row.project === 'github.com/Org/Repo')?.count, 2,
+      'the two checkouts must land in one bucket');
+
+    const byCwd = await run(process.execPath, [cli, 'stats', '--db', db, '--json', '--by-cwd', '--no-warning'], { env });
+    const cwdGrouped = JSON.parse(byCwd.stdout) as StatsJson;
+    assert.equal(cwdGrouped.grouped_by, 'cwd');
+    assert.ok(cwdGrouped.by_project.every((row) => row.project !== 'github.com/Org/Repo'),
+      '--by-cwd must restore the raw directory grouping');
+    assert.equal(cwdGrouped.by_project.find((row) => row.project === one)?.count, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -115,11 +183,16 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
       cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(hydrated.contract_version, 2);
+    assert.equal(hydrated.contract_version, 3);
     assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
       `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
+    // Claude's parser produces every kind, so `full` is a computed answer here
+    // rather than the literal every provider used to receive.
+    assert.deepEqual(hydrated.coverage, [
+      'history', 'session_event', 'tool_call', 'file_edit', 'relationship',
+    ]);
     assert.deepEqual(hydrated.evidence, {
       prompts: 1, events: 1, tool_calls: 0, file_edits: 0, related_sessions: 0,
     });
@@ -253,7 +326,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--limit', '1', '--db', db, '--json', '--no-warning',
     ], { env });
     const page = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(page.contract_version, 1);
+    assert.equal(page.contract_version, 2);
     assert.equal(page.source, 'claude');
     assert.equal(page.session_id, 'claude-evidence');
     const calls = page.tool_calls as Array<Record<string, unknown>>;
@@ -277,7 +350,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--json', '--no-warning',
     ], { env });
     const editPage = JSON.parse(edits.stdout) as Record<string, unknown>;
-    assert.equal(editPage.contract_version, 1);
+    assert.equal(editPage.contract_version, 2);
     assert.deepEqual((editPage.file_edits as Array<Record<string, unknown>>).map((edit) => edit.file_path), ['/work/app/a.ts', '/work/app/b.ts']);
 
     const human = await run(process.execPath, [
@@ -412,7 +485,7 @@ test('scope flags are boolean, default to local, and are mutually exclusive', as
     assert.deepEqual(JSON.parse(implicit.stdout), JSON.parse(explicit.stdout));
     const remote = await run(process.execPath, [cli, 'sessions', 'list', '--remote', '--db', db, '--json', '--no-warning'], { env });
     assert.deepEqual(JSON.parse(remote.stdout), {
-      contract_version: 3, scope: 'remote', sessions: [], next_cursor: null,
+      contract_version: 4, scope: 'remote', sessions: [], next_cursor: null,
     });
 
     await assert.rejects(
@@ -470,10 +543,12 @@ test('unknown, missing-value, and command-inapplicable flags fail with usage exi
     { args: ['sessions', 'list', '--remtoe'], message: "unknown option '--remtoe'" },
     { args: ['sessions', 'list', '--db'], message: '--db requires a value' },
     { args: ['sessions', 'list', '--source'], message: '--source requires a value' },
-    { args: ['sessions', 'list', '--project', '/work'], message: 'sessions list does not accept --project' },
+    { args: ['sessions', 'list', '--project'], message: '--project requires a value' },
     { args: ['sessions', 'list', '--version'], message: 'sessions list does not accept --version' },
     { args: ['sessions', 'list', '-V'], message: 'sessions list does not accept --version' },
     { args: ['stats', '--source', 'codex'], message: 'stats does not accept --source' },
+    { args: ['stats', '--by-cwd', 'true'], message: '--by-cwd does not take a value' },
+    { args: ['search', 'q', '--by-cwd'], message: 'search does not accept --by-cwd' },
   ]) {
     await assert.rejects(
       run(process.execPath, [cli, ...args, '--no-warning']),

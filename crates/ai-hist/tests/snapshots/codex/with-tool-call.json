@@ -1,0 +1,160 @@
+{
+  "corpus_files": [
+    "codex/with-tool-call.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/README.md",
+      "git_branch": null,
+      "lines_added": 1,
+      "lines_removed": 0,
+      "message_id": "6:patch_apply_end",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "structured_patch_json": "{\"type\":\"update\",\"unified_diff\":\"@@\\n+banner\"}",
+      "tool_name": "apply_patch",
+      "tool_use_id": "call_patch_1#/tmp/project/README.md",
+      "ts_ms": 1776646802500,
+      "user_modified": null
+    },
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/NEW.md",
+      "git_branch": null,
+      "lines_added": 0,
+      "lines_removed": 0,
+      "message_id": "8:patch_apply_end",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "structured_patch_json": "{\"type\":\"add\"}",
+      "tool_name": "apply_patch",
+      "tool_use_id": "call_patch_2#/tmp/project/NEW.md",
+      "ts_ms": 1776646803200,
+      "user_modified": null
+    }
+  ],
+  "fixture": "codex/with-tool-call",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "function calls and their outputs as `response_item` records",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:function_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "3:function_call",
+      "model": "gpt-5.3-codex",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "text": "exec_command git status",
+      "token_json": null,
+      "ts_ms": 1776646801000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "5:custom_tool_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "5:custom_tool_call",
+      "model": "gpt-5.3-codex",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "text": "apply_patch /tmp/project/README.md",
+      "token_json": null,
+      "ts_ms": 1776646802000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "7:custom_tool_call",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "7:custom_tool_call",
+      "model": "gpt-5.3-codex",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "text": "apply_patch /tmp/project/NEW.md",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":2000,\"input_tokens\":5000,\"output_tokens\":800,\"reasoning_output_tokens\":200,\"total_tokens\":5800}",
+      "ts_ms": 1776646803000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776646800000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776646804100,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.3-codex\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-with-tool-call.jsonl",
+      "repo_url": null,
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "source_stamp": "<n>:2132",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": [
+    {
+      "args_json": "{\"cmd\":\"git status\",\"workdir\":\"/tmp/project\"}",
+      "is_error": 0,
+      "message_id": "3:function_call",
+      "name": "exec_command",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "target": "git status",
+      "tool_use_id": "call_exec_1",
+      "ts_ms": 1776646801000
+    },
+    {
+      "args_json": "{\"input\":\"*** Begin Patch\\n*** Update File: /tmp/project/README.md\\n@@\\n+banner\\n*** End Patch\\n\"}",
+      "is_error": 0,
+      "message_id": "5:custom_tool_call",
+      "name": "apply_patch",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "target": "/tmp/project/README.md",
+      "tool_use_id": "call_patch_1",
+      "ts_ms": 1776646802000
+    },
+    {
+      "args_json": "{\"input\":\"*** Begin Patch\\n*** Add File: /tmp/project/NEW.md\\n+hello\\n*** End Patch\\n\"}",
+      "is_error": 0,
+      "message_id": "7:custom_tool_call",
+      "name": "apply_patch",
+      "session_id": "sess_tools_1",
+      "source": "codex",
+      "target": "/tmp/project/NEW.md",
+      "tool_use_id": "call_patch_2",
+      "ts_ms": 1776646803000
+    }
+  ]
+}
