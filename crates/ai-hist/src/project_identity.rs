@@ -353,8 +353,40 @@ fn load_git_config(git_dir: &Path, head_dir: &Path) -> GitConfig {
     for global in global_config_paths() {
         load_config_file(&global, &context, 0, &mut merged);
     }
-    load_config_file(&git_dir.join("config"), &context, 0, &mut merged);
+    // The repository's own scope is read into a map of its own so that
+    // `extensions.worktreeConfig` can be asked of *it*: extensions are
+    // repository-scoped in git, and a global one must not switch on a
+    // per-worktree file.
+    let mut repository = GitConfig::new();
+    load_config_file(&git_dir.join("config"), &context, 0, &mut repository);
+    let worktree_config = config_is_true(&repository, "extensions", "worktreeconfig");
+    merge_config(&mut merged, repository);
+    if worktree_config {
+        // Read after the shared config, which is where git reads it: its
+        // values win a single-valued key and its rewrites add to the shared
+        // ones. Note what this does *not* change — a remote's URL list still
+        // begins with the shared entry, so `get-url` (and this module) answer
+        // with the shared URL even when a worktree appends its own. Checked
+        // against git 2.43; the worktree file's reach here is every other
+        // key, `insteadOf` included.
+        load_config_file(&head_dir.join("config.worktree"), &context, 0, &mut merged);
+    }
     merged
+}
+
+/// A git boolean, as git reads one: `true`, `yes`, `on` and `1` are true, and
+/// anything else — including an unset key — is false.
+fn config_is_true(config: &GitConfig, section: &str, key: &str) -> bool {
+    config
+        .get(section)
+        .and_then(|entries| entries.get(key))
+        .and_then(|values| values.last())
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        })
 }
 
 /// What an `includeIf` condition is asked about.
@@ -558,7 +590,6 @@ fn home_dir() -> Option<PathBuf> {
 /// a single-valued key resolves to the last one written, which [`single`]
 /// takes, while a multi-valued one — `insteadOf`, the reason this function
 /// exists — is the union of every scope that sets it.
-#[cfg(test)]
 fn merge_config(base: &mut GitConfig, incoming: GitConfig) {
     for (section, entries) in incoming {
         let target = base.entry(section).or_default();
@@ -792,11 +823,25 @@ fn single<'a>(section: &'a HashMap<String, Vec<String>>, key: &str) -> Option<&'
 /// and the subsection kept verbatim, which lets every lookup below use one
 /// spelling without flattening a distinction git makes.
 ///
-/// A header that is not the `name "subsection"` shape keeps its whole body,
-/// lowercased — it is a plain section name, and those are case-insensitive too.
+/// git also accepts the legacy `[section.subsection]` spelling, and there the
+/// *whole* header folds — `[remote.Origin]` and `[remote.origin]` are the same
+/// remote, while quoted `[remote "Origin"]` is a different one. Checked
+/// against git 2.43 rather than assumed, since the two forms have to land on
+/// one internal spelling for a lookup to find either:
+///
+/// ```text
+/// [remote.origin] url = …dotted…      $ git remote get-url origin → …dotted…
+/// [remote.ORIGIN] url = …upper…       $ git config --get remote.origin.url
+///                                       → …upper…  (same remote)
+/// [remote "ORIGIN"] url = …quoted…    $ git config --get remote.ORIGIN.url
+///                                       → …quoted… (a different remote)
+/// ```
+///
+/// A header that is neither shape keeps its whole body, lowercased — it is a
+/// plain section name, and those are case-insensitive too.
 fn section_name(raw: &str) -> String {
     let Some(quote) = raw.find('"') else {
-        return raw.to_ascii_lowercase();
+        return dotted_section_name(raw);
     };
     if !raw.ends_with('"') || raw.len() < quote + 2 {
         return raw.to_ascii_lowercase();
@@ -817,6 +862,33 @@ fn section_name(raw: &str) -> String {
     // last one, embedded quotes and all.
     let subsection = &tail[1..tail.len() - 1];
     format!("{} \"{subsection}\"", name.to_ascii_lowercase())
+}
+
+/// The legacy `[section.subsection]` form, folded onto the same internal
+/// spelling the quoted form produces.
+///
+/// git accepts only `[A-Za-z0-9.-]` in this form and rejects the line
+/// otherwise ("bad config line"), so a body outside that set is left as a
+/// plain section name rather than being taken apart into a subsection this
+/// module invented. The split is at the *first* dot: everything after it is
+/// the subsection, dots and all.
+fn dotted_section_name(raw: &str) -> String {
+    let folded = raw.to_ascii_lowercase();
+    let Some(dot) = folded.find('.') else {
+        return folded;
+    };
+    if !folded
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return folded;
+    }
+    let (name, rest) = folded.split_at(dot);
+    let subsection = &rest[1..];
+    if name.is_empty() || subsection.is_empty() {
+        return folded;
+    }
+    format!("{name} \"{subsection}\"")
 }
 
 fn strip_inline_comment(value: &str) -> String {
@@ -1284,6 +1356,170 @@ mod tests {
         assert_eq!(
             single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
             Some("looped")
+        );
+    }
+
+    /// git's legacy `[section.subsection]` header, folded onto one spelling.
+    ///
+    /// A repository written before the quoted form — or by a tool that still
+    /// uses this one — has an `origin` that a lookup for `remote "origin"`
+    /// simply misses, and the whole repository falls back to a path key.
+    #[test]
+    fn a_dotted_section_header_is_the_same_section_as_the_quoted_form() {
+        let config = parse_git_config("[remote.origin]\n\turl = git@github.com:acme/app.git\n");
+        assert_eq!(
+            remote_url(&config, "origin").map(String::as_str),
+            Some("git@github.com:acme/app.git")
+        );
+
+        // The dotted form folds entirely: git answers `remote.origin.url` for
+        // `[remote.ORIGIN]` and `[Remote.Origin]` alike.
+        for header in ["[remote.ORIGIN]", "[Remote.Origin]", "[REMOTE.ORIGIN]"] {
+            let config =
+                parse_git_config(&format!("{header}\n\turl = git@github.com:acme/app.git\n"));
+            assert_eq!(
+                remote_url(&config, "origin").map(String::as_str),
+                Some("git@github.com:acme/app.git"),
+                "{header} must be the origin remote"
+            );
+        }
+
+        // The quoted form does not fold its subsection, which is the
+        // distinction that makes this a fold rather than a lowercase.
+        let quoted =
+            parse_git_config("[remote \"ORIGIN\"]\n\turl = git@github.com:acme/other.git\n");
+        assert_eq!(remote_url(&quoted, "origin"), None);
+        assert_eq!(
+            remote_url(&quoted, "ORIGIN").map(String::as_str),
+            Some("git@github.com:acme/other.git")
+        );
+
+        // A body git itself rejects is not taken apart into a subsection this
+        // module invented: `git` calls `[url.https://github.com/]` a bad
+        // config line, so it stays a plain section name.
+        let odd = parse_git_config("[url.https://github.com/]\n\tinsteadOf = gh:\n");
+        assert_eq!(apply_insteadof(&odd, "gh:Org/Repo.git"), "gh:Org/Repo.git");
+    }
+
+    /// A repository whose `origin` is written the legacy way still resolves.
+    #[test]
+    fn a_dotted_remote_resolves_end_to_end() {
+        let temp = tempdir().unwrap();
+        let work = temp.path().join("app");
+        let git = work.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\tbare = false\n[remote.origin]\n\turl = git@github.com:acme/app.git\n",
+        )
+        .unwrap();
+        let resolved = project_identity(&work);
+        assert_eq!(
+            (resolved.project_key.as_str(), resolved.method),
+            ("github.com/acme/app", ProjectKeyMethod::Remote),
+        );
+    }
+
+    /// `config.worktree`, when the repository has turned that extension on.
+    ///
+    /// Checked against git 2.43, because the interesting part is what it does
+    /// *not* change. git reads the file after the shared config, so its
+    /// values win a single-valued key and its rewrites add to the shared
+    /// ones — but a remote's URL list still begins with the shared entry, so
+    /// `git remote get-url origin` keeps answering with the shared URL:
+    ///
+    /// ```text
+    /// shared config     remote.origin.url = https://shared.example/…
+    /// config.worktree   remote.origin.url = https://per-worktree.example/…
+    /// $ git remote get-url origin        → https://shared.example/…
+    /// $ git remote get-url --all origin  → shared, then per-worktree
+    /// $ git config --get remote.origin.url → https://per-worktree.example/…
+    /// ```
+    ///
+    /// So the reach of this file here is every other key, `insteadOf`
+    /// included — which is exactly the kind of setting a worktree carries.
+    #[test]
+    fn a_worktree_config_is_read_when_the_extension_is_enabled() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let work = root.join("app");
+        let git = work.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = wt:acme/app.git\n",
+        )
+        .unwrap();
+        fs::write(
+            git.join("config.worktree"),
+            "[url \"https://worktree.example/\"]\n\tinsteadOf = wt:\n",
+        )
+        .unwrap();
+
+        // Off by default: the file is there and must be ignored.
+        assert_eq!(
+            project_identity(&work).method,
+            ProjectKeyMethod::PathFallback,
+            "config.worktree must not be read without extensions.worktreeConfig"
+        );
+
+        fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n\
+             [remote \"origin\"]\n\turl = wt:acme/app.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_identity(&work).project_key,
+            "worktree.example/acme/app",
+            "an enabled worktree config was not read"
+        );
+
+        // A value git reads as false leaves it unread again.
+        fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = false\n\
+             [remote \"origin\"]\n\turl = wt:acme/app.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_identity(&work).method,
+            ProjectKeyMethod::PathFallback,
+        );
+
+        // And a linked worktree reads *its own* file, not the main
+        // checkout's: the extension is shared, the file is not.
+        fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n\
+             [remote \"origin\"]\n\turl = wt:acme/app.git\n",
+        )
+        .unwrap();
+        let worktree_git = git.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree_git.join("config.worktree"),
+            "[url \"https://feature.example/\"]\n\tinsteadOf = wt:\n",
+        )
+        .unwrap();
+        let linked = root.join("app-feature");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            project_identity(&linked).project_key,
+            "feature.example/acme/app",
+            "a linked worktree must read its own config.worktree"
+        );
+        assert_eq!(
+            project_identity(&work).project_key,
+            "worktree.example/acme/app",
+            "and the main checkout keeps reading its own"
         );
     }
 

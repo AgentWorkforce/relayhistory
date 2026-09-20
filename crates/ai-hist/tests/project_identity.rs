@@ -919,3 +919,112 @@ fn a_cataloged_session_and_its_events_never_name_different_projects() {
     );
     assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
 }
+
+/// A key borrowed *across* an uncataloged generation follows its ancestor too.
+///
+/// The statement pass 2 runs joins a child to its parent's catalog row, so it
+/// can neither lend nor re-lend across a generation the catalog does not hold.
+/// The walk covers the lending; without covering the re-lending it freezes the
+/// first answer it ever gave: promote the ancestor and the grandchild keeps a
+/// stand-in that ancestor has stopped wearing, in a project no session claims
+/// any more. Same defect as the one fixed for direct children, one generation
+/// further out.
+#[test]
+fn a_key_borrowed_across_an_uncataloged_generation_follows_its_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("relend.db")).unwrap();
+
+    // The root wears a stand-in of its own: its directory is not a repository
+    // yet, so the key it holds came from somewhere outside this database.
+    let root_dir = temp.path().join("root-checkout");
+    fs::create_dir_all(&root_dir).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'root', ?, 'github.com/acme/old', 'inherited', 1, 'full')",
+        rusqlite::params![root_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The leaf is cataloged; the generation between them is not.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'leaf', 2, 'shallow')",
+        [],
+    )
+    .unwrap();
+    for (parent, child, created) in [("root", "middle", 1), ("middle", "leaf", 2)] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+         VALUES ('codex', 'leaf', 'leaf-1', 1, 'assistant', 'text', 'work')",
+        [],
+    )
+    .unwrap();
+
+    let event_key = || -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT project_key, project_key_method FROM session_events \
+             WHERE source = 'codex' AND session_id = 'leaf'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+
+    // The stand-in reaches the leaf and its events first — the state this test
+    // is about disturbing.
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    let borrowed = (
+        Some("github.com/acme/old".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    assert_eq!(
+        session_key(&conn, "codex", "leaf"),
+        borrowed,
+        "the leaf did not borrow across the uncataloged generation at all"
+    );
+    assert_eq!(event_key(), borrowed);
+
+    // The root's checkout gains an origin, so pass 1 promotes it.
+    let git_dir = root_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    assert_eq!(
+        session_key(&conn, "codex", "root"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "pass 1 did not promote the root, so the claim below is untested"
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    assert_eq!(
+        session_key(&conn, "codex", "leaf"),
+        promoted,
+        "the leaf kept a stand-in its ancestor no longer wears"
+    );
+    assert_eq!(event_key(), promoted, "and its events kept it too");
+
+    // Settled: no churn on the next sync.
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}

@@ -2324,25 +2324,44 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
 /// keeps a path key or none while the root it was delegated from carries the
 /// repository. The events of such a session must not be keyed where the
 /// session row itself is not, so this fills the row and lets the ordinary
-/// denormalizing pass carry it down.
+/// denormalizing pass carry it down — and keeps it in step afterwards, when
+/// the ancestor it borrowed from moves.
 fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
+    // A borrowed key is reconsidered here for the same reason the statement
+    // above reconsiders one: the ancestor it was borrowed from can be promoted
+    // onto a `remote` of its own, and every stand-in below has to move with
+    // it. Leaving that to the statement is not enough — the statement cannot
+    // see across a generation the catalog does not hold, which is the only
+    // kind of row that reaches this walk.
+    //
+    // Rows the statement *can* settle are excluded rather than walked twice:
+    // a row with a lendable direct parent is its business, and this keeps the
+    // steady-state cost to the handful of rows delegated through an
+    // uncataloged generation.
+    let lendable_parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
     let pending: Vec<(String, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT source, session_id FROM sessions \
-             WHERE (project_key IS NULL OR project_key_method = 'path') \
+             WHERE (project_key IS NULL OR project_key_method IN ('path', 'inherited')) \
                AND EXISTS (SELECT 1 FROM session_relationships r \
                      WHERE r.source = sessions.source \
-                       AND r.child_session_id = sessions.session_id)",
-        )?
+                       AND r.child_session_id = sessions.session_id) \
+               AND NOT EXISTS ({lendable_parent})"
+        ))?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if pending.is_empty() {
         return Ok(0);
     }
+    // The same ranking the rest of the module applies: a `remote` is never
+    // touched, and a borrowed key is rewritten only when the ancestor now
+    // holds a different one — so a settled database writes nothing and the
+    // loop around this terminates.
     let mut update = conn.prepare(
         "UPDATE sessions SET project_key = ?3, project_key_method = 'inherited' \
          WHERE source = ?1 AND session_id = ?2 \
-           AND (project_key IS NULL OR project_key_method = 'path')",
+           AND (project_key IS NULL OR project_key_method = 'path' \
+                OR (project_key_method = 'inherited' AND project_key IS NOT ?3))",
     )?;
     let mut written = 0;
     for (source, session_id) in pending {

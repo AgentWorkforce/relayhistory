@@ -183,7 +183,14 @@ names while `HEAD` is read from the worktree's own git directory, and
 `includeIf` conditions are evaluated against that same per-worktree directory.
 A worktree exists to be on a different branch from the checkout it shares a
 repository with, so asking the shared directory would answer about the wrong
-tree.
+tree. When the shared config enables `extensions.worktreeConfig`, that
+worktree's `config.worktree` is read after the shared config, as git reads it.
+
+Both spellings of a subsection are understood: `[remote "origin"]` and the
+legacy `[remote.origin]` name the same remote, with git's differing case rules
+— the quoted subsection is case-sensitive, the dotted header folds entirely,
+so `[remote.ORIGIN]` is `origin` while `[remote "ORIGIN"]` is a different
+remote.
 
 A remote's URL is a list, not a single value: git accumulates every
 `remote.<name>.url` it reads, across scopes as well as within a file, and the
