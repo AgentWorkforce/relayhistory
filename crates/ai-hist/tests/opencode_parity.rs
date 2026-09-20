@@ -195,7 +195,7 @@ fn evidence(db_path: &Path, session_ids: &[&str]) -> Evidence {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         out.file_edits.append(&mut edits);
-        for marker in session_markers(&conn, session_id, Some("opencode")).unwrap() {
+        for marker in session_markers(&conn, "opencode", session_id).unwrap() {
             out.markers.push(format!(
                 "{}|{}|{}|{:?}|{:?}|{:?}",
                 marker.session_id,
@@ -703,7 +703,7 @@ fn a_compaction_part_records_one_boundary_marker() {
     sync_local_at(&db_path).unwrap();
 
     let conn = open_db(&db_path).unwrap();
-    let markers = session_markers(&conn, "ses_compact", Some("opencode")).unwrap();
+    let markers = session_markers(&conn, "opencode", "ses_compact").unwrap();
     assert_eq!(
         markers.len(),
         1,
@@ -727,7 +727,7 @@ fn a_compaction_part_records_one_boundary_marker() {
     sync_local_at(&db_path).unwrap();
     let conn = open_db(&db_path).unwrap();
     assert_eq!(
-        session_markers(&conn, "ses_compact", Some("opencode"))
+        session_markers(&conn, "opencode", "ses_compact")
             .unwrap()
             .len(),
         1,

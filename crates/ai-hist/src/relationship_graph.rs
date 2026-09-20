@@ -289,6 +289,12 @@ pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
         // provider versions that also emit a per-child `agentId` give the
         // child a stable identity.
         "claude" => ("sometimes", true, true, true),
+        // Grok records a delegation in two places. The `Task` call in the
+        // transcript names no child at all; a `subagents/` metadata entry does
+        // when it carries a session id, and the child session then lives in
+        // the normal sessions tree. The id is never taken from the file name,
+        // so an entry without one stays unlinked evidence.
+        "grok" => ("sometimes", true, true, true),
         _ => ("never", false, false, false),
     };
     RelationshipCapabilities {
@@ -1278,7 +1284,11 @@ mod tests {
             relationship_capabilities("claude").stable_child_identity,
             "sometimes"
         );
-        for source in ["cursor", "grok", "relay"] {
+        assert_eq!(
+            relationship_capabilities("grok").stable_child_identity,
+            "sometimes"
+        );
+        for source in ["cursor", "relay"] {
             let capabilities = relationship_capabilities(source);
             assert_eq!(capabilities.stable_child_identity, "never");
             assert!(!capabilities.records_agent_type);

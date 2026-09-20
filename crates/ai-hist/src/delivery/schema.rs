@@ -101,6 +101,13 @@ pub(super) const TABLES: &[Table] = &[
             "evidence_uid",
         ],
     },
+    Table {
+        name: "session_markers",
+        kind: "session_marker",
+        source: "source",
+        session: "session_id",
+        key: &["source", "session_id", "marker_uid"],
+    },
 ];
 
 impl Table {
@@ -241,7 +248,11 @@ CREATE TABLE IF NOT EXISTS delivery_exclusions (
     // A pre-upgrade job/export has no snapshot boundary for newly introduced
     // tables. Give it an empty historical snapshot; new observation writes are
     // captured by the journal. A newly created generation exports current rows.
-    for kind in ["source_observation", "observation_evidence"] {
+    for kind in [
+        "source_observation",
+        "observation_evidence",
+        "session_marker",
+    ] {
         conn.execute("INSERT OR IGNORE INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT id,?,0 FROM delivery_jobs UNION ALL SELECT id,?,0 FROM history_exports",[kind,kind])?;
     }
     // Count retained logical bytes, including key/payload duplication and row
