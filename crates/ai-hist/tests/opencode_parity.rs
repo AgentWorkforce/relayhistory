@@ -13,8 +13,8 @@
 use ai_hist::internal::{session_markers, session_tree, SessionTreeOptions};
 use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, open_db, session_events,
-    session_relationships, sync_local_at, sync_opencode_db, DiscoverOptions, HydrateSessionOptions,
-    SessionScope,
+    session_relationships, sync_local_at, sync_opencode_at, sync_opencode_db, DiscoverOptions,
+    HydrateSessionOptions, SessionScope, SyncOutput,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::fs;
@@ -276,10 +276,12 @@ fn use_layout(home: &Path, db: Option<&Path>, storage: Option<&Path>) {
 /// still says which acceptance criterion broke.
 #[test]
 fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
+    targeted_sync_honors_the_configured_legacy_storage_root();
     the_two_layouts_normalize_to_identical_evidence();
     every_session_in_the_corpus_is_parsed();
     a_parent_id_links_a_child_session_and_the_tree_returns_it();
     a_tool_turn_records_errors_tokens_provider_and_stop_reason();
+    a_tool_without_a_target_keeps_its_name_in_the_event();
     a_compaction_part_records_one_boundary_marker();
     a_large_store_is_synced_without_copying_it();
     an_install_indexed_as_prompts_only_gains_events_on_the_next_plain_sync();
@@ -304,6 +306,73 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_failed_session_query_does_not_checkpoint_an_empty_session();
     one_unreadable_session_does_not_end_the_sqlite_sweep();
     a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event();
+}
+
+fn targeted_sync_honors_the_configured_legacy_storage_root() {
+    let root = temp_root("targeted-storage-root");
+    let home = root.join("home");
+    let tree = root.join("relocated/legacy-storage");
+    let provider_db = root.join("provider/opencode.db");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, Some(&provider_db), Some(&tree));
+
+    let db_path = root.join("history.db");
+    sync_opencode_at(&db_path, &provider_db, SyncOutput::Silent).unwrap();
+
+    let count: i64 = open_db(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='opencode' AND session_id='ses_simple'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "targeted sync must discover the independently configured legacy tree"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+fn a_tool_without_a_target_keeps_its_name_in_the_event() {
+    let root = temp_root("tool-without-target");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-with-tool/storage"), &tree);
+    write_json(
+        &tree.join("part/msg_tool_asst/prt_tool_5_no_target.json"),
+        r#"{
+          "id":"prt_tool_5_no_target",
+          "sessionID":"ses_tool",
+          "messageID":"msg_tool_asst",
+          "type":"tool",
+          "callID":"toolu_todo_1",
+          "tool":"todowrite",
+          "state":{"status":"completed","input":{},"output":"done"}
+        }"#,
+    );
+    use_layout(&home, None, Some(&tree));
+
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    let text: Option<String> = open_db(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT text FROM session_events \
+             WHERE source='opencode' AND session_id='ses_tool' \
+             AND event_uid='tool_use:toolu_todo_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        text.as_deref(),
+        Some("todowrite {}"),
+        "a targetless tool event must remain present and searchable by tool name"
+    );
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture

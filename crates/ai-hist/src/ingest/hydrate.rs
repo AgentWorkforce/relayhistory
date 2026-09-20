@@ -1114,7 +1114,8 @@ fn source_snapshot(
             hydration_error(
                 "SESSION_SOURCE_MISMATCH",
                 format!(
-                    "OpenCode catalog row points at {}, but {} is now the current store;                      run discoverSessions() again to re-establish this session's provenance",
+                    "OpenCode catalog row points at {}, but {} is now the current store; \
+                     run discoverSessions() again to re-establish this session's provenance",
                     stale.display(),
                     current.display()
                 ),

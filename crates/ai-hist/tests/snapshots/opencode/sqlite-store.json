@@ -157,7 +157,7 @@
       "role": "assistant",
       "session_id": "ses_sqlite_root",
       "source": "opencode",
-      "text": "/tmp/project/src/client.ts",
+      "text": "edit /tmp/project/src/client.ts",
       "token_json": "{\"cache\":{\"read\":0,\"write\":9000},\"input\":7,\"output\":120,\"reasoning\":0}",
       "ts_ms": 1776643210000
     },

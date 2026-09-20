@@ -1419,6 +1419,7 @@ fn normalize_session(
                 .filter(|value| value.is_object())
                 .unwrap_or_else(|| Value::Object(Map::new()));
             let target = pick_target(tool.tool, &input);
+            let event_text = super::format_tool_event_text(tool.tool, target.as_deref(), &input);
             let args_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
             let is_error = is_failed_tool(tool.state);
 
@@ -1434,7 +1435,7 @@ fn normalize_session(
                 message.time_created,
                 "assistant",
                 "tool_use",
-                target.as_deref(),
+                Some(&event_text),
                 model.as_deref(),
                 token_json.as_deref(),
                 message.provider_id.as_deref(),

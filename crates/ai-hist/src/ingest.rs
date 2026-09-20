@@ -29,7 +29,7 @@ use crate::diagnostics::*;
 use crate::discover;
 #[cfg(test)]
 use crate::history_search::{search_all, SearchRole};
-use crate::paths::home_dir;
+use crate::paths::{default_opencode_storage_dir, home_dir};
 use crate::remote;
 
 pub use crate::discover::{
@@ -745,7 +745,8 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     let env = DiscoveryEnv::with_provider_roots(
         &conn,
         crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
-    );
+    )
+    .with_opencode_storage_dir(default_opencode_storage_dir());
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()

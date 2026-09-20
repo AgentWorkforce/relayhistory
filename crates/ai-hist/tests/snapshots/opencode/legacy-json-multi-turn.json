@@ -55,7 +55,7 @@
       "role": "assistant",
       "session_id": "ses_multi",
       "source": "opencode",
-      "text": "git status",
+      "text": "bash git status",
       "token_json": "{\"cache\":{\"read\":15000,\"write\":3000},\"input\":5,\"output\":200,\"reasoning\":50}",
       "ts_ms": 1776988824000
     }

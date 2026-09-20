@@ -95,7 +95,7 @@
       "role": "assistant",
       "session_id": "ses_tool",
       "source": "opencode",
-      "text": "ls -la",
+      "text": "bash ls -la",
       "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
       "ts_ms": 1776988812000
     },
@@ -111,7 +111,7 @@
       "role": "assistant",
       "session_id": "ses_tool",
       "source": "opencode",
-      "text": "/src/b.ts",
+      "text": "edit /src/b.ts",
       "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
       "ts_ms": 1776988812000
     },
@@ -127,7 +127,7 @@
       "role": "assistant",
       "session_id": "ses_tool",
       "source": "opencode",
-      "text": "/src/a.ts",
+      "text": "read /src/a.ts",
       "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
       "ts_ms": 1776988812000
     }

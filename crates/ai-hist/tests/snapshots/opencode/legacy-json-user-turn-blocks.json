@@ -94,7 +94,7 @@
       "role": "assistant",
       "session_id": "ses_utb",
       "source": "opencode",
-      "text": "ls",
+      "text": "bash ls",
       "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
       "ts_ms": 1776990001000
     },
@@ -110,7 +110,7 @@
       "role": "assistant",
       "session_id": "ses_utb",
       "source": "opencode",
-      "text": "test",
+      "text": "bash test",
       "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
       "ts_ms": 1776990001000
     },
