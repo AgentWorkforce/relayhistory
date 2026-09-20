@@ -381,11 +381,24 @@ Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
 and `turn_context` populate the catalog, `token_count` is folded into the
 adjacent assistant event's `token_json`, `thread_settings_applied` carries the
-model forward, a `*_delta` is a fragment of an event recorded whole, and
-`user_message` / `message` reach the deduplicator that stores one row for the
-two representations Codex writes of the same message. That list is the inverse
-of the handler list in the way that matters: a wrong entry costs a redundant
-marker, where a wrong entry in the handler list costs a vanished line.
+model forward, a `*_delta` is a fragment of an event recorded whole, and an
+assistant `message` is the mirrored twin of the `agent_message` that stores the
+text.
+
+A **user** message is deliberately not on that list, and the reason is the
+lesson the list itself taught. Codex writes a user turn in two representations
+and a deduplicator stores one row for the pair — but only when it accepts the
+turn. It refuses blank text, application-injected control wrappers, and content
+with no `input_text` part, such as an image-only turn. Exempting user messages
+by type alone therefore asserted a row had been written when none had, and
+those lines vanished. The exemption is now *earned*: it applies to a mirrored
+twin, where the deduplicator reports that its partner really did write, and
+every other user line is settled by measurement like anything else.
+
+That is the general shape to keep: an exception list must be oriented so a
+wrong entry costs a redundant marker rather than a vanished line, and an entry
+that asserts "something else stored this" has to be checked against what was
+stored.
 
 Markers are evidence, so they are removed with the rest when a complete remote
 snapshot replaces a session: a marker left behind would tell a caller that

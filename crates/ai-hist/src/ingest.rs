@@ -2185,8 +2185,8 @@ fn ingest_codex_rollout(
         changes_before_line = conn.total_changes();
         // A state-only line is never registered: it writes no row by design,
         // and the allocation would land on the highest-volume lines in the file.
-        unwritten_line =
-            (!codex_line_is_state_only(line_type, payload_type)).then(|| UnwrittenCodexLine {
+        unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
+            UnwrittenCodexLine {
                 index,
                 ts_ms,
                 subkind: if payload_type.is_empty() {
@@ -2198,7 +2198,8 @@ fn ingest_codex_rollout(
                     .get("turn_id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-            });
+            }
+        });
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
@@ -2220,7 +2221,14 @@ fn ingest_codex_rollout(
                 },
             )?;
         }
-        if let Some(message) = human_messages.observe(&value) {
+        let human_outcome = human_messages.observe(&value);
+        if human_outcome == codex::HumanMessageOutcome::Suppressed {
+            // The mirrored encoding of the turn just stored. Its twin wrote
+            // the row, so this line is accounted for even though it writes
+            // nothing itself -- the one case where the exemption is earned.
+            unwritten_line = None;
+        }
+        if let codex::HumanMessageOutcome::Stored(message) = human_outcome {
             let suffix = match message.format {
                 codex::HumanMessageFormat::EventMessage => "user_message",
                 codex::HumanMessageFormat::ResponseItem => "response_item_user_message",
@@ -2634,23 +2642,42 @@ fn flush_unwritten_codex_line(
 /// elsewhere: `session_meta` and `turn_context` populate the session catalog,
 /// `token_count` is folded into the adjacent assistant event's `token_json`,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
-/// fragment of an event recorded whole, and `user_message` / `message` reach
-/// the deduplicator, which stores one row for the two representations Codex
-/// writes of the same message.
+/// fragment of an event recorded whole, and an assistant `message` is the
+/// mirrored twin of the `agent_message` that stores the text.
+///
+/// A *user* message is deliberately not on this list. The deduplicator stores
+/// one row for Codex's two representations of a turn, but only when it accepts
+/// the turn -- it refuses blank text, control wrappers, and content with no
+/// `input_text` part, and an exemption by type alone then swallowed those
+/// lines. The earned case, a mirrored twin, is handled at the call site, which
+/// knows that a row really was written.
 ///
 /// This list is the inverse of [`codex_payload_is_modeled`] in the way that
 /// matters: a wrong entry here costs a redundant marker, where a wrong entry
 /// there costs a vanished line.
-fn codex_line_is_state_only(line_type: &str, payload_type: &str) -> bool {
+fn codex_line_is_state_only(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> bool {
     match line_type {
         "session_meta" | "turn_context" => true,
         "event_msg" => {
-            matches!(
-                payload_type,
-                "token_count" | "thread_settings_applied" | "user_message"
-            ) || payload_type.ends_with("_delta")
+            matches!(payload_type, "token_count" | "thread_settings_applied")
+                || payload_type.ends_with("_delta")
         }
-        "response_item" => payload_type == "message" || payload_type.ends_with("_delta"),
+        "response_item" => {
+            // An *assistant* `message` is the mirrored twin of the readable
+            // `agent_message` event, which stores the text. A `user` message
+            // is not exempt by type: the deduplicator stores it only when it
+            // accepts it, and it refuses blank text, control wrappers and
+            // content with no `input_text` part. Those are settled by
+            // measurement instead, and a role this does not recognize falls
+            // through to measurement too -- the safe direction.
+            (payload_type == "message"
+                && payload.get("role").and_then(Value::as_str) == Some("assistant"))
+                || payload_type.ends_with("_delta")
+        }
         _ => false,
     }
 }
@@ -7895,6 +7922,129 @@ mod tests {
                 .all(|marker| marker.subkind.as_deref() != Some("user")
                     && marker.subkind.as_deref() != Some("assistant")),
             "modeled record types must stay silent: {page:?}"
+        );
+    }
+
+    /// The exception list's own failure mode, which I flagged as the risk when
+    /// I added it and then still got wrong: `response_item/message` was
+    /// exempted unconditionally on the grounds that the deduplicator stores
+    /// one row for Codex's two representations of a turn. It does — but only
+    /// when it accepts the message. A user message whose content carries no
+    /// `input_text` part (an image-only turn) is rejected, nothing is written,
+    /// and the blanket exemption then swallowed the line.
+    ///
+    /// The same holds for a blank `user_message` and for an
+    /// application-injected control wrapper: the deduplicator refuses both.
+    ///
+    /// The exemption now has to be earned: it holds for a mirrored duplicate,
+    /// whose twin really did write, and not for a message the deduplicator
+    /// simply refused.
+    #[test]
+    fn a_codex_message_the_deduplicator_rejects_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/13");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-image.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-image","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                // Image-only user turn: no `input_text` part, so the
+                // deduplicator rejects it and nothing stores it.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
+                // Blank text, and an application-injected control wrapper:
+                // the deduplicator refuses both, so nothing stores them
+                // either.
+                r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp/proj</environment_context>"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "the image-only turn reaches no event");
+
+        let markers = markers_of(&conn, "codex", "sess-image");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("unknown", "message"),
+                ("unknown", "user_message"),
+                ("unknown", "user_message"),
+            ],
+            "every user line nothing stored must leave a row: {markers:?}"
+        );
+        // No marker payload carries the image or the wrapper text, only the
+        // fact that the line was there.
+        assert!(
+            markers.iter().all(|(_, _, payload)| payload.is_empty()),
+            "the marker records that the line existed, not its contents"
+        );
+    }
+
+    /// The other side of the same exemption: a genuine mirror pair must still
+    /// produce exactly one event and no marker, or every user turn in every
+    /// rollout gains a spurious `unknown` row.
+    #[test]
+    fn a_mirrored_codex_user_turn_writes_one_row_and_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/13");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-mirror.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-mirror","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                // The same turn in both representations, adjacent: Codex's
+                // mirror pair. One row, and the twin is legitimately silent.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the importer"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:01.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the importer"}]}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+                // The assistant's own mirrored twin of `agent_message`.
+                r#"{"timestamp":"2026-09-13T00:00:02.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let texts: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source='codex' AND session_id='sess-mirror' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            texts,
+            vec!["fix the importer".to_string(), "done".to_string()],
+            "one row per turn, not one per representation"
+        );
+        let markers = markers_of(&conn, "codex", "sess-mirror");
+        assert!(
+            markers.is_empty(),
+            "a mirrored twin wrote through its partner, so it earns its silence: {markers:?}"
         );
     }
 
