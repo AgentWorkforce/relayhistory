@@ -486,9 +486,10 @@ pub struct NativeSessionUserTurn {
     pub source: String,
     pub session_id: String,
     pub message_id: Option<String>,
-    /// The messages recorded either side of this turn, from either side of
-    /// the conversation. Null at the ends of a session, and when the
-    /// neighbouring record carried no provider message id.
+    /// The nearest messages recorded either side of this turn, from either
+    /// side of the conversation. Null only when the session recorded no named
+    /// message on that side; an event the provider left unnamed is passed
+    /// over rather than nulling the field.
     pub preceding_message_id: Option<String>,
     pub following_message_id: Option<String>,
     pub ts_ms: i64,

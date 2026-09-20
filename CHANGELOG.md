@@ -91,9 +91,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
   derived from `session_events` rather than a second table. A turn is what
   arrived on one user message, and carries the `preceding_message_id` /
-  `following_message_id` the sourcing contract asks for: the messages recorded
-  either side of it, from either side of the conversation, null at the ends of
-  a session and wherever the adjacent record carried no provider message id. A block's `is_error` is `true` for a
+  `following_message_id` the sourcing contract asks for: the nearest messages
+  recorded either side of it, from either side of the conversation, null only
+  where the session recorded no named message on that side. An event the
+  provider left unnamed is passed over rather than nulling the field -- it is
+  not a message a consumer could reference, and the named message behind it
+  still borders the turn. A block's `is_error` is `true` for a
   `result_status` of `errored` or `cancelled`, `false` for `completed`, and
   `null` only while the outcome is genuinely undecided — a terminal status the
   provider stated is never reported as unknown. Membership is asserted through `event_source`
@@ -111,6 +114,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   Carried by `SESSION_EVIDENCE_CONTRACT_VERSION` 2, which the per-message raw
   provider facts already claimed: both landed unreleased, so 2 means the
   fidelity columns and the user-turn page as well.
+
+- Refuse a read-only `SessionStore::open` on a database older than the session
+  event shape this version reads, naming the remedy. A writable open migrates;
+  a read-only handle cannot, and the napi read path answers the same mismatch
+  by reopening writable — which a read-only embedder has asked not to happen.
+  Without the check the store opened and the first user-turn read died on
+  `no such column` inside a query.
 
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and
   `ai-hist-engine` packages). Default features expose `SessionStore`, evidence

@@ -2,8 +2,8 @@
 //! Rust contract-version constant.
 use crate::ingest::{sync_local_at, sync_local_at_with_home};
 use crate::store::{
-    default_db_path, open_db, open_db_readonly, session_user_turns_page, SessionEventCursor,
-    SessionUserTurnPage,
+    default_db_path, open_db, open_db_readonly, schema_is_event_read_current,
+    session_user_turns_page, SessionEventCursor, SessionUserTurnPage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -106,10 +106,28 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// Open (and create, unless `read_only`) the local history database.
+    ///
+    /// A writable open migrates the database to the shape this version reads.
+    /// A read-only one cannot, so it checks instead and fails here, naming the
+    /// remedy: the alternative is an open that succeeds and a first read that
+    /// dies on `no such column` somewhere inside a query, which tells the
+    /// caller nothing about what to do. The napi layer answers the same
+    /// mismatch by reopening writable and migrating; a read-only embedder has
+    /// asked not to be written for, so it is told rather than upgraded behind
+    /// its back.
     pub fn open(opts: StoreOptions) -> Result<Self, Error> {
         let db_path = resolve_db_path(&opts);
         if opts.read_only {
-            let _ = open_db_readonly(&db_path)?;
+            let conn = open_db_readonly(&db_path)?;
+            if !schema_is_event_read_current(&conn)? {
+                return Err(Error {
+                    message: format!(
+                        "{} predates the session-event schema this version reads; \
+                         open it writable once (or run a sync) to migrate it",
+                        db_path.display()
+                    ),
+                });
+            }
         } else {
             let _ = open_db(&db_path)?;
         }
@@ -201,5 +219,75 @@ mod tests {
         assert_eq!(page.user_turns.len(), 1);
         assert_eq!(page.user_turns[0].blocks[0].byte_len, 5);
         assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn a_read_only_open_rejects_a_database_it_cannot_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        // A database written before the tool-result fidelity columns existed.
+        // A read-only handle never runs `init_db`, so without the check at
+        // `open` the store would hand back a handle whose first user-turn read
+        // dies inside a SELECT on `no such column: event_source`.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     message_id TEXT,
+                     ts_ms INTEGER NOT NULL,
+                     role TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     text TEXT,
+                     event_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, event_uid)
+                 );
+                 INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', 'm1', 10, 'user', 'text', 'hello', 'e1');",
+            )
+            .unwrap();
+        }
+
+        let refused = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            read_only: true,
+            ..StoreOptions::default()
+        });
+        let message = match refused {
+            Ok(_) => panic!("a read-only open cannot migrate, so it must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("predates the session-event schema"),
+            "the error names the mismatch: {message}",
+        );
+        assert!(
+            message.contains("writable"),
+            "the error names the remedy: {message}",
+        );
+
+        // The same database opened writable migrates and reads, so the refusal
+        // is about what a read-only handle can do, not about the database.
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let page = store
+            .session_user_turns_page(Source::Claude, "s1", 10, None)
+            .unwrap();
+        assert_eq!(page.user_turns.len(), 1);
+
+        // And a migrated database opens read-only, so the check does not
+        // simply refuse every read-only caller.
+        SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
     }
 }

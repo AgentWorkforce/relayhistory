@@ -162,6 +162,11 @@ archive relocation.
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
 
+A writable `SessionStore::open` migrates the database it opens; a read-only
+one cannot, so it refuses a database older than the shape this version reads
+and names the remedy, rather than handing back a store whose first read fails
+inside a query.
+
 No read operation invokes discovery or sync. A common cold start is:
 
 ```ts

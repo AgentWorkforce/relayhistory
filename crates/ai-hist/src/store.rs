@@ -2385,11 +2385,13 @@ pub struct SessionUserTurn {
     pub session_id: String,
     /// Provider message id the blocks share, when there is one.
     pub message_id: Option<String>,
-    /// The message recorded immediately before this turn began, and the one
-    /// recorded immediately after it, whichever side of the conversation each
-    /// came from. `None` at the ends of a session, and on a row whose
-    /// neighbour carried no provider message id. Blocks of this same turn are
-    /// never reported as its neighbours.
+    /// The nearest message recorded before this turn began, and the nearest
+    /// one recorded after it, whichever side of the conversation each came
+    /// from. `None` only when the session recorded no named message on that
+    /// side at all. An event the provider left unnamed is passed over rather
+    /// than nulling the field: it is not a message any consumer can reference,
+    /// and the named message behind it is still the one that borders this
+    /// turn. Blocks of this same turn are never reported as its neighbours.
     pub preceding_message_id: Option<String>,
     pub following_message_id: Option<String>,
     pub ts_ms: i64,
@@ -2443,8 +2445,10 @@ const USER_TURN_ROW_FILTER: &str =
 /// later blocks can never be reported as the message that follows it. The
 /// search is over every event of the session, not only user-side ones: what
 /// precedes a human turn is normally the assistant message it answers, which
-/// is the whole point of asking. A row carrying no provider message id is
-/// skipped rather than reported as an empty id.
+/// is the whole point of asking. A row the provider left unnamed cannot be
+/// the answer, so the search passes over it to the nearest row that can be --
+/// reporting `NULL` there would say "no message borders this turn" about a
+/// session that has one, and an empty id would be worse.
 const USER_TURN_NEIGHBOUR_SELECT: &str = "SELECT NULLIF(message_id, '') FROM session_events \
      WHERE source = ? AND session_id = ? AND NULLIF(message_id, '') IS NOT NULL";
 
@@ -3822,8 +3826,11 @@ mod tests {
         insert("a1", 1, "assistant", "e1");
         insert("m1", 2, "user", "e2");
         insert("m1", 3, "tool_result", "e3");
-        // A row carrying no message id cannot be named as a neighbour, so the
-        // search passes over it rather than reporting an empty id.
+        // An event the provider left unnamed cannot be the answer to "which
+        // message borders this turn", so the search passes over it to the one
+        // that can. Nulling the field there would report that nothing borders
+        // the turn, which is false of this session, and an empty id would be
+        // worse still.
         insert("", 4, "assistant", "e4");
         insert("a2", 5, "assistant", "e5");
         insert("m2", 6, "user", "e6");
