@@ -1329,6 +1329,21 @@ impl SyncTick {
     }
 }
 
+/// How the watch loop reads a sweep's result.
+///
+/// One conversion rather than one per caller: a tick that never took the lock
+/// looked at nothing, and a caller that folded that into `skipped_unchanged`
+/// would be telling the loop the change had been considered and dismissed.
+impl From<SyncTick> for crate::watch::TickOutcome {
+    fn from(tick: SyncTick) -> Self {
+        Self {
+            swept: tick.swept,
+            skipped_unchanged: tick.skipped_unchanged(),
+            contended: !tick.attempted,
+        }
+    }
+}
+
 pub(crate) fn sync_exclusive_with_home(
     db_path: &Path,
     home: &Path,
@@ -5653,6 +5668,48 @@ mod tests {
             super::DecodedFileCursor::Typed(cursor) => cursor,
             super::DecodedFileCursor::Legacy(_) => panic!("expected typed cursor"),
         }
+    }
+
+    /// A sweep that never took the lock is not a sweep that found nothing.
+    /// Reading it as `skipped_unchanged` is what told the watch loop the
+    /// change had been considered.
+    #[test]
+    fn a_contended_tick_is_not_an_unchanged_one() {
+        use crate::watch::TickOutcome;
+
+        assert_eq!(
+            TickOutcome::from(SyncTick::default()),
+            TickOutcome {
+                swept: false,
+                skipped_unchanged: false,
+                contended: true,
+            },
+            "the lock was held elsewhere: nothing was read and nothing compared"
+        );
+        assert_eq!(
+            TickOutcome::from(SyncTick {
+                attempted: true,
+                swept: false,
+            }),
+            TickOutcome {
+                swept: false,
+                skipped_unchanged: true,
+                contended: false,
+            },
+            "the sweep ran and no source had moved"
+        );
+        assert_eq!(
+            TickOutcome::from(SyncTick {
+                attempted: true,
+                swept: true,
+            }),
+            TickOutcome {
+                swept: true,
+                skipped_unchanged: false,
+                contended: false,
+            },
+            "the sweep ran and walked"
+        );
     }
 
     #[test]

@@ -2169,10 +2169,7 @@ fn watch_loop_with_connectors(
     let connectors = connectors.clone();
     let tick: ai_hist::watch::TickFn = Arc::new(move |force| {
         let tick = sync_tick_at(&db, scope, &connectors, SyncOutput::Progress, force)?;
-        Ok(ai_hist::watch::TickOutcome {
-            swept: tick.swept,
-            skipped_unchanged: tick.skipped_unchanged(),
-        })
+        Ok(ai_hist::watch::TickOutcome::from(tick))
     });
     let mut watch = ai_hist::watch::WatchLoop::new(tick)
         .with_roots(roots)

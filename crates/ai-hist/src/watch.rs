@@ -54,6 +54,15 @@ use crate::discover::{self, WatchDepth, WatchRoot};
 /// until it is attached again.
 const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
 
+/// How soon a forced sweep that could not take the store's lock is tried
+/// again, before backing off.
+///
+/// Short, because the usual holder is a manual `sync` that is about to finish
+/// and the change is still owed; backed off from there so a long-running
+/// holder is not asked four times a second for minutes — the retry is a
+/// `try_lock` and a return, but it is also a log line each time.
+const CONTENDED_SWEEP_RETRY_MS: u64 = 250;
+
 /// The longest any configurable interval may be.
 ///
 /// `Instant + Duration` panics when the sum is not representable, and every
@@ -172,6 +181,17 @@ pub struct TickOutcome {
     pub swept: bool,
     /// The sweep was skipped because the source fingerprint was unchanged.
     pub skipped_unchanged: bool,
+    /// The sweep could not run at all: another process held the store's sync
+    /// lock, so nothing was read and nothing was compared.
+    ///
+    /// Distinct from `skipped_unchanged`, and the distinction is the whole
+    /// point: "no source moved" is an answer about the change this tick was
+    /// for, and this is the absence of one. The lock holder is no guarantee
+    /// of cover — its own source walk may already be past the provider that
+    /// just wrote — so a *forced* tick that comes back this way leaves the
+    /// change it was for still owed, and the loop retries it rather than
+    /// counting it done.
+    pub contended: bool,
 }
 
 /// One tick, as handed to [`WatchLoop::on_report`].
@@ -430,11 +450,16 @@ impl WatchInner {
     /// instead, and [`InFlight::drop`] re-posts it the moment the run in
     /// flight finishes. Repeats coalesce into the one bit, so a busy tree
     /// during a long manual sweep costs one sweep afterwards.
-    fn run_skip_if_busy(&self, trigger: TickTrigger) {
+    /// Returns whether a *forced* sweep is still owed: the tick ran, and came
+    /// back saying it never took the store's lock, so nothing looked at the
+    /// change it was for. A tick that could not have the slot returns `false`
+    /// — that change is remembered as `deferred_force` and re-posted by
+    /// [`InFlight::drop`], which is the same promise by another route.
+    fn run_skip_if_busy(&self, trigger: TickTrigger) -> bool {
         let Some(guard) = self.claim_or_defer(trigger) else {
-            return;
+            return false;
         };
-        self.run_claimed(trigger, guard);
+        self.run_claimed(trigger, guard)
     }
 
     /// Claim the in-flight slot, or remember a forced trigger that could not
@@ -462,7 +487,9 @@ impl WatchInner {
             }
         };
         match join_target {
-            None => self.run_claimed(trigger, InFlight { inner: self }),
+            None => {
+                self.run_claimed(trigger, InFlight { inner: self });
+            }
             Some(target) => {
                 let mut run = self.run.lock().expect("watch run state");
                 while run.completed < target {
@@ -472,10 +499,16 @@ impl WatchInner {
         }
     }
 
-    fn run_claimed(&self, trigger: TickTrigger, guard: InFlight<'_>) {
+    fn run_claimed(&self, trigger: TickTrigger, guard: InFlight<'_>) -> bool {
         let forced = trigger.forces_scan();
+        let mut owed = false;
         match (self.tick)(forced) {
             Ok(outcome) => {
+                // Only a forced tick is owed anything: a backstop tick that
+                // found the store busy is covered by the next backstop, while
+                // a forced one is standing in for a change nothing else knows
+                // about.
+                owed = forced && outcome.contended;
                 if let Some(sink) = &self.on_report {
                     sink(&TickReport {
                         trigger,
@@ -493,6 +526,7 @@ impl WatchInner {
             }
         }
         drop(guard);
+        owed
     }
 
     fn wait_for_idle(&self) {
@@ -696,6 +730,10 @@ impl WatchLoop {
         // now is a root whose writes are invisible now.
         let mut next_refresh = deadline_after(Instant::now(), self.slow_poll_ms);
         let mut next_check = next_refresh;
+        // A forced sweep the store's lock turned away, and how long to wait
+        // before asking again.
+        let mut retry_force: Option<Instant> = None;
+        let mut retry_backoff = CONTENDED_SWEEP_RETRY_MS;
         while !self.inner.stopped() {
             let sweep_every = match self.current_driver() {
                 WatchDriver::FsEvents => self.slow_poll_ms,
@@ -727,7 +765,14 @@ impl WatchLoop {
             };
             let check_every = self.check_cadence(watcher.as_ref(), refresh_every);
             let woke_early = refresh_every.min(check_every) < sweep_every;
-            let idle = Duration::from_millis(sweep_every.min(refresh_every).min(check_every));
+            let mut idle = Duration::from_millis(sweep_every.min(refresh_every).min(check_every));
+            if let Some(at) = retry_force {
+                // A change whose sweep never ran. Nothing else will bring the
+                // loop back for it: the wake state was cleared when its
+                // debounce window opened, so without this the next visit is
+                // the backstop, up to `--interval` away.
+                idle = idle.min(at.saturating_duration_since(Instant::now()));
+            }
             let Some(trigger) = self.inner.wait_for_wake(idle, debounce) else {
                 break;
             };
@@ -803,6 +848,17 @@ impl WatchLoop {
                 // was the whole of this wake.
                 continue;
             }
+            // A sweep the store's lock turned away comes back as the forced
+            // tick it was, not as the backstop tick this wake would otherwise
+            // have been: the change it is standing in for is still unread, so
+            // the fingerprint it would be compared against still cannot be
+            // trusted.
+            let trigger = if retry_force.is_some_and(|at| Instant::now() >= at) {
+                retry_force = None;
+                TickTrigger::FsEvent
+            } else {
+                trigger
+            };
             if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
                 // wait was deliberately shortened above, so a loop that was
@@ -812,7 +868,20 @@ impl WatchLoop {
                 }
                 last_poll_sweep = std::time::Instant::now();
             }
-            self.inner.run_skip_if_busy(trigger);
+            if self.inner.run_skip_if_busy(trigger) {
+                // Still owed, and the holder may be there for a while. Repeats
+                // coalesce into the one deadline, so a busy tree under a long
+                // sync costs one retry per window rather than one per event.
+                retry_force = Some(deadline_after(Instant::now(), retry_backoff));
+                retry_backoff = retry_backoff
+                    .saturating_mul(2)
+                    .min(self.slow_poll_ms.max(CONTENDED_SWEEP_RETRY_MS));
+            } else if trigger.forces_scan() {
+                // A forced sweep got through. Whatever was owed is paid, and
+                // the next contention starts from the short cadence again.
+                retry_force = None;
+                retry_backoff = CONTENDED_SWEEP_RETRY_MS;
+            }
         }
         let driver = self.current_driver();
         drop(watcher);

@@ -46,6 +46,12 @@ fs2 = "0.4"
 [dev-dependencies]
 tempfile = "3"
 
+# Already a dependency of the crate on every platform; declared here too so the
+# live-capture suite can take the sync path's advisory lock from a second
+# handle, which is the only way to test a contended sweep honestly.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "delivery_worker"
 required-features = ["delivery", "unstable-internal"]

@@ -123,6 +123,14 @@ added to an instant panics on a platform that cannot represent the sum, and a
 `--debounce-ms` in the billions would otherwise stop capture at the first
 change event with no sign that anything was wrong.
 
+A tick that cannot take the store's sync lock has not decided anything about
+the change that drove it. Another `ai-hist sync` holding the lock is no
+guarantee of cover, because its own source walk may already be past the
+provider that just wrote — and a transcript written and cleaned up inside that
+window would never be read. Such a sweep is retried 250 ms later and backs off
+towards the backstop while the lock stays held; repeated events coalesce into
+the one retry, and a sweep that gets through clears it.
+
 A root given relatively — `TRAJECTORY_ROOT=trajectory.json` — is resolved
 against the working directory when it is built, and every event path is put
 through the same resolution before it is matched. Both sides then hold one

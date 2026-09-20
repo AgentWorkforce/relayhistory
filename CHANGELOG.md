@@ -32,7 +32,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   reached through a symlink matches the events the watcher reports for it on
   either backend. A change arriving while a manual `tick()` holds the sweep
   slot is swept as soon as that tick finishes, rather than waiting for the
-  backstop.
+  backstop. A sweep another process's sync lock turned away is likewise kept
+  rather than counted as done: the lock holder may already have walked past
+  the provider that just wrote, so the forced sweep is retried 250 ms later,
+  backing off to the backstop while the lock stays held, and the change is
+  swept as soon as a sync can take it.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not

@@ -1732,6 +1732,135 @@ fn a_registration_lost_inside_the_debounce_window_is_put_back_before_the_sweep()
     );
 }
 
+/// A sweep another process's sync lock turned away is not a completed tick.
+///
+/// `sync_exclusive_with_home` returns `SyncTick::default()` when it cannot
+/// take the lock — `attempted: false`, `swept: false` — and a loop that reads
+/// that as "ran, nothing to do" consumes the filesystem event with it. The
+/// lock holder is no guarantee of cover: a manual `ai-hist sync` that has
+/// already walked past `~/.claude/projects` holds the lock while a session
+/// writes there, and a short-lived transcript is removed again long before the
+/// 30 s backstop. Nothing ever reads it.
+///
+/// End to end, because the shape of this bug is that every layer reports
+/// success: a real sync against a real database, the real advisory lock held
+/// from a second handle the way a concurrent sync holds it, and a real
+/// watcher event.
+#[cfg(all(feature = "fs-events", unix))]
+#[test]
+fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
+    use std::os::unix::io::AsRawFd;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = home.path().join("history.db");
+    let root = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&root).expect("the provider root");
+
+    // The lock the sync path takes, held here from a second handle.
+    let lock_path = home.path().join("history.db.sync.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open the sync lock");
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the test must be able to hold the sync lock"
+    );
+
+    let (ticks, ticks_rx) = mpsc::channel();
+    let tick: TickFn = {
+        let db = db.clone();
+        let home = home.path().to_path_buf();
+        Arc::new(move |force| {
+            // Exactly what the CLI's watch tick does.
+            let tick = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)?;
+            let _ = ticks.send(tick);
+            Ok(ai_hist::watch::TickOutcome::from(tick))
+        })
+    };
+    let running = RunningLoop::start(
+        {
+            let root = root.clone();
+            move |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(true)
+                    .with_roots(vec![ai_hist::discover::WatchRoot::tree(root)])
+                    .with_debounce_ms(100)
+                    // Ten minutes each: any sweep after the lock is released
+                    // can only have come from the retry.
+                    .with_poll_interval_ms(600_000)
+                    .with_slow_poll_ms(600_000)
+            }
+        },
+        tick,
+    );
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // A session writes while the other sync holds the lock.
+    write_claude_transcript(home.path(), "proj", "contended-session", 2);
+    let first = ticks_rx
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the write drove no sweep at all");
+    assert_eq!(
+        (first.attempted, first.swept),
+        (false, false),
+        "the positive control on the lock: the sweep this event drove was turned away"
+    );
+    assert!(
+        !db.exists(),
+        "a turned-away sweep must not have touched the database"
+    );
+
+    // The other sync finishes. Nothing else can wake the loop now: both
+    // intervals are ten minutes away.
+    drop(held);
+
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match ticks_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(tick) if tick.attempted => break,
+            _ => assert!(
+                std::time::Instant::now() < deadline,
+                "the change was consumed by the sweep that never ran: no sweep \
+                 was retried once the lock was free"
+            ),
+        }
+    }
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while catalog_session_count(&db, "claude", "contended-session") != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retried sweep did not ingest the transcript written under the lock"
+        );
+        std::thread::yield_now();
+    }
+
+    // Control: with the lock free, one event is still one sweep — the retry
+    // is for a sweep that did not happen, not an extra one for every sweep
+    // that did.
+    while ticks_rx.recv_timeout(Duration::from_millis(600)).is_ok() {}
+    write_claude_transcript(home.path(), "proj", "free-session", 2);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while catalog_session_count(&db, "claude", "free-session") != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a write with the lock free must be swept as it always was"
+        );
+        std::thread::yield_now();
+    }
+    while ticks_rx.recv_timeout(Duration::from_millis(600)).is_ok() {}
+    assert_eq!(
+        ticks_rx.recv_timeout(Duration::from_millis(1_500)),
+        Err(RecvTimeoutError::Timeout),
+        "a sweep that ran must not be retried"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
