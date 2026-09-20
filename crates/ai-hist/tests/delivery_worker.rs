@@ -742,13 +742,20 @@ fn a_validation_blocked_past_the_deadline_is_refused_not_dated_from_before_it() 
     let lease_ms = 100;
     let hold = Duration::from_millis(lease_ms as u64 * 6);
     let claim = prepare_and_claim(&fixture.conn, &job.job_id, lease_ms);
+    // The setup is dated from the claim itself, not from the wall clock: on a
+    // loaded runner the few statements between claiming and persisting can
+    // outlast a 100 ms lease, and the store would then be refused for a
+    // reason this test is not about. The liveness under test is the one the
+    // validator reads inside the lock below, and that one stays on the wall
+    // clock.
+    let claimed_at = claim.lease.expires_at_ms - lease_ms;
     store_prepared_payload(
         &fixture.conn,
         &claim.lease,
         &claim.batch.mapping_version,
         "application/json",
         &serde_json::to_string(&claim.batch).unwrap(),
-        &system_clock,
+        &|| claimed_at,
     )
     .expect("a live lease persists its payload");
 
@@ -774,6 +781,12 @@ fn a_validation_blocked_past_the_deadline_is_refused_not_dated_from_before_it() 
         refused.to_string().contains("expired before dispatch"),
         "unexpected refusal: {refused}"
     );
+    // Positive control: nothing but the clock reading refused it. Dated from
+    // the claim, the same lease still validates, so the refusal above came
+    // from reading the clock inside the lock and not from any other change
+    // to the lease.
+    validate_dispatch(&validator, &claim.lease, &|| claimed_at)
+        .expect("the lease is refused only by a clock read after the wait");
 }
 
 #[test]
