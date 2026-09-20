@@ -4457,6 +4457,7 @@ fn ingest_grok_session(
     }
 
     ingest_grok_session_extras(conn, session, &mut outcome)?;
+    refresh_grok_incoming_relationships(conn, sid)?;
 
     upsert_session(
         conn,
@@ -4514,6 +4515,25 @@ fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<
     ] {
         conn.execute(statement, params![session_id])?;
     }
+    Ok(())
+}
+
+/// Tell this session's parents whether it is addressable yet.
+///
+/// A parent's `subagents/` directory can be read before its child has ever
+/// been indexed — sync walks the store in whatever order the filesystem hands
+/// it back, and the child may not even exist on disk yet. The edge is recorded
+/// then with `child_has_events = 0`, and nothing would ever correct it,
+/// because refreshing it requires re-reading the *parent*. So the child does
+/// it when it is indexed, in both directions: a session whose events were
+/// replaced by a read that produced none says so too.
+fn refresh_grok_incoming_relationships(conn: &Connection, session_id: &str) -> Result<()> {
+    let has_events = session_events_exist(conn, "grok", session_id)?;
+    conn.execute(
+        "UPDATE session_relationships SET child_has_events = ?, updated_ms = ? \
+         WHERE source = 'grok' AND child_session_id = ? AND child_has_events <> ?",
+        params![has_events, now_ms(), session_id, has_events],
+    )?;
     Ok(())
 }
 
@@ -4597,7 +4617,14 @@ fn ingest_grok_session_extras(
                 evidence_kind: "grok_subagent_dir",
                 evidence_locator: Some(&subagent.locator),
                 evidence_ref: None,
-                child_has_events: false,
+                // Whether the child is addressable is a fact about the child,
+                // not a default. `session_tree` reads this stored flag rather
+                // than probing, so a hard-coded `false` renders an indexed
+                // child as an empty node.
+                child_has_events: match subagent.metadata.child_session_id.as_deref() {
+                    Some(child) => session_events_exist(conn, SOURCE, child)?,
+                    None => false,
+                },
                 spawned_at_ms: subagent.metadata.spawned_at_ms,
             },
         )?;
@@ -4669,7 +4696,7 @@ fn truncate_marker_text(text: &str) -> String {
 }
 
 fn grok_session_stamp(chat: &Path) -> Result<String> {
-    Ok(grok_source_stamp(chat)?.0)
+    Ok(grok_source_inventory(chat)?.stamp)
 }
 
 /// The files beside `chat_history.jsonl` that get their own readable marker in
@@ -4688,7 +4715,29 @@ const GROK_DIGESTED_DIRECTORIES: &[&str] = &["compaction_checkpoints", "subagent
 
 /// [`grok_session_stamp`] plus the recency hint, with one stat per file.
 pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Option<i64>)> {
-    grok_source_stamp(chat)
+    let inventory = grok_source_inventory(chat)?;
+    Ok((inventory.stamp, inventory.modified_ms))
+}
+
+/// What one Grok session directory holds, as the numbers a hydration reports.
+///
+/// `bytes` and `records` describe **everything the read consumes**, not just
+/// the transcript: a 10 KB `chat_history.jsonl` beside a 2 MB `updates.jsonl`
+/// is a 2 MB read, and reporting 10 KB of it understates the work by two
+/// orders of magnitude in `HYDRATION_METRICS` and in the stored checkpoint.
+pub(crate) struct GrokSourceInventory {
+    pub stamp: String,
+    pub modified_ms: Option<i64>,
+    pub bytes: i64,
+    /// One per complete JSONL record in `chat_history.jsonl` and
+    /// `updates.jsonl`, plus **one per whole-file JSON sidecar** —
+    /// `summary.json`, `signals.json`, `prompt_context.json`, and each
+    /// `compaction_checkpoints/` and `subagents/` entry. A sidecar is one
+    /// document: the read either parsed it or did not, and counting it as
+    /// zero would make a directory of fifty checkpoints look like no work at
+    /// all. A `.jsonl` entry inside those directories is counted by record,
+    /// as the older Grok layout writes subagent transcripts that way.
+    pub records: i64,
 }
 
 /// The change stamp of one Grok session directory, over **every** file its
@@ -4703,7 +4752,11 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
 ///
 /// The two directories are listed, not stat-ed: a directory's own mtime moves
 /// when an entry is added or removed, but not when an entry's contents change.
-fn grok_source_stamp(chat: &Path) -> Result<(String, Option<i64>)> {
+///
+/// The same walk produces the stamp and the byte and record counts, so the
+/// numbers a hydration reports can never describe a different set of files
+/// from the one its change stamp covers.
+pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> {
     let metadata = chat.metadata()?;
     anyhow::ensure!(
         metadata.is_file(),
@@ -4712,13 +4765,16 @@ fn grok_source_stamp(chat: &Path) -> Result<(String, Option<i64>)> {
     );
     let mut stamp = stamp_of(&metadata);
     let mut modified = modified_ms_of(&metadata);
+    let mut bytes = metadata.len() as i64;
+    let mut records = hydrate::complete_jsonl_records(chat)?;
     let freshen = |candidate: Option<i64>, modified: &mut Option<i64>| {
         if let Some(candidate) = candidate {
             *modified = Some(modified.map_or(candidate, |current| current.max(candidate)));
         }
     };
-    for sibling in GROK_STAMPED_SIBLINGS {
-        let Ok(sibling) = chat.with_file_name(sibling).metadata() else {
+    for name in GROK_STAMPED_SIBLINGS {
+        let path = chat.with_file_name(name);
+        let Ok(sibling) = path.metadata() else {
             continue;
         };
         stamp.push('|');
@@ -4726,14 +4782,19 @@ fn grok_source_stamp(chat: &Path) -> Result<(String, Option<i64>)> {
         // `updates.jsonl` is appended on every turn, so it — not the
         // transcript — is usually the freshest signal of activity.
         freshen(modified_ms_of(&sibling), &mut modified);
+        bytes += sibling.len() as i64;
+        records += grok_record_count(&path)?;
     }
     let mut digest = Sha256::new();
     for sibling in GROK_DIGESTED_SIBLINGS {
-        let Ok(found) = chat.with_file_name(sibling).metadata() else {
+        let path = chat.with_file_name(sibling);
+        let Ok(found) = path.metadata() else {
             continue;
         };
         digest.update(format!("{sibling}={}\n", stamp_of(&found)));
         freshen(modified_ms_of(&found), &mut modified);
+        bytes += found.len() as i64;
+        records += grok_record_count(&path)?;
     }
     for directory in GROK_DIGESTED_DIRECTORIES {
         // Sorted, so the digest describes the directory's contents rather than
@@ -4750,13 +4811,30 @@ fn grok_source_stamp(chat: &Path) -> Result<(String, Option<i64>)> {
                 .unwrap_or_default();
             digest.update(format!("{directory}/{name}={}\n", stamp_of(&found)));
             freshen(modified_ms_of(&found), &mut modified);
+            bytes += found.len() as i64;
+            records += grok_record_count(&entry)?;
         }
     }
     // Sixteen hex characters of SHA-256: enough that two different sets of
     // extra files colliding is not a failure mode worth designing against,
     // short enough that the stamp stays readable in a diagnostic.
     stamp.push_str(&format!("|x:{:.16}", format!("{:x}", digest.finalize())));
-    Ok((stamp, modified))
+    Ok(GrokSourceInventory {
+        stamp,
+        modified_ms: modified,
+        bytes,
+        records,
+    })
+}
+
+/// How many records one file in a Grok session directory contributes: its
+/// complete JSONL records, or one, for a whole-file JSON document.
+fn grok_record_count(path: &Path) -> Result<i64> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+        hydrate::complete_jsonl_records(path)
+    } else {
+        Ok(1)
+    }
 }
 
 /// One `compaction_checkpoints/` entry.

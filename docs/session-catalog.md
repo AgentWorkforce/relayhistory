@@ -524,6 +524,19 @@ How each adapter works:
   checkpoint written before those were persisted has none stored, and the usage
   caveat is rebuilt from the stored `token_json` instead.
 
+  A hydration's `source_bytes` and `records_parsed` describe the whole
+  directory, not the transcript: an `updates.jsonl` is routinely the largest
+  file in a busy session, and reporting the transcript alone understates the
+  read by orders of magnitude. Records are the complete JSONL records of
+  `chat_history.jsonl` and `updates.jsonl`, plus **one per whole-file JSON
+  sidecar** — `summary.json`, `signals.json`, `prompt_context.json` and each
+  `compaction_checkpoints/` and `subagents/` entry — because a sidecar is one
+  document, and counting it as zero would make a directory of fifty
+  checkpoints look like no work at all. A `.jsonl` entry inside those
+  directories is counted by record, as the older layout writes subagent
+  transcripts that way. The same directory walk produces the numbers and the
+  change stamp, so the two can never describe different sets of files.
+
   ### Delegation
 
   `relationship_capabilities("grok").stableChildIdentity` is **`sometimes`**,
@@ -533,6 +546,13 @@ How each adapter works:
   child id is never taken from the file name. A `Task`-style call in the
   transcript names no child at all — it is a `tool_calls` row, reported as
   `GROK_SUBAGENT_SPAWN_UNLINKED`, and it never invents a relationship row.
+
+  A linked edge records whether the child is **addressable** —
+  `child_has_events`, which `session_tree` reads rather than probing — and
+  that is a fact about the child, read from its indexed events. Because a
+  parent can be read before its child exists in the index at all, indexing a
+  Grok session also refreshes the edges that point *at* it, in both
+  directions.
 
   ### Verification status
 

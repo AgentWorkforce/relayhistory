@@ -1127,12 +1127,18 @@ fn source_snapshot(
         ));
     }
     validate_provider_path(&options.source, &path, home)?;
-    let mut bytes = path.metadata()?.len() as i64;
-    let mut records = complete_jsonl_records(&path)?;
-    let mut stamp = if options.source == "grok" {
-        grok_session_stamp(&path)?
+    // Grok's source is a directory, not a file: one inventory produces its
+    // stamp, its byte total and its record total together, so the metrics can
+    // never describe a different set of files from the change stamp.
+    let (mut bytes, mut records, mut stamp) = if options.source == "grok" {
+        let inventory = grok_source_inventory(&path)?;
+        (inventory.bytes, inventory.records, inventory.stamp)
     } else {
-        file_stamp(&path)?
+        (
+            path.metadata()?.len() as i64,
+            complete_jsonl_records(&path)?,
+            file_stamp(&path)?,
+        )
     };
     let mut subagents = Vec::new();
     if options.source == "claude" && options.include_related {
@@ -1195,7 +1201,7 @@ fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> 
     Ok(())
 }
 
-fn complete_jsonl_records(path: &Path) -> Result<i64> {
+pub(crate) fn complete_jsonl_records(path: &Path) -> Result<i64> {
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut records = 0;
     let mut line = String::new();
@@ -2905,6 +2911,179 @@ mod tests {
             "{:?}",
             result.diagnostics
         );
+    }
+
+    /// Write a minimal Grok session directory and answer with its transcript.
+    fn grok_session_dir(
+        home: &Path,
+        session_id: &str,
+        prompt: &str,
+        subagent: Option<&str>,
+    ) -> PathBuf {
+        let dir = home.join(".grok/sessions/%2Ftmp%2Ftree").join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let chat = dir.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            format!("{{\"type\":\"user\",\"content\":\"{prompt}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            format!(
+                r#"{{"info":{{"id":"{session_id}","cwd":"/tmp/tree"}},"created_at":"2026-09-16T12:00:00.000Z"}}"#
+            ),
+        )
+        .unwrap();
+        if let Some(child) = subagent {
+            fs::create_dir_all(dir.join("subagents")).unwrap();
+            fs::write(
+                dir.join("subagents/child.json"),
+                format!(r#"{{"session_id":"{child}","agent_type":"reviewer"}}"#),
+            )
+            .unwrap();
+        }
+        chat
+    }
+
+    fn child_has_events(conn: &Connection, parent: &str) -> bool {
+        conn.query_row(
+            "SELECT child_has_events FROM session_relationships \
+             WHERE source = 'grok' AND parent_session_id = ?",
+            params![parent],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn tree_child_has_events(conn: &Connection, parent: &str) -> bool {
+        let tree = crate::relationships::session_tree(
+            conn,
+            "grok",
+            parent,
+            &crate::relationships::SessionTreeOptions::default(),
+        )
+        .unwrap();
+        tree.nodes
+            .iter()
+            .find(|node| node.depth == 1)
+            .expect("the child node")
+            .has_events
+    }
+
+    /// `session_tree` reads the stored `child_has_events` rather than probing,
+    /// so recording it as a constant renders an indexed child as an empty
+    /// node. It has to be true of the child, in whichever order the two
+    /// sessions are read.
+    #[test]
+    fn a_grok_child_that_has_events_is_recorded_as_having_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = grok_session_dir(dir.path(), "grok-b", "child work", None);
+        let parent = grok_session_dir(dir.path(), "grok-a", "parent work", Some("grok-b"));
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-b", Some(&child));
+        catalog_row(&conn, "grok", "grok-a", Some(&parent));
+        drop(conn);
+
+        // Child first: the parent's read can see it already has events.
+        hydrate_session_at_with_home(&db, &options("grok", "grok-b"), dir.path()).unwrap();
+        hydrate_session_at_with_home(&db, &options("grok", "grok-a"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert!(child_has_events(&conn, "grok-a"));
+        assert!(tree_child_has_events(&conn, "grok-a"));
+    }
+
+    /// The other order, which is the one sync produces about half the time:
+    /// the parent is read before the child exists in the index at all.
+    #[test]
+    fn indexing_a_grok_child_later_tells_its_parent_it_is_addressable() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = grok_session_dir(dir.path(), "grok-b", "child work", None);
+        let parent = grok_session_dir(dir.path(), "grok-a", "parent work", Some("grok-b"));
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-b", Some(&child));
+        catalog_row(&conn, "grok", "grok-a", Some(&parent));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-a"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        // The positive control: before the child is indexed the answer is
+        // honestly `false`, so the assertion below is not vacuous.
+        assert!(!child_has_events(&conn, "grok-a"));
+        assert!(!tree_child_has_events(&conn, "grok-a"));
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-b"), dir.path()).unwrap();
+        assert!(child_has_events(&conn, "grok-a"));
+        assert!(tree_child_has_events(&conn, "grok-a"));
+    }
+
+    /// The numbers a hydration reports have to describe the read it did. Grok
+    /// reads a directory, and its update stream is routinely the largest file
+    /// in it.
+    #[test]
+    fn grok_hydration_metrics_cover_every_file_the_read_consumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let session_dir = chat.parent().unwrap().to_path_buf();
+        let updates = session_dir.join("updates.jsonl");
+        let transcript_bytes = fs::metadata(&chat).unwrap().len() as i64;
+        // A stream far larger than the transcript, as a busy session has.
+        let padded = fs::read_to_string(&updates).unwrap().repeat(64);
+        fs::write(&updates, &padded).unwrap();
+        let stream_bytes = fs::metadata(&updates).unwrap().len() as i64;
+        assert!(
+            stream_bytes > transcript_bytes * 8,
+            "the fixture must make the stream dominate: {stream_bytes} vs {transcript_bytes}"
+        );
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        let metrics = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "HYDRATION_METRICS")
+            .expect("the metrics diagnostic");
+        let bytes = metrics.source_bytes.unwrap();
+        let records = metrics.records_parsed.unwrap();
+        assert!(
+            bytes >= transcript_bytes + stream_bytes,
+            "{bytes} must cover the transcript ({transcript_bytes}) and the stream ({stream_bytes})"
+        );
+        // …and the sidecars on top of those two.
+        let mut expected = transcript_bytes + stream_bytes;
+        for name in ["summary.json", "signals.json", "prompt_context.json"] {
+            expected += fs::metadata(session_dir.join(name)).unwrap().len() as i64;
+        }
+        expected += fs::metadata(session_dir.join("compaction_checkpoints/1789560090000.json"))
+            .unwrap()
+            .len() as i64;
+        expected += fs::metadata(session_dir.join("subagents/agent-review.json"))
+            .unwrap()
+            .len() as i64;
+        assert_eq!(bytes, expected);
+        // 17 transcript records + 16*64 stream records + one per JSON
+        // sidecar: summary, signals, prompt context, one checkpoint, one
+        // subagent entry.
+        assert_eq!(records, 17 + 16 * 64 + 5);
+        // The checkpoint stores the same numbers the diagnostic reported.
+        let conn = open_db(&db).unwrap();
+        let stored: (i64, i64) = conn
+            .query_row(
+                "SELECT source_bytes, records_parsed FROM session_hydration_checkpoints \
+                 WHERE source = 'grok' AND session_id = 'grok-evt-0001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (bytes, records));
     }
 
     /// A relationship recorded by somebody else about this session is not this
