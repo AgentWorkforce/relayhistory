@@ -425,6 +425,7 @@ INSERT INTO session_commit_links(source,session_id,repo,commit_sha,match_method,
 INSERT INTO trajectories(id,decisions_json,retrospective_json,search_text,updated_ms,timestamp_ms) VALUES('traj','[]','{}','',1,1);
 INSERT INTO session_observations(source,session_id,location,connector_id,connector_instance,raw_locator,source_stamp,updated_ms) VALUES('codex','s','remote','fixture','account','fixture://s','v1',1);
 INSERT INTO observation_evidence(source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json) VALUES('codex','s','remote','fixture','account','record','{ "events": [] }');
+INSERT INTO session_markers(source,session_id,marker_uid,kind,ts_ms,text,detail_json) VALUES('codex','s','c0','compaction_boundary',1,'compacted','{ "checkpoint": 1 }');
 "#).unwrap();
     event(&conn, "a", "event");
     let mut cfg = config("all");
@@ -448,6 +449,14 @@ INSERT INTO observation_evidence(source,session_id,location,connector_id,connect
         r#"{ "events": [] }"#
     );
     assert_eq!(by_kind["history"].payload["git_branch"], "main");
+    assert_eq!(
+        by_kind["session_marker"].payload["kind"],
+        "compaction_boundary"
+    );
+    assert_eq!(
+        by_kind["session_marker"].payload["detail_json"],
+        r#"{ "checkpoint": 1 }"#
+    );
     assert!(records
         .iter()
         .all(|r| r.schema_version == 1 && !r.origin_id.is_empty()));
