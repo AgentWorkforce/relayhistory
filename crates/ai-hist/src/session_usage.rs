@@ -54,6 +54,12 @@ pub const SESSION_USAGE_CONTRACT_VERSION: u32 = 1;
 /// into two ids matching nothing, so the request lost the tool calls keyed on
 /// it.
 ///
+/// The view pins the session-scoped page index. The continuity index also
+/// starts with `source` and filters out null message ids, so SQLite can prefer
+/// it for small or unanalyzed databases even though it cannot bound the read
+/// to one session. Every supported request read supplies both source and
+/// session, making the page index the correct access path.
+///
 /// `usage_variants` counts the *distinct* non-null `token_json` blobs in a
 /// group. Claude copies the same blob onto every record of one request, so
 /// the expected value is 1; anything higher means the copies disagree and the
@@ -84,7 +90,7 @@ SELECT
     COUNT(DISTINCT e.token_json) AS usage_variants,
     MAX(e.kind = 'thinking') AS has_thinking,
     COUNT(*) AS event_count
-FROM session_events e
+FROM session_events e INDEXED BY idx_session_events_source_page
 WHERE e.role = 'assistant'
   AND e.message_id IS NOT NULL
   AND e.message_id <> ''
