@@ -6982,6 +6982,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_function_outputs_are_not_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-2026-04-21T00-00-00-sess_turns.jsonl");
+        // Codex records the human message and each function output as separate
+        // response items, and an output's `message_id` is its own item id. It
+        // is not a block on the user's message and never was, so a rollout
+        // with one prompt and three outputs is one user turn, not four.
+        let lines = [
+            r#"{"timestamp":"2026-04-21T00:00:00.000Z","type":"session_meta","payload":{"id":"sess_turns","cwd":"/tmp/project"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the build"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"c1"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fo_1","call_id":"c1","output":"one"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fo_2","call_id":"c2","output":"two"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fo_3","call_id":"c3","output":"three"}}"#.to_string(),
+            r#"{"timestamp":"2026-04-21T00:00:06.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#.to_string(),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        // The outputs are still indexed as tool results with their facts; they
+        // are simply not user turns.
+        assert_eq!(tool_results(&conn, "codex", "sess_turns").len(), 3);
+
+        let page = crate::session_user_turns_page(&conn, "codex", "sess_turns", 100, None).unwrap();
+        assert_eq!(
+            page.user_turns.len(),
+            1,
+            "one prompt is one user turn: {:?}",
+            page.user_turns,
+        );
+        let turn = &page.user_turns[0];
+        assert_eq!(turn.blocks.len(), 1);
+        assert_eq!(turn.blocks[0].kind, "text");
+        assert_eq!(turn.blocks[0].byte_len, "fix the build".len() as i64);
+    }
+
+    #[test]
     fn a_contributed_row_without_fidelity_does_not_re_read_the_local_transcript_forever() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sess-shared.jsonl");

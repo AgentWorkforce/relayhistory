@@ -671,10 +671,15 @@ discoverable".
   each turn's blocks — run inside one deferred read transaction, so a sync
   writing concurrently cannot hand back a header whose blocks have moved or
   vanished behind a cursor that already advanced past it.
-  A turn is what arrived on one user message;
-  harness lines stored as tool results — Claude subagent notifications — are
-  not turns and are excluded, because grouping on `role` alone would invent a
-  turn that is neither human text nor an in-message result. `approxTokens` is deliberately absent: every
+  A turn is what arrived on one user message.
+  Membership is asserted through `event_source`, never inferred from `role`:
+  only `tool_result` means "a block inside a message". A Claude subagent
+  notification and a Codex `function_call_output` are both stored with
+  `role = 'tool_result'` and both carry their own `message_id`, so grouping on
+  role invented turns that never happened — a Codex rollout with one prompt and
+  three outputs reported four. Codex has no in-message grouping at all: a Codex
+  turn is the prompt alone, and its tool results are read through the event
+  APIs, where a standalone result belongs. `approxTokens` is deliberately absent: every
   estimate available here is a bytes-per-token heuristic, and a heuristic
   served beside measured values is indistinguishable from a measurement at the
   call site.

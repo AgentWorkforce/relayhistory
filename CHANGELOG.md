@@ -50,8 +50,13 @@ Notable changes to the native `ai-hist` CLI are documented here.
   one keyset page of user turns, each with the ordered
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
   derived from `session_events` rather than a second table. A turn is what
-  arrived on one user message, so harness lines stored as tool results (Claude
-  subagent notifications) are excluded. The turn headers and the per-turn block
+  arrived on one user message. Membership is asserted through `event_source`
+  rather than inferred from `role`: only `tool_result` means "a block inside a
+  message", so a Claude subagent notification and a Codex
+  `function_call_output` — both stored with `role = 'tool_result'`, both
+  carrying their own `message_id` — are excluded instead of each becoming a
+  turn of its own. Codex has no in-message grouping, so a Codex turn is the
+  prompt alone; its tool results are read through the event APIs. The turn headers and the per-turn block
   reads share one deferred read transaction, so a concurrent sync cannot
   produce a page whose headers and blocks come from different snapshots. `approx_tokens` is
   deliberately not computed — every estimate available here is a

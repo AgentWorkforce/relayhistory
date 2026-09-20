@@ -2098,19 +2098,30 @@ const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, LENGTH(CAST(text AS BL
 /// turn of its own instead of merging with every other unattributed event.
 const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 
-/// Which rows are blocks on a user message.
+/// Which rows are a human message, or a block that arrived inside one.
 ///
-/// `role` alone is not the discriminator. A Claude subagent notification is a
-/// harness line reporting on a delegated child; it is stored with
-/// `role = 'tool_result'` because that is what it is evidence of, but it never
-/// arrived on a user message and carries its own `message_id`. Grouping by role
-/// alone would turn every one of them into a user turn that is neither human
-/// text nor an in-message tool result. `event_source` is the field that
-/// separates the two, and a row indexed before that column existed is null, so
-/// the test excludes the one source that does not qualify rather than naming
-/// the ones that do.
-const USER_TURN_ROW_FILTER: &str = "role IN ('user', 'tool_result') \
-     AND COALESCE(event_source, '') <> 'subagent_notification'";
+/// `role` is not the discriminator, and neither is "not one known exception".
+/// Several kinds of row are stored with `role = 'tool_result'` because that is
+/// what they are evidence of, while never having arrived on a user message:
+/// a Claude subagent notification is a harness line about a delegated child,
+/// and a Codex `function_call_output` is a standalone response item carrying
+/// its own item id as `message_id`. Grouping by role turns each of them into
+/// a "user turn" that is neither human text nor an in-message result -- a
+/// Codex rollout with one prompt and three outputs reported four turns.
+///
+/// `event_source` records which of those a row is, so membership is asserted
+/// rather than inferred: `tool_result` is the only source that means "a block
+/// inside a message". This is an allowlist on purpose. The previous denylist
+/// admitted anything it had not been told to exclude, which is how it let the
+/// Codex outputs through after the notifications had already been caught;
+/// naming what qualifies cannot fail that way.
+///
+/// A row indexed before `event_source` existed is null and therefore not
+/// proven to belong to a user message, so it is left out rather than guessed
+/// at. Those rows are transient: the one-time fidelity backfill pass populates
+/// `event_source` for every transcript it can still read.
+const USER_TURN_ROW_FILTER: &str =
+    "(role = 'user' OR (role = 'tool_result' AND event_source = 'tool_result'))";
 
 /// One bounded page of user turns for one session, oldest first.
 ///
@@ -2123,10 +2134,14 @@ const USER_TURN_ROW_FILTER: &str = "role IN ('user', 'tool_result') \
 /// A turn is the set of rows that arrived on one user message, selected by
 /// [`USER_TURN_ROW_FILTER`] and grouped by provider message id. That is exactly
 /// a Claude user message, whose text and tool-result blocks arrive together.
-/// Codex records each output as its own response item, so a Codex turn is one
-/// block wide; the per-block facts are the same either way. Harness lines
-/// stored as tool results that never arrived on a user message -- Claude
-/// subagent notifications -- are not turns and are excluded.
+///
+/// Codex has no such grouping: it records the human message and every function
+/// output as separate response items, and an output is not part of the user's
+/// message. A Codex turn is therefore the prompt alone. Its tool results are
+/// still indexed, with all their fidelity facts -- they are read through the
+/// event APIs, which is where a standalone result belongs. Anything else
+/// stored as a tool result but not carried on a user message, such as a Claude
+/// subagent notification, is excluded for the same reason.
 pub fn session_user_turns_page(
     conn: &Connection,
     source: &str,
