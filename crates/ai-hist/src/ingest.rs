@@ -112,7 +112,7 @@ pub fn sync_local_at_with_progress(
         Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
     capture_progress("initializing", 0, None);
     let result = sync_local_at(db_path);
-    if matches!(result, Ok(true)) {
+    if result.is_ok() {
         capture_progress("complete", 0, None);
     }
     result
@@ -10194,6 +10194,23 @@ mod capture_progress_tests {
             vec!["outer:initializing", "inner:initializing"]
         );
         CAPTURE_OBSERVER.with(|slot| assert!(slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn skipped_sync_still_emits_complete_progress() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("history.db");
+        let _lock = try_acquire_sync_lock(&db).unwrap().unwrap();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = updates.clone();
+        assert!(!sync_local_at_with_progress(&db, move |progress| {
+            observed.lock().unwrap().push(progress.source);
+        })
+        .unwrap());
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec!["initializing".to_string(), "complete".to_string()]
+        );
     }
 
     #[test]
