@@ -10,9 +10,10 @@ use std::time::Instant;
 
 /// Bumped to 3 when capability became derived from declared evidence coverage.
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
-/// Version 3 re-parsed existing sessions for continuity and raw provider facts.
+/// Version 3 re-parsed existing sessions for raw provider facts.
 /// Version 4 invalidates checkpoints from the unbounded Codex child scan.
-const HYDRATION_PARSER_VERSION: i64 = 4;
+/// Version 5 banks continuity evidence for sessions checkpointed by version 4.
+const HYDRATION_PARSER_VERSION: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -2819,6 +2820,77 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(parent, format!("prior-{source}"));
+        }
+    }
+
+    #[test]
+    fn version_four_checkpoints_reparse_to_bank_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = claude_fixture(dir.path(), "explicit-line-relationships.jsonl");
+        let codex = dir
+            .path()
+            .join(".codex/sessions/2026/08/31/rollout-forked.jsonl");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T11:00:00Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"forked\",\"cwd\":\"/work/app\",",
+                "\"continuedFromSessionId\":\"prior\"}}\n",
+                "{\"timestamp\":\"2026-08-31T11:00:01Z\",\"type\":\"event_msg\",",
+                "\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(
+            &conn,
+            "claude",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            Some(&claude),
+        );
+        catalog_row(&conn, "codex", "forked", Some(&codex));
+        drop(conn);
+
+        for (source, session_id) in [
+            ("claude", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            ("codex", "forked"),
+        ] {
+            let request = options(source, session_id);
+            hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+            let conn = open_db(&db).unwrap();
+            conn.execute(
+                "UPDATE observation_hydration_checkpoints SET parser_version = 4 \
+                 WHERE source = ? AND session_id = ? AND location = 'local'",
+                params![source, session_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM session_relationships WHERE source = ? \
+                 AND relationship IN ('continuation', 'fork', 'resume')",
+                [source],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM session_continuity_evidence WHERE source = ?",
+                [source],
+            )
+            .unwrap();
+            drop(conn);
+
+            let repaired = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+            assert_eq!(repaired.status, "updated", "{source} v4 checkpoint");
+            let conn = open_db(&db).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_relationships WHERE source = ? \
+                     AND child_session_id = ? AND relationship = 'continuation'",
+                    params![source, session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{source} continuity restored");
         }
     }
 
