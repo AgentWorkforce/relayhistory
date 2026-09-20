@@ -8,6 +8,7 @@ import {
   InvalidArgumentError,
   ConnectorFailureError,
   ConnectorNotConfiguredError,
+  SESSION_HYDRATION_CONTRACT_VERSION,
   type CatalogSource,
 } from './sdk-common.js';
 import type {
@@ -214,7 +215,11 @@ export async function hydrateSourcePlugin(
     snapshot.records.length === 0
   )
     return {
-      contract_version: 2,
+      // The hydration contract this SDK speaks. A literal here drifted from
+      // `SESSION_HYDRATION_CONTRACT_VERSION` the first time that constant was
+      // bumped, and the plugin path then reported a version the normalizer
+      // rejected; the constant is the single declaration.
+      contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
       source: identity.source,
       session_id: identity.sessionId,
       status: 'capability_limited',

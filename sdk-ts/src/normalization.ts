@@ -480,6 +480,10 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
       fileEdits: Number(evidence.fileEdits),
       relatedSessions: Number(evidence.relatedSessions),
     },
+    // Absent only from an addon that predates the counter; the contract-version
+    // check above already rejects those, so the fallback is belt and braces
+    // rather than a supported shape.
+    bytesRead: typeof value.bytesRead === 'number' ? value.bytesRead : 0,
     relatedSessionIds: Array.isArray(value.relatedSessionIds)
       ? value.relatedSessionIds.map(String)
       : [],

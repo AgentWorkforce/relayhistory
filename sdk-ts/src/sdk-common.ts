@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export const SESSION_CATALOG_CONTRACT_VERSION = 3;
-export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
+export const SESSION_HYDRATION_CONTRACT_VERSION = 3;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 1;
 

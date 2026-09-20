@@ -115,7 +115,7 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
       cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(hydrated.contract_version, 2);
+    assert.equal(hydrated.contract_version, 3);
     assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
       `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
