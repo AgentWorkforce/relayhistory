@@ -1906,6 +1906,30 @@ const LEADING_BYTE_LIMIT: u64 = 1024 * 1024;
 /// trailing record with no newline counts, because the head of a one-record
 /// file is that record.
 fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
+    read_head_records(path, limit, true)
+}
+
+/// The **first physical record** of a file, and the bytes reading it cost.
+///
+/// Distinct from [`read_leading_records`], which walks past records it cannot
+/// parse until it finds one that it can. That is right for a caller looking
+/// for the first usable record and wrong for anything that defines identity by
+/// position: a rollout whose first line is corrupt, followed by a
+/// `session_meta` naming another session, was adopted under that other
+/// session's id. `None` here means "the first record is not one I can read",
+/// which is a different claim from "there is no such record in the file".
+fn read_first_record(path: &Path) -> Result<(Option<Value>, u64)> {
+    let (values, bytes_read) = read_head_records(path, 1, false)?;
+    Ok((values.into_iter().next(), bytes_read))
+}
+
+/// `skip_unparseable` decides what a record that does not parse means: skip
+/// past it and keep looking, or stop, having read it.
+fn read_head_records(
+    path: &Path,
+    limit: usize,
+    skip_unparseable: bool,
+) -> Result<(Vec<Value>, u64)> {
     let file = fs::File::open(path)?;
     // `take` is what enforces the ceiling. Checking `bytes_read` at the top of
     // the loop only decided whether to start *another* line, and
@@ -1925,8 +1949,11 @@ fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> 
             break;
         }
         bytes_read += read as u64;
-        if let Ok(value) = serde_json::from_slice::<Value>(trim_ascii_end(&raw)) {
-            values.push(value);
+        match serde_json::from_slice::<Value>(trim_ascii_end(&raw)) {
+            Ok(value) => values.push(value),
+            Err(_) if skip_unparseable => continue,
+            // The bytes were read either way, so they are counted either way.
+            Err(_) => break,
         }
     }
     Ok((values, bytes_read))
@@ -1960,7 +1987,11 @@ fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMe
     // started failing a whole parent hydration or Codex sync — a file that
     // could not be read taking down the files that could. The failure is
     // reported rather than swallowed.
-    let (values, bytes_read) = match read_leading_records(path, 1) {
+    // The *first physical* record, not the first one that parses. Codex
+    // defines a rollout's identity by position, and skipping a corrupt opening
+    // line to reach a `session_meta` further down adopts the rollout under
+    // whatever session that record names.
+    let (value, bytes_read) = match read_first_record(path) {
         Ok(read) => read,
         Err(error) => {
             sync_note!(
@@ -1970,7 +2001,7 @@ fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMe
             return Ok((None, 0));
         }
     };
-    let meta = values.first().and_then(codex_session_meta_from_record);
+    let meta = value.as_ref().and_then(codex_session_meta_from_record);
     Ok((meta, bytes_read))
 }
 
@@ -7121,6 +7152,42 @@ mod tests {
         .unwrap();
         let (meta, _) = super::read_codex_session_meta_counted(&good).unwrap();
         assert_eq!(meta.unwrap().session_id, "good");
+    }
+
+    /// A rollout's identity is its **first physical record**, not the first
+    /// record that happens to parse.
+    ///
+    /// The bounded head reader skips records it cannot parse until it finds
+    /// one, which is right for a caller looking for the first usable record
+    /// and wrong for Codex identity: a rollout whose first line is corrupt,
+    /// followed by a `session_meta` naming another session, was adopted under
+    /// that other session's id. The whole-file reader this replaced took
+    /// `lines().next()` and rejected the file, so the incremental rewrite
+    /// changed which session the rows landed under.
+    #[test]
+    fn a_malformed_first_record_does_not_hand_a_rollout_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_line = "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                         \"payload\":{\"id\":\"session-b\",\"cwd\":\"/work/app\"}}\n";
+
+        let corrupt = dir.path().join("rollout-corrupt.jsonl");
+        fs::write(&corrupt, format!("not-json\n{meta_line}")).unwrap();
+        assert!(
+            super::read_codex_session_meta(&corrupt).unwrap().is_none(),
+            "a rollout whose first physical record is not a session_meta has no identity"
+        );
+
+        // Positive control: the same file without the corrupt line is read,
+        // so this is the first record being respected rather than the reader
+        // failing on the fixture.
+        let clean = dir.path().join("rollout-clean.jsonl");
+        fs::write(&clean, meta_line).unwrap();
+        assert_eq!(
+            super::read_codex_session_meta(&clean)
+                .unwrap()
+                .map(|meta| meta.session_id),
+            Some("session-b".to_string())
+        );
     }
 
     /// A rewrite that preserves size and mtime is still a rewrite.

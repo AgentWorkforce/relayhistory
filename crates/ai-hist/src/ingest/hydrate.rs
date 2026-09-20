@@ -101,6 +101,14 @@ struct SourceSnapshot {
     /// hydration cannot avoid belongs in `bytesRead`, or the counter measures
     /// the walk that was optimised rather than the work that was done.
     scanned_bytes: i64,
+    /// Every locator-keyed cursor this stamp folds a file into: Claude
+    /// sidecars and their metadata documents, Codex child rollouts.
+    ///
+    /// The stamp is built from `file_stamp`, which is mtime and size, so each
+    /// of these files needs the same bounded prefix check the session's own
+    /// transcript gets before the skip path trusts it. Collected while
+    /// stamping so the check does not re-walk the directory to find them.
+    stamped_cursors: Vec<(String, PathBuf)>,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -1188,6 +1196,7 @@ fn source_snapshot(
             path: Some(path),
             claude_subagents: Vec::new(),
             scanned_bytes: 0,
+            stamped_cursors: Vec::new(),
         });
     }
 
@@ -1227,6 +1236,7 @@ fn source_snapshot(
         scanned_bytes += read_codex_session_meta_counted(&path)?.1 as i64;
     }
     let mut subagents = Vec::new();
+    let mut stamped_cursors = Vec::new();
     if options.source == "claude" && options.include_related {
         let (found, sidecar_bytes) = claude_subagents(conn, &path, &options.session_id)?;
         subagents = found;
@@ -1235,6 +1245,7 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
+            stamped_cursors.push(("claude".to_string(), evidence.path.clone()));
             // The metadata sidecar describes the child — its type, model and
             // spawn depth, and the tool use that started it — so a sidecar
             // that arrives or changes on its own is still new evidence.
@@ -1243,6 +1254,10 @@ fn source_snapshot(
                 stamp.push('|');
                 stamp.push_str(&file_stamp(&metadata)?);
                 bytes += metadata.metadata()?.len() as i64;
+                stamped_cursors.push((
+                    crate::ingest::CLAUDE_SUBAGENT_META_SOURCE.to_string(),
+                    metadata,
+                ));
             }
         }
     }
@@ -1256,6 +1271,7 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
             bytes += child.metadata()?.len() as i64;
+            stamped_cursors.push(("codex".to_string(), child));
         }
     }
     Ok(SourceSnapshot {
@@ -1265,6 +1281,7 @@ fn source_snapshot(
         path: Some(path),
         claude_subagents: subagents,
         scanned_bytes,
+        stamped_cursors,
     })
 }
 
@@ -1334,37 +1351,32 @@ fn unchanged_cursor_check(
             bytes_read,
         });
     }
-    // A sidecar is a transcript like any other and carries the same hazard.
-    // Its cursor is keyed by path, and a sidecar that has never been read has
-    // none — the stamp still covers its arrival, so a missing cursor does not
-    // block the skip the way the session's own missing cursor does.
-    for evidence in &snapshot.claude_subagents {
-        for (source, file_path) in [
-            ("claude", evidence.path.clone()),
-            (
-                crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
-                claude_subagent_meta_path(&evidence.path),
-            ),
-        ] {
-            let locator = file_path.to_string_lossy().to_string();
-            let cursor = load_cursor(
-                conn,
-                &CursorKey::Locator {
-                    source,
-                    locator: &locator,
-                },
-            )?;
-            let Some(file) = cursor.file.as_ref() else {
-                continue;
-            };
-            let check = crate::ingest::cursor::committed_prefix_matches(file, &file_path);
-            bytes_read += check.bytes_read as i64;
-            if !check.valid {
-                return Ok(UnchangedCursorCheck {
-                    valid: false,
-                    bytes_read,
-                });
-            }
+    // Every other file the stamp folds in — Claude sidecars, their metadata
+    // documents, Codex child rollouts — is a transcript like any other and
+    // carries the same hazard. Each has a locator-keyed cursor, and a file
+    // that has never been read has none: the stamp still covers its arrival,
+    // so a missing cursor does not block the skip the way the session's own
+    // missing cursor does. Driving this from the stamp's own list is what
+    // stops a provider being added to the stamp and forgotten here.
+    for (source, file_path) in &snapshot.stamped_cursors {
+        let locator = file_path.to_string_lossy().to_string();
+        let cursor = load_cursor(
+            conn,
+            &CursorKey::Locator {
+                source,
+                locator: &locator,
+            },
+        )?;
+        let Some(file) = cursor.file.as_ref() else {
+            continue;
+        };
+        let check = crate::ingest::cursor::committed_prefix_matches(file, file_path);
+        bytes_read += check.bytes_read as i64;
+        if !check.valid {
+            return Ok(UnchangedCursorCheck {
+                valid: false,
+                bytes_read,
+            });
         }
     }
     Ok(UnchangedCursorCheck {
@@ -4445,6 +4457,74 @@ mod tests {
         assert!(
             released.quiesced(),
             "a genuinely quiescent file must still release what it held"
+        );
+    }
+
+    /// A Codex child rollout is folded into the parent's stamp, so it needs
+    /// the same prefix validation the parent and the Claude sidecars get.
+    ///
+    /// Round 5 gave the skip path a bounded window check and reached the
+    /// session's own transcript and the Claude sidecars. Codex children were
+    /// folded into the stamp with `file_stamp` alone, and they carry
+    /// locator-keyed cursors of their own — so a same-size, same-mtime rewrite
+    /// of a child was still served from the replaced bytes.
+    #[test]
+    fn a_same_stat_rewrite_of_a_codex_child_is_not_served_from_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        fs::write(
+            &root,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            ),
+        )
+        .unwrap();
+        let child = day.join("rollout-child.jsonl");
+        let child_body = concat!(
+            "{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"parent_thread_id\":\"root\",\"cwd\":\"/work/app\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"aaaaa\"}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&child, child_body).unwrap();
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        let stamped = fs::metadata(&child).unwrap().modified().unwrap();
+
+        // Positive control: nothing touched, so the shortcut is available and
+        // fires. Without it, "the rewrite was not skipped" is also satisfied
+        // by a check that never skips anything.
+        let untouched =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert_eq!(
+            untouched.status, "unchanged",
+            "an untouched parent and child must still be skipped"
+        );
+
+        let rewritten = child_body.replace("aaaaa", "bbbbb");
+        assert_eq!(rewritten.len(), child_body.len());
+        fs::write(&child, &rewritten).unwrap();
+        fs::File::open(&child)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&child).unwrap();
+        assert_eq!(metadata.len() as usize, child_body.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        let after =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert_ne!(
+            after.status, "unchanged",
+            "a same-size, same-mtime rewrite of a child must not be served from its cursor"
         );
     }
 
