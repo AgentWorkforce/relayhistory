@@ -2617,19 +2617,24 @@ fn lendable_ancestor_key_for(
 ) -> Result<Option<String>> {
     let mut walk = AncestorWalk {
         visited: HashSet::new(),
-        looped: false,
+        path: HashSet::new(),
     };
     walk.visited.insert(session_id.to_string());
-    lendable_ancestor_key(conn, source, session_id, &mut walk, 0)
+    walk.path.insert(session_id.to_string());
+    Ok(lendable_ancestor_key(conn, source, session_id, &mut walk, 0)?.0)
 }
 
-/// State carried up the ancestor walk.
+/// State carried through the ancestor walk.
 struct AncestorWalk {
-    /// Sessions already examined, so a circle is walked once, not forever.
+    /// Sessions already examined, so a shared ancestor is examined once and a
+    /// circle is walked once rather than forever.
     visited: HashSet<String>,
-    /// Whether an edge pointed back at something already examined — that is,
-    /// whether this walk is looking at a circle rather than a chain.
-    looped: bool,
+    /// Sessions on the *current* path from the starting row. An edge back into
+    /// this set closes a cycle; an edge into `visited` but not into this set is
+    /// only a second route to the same ancestor, which is a diamond and
+    /// perfectly ordinary. Conflating the two is what made a shared ancestor
+    /// look like a loop.
+    path: HashSet<String>,
 }
 
 /// The key of the nearest ancestor that has one worth lending, following the
@@ -2659,15 +2664,19 @@ struct AncestorWalk {
 ///     promote an ancestor and every stand-in beneath it moves, so returning
 ///     the stand-in first answers with the key the refresh is about to
 ///     replace.
+///
+/// Returns the key, and whether a cycle was closed *below this point* — the
+/// second is what tells the caller whether an ancestor's borrowed key is
+/// grounded in anything or only in the row being keyed.
 fn lendable_ancestor_key(
     conn: &Connection,
     source: &str,
     session_id: &str,
     walk: &mut AncestorWalk,
     depth: usize,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, bool)> {
     if depth >= PROJECT_KEY_INHERITANCE_PASSES {
-        return Ok(None);
+        return Ok((None, false));
     }
     let parents: Vec<ParentIdentityRow> = conn
         .prepare(
@@ -2694,9 +2703,16 @@ fn lendable_ancestor_key(
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let mut closed_a_cycle = false;
     for (parent_id, key, method, cwd, repo_url) in parents {
+        if walk.path.contains(&parent_id) {
+            // Back into the path we are standing on: this edge closes a cycle.
+            closed_a_cycle = true;
+            continue;
+        }
         if !walk.visited.insert(parent_id.clone()) {
-            walk.looped = true;
+            // Seen on another branch and fully examined there. Nothing new is
+            // reachable through it, and it is not a cycle.
             continue;
         }
         // What pass 1 will leave on this parent, by the rule pass 1 uses
@@ -2708,23 +2724,33 @@ fn lendable_ancestor_key(
         // walk has already run pass 1, so the two agree either way — and one
         // rule that is right in both places beats two that must be kept so.
         if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
-            return Ok(Some(settled));
+            return Ok((Some(settled), closed_a_cycle));
         }
-        if let Some(found) = lendable_ancestor_key(conn, source, &parent_id, walk, depth + 1)? {
-            return Ok(Some(found));
+        walk.path.insert(parent_id.clone());
+        let (found, cycle_below) =
+            lendable_ancestor_key(conn, source, &parent_id, walk, depth + 1)?;
+        walk.path.remove(&parent_id);
+        if let Some(found) = found {
+            return Ok((Some(found), closed_a_cycle || cycle_below));
         }
-        // The borrowed key an ancestor is already wearing — unless this walk
-        // went in a circle. A stand-in is only worth passing on when it came
-        // from somewhere: in a cycle of sessions that all borrowed from each
-        // other, every one of them is "wearing" a key on the authority of the
-        // next, and lending it round again rotates the three of them on every
-        // refresh forever. Declining leaves the keys exactly as they are,
-        // which is the only stable answer available.
-        if !walk.looped && key.is_some() && method.as_deref() == Some("inherited") {
-            return Ok(key);
+        closed_a_cycle |= cycle_below;
+        // The borrowed key this ancestor is already wearing — unless the
+        // search below *it* closed a cycle. A stand-in is only worth passing
+        // on when it came from somewhere: in a ring of sessions that all
+        // borrowed from each other, each one wears its key on the authority of
+        // the next, and lending it round again just moves the ring. Declining
+        // leaves those keys exactly as they are, which is the only stable
+        // answer available.
+        //
+        // Scoped to this ancestor's own subtree, not to the whole walk: a
+        // cycle somewhere else in the graph says nothing about whether *this*
+        // key is grounded, and a walk that gave up after touching one left
+        // every later parent's key on the floor.
+        if !cycle_below && key.is_some() && method.as_deref() == Some("inherited") {
+            return Ok((key, closed_a_cycle));
         }
     }
-    Ok(None)
+    Ok((None, closed_a_cycle))
 }
 
 fn now_ms() -> i64 {

@@ -798,3 +798,121 @@ fn plugin_intake_opens_a_new_acquisition_pass() -> Result<()> {
     );
     Ok(())
 }
+
+/// Enriching an adapter's event must not take it away from the adapter.
+///
+/// `project_key` and `project_key_method` travel in the record so a snapshot
+/// round-trips what the emitting side knew, but they are *derived* canonical
+/// state: `refresh_project_identity` rewrites them, inside the very
+/// transaction that stores the adapter's snapshot. Comparing them in the
+/// ownership check therefore reads the enrichment as an external edit — the
+/// connector's own event is protected against the connector, and from then on
+/// a changed text is never applied and an omitted record is never deleted.
+/// The adapter goes on reporting into a record it no longer owns, and nothing
+/// says so.
+#[test]
+fn enrichment_does_not_revoke_the_adapter_s_ownership_of_its_event() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("history.db");
+    observe(&path, "one")?;
+
+    let conn = ai_hist::open_db(&path)?;
+    // The session has a canonical key, so the refresh has something to stamp.
+    conn.execute(
+        "UPDATE sessions SET cwd = '/work/app', project_key = 'github.com/Org/Repo', \
+         project_key_method = 'remote' WHERE source = 'claude' AND session_id = 's'",
+        [],
+    )?;
+
+    let revision = |instance: &str| -> Result<String> {
+        Ok(state(&path, instance)?
+            .revision
+            .expect("an observed session has a revision"))
+    };
+    let text_of = |uid: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT text FROM session_events WHERE event_uid = ?",
+            rusqlite::params![uid],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+
+    // The adapter says nothing about the project, as an older one would not.
+    apply(
+        &path,
+        "one",
+        revision("one")?,
+        vec![EvidenceKind::SessionEvent],
+        vec![event("e1", "first")],
+    )?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT project_key FROM session_events WHERE event_uid = 'e1'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?,
+        Some("github.com/Org/Repo".to_string()),
+        "the premise is that intake enriches the event it just stored"
+    );
+
+    // Same record, new text. The adapter still owns it, so this must land.
+    apply(
+        &path,
+        "one",
+        revision("one")?,
+        vec![EvidenceKind::SessionEvent],
+        vec![event("e1", "second")],
+    )?;
+    assert_eq!(
+        text_of("e1").as_deref(),
+        Some("second"),
+        "an update from the owning adapter was refused after its own event was enriched"
+    );
+
+    // And the adapter dropping the record must delete it.
+    apply(
+        &path,
+        "one",
+        revision("one")?,
+        vec![EvidenceKind::SessionEvent],
+        vec![],
+    )?;
+    assert_eq!(
+        text_of("e1"),
+        None,
+        "a record the adapter stopped reporting was kept, because enrichment had \
+         quietly revoked its ownership"
+    );
+
+    // --- the control: a real external edit still revokes -----------------
+    //
+    // The protection exists for a reason, and this proves the fix did not
+    // disarm it: a *non-derived* column changed outside the connector means
+    // something else owns the row now, and the connector may no longer delete
+    // it.
+    apply(
+        &path,
+        "one",
+        revision("one")?,
+        vec![EvidenceKind::SessionEvent],
+        vec![event("e2", "from the adapter")],
+    )?;
+    conn.execute(
+        "UPDATE session_events SET text = 'edited locally' WHERE event_uid = 'e2'",
+        [],
+    )?;
+    apply(
+        &path,
+        "one",
+        revision("one")?,
+        vec![EvidenceKind::SessionEvent],
+        vec![],
+    )?;
+    assert_eq!(
+        text_of("e2").as_deref(),
+        Some("edited locally"),
+        "an externally edited row must be protected from the connector that used to own it"
+    );
+    Ok(())
+}

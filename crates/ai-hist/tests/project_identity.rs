@@ -1138,3 +1138,139 @@ fn a_delegation_cycle_settles_instead_of_rotating_its_keys() {
         "chain and cycle together must still converge to no writes"
     );
 }
+
+/// A shared ancestor is a diamond, not a circle.
+///
+/// Two parents of one child can perfectly well have the same grandparent, and
+/// the second branch then reaches a session the first branch already examined.
+/// Treating that revisit as a loop makes the walk refuse every borrowed key
+/// after it, so the child keeps nothing — for no better reason than the order
+/// its parents were recorded in.
+///
+/// The shape is deliberate. Both of the child's parents are *evidence only*,
+/// with no catalog row, which is the one case pass 2's statement cannot reach
+/// across: the answer can therefore come only from the walk. The branch
+/// holding it is the second one, reached after the revisit.
+#[test]
+fn a_shared_ancestor_is_not_mistaken_for_a_cycle() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("diamond.db")).unwrap();
+
+    let session = |id: &str, key: Option<&str>, method: Option<&str>| {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+             last_activity_ms, discovery_state) VALUES ('codex', ?1, ?2, ?3, 1, 'full')",
+            rusqlite::params![id, key, method],
+        )
+        .unwrap();
+    };
+    // `first` and `second` are delegated threads with no catalog row at all.
+    session("shared", None, None);
+    session("lender", Some("github.com/acme/app"), Some("inherited"));
+    session("child", None, None);
+
+    let edge = |parent: &str, child: &str, created: i64| {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    };
+    // Both branches pass through `shared`; only the second reaches the lender,
+    // and it meets `shared` again on the way.
+    edge("shared", "first", 1);
+    edge("shared", "second", 2);
+    edge("lender", "second", 3);
+    edge("first", "child", 4);
+    edge("second", "child", 5);
+    for uncataloged in ["first", "second"] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = ?",
+                rusqlite::params![uncataloged],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "the premise is that neither parent has a catalog row, so only the walk \
+             can answer"
+        );
+    }
+
+    refresh_project_identity(&conn).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/app".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "a second route to the same ancestor was read as a loop, so the key further \
+         along that branch was dropped"
+    );
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// Touching a cycle is not being in one.
+///
+/// A session can be delegated by a member of a ring *and* by something sane.
+/// The ring is not a reason to throw away the sane answer: a stand-in is
+/// refused because *its own* authority is circular, not because a circle
+/// exists somewhere in the graph. Loop detection therefore has to be scoped to
+/// the path being walked, not to the walk.
+#[test]
+fn a_cycle_elsewhere_does_not_cost_a_child_its_grounded_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("touching.db")).unwrap();
+
+    let session = |id: &str, key: Option<&str>, method: Option<&str>| {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+             last_activity_ms, discovery_state) VALUES ('codex', ?1, ?2, ?3, 1, 'full')",
+            rusqlite::params![id, key, method],
+        )
+        .unwrap();
+    };
+    // A two-session ring, each borrowing from the other...
+    session("ring-x", Some("github.com/acme/ring"), Some("inherited"));
+    session("ring-y", Some("github.com/acme/ring"), Some("inherited"));
+    // ...a clean ancestor wearing a key lent from outside this database...
+    session("lender", Some("github.com/acme/app"), Some("inherited"));
+    // ...and the child delegated by both.
+    session("child", None, None);
+
+    let edge = |parent: &str, child: &str, created: i64| {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    };
+    edge("ring-x", "ring-y", 1);
+    edge("ring-y", "ring-x", 2);
+    // The ring member is the *earlier* parent, so the walk meets the cycle
+    // before it ever reaches the lender.
+    edge("ring-y", "child", 3);
+    edge("lender", "child", 4);
+
+    refresh_project_identity(&conn).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/app".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "the walk gave up on every later parent because it had touched a cycle"
+    );
+    // The ring itself is untouched, and the whole thing settles.
+    assert_eq!(
+        session_key(&conn, "codex", "ring-x").0.as_deref(),
+        Some("github.com/acme/ring")
+    );
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
