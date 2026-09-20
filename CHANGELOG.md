@@ -10,7 +10,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   reads — the providers' session roots, the flat `~/.claude/history.jsonl` and
   `~/.codex/history.jsonl` logs, and `.trajectories` directories — with a
   200 ms debounce and a 30 s slow-poll backstop, falling back to polling when
-  no root can be watched. New flags: `--no-fsevents`, `--debounce-ms`,
+  no root can be watched. The flat logs are watched as the single files they
+  are, so their neighbours — `~/.claude/settings.json` and the rest — do not
+  each force a sweep, and re-deriving the root set stays on the backstop once
+  the watcher is attached rather than following a short `--interval`. New flags: `--no-fsevents`, `--debounce-ms`,
   alongside the existing `--interval`. The watcher backend is behind the
   optional `fs-events` crate feature, which the CLI enables; a
   `--no-default-features` build polls.

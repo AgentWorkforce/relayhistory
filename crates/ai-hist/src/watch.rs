@@ -631,13 +631,22 @@ impl WatchLoop {
             // status output and the docs promise the backstop, so the wait is
             // shortened to it while anything is uncovered; the sweep itself
             // still happens on the interval that was asked for.
-            let reconcile_every = match watcher.as_ref() {
-                Some(watch)
-                    if !watch.pending().is_empty() || self.roots_refresh.is_some() =>
-                {
-                    self.slow_poll_ms.min(self.poll_interval_ms)
-                }
-                _ => sweep_every,
+            let reconcile_every = match self.current_driver() {
+                // Events are flowing, so the backstop *is* the cadence for
+                // everything the backstop does. Shortening it here would make
+                // `--interval 1` re-derive the root set — a walk of every
+                // project tree — once a second on a loop that is not polling
+                // for changes at all, which is the opposite of what a short
+                // interval asks for.
+                WatchDriver::FsEvents => self.slow_poll_ms,
+                WatchDriver::Polling => match watcher.as_ref() {
+                    Some(watch)
+                        if !watch.pending().is_empty() || self.roots_refresh.is_some() =>
+                    {
+                        self.slow_poll_ms.min(self.poll_interval_ms)
+                    }
+                    _ => sweep_every,
+                },
             };
             let woke_early = reconcile_every < sweep_every;
             let idle = Duration::from_millis(sweep_every.min(reconcile_every));

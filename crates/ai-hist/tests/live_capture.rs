@@ -567,11 +567,13 @@ fn the_sweep_only_sources_are_watched_too() {
     let home = PathBuf::from("/tmp/relayhistory-sweep-watch-roots");
     let roots = ai_hist::sync_watch_roots(&home, &home.join("opencode.db"));
 
-    // The flat logs are reached through their parent: a watch on the file
-    // itself follows an inode the harness may replace.
+    // The flat logs are watched as the files they are: registered through
+    // their parent, because a watch on the file itself follows an inode the
+    // harness may replace, but filtered back down to the one name so the
+    // entries beside them do not each force a sweep.
     for (expected, depth) in [
-        (home.join(".claude"), WatchDepth::Directory),
-        (home.join(".codex"), WatchDepth::Directory),
+        (home.join(".claude/history.jsonl"), WatchDepth::File),
+        (home.join(".codex/history.jsonl"), WatchDepth::File),
         (home.join(".claude/projects"), WatchDepth::Tree),
     ] {
         let root = roots
@@ -1171,6 +1173,140 @@ fn a_root_that_does_not_exist_yet_is_still_reported_pending() {
         status.pending,
         vec![absent],
         "a root that does not exist yet is retried, and says so: {status:?}"
+    );
+}
+
+/// Re-deriving the root set walks every project tree, so it belongs on the
+/// backstop and nowhere else. A local `watch` always installs a refresher, so
+/// shortening that cadence to `--interval` meant `--interval 1` re-scanned the
+/// projects once a second on a loop that is not polling for changes at all —
+/// the opposite of what a short interval asks for, and the expense the whole
+/// fingerprint design exists to avoid.
+#[cfg(feature = "fs-events")]
+#[test]
+fn an_attached_loop_re_derives_its_roots_on_the_backstop_not_the_interval() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let root = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&root).expect("an existing root");
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
+    let running = RunningLoop::reporting({
+        let root = root.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(root.clone())])
+                .with_roots_refresh(Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    vec![ai_hist::discover::WatchRoot::tree(root.clone())]
+                }))
+                .with_debounce_ms(50)
+                // The backstop, and a much shorter user interval beside it.
+                .with_slow_poll_ms(600)
+                .with_poll_interval_ms(50)
+        }
+    });
+    assert_eq!(
+        running.watch.driver(),
+        Some(WatchDriver::FsEvents),
+        "the root exists, so the loop is event-driven"
+    );
+
+    // Long enough for ~20 wakes at the user's interval and ~2 at the backstop.
+    // Measured by waiting on the loop's own ticks rather than by sleeping:
+    // two backstop ticks have passed by the time this returns.
+    backstop_ticks(&running, 2, "while watching an attached root");
+    let attached = refreshes.load(Ordering::SeqCst);
+    assert!(
+        attached <= 4,
+        "an attached loop re-derived its roots {attached} times across two backstops; \
+         the user's interval is not the cadence for that work"
+    );
+
+    // Positive control: while *polling* — nothing attached, a root that does
+    // not exist yet — the refresher is exactly how a new root is found, and
+    // there the short interval is the right cadence. Same cadences, opposite
+    // expectation.
+    drop(running);
+    let absent = home.path().join(".codex/sessions");
+    let polling_refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = polling_refreshes.clone();
+    let running = RunningLoop::reporting({
+        let absent = absent.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(absent.clone())])
+                .with_roots_refresh(Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    vec![ai_hist::discover::WatchRoot::tree(absent.clone())]
+                }))
+                .with_debounce_ms(50)
+                .with_slow_poll_ms(600)
+                .with_poll_interval_ms(50)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::Polling));
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while polling_refreshes.load(Ordering::SeqCst) < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a polling loop with an uncovered root must consult the refresher at \
+             the shorter cadence, not wait out the backstop"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// The flat logs are single files, and the directory holding one is full of
+/// things a sweep never reads — `~/.claude/settings.json`, the credentials
+/// file, whatever the next harness release adds. Watching the parent as a
+/// *directory* root makes every one of those writes a forced sweep, which is
+/// the expensive kind that bypasses the fingerprint.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_file_beside_the_flat_log_does_not_force_a_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(home.path().join(".claude")).expect("claude dir");
+    let log = home.path().join(".claude/history.jsonl");
+    std::fs::write(&log, "{}\n").expect("seed the flat log");
+
+    let running = RunningLoop::reporting({
+        let home = home.path().to_path_buf();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(ai_hist::sync_watch_roots(
+                    &home,
+                    &home.join("no-opencode.db"),
+                ))
+                .with_debounce_ms(100)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // A neighbour of the flat log that the sweep never reads.
+    std::fs::write(home.path().join(".claude/settings.json"), "{}\n").expect("write a neighbour");
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(800)),
+        Err(RecvTimeoutError::Timeout),
+        "a file beside the flat log must not force a sweep"
+    );
+
+    // Positive control: the flat log itself still does, so the narrowing did
+    // not simply stop watching it.
+    running.settle("before appending to the flat log");
+    append_history_log(home.path(), "claude", "a new prompt");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "the flat log itself must still drive a forced sweep"
     );
 }
 

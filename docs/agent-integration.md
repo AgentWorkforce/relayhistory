@@ -93,8 +93,10 @@ every backstop tick, and a loop that started with nothing to watch promotes
 itself to filesystem events as soon as one appears. Those retries are on the
 *backstop*, not on `--interval`: a `watch --interval 3600` started before a
 provider exists picks it up in seconds rather than in an hour, while its
-sweeps stay on the hour it was given. That tick also re-checks each
-registration against the directory it was made against — a watch is bound to
+sweeps stay on the hour it was given. Re-deriving the root set is a walk of every project
+tree, so it belongs on the backstop and stays there once the watcher is
+attached, however short an `--interval` was asked for. That tick also
+re-checks each registration against the directory it was made against — a watch is bound to
 the directory object, not to its name, so a root deleted and recreated
 (`rm -rf ~/.codex/sessions`, then the next session) has a live name and a dead
 watch — and re-registers only the ones that changed. That work is on a
@@ -124,8 +126,10 @@ up too.
 
 A root is watched at the depth it asks for: transcript trees recursively,
 because a new session is a new file somewhere inside; the directories holding
-the flat logs shallowly, so the todo files and shell snapshots an active
-session rewrites constantly do not each wake a sweep; and a `TRAJECTORY_ROOT`
+the flat logs as the single files they are — registered through the parent,
+because a watch on the file itself dies with the next atomic rewrite, but
+filtered back to the one name so the todo files, shell snapshots and settings
+beside them do not each wake a sweep; and a `TRAJECTORY_ROOT`
 naming a single JSON file as that one file — registered through its parent,
 because an atomic rewrite takes a watch on the file itself with it, but
 filtered back down to the one name, since that parent is routinely `$HOME`.

@@ -844,8 +844,17 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
         &shallow_providers(),
         &discover::ProviderRoots { home, opencode_db },
     );
-    roots.push(discover::WatchRoot::directory(home.join(".claude")));
-    roots.push(discover::WatchRoot::directory(home.join(".codex")));
+    // The flat logs, each as the one file it is. A `directory` root here would
+    // cover every entry beside them — `~/.claude/settings.json`, the
+    // credentials file, whatever a harness release adds next — and each of
+    // those writes would drive a *forced* sweep, the kind that bypasses the
+    // fingerprint. A file root registers the same parent (a watch on the file
+    // itself dies with the next atomic rewrite) and then filters back down to
+    // the one name, which is exactly the distinction it exists for.
+    roots.push(discover::WatchRoot::file(
+        home.join(".claude/history.jsonl"),
+    ));
+    roots.push(discover::WatchRoot::file(home.join(".codex/history.jsonl")));
     for root in trajectory_roots(home).unwrap_or_default() {
         roots.push(trajectory_watch_root(root));
     }
