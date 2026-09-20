@@ -150,7 +150,7 @@ impl Monitor {
                     }
                     .into();
                 }
-                println!("{} ({}s)", progress.line(), started.elapsed().as_secs());
+                humanln!("{} ({}s)", progress.line(), started.elapsed().as_secs());
                 acknowledged = report(&progress, finish.is_some());
                 if finish.is_some() {
                     break;
