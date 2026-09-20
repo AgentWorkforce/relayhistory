@@ -92,8 +92,9 @@ pub struct CaptureProgress {
     pub processed_files: usize,
     pub total_files: Option<usize>,
 }
+type CaptureObserver = std::rc::Rc<dyn Fn(CaptureProgress)>;
 thread_local! {
-    static CAPTURE_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn(CaptureProgress)>>> = std::cell::RefCell::new(None);
+    static CAPTURE_OBSERVER: std::cell::RefCell<Option<CaptureObserver>> = std::cell::RefCell::new(None);
 }
 
 /// Observes this thread's capture only; no paths or session contents are exposed.
@@ -101,13 +102,14 @@ pub fn sync_local_at_with_progress(
     db_path: &Path,
     observer: impl Fn(CaptureProgress) + 'static,
 ) -> Result<bool> {
-    struct Restore(Option<Box<dyn Fn(CaptureProgress)>>);
+    struct Restore(Option<CaptureObserver>);
     impl Drop for Restore {
         fn drop(&mut self) {
             CAPTURE_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
         }
     }
-    let _restore = Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+    let _restore =
+        Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
     capture_progress("initializing", 0, None);
     let result = sync_local_at(db_path);
     if matches!(result, Ok(true)) {
@@ -118,7 +120,8 @@ pub fn sync_local_at_with_progress(
 
 fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
     CAPTURE_OBSERVER.with(|slot| {
-        if let Some(observer) = slot.borrow().as_ref() {
+        let observer = slot.borrow().clone();
+        if let Some(observer) = observer {
             observer(CaptureProgress {
                 source: source.into(),
                 processed_files,
@@ -8194,7 +8197,7 @@ mod capture_progress_tests {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let observed = updates.clone();
         CAPTURE_OBSERVER.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move |p| observed.lock().unwrap().push(p)))
+            *slot.borrow_mut() = Some(std::rc::Rc::new(move |p| observed.lock().unwrap().push(p)))
         });
         let files: Vec<_> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
         assert_eq!(files.len(), 2);
@@ -8213,6 +8216,36 @@ mod capture_progress_tests {
         capture_progress("restored", 0, None);
         assert_eq!(updates.lock().unwrap().last().unwrap().source, "restored");
         CAPTURE_OBSERVER.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn callbacks_can_reenter_capture_and_restore_the_outer_observer() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("bad.db");
+        fs::write(&db, "not a database").unwrap();
+        let inner_db = db.clone();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let outer_updates = updates.clone();
+        assert!(sync_local_at_with_progress(&db, move |progress| {
+            outer_updates
+                .lock()
+                .unwrap()
+                .push(format!("outer:{}", progress.source));
+            let inner_updates = outer_updates.clone();
+            assert!(sync_local_at_with_progress(&inner_db, move |inner| {
+                inner_updates
+                    .lock()
+                    .unwrap()
+                    .push(format!("inner:{}", inner.source));
+            })
+            .is_err());
+        })
+        .is_err());
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec!["outer:initializing", "inner:initializing"]
+        );
+        CAPTURE_OBSERVER.with(|slot| assert!(slot.borrow().is_none()));
     }
 
     #[test]

@@ -30,7 +30,7 @@ impl Progress {
         let _ = conn.busy_timeout(Duration::from_millis(100));
         self.sessions_captured = conn
             .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE discovery_state = 'full'",
+                "SELECT COUNT(*) FROM sessions WHERE COALESCE(discovery_state, 'full') = 'full'",
                 [],
                 |r| r.get(0),
             )
@@ -66,6 +66,10 @@ impl Progress {
                     self.source, self.sessions_captured
                 ),
             },
+            "capture_paused" => format!(
+                "Local capture paused; retrying. {} session files processed, {} sessions captured",
+                self.processed_files, self.sessions_captured
+            ),
             "paused" => format!(
                 "Upload paused; retrying. {} records uploaded, {} queued",
                 self.records_uploaded, self.records_queued
@@ -91,10 +95,17 @@ impl Progress {
 pub struct Monitor {
     snapshot: Arc<Mutex<Progress>>,
     stop: Option<mpsc::Sender<bool>>,
-    thread: Option<thread::JoinHandle<()>>,
 }
 impl Monitor {
     pub fn start(directory: &Path, history_url: &str, job: Option<&str>) -> Self {
+        let url = history_url.to_owned();
+        Self::start_with_report(directory, job, move |progress| heartbeat(&url, progress))
+    }
+    fn start_with_report(
+        directory: &Path,
+        job: Option<&str>,
+        mut report: impl FnMut(&Progress) + Send + 'static,
+    ) -> Self {
         let snapshot = Arc::new(Mutex::new(Progress {
             phase: if job.is_some() {
                 "uploading"
@@ -107,20 +118,29 @@ impl Monitor {
         }));
         let shared = snapshot.clone();
         let db = directory.join("history.db");
-        let url = history_url.to_owned();
         let job = job.map(str::to_owned);
         let (stop, receive) = mpsc::channel();
-        let thread = thread::spawn(move || {
+        thread::spawn(move || {
             let started = Instant::now();
             let mut finish = None;
             loop {
+                // The next upload monitor now owns progress. Do not send a
+                // delayed final "scanning" heartbeat after successful capture.
+                if finish == Some(true) && job.is_none() {
+                    break;
+                }
                 let mut progress = shared.lock().unwrap().clone();
                 progress.read_counts(&db, job.as_deref());
                 if finish == Some(false) {
-                    progress.phase = "paused".into();
+                    progress.phase = if job.is_none() {
+                        "capture_paused"
+                    } else {
+                        "paused"
+                    }
+                    .into();
                 }
                 println!("{} ({}s)", progress.line(), started.elapsed().as_secs());
-                heartbeat(&url, &progress);
+                report(&progress);
                 if finish.is_some() {
                     break;
                 }
@@ -134,7 +154,6 @@ impl Monitor {
         Self {
             snapshot,
             stop: Some(stop),
-            thread: Some(thread),
         }
     }
     pub fn observer(&self) -> impl Fn(ai_hist::CaptureProgress) + 'static {
@@ -146,27 +165,40 @@ impl Monitor {
             p.total_files = capture.total_files;
         }
     }
+    // Sending stop is sufficient: the detached worker exits after its bounded
+    // request/final report. Capture, delivery and shutdown never join network I/O.
     pub fn finish(mut self, success: bool) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(success);
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
         }
     }
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
         self.stop.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }
 fn heartbeat(url: &str, progress: &Progress) {
-    let Ok(token) = cloud::access_token(Some(url)) else {
+    // Progress must never acquire the refresh lock or rotate credentials. The
+    // delivery path owns renewal; skip this heartbeat if its cached token expired.
+    let Ok(Some(auth)) = cloud::load_selected_auth(Some(url)) else {
         return;
     };
+    let valid = auth
+        .access_token_expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expiry| expiry.timestamp() > chrono::Utc::now().timestamp() + 5);
+    if !valid
+        || !auth.access_token.starts_with("rth_at_")
+        || !auth
+            .access_token
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+    {
+        return;
+    }
+    let token = auth.access_token;
     let result = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout(Duration::from_secs(3))
@@ -182,6 +214,58 @@ fn heartbeat(url: &str, progress: &Progress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finish_and_drop_do_not_wait_for_a_slow_reporter() {
+        for success in [None, Some(false), Some(true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let (entered, started) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let (finished, done) = mpsc::channel();
+            let mut first = true;
+            let monitor = Monitor::start_with_report(directory.path(), None, move |progress| {
+                if first {
+                    first = false;
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                } else {
+                    finished.send(progress.phase.clone()).unwrap();
+                }
+            });
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            let start = Instant::now();
+            if let Some(success) = success {
+                monitor.finish(success);
+            } else {
+                drop(monitor);
+            }
+            assert!(start.elapsed() < Duration::from_millis(100));
+            release.send(()).unwrap();
+            let final_phase = done.recv_timeout(Duration::from_secs(2));
+            if success == Some(true) {
+                assert!(matches!(
+                    final_phase,
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ));
+            } else {
+                assert_eq!(final_phase.unwrap(), "capture_paused");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_null_discovery_state_counts_as_captured() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("history.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE sessions (discovery_state TEXT); INSERT INTO sessions VALUES (NULL), ('full'), ('partial');").unwrap();
+        let mut progress = Progress::default();
+        progress.read_counts(&db, None);
+        assert_eq!(progress.sessions_captured, 2);
+        progress.phase = "capture_paused".into();
+        assert!(progress.line().contains("Local capture paused"));
+        assert!(!progress.line().contains("uploaded"));
+    }
+
     #[test]
     fn unknown_totals_do_not_claim_completion() {
         let progress = Progress {
