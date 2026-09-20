@@ -1289,23 +1289,13 @@ fn note_content_read(_path: &Path) {}
 
 pub(crate) fn complete_jsonl_records(path: &Path) -> Result<i64> {
     note_content_read(path);
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut records = 0;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        if !line.ends_with('\n') {
-            break;
-        }
-        if serde_json::from_str::<Value>(line.trim_end()).is_ok() {
-            records += 1;
-        }
-    }
-    Ok(records)
+    // The rule lives in one place and both passes call it. Deciding here as
+    // well is how the count came to disagree with the parse: it stopped at a
+    // final row with no newline without testing whether it parsed, so a
+    // transcript whose last record was valid but unterminated reported one
+    // fewer record than the parse had just read -- and that figure was
+    // checkpointed.
+    jsonl::count_records(path)
 }
 
 /// How many records the last parse of this session read, from its checkpoint.
@@ -3157,6 +3147,200 @@ mod tests {
         hydrate_session_at_with_home(&db, &options("grok", "grok-b"), dir.path()).unwrap();
         assert!(child_has_events(&conn, "grok-a"));
         assert!(tree_child_has_events(&conn, "grok-a"));
+    }
+
+    /// A marker is evidence, so a marker has to be deliverable.
+    ///
+    /// `session_markers` is where a Grok session's compaction boundaries,
+    /// system lines, synthetic turns and encrypted-reasoning traces are
+    /// stored -- for some sessions it is the *only* place anything is stored.
+    /// Durable delivery captures a table only if it is in
+    /// `delivery::schema::TABLES`, and the new table was not, so an export of
+    /// a Grok session carried its events and relationships and silently
+    /// dropped every marker. Nothing failed; the export was simply missing
+    /// evidence, which is the worst shape this repository's failures take.
+    ///
+    /// The entry is **appended**, never inserted: `delivery_jobs.bootstrap_kind`
+    /// is a persisted index into `TABLES`, so putting a row anywhere but the
+    /// end would silently re-point every in-flight job's bootstrap cursor at a
+    /// different table.
+    #[test]
+    fn a_hydrated_grok_marker_reaches_a_delivery_export() {
+        use crate::delivery::{
+            acknowledge, claim_batch, create_job, prepare_batch, store_prepared_payload,
+            AcceptanceLevel, DeliveryAcknowledgment, DeliveryJobConfig, DeliveryLimits,
+            ExportSelection,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let hydrated =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(hydrated.status, "hydrated");
+
+        let conn = open_db(&db).unwrap();
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(markers > 0, "the fixture has to write markers to test this");
+
+        let job = create_job(
+            &conn,
+            &DeliveryJobConfig {
+                destination_id: "fixture".into(),
+                instance_id: "grok".into(),
+                account_id: "account".into(),
+                mapping_version: "1".into(),
+                selection: ExportSelection {
+                    all_sources: true,
+                    kinds: vec!["session_marker".into(), "session_event".into()],
+                    ..ExportSelection::default()
+                },
+                limits: DeliveryLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+
+        let mut kinds = Vec::new();
+        for step in 0..200 {
+            let now = step * 10;
+            let prepared = prepare_batch(&conn, &job.job_id, now).unwrap();
+            if prepared.batch_id.is_none() {
+                if prepared.bootstrap_complete && prepared.scanned_records == 0 {
+                    break;
+                }
+                continue;
+            }
+            let claim = claim_batch(&conn, &job.job_id, "worker", 1000, now)
+                .unwrap()
+                .expect("a prepared batch is claimable");
+            store_prepared_payload(
+                &conn,
+                &claim.lease,
+                &claim.batch.mapping_version,
+                "application/json",
+                &serde_json::to_string(&claim.batch).unwrap(),
+                &|| now,
+            )
+            .unwrap();
+            acknowledge(
+                &conn,
+                &claim.lease,
+                &DeliveryAcknowledgment {
+                    batch_id: claim.batch.batch_id.clone(),
+                    accepted_revision_ids: claim
+                        .batch
+                        .records
+                        .iter()
+                        .map(|record| record.revision_id.clone())
+                        .collect(),
+                    unsupported_revision_ids: vec![],
+                    acceptance_level: AcceptanceLevel::Durable,
+                },
+                now,
+            )
+            .unwrap();
+            kinds.extend(claim.batch.records.into_iter().map(|record| record.kind));
+        }
+
+        let delivered = |kind: &str| kinds.iter().filter(|seen| *seen == kind).count();
+        // The positive control, which passed before the fix and still does:
+        // the session's events are exported.
+        assert!(
+            delivered("session_event") > 0,
+            "the export carried no events at all, so it proves nothing: {kinds:?}"
+        );
+        assert_eq!(
+            delivered("session_marker") as i64,
+            markers,
+            "every stored marker has to reach the export: {kinds:?}"
+        );
+    }
+
+    /// A record the parse reads is a record the count counts.
+    ///
+    /// The two are separate passes over the same files, and they disagreed:
+    /// the parse reads a final record that has no trailing newline (round
+    /// seven's rule -- not every writer terminates its last line), while the
+    /// count stopped at the missing newline without testing whether it parsed.
+    /// A one-line `chat_history.jsonl` with no final newline therefore
+    /// produced a user event and a `records_parsed` of **zero**, and that
+    /// figure was written into the hydration checkpoint as the session's
+    /// settled record total. Both passes now go through `jsonl::classify`.
+    #[test]
+    fn a_valid_final_record_without_a_newline_is_counted_as_well_as_read() {
+        let hydrate_once = |contents: &str| -> (u64, i64) {
+            let dir = tempfile::tempdir().unwrap();
+            let session = dir
+                .path()
+                .join(".grok/sessions/%2Ftmp%2Ftail/grok-tail-0001");
+            fs::create_dir_all(&session).unwrap();
+            let chat = session.join("chat_history.jsonl");
+            fs::write(&chat, contents).unwrap();
+            fs::write(
+                session.join("summary.json"),
+                r#"{"info":{"id":"grok-tail-0001","cwd":"/tmp/tail"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+            )
+            .unwrap();
+            let db = dir.path().join("history.db");
+            let conn = open_db(&db).unwrap();
+            catalog_row(&conn, "grok", "grok-tail-0001", Some(&chat));
+            drop(conn);
+            let result =
+                hydrate_session_at_with_home(&db, &options("grok", "grok-tail-0001"), dir.path())
+                    .unwrap();
+            let counted = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "HYDRATION_METRICS")
+                .and_then(|diagnostic| diagnostic.records_parsed)
+                .expect("the metrics diagnostic carries the record count");
+            (result.evidence.events, counted)
+        };
+
+        let record = r#"{"type":"user","content":"only turn"}"#;
+
+        // The baseline: the same record, terminated. Both passes already
+        // agreed here, which is why the disagreement stayed hidden. (The count
+        // covers the whole directory, so it also includes `summary.json`;
+        // these assertions are about the difference between the shapes, not
+        // about that total.)
+        let (terminated_events, terminated_count) = hydrate_once(&format!("{record}\n"));
+        assert_eq!(terminated_events, 1);
+        assert!(terminated_count >= 1);
+
+        // The case that was wrong: the very same record, with no final
+        // newline. The parse reads it, so the count must count it.
+        let (events, counted) = hydrate_once(record);
+        assert_eq!(events, terminated_events, "the parse reads it either way");
+        assert_eq!(
+            counted, terminated_count,
+            "a missing final newline does not change how many records there are"
+        );
+
+        // The positive control: an unterminated tail that does *not* parse is
+        // a record still being written -- read by neither pass and counted by
+        // neither. Without this the fix could simply be "count every line".
+        let (events, counted) = hydrate_once(&format!("{record}\n{{\"type\":\"us"));
+        assert_eq!(
+            events, terminated_events,
+            "the finished record is still read"
+        );
+        assert_eq!(
+            counted, terminated_count,
+            "and the half-written one is still not counted"
+        );
     }
 
     /// The numbers a hydration reports have to describe the read it did. Grok

@@ -61,7 +61,8 @@
 //! in the file. The previous parser stamped prompt *n* with
 //! `created_at + n` milliseconds, which is a fabricated fact.
 
-use anyhow::{Context, Result};
+use super::jsonl;
+use anyhow::Result;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -535,70 +536,13 @@ impl GrokUpdates {
     }
 }
 
-/// One complete record of a JSONL file, or the unfinished tail.
-///
-/// The distinction is the whole point: a row that ends in a newline is a row
-/// Grok finished writing, so if it does not parse the file is damaged and the
-/// read has to fail. Only the final piece of the file can lack its newline,
-/// and that one may be a record still being written.
-pub(crate) struct JsonlRow<'a> {
-    pub(crate) text: &'a str,
-    /// The row was newline-terminated, so Grok finished writing it.
-    pub(crate) complete: bool,
-}
-
-/// Split a JSONL file into rows, saying for each whether it is complete.
-pub(crate) fn jsonl_rows(contents: &str) -> impl Iterator<Item = JsonlRow<'_>> {
-    contents
-        .split_inclusive('\n')
-        .map(|row| match row.strip_suffix('\n') {
-            Some(text) => JsonlRow {
-                text: text.strip_suffix('\r').unwrap_or(text),
-                complete: true,
-            },
-            // Only the final piece can lack its newline.
-            None => JsonlRow {
-                text: row,
-                complete: false,
-            },
-        })
-}
-
-/// Parse one JSONL row, failing the read when a *complete* row does not parse.
-///
-/// `Ok(None)` is a blank line, or an unterminated trailing fragment that does
-/// not parse -- a record Grok is still writing. A complete row that is not
-/// JSON is an error, because the caller is about to **replace** this session's
-/// stored evidence with what it read: silently dropping the row would commit a
-/// snapshot that is missing a turn Grok did write, and save a change stamp
-/// that stops the next run from ever looking again.
-///
-/// A trailing fragment that *does* parse is kept. Not every JSONL writer
-/// terminates its last line, and discarding a whole record over a missing
-/// newline would lose evidence just as surely.
-pub(crate) fn parse_jsonl_row(
-    row: JsonlRow<'_>,
-    path: &Path,
-    number: usize,
-) -> Result<Option<Value>> {
-    if row.text.trim().is_empty() {
-        return Ok(None);
-    }
-    match serde_json::from_str(row.text) {
-        Ok(value) => Ok(Some(value)),
-        Err(_) if !row.complete => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("{}: line {number} is not valid JSON", path.display())),
-    }
-}
-
 /// Read `updates.jsonl` into the timing facts the join needs.
 pub(crate) fn parse_updates(contents: &str, path: &Path) -> Result<GrokUpdates> {
     let mut updates = GrokUpdates::default();
     let mut previous_kind: Option<UpdateKind> = None;
     let mut turn;
-    for (number, row) in jsonl_rows(contents).enumerate() {
-        let Some(value) = parse_jsonl_row(row, path, number + 1)? else {
+    for (number, row) in jsonl::rows(contents).enumerate() {
+        let Some(value) = jsonl::parse_row(row, path, number + 1)? else {
             continue;
         };
         let params = value.get("params").unwrap_or(&Value::Null);

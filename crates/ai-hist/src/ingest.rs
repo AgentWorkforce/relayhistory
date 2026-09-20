@@ -17,6 +17,7 @@ use std::time::Duration;
 pub(crate) mod codex;
 pub(crate) mod grok;
 pub(crate) mod hydrate;
+pub(crate) mod jsonl;
 
 use crate::diagnostics::*;
 use crate::discover;
@@ -1817,6 +1818,33 @@ fn grok_state_session(entry: &Value) -> Option<&str> {
         .get("session")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
+}
+
+/// Whether the run that last indexed this file wrote any evidence for it.
+///
+/// `None` for a state entry written before this was recorded; the caller then
+/// falls back to asking the database, which self-heals on the next re-read.
+fn grok_state_had_evidence(entry: &Value) -> Option<bool> {
+    entry.get("evidence").and_then(Value::as_bool)
+}
+
+/// Whether any Grok-owned evidence is stored for a session.
+///
+/// Both tables, because a Grok session need not produce events: one made only
+/// of `system` lines, synthetic turns or encrypted reasoning is stored
+/// entirely as markers, and asking only about events would call it unindexed
+/// on every run.
+fn grok_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    if session_events_exist(conn, "grok", session_id)? {
+        return Ok(true);
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_markers \
+         WHERE source = 'grok' AND session_id = ? LIMIT 1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
@@ -4035,6 +4063,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
         let recorded = grok_state.get(&key);
         let recorded_stamp = recorded.and_then(grok_state_stamp).map(str::to_string);
         let recorded_session = recorded.and_then(grok_state_session).map(str::to_string);
+        let recorded_evidence = recorded.and_then(grok_state_had_evidence);
         if recorded_stamp.as_deref() == Some(stamp.as_str()) {
             // The stamp says the file has not changed. That is only half the
             // question: `.sync-state.json` lives beside the database, so a
@@ -4043,19 +4072,34 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             // whose rows are gone -- until some file in the directory changes,
             // which for a finished session is never. The Codex and Claude
             // walks check the database for the same reason.
-            match recorded_session.as_deref() {
+            //
+            // The other half of that is knowing what "its rows" means for
+            // *this* session. Not every Grok session produces `session_events`
+            // -- one made only of `system` lines, synthetic turns or encrypted
+            // reasoning is stored entirely as markers -- so asking only about
+            // events would find nothing and re-read such a session on every
+            // run, forever. The answer is not to guess from the tables but to
+            // record what the indexing run actually produced.
+            match (recorded_session.as_deref(), recorded_evidence) {
                 // Written by an older build that saved the stamp alone, so
                 // there is no session id to look the evidence up by. Trust
                 // the stamp, as that build did.
-                None => {
+                (None, _) => {
                     accounted += 1;
                     continue;
                 }
-                Some(id) if session_events_exist(conn, "grok", id)? => {
+                // The run that indexed it wrote no evidence rows at all, so
+                // their absence now is not information. Trust the stamp.
+                (Some(_), Some(false)) => {
                     accounted += 1;
                     continue;
                 }
-                // Unchanged, and its evidence is missing: re-index it.
+                (Some(id), _) if grok_evidence_exists(conn, id)? => {
+                    accounted += 1;
+                    continue;
+                }
+                // Unchanged, and the evidence it did write is missing:
+                // re-index it.
                 _ => {}
             }
         }
@@ -4068,13 +4112,23 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 // replaced, not merged, and a reader must never see the gap
                 // between the two halves of that.
                 let tx = conn.unchecked_transaction()?;
-                inserted += ingest_grok_session(&tx, &session, &raw_path)?.prompts;
+                let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
+                inserted += outcome.prompts;
                 tx.commit()?;
+                // Whether this session has any evidence to go looking for on a
+                // later run. A session stored entirely as markers has no
+                // events; one whose transcript yields no usable record at all
+                // has neither, and for it the question does not arise.
+                let had_evidence = outcome.events > 0 || outcome.markers > 0;
                 sessions += 1;
                 accounted += 1;
                 // The session id travels with the stamp so the next run can
-                // ask the database whether this evidence is still there.
-                grok_state.insert(key, json!({ "stamp": stamp, "session": session_id }));
+                // ask the database whether this evidence is still there, and
+                // `evidence` says whether there was any to ask about.
+                grok_state.insert(
+                    key,
+                    json!({ "stamp": stamp, "session": session_id, "evidence": had_evidence }),
+                );
             }
             Ok(None) => {
                 // Read fine, and there was no session in it -- so there is no
@@ -5109,12 +5163,12 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let mut models: Vec<String> = Vec::new();
     let contents = fs::read_to_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
-    for (number, row) in grok::jsonl_rows(&contents).enumerate() {
+    for (number, row) in jsonl::rows(&contents).enumerate() {
         // A complete row that does not parse fails the read. The ingestion
         // this feeds replaces the session's evidence, so dropping the row
         // would commit a transcript that is missing a turn Grok did write --
         // and save the stamp that stops the next run from looking again.
-        let Some(value) = grok::parse_jsonl_row(row, chat, number + 1)? else {
+        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
             continue;
         };
         if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
@@ -6835,6 +6889,88 @@ mod tests {
             insert_history(&conn, &entry("claude", "claude-b")).unwrap(),
             0,
             "a different Claude session collapses the same way; session_id is not in the key"
+        );
+    }
+
+    /// A session whose only evidence is markers is an indexed session.
+    ///
+    /// Round seven stopped trusting an unchanged stamp on its own, by asking
+    /// the database whether the session's rows were still there. Asking only
+    /// about `session_events` was too narrow: Grok writes events for user,
+    /// assistant, tool and readable-reasoning records, and a session made only
+    /// of `system` lines, synthetic turns or encrypted reasoning lands in
+    /// `session_markers` alone. Such a session answered "not indexed" on every
+    /// later sync and was re-read in full every time -- a fix that made the
+    /// hot path do the thing it was added to prevent.
+    ///
+    /// So the indexing run records whether it wrote any evidence, and the
+    /// check asks about the tables Grok actually writes.
+    #[test]
+    fn a_session_stored_only_as_markers_is_not_re_read_every_sync() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fstream/grok-mark-0001");
+        fs::create_dir_all(&dir).unwrap();
+        // `system` and encrypted reasoning: markers, and not one event.
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                "{\"type\":\"system\",\"content\":\"session opened\"}\n",
+                "{\"type\":\"reasoning\",\"encrypted_content\":\"b64\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"grok-mark-0001","cwd":"/tmp/stream"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let mut state = Map::new();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            count("SELECT COUNT(*) FROM session_events WHERE source = 'grok'"),
+            0,
+            "the fixture must produce no events, or it does not test the case"
+        );
+        let markers = count("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'");
+        assert!(markers > 0, "but it does produce markers");
+
+        // The second sync must skip it. `sync_grok` returns prompts, which are
+        // zero either way here, so the re-read is detected by the markers
+        // being deleted and rewritten rather than left alone.
+        let marker_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM session_markers WHERE source = 'grok' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        let after: Vec<i64> = conn
+            .prepare("SELECT id FROM session_markers WHERE source = 'grok' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            after, marker_ids,
+            "an unchanged marker-only session must be skipped, not deleted and rewritten"
+        );
+
+        // The positive control: round seven's case still holds. Wipe the
+        // evidence and the same unchanged session is read again.
+        conn.execute("DELETE FROM session_markers WHERE source = 'grok'", [])
+            .unwrap();
+        super::sync_grok(&conn, &mut state, &root).unwrap();
+        assert!(
+            count("SELECT COUNT(*) FROM session_markers WHERE source = 'grok'") > 0,
+            "a session with no stored evidence at all is still re-read"
         );
     }
 
