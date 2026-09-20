@@ -427,6 +427,14 @@ pub fn session_requests_page(
     after: Option<&SessionRequestCursor>,
 ) -> Result<SessionRequestPage> {
     let limit = limit.clamp(1, 1_000);
+    // Request rows and their tool ids come from separate statements. Keep an
+    // autocommit caller on one deferred read snapshot so a concurrent sync
+    // cannot make the second statement describe a different version of the
+    // page. A caller already inside a transaction supplies that snapshot.
+    let snapshot = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
     let mut sql = format!(
         "SELECT {REQUEST_COLUMNS} FROM session_requests \
          WHERE source = ?1 AND session_id = ?2"
@@ -501,6 +509,11 @@ pub fn session_requests_page(
             }
         })
         .collect();
+    // Read-only: release an internally created snapshot explicitly. Dropping
+    // it would also roll back, but doing so here makes its lifetime clear.
+    if let Some(snapshot) = snapshot {
+        snapshot.rollback()?;
+    }
     Ok(SessionRequestPage {
         requests,
         next_cursor,

@@ -48,11 +48,15 @@ fn a_session_scoped_request_read_uses_the_event_page_index() {
     ] {
         let plan = plan(&conn, sql);
         assert!(
-            plan.contains("USING INDEX idx_session_events_source_page"),
+            plan.lines().any(|line| {
+                line.contains("SEARCH e USING INDEX idx_session_events_source_page")
+                    && line.contains("source=?")
+                    && line.contains("session_id=?")
+            }),
             "the session filter must reach the table:\n{plan}"
         );
         assert!(
-            !plan.contains("SCAN session_events") || plan.contains("USING INDEX"),
+            !plan.lines().any(|line| line.contains("SCAN e")),
             "no unindexed scan of every session:\n{plan}"
         );
     }
