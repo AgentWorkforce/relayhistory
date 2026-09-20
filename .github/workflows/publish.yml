@@ -851,15 +851,27 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           set -euo pipefail
-          # crates.io 403s requests without a User-Agent, which would look like
-          # a miss and try to republish an existing version.
-          if curl -sf -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
-            "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "ai-hist ${VERSION} already exists on crates.io; skip"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          # crates.io 403s requests without a User-Agent. Treat only 200/404 as
+          # known; any other status or a transport error must fail this gate
+          # rather than look like "not published" and retry cargo publish.
+          status="$(
+            curl -sS -o /dev/null -w "%{http_code}" \
+              -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
+              "https://crates.io/api/v1/crates/ai-hist/${VERSION}"
+          )"
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "ai-hist ${VERSION} already exists on crates.io; skip"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io lookup returned HTTP ${status}; not publishing"
+              exit 1
+              ;;
+          esac
       - name: Authenticate with crates.io
         if: ${{ !inputs.dry_run && steps.crate-gate.outputs.exists != 'true' }}
         id: crates-auth
