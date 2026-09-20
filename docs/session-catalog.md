@@ -359,7 +359,15 @@ bytes.
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
 | `encrypted_reasoning` | – | ✓ `response_item/reasoning` | `reasoning` |
 | `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | `tool_result` |
-| `unknown` | ✓ any unclassified record type | ✓ any unclassified payload type | the provider type, verbatim |
+| `unknown` | ✓ any unclassified record type, plus a `user`/`assistant` record that produced no event at all | ✓ any unclassified payload type, including `agent_reasoning_raw_content` and `agent_reasoning_section_break` | the provider type, verbatim |
+
+Every provider line leaves a row behind: an event, a marker, or both. A record
+type is silent here only when some other part of the parser is known to store
+it — a claim that is checked, not assumed, by
+`every_codex_line_leaves_an_event_or_a_marker_behind`. A record's outer `type`
+is classified independently of whether it also carries message content, so a
+future record type that happens to carry some is not filed away as an ordinary
+text event with its native type recorded nowhere.
 
 A compaction boundary states no size of its own, so a Claude
 `compaction_boundary` payload carries `tokens_before_compact` taken from the

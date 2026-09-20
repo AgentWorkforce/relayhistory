@@ -3147,29 +3147,37 @@ fn ingest_claude_transcript_as(
                 }
             }
         }
-        let Some(content) = message.and_then(|m| m.get("content")) else {
-            // A record with no message content is not nothing: summaries,
-            // compaction boundaries and subagent notifications all arrive
-            // this way. Record what it was before moving on.
-            if let Some(draft) =
-                claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
-            {
-                let marker_uid = format!("{message_uuid}:marker");
-                insert_session_marker(
-                    conn,
-                    "claude",
-                    session_id,
-                    &NewSessionMarker {
-                        marker_uid: &marker_uid,
-                        ts_ms: (ts_ms != 0).then_some(ts_ms),
-                        message_id: Some(message_uuid),
-                        parent_id: draft.parent_id.as_deref().or(parent_id),
-                        turn_id: draft.turn_id.as_deref(),
-                        kind: draft.kind,
-                        subkind: draft.subkind.as_deref(),
-                        payload_json: draft.payload_json.as_deref(),
-                    },
-                )?;
+        let record_content = message.and_then(|m| m.get("content"));
+        // Explicit `null` is not content: it reaches no event, so a record
+        // carrying it is as unrecorded as one with no `content` key at all.
+        let yields_events = record_content.is_some_and(|value| !value.is_null());
+        // Classified before the guard below rather than inside it: what a
+        // record *is* does not depend on whether it also carries a message.
+        let record_draft = claude_marker_for_record(
+            obj,
+            last_assistant_cache_read.get(session_id).copied(),
+            yields_events,
+        );
+        if let Some(draft) = &record_draft {
+            let marker_uid = format!("{message_uuid}:marker");
+            insert_session_marker(
+                conn,
+                "claude",
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &marker_uid,
+                    ts_ms: (ts_ms != 0).then_some(ts_ms),
+                    message_id: Some(message_uuid),
+                    parent_id: draft.parent_id.as_deref().or(parent_id),
+                    turn_id: draft.turn_id.as_deref(),
+                    kind: draft.kind,
+                    subkind: draft.subkind.as_deref(),
+                    payload_json: draft.payload_json.as_deref(),
+                },
+            )?;
+        }
+        let Some(content) = record_content else {
+            if let Some(draft) = &record_draft {
                 // A subagent notification is the provider reporting a
                 // delegated call finishing. It is a tool result in everything
                 // but shape, so it is stored as one — `raw_kind` keeps it
@@ -3564,13 +3572,29 @@ fn marker_string(value: Option<&Value>) -> Value {
 /// An unclassified record is still recorded, as `kind = "unknown"` carrying
 /// its provider-native type — a stored row nobody understands is recoverable,
 /// a dropped one is not.
+///
+/// The outer `type` is the provider's own name for what a record *is*, and it
+/// is classified independently of whether the record also carries message
+/// content. Classifying only records without content would mean a future type
+/// that happens to carry some became an ordinary text event with its native
+/// type recorded nowhere. `yields_events` therefore only decides whether a
+/// record of an already-modeled type needs a marker of its own.
 fn claude_marker_for_record(
     obj: &Map<String, Value>,
     tokens_before_compact: Option<i64>,
+    yields_events: bool,
 ) -> Option<MarkerDraft> {
     let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
     let subtype = obj.get("subtype").and_then(Value::as_str);
     match record_type {
+        // `user` and `assistant` are the record types the event model is built
+        // on, so they are silent -- a marker per message would double every
+        // transcript. They are still not allowed to vanish: a record of either
+        // type that produced no event at all is recorded as having existed,
+        // which is the whole claim this table makes.
+        "user" | "assistant" => {
+            (!yields_events).then(|| MarkerDraft::new("unknown", Some(record_type)))
+        }
         "summary" => Some(
             MarkerDraft::new("summary", subtype.or(Some("summary"))).with_payload(vec![
                 ("summary", marker_string(obj.get("summary"))),
@@ -3741,7 +3765,11 @@ fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static st
 ///
 /// Listing them is what lets everything else fall through to a marker: the
 /// default is "record it", and a type is silent only when something else in
-/// the parser is known to have stored it.
+/// the parser is known to have stored it. Membership here is a claim that an
+/// `event_msg` arm below persists the type -- entries with no such arm made
+/// the marker silent without anything taking its place, which is the drop this
+/// table exists to end. `every_codex_line_leaves_an_event_or_a_marker_behind`
+/// is the guard; check for a real arm before adding a name.
 fn codex_payload_is_modeled(line_type: &str, payload_type: &str) -> bool {
     match line_type {
         "event_msg" => matches!(
@@ -3749,8 +3777,6 @@ fn codex_payload_is_modeled(line_type: &str, payload_type: &str) -> bool {
             "user_message"
                 | "agent_message"
                 | "agent_reasoning"
-                | "agent_reasoning_raw_content"
-                | "agent_reasoning_section_break"
                 | "token_count"
                 | "thread_settings_applied"
                 | "mcp_tool_call_end"
@@ -7564,6 +7590,164 @@ mod tests {
             .into_iter()
             .map(|(kind, _, _)| kind)
             .collect()
+    }
+
+    /// Claiming a payload type is "modeled" is a claim that something else in
+    /// the parser stores it. For these two nothing did: they had no `event_msg`
+    /// arm, so listing them silenced the marker without anything taking their
+    /// place, and the line vanished entirely. The invariant this locks in is
+    /// the one the whole table exists for -- every line leaves a row behind.
+    #[test]
+    fn every_codex_line_leaves_an_event_or_a_marker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/11");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-reasoning.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-11T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-reason","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_reasoning_raw_content","text":"raw chain of thought"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning_section_break"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-reason");
+        for payload_type in [
+            "agent_reasoning_raw_content",
+            "agent_reasoning_section_break",
+        ] {
+            assert!(
+                markers
+                    .iter()
+                    .any(|(_, subkind, _)| subkind == payload_type),
+                "{payload_type} produced neither an event nor a marker: {markers:?}"
+            );
+        }
+
+        // The readable stream is still an event, not a second marker: a type
+        // something else really does store must stay silent here.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND text='done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        assert!(
+            !markers
+                .iter()
+                .any(|(_, subkind, _)| subkind == "agent_message"),
+            "a modeled type must not also produce a marker: {markers:?}"
+        );
+    }
+
+    /// A record's outer `type` is the provider's own name for what the record
+    /// *is*, and it is recorded independently of whether the record also
+    /// carries message content. Classifying only on the empty-content path
+    /// meant a future record type that happens to carry content became an
+    /// ordinary text event with its native type nowhere in the ledger.
+    #[test]
+    fn claude_unknown_record_types_are_recorded_even_when_they_carry_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u0","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":"an ordinary prompt"}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f1","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"user","content":"notice"}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f2","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"blocked notice"}]}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f3","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:03.000Z","message":{"role":"user","content":null}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:04.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"ok"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_markers_page(&conn, "claude", "future-session", 100, None)
+            .unwrap()
+            .markers;
+        let notices = page
+            .iter()
+            .filter(|marker| marker.subkind.as_deref() == Some("future_notice"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            3,
+            "string, array and null content must each keep the native type: {page:?}"
+        );
+        assert!(notices.iter().all(|marker| marker.kind == "unknown"));
+        assert_eq!(
+            notices
+                .iter()
+                .filter_map(|marker| marker.message_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["f1", "f2", "f3"],
+            "each record keys its own marker"
+        );
+
+        // The content that *is* modeled still becomes an event, so the marker
+        // records the record's identity rather than replacing its contents.
+        let texts: Vec<String> = conn
+            .prepare("SELECT text FROM session_events WHERE source='claude' ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(texts.iter().any(|text| text == "notice"));
+        assert!(texts.iter().any(|text| text == "blocked notice"));
+
+        // An ordinary message record is fully modeled and must not gain a
+        // marker, or every transcript doubles in rows.
+        assert!(
+            page.iter()
+                .all(|marker| marker.subkind.as_deref() != Some("user")
+                    && marker.subkind.as_deref() != Some("assistant")),
+            "modeled record types must stay silent: {page:?}"
+        );
+    }
+
+    /// The converse of the rule above: a record whose outer type *is* modeled
+    /// but which produced no event at all is still not allowed to vanish.
+    #[test]
+    fn a_message_record_that_yields_no_event_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"empty-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":null}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"empty-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"assistant","model":"m"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "empty-session");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("unknown", "user"), ("unknown", "assistant")],
+            "a record that produced nothing is recorded as having existed: {markers:?}"
+        );
     }
 
     /// A marker exists nowhere but the transcript, so the only way an existing
