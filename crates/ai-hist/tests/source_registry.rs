@@ -81,6 +81,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         model: None,
         token_json: None,
         event_uid: uid.into(),
+        raw_kind: None,
     }
 }
 impl ShallowSessionProvider for Fixture {

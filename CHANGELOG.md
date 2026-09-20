@@ -20,10 +20,15 @@ Notable changes to the native `ai-hist` CLI are documented here.
   size, never its bytes. Read one bounded page with
   `session_markers_page(conn, source, session_id, limit, after)`, which uses
   the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits.
-  `session_events.raw_kind` records the provider-native record or block type
-  an event came from, so a `tool_result` synthesized from a `system` subagent
-  notification stays distinguishable from a `tool_result` content block.
-  `HYDRATION_PARSER_VERSION` is 3, so existing databases re-parse once.
+  `SessionEvent` gains `raw_kind`, the provider-native record or block type an
+  event came from, returned by both `session_events` and `session_events_page`
+  and carried by the normalized source-evidence row contract, so a
+  `tool_result` synthesized from a `system` subagent notification stays
+  distinguishable from one that came from a `tool_result` content block.
+  `HYDRATION_PARSER_VERSION` is 3 and the global sync state generations advance
+  to `claude_sessions_v4` / `codex_rollouts_v6`, so an existing install re-reads
+  each transcript once — a marker exists nowhere but the transcript, and the
+  parser version alone only invalidates targeted hydration checkpoints.
   napi/TS/MCP exposure is not included.
 
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and

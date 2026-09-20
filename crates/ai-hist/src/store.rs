@@ -1602,6 +1602,14 @@ pub struct SessionEvent {
     pub model: Option<String>,
     pub token_json: Option<String>,
     pub event_uid: String,
+    /// Provider-native record or block type this event was derived from.
+    ///
+    /// Two very different provider records normalize to `kind = "tool_result"`
+    /// -- a `tool_result` content block and a Claude `type: "system"` subagent
+    /// notification -- and only this column tells them apart. `None` for rows
+    /// written before the column existed, and for sources that do not yet set
+    /// it.
+    pub raw_kind: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -1719,7 +1727,7 @@ pub fn session_events(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionEvent>> {
-    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
+    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid, raw_kind                    FROM session_events WHERE session_id = ?"
         .to_string();
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
@@ -1745,6 +1753,7 @@ pub fn session_events(
             model: row.get(12)?,
             token_json: row.get(13)?,
             event_uid: row.get(14)?,
+            raw_kind: row.get(15)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1761,7 +1770,7 @@ pub fn session_events_page(
     let limit = limit.clamp(1, 1_000);
     let mut sql =
         "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
-                          ts_ms, role, kind, text, model, token_json, event_uid \
+                          ts_ms, role, kind, text, model, token_json, event_uid, raw_kind \
                    FROM session_events WHERE session_id = ?"
             .to_string();
     let mut params_vec = vec![session_id.to_string()];
@@ -1796,6 +1805,7 @@ pub fn session_events_page(
             model: row.get(12)?,
             token_json: row.get(13)?,
             event_uid: row.get(14)?,
+            raw_kind: row.get(15)?,
         })
     })?;
     let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;

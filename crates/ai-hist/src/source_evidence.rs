@@ -42,7 +42,12 @@ impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
         Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt"},
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
+        // `raw_kind` is part of the projection, not just the table: the row
+        // contract is what `read_session` reads back and what a snapshot is
+        // compared against, and a column missing here is rejected outright as
+        // an unsupported column when it appears in a payload. It stays out of
+        // `required` because it is optional for every source.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid,raw_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id"},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},
@@ -348,4 +353,63 @@ pub fn read_session(
         records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::collections::HashSet;
+
+    /// Every column a canonical table has must appear in its evidence spec.
+    ///
+    /// `validate_records` rejects any payload field the spec does not list, and
+    /// `read_session` builds payloads from the live table. So a column added to
+    /// one of these tables but not to its spec turns every normalized snapshot
+    /// of that table into `INVALID_ARGUMENT` -- and it surfaces in remote
+    /// intake, a long way from the migration that caused it. Asserting the two
+    /// agree here puts the failure next to the change that causes it.
+    #[test]
+    fn every_canonical_column_is_part_of_its_evidence_spec() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        for kind in [
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+            EvidenceKind::CommitLink,
+        ] {
+            let spec = kind.spec();
+            let declared: HashSet<&str> = spec.columns.split(',').collect();
+            let actual: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{}')",
+                    spec.table
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                !actual.is_empty(),
+                "{} has no columns -- the probe read nothing, so it proves nothing",
+                spec.table
+            );
+            let missing: Vec<&String> = actual
+                .iter()
+                // `id` / `rowid` are surrogate keys `validate_records` accepts
+                // and ignores; they are deliberately not part of a projection.
+                .filter(|name| !matches!(name.as_str(), "id" | "rowid"))
+                .filter(|name| !declared.contains(name.as_str()))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{} columns are missing from the {kind:?} evidence spec: {missing:?}",
+                spec.table
+            );
+        }
+    }
 }

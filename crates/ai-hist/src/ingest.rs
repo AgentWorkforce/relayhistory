@@ -764,15 +764,17 @@ impl Drop for SyncStateLock {
 /// once per source against the whole state map, and `codex_rollouts_v4` is still
 /// *read* by this version to seed the v5 migration. Sweeping unconditionally
 /// would drop it during an earlier source's checkpoint, before
-/// `sync_codex_rollouts` has written `codex_rollouts_v5`; a crash or an
+/// `sync_codex_rollouts` has written `codex_rollouts_v6`; a crash or an
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
-    ("codex_rollouts", "codex_rollouts_v5"),
-    ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
-    ("codex_rollouts_v3", "codex_rollouts_v5"),
-    ("codex_rollouts_v4", "codex_rollouts_v5"),
+    ("codex_rollouts", "codex_rollouts_v6"),
+    ("codex_rollout_user_messages_v2", "codex_rollouts_v6"),
+    ("codex_rollouts_v3", "codex_rollouts_v6"),
+    ("codex_rollouts_v4", "codex_rollouts_v6"),
+    ("codex_rollouts_v5", "codex_rollouts_v6"),
+    ("claude_sessions_v3", "claude_sessions_v4"),
 ];
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
@@ -1448,12 +1450,19 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) ->
 ///
 /// Replaces the earlier split walks (state keys `codex_rollouts` and
 /// `codex_rollout_user_messages_v2`) with one stamp map. The current
-/// `codex_rollouts_v5` generation repairs the user-message parser change
-/// and reclassifies existing `source.subagent` markers by re-reading unchanged
-/// files once. Its per-file record carries the session id and classification so
-/// a wiped database or an older standalone-guardian classification forces the
-/// necessary re-ingestion even when the file stamp is unchanged. (session cwds,
-/// session branches, prompts inserted).
+/// `codex_rollouts_v6` generation adds `session_markers`: lifecycle,
+/// compaction and streaming-failure lines that earlier versions parsed and
+/// discarded. There is no way to recover a marker from a database -- only from
+/// the rollout -- so unlike the v4 -> v5 upgrade, which could invalidate just
+/// the entries it knew were stale, this one has to re-read every file once.
+/// The map therefore starts empty and `codex_rollouts_v5` is retired, rather
+/// than being carried forward with stamps that would skip exactly the files
+/// that need re-reading. Earlier generations repaired the user-message parser
+/// and reclassified `source.subagent` markers. Each per-file record carries the
+/// session id and classification so a wiped database or an older
+/// standalone-guardian classification forces the necessary re-ingestion even
+/// when the file stamp is unchanged. (session cwds, session branches, prompts
+/// inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
 /// Reconcile the catalog registration for a locally observed subagent.
@@ -1541,26 +1550,29 @@ fn sync_codex_rollouts(
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
+    let has_v6 = state.contains_key("codex_rollouts_v6");
     let has_v5 = state.contains_key("codex_rollouts_v5");
     let has_v4 = state.contains_key("codex_rollouts_v4");
-    // v4 already repaired user-message parsing. Its only stale knowledge is
-    // the source.subagent classification, so a v4->v5 upgrade must not
-    // re-read the complete archive: invalidate only marked subagent entries.
-    let repair_user_messages = !has_v5 && !has_v4;
+    // v4 and v5 both already repaired user-message parsing, so an upgrade from
+    // either must not redo it; only a database that predates them needs it.
+    let repair_user_messages = !has_v6 && !has_v5 && !has_v4;
+    // Deliberately seeded from v6 alone. Carrying a v5 map forward would keep
+    // a matching stamp for every rollout, and the fast path below would then
+    // skip precisely the unchanged files whose markers are missing -- an
+    // upgrade that reports a clean, fully-synced run and writes nothing.
     let mut seen = state
-        .get("codex_rollouts_v5")
-        .or_else(|| state.get("codex_rollouts_v4"))
+        .get("codex_rollouts_v6")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    if !has_v5 && has_v4 {
-        seen.retain(|_, record| record.get("subagent").and_then(Value::as_bool) != Some(true));
-    }
     // Superseded stamp maps from the split-walk era; keeping them would carry
-    // three path->stamp maps over the same 2K-file tree in .sync-state.json.
+    // several path->stamp maps over the same 2K-file tree in .sync-state.json.
+    // The in-memory removes cannot reach disk on their own -- see
+    // RETIRED_SYNC_STATE_KEYS, which is what actually sweeps them.
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    state.remove("codex_rollouts_v5");
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
@@ -1719,7 +1731,7 @@ fn sync_codex_rollouts(
         ),
     );
     state.remove("codex_rollouts_v3");
-    state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    state.insert("codex_rollouts_v6".to_string(), Value::Object(seen));
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -2660,16 +2672,24 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
-    // The v3 key forces one full re-scan on upgrade so exact remote/local ids
-    // are cached for bounded post-discovery correlation. The earlier v2 pass
-    // healed sidechains that had been attributed to their parent.
+    // The v4 key forces one full re-scan on upgrade so every transcript passes
+    // through the marker parser once. A marker exists nowhere but the
+    // transcript, and the skip below is satisfied by a matching stamp plus any
+    // pre-existing events, so carrying the v3 map forward would leave an
+    // upgraded install with no markers at all while every sync reported
+    // success. v3 is retired rather than seeded for exactly that reason.
+    // The earlier v3 pass cached exact remote/local ids for bounded
+    // post-discovery correlation; v2 healed sidechains attributed to a parent.
     let mut session_state = state
-        .get("claude_sessions_v3")
+        .get("claude_sessions_v4")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // These in-memory removes cannot reach disk on their own; RETIRED_SYNC_STATE_KEYS
+    // is what sweeps a superseded map.
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    state.remove("claude_sessions_v3");
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2717,7 +2737,7 @@ fn sync_claude_session_metadata(
         }
     }
     state.insert(
-        "claude_sessions_v3".to_string(),
+        "claude_sessions_v4".to_string(),
         Value::Object(session_state),
     );
     if scanned > 0 {
@@ -3035,7 +3055,16 @@ fn ingest_claude_transcript_as(
     // replaced is the cache read of the assistant message immediately before
     // it, which is the only place the provider states how much was in flight
     // when compaction fired.
-    let mut last_assistant_cache_read: Option<i64> = None;
+    //
+    // Keyed by session, and never written from a sidechain record. One
+    // transcript file can carry more than one identity -- a subagent sidecar's
+    // records name the parent's `sessionId`, and a named child is re-attributed
+    // to its own -- so a single file-wide value would let a delegated agent's
+    // cache read become the number a later parent boundary reports. A
+    // confidently wrong token count is worse than none, so an assistant record
+    // whose usage omits the field clears the entry rather than leaving the
+    // previous message's value standing.
+    let mut last_assistant_cache_read: HashMap<String, i64> = HashMap::new();
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -3104,20 +3133,27 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
-        if message_role == "assistant" {
-            if let Some(cache_read) = message
+        if message_role == "assistant" && !sidechain {
+            match message
                 .and_then(|m| m.get("usage"))
                 .and_then(|usage| usage.get("cache_read_input_tokens"))
                 .and_then(Value::as_i64)
             {
-                last_assistant_cache_read = Some(cache_read);
+                Some(cache_read) => {
+                    last_assistant_cache_read.insert(session_id.to_string(), cache_read);
+                }
+                None => {
+                    last_assistant_cache_read.remove(session_id);
+                }
             }
         }
         let Some(content) = message.and_then(|m| m.get("content")) else {
             // A record with no message content is not nothing: summaries,
             // compaction boundaries and subagent notifications all arrive
             // this way. Record what it was before moving on.
-            if let Some(draft) = claude_marker_for_record(obj, last_assistant_cache_read) {
+            if let Some(draft) =
+                claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
+            {
                 let marker_uid = format!("{message_uuid}:marker");
                 insert_session_marker(
                     conn,
@@ -3426,6 +3462,12 @@ fn ingest_claude_transcript_as(
 /// cannot grow with the record it describes.
 const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
 
+/// Most elements any array or object inside a marker payload keeps.
+///
+/// The element count is provider-chosen too, so bounding element *length*
+/// alone still lets a payload grow without limit.
+const MARKER_PAYLOAD_ARRAY_LIMIT: usize = 32;
+
 /// One marker a parser decided to record, before it is keyed and written.
 ///
 /// Both parsers build these in helpers rather than inline so the record and
@@ -3464,21 +3506,47 @@ impl MarkerDraft {
 fn marker_payload(fields: Vec<(&str, Value)>) -> Option<String> {
     let mut map = Map::new();
     for (name, value) in fields {
-        let value = match value {
-            Value::Null => continue,
-            Value::String(text) => Value::String(
-                text.chars()
-                    .take(MARKER_PAYLOAD_FIELD_LIMIT)
-                    .collect::<String>(),
-            ),
-            other => other,
-        };
-        map.insert(name.to_string(), value);
+        if value.is_null() {
+            continue;
+        }
+        map.insert(name.to_string(), bound_marker_value(value));
     }
     if map.is_empty() {
         return None;
     }
     serde_json::to_string(&Value::Object(map)).ok()
+}
+
+/// Bound every string anywhere in a marker payload, not just the top level.
+///
+/// The bound has to be recursive because a payload field can be a container:
+/// `tool_replacement` carries `replaces` as an array of provider-supplied tool
+/// names, and a top-level-only truncation copied each element verbatim — 32
+/// names the provider chose the length of. A marker must never grow with the
+/// record it describes, and "only at the top level" is not that guarantee.
+fn bound_marker_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(bound_marker_string(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .take(MARKER_PAYLOAD_ARRAY_LIMIT)
+                .map(bound_marker_value)
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .take(MARKER_PAYLOAD_ARRAY_LIMIT)
+                .map(|(name, value)| (bound_marker_string(&name), bound_marker_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn bound_marker_string(text: &str) -> String {
+    text.chars().take(MARKER_PAYLOAD_FIELD_LIMIT).collect()
 }
 
 fn marker_string(value: Option<&Value>) -> Value {
@@ -3610,7 +3678,6 @@ fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static st
                             names
                                 .iter()
                                 .filter_map(Value::as_str)
-                                .take(32)
                                 .map(|name| Value::String(name.to_string()))
                                 .collect(),
                         )
@@ -5529,7 +5596,7 @@ mod tests {
         );
     }
 
-    /// The v4->v5 migration drops `codex_rollouts_v4` from the in-memory map, but
+    /// A generation migration drops its predecessor from the in-memory map, but
     /// the merge only folds in the keys a run *has*, so on its own that deletion
     /// never reaches disk: the retired map is reloaded and rewritten forever.
     #[test]
@@ -5547,15 +5614,22 @@ mod tests {
             json!({"u.jsonl": "1:1"}),
         );
         on_disk.insert("codex_rollouts_v3".into(), json!({"v3.jsonl": "1:1"}));
+        on_disk.insert(
+            "codex_rollouts_v5".into(),
+            json!({"a.jsonl": {"stamp": "1:1"}}),
+        );
+        on_disk.insert("claude_sessions_v3".into(), json!({"s.jsonl": "1:1"}));
         on_disk.insert("claude".into(), json!({"keep.jsonl": 7}));
         save_sync_state(&path, &on_disk).unwrap();
 
-        // What a post-migration run holds: v5 written, the retired keys removed.
+        // What a post-migration run holds: the current generations written, the
+        // retired keys removed.
         let mut ours = Map::new();
         ours.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
+        ours.insert("claude_sessions_v4".into(), json!({"s.jsonl": "2:2"}));
         checkpoint_sync_state(&path, &ours);
 
         let saved = load_sync_state(&path).unwrap();
@@ -5566,9 +5640,10 @@ mod tests {
             );
         }
         assert_eq!(
-            saved["codex_rollouts_v5"],
+            saved["codex_rollouts_v6"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
+        assert_eq!(saved["claude_sessions_v4"], json!({"s.jsonl": "2:2"}));
         // A source this run never touched must still be preserved -- absence from
         // `ours` is not a deletion, which is why retirement has to be declared.
         assert_eq!(saved["claude"], json!({"keep.jsonl": 7}));
@@ -5578,44 +5653,44 @@ mod tests {
         assert!(super::merged_sync_state(&path, &ours).unwrap().is_none());
     }
 
-    /// `checkpoint_sync_state` runs once per source, and `codex_rollouts_v4` is
-    /// still read to seed the v5 migration. An earlier source's checkpoint must
+    /// `checkpoint_sync_state` runs once per source, and a predecessor map is
+    /// still read during its migration. An earlier source's checkpoint must
     /// therefore not drop it: if a crash landed between that checkpoint and
-    /// `sync_codex_rollouts` writing v5, neither map would survive and the next
-    /// run would re-read the whole archive.
+    /// `sync_codex_rollouts` writing the successor, neither map would survive
+    /// and the next run would re-read the whole archive.
     #[test]
     fn a_retired_key_survives_until_its_successor_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
         on_disk.insert(
-            "codex_rollouts_v4".into(),
+            "codex_rollouts_v5".into(),
             json!({"a.jsonl": {"stamp": "1:1"}}),
         );
         save_sync_state(&path, &on_disk).unwrap();
 
         // An earlier source checkpoints first; codex has not run yet, so nothing
-        // in this write supersedes v4.
+        // in this write supersedes v5.
         let mut early = Map::new();
         early.insert("claude".into(), json!({"c.jsonl": 3}));
         checkpoint_sync_state(&path, &early);
         assert_eq!(
-            load_sync_state(&path).unwrap()["codex_rollouts_v4"],
+            load_sync_state(&path).unwrap()["codex_rollouts_v5"],
             json!({"a.jsonl": {"stamp": "1:1"}}),
-            "v4 must still be readable until v5 replaces it"
+            "v5 must still be readable until v6 replaces it"
         );
 
-        // Codex then runs and writes v5 in the same state map.
+        // Codex then runs and writes v6 in the same state map.
         let mut after_codex = early.clone();
         after_codex.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
         checkpoint_sync_state(&path, &after_codex);
         let saved = load_sync_state(&path).unwrap();
-        assert!(!saved.contains_key("codex_rollouts_v4"));
+        assert!(!saved.contains_key("codex_rollouts_v5"));
         assert_eq!(
-            saved["codex_rollouts_v5"],
+            saved["codex_rollouts_v6"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
     }
@@ -6960,7 +7035,7 @@ mod tests {
         );
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v3".to_string(),
+            "claude_sessions_v4".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -7279,7 +7354,7 @@ mod tests {
         .unwrap();
         let key = named.to_string_lossy().to_string();
         state
-            .get_mut("claude_sessions_v3")
+            .get_mut("claude_sessions_v4")
             .and_then(Value::as_object_mut)
             .unwrap()
             .insert(key, json!(claude_sync_stamp(&named).unwrap()));
@@ -7368,7 +7443,7 @@ mod tests {
         }
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v3".to_string(),
+            "claude_sessions_v4".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -7489,6 +7564,307 @@ mod tests {
             .into_iter()
             .map(|(kind, _, _)| kind)
             .collect()
+    }
+
+    /// A marker exists nowhere but the transcript, so the only way an existing
+    /// install gets one is by re-reading a file whose bytes never changed.
+    /// `HYDRATION_PARSER_VERSION` does not reach this path -- it only
+    /// invalidates targeted hydration checkpoints -- so the global sync state
+    /// generation has to advance too. Seeded exactly as an upgraded install
+    /// looks: a current-at-the-time stamp map plus events already in the
+    /// database, which together satisfy the skip.
+    #[test]
+    fn a_claude_upgrade_re_reads_unchanged_transcripts_once_for_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"upgrade-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"upgrade-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],"usage":{"cache_read_input_tokens":9000}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"upgrade-session","timestamp":"2026-04-20T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the previous release left behind: the catalog row and events
+        // are present, so `claude_transcript_events_exist` is satisfied.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, raw_path) VALUES ('upgrade-session', 'claude', '/tmp/p', ?)",
+            [path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'upgrade-session', 1, 'assistant', 'text', 'hi', 'a1:0')",
+            [],
+        )
+        .unwrap();
+
+        let mut old_state = Map::new();
+        old_state.insert(
+            path.to_string_lossy().to_string(),
+            json!(claude_sync_stamp(&path).unwrap()),
+        );
+        let mut state = Map::new();
+        state.insert("claude_sessions_v3".to_string(), Value::Object(old_state));
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let markers = markers_of(&conn, "claude", "upgrade-session");
+        assert_eq!(
+            markers.len(),
+            1,
+            "the upgrade must re-read the unchanged transcript once: {markers:?}"
+        );
+        assert_eq!(markers[0].0, "compaction_boundary");
+
+        // And the new generation is what is written, so the next run is fast
+        // again rather than re-reading forever.
+        assert!(state.get("claude_sessions_v4").is_some());
+        assert!(state.get("claude_sessions_v3").is_none());
+        let before = markers_of(&conn, "claude", "upgrade-session");
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            markers_of(&conn, "claude", "upgrade-session"),
+            before,
+            "a second run is a no-op, not a second re-read"
+        );
+    }
+
+    /// The Codex half of the same upgrade. A `codex_rollouts_v5` record whose
+    /// stamp matches and whose session already has events takes the fast path
+    /// and is skipped, so the generation has to advance for markers to land.
+    #[test]
+    fn a_codex_upgrade_re_reads_unchanged_rollouts_once_for_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/10");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-upgrade.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-10T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-upgrade","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:02.000Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-upgrade', 1, 'assistant', 'text', 'done', 'retained')",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v5".into(),
+            json!({
+                rollout.to_string_lossy().to_string(): {
+                    "stamp": file_stamp(&rollout).unwrap(),
+                    "session": "sess-upgrade",
+                    "subagent": false
+                }
+            }),
+        );
+
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+
+        let kinds = marker_kinds(&conn, "codex", "sess-upgrade");
+        assert!(
+            kinds.iter().any(|kind| kind == "stream_error")
+                && kinds.iter().any(|kind| kind == "task_started"),
+            "the upgrade must re-read the unchanged rollout once: {kinds:?}"
+        );
+        assert!(state.get("codex_rollouts_v6").is_some());
+        assert!(state.get("codex_rollouts_v5").is_none());
+
+        let before = marker_kinds(&conn, "codex", "sess-upgrade");
+        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        assert_eq!(
+            marker_kinds(&conn, "codex", "sess-upgrade"),
+            before,
+            "a second run is a no-op, not a second re-read"
+        );
+    }
+
+    /// The payload bound has to be recursive. `replaces` is an array of
+    /// provider-supplied tool names, and truncating only top-level strings
+    /// copied every element verbatim -- a marker that grows without limit with
+    /// the record it is supposed to merely describe.
+    #[test]
+    fn marker_payload_bounds_strings_inside_containers_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-replacement.jsonl");
+        let huge_name = "N".repeat(4096);
+        let names = (0..64)
+            .map(|index| format!("{huge_name}{index}"))
+            .collect::<Vec<_>>();
+        let record = json!({
+            "type": "user",
+            "uuid": "u-huge",
+            "sessionId": "huge-session",
+            "cwd": "/tmp/p",
+            "timestamp": "2026-09-10T00:00:00.000Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": "ok",
+                    "_meta": { "replaces": names, "collapsedCalls": 9 }
+                }]
+            }
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "huge-session");
+        let replacement = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "tool_replacement")
+            .unwrap_or_else(|| panic!("no tool_replacement marker in {markers:?}"));
+        assert!(
+            replacement.2.len() < 8 * 1024,
+            "a marker payload must not grow with the record: {} bytes",
+            replacement.2.len()
+        );
+        let payload: Value = serde_json::from_str(&replacement.2).unwrap();
+        let replaces = payload["replaces"].as_array().unwrap();
+        assert_eq!(replaces.len(), super::MARKER_PAYLOAD_ARRAY_LIMIT);
+        for name in replaces {
+            assert_eq!(
+                name.as_str().unwrap().chars().count(),
+                super::MARKER_PAYLOAD_FIELD_LIMIT
+            );
+        }
+        assert_eq!(payload["collapsedCalls"], json!(9));
+    }
+
+    /// `raw_kind` is only worth writing if a reader returns it. Without it a
+    /// notification synthesized from a `type: "system"` row and a real
+    /// `tool_result` block are the same row through the API.
+    #[test]
+    fn raw_kind_comes_back_through_the_event_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-kind.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"rk-session","cwd":"/tmp/p","timestamp":"2026-04-24T01:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"description":"explore"}}]}}"#, "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":"a1","sessionId":"rk-session","cwd":"/tmp/p","timestamp":"2026-04-24T01:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result text"}]}}"#, "\n",
+                r#"{"type":"system","subtype":"subagent_completed","sessionId":"rk-session","timestamp":"2026-04-24T01:00:02.000Z","parent_tool_use_id":"toolu_1","agent_id":"agent-1","status":"completed","content":"subagent completed"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_events_page(&conn, "rk-session", Some("claude"), 100, None)
+            .unwrap()
+            .events;
+        let raw_kinds = page
+            .iter()
+            .filter(|event| event.kind == "tool_result")
+            .map(|event| event.raw_kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw_kinds,
+            vec![
+                Some("tool_result_block".to_string()),
+                Some("system_subagent_notification".to_string())
+            ],
+            "both tool_result rows must be distinguishable through the reader"
+        );
+
+        // The unpaged reader carries it too, so the two are not inconsistent.
+        let all = crate::session_events(&conn, "rk-session", Some("claude")).unwrap();
+        assert!(all
+            .iter()
+            .any(|event| event.raw_kind.as_deref() == Some("system_subagent_notification")));
+        assert!(
+            all.iter()
+                .any(|event| event.kind == "tool_use" && event.raw_kind.is_none()),
+            "an event nothing set raw_kind on reads back as None, not as a guess"
+        );
+    }
+
+    /// A stale token count is worse than none. The tracker used to update only
+    /// when the field was present, so an assistant message without a cache
+    /// read left the previous message's number standing and the next boundary
+    /// reported it as its own.
+    #[test]
+    fn a_compaction_boundary_does_not_inherit_an_older_messages_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-tokens.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"stale-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"one"}],"usage":{"cache_read_input_tokens":9000}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"stale-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"two"}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"stale-session","timestamp":"2026-04-20T00:00:02.000Z","compactMetadata":{"trigger":"manual"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "stale-session");
+        assert_eq!(markers.len(), 1);
+        let payload: Value = serde_json::from_str(&markers[0].2).unwrap();
+        assert_eq!(payload["trigger"], json!("manual"));
+        assert!(
+            payload.get("tokens_before_compact").is_none(),
+            "an absent cache read must clear the tracker, not inherit 9000: {payload}"
+        );
+    }
+
+    /// One transcript file can carry more than one identity: a subagent
+    /// sidecar's records name the *parent's* `sessionId`. A file-wide tracker
+    /// therefore let a delegated agent's cache read become the number the
+    /// parent's own compaction boundary reported.
+    #[test]
+    fn a_compaction_boundary_does_not_take_a_sidechain_agents_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidechain-tokens.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"side-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"parent"}],"usage":{"cache_read_input_tokens":120}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","isSidechain":true,"sessionId":"side-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"child"}],"usage":{"cache_read_input_tokens":987654}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"side-session","timestamp":"2026-04-20T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "side-session");
+        assert_eq!(markers.len(), 1);
+        let payload: Value = serde_json::from_str(&markers[0].2).unwrap();
+        assert_eq!(
+            payload["tokens_before_compact"],
+            json!(120),
+            "the parent's boundary reports the parent's context, not a delegated agent's"
+        );
     }
 
     /// A compaction boundary carries no size of its own, so the only honest
@@ -8309,7 +8685,7 @@ mod tests {
             .unwrap();
         assert_eq!(tool_count, 1);
         assert!(state.get("codex_rollouts_v3").is_none());
-        assert!(state.get("codex_rollouts_v5").is_some());
+        assert!(state.get("codex_rollouts_v6").is_some());
 
         super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
@@ -8467,7 +8843,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -8517,7 +8893,7 @@ mod tests {
     fn unchanged_subagent_state(rollout: &std::path::Path, session_id: &str) -> Map<String, Value> {
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v4".into(),
+            "codex_rollouts_v6".into(),
             json!({
                 rollout.to_string_lossy().to_string(): {
                     "stamp": file_stamp(rollout).unwrap(),
@@ -8655,7 +9031,8 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // Existing events make the old v4 entries eligible for the fast path.
+        // Existing events would have made the old v4 entries eligible for the
+        // fast path under the generation that seeded itself from them.
         for session_id in [
             "sess-top",
             "sess-standalone-guardian",
@@ -8669,8 +9046,8 @@ mod tests {
             )
             .unwrap();
         }
-        // The normal root has an existing catalog row and should stay on the
-        // stamp fast path during this targeted migration.
+        // The normal root has an existing catalog row. A v6 upgrade re-reads it
+        // anyway -- see below -- but its catalog identity must survive that.
         conn.execute(
             "INSERT INTO sessions (session_id, source, cwd) \
              VALUES ('sess-top', 'codex', '/tmp/proj')",
@@ -8732,7 +9109,12 @@ mod tests {
         );
 
         let (_, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
-        assert_eq!(inserted, 1, "standalone guardian prompt is newly indexed");
+        // `codex_rollouts_v6` is not seeded from an older map, because a marker
+        // exists nowhere but the rollout and a carried-forward stamp would skip
+        // the files whose markers are missing. So both non-subagent rollouts are
+        // re-read and re-index their one prompt each; the linked guardian stays a
+        // subagent and indexes none.
+        assert_eq!(inserted, 2, "both root and standalone prompts are indexed");
         let sessions: Vec<String> = conn
             .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
             .unwrap()
@@ -8767,12 +9149,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            root_history, 0,
-            "the unchanged root stayed on the fast path"
+            root_history, 1,
+            "an old cache costs one full re-read, which is what materializes markers"
+        );
+        let root_markers = crate::session_markers_page(&conn, "codex", "sess-top", 100, None)
+            .unwrap()
+            .markers;
+        assert!(
+            !root_markers.is_empty(),
+            "the re-read is only worth its cost if it produces the markers"
         );
         assert!(state.get("codex_rollouts_v4").is_none());
         let records = state
-            .get("codex_rollouts_v5")
+            .get("codex_rollouts_v6")
             .and_then(Value::as_object)
             .expect("upgraded rollout cache");
         assert_eq!(
