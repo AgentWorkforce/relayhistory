@@ -485,7 +485,7 @@ pub fn reconcile(conn: &Connection, source: &str) -> Result<ContinuityReconcilia
         // rewritten transcript cannot leave a stale edge queryable.
         let mut written: Vec<(String, String)> = Vec::new();
         resolve_explicit(conn, evidence, &mut written)?;
-        resolve_resume(conn, evidence, &mut reasons, &mut written)?;
+        resolve_resume(conn, evidence, &mut written)?;
         resolve_cross_file_parent(conn, evidence, &mut reasons, &mut written)?;
         // Last of the explicit signals: only when none of the above applied.
         resolve_explicit_source(conn, evidence, &mut written)?;
@@ -659,13 +659,11 @@ fn resolve_explicit_source(
 
 /// A `/resume <id>` or `/continue <id>` the human typed.
 ///
-/// A marker naming no session is recorded as unresolved rather than guessed
-/// at: the parent of a relationship row cannot be null, and the nearest
-/// session in time is not evidence.
+/// A marker naming no session does not establish lineage. Another transcript
+/// cannot supply its missing target, so it is neither an edge nor pending work.
 fn resolve_resume(
     conn: &Connection,
     evidence: &ContinuityEvidence,
-    reasons: &mut Vec<String>,
     written: &mut Vec<(String, String)>,
 ) -> Result<()> {
     if !evidence.has_resume_marker {
@@ -676,7 +674,6 @@ fn resolve_resume(
         .as_deref()
         .filter(|target| !target.is_empty())
     else {
-        reasons.push("resume marker names no prior session".to_string());
         return Ok(());
     };
     if target == evidence.session_id {
@@ -800,6 +797,15 @@ fn resolve_fork_group(
         return Ok(());
     }
     for member in &group {
+        // Group membership alone is weaker than a provider-named target or a
+        // parent record already indexed in another session. This check must
+        // cover siblings too: they may have reconciled before the group grew,
+        // and emitting their fork here would add a second lineage parent.
+        if (member.locator == evidence.locator && has_lineage)
+            || has_stronger_lineage(conn, member)?
+        {
+            continue;
+        }
         let child = (member.session_id != origin).then_some(member.session_id.as_str());
         let uid = write_edge(
             conn,
@@ -817,6 +823,32 @@ fn resolve_fork_group(
         }
     }
     Ok(())
+}
+
+fn has_stronger_lineage(conn: &Connection, evidence: &ContinuityEvidence) -> Result<bool> {
+    let names_other_session = |target: &str| !target.is_empty() && target != evidence.session_id;
+    if evidence
+        .explicit_continuation_targets
+        .iter()
+        .chain(&evidence.explicit_fork_targets)
+        .any(|target| names_other_session(target))
+        || evidence
+            .explicit_source_session_id
+            .as_deref()
+            .is_some_and(names_other_session)
+        || evidence.has_resume_marker
+            && evidence
+                .resume_target
+                .as_deref()
+                .is_some_and(names_other_session)
+    {
+        return Ok(true);
+    }
+    let Some(parent_uuid) = evidence.first_parent_uuid.as_deref() else {
+        return Ok(false);
+    };
+    Ok(session_holding_record(conn, &evidence.source, parent_uuid)?
+        .is_some_and(|session| session != evidence.session_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,6 +2030,79 @@ mod tests {
         let pending = pending_reasons(&conn, "claude", "shared").unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].1.contains("a fork needs a sibling"));
+    }
+
+    #[test]
+    fn a_later_fork_sibling_does_not_add_a_parent_to_stronger_lineage() {
+        let (dir, conn) = database();
+        let stronger = dir.path().join("branch-a.jsonl");
+        let sibling = dir.path().join("branch-b.jsonl");
+        std::fs::write(
+            &stronger,
+            "{\"sessionId\":\"shared\",\"uuid\":\"a-u\",\"parentUuid\":null,\"type\":\"user\",\"continuedFromSessionId\":\"prior\",\"message\":{\"role\":\"user\",\"content\":\"carry on\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &sibling,
+            "{\"sessionId\":\"shared\",\"uuid\":\"b-u\",\"parentUuid\":null,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"branch\"}}\n",
+        )
+        .unwrap();
+        capture_claude_transcript(&conn, &stronger).unwrap();
+        reconcile(&conn, "claude").unwrap();
+        capture_claude_transcript(&conn, &sibling).unwrap();
+        reconcile(&conn, "claude").unwrap();
+
+        let rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT relationship, parent_session_id, evidence_locator \
+                 FROM session_relationships WHERE source = 'claude' \
+                 ORDER BY relationship, evidence_locator",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "continuation".into(),
+                    "prior".into(),
+                    stronger.to_string_lossy().into_owned(),
+                ),
+                (
+                    "fork".into(),
+                    "shared".into(),
+                    sibling.to_string_lossy().into_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn nameless_continue_does_not_leave_permanent_pending_evidence() {
+        let (dir, conn) = database();
+        for (session, explicit) in [("ordinary", ""), ("continued", ",\"continuedFromSessionId\":\"prior\"")] {
+            let path = dir.path().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"sessionId\":\"{session}\",\"uuid\":\"{session}-u\",\"parentUuid\":null,\"type\":\"user\"{explicit},\"message\":{{\"role\":\"user\",\"content\":\"/continue\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            capture_claude_transcript(&conn, &path).unwrap();
+        }
+        reconcile(&conn, "claude").unwrap();
+        assert!(pending_reasons(&conn, "claude", "ordinary")
+            .unwrap()
+            .is_empty());
+        assert!(pending_reasons(&conn, "claude", "continued")
+            .unwrap()
+            .is_empty());
+        assert!(edges(&conn, "ordinary").is_empty());
+        assert_eq!(edges(&conn, "prior").len(), 1);
     }
 
     #[test]
