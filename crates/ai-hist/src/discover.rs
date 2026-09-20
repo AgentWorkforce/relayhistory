@@ -254,6 +254,12 @@ impl CounterCell {
 pub struct DiscoveryEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: PathBuf,
+    /// Claude Code configuration root.
+    pub claude_config_dir: PathBuf,
+    /// Codex state root.
+    pub codex_home: PathBuf,
+    /// Grok state root.
+    pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     conn: &'a Connection,
@@ -261,11 +267,22 @@ pub struct DiscoveryEnv<'a> {
 }
 
 impl<'a> DiscoveryEnv<'a> {
-    /// Build an environment from the process environment (`HOME`, `OPENCODE_DB`).
+    /// Build an environment from the process environment.
     pub fn new(conn: &'a Connection) -> Self {
+        let roots = crate::ProviderRoots::from_env(crate::home_dir());
+        Self::with_provider_roots(conn, roots)
+    }
+
+    pub(crate) fn with_provider_roots(
+        conn: &'a Connection,
+        roots: crate::ProviderRoots,
+    ) -> Self {
         Self {
-            home: crate::home_dir(),
-            opencode_db: crate::default_opencode_db_path(),
+            home: roots.home,
+            claude_config_dir: roots.claude,
+            codex_home: roots.codex,
+            grok_home: roots.grok,
+            opencode_db: roots.opencode_db,
             conn,
             counters: CounterCell::default(),
         }
@@ -275,12 +292,29 @@ impl<'a> DiscoveryEnv<'a> {
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
-        Self {
-            home,
-            opencode_db,
+        Self::with_provider_roots(conn, crate::ProviderRoots::from_home(home, opencode_db))
+    }
+
+    /// Build an environment with every provider root supplied explicitly.
+    pub fn with_all_roots(
+        conn: &'a Connection,
+        home: PathBuf,
+        claude_config_dir: PathBuf,
+        codex_home: PathBuf,
+        grok_home: PathBuf,
+        opencode_db: PathBuf,
+    ) -> Self {
+        Self::with_provider_roots(
             conn,
-            counters: CounterCell::default(),
-        }
+            crate::ProviderRoots {
+                home,
+                claude: claude_config_dir,
+                codex: codex_home,
+                grok: grok_home,
+                opencode_db,
+                use_env_roots: false,
+            },
+        )
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -295,6 +329,9 @@ impl<'a> DiscoveryEnv<'a> {
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
             home: &self.home,
+            claude_config_dir: &self.claude_config_dir,
+            codex_home: &self.codex_home,
+            grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
             counters: &self.counters,
         }
@@ -329,6 +366,12 @@ impl<'a> DiscoveryEnv<'a> {
 pub struct ScanEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: &'a Path,
+    /// Claude Code configuration root.
+    pub claude_config_dir: &'a Path,
+    /// Codex state root.
+    pub codex_home: &'a Path,
+    /// Grok state root.
+    pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     counters: &'a CounterCell,
@@ -716,7 +759,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
+            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "jsonl")?,
             crate::file_stamp_and_modified,
         )
     }
@@ -886,8 +929,8 @@ impl ShallowSessionProvider for CodexProvider {
     ) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for root in [
-            env.home.join(".codex/sessions"),
-            env.home.join(".codex/archived_sessions"),
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
         ] {
             files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
         }
@@ -1131,7 +1174,7 @@ impl ShallowSessionProvider for GrokProvider {
         file_candidates(
             "grok",
             crate::collect_matching_files(
-                &env.home.join(".grok/sessions"),
+                &env.grok_home.join("sessions"),
                 "chat_history",
                 "jsonl",
             )?,

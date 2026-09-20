@@ -347,7 +347,8 @@ unlinked evidence and the child id is left null — it is never taken from the
 
 How each adapter works:
 
-- **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
+- **claude** — `$CLAUDE_CONFIG_DIR/projects/**/*.jsonl` (default
+  `~/.claude/projects/**/*.jsonl`). Head for identity, `cwd`,
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
@@ -357,8 +358,9 @@ How each adapter works:
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet.
-- **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
-  `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
+- **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
+  `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
+  is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Subagent threads are real
   rollouts but not user sessions, so they are excluded — exactly as the full
@@ -368,7 +370,8 @@ How each adapter works:
   Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
   always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
   the project directory name.
-- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
+- **grok** — `$GROK_HOME/sessions/<encoded-path>/<id>/` (default
+  `~/.grok/sessions/<encoded-path>/<id>/`). Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default

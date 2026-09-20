@@ -81,7 +81,8 @@ pub fn sync_local() -> Result<()> {
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
-    sync_local_at_with_home(db_path, &home_dir())
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    sync_exclusive(db_path)
 }
 
 /// Full local ingest using an explicit provider home instead of the process
@@ -383,7 +384,24 @@ impl SyncSourceReport {
     }
 }
 
-fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
+fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -> Result<()> {
+    let home = &roots.home;
+    if roots.use_env_roots {
+        for (var, root) in [
+            ("CLAUDE_CONFIG_DIR", &roots.claude),
+            ("CODEX_HOME", &roots.codex),
+            ("GROK_HOME", &roots.grok),
+        ] {
+            if std::env::var_os(var).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+                && !root.exists()
+            {
+                sync_note!(
+                    "  [{var}] configured root not found: {} (skipped)",
+                    root.display()
+                );
+            }
+        }
+    }
     let mut total_inserted = 0;
     let mut report = SyncSourceReport::default();
     let state_path = db_path
@@ -425,7 +443,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
             conn,
             &mut state,
             "claude",
-            &home.join(".claude/history.jsonl"),
+            &roots.claude.join("history.jsonl"),
             parse_claude_line,
             &mut |in_progress| checkpoint_sync_state(&state_path, in_progress),
         ),
@@ -436,13 +454,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     if report
         .capture(
             "claude-metadata",
-            sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects")),
+            sync_claude_session_metadata(conn, &mut state, &roots.claude.join("projects")),
         )
         .is_some()
     {
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, home)) {
+    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, &roots.codex)) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -455,7 +473,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     }
     if let Some(inserted) = report.capture(
         "grok",
-        sync_grok(conn, &mut state, &home.join(".grok/sessions")),
+        sync_grok(conn, &mut state, &roots.grok.join("sessions")),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -465,9 +483,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
-    let opencode = std::env::var_os("OPENCODE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+    let opencode = roots.opencode_db.clone();
     if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
         if opencode.exists() {
             sync_note!("  [opencode] +{open_inserted} rows");
@@ -480,7 +496,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
-    let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode);
+    let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
     discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
@@ -578,16 +594,25 @@ fn try_acquire_sync_lock(db_path: &Path) -> Result<Option<SyncRunLock>> {
 }
 
 fn sync_exclusive(db_path: &Path) -> Result<bool> {
-    sync_exclusive_with_home(db_path, &home_dir())
+    let roots = crate::ProviderRoots::from_env(home_dir());
+    sync_exclusive_with_roots(db_path, &roots)
 }
 
 fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
+    let roots = crate::ProviderRoots::from_home(
+        home.to_path_buf(),
+        home.join(".local/share/opencode/opencode.db"),
+    );
+    sync_exclusive_with_roots(db_path, &roots)
+}
+
+fn sync_exclusive_with_roots(db_path: &Path, roots: &crate::ProviderRoots) -> Result<bool> {
     let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
         sync_note!("  [sync] another sync is already running; skipped");
         return Ok(false);
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, home).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, roots).map_err(|error| enrich_sync_error(db_path, error))?;
     Ok(true)
 }
 
@@ -600,7 +625,11 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
     let inserted = sync_opencode_db(&conn, opencode_path)
         .map_err(|error| enrich_sync_error(db_path, error))?;
     sync_note!("  [opencode] +{inserted} rows");
-    let env = DiscoveryEnv::with_roots(&conn, home_dir(), opencode_path.to_path_buf());
+    let home = home_dir();
+    let env = DiscoveryEnv::with_provider_roots(
+        &conn,
+        crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
+    );
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()
@@ -630,7 +659,8 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
         return Ok((conn, true));
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_basic(&conn, db_path, &home_dir()).map_err(|error| enrich_sync_error(db_path, error))?;
+    let roots = crate::ProviderRoots::from_env(home_dir());
+    sync_basic(&conn, db_path, &roots).map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -1380,9 +1410,9 @@ fn sync_jsonl_incremental(
     Ok(inserted)
 }
 
-fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) -> Result<usize> {
-    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, home)?;
-    let path = home.join(".codex/history.jsonl");
+fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
+    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, root)?;
+    let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
         return Ok(inserted);
@@ -1537,7 +1567,7 @@ fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result
 fn sync_codex_rollouts(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    home: &Path,
+    root: &Path,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -1564,10 +1594,7 @@ fn sync_codex_rollouts(
     let mut inserted = 0;
     let mut scanned = 0;
     let mut events = 0usize;
-    for root in [
-        home.join(".codex/sessions"),
-        home.join(".codex/archived_sessions"),
-    ] {
+    for root in [root.join("sessions"), root.join("archived_sessions")] {
         if !root.exists() {
             continue;
         }
@@ -6086,14 +6113,20 @@ mod tests {
         let codex = dir.path().join(".codex/history.jsonl");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
         fs::write(&codex, r#"{"text":"codex"#).unwrap();
-        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 0);
+        assert_eq!(
+            super::sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap(),
+            0
+        );
         assert_eq!(saved_cursor_offset(&state["codex"]), 0);
         let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
         file.write_all(br#" prompt","ts":1,"session_id":"c1"}"#)
             .unwrap();
         file.write_all(b"\n").unwrap();
         drop(file);
-        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 1);
+        assert_eq!(
+            super::sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap(),
+            1
+        );
 
         let cursor_root = dir.path().join(".cursor/projects");
         let cursor = cursor_root.join("P/agent-transcripts/s1/s1.jsonl");
@@ -7355,7 +7388,7 @@ mod tests {
                 "session": "sess-repair"
             }}),
         );
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let counts: (i64, i64, i64, Option<String>) = conn
             .query_row(
                 "SELECT \
@@ -7379,7 +7412,7 @@ mod tests {
         assert!(state.get("codex_rollouts_v3").is_none());
         assert!(state.get("codex_rollouts_v5").is_some());
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT \
@@ -7554,7 +7587,7 @@ mod tests {
         );
 
         let (cwds, branches, inserted) =
-            super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         assert_eq!(inserted, 0);
         assert!(!cwds.contains_key("sess-unchanged-sub"));
         assert!(!branches.contains_key("sess-unchanged-sub"));
@@ -7619,7 +7652,7 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let edge: (String, String, String, i64) = conn
             .query_row(
                 "SELECT parent_session_id, relationship_uid, evidence_kind, created_ms \
@@ -7635,7 +7668,7 @@ mod tests {
 
         // A second pass over the same unchanged state neither duplicates the
         // row nor re-reads the rollout to rewrite it.
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let (count, created): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), MIN(created_ms) FROM session_relationships \
@@ -7685,7 +7718,7 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let registrations: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions \
@@ -7799,7 +7832,8 @@ mod tests {
             }),
         );
 
-        let (_, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (_, _, inserted) =
+            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         assert_eq!(inserted, 1, "standalone guardian prompt is newly indexed");
         let sessions: Vec<String> = conn
             .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
@@ -7889,7 +7923,7 @@ mod tests {
         )
         .unwrap();
 
-        super::sync_codex_rollouts(&conn, &mut Map::new(), home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut Map::new(), &home.join(".codex")).unwrap();
 
         let prompts: Vec<String> = conn
             .prepare(
@@ -7945,7 +7979,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), home)
+        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), &home.join(".codex"))
             .expect_err("the trigger must fail ingestion");
         assert!(error.to_string().contains("forced subagent ingest failure"));
         let stale_rows: i64 = conn
@@ -8010,7 +8044,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let (cwds, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (cwds, _, inserted) =
+            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         assert_eq!(inserted, 1);
         // Subagent threads never reach the maps, prompt history, or session
         // registration — including rows left behind by earlier syncs.
@@ -8058,7 +8093,8 @@ mod tests {
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
             .unwrap();
-        let (_, _, inserted_again) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (_, _, inserted_again) =
+            super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         assert_eq!(inserted_again, 0);
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
