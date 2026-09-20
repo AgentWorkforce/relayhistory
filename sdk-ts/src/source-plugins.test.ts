@@ -12,6 +12,9 @@ import {
   getSourceObservation,
   hydrateSourcePlugin,
   discoverSourcePlugins,
+  SESSION_HYDRATION_CONTRACT_VERSION,
+  __testing,
+  type HydrateSessionResult,
   RelayHistoryError,
   AuthenticationExpiredError,
   SessionNotFoundError,
@@ -419,4 +422,86 @@ test('source deadlines and explicit cancellation have distinct safe errors and d
     await new Promise(resolve => setImmediate(resolve));
     assert.equal((await getSessionEventsPage('fixture-session', { source: 'claude', dbPath })).events.length, 0);
   }
+});
+
+test('a capability-limited plugin result satisfies the hydration contract it declares', async (t) => {
+  // `hydrateSourcePlugin` is public and hands this object straight back, so
+  // every field the declared contract version requires has to be on it. The
+  // empty-snapshot branch builds its result by hand rather than through the
+  // native normalizer, and its return type is inferred from a snake_case
+  // literal rather than checked against `HydrateSessionResult`, so a field
+  // added to the contract goes missing here without the compiler noticing.
+  const dir = await mkdtemp(join(tmpdir(), 'rh-source-contract-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'history.db');
+  const empty = fixture('empty');
+  empty.snapshot = {
+    source_stamp: 'metadata-only',
+    source_bytes: 7,
+    covered_kinds: [],
+    records: [],
+  };
+  const plugins = new HistoryPluginRegistry();
+  plugins.register({ sources: [empty] });
+  await discoverSessions({ scope: 'remote', plugins, dbPath });
+
+  const result = await hydrateSourcePlugin(
+    empty,
+    { source: 'claude', sessionId: 'fixture-session' },
+    { dbPath },
+  );
+  assert.equal(result.capability, 'shallow_only');
+  assert.equal(result.contract_version, SESSION_HYDRATION_CONTRACT_VERSION);
+  for (const field of [
+    'contract_version', 'source', 'session_id', 'status', 'capability',
+    'discovery_state', 'presence', 'indexed_through', 'evidence', 'bytes_read',
+    'related_session_ids', 'diagnostics',
+  ]) {
+    assert.ok(field in result, `plugin hydration result is missing ${field}`);
+  }
+  // Nothing was read from a provider file, so this is a real zero rather than
+  // an absent field that happens to read as one.
+  assert.equal(result.bytes_read, 0);
+});
+
+test('a hydration drawing on several sources reports the bytes all of them read', async () => {
+  // Evidence counts are the same rows seen twice, so the larger wins. Bytes
+  // are disjoint work each source actually did, so they add. Spreading only
+  // the result that won the capability rank let a real read be reported as
+  // the other one's zero.
+  const base: Omit<HydrateSessionResult, 'capability' | 'evidence' | 'bytesRead'> = {
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'claude',
+    sessionId: 'fixture-session',
+    status: 'hydrated',
+    discoveryState: 'full',
+    presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    relatedSessionIds: [],
+    diagnostics: [],
+  };
+  const local: HydrateSessionResult = {
+    ...base,
+    capability: 'full',
+    evidence: { prompts: 2, events: 9, toolCalls: 1, fileEdits: 0, relatedSessions: 0 },
+    bytesRead: 4096,
+  };
+  const connector: HydrateSessionResult = {
+    ...base,
+    capability: 'partial',
+    evidence: { prompts: 0, events: 3, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
+    bytesRead: 512,
+  };
+
+  const merged = __testing.combineHydration(local, connector);
+  assert.equal(merged.bytesRead, 4608);
+  // Order must not change the total, and the richer result still wins the rank.
+  assert.equal(__testing.combineHydration(connector, local).bytesRead, 4608);
+  assert.equal(merged.capability, 'full');
+  assert.equal(merged.evidence.events, 9);
+  // Neither input's own figure can pass for the total.
+  assert.notEqual(merged.bytesRead, local.bytesRead);
+  assert.notEqual(merged.bytesRead, connector.bytesRead);
+  // A single result is returned unchanged rather than doubled.
+  assert.equal(__testing.combineHydration(undefined, local).bytesRead, 4096);
 });

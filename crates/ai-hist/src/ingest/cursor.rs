@@ -135,6 +135,41 @@ pub(crate) struct ClaudeCursorState {
     /// `HYDRATION_IN_PROGRESS_MESSAGES` diagnostic rather than for correctness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_progress: Vec<String>,
+    /// Where a trailing record that had no newline began.
+    ///
+    /// Such a record is indexed if it parses (see the reader), and the cursor
+    /// still commits past it so an untouched file compares equal to its cursor
+    /// and is skipped. If the file later grows, the newline may have arrived
+    /// with more of that same record, so the next pass rewinds to here and
+    /// reads it again rather than resuming after a line it only half saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<u64>,
+    /// The record index that goes with `resume_from`, so a rewound pass gives
+    /// the record the same fallback identity it had before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_line_index: Option<usize>,
+    /// The metadata walk's position and fold over the same file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ClaudeScanState>,
+}
+
+/// The metadata walk's own resumable position and running fold.
+///
+/// Identity and metadata are recovered by a walk over the records, separate
+/// from the walk that indexes them: the indexing walk holds records back for a
+/// message still being written, the metadata walk has no reason to, and the
+/// two therefore commit at different offsets. They get a cursor each rather
+/// than one cursor that has to be correct for both.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ClaudeScanState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<TranscriptFileCursor>,
+    /// Where a trailing record without a newline began; see
+    /// `ClaudeCursorState::resume_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<u64>,
+    #[serde(default)]
+    pub fold: super::ClaudeMetaFold,
 }
 
 /// Codex's per-source resume state: everything `ingest_codex_rollout` carries
@@ -328,6 +363,19 @@ pub(crate) fn forget_locator_cursor(conn: &Connection, source: &str, path: &Path
     Ok(())
 }
 
+/// Whether a cursor has ever been recorded for `path` under `source`.
+///
+/// Distinguishes "this file has never existed" from "this file was indexed and
+/// has since been deleted". The second is a change, and a deletion is the one
+/// change that cannot be noticed by looking at the file.
+pub(crate) fn locator_cursor_exists(conn: &Connection, source: &str, path: &Path) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM transcript_cursors WHERE source = ? AND locator = ?)",
+        params![source, path.to_string_lossy()],
+        |row| row.get(0),
+    )?)
+}
+
 /// Record a whole-file cursor for `path` under `source`.
 pub(crate) fn stamp_whole_file(conn: &Connection, source: &str, path: &Path) -> Result<()> {
     let locator = path.to_string_lossy().to_string();
@@ -340,12 +388,30 @@ pub(crate) fn stamp_whole_file(conn: &Connection, source: &str, path: &Path) -> 
     store_cursor(conn, &key, &cursor)
 }
 
-/// A transcript opened at its cursor, yielding only complete records.
+/// How a record ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadRecord {
+    /// The record ended with a newline. It is committed work.
+    Terminated,
+    /// The file ended without one. The record may be everything the writer
+    /// will ever put there, or it may be half of a line still being written;
+    /// nothing in the bytes distinguishes the two. The reader hands it over
+    /// and leaves the decision to the caller, and the position does not
+    /// advance past it.
+    Unterminated,
+}
+
+/// A transcript opened at its cursor.
 pub(crate) struct TranscriptReader {
     file: fs::File,
     reader: BufReader<fs::File>,
     position: u64,
     start_offset: u64,
+    /// Bytes of an unterminated trailing record handed to the caller.
+    tail_bytes: u64,
+    /// The file is byte-for-byte where its cursor left it, so nothing has been
+    /// appended since the last pass and whatever wrote it has stopped.
+    quiesced: bool,
     device: Option<u64>,
     inode: Option<u64>,
     /// The saved cursor was rejected and the file is being read from zero
@@ -356,7 +422,16 @@ pub(crate) struct TranscriptReader {
 }
 
 impl TranscriptReader {
-    pub(crate) fn open(path: &Path, saved: Option<&TranscriptFileCursor>) -> Result<Self> {
+    /// `rewind_to` asks to start earlier than the committed offset, for a
+    /// trailing record the last pass saw without its newline. It is honoured
+    /// only when the cursor itself validates and only when it is at or before
+    /// that cursor; the prefix window is still checked against the committed
+    /// offset, so rewinding cannot be used to skip validation.
+    pub(crate) fn open(
+        path: &Path,
+        saved: Option<&TranscriptFileCursor>,
+        rewind_to: Option<u64>,
+    ) -> Result<Self> {
         let mut file = fs::File::open(path)?;
         let metadata = file.metadata()?;
         let size = metadata.len();
@@ -364,6 +439,7 @@ impl TranscriptReader {
         let (device, inode) = file_identity(&metadata);
 
         let mut rotated = false;
+        let mut quiesced = false;
         let offset = match saved {
             Some(saved) if saved.offset > 0 => {
                 let identity_changed = saved.device.is_some()
@@ -375,7 +451,10 @@ impl TranscriptReader {
                     && prefix_window_digest(&mut file, saved.offset)
                         .is_ok_and(|digest| digest == saved.prefix_hash);
                 if valid {
-                    saved.offset
+                    quiesced = size == saved.size && mtime_ns == saved.mtime_ns;
+                    rewind_to
+                        .filter(|rewind| *rewind <= saved.offset)
+                        .unwrap_or(saved.offset)
                 } else {
                     rotated = true;
                     0
@@ -391,10 +470,28 @@ impl TranscriptReader {
             reader: BufReader::new(handle),
             position: offset,
             start_offset: offset,
+            tail_bytes: 0,
+            quiesced,
             device,
             inode,
             rotated,
         })
+    }
+
+    /// Nothing has been appended since the cursor was written.
+    ///
+    /// A writer that has stopped is the only evidence available that a message
+    /// with `stop_reason: null` is never going to be finished. Without it, a
+    /// session abandoned mid-message would have that message held back on this
+    /// pass and on every pass after it.
+    pub(crate) fn quiesced(&self) -> bool {
+        self.quiesced
+    }
+
+    /// Bytes of an unterminated trailing record handed to the caller. Read,
+    /// and so counted, even though the position did not advance over them.
+    pub(crate) fn tail_bytes(&self) -> u64 {
+        self.tail_bytes
     }
 
     pub(crate) fn position(&self) -> u64 {
@@ -405,21 +502,30 @@ impl TranscriptReader {
         self.start_offset
     }
 
-    /// Read the next newline-terminated record into `line`.
+    /// Read the next record into `line`.
     ///
-    /// A trailing buffer with no newline is the half-written tail of a live
-    /// session. It is withheld and the position does not advance, so the next
-    /// pass reads it again once the writer has finished the line.
-    pub(crate) fn next_line(&mut self, line: &mut String) -> Result<bool> {
+    /// A newline-terminated record is [`ReadRecord::Terminated`] and advances
+    /// the position. A trailing buffer with no newline is
+    /// [`ReadRecord::Unterminated`]: it is still handed over, because a
+    /// provider that simply does not terminate its last line is
+    /// indistinguishable from one that has not finished writing it, and
+    /// withholding both meant a complete transcript's final record was never
+    /// indexed. The position does not advance over it, so the caller decides
+    /// what to commit.
+    pub(crate) fn next_line(&mut self, line: &mut String) -> Result<Option<ReadRecord>> {
         line.clear();
         let mut raw = Vec::new();
         let read = self.reader.read_until(b'\n', &mut raw)?;
-        if read == 0 || raw.last() != Some(&b'\n') {
-            return Ok(false);
+        if read == 0 {
+            return Ok(None);
         }
         line.push_str(&String::from_utf8_lossy(&raw));
+        if raw.last() != Some(&b'\n') {
+            self.tail_bytes = read as u64;
+            return Ok(Some(ReadRecord::Unterminated));
+        }
         self.position += read as u64;
-        Ok(true)
+        Ok(Some(ReadRecord::Terminated))
     }
 
     /// The cursor to store for a pass that committed through `offset`.

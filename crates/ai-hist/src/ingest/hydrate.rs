@@ -200,8 +200,24 @@ fn hydrate_session_at_with_home_and_connectors(
         )
     });
     let previous_stamp = previous.as_ref().and_then(|(stamp, _, _)| stamp.clone());
+    // A session whose last pass held records back is not finished with, even
+    // though its bytes have not moved. The stamp short-circuit is what decides
+    // whether a pass runs at all, so leaving it to fire here would mean the
+    // held records were never looked at again and the message was lost rather
+    // than deferred.
+    let holding_records = load_cursor(
+        &conn,
+        &CursorKey::Session {
+            source: &options.source,
+            session_id: &options.session_id,
+            location: "local",
+        },
+    )?
+    .claude
+    .is_some_and(|claude| !claude.in_progress.is_empty());
 
-    if previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
+    if !holding_records
+        && previous_stamp.as_deref() == Some(snapshot.stamp.as_str())
         && previous
             .as_ref()
             .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
@@ -1333,7 +1349,14 @@ fn ingest_claude(
     subagents: &[ClaudeSubagentEvidence],
     cursor: &mut TranscriptCursorState,
 ) -> Result<IngestOutcome> {
-    let meta = scan_claude_session_file(path)?.ok_or_else(|| {
+    // Resumed from the same cursor document the record walk uses, so a
+    // hydration of a transcript that grew by a kilobyte reads a kilobyte in
+    // total. Recovering identity by reading the whole file here made the
+    // incremental reader behind it pointless and its `bytes_read` a report
+    // about one of the two walks rather than about the hydration.
+    let mut scan = cursor.claude.clone().unwrap_or_default().scan;
+    let (meta, scanned_bytes) = scan_claude_session_file_resumed(path, &mut scan)?;
+    let meta = meta.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
             "Claude transcript has no session identity",
@@ -1356,10 +1379,18 @@ fn ingest_claude(
         meta.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
-    let mut outcome = IngestOutcome::default();
+    let mut outcome = IngestOutcome {
+        bytes_read: scanned_bytes as i64,
+        ..Default::default()
+    };
     outcome.absorb(incremental::ingest_claude_transcript_incremental(
         conn, path, None, cursor,
     )?);
+    // The record walk rewrites `cursor.claude`; put the metadata walk's own
+    // position back on it so both survive the same store.
+    if let Some(claude) = cursor.claude.as_mut() {
+        claude.scan = scan;
+    }
     record_claude_remote_relationship(conn, &meta)?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
@@ -1399,6 +1430,19 @@ pub(crate) fn ingest_claude_subagent(
     let meta_path = claude_subagent_meta_path(&evidence.path);
     if meta_path.is_file() {
         crate::ingest::cursor::stamp_whole_file(
+            conn,
+            crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
+            &meta_path,
+        )?;
+    } else {
+        // The sidecar that described this child is gone. `record_relationship`
+        // merges with COALESCE, so re-recording evidence that no longer
+        // carries a type, a name, a model or a spawn depth leaves the old ones
+        // in place: absent reads as "nothing new to say" rather than as "that
+        // is no longer true". Clearing first is what makes the merge able to
+        // express a removal.
+        clear_claude_subagent_metadata(conn, &locator)?;
+        crate::ingest::cursor::forget_locator_cursor(
             conn,
             crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
             &meta_path,
@@ -1458,6 +1502,19 @@ pub(crate) fn ingest_claude_subagent(
         }
     }
     Ok(outcome)
+}
+
+/// Forget everything a metadata sidecar said about a child, because the
+/// sidecar has been deleted.
+///
+/// Only the fields the sidecar owns. The relationship itself, the child's
+/// identity and its events are evidence from the transcript and survive.
+fn clear_claude_subagent_metadata(conn: &Connection, evidence_locator: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE session_relationships          SET child_agent_type = NULL, child_agent_name = NULL, child_model = NULL,              spawn_depth = NULL, evidence_ref = NULL          WHERE source = 'claude' AND evidence_locator = ?",
+        [evidence_locator],
+    )?;
+    Ok(())
 }
 
 /// One Claude subagent transcript beside a parent's, with whatever identity
@@ -2465,10 +2522,11 @@ mod tests {
         assert!(usage.contains("\"output_tokens\":3"), "{usage}");
 
         // Only the appended bytes were read on the second pass, plus the held
-        // message the first pass declined to commit past.
+        // message the record walk declined to commit past. The metadata walk
+        // holds nothing back, so it reads the append alone.
         let appended = incomplete_fixture_completion().len() as i64;
         let held_line = bytes.len() as i64 - INCOMPLETE_INPROGRESS_OFFSET;
-        assert_eq!(second.bytes_read, appended + held_line);
+        assert_eq!(second.bytes_read, 2 * appended + held_line);
         assert_eq!(
             stored_cursor(&db, INCOMPLETE_SESSION).committed_offset(),
             bytes.len() as i64 + appended
@@ -2592,8 +2650,9 @@ mod tests {
         let diagnostic = diagnostic(&rotated, "HYDRATION_SOURCE_ROTATED")
             .expect("truncation below the cursor is reported");
         assert!(diagnostic.message.contains("re-read in full"));
-        // Re-read from zero: every byte of the shorter file, not a resume.
-        assert_eq!(rotated.bytes_read, truncated.len() as i64);
+        // Re-read from zero: every byte of the shorter file, by both walks,
+        // not a resume.
+        assert_eq!(rotated.bytes_read, 2 * truncated.len() as i64);
         assert_eq!(
             stored_cursor(&db, session_id).committed_offset(),
             truncated.len() as i64
@@ -2667,7 +2726,7 @@ mod tests {
         let upgraded =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(upgraded.status, "updated");
-        assert_eq!(upgraded.bytes_read, bytes.len() as i64);
+        assert_eq!(upgraded.bytes_read, 2 * bytes.len() as i64);
         assert!(diagnostic(&upgraded, "HYDRATION_SOURCE_ROTATED").is_none());
 
         // And from here the cursor carries: an append reads only the append.
@@ -2680,7 +2739,7 @@ mod tests {
         drop(file);
         let resumed =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
-        assert_eq!(resumed.bytes_read, addition.len() as i64);
+        assert_eq!(resumed.bytes_read, 2 * addition.len() as i64);
     }
 
     #[test]
@@ -2903,6 +2962,12 @@ mod tests {
     /// The same property at a size CI can afford on every run: after a first
     /// pass over a transcript of many records, appending one record reads only
     /// that record's bytes.
+    ///
+    /// `bytes_read` is the **whole hydration's** total, which is the only
+    /// figure worth asserting. It once covered the record walk alone while a
+    /// metadata walk ahead of it read the file from the start, so a 1 KiB
+    /// append to a 200 MB transcript read 200 MB and reported about 1 KiB —
+    /// the shape of a success, computed over one of the two walks.
     #[test]
     fn an_append_to_a_large_transcript_reads_only_the_append() {
         let dir = tempfile::tempdir().unwrap();
@@ -2924,7 +2989,8 @@ mod tests {
 
         let first =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
-        assert_eq!(first.bytes_read, size as i64);
+        // Both walks read the whole file once.
+        assert_eq!(first.bytes_read, 2 * size as i64);
         let events_after_first = session_event_snapshot(&db, session_id).len();
 
         let addition = format!(
@@ -2944,14 +3010,197 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(
             appended.bytes_read,
-            addition.len() as i64,
-            "an append must cost its own size, not the file's"
+            2 * addition.len() as i64,
+            "an append must cost its own size across both walks, not the file's"
         );
         assert!(appended.bytes_read * 100 < size as i64);
         assert_eq!(
             session_event_snapshot(&db, session_id).len(),
             events_after_first + 1
         );
+    }
+
+    /// The last record of a transcript that does not end in a newline is still
+    /// that transcript's last record.
+    ///
+    /// Regression for the `optional-history-plugins` CI failure on #204: the
+    /// plugin SDK drives a real sync over a 525-record fixture built with
+    /// `records.join('\n')` — no trailing newline — and got 524. Withholding
+    /// every unterminated line is right for a half-written one and wrong for a
+    /// provider that simply does not terminate its last, and nothing in the
+    /// bytes tells the two apart. Parsing does: a half-written line is not
+    /// complete JSON.
+    ///
+    /// The count is the point. An off-by-one here is invisible in any
+    /// assertion that only checks the events it names.
+    #[test]
+    fn a_final_record_without_a_trailing_newline_is_still_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-unterminated";
+        let records = (0..525)
+            .map(|index| {
+                format!(
+                    "{{\"type\":\"user\",\"uuid\":\"u-{index}\",\"sessionId\":\"{session_id}\",\
+                     \"cwd\":\"/work/app\",\"timestamp\":\"2026-08-31T10:00:00Z\",\
+                     \"message\":{{\"role\":\"user\",\"content\":\"synthetic cloud prompt {index}\"}}}}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !records.ends_with('\n'),
+            "the fixture must not be terminated"
+        );
+        let transcript = seed_claude_transcript(dir.path(), session_id, records.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(result.evidence.prompts, 525);
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 525);
+        // The whole file was read once by each walk, trailing record included.
+        assert_eq!(result.bytes_read, 2 * records.len() as i64);
+
+        // A pass that changes nothing must not duplicate the record, and the
+        // cursor must sit at the end of the file so an untouched transcript is
+        // skipped outright rather than re-read for its unterminated tail.
+        assert_eq!(
+            stored_cursor(&db, session_id).committed_offset(),
+            records.len() as i64
+        );
+        let again =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
+        assert_eq!(again.bytes_read, 0);
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 525);
+
+        // When the newline and another record finally arrive, the pass rewinds
+        // to the record it read unterminated rather than resuming after it, so
+        // the completed line is re-read and upserted rather than skipped.
+        let tail = format!(
+            "\n{{\"type\":\"user\",\"uuid\":\"u-525\",\"sessionId\":\"{session_id}\",\
+             \"cwd\":\"/work/app\",\"timestamp\":\"2026-08-31T10:01:00Z\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"synthetic cloud prompt 525\"}}}}\n"
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{tail}").unwrap();
+        drop(file);
+        let grown =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 526);
+        // The re-read covers the previously unterminated record plus the new
+        // one, and nothing before it.
+        let last_record_len = records.len() as i64 - (records.rfind('\n').unwrap() as i64 + 1);
+        assert_eq!(grown.bytes_read, 2 * (last_record_len + tail.len() as i64));
+    }
+
+    /// A partial line is still withheld: the distinction is whether it parses.
+    #[test]
+    fn a_half_written_final_record_is_withheld_until_it_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-half-written";
+        let complete = format!(
+            "{{\"type\":\"user\",\"uuid\":\"u-1\",\"sessionId\":\"{session_id}\",\
+             \"cwd\":\"/work/app\",\"timestamp\":\"2026-08-31T10:00:00Z\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"first\"}}}}\n"
+        );
+        let transcript = seed_claude_transcript(dir.path(), session_id, complete.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 1);
+
+        // Half of a record, with no newline. It is not JSON, so it is not
+        // evidence of anything yet.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{{\"type\":\"user\",\"uuid\":\"u-2\",\"sessionI").unwrap();
+        drop(file);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(session_event_snapshot(&db, session_id).len(), 1);
+
+        // The rest of it arrives.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            "d\":\"{session_id}\",\"cwd\":\"/work/app\",\"timestamp\":\"2026-08-31T10:00:01Z\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"second\"}}}}"
+        )
+        .unwrap();
+        drop(file);
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let uids: Vec<String> = session_event_snapshot(&db, session_id)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(uids, vec!["u-1:0".to_string(), "u-2:0".to_string()]);
+    }
+
+    /// A message left unfinished by a writer that then stopped must not be
+    /// held back forever.
+    ///
+    /// Deferral is a bet that the provider will finish the message. When the
+    /// file stops changing the bet has lost, and holding the records back
+    /// again on every pass would lose the message permanently. A pass that
+    /// finds the file byte-for-byte where its cursor left it indexes what it
+    /// held.
+    #[test]
+    fn an_abandoned_in_progress_message_is_indexed_once_the_writer_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fs::read(fixture("incomplete-then-complete.jsonl")).unwrap();
+        let transcript = seed_claude_transcript(dir.path(), INCOMPLETE_SESSION, &bytes);
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", INCOMPLETE_SESSION, Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert_eq!(
+            diagnostic(&first, "HYDRATION_IN_PROGRESS_MESSAGES").map(|held| held.records_parsed),
+            Some(Some(1))
+        );
+        assert!(!session_event_snapshot(&db, INCOMPLETE_SESSION)
+            .iter()
+            .any(|row| row.0.starts_with("u-asst-2")));
+
+        // Nothing appended. The writer is gone, so the next pass stops waiting
+        // for a completion that is not coming. A session with a message still
+        // held is never reported `unchanged`, which is what lets this pass run
+        // at all.
+        let second =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert_ne!(second.status, "unchanged");
+        assert!(diagnostic(&second, "HYDRATION_IN_PROGRESS_MESSAGES").is_none());
+        assert!(session_event_snapshot(&db, INCOMPLETE_SESSION)
+            .iter()
+            .any(|row| row.0 == "u-asst-2:0"));
+        assert_eq!(
+            stored_cursor(&db, INCOMPLETE_SESSION).committed_offset(),
+            bytes.len() as i64
+        );
+
+        // And now it really is unchanged.
+        let third =
+            hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
+                .unwrap();
+        assert_eq!(third.status, "unchanged");
+        assert_eq!(third.bytes_read, 0);
     }
 
     #[test]

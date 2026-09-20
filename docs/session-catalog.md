@@ -565,6 +565,48 @@ baseline mid-turn. The open turn's events are still indexed as they are read —
 this is an evidence store, and a live session should be visible before its turn
 ends — and re-derived on the next pass from the last committed boundary.
 
+### A record that never got its newline
+
+A transcript's last line may have no `\n`, and nothing in the bytes says
+whether that is a record the writer has finished or half of one it is still
+writing. The reader used to withhold every such line, which is right for the
+second case and silently drops the last record of a complete transcript in the
+first — the plugin SDK's 525-record fixture is built with `join('\n')` and
+indexed 524.
+
+The rule now: an unterminated trailing record is **indexed if it parses as
+complete JSON**, because a half-written line does not. The cursor still
+commits past it, so a file nobody has touched compares equal to its cursor and
+is skipped outright; `resume_from` in the cursor remembers where that record
+began, and if the file later grows the next pass rewinds there and reads it
+again rather than resuming after a record it only half saw. Re-reading is
+harmless — the row is an idempotent upsert under the same identity.
+
+Codex keeps the older rule and withholds an unterminated line: its rollouts are
+newline-terminated, and its cursor already advances only at `task_complete`.
+
+### A message the writer abandoned
+
+Holding a message back is a bet that the provider will finish it. If the file
+stops changing the bet has lost, and holding it again on every pass would turn
+"deferred" into "lost". A pass that finds the file byte-for-byte where its
+cursor left it — same size, same mtime — stops deferring and indexes what it
+held. A session with records still held is never reported `unchanged`, which is
+what lets that pass run at all.
+
+### Identity and metadata resume too
+
+A Claude transcript is walked twice: once for identity and metadata
+(`ClaudeMetaFold`), once to index its records. Both resume from the same
+cursor document, under separate positions, because the record walk holds
+records back for a message still being written and the metadata walk has no
+reason to.
+
+They have to resume together. While the metadata walk read the whole file, a
+kilobyte appended to a 200 MB transcript still cost a 200 MB read, and
+`bytesRead` reported the kilobyte — the shape of a success, computed over one
+of the two walks. `bytesRead` is now the total across both.
+
 ### What an existing install does on the first sync after upgrading
 
 `HYDRATION_PARSER_VERSION` is 3. A checkpoint written by an earlier generation
@@ -582,7 +624,9 @@ than about file positions, and it keeps working unchanged beside the cursors.
 ### `bytesRead`
 
 `hydrateSession` now returns `bytesRead`: what that call actually read from
-provider files. Zero for an `unchanged` result, about the size of the append
+provider files, across every walk and every file it touched — and, when more
+than one source contributed, summed across them rather than taken from
+whichever one won the capability rank. Zero for an `unchanged` result, about the size of the append
 for an incremental one, and the whole file when a cursor was rejected or the
 parser generation changed. It is the number a watch loop reads to tell "the
 tail grew" from "the whole file was re-read". `HydrateSessionResult`'s contract

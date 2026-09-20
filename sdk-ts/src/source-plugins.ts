@@ -228,6 +228,10 @@ export async function hydrateSourcePlugin(
       presence: connector.location,
       indexed_through: { source_stamp: null, last_event_at_ms: null },
       evidence: { prompts: 0, events: 0, tool_calls: 0, file_edits: 0, related_sessions: 0 },
+      // Required by contract version 3. `hydrateSourcePlugin` is public and
+      // hands this object straight back, so omitting it published a result
+      // that did not satisfy the type it claims to be.
+      bytes_read: 0,
       related_session_ids: [],
       diagnostics: [
         {

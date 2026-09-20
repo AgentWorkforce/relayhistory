@@ -89,7 +89,8 @@ pub(crate) fn ingest_claude_transcript_incremental(
     attributed_session_id: Option<&str>,
     cursor: &mut TranscriptCursorState,
 ) -> Result<IncrementalPass> {
-    let mut reader = TranscriptReader::open(path, cursor.file.as_ref())?;
+    let saved_claude = cursor.claude.clone().unwrap_or_default();
+    let mut reader = TranscriptReader::open(path, cursor.file.as_ref(), saved_claude.resume_from)?;
     let mut pass = IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -100,10 +101,22 @@ pub(crate) fn ingest_claude_transcript_incremental(
     let mut claude = if reader.start_offset() == 0 {
         ClaudeCursorState::default()
     } else {
-        cursor.claude.clone().unwrap_or_default()
+        saved_claude.clone()
     };
     let start_offset = reader.start_offset();
-    let mut line_index = claude.next_line_index;
+    // A rewound pass restarts at the unterminated record it saw last time, so
+    // that record gets the index it had before rather than one past it.
+    let mut line_index = if reader.start_offset() == saved_claude.resume_from.unwrap_or(u64::MAX) {
+        saved_claude
+            .resume_line_index
+            .unwrap_or(claude.next_line_index)
+    } else {
+        claude.next_line_index
+    };
+    // Nothing has been appended since the last pass, so whatever was still
+    // being written then is not going to be finished. Holding it back again
+    // would hold it back forever.
+    let defer_unfinished = !reader.quiesced();
 
     let mut deferred: HashMap<String, DeferredMessage> = HashMap::new();
     // First-held order, which is file order, so the head is always the
@@ -111,14 +124,33 @@ pub(crate) fn ingest_claude_transcript_incremental(
     let mut deferred_order: Vec<String> = Vec::new();
     let mut deferred_bytes = 0usize;
 
+    // Where an unterminated trailing record began, and the index it was given.
+    let mut unterminated: Option<(u64, usize)> = None;
     let mut line = String::new();
     loop {
         let line_start = reader.position();
-        if !reader.next_line(&mut line)? {
+        let Some(kind) = reader.next_line(&mut line)? else {
             break;
-        }
+        };
         let index = line_index;
         line_index += 1;
+        if kind == ReadRecord::Unterminated {
+            // A record with no newline is indexed only if it is complete JSON.
+            // A half-written line is not, and a writer appends a line at a
+            // time, so parsing is the available evidence that the provider
+            // finished saying this. The cursor remembers where it began, so a
+            // file that grows is re-read from here rather than resumed after a
+            // record the reader only half saw.
+            if let Some(obj) = serde_json::from_str::<Value>(line.trim_end())
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+            {
+                pass.records += 1;
+                ingest_claude_record(conn, path, attributed_session_id, index, &obj)?;
+                unterminated = Some((line_start, index));
+            }
+            break;
+        }
         let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
             continue;
         };
@@ -143,7 +175,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                             &mut deferred_bytes,
                         )?;
                     }
-                } else if complete {
+                } else if complete || !defer_unfinished {
                     ingest_claude_record(conn, path, attributed_session_id, index, obj)?;
                 } else {
                     deferred_bytes += line.len();
@@ -187,13 +219,31 @@ pub(crate) fn ingest_claude_transcript_incremental(
     let (commit_offset, commit_line_index) =
         match deferred_order.first().and_then(|id| deferred.get(id)) {
             Some(entry) => (entry.offset, entry.line_index),
-            None => (reader.position(), line_index),
+            // With an unterminated record indexed, commit past it so a file
+            // nobody has touched compares equal to its cursor and is skipped
+            // outright; `resume_from` is what brings the reader back to it if
+            // the file ever grows.
+            None => match unterminated {
+                Some((start, _)) => (start + reader.tail_bytes(), line_index),
+                None => (reader.position(), line_index),
+            },
         };
-    pass.bytes_read = reader.position().saturating_sub(start_offset);
+    pass.bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes());
     pass.in_progress = deferred_order.clone();
 
     claude.next_line_index = commit_line_index;
     claude.in_progress = deferred_order;
+    // Only meaningful when the pass committed past the record; a pass that
+    // backed up for a held message will re-read it anyway.
+    let (resume_from, resume_line_index) = match unterminated {
+        Some((start, index)) if claude.in_progress.is_empty() => (Some(start), Some(index)),
+        _ => (None, None),
+    };
+    claude.resume_from = resume_from;
+    claude.resume_line_index = resume_line_index;
     cursor.file = Some(reader.commit(commit_offset)?);
     cursor.claude = Some(claude);
     Ok(pass)

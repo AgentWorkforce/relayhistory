@@ -2137,7 +2137,10 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    let mut reader = cursor::TranscriptReader::open(path, cursor.file.as_ref())?;
+    // Codex keeps its existing rule for a trailing line with no newline: it
+    // is the half-written tail of a live rollout and the next pass re-reads
+    // it. Unlike Claude, no Codex writer leaves its last line unterminated.
+    let mut reader = cursor::TranscriptReader::open(path, cursor.file.as_ref(), None)?;
     let mut pass = cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -2162,8 +2165,8 @@ fn ingest_codex_rollout_incremental(
     let mut line = String::new();
     loop {
         // A line without its newline is the half-written tail of a live
-        // session; `next_line` withholds it and the next pass re-reads it.
-        if !reader.next_line(&mut line)? {
+        // session; the next pass re-reads it.
+        if reader.next_line(&mut line)? != Some(cursor::ReadRecord::Terminated) {
             break;
         }
         let index = line_index;
@@ -2727,7 +2730,20 @@ fn sync_claude_session_metadata(
             cursor::forget_locator_cursor(conn, "claude", &path)?;
         }
         scanned += 1;
-        if let Some(meta) = scan_claude_session_file(&path)? {
+        // Resumed for the same reason hydration resumes it: a sync over a
+        // fleet machine's transcripts should read what arrived, not what is
+        // there.
+        let locator = path.to_string_lossy().to_string();
+        let scan_key = cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &locator,
+        };
+        let mut scan_cursor = cursor::load_cursor(conn, &scan_key)?;
+        let mut scan = scan_cursor.claude.clone().unwrap_or_default().scan;
+        let scanned_meta = scan_claude_session_file_resumed(&path, &mut scan)?.0;
+        scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
+        cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
+        if let Some(meta) = scanned_meta {
             // A subagent sidecar carries the parent's `sessionId` but is not
             // that session: registering it would overwrite the parent's
             // locator with the sidecar path, and ingesting it unattributed
@@ -2778,7 +2794,14 @@ fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
         return Ok(false);
     }
     let metadata = hydrate::claude_subagent_meta_path(path);
-    if metadata.is_file()
+    // A sidecar that was indexed and has since been deleted is a change, and
+    // it is the one change no amount of looking at the file will reveal. Its
+    // cursor is the record that it was once there; without this the transcript
+    // takes the fast path forever and the relationship keeps describing a
+    // child from a file nobody can read any more.
+    let indexed_metadata =
+        cursor::locator_cursor_exists(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?;
+    if (metadata.is_file() || indexed_metadata)
         && !cursor::transcript_unchanged(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?
     {
         return Ok(false);
@@ -2852,47 +2875,70 @@ pub(crate) struct ClaudeSessionMeta {
     agent_id: Option<String>,
 }
 
-fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let mut session_id = None;
-    let mut remote_session_id = None;
-    let mut cwd = None;
-    let mut git_branch = None;
-    let mut first_ts = None;
-    let mut last_ts = None;
-    let mut last_assistant_text = None;
-    let mut identified_records = 0usize;
-    let mut sidechain_records = 0usize;
-    let mut agent_id: Option<String> = None;
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+/// The running state of a walk over a Claude transcript's records, from which
+/// [`ClaudeSessionMeta`] is derived.
+///
+/// Split out of the walk so it can be **resumed**. Every field is either
+/// first-wins (set once, from the head of the file) or last-wins/accumulating
+/// (only the newly arrived records can change it), so folding the same
+/// records in the same order from a saved state gives the same answer as
+/// folding the whole file. That is what lets a 1 KiB append to a 200 MB
+/// transcript cost a 1 KiB read: identity and metadata used to be recovered by
+/// reading every byte before the incremental reader ran, which made the
+/// incremental reader's saving invisible in wall time and its `bytes_read`
+/// counter a report about the wrong thing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ClaudeMetaFold {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ts: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_text: Option<String>,
+    #[serde(default)]
+    pub identified_records: usize,
+    #[serde(default)]
+    pub sidechain_records: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+impl ClaudeMetaFold {
+    /// Fold one record in. Must be called in file order, once per record.
+    pub(crate) fn observe(&mut self, value: &Value) {
         if value
             .get("sessionId")
             .and_then(Value::as_str)
             .is_some_and(|id| !id.is_empty())
         {
-            identified_records += 1;
+            self.identified_records += 1;
             if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                sidechain_records += 1;
+                self.sidechain_records += 1;
             }
         }
-        if agent_id.is_none() {
-            agent_id = value
+        if self.agent_id.is_none() {
+            self.agent_id = value
                 .get("agentId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string);
         }
-        if session_id.is_none() {
-            session_id = value
+        if self.session_id.is_none() {
+            self.session_id = value
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
-        if remote_session_id.is_none() {
-            remote_session_id = [
+        if self.remote_session_id.is_none() {
+            self.remote_session_id = [
                 value.get("remoteSessionId"),
                 value.get("remote_session_id"),
                 value.pointer("/teleportedSessionInfo/sessionId"),
@@ -2904,25 +2950,25 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
             .find(|id| !id.is_empty())
             .map(str::to_string);
         }
-        if cwd.is_none() {
-            cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
+        if self.cwd.is_none() {
+            self.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-            git_branch = Some(branch.to_string());
+            self.git_branch = Some(branch.to_string());
         }
         if let Some(ts) = value
             .get("timestamp")
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
         {
-            first_ts.get_or_insert(ts);
-            last_ts = Some(ts);
+            self.first_ts.get_or_insert(ts);
+            self.last_ts = Some(ts);
         }
         if value.get("type").and_then(Value::as_str) == Some("assistant")
             && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
         {
             if let Some(content) = value.pointer("/message/content") {
                 if let Some(text) = content.as_str() {
-                    last_assistant_text = Some(text.chars().take(4096).collect());
+                    self.last_assistant_text = Some(text.chars().take(4096).collect());
                 } else if let Some(items) = content.as_array() {
                     let parts = items
                         .iter()
@@ -2930,27 +2976,96 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
                         .filter_map(|item| item.get("text").and_then(Value::as_str))
                         .collect::<Vec<_>>();
                     if !parts.is_empty() {
-                        last_assistant_text = Some(parts.join("\n").chars().take(4096).collect());
+                        self.last_assistant_text =
+                            Some(parts.join("\n").chars().take(4096).collect());
                     }
                 }
             }
         }
     }
-    let Some(session_id) = session_id else {
-        return Ok(None);
+
+    /// The session this transcript describes, or `None` when no record named
+    /// one.
+    pub(crate) fn finish(&self) -> Option<ClaudeSessionMeta> {
+        let session_id = self.session_id.clone()?;
+        let first = self.first_ts.unwrap_or(0);
+        Some(ClaudeSessionMeta {
+            session_id,
+            remote_session_id: self.remote_session_id.clone(),
+            cwd: self.cwd.clone(),
+            git_branch: self.git_branch.clone(),
+            first_ts: first,
+            last_ts: self.last_ts.unwrap_or(first),
+            last_assistant_text: self.last_assistant_text.clone(),
+            subagent: self.identified_records > 0
+                && self.sidechain_records == self.identified_records,
+            agent_id: self.agent_id.clone(),
+        })
+    }
+}
+
+/// Walk a whole Claude transcript for its identity and metadata.
+///
+/// Callers that hold a cursor should use [`scan_claude_session_file_resumed`]
+/// instead; this one exists for the paths that have no cursor to resume from
+/// and deliberately reads everything.
+fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
+    let mut state = None;
+    Ok(scan_claude_session_file_resumed(path, &mut state)?.0)
+}
+
+/// Walk only the records that have arrived since `state` was written.
+///
+/// Returns the metadata and the bytes this call read. `state` is updated in
+/// place and must be persisted by the caller; a rejected or absent cursor
+/// reads the file from the start, which is the same answer at a higher price.
+pub(crate) fn scan_claude_session_file_resumed(
+    path: &Path,
+    state: &mut Option<cursor::ClaudeScanState>,
+) -> Result<(Option<ClaudeSessionMeta>, u64)> {
+    let saved = state.clone().unwrap_or_default();
+    let mut reader = cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
+    let mut fold = if reader.start_offset() == 0 {
+        ClaudeMetaFold::default()
+    } else {
+        saved.fold.clone()
     };
-    let first = first_ts.unwrap_or(0);
-    Ok(Some(ClaudeSessionMeta {
-        session_id,
-        remote_session_id,
-        cwd,
-        git_branch,
-        first_ts: first,
-        last_ts: last_ts.unwrap_or(first),
-        last_assistant_text,
-        subagent: identified_records > 0 && sidechain_records == identified_records,
-        agent_id,
-    }))
+    let start_offset = reader.start_offset();
+    let mut resume_from = None;
+    let mut line = String::new();
+    loop {
+        let line_start = reader.position();
+        let Some(kind) = reader.next_line(&mut line)? else {
+            break;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+            if kind == cursor::ReadRecord::Unterminated {
+                break;
+            }
+            continue;
+        };
+        fold.observe(&value);
+        if kind == cursor::ReadRecord::Unterminated {
+            // Counted, because it is a complete record as far as anything can
+            // tell; re-read next time in case the writer had more to say.
+            resume_from = Some(line_start);
+            break;
+        }
+    }
+    let committed = match resume_from {
+        Some(start) => start + reader.tail_bytes(),
+        None => reader.position(),
+    };
+    let bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes());
+    *state = Some(cursor::ClaudeScanState {
+        file: Some(reader.commit(committed)?),
+        resume_from,
+        fold: fold.clone(),
+    });
+    Ok((fold.finish(), bytes_read))
 }
 
 pub(crate) fn reconcile_claude_remote_relationships(conn: &Connection) -> Result<()> {
@@ -6843,6 +6958,60 @@ mod tests {
         assert_eq!(rewritten(&conn), 1);
     }
 
+    /// A metadata sidecar that is deleted stops describing its child.
+    ///
+    /// Two things had to be true for the stale value to survive, and both were
+    /// the same mistake in different places. The transcript's fast path only
+    /// consulted the metadata cursor when the metadata file still existed, so
+    /// a deletion was the one change that could not be seen; and
+    /// `record_relationship` merges with COALESCE, so even a re-ingest read an
+    /// absent agent type as "nothing new to say" rather than as "that is no
+    /// longer true".
+    #[test]
+    fn a_deleted_metadata_sidecar_stops_describing_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let described = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(described.agent_type.as_deref(), Some("Plan"));
+
+        // The provider removes the sidecar. The transcript does not move.
+        let metadata = named.with_extension("meta.json");
+        assert!(metadata.is_file());
+        fs::remove_file(&metadata).unwrap();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let after = delegation_row(&conn, "claude_subagent_meta");
+        assert_eq!(
+            after.agent_type, None,
+            "a deleted sidecar must not keep describing the child"
+        );
+        assert_eq!(after.agent_name, None);
+        assert_eq!(after.model, None);
+        assert_eq!(after.spawn_depth, None);
+
+        // The relationship itself is evidence from the transcript, not from
+        // the sidecar, so it survives with its child and its events.
+        let child_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(child_events > 0);
+
+        // The cursor for the deleted file is gone, so the transcript can take
+        // the fast path again rather than re-reading forever.
+        assert!(
+            !cursor::locator_cursor_exists(&conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata).unwrap()
+        );
+        assert!(claude_transcript_unchanged(&conn, &named).unwrap());
+    }
+
     #[test]
     fn a_changed_metadata_sidecar_refreshes_delegation_during_a_full_sync() {
         let dir = tempfile::tempdir().unwrap();
@@ -6960,8 +7129,7 @@ mod tests {
             path,
             r#"{"type":"user","uuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:00.000Z","message":{"role":"user","content":"please update auth"}}
 {"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:01.000Z","message":{"role":"assistant","model":"claude-test","usage":{"input_tokens":11,"output_tokens":22},"content":[{"type":"text","text":"I will update auth.ts"},{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/tmp/proj/auth.ts","old_string":"old","new_string":"new"}}]}}
-{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}
-"#,
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"s-rich","cwd":"/tmp/proj","gitBranch":"feat/rich","timestamp":"2026-06-25T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","toolUseResult":{"filePath":"/tmp/proj/auth.ts","structuredPatch":"--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n","userModified":true}}]}}"#,
         )
         .unwrap();
     }

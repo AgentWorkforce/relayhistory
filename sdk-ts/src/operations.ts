@@ -953,10 +953,19 @@ function combineHydration(
       fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
       relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
     },
+    // Summed, not taken from `best`. Evidence counts are the same rows counted
+    // by two sources, so the larger is the truth; bytes are disjoint work each
+    // source actually did, so the truth is the total. Spreading `best` alone
+    // let a local read of a whole transcript be reported as the connector's
+    // zero.
+    bytesRead: previous.bytesRead + next.bytesRead,
     relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
     diagnostics: [...previous.diagnostics, ...next.diagnostics],
   };
 }
+/** Internals reachable from this package's own tests. Not public API. */
+export const __testing = { combineHydration };
+
 function validateSourceConnectors(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (
