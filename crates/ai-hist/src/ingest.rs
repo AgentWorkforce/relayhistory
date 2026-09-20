@@ -3833,14 +3833,17 @@ fn ingest_claude_transcript_as(
         // upsert instead of retaining it. The hash keeps a surviving row on
         // its identity across a rewrite; a row whose bytes changed is a new
         // identity whose predecessor stays retained. Byte-identical id-less
-        // rows share one identity.
+        // rows share one identity. The `sha256:` namespace keeps hash
+        // identities disjoint from the legacy positional `{stem}:{digits}`
+        // namespace, so the legacy detector below can never select a row
+        // the new parser wrote (an all-decimal hash would otherwise match).
         let digest = Sha256::digest(line.as_bytes());
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("session");
         let fallback_uid = format!(
-            "{stem}:{}",
+            "{stem}:sha256:{}",
             digest
                 .iter()
                 .take(8)
@@ -7753,6 +7756,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(healed, 7);
+        let sample_uid: String = conn
+            .query_row(
+                "SELECT event_uid FROM session_events WHERE source = 'claude' AND session_id = 'child' \
+                 AND text = 'delegated work'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sample_uid.starts_with("side:sha256:"),
+            "the healed row carries the namespaced hash identity: {sample_uid}"
+        );
         let positional_under_child: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'child' \
