@@ -257,10 +257,18 @@ fn hydrate_session_at_with_home_and_connectors(
         );
     }
 
+    // The content pass, on the one path that has already read every one of
+    // these files anyway. Taken *before* the writer lock: it re-reads every
+    // byte of the session's files, and doing that inside the transaction
+    // would hold the lock for the length of a full content pass over a
+    // directory that may still be growing.
+    let records_parsed = snapshot.records.count()?;
+
     // One selected provider session is one destination transaction. Provider
-    // JSONL readers ignore an incomplete final record, and every evidence table
-    // has a provider-native uniqueness key, so interruption followed by retry is
-    // safe for both new and growing sessions.
+    // JSONL readers ignore an incomplete final record -- one that is not
+    // newline-terminated, and so is still being written -- and every evidence
+    // table has a provider-native uniqueness key, so interruption followed by
+    // retry is safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_diagnostics = ingest_selected(
         &tx,
@@ -285,9 +293,6 @@ fn hydrate_session_at_with_home_and_connectors(
         params![options.source, options.session_id],
     )?;
     let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
-    // The content pass, on the one path that has already read every one of
-    // these files anyway.
-    let records_parsed = snapshot.records.count()?;
     tx.execute(
         "INSERT INTO session_hydration_checkpoints \
          (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms, source_diagnostics_json) \
@@ -1940,7 +1945,7 @@ fn build_result_with(
         source: options.source.clone(),
         session_id: options.session_id.clone(),
         status: status.to_string(),
-        capability: "full".to_string(),
+        capability: local_capability(&options.source).to_string(),
         discovery_state: "full".to_string(),
         presence: "local".to_string(),
         indexed_through: HydrationIndexedThrough {
@@ -1951,6 +1956,31 @@ fn build_result_with(
         related_session_ids,
         diagnostics,
     })
+}
+
+/// How complete the evidence from a local source can be.
+///
+/// Grok is `partial`, and the reason is the one thing this parser cannot get
+/// from the provider at any effort: Grok writes no per-turn billing tokens.
+/// `updates.jsonl` carries a running context total, which this ingestion
+/// records as an explicitly labelled proxy and never as usage -- see
+/// `GROK_USAGE_CONTEXT_PROXY_ONLY`, which travels with every Grok result and
+/// says so. A consumer ranking sources by `capability` (the TypeScript SDK
+/// scores `full: 2, partial: 1, shallow_only: 0`) would otherwise read a Grok
+/// session as carrying everything a Claude session does, and a cost report
+/// built on that would be a well-formed number computed over a proxy.
+///
+/// This is deliberately narrower than #169, which computes `capability` from
+/// declared evidence *kinds* and whose set (history, session events, tool
+/// calls, file edits, relationships) Grok now satisfies in full. Usage is not
+/// one of those kinds, so that rule alone would score Grok `full`. When #169
+/// lands, this function is where the two rules have to be reconciled rather
+/// than one silently replacing the other.
+fn local_capability(source: &str) -> &'static str {
+    match source {
+        "grok" => "partial",
+        _ => "full",
+    }
 }
 
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
@@ -3501,6 +3531,87 @@ mod tests {
         assert!(codes(&cached)
             .iter()
             .any(|(_, message)| message.contains("latest: 9210")));
+    }
+
+    /// Grok hydration answers `partial`, and says why.
+    ///
+    /// Grok writes no per-turn billing tokens -- `updates.jsonl` carries a
+    /// running context total, which can fall on compaction and is recorded
+    /// here as a labelled proxy, never as usage. Reporting `full` would tell
+    /// the TypeScript SDK's merge ranking (`full: 2, partial: 1,
+    /// shallow_only: 0`) that a Grok session carries everything a Claude
+    /// session does; a cost report built on that ranking would be a
+    /// well-formed number computed over a proxy.
+    ///
+    /// The positive control is a Claude session, not a second Grok one: no
+    /// Grok record carries per-turn input/output tokens in any layout, so
+    /// there is no Grok fixture that could legitimately report `full`, and a
+    /// control that cannot ever observe `full` would prove nothing about the
+    /// assertion. Claude's transcript does carry real per-turn usage, and it
+    /// is still `full` here.
+    #[test]
+    fn grok_hydration_is_partial_because_grok_records_no_billing_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        let parsed =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(parsed.status, "hydrated");
+        assert_eq!(parsed.capability, "partial");
+        let reason = parsed
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "GROK_USAGE_CONTEXT_PROXY_ONLY")
+            .unwrap_or_else(|| panic!("no reason given: {:?}", parsed.diagnostics));
+        assert!(
+            reason.message.contains("context"),
+            "the reason has to name the proxy: {}",
+            reason.message
+        );
+
+        // The caveat is a fact about the stored rows, so the cached read
+        // reports the same capability and the same reason.
+        let cached =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(cached.status, "unchanged");
+        assert_eq!(cached.capability, "partial");
+        assert!(cached
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "GROK_USAGE_CONTEXT_PROXY_ONLY"));
+
+        // The positive control: a provider that does record per-turn tokens
+        // still reports `full` through the same code path.
+        let transcript = dir.path().join(".claude/projects/app/session-1.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"sessionId\":\"session-1\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+                "{\"sessionId\":\"session-1\",\"uuid\":\"a1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":11,\"output_tokens\":7}},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        let claude =
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path()).unwrap();
+        assert_eq!(claude.capability, "full");
+        assert!(
+            !claude
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("GROK_")),
+            "the Grok caveat must not leak onto another source: {:?}",
+            claude.diagnostics
+        );
     }
 
     /// A checkpoint written before the diagnostics were persisted must not
