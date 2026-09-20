@@ -882,9 +882,10 @@ pub fn acknowledge(
     conn: &Connection,
     lease: &DeliveryLease,
     ack: &DeliveryAcknowledgment,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
+    let now_ms = clock();
     check_lease(&tx, lease, now_ms, LeaseCheck::Owned)?;
     ensure!(
         ack.batch_id == lease.batch_id,
@@ -978,14 +979,28 @@ fn apply_failure(
     Ok(())
 }
 
+/// Record a receiver outcome, dating the retry from *inside* the write
+/// transaction.
+///
+/// Ownership is fence-only here (`LeaseCheck::Owned`), so an expired but
+/// unclaimed worker may still record its own outcome. That is precisely why
+/// the clock must be read after the lock: acquiring it can block for as long
+/// as the busy policy allows, and `apply_failure` schedules the next attempt
+/// from `now_ms`. Dated from before the wait, a two-second backoff committed
+/// after a thirty-second wait is already twenty-eight seconds overdue, and the
+/// batch is claimable the moment the transaction commits — contention is the
+/// one situation backoff exists for, and it was the one situation that
+/// defeated it. `acknowledge` reads its clock the same way, because partial
+/// and unsupported acceptance schedule a retry through the same path.
 pub fn record_failure(
     conn: &Connection,
     lease: &DeliveryLease,
     failure: DeliveryFailure,
     retry_after_ms: Option<i64>,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<DeliveryStatus> {
     let tx = write_transaction(conn)?;
+    let now_ms = clock();
     check_lease(&tx, lease, now_ms, LeaseCheck::Owned)?;
     apply_failure(&tx, lease, failure, retry_after_ms, now_ms)?;
     tx.commit()?;
