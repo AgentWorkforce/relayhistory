@@ -133,6 +133,11 @@ That depth is enforced on the events themselves rather than left to the OS,
 because the macOS backend has no shallow mode and delivers the whole subtree
 regardless.
 
+A root is reported as *pending* only when a retry is really pending: with
+filesystem events off, or unavailable, the loop reports none, because polling
+already covers every root at `--interval` and there is no watcher to promote
+them to.
+
 `watch --remote` installs no local roots at all. Local provider writes are not
 what a remote-only run collects, and letting them drive the loop would fire the
 remote connectors on every local keystroke instead of at `--interval`.
@@ -196,6 +201,13 @@ Reads one Claude Code hook payload from stdin and hydrates exactly the
 transcript it names, instead of sweeping every provider root. The path is
 checked against Claude's own root before it is read — a hook payload comes from
 another process, and an arbitrary path must never become an ingest target.
+
+The payload makes *two* claims — which session fired, and which file holds it —
+and both are checked against each other. A delayed, replayed or malformed hook
+can pair a live `session_id` with a file belonging to another session; the
+transcript's own identity is read before anything is written, and a
+disagreement is reported as `mismatched` with nothing ingested, rather than
+attributing the lifecycle event to a session it did not come from.
 
 **The command always exits 0.** A hook runs inside the agent's tool call, and a
 non-zero exit there fails that tool call. A missing or rotated transcript, an

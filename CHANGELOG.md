@@ -14,7 +14,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   alongside the existing `--interval`. The watcher backend is behind the
   optional `fs-events` crate feature, which the CLI enables; a
   `--no-default-features` build polls.
-- Startup reports the driver **and any root not covered yet**. Roots that do
+- Startup reports the driver **and any root not covered yet** — only where a
+  retry is actually pending. A loop with no filesystem backend at all
+  (`--no-fsevents`, a build without the feature, a watcher that could not be
+  brought up) reports none, because polling covers every root at `--interval`
+  and nothing would ever promote them. Roots that do
   not exist are retried on the backstop — not on `--interval`, which may be an
   hour — so a provider installed after `watch` started becomes covered in
   seconds without a restart, while sweeps keep the cadence that was asked for.
@@ -59,7 +63,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   stale rather than recording the shortfall as the new truth.
 - New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
   lifecycle-hook payload from stdin and hydrates exactly the transcript it
-  names. It always exits 0, and `--quiet` outranks `--json` so a hook wired
+  names — and only if the transcript is the session the payload named. A
+  payload whose two claims disagree (a delayed or replayed hook pairing a live
+  session id with another session's file) is reported as `mismatched` and
+  ingests nothing. It always exits 0, and `--quiet` outranks `--json` so a hook wired
   with both stays silent. See `docs/agent-integration.md` for the
   `settings.json` wiring, including why `PreCompact` cannot be replaced by
   watch mode.

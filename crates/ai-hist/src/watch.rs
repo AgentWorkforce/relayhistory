@@ -709,10 +709,17 @@ impl WatchLoop {
                 watched: watch.watched(),
                 pending: watch.pending(),
             },
+            // No backend at all — `--no-fsevents`, a build without the
+            // feature, or a watcher that could not be brought up. `pending`
+            // means "not watched yet, and being retried", and neither half is
+            // true here: there is nothing to reconcile, so nothing will ever
+            // promote these roots, and they are not uncovered either —
+            // polling reads all of them at `--interval`. Reporting them as
+            // pending promises a retry that cannot happen.
             None => DriverStatus {
                 driver: WatchDriver::Polling,
                 watched: Vec::new(),
-                pending: self.roots.iter().map(|root| root.path.clone()).collect(),
+                pending: Vec::new(),
             },
         };
         let changed = {

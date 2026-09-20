@@ -2242,15 +2242,14 @@ fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Resul
     // Mirrors the harness contract: a payload with no `session_id` is not a
     // session lifecycle event we can attribute, so it is ignored rather than
     // guessed at.
-    if parsed
+    let Some(session_id) = parsed
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
-        .is_none()
-    {
+    else {
         note("hook payload has no session_id; ignoring".into());
         return Ok(());
-    }
+    };
     let transcript = parsed
         .get("transcript_path")
         .and_then(serde_json::Value::as_str)
@@ -2277,7 +2276,11 @@ fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Resul
                 })
             })
         }
-        Some(path) => ai_hist::ingest_transcript_at(db_path, hook, path, true)
+        // The payload names both the session and the file. Passing the
+        // session through is what lets the ingest refuse a pairing the two
+        // disagree about, rather than hydrating whatever the file turns out
+        // to be.
+        Some(path) => ai_hist::ingest_transcript_at(db_path, hook, path, Some(session_id), true)
             .and_then(|report| Ok(serde_json::to_value(&report)?)),
     };
     match outcome {

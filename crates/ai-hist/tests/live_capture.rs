@@ -1100,6 +1100,80 @@ fn a_root_matches_an_event_reported_under_its_resolved_path() {
     assert!(root.registers_at(&link.join("sessions")));
 }
 
+/// `pending` means "not watched yet, and being retried". A loop with no
+/// filesystem backend at all — `--no-fsevents`, a build without the feature, a
+/// watcher that could not be brought up — has nothing to reconcile, so nothing
+/// will ever promote those roots; and they are not uncovered either, because
+/// polling reads every one of them at `--interval`. Listing them as pending
+/// promises a retry that cannot happen, and the CLI renders that promise as
+/// "not watched yet (retried every 30s)".
+#[test]
+fn a_polling_loop_reports_no_pending_roots() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let root = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&root).expect("an existing root");
+
+    let running = RunningLoop::reporting({
+        let root = root.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(root)])
+                .with_debounce_ms(50)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+
+    let status = running.watch.status().expect("status");
+    assert_eq!(
+        status.driver,
+        WatchDriver::Polling,
+        "a loop asked not to use filesystem events polls"
+    );
+    assert!(
+        status.pending.is_empty(),
+        "a polling loop has no root waiting to be attached: {status:?}"
+    );
+    assert!(
+        status.watched.is_empty(),
+        "and none attached either, since there is no watcher: {status:?}"
+    );
+}
+
+/// The other side of the same distinction: with filesystem events *enabled*, a
+/// root that does not exist is genuinely uncovered and genuinely retried, so
+/// it must still be reported as pending. This is the control that keeps the
+/// fix above from being "never report anything".
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_root_that_does_not_exist_yet_is_still_reported_pending() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let absent = home.path().join(".claude/projects");
+
+    let running = RunningLoop::reporting({
+        let absent = absent.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(absent)])
+                .with_debounce_ms(50)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+
+    let status = running.watch.status().expect("status");
+    assert_eq!(status.driver, WatchDriver::Polling);
+    assert_eq!(
+        status.pending,
+        vec![absent],
+        "a root that does not exist yet is retried, and says so: {status:?}"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
@@ -1589,6 +1663,65 @@ fn imported_relay_history_reaches_the_catalog() {
 // hook fast path
 // ---------------------------------------------------------------------------
 
+/// A hook payload makes two claims — which session fired, and which file
+/// holds it — and a delayed, replayed or malformed one can pair them wrongly.
+/// Ingesting the file regardless attributes the lifecycle event to a session
+/// it did not come from, and the harness has no way to know: the hook exits
+/// zero either way.
+#[test]
+fn a_hook_payload_naming_another_session_ingests_nothing() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let stale = write_claude_transcript(home.path(), "proj", "previous", 2);
+    let db = home.path().join("history.db");
+
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &stale,
+        Some("current"),
+        true,
+    )
+    .expect("hook ingest");
+
+    assert_eq!(
+        report.status,
+        ai_hist::TranscriptStatus::Mismatched,
+        "a transcript that is not the named session must be refused"
+    );
+    assert_eq!(
+        report.session_id.as_deref(),
+        Some("previous"),
+        "and the caller is told what the file actually was"
+    );
+    assert_eq!(
+        catalog_session_count(&db, "claude", "previous"),
+        0,
+        "the session the file belongs to must not be ingested either"
+    );
+    assert_eq!(
+        catalog_session_count(&db, "claude", "current"),
+        0,
+        "and the session the payload named certainly must not be"
+    );
+
+    // Positive control: the same transcript, named correctly, ingests exactly
+    // that session — so the refusal above is about the mismatch and not about
+    // the path, the payload shape, or the check refusing everything.
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &stale,
+        Some("previous"),
+        true,
+    )
+    .expect("hook ingest");
+    assert_eq!(report.status, ai_hist::TranscriptStatus::Ingested);
+    assert_eq!(report.session_id.as_deref(), Some("previous"));
+    assert_eq!(catalog_session_count(&db, "claude", "previous"), 1);
+}
+
 #[test]
 fn a_missing_transcript_is_reported_not_raised() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -1599,6 +1732,7 @@ fn a_missing_transcript_is_reported_not_raised() {
         home.path(),
         "claude",
         &home.path().join(".claude/projects/proj/gone.jsonl"),
+        None,
         true,
     )
     .expect("a missing transcript must not fail the hook");
@@ -1614,8 +1748,9 @@ fn a_transcript_outside_the_provider_root_is_refused() {
     let outside = home.path().join("elsewhere.jsonl");
     std::fs::write(&outside, "{}\n").expect("write");
 
-    let error = ai_hist::ingest_transcript_at_with_home(&db, home.path(), "claude", &outside, true)
-        .expect_err("a hook payload must not name an arbitrary path");
+    let error =
+        ai_hist::ingest_transcript_at_with_home(&db, home.path(), "claude", &outside, None, true)
+            .expect_err("a hook payload must not name an arbitrary path");
 
     assert!(
         format!("{error:#}").contains("SESSION_SOURCE_MISMATCH"),
@@ -1631,9 +1766,15 @@ fn a_hook_ingest_then_a_full_sweep_leaves_no_duplicates() {
     let transcript = write_claude_transcript(home.path(), "proj", "hooked-1", 3);
     let db = home.path().join("history.db");
 
-    let report =
-        ai_hist::ingest_transcript_at_with_home(&db, home.path(), "claude", &transcript, true)
-            .expect("hook ingest");
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        None,
+        true,
+    )
+    .expect("hook ingest");
     assert_eq!(report.status, ai_hist::TranscriptStatus::Ingested);
     assert_eq!(report.session_id.as_deref(), Some("hooked-1"));
 
@@ -1675,14 +1816,26 @@ fn a_hook_ingest_of_an_unchanged_transcript_reports_unchanged() {
     let transcript = write_claude_transcript(home.path(), "proj", "twice-1", 2);
     let db = home.path().join("history.db");
 
-    let first =
-        ai_hist::ingest_transcript_at_with_home(&db, home.path(), "claude", &transcript, true)
-            .expect("first hook ingest");
+    let first = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        None,
+        true,
+    )
+    .expect("first hook ingest");
     assert_eq!(first.status, ai_hist::TranscriptStatus::Ingested);
 
-    let second =
-        ai_hist::ingest_transcript_at_with_home(&db, home.path(), "claude", &transcript, true)
-            .expect("second hook ingest");
+    let second = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        None,
+        true,
+    )
+    .expect("second hook ingest");
     assert_eq!(
         second.status,
         ai_hist::TranscriptStatus::Unchanged,

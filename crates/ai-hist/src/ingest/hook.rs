@@ -51,6 +51,14 @@ pub enum TranscriptStatus {
     /// The file exists but carries no session identity — a Claude subagent
     /// sidecar, or a transcript whose first records are still being written.
     Unidentified,
+    /// The transcript belongs to a different session than the payload named.
+    ///
+    /// A hook payload is a claim from another process about two things — which
+    /// session fired, and which file holds it — and a delayed, replayed or
+    /// malformed one can pair them wrongly. Ingesting the file anyway would
+    /// attribute the lifecycle event to a session it did not come from, so
+    /// nothing is ingested and the caller is told.
+    Mismatched,
 }
 
 impl TranscriptStatus {
@@ -60,6 +68,7 @@ impl TranscriptStatus {
             TranscriptStatus::Unchanged => "unchanged",
             TranscriptStatus::Missing => "missing",
             TranscriptStatus::Unidentified => "unidentified",
+            TranscriptStatus::Mismatched => "mismatched",
         }
     }
 }
@@ -92,9 +101,17 @@ pub fn ingest_transcript_at(
     db_path: &Path,
     source: &str,
     transcript: &Path,
+    expected_session: Option<&str>,
     include_related: bool,
 ) -> Result<TranscriptIngest> {
-    ingest_transcript_at_with_home(db_path, &home_dir(), source, transcript, include_related)
+    ingest_transcript_at_with_home(
+        db_path,
+        &home_dir(),
+        source,
+        transcript,
+        expected_session,
+        include_related,
+    )
 }
 
 /// Ingest one provider transcript named by path, against an explicit provider
@@ -108,6 +125,7 @@ pub fn ingest_transcript_at_with_home(
     home: &Path,
     source: &str,
     transcript: &Path,
+    expected_session: Option<&str>,
     include_related: bool,
 ) -> Result<TranscriptIngest> {
     match fs::metadata(transcript) {
@@ -153,16 +171,49 @@ pub fn ingest_transcript_at_with_home(
         candidate,
     };
 
+    // Resolved the way the sweep resolves it, against the home this call was
+    // given rather than the process one. No hook harness is database-backed
+    // today, so this only keeps the environment honest.
+    let opencode_db = std::env::var_os("OPENCODE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     let mut session_id = None;
     {
         let conn = open_db(db_path)?;
-        // Resolved the way the sweep resolves it, against the home this call
-        // was given rather than the process one. No hook harness is
-        // database-backed today, so this only keeps the environment honest.
-        let opencode_db = std::env::var_os("OPENCODE_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
-        let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), opencode_db);
+        let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), opencode_db.clone());
+        // Read before anything is written. The payload says which session
+        // fired *and* which file holds it, and those are two claims: a
+        // delayed or replayed hook can pair a live session id with a
+        // transcript that belongs to another one. Asking the adapter what
+        // this file says it is — without persisting the answer — is what lets
+        // the two be compared before either session is touched. The cost is
+        // one extra bounded read of one file on a path that is already
+        // reading it.
+        if let Some(expected) = expected_session {
+            let observed = single.read_shallow(&env.scan(), Some(&conn), &single.candidate)?;
+            match observed {
+                Some(observed) if observed.session_id != expected => {
+                    return Ok(TranscriptIngest {
+                        source: source.to_string(),
+                        transcript: transcript.to_string_lossy().into_owned(),
+                        // The identity that was *found*, so the caller can see
+                        // what the file really was rather than only that it
+                        // disagreed.
+                        session_id: Some(observed.session_id),
+                        status: TranscriptStatus::Mismatched,
+                        hydration: None,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Ok(TranscriptIngest::short(
+                        source,
+                        transcript,
+                        TranscriptStatus::Unidentified,
+                    ))
+                }
+            }
+        }
         discover_sessions_with_provider_refs(
             &env,
             &DiscoverOptions::default(),
