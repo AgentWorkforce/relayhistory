@@ -232,8 +232,26 @@ into a store that did not ask for one would put a whole provider into the
 ingested byte count while the report still called the run codex-only.
 `incremental_sync` is the one phase that does require Claude, because the
 harness appends a Claude-shaped record and no other provider has an equivalent
-yet; asking for it without a Claude source is refused by name before any store
-is generated rather than surfacing as an empty path mid-run. For the hydration phases it is the
+yet.
+
+**`--phases` is an ordered list, not a set.** Every phase but `cold_sync` reads
+a database `cold_sync` created, and `cold_sync` itself insists on a database
+that does not exist yet, so `--phases hydrate_cold` or
+`--phases incremental_sync,cold_sync` cannot be measured at all. The driver
+refuses such a list by name, and it refuses twice:
+
+* against the **request**, before anything is generated — a phase whose setup
+  the order cannot provide, a phase listed twice, a provider the plan never
+  asked for;
+* against the **generated manifest**, before the harness is even built —
+  because a source appearing in `--sources` is not a promise that a session of
+  it was written. When the oversized session alone already meets the byte
+  target, the round-robin loop never runs, so `--sources codex,claude` can
+  produce a store containing no Claude transcript. Only the manifest knows.
+
+Both refusals name the phase and what it lacked, which is the point: an
+unmeasurable combination should cost a second and a sentence, not a compile
+followed by a panic inside the timed region. For the hydration phases it is the
 `records_parsed` the hydration diagnostic reports.
 
 ### How peak RSS is measured

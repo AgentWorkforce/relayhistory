@@ -195,6 +195,17 @@ function runPhase(phase, context) {
   return { ...JSON.parse(readFileSync(reportPath, "utf8")), harnessWallMs: wallMs };
 }
 
+/** Turn `unsupportedPhases` findings into one actionable failure. */
+function refuseUnmeasurable(problems) {
+  if (problems.length === 0) return;
+  throw new Error(
+    `this run cannot measure ${problems.length} of the requested phases:\n`
+    + problems.map(({ phase, reason }) => `  - ${phase}: ${reason}`).join("\n")
+    + `\nRun the phases in their documented order (${PHASE_ORDER.join(", ")}), `
+    + "add the missing source to --sources, or drop the phase from --phases.",
+  );
+}
+
 function loadThresholds() {
   return JSON.parse(readFileSync(THRESHOLDS, "utf8"));
 }
@@ -259,16 +270,10 @@ async function main(argv) {
   for (const phase of phases) {
     if (!PHASE_ORDER.includes(phase)) throw new Error(`unknown phase ${phase}`);
   }
-  // Refuse a phase/source combination before generating a store for it, so the
-  // answer is an error at the start rather than an empty path partway through.
-  const unsupported = unsupportedPhases(plan, phases);
-  if (unsupported.length > 0) {
-    throw new Error(
-      `this plan cannot measure ${unsupported.length} of the requested phases:\n`
-      + unsupported.map(({ phase, reason }) => `  - ${phase}: ${reason}`).join("\n")
-      + "\nAdd the source to --sources, or drop the phase from --phases.",
-    );
-  }
+  // Refuse what the request alone already rules out, before generating a store
+  // for it: a phase whose setup the order cannot provide, a phase listed twice,
+  // a provider the plan never asked for.
+  refuseUnmeasurable(unsupportedPhases(phases, { plan }));
   const repeat = Number(option(argv, "repeat", profile.repeat ?? 1));
   if (!Number.isSafeInteger(repeat) || repeat < 1) throw new Error("--repeat must be >= 1");
   const context = {
@@ -280,13 +285,22 @@ async function main(argv) {
   };
   rmSync(work, { recursive: true, force: true });
   mkdirSync(work, { recursive: true });
-  context.harness = buildHarness(context);
 
-  const started = Date.now();
+  // Generate before building. The store costs well under a second and the
+  // harness can cost minutes, so the check below — the one that reads what
+  // actually landed — should not be paid for with a compile first.
   const manifest = await generateStore(plan, context.storeRoot);
   writeFileSync(join(work, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   context.manifest = manifest;
+  // A source named in `--sources` is not a promise that a session of it was
+  // written: when the oversized session alone meets the byte target the
+  // round-robin loop never runs. This reading, not the plan's, decides.
+  refuseUnmeasurable(unsupportedPhases(phases, { manifest }));
 
+  context.harness = buildHarness(context);
+
+  // Setup is done; from here on the clock covers measurement.
+  const started = Date.now();
   const samples = [];
   try {
     for (let round = 0; round < repeat; round += 1) {

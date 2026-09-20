@@ -242,40 +242,84 @@ export function grokSession(plan, sessionId, rng, { turns = plan.turns, baseMs }
 // that it lands outside the timed region and in the same process that times it.
 
 /**
- * Phases that can only be measured against a Claude transcript, and why.
+ * What each phase needs before it can be measured.
  *
- * `append_one_record` writes a Claude-shaped record; no other provider has an
- * equivalent yet. Rather than let a Claude transcript be smuggled into a store
- * that did not ask for one — which would put a whole provider into the ingested
- * byte count while the report still called the run codex-only — a plan without
- * Claude simply cannot run these.
+ * `needs` names phases that must already have run in this invocation —
+ * everything but `cold_sync` reads a database `cold_sync` created, and
+ * `cold_sync` itself insists on a database that does not exist yet, so a list
+ * is not a set: order is part of whether it can run at all.
+ *
+ * `target` names the manifest field the phase is pointed at. `source` is the
+ * provider that field can only come from — `append_one_record` writes a
+ * Claude-shaped record and no other provider has an equivalent yet, which is
+ * why `incremental_sync` alone carries one. Letting a Claude transcript be
+ * smuggled into a store that did not ask for one is not the alternative: that
+ * would put a whole provider into the ingested byte count while the report
+ * still called the run codex-only.
  */
-export const PHASE_SOURCE_REQUIREMENTS = {
+export const PHASE_REQUIREMENTS = {
+  cold_sync: { needs: [] },
   incremental_sync: {
+    needs: ["cold_sync"],
+    target: "incrementalTarget",
     source: "claude",
-    reason:
-      "the harness appends a Claude-shaped record and no other provider has an equivalent",
+    reason: "the harness appends a Claude-shaped record and no other provider has an equivalent",
   },
+  unchanged_sync: { needs: ["cold_sync"] },
+  hydrate_cold: { needs: ["cold_sync"], target: "hydrationTarget" },
+  hydrate_unchanged: { needs: ["cold_sync"], target: "hydrationTarget" },
 };
 
 /**
- * Phases the requested plan cannot measure, as `{ phase, reason }`.
+ * Phases this run cannot measure, as `{ phase, reason }`.
  *
- * Called before the store is generated: a combination that cannot be measured
- * is refused up front rather than discovered as an empty path in the middle of
- * a run.
+ * Call it twice. With `plan`, before generating anything, it catches what the
+ * request alone already rules out. With `manifest`, after generating and
+ * before the first phase runs, it catches what the store actually contains —
+ * and that reading is the authoritative one, because a source appearing in
+ * `--sources` is not a promise that a session of it was written. When the
+ * oversized session alone meets the byte target the round-robin loop never
+ * runs, so `--sources codex,claude` can produce a store with no Claude
+ * transcript in it at all.
  */
-export function unsupportedPhases(plan, phases) {
+export function unsupportedPhases(phases, { plan, manifest } = {}) {
+  const list = phases ?? [];
   const available = new Set(plan?.sources ?? []);
-  return (phases ?? []).flatMap((phase) => {
-    const requirement = PHASE_SOURCE_REQUIREMENTS[phase];
-    if (!requirement || available.has(requirement.source)) return [];
-    return [{
-      phase,
-      reason: `needs a \`${requirement.source}\` source (${requirement.reason}); `
-        + `this plan has ${[...available].join(", ") || "no sources"}`,
-    }];
-  });
+  const seen = new Set();
+  const problems = [];
+  for (const phase of list) {
+    const requirement = PHASE_REQUIREMENTS[phase];
+    const add = (reason) => problems.push({ phase, reason });
+    if (seen.has(phase)) {
+      add("is listed more than once; each phase leaves state the next one reads, "
+        + "so running it twice in one invocation is not repeatable");
+      continue;
+    }
+    seen.add(phase);
+    if (!requirement) continue;
+    const missing = (requirement.needs ?? []).filter((prerequisite) => !seen.has(prerequisite));
+    if (missing.length > 0) {
+      add(`needs ${missing.map((name) => `\`${name}\``).join(" and ")} to run before it `
+        + "in this invocation, and the requested order does not");
+      continue;
+    }
+    // The manifest is the ground truth; the plan is only a cheap early guess.
+    if (manifest) {
+      if (requirement.target && !manifest[requirement.target]) {
+        add(requirement.source
+          ? `the generated store has no ${requirement.source[0].toUpperCase()}`
+            + `${requirement.source.slice(1)} transcript to use as its \`${requirement.target}\``
+            + `, though the plan listed \`${requirement.source}\` among its sources`
+          : `the generated store produced no \`${requirement.target}\``);
+      }
+      continue;
+    }
+    if (requirement.source && !available.has(requirement.source)) {
+      add(`needs a \`${requirement.source}\` source (${requirement.reason}); `
+        + `this plan has ${[...available].join(", ") || "no sources"}`);
+    }
+  }
+  return problems;
 }
 
 // ---------------------------------------------------------------------------

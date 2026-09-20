@@ -113,17 +113,74 @@ test("the oversized session follows --sources instead of forcing Claude in", asy
 
 test("a phase that needs Claude is refused before anything is measured", () => {
   const codexOnly = planStore({ sources: ["codex"] });
-  const refused = unsupportedPhases(codexOnly, PHASE_ORDER);
+  const refused = unsupportedPhases(PHASE_ORDER, { plan: codexOnly });
   assert.deepEqual(refused.map(({ phase }) => phase), ["incremental_sync"]);
   assert.match(refused[0].reason, /needs a `claude` source/);
   assert.match(refused[0].reason, /this plan has codex/);
   // Everything else is provider-agnostic and must not be refused.
   assert.deepEqual(
-    unsupportedPhases(codexOnly, PHASE_ORDER.filter((phase) => phase !== "incremental_sync")),
+    unsupportedPhases(
+      PHASE_ORDER.filter((phase) => phase !== "incremental_sync"),
+      { plan: codexOnly },
+    ),
     [],
   );
-  assert.deepEqual(unsupportedPhases(planStore({}), PHASE_ORDER), []);
-  assert.deepEqual(unsupportedPhases(codexOnly, []), []);
+  assert.deepEqual(unsupportedPhases(PHASE_ORDER, { plan: planStore({}) }), []);
+  assert.deepEqual(unsupportedPhases([], { plan: codexOnly }), []);
+});
+
+test("listing Claude is not the same as writing one, and the manifest decides", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sync-bench-empty-claude-"));
+  try {
+    // `claude` is in --sources, but the oversized codex session already meets
+    // the byte target, so the round-robin loop never runs and no Claude
+    // transcript is ever written. Checking the source list alone accepts
+    // `incremental_sync` here and only discovers the truth after generating.
+    const plan = planStore({
+      seed: 4, sources: ["codex", "claude"],
+      targetBytes: 32 * 1024, largeSessionBytes: 64 * 1024, turns: 2,
+    });
+    const manifest = await generateStore(plan, join(root, "home"));
+    assert.deepEqual(
+      manifest.sessions.map((session) => session.source), ["codex"],
+      "the premise: nothing Claude was written despite Claude being requested",
+    );
+    assert.equal(manifest.incrementalTarget, null);
+
+    const refused = unsupportedPhases(["cold_sync", "incremental_sync"], { manifest });
+    assert.deepEqual(refused.map(({ phase }) => phase), ["incremental_sync"]);
+    assert.match(refused[0].reason, /generated store has no Claude transcript/);
+    // Phases the store can serve are not caught by the same check.
+    assert.deepEqual(unsupportedPhases(["cold_sync", "hydrate_cold"], { manifest }), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a phase order that cannot provide its own setup is refused", () => {
+  const plan = planStore({});
+  // The reported bug: `incremental_sync` runs first and reaches the harness
+  // with no database, because validation only looked at the set of phases.
+  const backwards = unsupportedPhases(["incremental_sync", "cold_sync"], { plan });
+  assert.deepEqual(backwards.map(({ phase }) => phase), ["incremental_sync"]);
+  assert.match(backwards[0].reason, /needs `cold_sync` to run before it/);
+
+  assert.deepEqual(unsupportedPhases(["cold_sync", "incremental_sync"], { plan }), []);
+  assert.deepEqual(unsupportedPhases(PHASE_ORDER, { plan }), []);
+
+  // Every dependent phase, alone, is missing its setup.
+  for (const phase of PHASE_ORDER.filter((name) => name !== "cold_sync")) {
+    const alone = unsupportedPhases([phase], { plan });
+    assert.deepEqual(alone.map((entry) => entry.phase), [phase], `${phase} alone is refused`);
+    assert.match(alone[0].reason, /cold_sync/);
+  }
+
+  // A repeated phase is malformed: the second `cold_sync` would find the
+  // database its predecessor created.
+  assert.match(
+    unsupportedPhases(["cold_sync", "cold_sync"], { plan })[0].reason,
+    /more than once/,
+  );
 });
 
 test("OpenCode sessions are counted, not dropped from the total", async (t) => {
