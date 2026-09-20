@@ -91,6 +91,69 @@ pub fn sync_local_at(db_path: &Path) -> Result<bool> {
     sync_local_at_with_home(db_path, &home_dir())
 }
 
+/// Content-free progress for hosts displaying a local capture operation.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureProgress {
+    pub source: String,
+    pub processed_files: usize,
+    pub total_files: Option<usize>,
+}
+type CaptureObserver = std::rc::Rc<dyn Fn(CaptureProgress)>;
+thread_local! {
+    static CAPTURE_OBSERVER: std::cell::RefCell<Option<CaptureObserver>> = std::cell::RefCell::new(None);
+}
+
+/// Observes this thread's capture only; no paths or session contents are exposed.
+pub fn sync_local_at_with_progress(
+    db_path: &Path,
+    observer: impl Fn(CaptureProgress) + 'static,
+) -> Result<bool> {
+    struct Restore(Option<CaptureObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURE_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(CAPTURE_OBSERVER.with(|slot| slot.replace(Some(std::rc::Rc::new(observer)))));
+    capture_progress("initializing", 0, None);
+    let result = sync_local_at(db_path);
+    if matches!(result, Ok(true)) {
+        capture_progress("complete", 0, None);
+    }
+    result
+}
+
+fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
+    CAPTURE_OBSERVER.with(|slot| {
+        let observer = slot.borrow().clone();
+        if let Some(observer) = observer {
+            observer(CaptureProgress {
+                source: source.into(),
+                processed_files,
+                total_files,
+            });
+        }
+    });
+}
+
+// Report before taking each file, including the final None. This counts completed
+// files even when the ingest loop continues early for an unchanged checkpoint.
+fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Item = PathBuf> {
+    let total = files.len();
+    let mut files = files.into_iter();
+    let mut processed = 0;
+    std::iter::from_fn(move || {
+        capture_progress(source, processed, Some(total));
+        let next = files.next();
+        if next.is_some() {
+            processed += 1;
+        }
+        next
+    })
+}
+
 /// Full local ingest using an explicit provider home instead of the process
 /// `HOME`. Used by [`crate::SessionStore`] when the embedder overrides home.
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
@@ -430,6 +493,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     // turns one interrupted run into a loop that re-scans from scratch forever
     // and never persists anything. Checkpointing makes each source's cursor
     // durable the moment that source completes.
+    capture_progress("claude-history", 0, None);
     if let Some(inserted) = report.capture(
         "claude",
         sync_jsonl_incremental(
@@ -444,6 +508,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("claude", 0, None);
     if report
         .capture(
             "claude-metadata",
@@ -453,10 +518,12 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     {
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("codex", 0, None);
     if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, home)) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("cursor", 0, None);
     if let Some(inserted) = report.capture(
         "cursor",
         sync_cursor(conn, &mut state, &home.join(".cursor/projects")),
@@ -464,6 +531,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("grok", 0, None);
     if let Some(inserted) = report.capture(
         "grok",
         sync_grok(conn, &mut state, &home.join(".grok/sessions")),
@@ -471,11 +539,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("trajectory", 0, None);
     if let Some(inserted) = report.capture("trajectory", sync_trajectories(conn, &mut state, home))
     {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
+    capture_progress("opencode", 0, None);
     let opencode = std::env::var_os("OPENCODE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
@@ -517,6 +587,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path) -> Result<()> {
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
+    capture_progress("catalog", 0, None);
     let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode)
         .with_opencode_storage_dir(opencode_storage);
     discover::discover_sessions_with_providers(
@@ -1637,7 +1708,7 @@ fn sync_codex_rollouts(
         if !root.exists() {
             continue;
         }
-        for rollout in collect_matching_files(&root, "rollout-", "jsonl")? {
+        for rollout in capture_files("codex", collect_matching_files(&root, "rollout-", "jsonl")?) {
             let key = rollout.to_string_lossy().to_string();
             let stamp = file_stamp(&rollout)?;
             let record = seen.get(&key).and_then(Value::as_object);
@@ -2717,7 +2788,7 @@ fn sync_claude_session_metadata(
     state.remove("claude_sessions_v2");
     let mut scanned = 0;
     let mut upserted = 0;
-    for path in collect_matching_files(root, "", "jsonl")? {
+    for path in capture_files("claude", collect_matching_files(root, "", "jsonl")?) {
         let key = path.to_string_lossy().to_string();
         let stamp = claude_sync_stamp(&path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
@@ -4136,7 +4207,10 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     let mut scanned = 0;
     let mut sessions = 0;
     let mut errors = 0;
-    for chat in collect_matching_files(root, "chat_history", "jsonl")? {
+    for chat in capture_files(
+        "grok",
+        collect_matching_files(root, "chat_history", "jsonl")?,
+    ) {
         let key = chat.to_string_lossy().to_string();
         let stamp = grok_session_stamp(&chat)?;
         if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
@@ -4391,7 +4465,7 @@ fn sync_trajectories(
     let mut updated = 0;
     let mut skipped = 0;
     let mut errors = 0;
-    for path in files {
+    for path in capture_files("trajectory", files) {
         let metadata = match path.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -4508,11 +4582,27 @@ fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result
         return Ok(());
     }
     for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|s| s.to_str()) == Some(name) {
-                out.push(path.clone());
-            }
+        let entry = entry?;
+        // Never follow symlinks: dependency links can revisit the same tree or cycle.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let child = file_name.to_str().unwrap_or("");
+        if child == name {
+            out.push(path);
+        } else if !matches!(
+            child,
+            "node_modules"
+                | ".git"
+                | "target"
+                | ".next"
+                | ".venv"
+                | "venv"
+                | "__pycache__"
+                | ".cache"
+        ) {
             collect_named_dirs(&path, name, out)?;
         }
     }
@@ -4527,10 +4617,12 @@ fn collect_trajectory_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
             collect_trajectory_json(&path, out)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+        } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if name != "index.json" && name != ".sync-state.json" && !name.ends_with(".trace.json")
             {
@@ -8256,5 +8348,95 @@ mod tests {
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_progress_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn file_progress_counts_completed_files_and_restores_observer() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = updates.clone();
+        CAPTURE_OBSERVER.with(|slot| {
+            *slot.borrow_mut() = Some(std::rc::Rc::new(move |p| observed.lock().unwrap().push(p)))
+        });
+        let files: Vec<_> = capture_files("claude", vec!["a".into(), "b".into()]).collect();
+        assert_eq!(files.len(), 2);
+        let values = updates.lock().unwrap();
+        assert_eq!(
+            values.iter().map(|v| v.processed_files).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(values.iter().all(|v| v.total_files == Some(2)));
+        drop(values);
+        // Even an early database failure restores the caller's observer.
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("bad.db");
+        fs::write(&db, "not a database").unwrap();
+        assert!(sync_local_at_with_progress(&db, |_| {}).is_err());
+        capture_progress("restored", 0, None);
+        assert_eq!(updates.lock().unwrap().last().unwrap().source, "restored");
+        CAPTURE_OBSERVER.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn callbacks_can_reenter_capture_and_restore_the_outer_observer() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("bad.db");
+        fs::write(&db, "not a database").unwrap();
+        let inner_db = db.clone();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let outer_updates = updates.clone();
+        assert!(sync_local_at_with_progress(&db, move |progress| {
+            outer_updates
+                .lock()
+                .unwrap()
+                .push(format!("outer:{}", progress.source));
+            let inner_updates = outer_updates.clone();
+            assert!(sync_local_at_with_progress(&inner_db, move |inner| {
+                inner_updates
+                    .lock()
+                    .unwrap()
+                    .push(format!("inner:{}", inner.source));
+            })
+            .is_err());
+        })
+        .is_err());
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec!["outer:initializing", "inner:initializing"]
+        );
+        CAPTURE_OBSERVER.with(|slot| assert!(slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn trajectory_discovery_prunes_dependencies_and_build_output() {
+        let home = tempfile::tempdir().unwrap();
+        let wanted = home.path().join("repo/.trajectories");
+        fs::create_dir_all(wanted.join("completed/month")).unwrap();
+        for ignored in [
+            "node_modules/pkg",
+            ".git/objects",
+            "target/debug",
+            ".next/cache",
+            ".venv/lib",
+        ] {
+            fs::create_dir_all(home.path().join(ignored).join(".trajectories")).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.path(), home.path().join("repo/cycle")).unwrap();
+            std::os::unix::fs::symlink(&wanted, wanted.join("completed/cycle")).unwrap();
+        }
+        let mut roots = vec![];
+        collect_named_dirs(home.path(), ".trajectories", &mut roots).unwrap();
+        assert_eq!(roots, vec![wanted.clone()]);
+        fs::write(wanted.join("completed/month/run.json"), "{}").unwrap();
+        let mut files = vec![];
+        collect_trajectory_json(&wanted, &mut files).unwrap();
+        assert_eq!(files, vec![wanted.join("completed/month/run.json")]);
     }
 }
