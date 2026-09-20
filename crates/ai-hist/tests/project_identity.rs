@@ -1028,3 +1028,113 @@ fn a_key_borrowed_across_an_uncataloged_generation_follows_its_ancestor() {
     ai_hist::project_identity::begin_acquisition_pass();
     assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
 }
+
+/// A delegation cycle must settle, not spin.
+///
+/// The ledger does not forbid a cycle, and a set-at-a-time UPDATE reads every
+/// parent from one pre-statement snapshot — so in an inherited-only cycle
+/// `A -> B -> C -> A` the three keys *rotate* on each iteration. The bound
+/// ends the call, but not at a fixed point: every later refresh rotates them
+/// again and denormalizes the new arrangement onto every event, which is
+/// endless write traffic that each pass reports as work done. Worse, it is
+/// silent — the keys look plausible at every moment, just never the same.
+#[test]
+fn a_delegation_cycle_settles_instead_of_rotating_its_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("cycle.db")).unwrap();
+
+    for (id, key) in [
+        ("a", "github.com/acme/one"),
+        ("b", "github.com/acme/two"),
+        ("c", "github.com/acme/three"),
+    ] {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+             last_activity_ms, discovery_state) VALUES ('codex', ?1, ?2, 'inherited', 1, 'full')",
+            rusqlite::params![id, key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text, \
+             project_key, project_key_method) \
+             VALUES ('codex', ?1, ?1 || '-1', 1, 'assistant', 'text', 'work', ?2, 'inherited')",
+            rusqlite::params![id, key],
+        )
+        .unwrap();
+    }
+    for (parent, child) in [("a", "b"), ("b", "c"), ("c", "a")] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child],
+        )
+        .unwrap();
+    }
+
+    let keys = || -> Vec<(Option<String>, Option<String>)> {
+        ["a", "b", "c"]
+            .iter()
+            .map(|id| session_key(&conn, "codex", id))
+            .collect()
+    };
+    let before = keys();
+
+    assert_eq!(
+        refresh_project_identity(&conn).unwrap(),
+        0,
+        "a cycle with nothing settled above it has no better key to reach, so \
+         the first refresh must already write nothing"
+    );
+    assert_eq!(keys(), before, "the keys rotated inside the cycle");
+    assert_eq!(
+        refresh_project_identity(&conn).unwrap(),
+        0,
+        "a second refresh must write nothing: a cycle has to reach a fixed point"
+    );
+    assert_eq!(keys(), before);
+
+    // A cycle is not an excuse to stop lending: hang an acyclic chain off it
+    // from a session that *is* settled, and that chain still inherits — and
+    // also converges.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'root', '/work/app', 'github.com/acme/app', 'remote', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'child', 2, 'shallow')",
+        [],
+    )
+    .unwrap();
+    for (parent, child) in [("root", "middle"), ("middle", "child")] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 2, 2)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child],
+        )
+        .unwrap();
+    }
+
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/app".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "the acyclic chain stopped inheriting"
+    );
+    assert_eq!(keys(), before, "the cycle moved when the chain was added");
+    assert_eq!(
+        refresh_project_identity(&conn).unwrap(),
+        0,
+        "chain and cycle together must still converge to no writes"
+    );
+}

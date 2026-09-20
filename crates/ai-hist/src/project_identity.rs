@@ -719,9 +719,8 @@ impl<F: FnMut(&str, Option<(&str, String)>)> ConfigVisitor for F {
 /// closure.
 fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
     let mut current: Option<String> = None;
-    for raw_line in text.split('\n') {
-        let line = raw_line
-            .trim_end_matches('\r')
+    for logical in logical_config_lines(text) {
+        let line = logical
             .trim_start_matches([' ', '\t'])
             .trim_end_matches([' ', '\t']);
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -742,7 +741,7 @@ fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
         if key.is_empty() {
             continue;
         }
-        let value = strip_inline_comment(line[eq + 1..].trim());
+        let value = parse_config_value(&line[eq + 1..]);
         // Variable names are case-insensitive in git, so they are folded here
         // rather than compared case-insensitively at each lookup. Folding is
         // what keeps `URL` and `url` in *one* list in the order they were
@@ -752,6 +751,115 @@ fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
         // the repository and one of its mirrors.
         visit.visit(section, Some((&key.to_ascii_lowercase(), value)));
     }
+}
+
+/// Join physical lines into the logical ones git reads.
+///
+/// A value may be continued onto the next line with a trailing backslash, and
+/// git joins the two with nothing between them. Iterating physical lines
+/// instead leaves the backslash in the value: a remote written as
+///
+/// ```text
+///     url = https://github.com/acme/long\
+/// /path.git
+/// ```
+///
+/// yields `github.com/acme/long\` here while `git remote get-url origin`
+/// yields `https://github.com/acme/long/path.git` — so the same repository
+/// splits into two projects depending on how its config happens to be
+/// wrapped. Verified against git 2.43.
+///
+/// The backslash only continues when it is not itself escaped, so a trailing
+/// `\\` ends the line and leaves a literal backslash in the value, which git
+/// also does.
+///
+/// One documented difference: git rejects an entire file whose *section
+/// header* is continued this way (`fatal: bad config line`), while this joins
+/// the header and carries on. Refusing everything would throw away every
+/// rewrite in a global file over one malformed line, which is a worse failure
+/// than reading it.
+fn logical_config_lines(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for raw in text.split('\n') {
+        let line = raw.trim_end_matches('\r');
+        let continued = trailing_backslashes(line) % 2 == 1;
+        let body = if continued {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        match pending.as_mut() {
+            Some(buffer) => buffer.push_str(body),
+            None => pending = Some(body.to_string()),
+        }
+        if !continued {
+            out.push(pending.take().unwrap_or_default());
+        }
+    }
+    if let Some(last) = pending {
+        out.push(last);
+    }
+    out
+}
+
+fn trailing_backslashes(line: &str) -> usize {
+    line.chars().rev().take_while(|c| *c == '\\').count()
+}
+
+/// Read one variable's value the way git reads it.
+///
+/// Quoted runs keep their whitespace and treat `#` and `;` as ordinary
+/// characters; outside quotes those start a comment. `\n`, `\t`, `\b`, `\"` and
+/// `\\` are escapes on both sides of a quote. Leading and trailing whitespace
+/// is dropped, and each whitespace character *inside* the value becomes a
+/// single space — a tab between two words comes back as one space, while two
+/// spaces stay two, which is what git 2.43 does.
+///
+/// An unrecognized escape keeps the character that follows it rather than
+/// rejecting the line: git errors there, and a reader whose job is to answer
+/// "which project is this" should not decide a whole file is unreadable over
+/// one variable it will probably never look at.
+fn parse_config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = 0usize;
+    let mut in_quotes = false;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let Some(escaped) = chars.next() else { break };
+                let decoded = match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'b' => '\u{8}',
+                    other => other,
+                };
+                flush_spaces(&mut out, &mut pending_space);
+                out.push(decoded);
+            }
+            '"' => in_quotes = !in_quotes,
+            '#' | ';' if !in_quotes => break,
+            c if c.is_whitespace() && !in_quotes => pending_space += 1,
+            c => {
+                flush_spaces(&mut out, &mut pending_space);
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Emit whitespace that was held back, now that something follows it.
+///
+/// Held back rather than written as it is read, so that whitespace at the end
+/// of a value disappears with it — and dropped entirely before the first
+/// character, which is what makes `key = value` and `key=value` the same.
+fn flush_spaces(out: &mut String, pending: &mut usize) {
+    if !out.is_empty() {
+        out.extend(std::iter::repeat_n(' ', *pending));
+    }
+    *pending = 0;
 }
 
 /// A parsed `.git/config`: `{section -> {key -> values}}`.
@@ -889,22 +997,6 @@ fn dotted_section_name(raw: &str) -> String {
         return folded;
     }
     format!("{name} \"{subsection}\"")
-}
-
-fn strip_inline_comment(value: &str) -> String {
-    let mut out = String::new();
-    let mut in_quotes = false;
-    for ch in value.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            continue;
-        }
-        if !in_quotes && (ch == '#' || ch == ';') {
-            break;
-        }
-        out.push(ch);
-    }
-    out.trim().to_string()
 }
 
 /// Expand a `url.<base>.insteadOf` rewrite over a configured remote.
@@ -1357,6 +1449,93 @@ mod tests {
             single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
             Some("looped")
         );
+    }
+
+    /// A value continued onto the next line is one value, as git reads it.
+    ///
+    /// Two checkouts of one repository whose configs differ only in where the
+    /// line happens to wrap would otherwise key differently — the wrapped one
+    /// keeping a trailing backslash in its URL, which canonicalizes to
+    /// something no other machine produces. Verified against git 2.43:
+    ///
+    /// ```text
+    ///     url = https://github.com/acme/long\
+    /// /path.git
+    /// $ git remote get-url origin → https://github.com/acme/long/path.git
+    /// ```
+    #[test]
+    fn a_continued_value_is_joined_the_way_git_joins_it() {
+        let config = parse_git_config(
+            "[remote \"origin\"]\n\turl = https://github.com/acme/long\\\n/path.git\n",
+        );
+        assert_eq!(
+            remote_url(&config, "origin").map(String::as_str),
+            Some("https://github.com/acme/long/path.git")
+        );
+
+        // The continuation may fall inside quotes.
+        let quoted = parse_git_config(
+            "[remote \"origin\"]\n\turl = \"https://github.com/acme/\\\nquoted.git\"\n",
+        );
+        assert_eq!(
+            remote_url(&quoted, "origin").map(String::as_str),
+            Some("https://github.com/acme/quoted.git")
+        );
+
+        // A *doubled* backslash is a literal one and ends the line, so the
+        // variable below it stays a variable of its own.
+        let escaped = parse_git_config("[test]\n\tvalue = a\\\\\n\tother = b\n");
+        let section = escaped.get("test").expect("section");
+        assert_eq!(section["value"], vec!["a\\".to_string()]);
+        assert_eq!(section["other"], vec!["b".to_string()]);
+
+        // Escapes and quoting, on both sides of a quote.
+        let values = parse_git_config(
+            "[test]\n\
+             \tquoted = \"a\\\"b\"\n\
+             \thash = \"a#b\"\n\
+             \tcomment = a#b\n\
+             \tspaces = a  b\n\
+             \ttab = a\tb\n",
+        );
+        let section = values.get("test").expect("section");
+        assert_eq!(section["quoted"], vec!["a\"b".to_string()]);
+        assert_eq!(section["hash"], vec!["a#b".to_string()]);
+        assert_eq!(section["comment"], vec!["a".to_string()]);
+        assert_eq!(section["spaces"], vec!["a  b".to_string()]);
+        assert_eq!(section["tab"], vec!["a b".to_string()]);
+    }
+
+    /// The same repository, wrapped and unwrapped, is one project.
+    #[test]
+    fn a_continued_remote_resolves_to_the_same_key_as_the_plain_one() {
+        let temp = tempdir().unwrap();
+        let write_repo = |name: &str, config: &str| {
+            let work = temp.path().join(name);
+            let git = work.join(".git");
+            fs::create_dir_all(&git).unwrap();
+            fs::write(git.join("config"), config).unwrap();
+            project_identity(&work)
+        };
+
+        let plain = write_repo(
+            "plain",
+            "[remote \"origin\"]\n\turl = https://github.com/acme/long/path.git\n",
+        );
+        let wrapped = write_repo(
+            "wrapped",
+            "[remote \"origin\"]\n\turl = https://github.com/acme/long\\\n/path.git\n",
+        );
+        assert_eq!(
+            (plain.project_key.as_str(), plain.method),
+            ("github.com/acme/long/path", ProjectKeyMethod::Remote),
+            "the control: an ordinary single-line URL still resolves as before"
+        );
+        assert_eq!(
+            wrapped.project_key, plain.project_key,
+            "a wrapped config split one repository into two projects"
+        );
+        assert_eq!(wrapped.method, ProjectKeyMethod::Remote);
     }
 
     /// git's legacy `[section.subsection]` header, folded onto one spelling.

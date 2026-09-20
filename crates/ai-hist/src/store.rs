@@ -2327,26 +2327,25 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
 /// denormalizing pass carry it down — and keeps it in step afterwards, when
 /// the ancestor it borrowed from moves.
 fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
-    // A borrowed key is reconsidered here for the same reason the statement
-    // above reconsiders one: the ancestor it was borrowed from can be promoted
-    // onto a `remote` of its own, and every stand-in below has to move with
-    // it. Leaving that to the statement is not enough — the statement cannot
-    // see across a generation the catalog does not hold, which is the only
-    // kind of row that reaches this walk.
+    // Two kinds of row reach the walk, and everything else is the statement's:
     //
-    // Rows the statement *can* settle are excluded rather than walked twice:
-    // a row with a lendable direct parent is its business, and this keeps the
-    // steady-state cost to the handful of rows delegated through an
-    // uncataloged generation.
+    //   - one already wearing a borrowed key, because re-lending has to be
+    //     decided one row at a time against a visited set — a statement that
+    //     re-lends rotates the keys of a delegation cycle forever;
+    //   - one with no key, or only a path, whose direct parent has nothing to
+    //     lend, because then the answer is further up than a join can see.
+    //
+    // A row the statement can settle is left to it rather than walked twice.
     let lendable_parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
     let pending: Vec<(String, String)> = conn
         .prepare(&format!(
             "SELECT source, session_id FROM sessions \
-             WHERE (project_key IS NULL OR project_key_method IN ('path', 'inherited')) \
+             WHERE ((project_key_method = 'inherited' AND project_key IS NOT NULL) \
+                    OR ((project_key IS NULL OR project_key_method = 'path') \
+                        AND NOT EXISTS ({lendable_parent}))) \
                AND EXISTS (SELECT 1 FROM session_relationships r \
                      WHERE r.source = sessions.source \
-                       AND r.child_session_id = sessions.session_id) \
-               AND NOT EXISTS ({lendable_parent})"
+                       AND r.child_session_id = sessions.session_id)"
         ))?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -2394,22 +2393,26 @@ fn inheritable_parent_key_sql(source: &str, session_id: &str) -> String {
     )
 }
 
-/// The rows pass 2 would rewrite: a delegated child whose own key is absent
-/// or merely its own path, and one still wearing a borrowed key its parent has
-/// since stopped wearing.
+/// The rows this one statement lends to: a delegated child whose own key is
+/// absent or merely its own path, whose parent has something better.
 ///
-/// That third arm is not symmetry for its own sake. Pass 1 can promote a
-/// parent from the key it borrowed to a `remote` of its own, and every child
-/// that borrowed the old stand-in would otherwise keep it — filed under a
-/// repository that no session in the database claims any more, with nothing
-/// anywhere recording that they were once the same.
+/// Deliberately *not* rows that already wear a borrowed key. Re-lending one is
+/// necessary — an ancestor can be promoted onto a `remote` of its own and
+/// every stand-in beneath it has to move — but it cannot be done by a
+/// set-at-a-time statement: the relationship ledger permits a cycle, and in an
+/// inherited-only cycle `A -> B -> C -> A` a single UPDATE reads every parent
+/// from the same pre-statement snapshot and *rotates* the three keys. The
+/// iteration bound ends the call but not at a fixed point, so every later
+/// refresh rotates them again and denormalizes the new arrangement onto every
+/// event — permanent churn that each pass reports as work done.
+///
+/// Re-lending therefore belongs to the walk below, which carries a visited set
+/// and so can tell a chain from a circle. What is left here strictly shrinks
+/// its own candidate set each iteration — a row it rewrites becomes
+/// `inherited` and stops matching — which is the loop's termination argument.
 fn inheritable_session_sql() -> String {
     let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
-    format!(
-        "(project_key IS NULL OR project_key_method = 'path' \
-          OR (project_key_method = 'inherited' AND project_key IS NOT ({parent}))) \
-         AND EXISTS ({parent})"
-    )
+    format!("(project_key IS NULL OR project_key_method = 'path') AND EXISTS ({parent})")
 }
 
 /// The key a session will hold once pass 1 and pass 2 have both run, computed
@@ -2612,9 +2615,21 @@ fn lendable_ancestor_key_for(
     source: &str,
     session_id: &str,
 ) -> Result<Option<String>> {
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(session_id.to_string());
-    lendable_ancestor_key(conn, source, session_id, &mut visited, 0)
+    let mut walk = AncestorWalk {
+        visited: HashSet::new(),
+        looped: false,
+    };
+    walk.visited.insert(session_id.to_string());
+    lendable_ancestor_key(conn, source, session_id, &mut walk, 0)
+}
+
+/// State carried up the ancestor walk.
+struct AncestorWalk {
+    /// Sessions already examined, so a circle is walked once, not forever.
+    visited: HashSet<String>,
+    /// Whether an edge pointed back at something already examined — that is,
+    /// whether this walk is looking at a circle rather than a chain.
+    looped: bool,
 }
 
 /// The key of the nearest ancestor that has one worth lending, following the
@@ -2648,7 +2663,7 @@ fn lendable_ancestor_key(
     conn: &Connection,
     source: &str,
     session_id: &str,
-    visited: &mut HashSet<String>,
+    walk: &mut AncestorWalk,
     depth: usize,
 ) -> Result<Option<String>> {
     if depth >= PROJECT_KEY_INHERITANCE_PASSES {
@@ -2680,7 +2695,8 @@ fn lendable_ancestor_key(
         })?
         .collect::<rusqlite::Result<_>>()?;
     for (parent_id, key, method, cwd, repo_url) in parents {
-        if !visited.insert(parent_id.clone()) {
+        if !walk.visited.insert(parent_id.clone()) {
+            walk.looped = true;
             continue;
         }
         // What pass 1 will leave on this parent, by the rule pass 1 uses
@@ -2694,10 +2710,17 @@ fn lendable_ancestor_key(
         if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
             return Ok(Some(settled));
         }
-        if let Some(found) = lendable_ancestor_key(conn, source, &parent_id, visited, depth + 1)? {
+        if let Some(found) = lendable_ancestor_key(conn, source, &parent_id, walk, depth + 1)? {
             return Ok(Some(found));
         }
-        if key.is_some() && method.as_deref() == Some("inherited") {
+        // The borrowed key an ancestor is already wearing — unless this walk
+        // went in a circle. A stand-in is only worth passing on when it came
+        // from somewhere: in a cycle of sessions that all borrowed from each
+        // other, every one of them is "wearing" a key on the authority of the
+        // next, and lending it round again rotates the three of them on every
+        // refresh forever. Declining leaves the keys exactly as they are,
+        // which is the only stable answer available.
+        if !walk.looped && key.is_some() && method.as_deref() == Some("inherited") {
             return Ok(key);
         }
     }
