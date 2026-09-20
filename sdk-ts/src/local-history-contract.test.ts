@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import {
   FULL_SESSION_KINDS, SESSION_HYDRATION_CONTRACT_VERSION, SessionSourceUnavailableError,
@@ -147,29 +147,33 @@ test('local discovery, hydration and cached evidence survive malformed commercia
   });
 });
 
-// Grok is the prompt-only provider: its reader indexes `history` rows and
-// nothing else. Cursor used to stand here and stopped being prompt-only when
-// its transcript parser became event-level.
-async function grokSession(home: string, sessionId: string): Promise<void> {
-  const directory = join(home, '.grok', 'sessions', '%2Fwork%2Fcontract', sessionId);
-  await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, 'summary.json'), JSON.stringify({
-    info: { id: sessionId, cwd: '/work/contract' },
-    created_at: '2026-08-31T10:00:00.000Z',
-    updated_at: '2026-08-31T10:00:00.000Z',
-  }));
-  await writeFile(join(directory, 'chat_history.jsonl'), `${JSON.stringify({
-    type: 'user', content: 'grokneedle prompt',
-  })}\n`);
+// OpenCode is the remaining prompt-only local parser: its reader indexes
+// `history` rows and nothing else. Cursor and Grok both write events now.
+async function opencodeSession(home: string, sessionId: string): Promise<void> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const path = join(home, '.local', 'share', 'opencode', 'opencode.db');
+  await mkdir(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+  `);
+  db.prepare('INSERT INTO session VALUES (?, ?, ?)').run(sessionId, '/work/contract', 1);
+  db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('m1', sessionId, 1, JSON.stringify({ role: 'user' }));
+  db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run(
+    'p1', 'm1', sessionId, 2, JSON.stringify({ type: 'text', text: 'openeedle prompt' }),
+  );
+  db.close();
 }
 
 // The bug this replaced: a prompt-only provider reported `full`, so the SDK's
 // merge ranking preferred it over a presence that actually had the events.
 test('a prompt-only provider reports partial capability and names the evidence nobody parsed', async () => {
   await withFixture(async ({ home, dbPath }) => {
-    await grokSession(home, 'grok-contract');
-    await discoverSessions({ dbPath, scope: 'local', sources: ['grok'] });
-    const hydrated = await hydrateSession({ source: 'grok', sessionId: 'grok-contract', dbPath });
+    await opencodeSession(home, 'oc-contract');
+    await discoverSessions({ dbPath, scope: 'local', sources: ['opencode'] });
+    const hydrated = await hydrateSession({ source: 'opencode', sessionId: 'oc-contract', dbPath });
 
     assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
     assert.equal(hydrated.capability, 'partial');
@@ -178,7 +182,7 @@ test('a prompt-only provider reports partial capability and names the evidence n
     // having failed: the prompt it can read did land.
     assert.equal(hydrated.evidence.prompts, 1);
     assert.equal(hydrated.evidence.events, 0);
-    assert.equal((await search('grokneedle', { dbPath, scope: 'local' })).length, 1);
+    assert.equal((await search('openeedle', { dbPath, scope: 'local' })).length, 1);
 
     const partial = hydrated.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE');
     assert.ok(partial, 'a partial hydration names its missing evidence kinds');

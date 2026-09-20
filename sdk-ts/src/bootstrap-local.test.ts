@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -59,8 +59,8 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
 // Bootstrap hydrates with includeRelated: false, so the absent `relationship`
 // coverage is its own choice. Only what the provider itself cannot produce is a
 // capability limitation -- otherwise every Claude bootstrap would report the
-// provider as limited and land in `partial`. Grok is the prompt-only exemplar
-// here; cursor stopped being one when its parser became event-level.
+// provider as limited and land in `partial`. OpenCode is the remaining
+// prompt-only local parser; Cursor and Grok both write events now.
 test('bootstrap reports only the evidence the provider cannot produce, not what it declined', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
   const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
@@ -70,19 +70,11 @@ test('bootstrap reports only the evidence the provider cannot produce, not what 
     status: string; diagnostics: Array<{ source: string; code: string; message: string }>;
   };
   try {
-    const grok = join(home, '.grok', 'sessions', '%2Fwork%2Fapp', 'grok-boot');
-    await mkdir(grok, { recursive: true });
-    await writeFile(join(grok, 'summary.json'), JSON.stringify({
-      info: { id: 'grok-boot', cwd: '/work/app' },
-      created_at: '2026-08-31T10:00:00.000Z',
-      updated_at: '2026-08-31T10:00:00.000Z',
-    }));
-    await writeFile(join(grok, 'chat_history.jsonl'),
-      JSON.stringify({ type: 'user', content: 'bootstrap grok prompt' }) + '\n');
+    await writeOpencodePrompt(home, 'oc-boot', 'bootstrap opencode prompt');
     const result = await call();
     const limited = result.diagnostics.find((item) => item.code === 'CAPABILITY_LIMITED');
     assert.ok(limited, 'a prompt-only provider is still reported as limited');
-    assert.equal(limited.source, 'grok');
+    assert.equal(limited.source, 'opencode');
     assert.equal(limited.message, 'Provider exposes no session_event, tool_call, file_edit evidence');
     // `relationship` is absent from the message: bootstrap declined it.
     assert.doesNotMatch(limited.message, /relationship/);
@@ -91,6 +83,24 @@ test('bootstrap reports only the evidence the provider cannot produce, not what 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+async function writeOpencodePrompt(home: string, sessionId: string, prompt: string): Promise<void> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const path = join(home, '.local', 'share', 'opencode', 'opencode.db');
+  await mkdir(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+  `);
+  db.prepare('INSERT INTO session VALUES (?, ?, ?)').run(sessionId, '/work/app', 1);
+  db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('m1', sessionId, 1, JSON.stringify({ role: 'user' }));
+  db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run(
+    'p1', 'm1', sessionId, 2, JSON.stringify({ type: 'text', text: prompt }),
+  );
+  db.close();
+}
 
 test('bare CLI discovers and indexes on first invocation with an explicit database', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-first-cli-'));
