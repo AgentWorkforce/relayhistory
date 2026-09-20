@@ -464,6 +464,20 @@ test('merging complementary partial presences yields a capability the union supp
   assert.deepEqual(combineHydration(b, a).coverage, [...FULL_SESSION_KINDS]);
 });
 
+test('merged status reports work from either presence regardless of capability or fold order', () => {
+  const unchanged = { ...hydrationPart('full', FULL_SESSION_KINDS), status: 'unchanged' as const };
+  const updated = { ...hydrationPart('partial', ['history']), status: 'updated' as const };
+  assert.equal(combineHydration(unchanged, updated).status, 'updated');
+  assert.equal(combineHydration(updated, unchanged).status, 'updated');
+
+  const hydrated = { ...hydrationPart('partial', ['tool_call']), status: 'hydrated' as const };
+  assert.equal(combineHydration(updated, hydrated).status, 'hydrated');
+  assert.equal(combineHydration(hydrated, updated).status, 'hydrated');
+
+  const limited = { ...hydrationPart('shallow_only', []), status: 'capability_limited' as const };
+  assert.equal(combineHydration(unchanged, limited).status, 'unchanged');
+});
+
 test('a merge that is still short of full coverage stays partial, and empty coverage stays shallow_only', () => {
   const short = combineHydration(
     hydrationPart('partial', ['history']),

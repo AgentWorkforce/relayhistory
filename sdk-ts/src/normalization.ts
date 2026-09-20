@@ -542,6 +542,12 @@ export function combineHydration(
   if (!previous) return next;
   const rank = { full: 2, partial: 1, shallow_only: 0 };
   const best = rank[next.capability] > rank[previous.capability] ? next : previous;
+  // A presence that performed work must not disappear behind an unchanged
+  // presence chosen for its capability. A first hydration outranks an update,
+  // which outranks a repeat; a capability-limited result did no indexing.
+  const statusRank = { hydrated: 3, updated: 2, unchanged: 1, capability_limited: 0 };
+  const status = statusRank[next.status] > statusRank[previous.status]
+    ? next.status : previous.status;
   // Taking only the winner's coverage would understate a merge whose other
   // half indexed a kind the winner does not.
   const coverage = EVIDENCE_KINDS.filter(
@@ -577,6 +583,7 @@ export function combineHydration(
     // Derived from the union rather than carried off `best`, which is spread
     // above: an individual `partial` no longer describes the merged coverage.
     capability: mergedHydrationCapability(coverage, [previous, next]),
+    status,
     evidence: {
       prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
       events: Math.max(previous.evidence.events, next.evidence.events),

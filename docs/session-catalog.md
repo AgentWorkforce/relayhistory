@@ -74,8 +74,10 @@ difference between "this session has no delegation" and "nothing looked"; the
 diagnostic says which by naming `include_related`.
 
 Codex child acquisition reads the selected session's date directory and the
-following date, which finds children spawned across midnight without making an
-old session scan years of newer rollouts. If later date directories exist, the
+following date in both the active and archived rollout stores, which finds
+children spawned across midnight or moved between stores without making an
+old session scan years of newer rollouts. If later date directories exist in
+either store, the
 bounded search may miss delayed descendants; the result omits `relationship`
 from `coverage`, reports `partial`, and includes
 `HYDRATION_BOUNDED_RELATIONSHIPS`. A full sync can index relationships across

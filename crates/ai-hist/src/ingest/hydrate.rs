@@ -1530,23 +1530,42 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
 /// directories exist, `codex_child_scan_complete` prevents this bounded search
 /// from claiming complete relationship coverage.
 fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
+    let Some((from, through)) = codex_child_scan_dates(directory) else {
+        return collect_matching_files(directory, "rollout-", "jsonl");
+    };
+    let mut candidates = Vec::new();
+    for root in codex_rollout_roots(directory) {
+        for date in [&from, &through] {
+            candidates.extend(collect_matching_files(
+                &root.join(date),
+                "rollout-",
+                "jsonl",
+            )?);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn codex_rollout_roots(directory: &Path) -> Vec<PathBuf> {
     let Some(root) = directory
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
     else {
-        return collect_matching_files(directory, "rollout-", "jsonl");
+        return vec![directory.to_path_buf()];
     };
-    let Some((_, through)) = codex_child_scan_dates(directory) else {
-        return collect_matching_files(directory, "rollout-", "jsonl");
+    let Some(codex_home) = root.parent() else {
+        return vec![root.to_path_buf()];
     };
-    let mut candidates = collect_matching_files(directory, "rollout-", "jsonl")?;
-    candidates.extend(collect_matching_files(
-        &root.join(through),
-        "rollout-",
-        "jsonl",
-    )?);
-    Ok(candidates)
+    match root.file_name().and_then(|name| name.to_str()) {
+        Some("sessions" | "archived_sessions") => vec![
+            codex_home.join("sessions"),
+            codex_home.join("archived_sessions"),
+        ],
+        _ => vec![root.to_path_buf()],
+    }
 }
 
 fn codex_child_scan_dates(directory: &Path) -> Option<(String, String)> {
@@ -1560,23 +1579,21 @@ fn codex_child_scan_complete(directory: &Path) -> Result<bool> {
     let Some((_, through)) = codex_child_scan_dates(directory) else {
         return Ok(false);
     };
-    let Some(root) = directory
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-    else {
-        return Ok(false);
-    };
-    let Some(year) = sorted_dirs(root)?.pop() else {
-        return Ok(true);
-    };
-    let Some(month) = sorted_dirs(&year)?.pop() else {
-        return Ok(true);
-    };
-    let Some(day) = sorted_dirs(&month)?.pop() else {
-        return Ok(true);
-    };
-    Ok(date_key(&day).is_some_and(|key| key <= through))
+    for root in codex_rollout_roots(directory) {
+        let Some(year) = sorted_dirs(&root)?.pop() else {
+            continue;
+        };
+        let Some(month) = sorted_dirs(&year)?.pop() else {
+            continue;
+        };
+        let Some(day) = sorted_dirs(&month)?.pop() else {
+            continue;
+        };
+        if !date_key(&day).is_some_and(|key| key <= through) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `YYYY/MM/DD` for a rollout date directory, as a sortable string.
@@ -2914,6 +2931,45 @@ mod tests {
         assert!(!result.related_session_ids.contains(&"later".to_string()));
         assert!(!result.coverage.contains(&EvidenceKind::Relationship));
         assert_eq!(result.capability, "partial");
+    }
+
+    #[test]
+    fn codex_children_across_active_and_archived_roots_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        let root = codex.join("sessions/2026/09/20/rollout-root.jsonl");
+        codex_rollout(&root, "root", None, "2026-09-20T23:59:00Z");
+        codex_rollout(
+            &codex.join("archived_sessions/2026/09/21/rollout-child.jsonl"),
+            "archived-child",
+            Some("root"),
+            "2026-09-21T00:00:30Z",
+        );
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+        let found =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert!(found
+            .related_session_ids
+            .contains(&"archived-child".to_string()));
+        assert_eq!(found.capability, "full");
+
+        // A later date in either root invalidates the exhaustive coverage
+        // claim, even when the selected root has no newer rollouts.
+        codex_rollout(
+            &codex.join("archived_sessions/2026/09/23/rollout-later.jsonl"),
+            "later",
+            Some("root"),
+            "2026-09-23T10:00:00Z",
+        );
+        let bounded =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert_ne!(bounded.status, "unchanged");
+        assert_eq!(bounded.capability, "partial");
+        assert!(!bounded.coverage.contains(&EvidenceKind::Relationship));
     }
 
     #[test]
