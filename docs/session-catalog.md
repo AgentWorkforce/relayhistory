@@ -516,8 +516,11 @@ How each adapter works:
   would have re-read — a new checkpoint written after the last update row is
   new evidence, and is read as such.
 
-  A file the read consumes and **cannot read** is an error, never an absent
-  one: an unreadable `updates.jsonl` taken as "no stream" would replace exact
+  Every read in this path answers in three states: **absent** (nothing to
+  record), **malformed but present** (the file's existence is itself evidence,
+  so the marker is written with no detail rather than deleted), and
+  **unreadable** (an error). A file the read consumes and cannot read is never
+  an absent one: an unreadable `updates.jsonl` taken as "no stream" would replace exact
   event times with fallbacks and drop the token snapshots, and an unreadable
   sidecar directory taken as "no entries" would delete the checkpoints already
   stored — both while the metadata stamp, still perfectly readable,

@@ -1150,7 +1150,7 @@ impl ShallowSessionProvider for GrokProvider {
         let summary = if summary_path.is_file() {
             scan.note_open();
             scan.note_bytes(fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
-            crate::read_grok_summary(&summary_path)
+            crate::read_grok_summary(&summary_path)?
         } else {
             None
         };

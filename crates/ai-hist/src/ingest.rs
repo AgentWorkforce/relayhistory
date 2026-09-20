@@ -3987,6 +3987,13 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     let mut scanned = 0;
     let mut sessions = 0;
     let mut errors = 0;
+    // Sessions this run could **account for**: indexed now, or confirmed
+    // unchanged against a stamp it read successfully. Not the same as
+    // `sessions`, which counts only what was indexed — a store that is fully
+    // synced indexes nothing on every later run, and using that count to
+    // decide whether the source failed would fail it forever over one
+    // unreadable sibling.
+    let mut accounted = 0;
     for chat in collect_matching_files(root, "chat_history", "jsonl")? {
         let key = chat.to_string_lossy().to_string();
         // One unreadable session directory does not stop the rest, and it does
@@ -4004,6 +4011,7 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             }
         };
         if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
+            accounted += 1;
             continue;
         }
         scanned += 1;
@@ -4017,9 +4025,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
                 inserted += ingest_grok_session(&tx, &session, &raw_path)?.prompts;
                 tx.commit()?;
                 sessions += 1;
+                accounted += 1;
                 grok_state.insert(key, json!(stamp));
             }
             Ok(None) => {
+                // Read fine, and there was no session in it.
+                accounted += 1;
                 grok_state.insert(key, json!(stamp));
             }
             Err(error) => {
@@ -4039,10 +4050,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     }
     // A store where nothing could be read is a failed source, not an empty
     // one: the caller records it and the run says so. A store where something
-    // failed and something else worked stays a success, so the sessions that
-    // did read keep their saved stamps -- otherwise one unreadable directory
-    // would send every future run back over the whole store.
-    if errors > 0 && sessions == 0 {
+    // failed and something else was accounted for stays a success, so the
+    // sessions that did read keep their saved stamps -- otherwise one
+    // unreadable directory would send every future run back over the whole
+    // store, and a fully synced store would fail this source on every run
+    // from then on.
+    if errors > 0 && accounted == 0 {
         anyhow::bail!(
             "{errors} Grok session(s) could not be read and none were indexed; \
              the unreadable directories are named above"
@@ -4836,7 +4849,7 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
     };
     for name in GROK_STAMPED_SIBLINGS {
         let path = chat.with_file_name(name);
-        let Ok(sibling) = path.metadata() else {
+        let Some(sibling) = grok_entry_metadata(&path)? else {
             continue;
         };
         stamp.push('|');
@@ -4849,7 +4862,7 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
     let mut digest = Sha256::new();
     for sibling in GROK_DIGESTED_SIBLINGS {
         let path = chat.with_file_name(sibling);
-        let Ok(found) = path.metadata() else {
+        let Some(found) = grok_entry_metadata(&path)? else {
             continue;
         };
         digest.update(format!("{sibling}={}\n", stamp_of(&found)));
@@ -4905,7 +4918,7 @@ pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
     let mut records = hydrate::complete_jsonl_records(chat)?;
     for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
         let path = chat.with_file_name(name);
-        if path.is_file() {
+        if grok_entry_metadata(&path)?.is_some_and(|found| found.is_file()) {
             records += grok_record_count(&path)?;
         }
     }
@@ -4981,7 +4994,7 @@ struct GrokSession {
 }
 
 fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
-    let summary = read_grok_summary(&chat.with_file_name("summary.json"));
+    let summary = read_grok_summary(&chat.with_file_name("summary.json"))?;
     let fallback_session = chat
         .parent()
         .and_then(|p| p.file_name())
@@ -5079,15 +5092,22 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }
 
     let directory = chat.parent().map(Path::to_path_buf);
+    // A `signals.json` that exists but does not parse is still a fact about
+    // the session, so the marker is written from its existence and the counters
+    // are simply absent. Collapsing that into "no signals" would delete the
+    // marker a previous read wrote and record nothing in its place.
     let signals = match directory.as_deref() {
-        Some(dir) => read_json_file(&dir.join("signals.json"))?
-            .as_ref()
-            .map(grok::parse_signals),
+        Some(dir) => match read_json_file(&dir.join("signals.json"))? {
+            GrokSidecar::Absent => None,
+            GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
+            GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
+        },
         None => None,
     };
-    let prompt_context = directory
-        .as_deref()
-        .and_then(|dir| read_grok_prompt_context(&dir.join("prompt_context.json")));
+    let prompt_context = match directory.as_deref() {
+        Some(dir) => read_grok_prompt_context(&dir.join("prompt_context.json"))?,
+        None => None,
+    };
     let (compactions, subagents) = match directory.as_deref() {
         Some(dir) => (
             read_grok_compactions(&dir.join("compaction_checkpoints"))?,
@@ -5130,34 +5150,89 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }))
 }
 
-/// One JSON sidecar, if it is there and parses.
+/// What a read of one Grok sidecar found.
 ///
-/// Absent is `None` and so is malformed — a sidecar this parser cannot read is
-/// still evidence that the file exists, and the caller records the entry
-/// without detail. An I/O failure is neither: it is an error, so a directory
-/// that cannot be read does not masquerade as a directory of empty files.
-fn read_json_file(path: &Path) -> Result<Option<Value>> {
+/// The three states are not interchangeable, and collapsing any two of them
+/// loses evidence:
+///
+/// * **Absent** — Grok never wrote this file. There is nothing to record.
+/// * **Unparsed** — the file is there and this parser cannot interpret it: a
+///   half-written document, or a shape nobody has characterized yet. The
+///   *existence* is evidence, so the caller still records the entry, with no
+///   detail. Deleting the previous marker and writing nothing would report a
+///   session that had never had one.
+/// * **Read** — the document, parsed.
+///
+/// An I/O failure is none of these: it is an error, so a file that cannot be
+/// read never masquerades as a file that is not there.
+enum GrokSidecar {
+    Absent,
+    Unparsed,
+    Read(Value),
+}
+
+impl GrokSidecar {
+    /// The parsed document, if there is one.
+    fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Read(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+fn read_json_file(path: &Path) -> Result<GrokSidecar> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(GrokSidecar::Absent),
         Err(error) => {
             return Err(error).with_context(|| format!("read Grok sidecar {}", path.display()))
         }
     };
-    Ok(serde_json::from_str(&contents).ok())
+    Ok(match serde_json::from_str(&contents) {
+        Ok(value) => GrokSidecar::Read(value),
+        Err(_) => GrokSidecar::Unparsed,
+    })
+}
+
+/// The metadata of a file a Grok read consumes: `None` when it is not there,
+/// an error when it is there and cannot be stat-ed.
+///
+/// The `Ok(_) => continue` this replaces was the same silent-absence bug one
+/// level down: a `summary.json` or `updates.jsonl` that could not be stat-ed
+/// dropped out of the change stamp, making an unreadable file indistinguishable
+/// from a missing one.
+fn grok_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match path.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("stat Grok file {}", path.display())),
+    }
 }
 
 /// Identify `prompt_context.json` without copying it: the path, its SHA-256
 /// and its size are enough to tell two sessions' instruction snapshots apart.
-fn read_grok_prompt_context(path: &Path) -> Option<GrokPromptContext> {
-    let contents = fs::read(path).ok()?;
+///
+/// Absent is `None`; unreadable is an error. Taking a permission failure for
+/// absence would delete the marker this session already had and then save the
+/// stamp, so every later run would agree the directory was unchanged and the
+/// snapshot would stay gone.
+fn read_grok_prompt_context(path: &Path) -> Result<Option<GrokPromptContext>> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read Grok prompt context {}", path.display()))
+        }
+    };
     let mut hasher = Sha256::new();
     hasher.update(&contents);
-    Some(GrokPromptContext {
+    Ok(Some(GrokPromptContext {
         path: path.to_string_lossy().to_string(),
         sha256: format!("{:x}", hasher.finalize()),
         bytes: contents.len() as u64,
-    })
+    }))
 }
 
 /// Every readable entry in `compaction_checkpoints/`, oldest name first.
@@ -5175,10 +5250,10 @@ fn read_grok_compactions(dir: &Path) -> Result<Vec<GrokCompaction>> {
             .unwrap_or_default();
         checkpoints.push(GrokCompaction {
             ts_ms: parsed
-                .as_ref()
+                .value()
                 .and_then(grok::compaction_timestamp_ms)
                 .or_else(|| timestamp_from_name(&name)),
-            detail_json: parsed.as_ref().map(ToString::to_string),
+            detail_json: parsed.value().map(ToString::to_string),
             locator: path.to_string_lossy().to_string(),
             name,
         });
@@ -5193,7 +5268,7 @@ fn read_grok_subagents(dir: &Path) -> Result<Vec<GrokSubagentEvidence>> {
     for path in read_dir_files(dir)? {
         found.push(GrokSubagentEvidence {
             metadata: read_json_file(&path)?
-                .as_ref()
+                .value()
                 .map(grok::parse_subagent)
                 .unwrap_or_default(),
             locator: path.to_string_lossy().to_string(),
@@ -5250,8 +5325,16 @@ fn timestamp_from_name(name: &str) -> Option<i64> {
     grok::timestamp_value_ms(&json!(digits.parse::<i64>().ok()?))
 }
 
-pub(crate) fn read_grok_summary(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+/// `summary.json`, parsed.
+///
+/// `None` covers two cases that share an answer: the file is not there, or it
+/// is there and does not parse. Both leave identity to the path layout, which
+/// is the documented degrade. An I/O failure does **not** share that answer —
+/// a session whose summary cannot be read would otherwise be indexed under its
+/// directory name with a `created_at` taken from an mtime, silently becoming a
+/// different session from the one already in the catalog.
+pub(crate) fn read_grok_summary(path: &Path) -> Result<Option<Value>> {
+    Ok(read_json_file(path)?.value().cloned())
 }
 
 pub(crate) fn grok_project_from_path(chat: &Path) -> Option<String> {
@@ -6467,6 +6550,127 @@ mod tests {
         assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
         let saved = state[super::GROK_SYNC_STATE_KEY].as_object().unwrap();
         assert_eq!(saved.len(), 1, "only the readable session is checkpointed");
+    }
+
+    /// Every sidecar read obeys the same three-way rule: absent is nothing,
+    /// malformed-but-present is evidence, unreadable is an error.
+    ///
+    /// The malformed case is the one that is easy to get wrong in the safe
+    /// direction: collapsing it into "absent" deletes the marker a previous
+    /// read wrote and records nothing in its place, so a session that *had* a
+    /// `prompt_context` or `signals` file looks like one that never did.
+    #[test]
+    fn a_malformed_sidecar_is_evidence_and_an_unreadable_one_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-side-0001");
+        fs::write(
+            dir.join("signals.json"),
+            br#"{"contextTokensUsed":10,"turnCount":2,"compactionCount":1}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("prompt_context.json"), br#"{"files":[]}"#).unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let index = |conn: &Connection| {
+            let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+            super::ingest_grok_session(conn, &session, &chat.to_string_lossy()).unwrap()
+        };
+        let marker = |conn: &Connection, kind: &str| -> Option<(Option<String>, Option<String>)> {
+            conn.query_row(
+                "SELECT text, detail_json FROM session_markers \
+                 WHERE source = 'grok' AND kind = ?",
+                params![kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+        };
+
+        // The positive control: parsed, both markers carry their detail.
+        index(&conn);
+        let signals = marker(&conn, "signals").expect("a signals marker");
+        assert_eq!(
+            signals.0.as_deref(),
+            Some("turns=2 compactions=1 context_tokens_used=10")
+        );
+        assert!(signals.1.unwrap().contains("contextTokensUsed"));
+        assert!(marker(&conn, "prompt_context").is_some());
+
+        // Half-written: still a session that has a signals file, recorded with
+        // no counters rather than deleted.
+        fs::write(dir.join("signals.json"), b"{\"contextTokensUsed\":").unwrap();
+        index(&conn);
+        let signals = marker(&conn, "signals").expect("a malformed signals file is still evidence");
+        assert_eq!(signals.0.as_deref(), Some(""));
+        assert_eq!(signals.1.as_deref(), Some("{}"));
+
+        // Absent: nothing to record, and the read is clean.
+        fs::remove_file(dir.join("signals.json")).unwrap();
+        index(&conn);
+        assert!(marker(&conn, "signals").is_none());
+        assert!(marker(&conn, "prompt_context").is_some());
+
+        // Unreadable: an error, so the transaction rolls back and the
+        // prompt_context marker this session already had survives.
+        let context = dir.join("prompt_context.json");
+        fs::remove_file(&context).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&context, &context).unwrap();
+        #[cfg(not(unix))]
+        return;
+        assert!(super::scan_grok_session_file(&chat).is_err());
+        assert!(
+            marker(&conn, "prompt_context").is_some(),
+            "a failed read must leave the previous evidence alone"
+        );
+        // …and an unreadable summary.json does not quietly re-identify the
+        // session from its directory name either.
+        fs::remove_file(&context).unwrap();
+        let summary = dir.join("summary.json");
+        fs::remove_file(&summary).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&summary, &summary).unwrap();
+        assert!(super::scan_grok_session_file(&chat).is_err());
+    }
+
+    /// A fully synced store indexes nothing on every later run. Deciding
+    /// whether the source failed from "sessions indexed" therefore fails it
+    /// forever over one unreadable sibling; the count has to be "sessions this
+    /// run could account for".
+    #[test]
+    fn an_unchanged_session_still_accounts_for_itself_when_a_sibling_is_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let (_chat, healthy) = grok_stream_fixture(home.path(), "grok-acc-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+
+        // A second session that cannot be read, beside one that is now
+        // unchanged. The store is still healthy enough to report.
+        let (_broken, broken) = grok_stream_fixture(home.path(), "grok-acc-0002");
+        fs::create_dir_all(broken.join("compaction_checkpoints")).unwrap();
+        let loop_entry = broken.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let inserted = super::sync_grok(&conn, &mut state, &root)
+            .expect("an unchanged session accounts for itself; the source has not failed");
+        assert_eq!(inserted, 0, "nothing new was indexed, and that is fine");
+        assert_eq!(
+            state[super::GROK_SYNC_STATE_KEY].as_object().unwrap().len(),
+            1,
+            "the healthy session keeps its checkpoint and the broken one gets none"
+        );
+
+        // The positive control from round five still holds: with *only* the
+        // unreadable session in the store, the source fails.
+        fs::remove_dir_all(&healthy).unwrap();
+        let mut fresh = Map::new();
+        let error = super::sync_grok(&conn, &mut fresh, &root)
+            .expect_err("a store that could account for nothing is a failed source");
+        assert!(format!("{error:#}").contains("could not be read"));
     }
 
     #[test]
