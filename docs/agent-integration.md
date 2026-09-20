@@ -112,7 +112,12 @@ against the working directory when it is built, and every event path is put
 through the same resolution before it is matched. Both sides then hold one
 spelling: a root that kept a relative name would register successfully, be
 reported as watched, and never match the absolute path the watcher reports for
-it, so the file would be watched and never seen to change. The backstop also
+it, so the file would be watched and never seen to change. A root also
+remembers what the filesystem says its registration path really is, resolved
+once per registration, because the backends disagree: inotify echoes the path
+the watch was registered with, while macOS FSEvents always reports the real
+one (`/private/var/…`, and the target of any symlink on the way). Either
+spelling matches. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.
@@ -146,7 +151,9 @@ Two things make this cheap enough to leave running:
   including the per-file failures a provider absorbs on its way to a
   successful partial run. A file that could not be read this tick keeps the
   fingerprint stale so the next tick retries it, rather than caching the
-  failure in place. The value is qualified by the sweep's own parser and
+  failure in place. Discovery's per-file failures are counted the same way:
+  it reads the same files, and its failures are non-fatal, so a candidate it
+  could not read must not be checkpointed as one it did. The value is qualified by the sweep's own parser and
   scanner generations, so a stamp written before an upgrade that bumps one
   cannot skip the re-read that bump exists to force.
 - A sweep owes more than ingestion — it also repairs a session whose per-file

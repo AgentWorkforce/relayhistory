@@ -20,8 +20,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   seconds without a restart, while sweeps keep the cadence that was asked for.
   Every configurable interval is bounded at seven days where it enters, so an
   absurd `--debounce-ms` cannot stop capture on the first change event. Watch
-  roots and event paths are resolved to one absolute spelling, so a root given
-  relatively matches the events the watcher reports for it.
+  roots and event paths are resolved to one absolute spelling, and a root also
+  remembers its symlink-resolved spelling, so a root given relatively or
+  reached through a symlink matches the events the watcher reports for it on
+  either backend. A change arriving while a manual `tick()` holds the sweep
+  slot is swept as soon as that tick finishes, rather than waiting for the
+  backstop.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not
@@ -34,7 +38,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `agent-*.meta.json` sidecars, the two flat logs and the trajectory records —
   recorded in `.sync-state.json`. A tick over unchanged sources opens no files.
   Filesystem-event ticks force past it, because an event can arrive before the
-  write flushes.
+  write flushes. A file that could not be read — by the sweep or by discovery,
+  whose per-file failures are non-fatal — leaves the fingerprint stale so the
+  next tick retries it, rather than caching the failure in place.
 - The fingerprint is qualified by the sweep's parser and scanner generations,
   and paired with a `destination_generation` marker in `.sync-state.json`
   recorded after each sweep. An upgrade that bumps a generation cannot honour

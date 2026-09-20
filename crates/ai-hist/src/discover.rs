@@ -382,6 +382,10 @@ pub struct WatchRoot {
     pub path: PathBuf,
     /// How much of `path` is watched.
     pub depth: WatchDepth,
+    /// The same root with its symlinks resolved, once the filesystem has been
+    /// asked — see [`WatchRoot::resolve`]. `None` until then, and for a root
+    /// whose registration path does not exist yet.
+    pub canonical: Option<PathBuf>,
 }
 
 /// How much of a [`WatchRoot`]'s path is watched.
@@ -443,6 +447,7 @@ impl WatchRoot {
         Self {
             path: watch_path(&path.into()),
             depth: WatchDepth::Tree,
+            canonical: None,
         }
     }
 
@@ -451,6 +456,7 @@ impl WatchRoot {
         Self {
             path: watch_path(&path.into()),
             depth: WatchDepth::Directory,
+            canonical: None,
         }
     }
 
@@ -459,6 +465,7 @@ impl WatchRoot {
         Self {
             path: watch_path(&path.into()),
             depth: WatchDepth::File,
+            canonical: None,
         }
     }
 
@@ -478,14 +485,68 @@ impl WatchRoot {
         }
     }
 
+    /// Ask the filesystem what this root's registration path really is, and
+    /// remember it alongside the spelling the root was given.
+    ///
+    /// Two spellings, because the two backends disagree about which one they
+    /// report. inotify echoes the path the watch was registered with; macOS
+    /// FSEvents reports the *real* path — `/private/var/...` for anything
+    /// under `/var`, and the resolved target of any symlink on the way. A
+    /// root reached through a symlink therefore registers, is reported as
+    /// watched, and never matches an event, which is the failure that looks
+    /// most like everything working.
+    ///
+    /// Resolving the *registration* path rather than the root itself is what
+    /// makes this work for a file that does not exist yet: the directory it
+    /// will appear in does, so the canonical spelling is known before the
+    /// first write. Called once per registration, never per event.
+    pub fn resolve(&mut self) {
+        let Ok(directory) = std::fs::canonicalize(self.registered_path()) else {
+            // Not there yet. The root stays pending and this is asked again
+            // when it is retried.
+            self.canonical = None;
+            return;
+        };
+        self.canonical = Some(match self.depth {
+            WatchDepth::File => match self.path.file_name() {
+                Some(name) => directory.join(name),
+                None => directory,
+            },
+            _ => directory,
+        });
+    }
+
+    /// The registration path in its resolved spelling, when one is known.
+    pub fn canonical_registered_path(&self) -> Option<&Path> {
+        let canonical = self.canonical.as_deref()?;
+        Some(match self.depth {
+            WatchDepth::File => canonical.parent().unwrap_or(canonical),
+            _ => canonical,
+        })
+    }
+
+    /// Whether `path` is one of the spellings this root registers under.
+    pub fn registers_at(&self, path: &Path) -> bool {
+        self.registered_path() == path || self.canonical_registered_path() == Some(path)
+    }
+
     /// Whether an event on `path` is one this root asked for.
     pub fn covers(&self, path: &Path) -> bool {
+        // Either spelling. The lexical one is what inotify reports back, the
+        // resolved one is what FSEvents reports, and a root is the same root
+        // under both.
+        self.covers_as(&self.path, path)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|canonical| self.covers_as(canonical, path))
+    }
+
+    fn covers_as(&self, root: &Path, path: &Path) -> bool {
         match self.depth {
-            WatchDepth::Tree => path.starts_with(&self.path),
-            WatchDepth::Directory => {
-                path == self.path || path.parent() == Some(self.path.as_path())
-            }
-            WatchDepth::File => path == self.path,
+            WatchDepth::Tree => path.starts_with(root),
+            WatchDepth::Directory => path == root || path.parent() == Some(root),
+            WatchDepth::File => path == root,
         }
     }
 }
@@ -519,7 +580,11 @@ pub fn watch_roots(
         .into_iter()
         .map(|path| {
             let depth = widest[&path];
-            WatchRoot { path, depth }
+            WatchRoot {
+                path,
+                depth,
+                canonical: None,
+            }
         })
         .collect()
 }

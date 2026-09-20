@@ -205,6 +205,10 @@ struct WakeState {
 #[derive(Default)]
 struct RunState {
     in_flight: bool,
+    /// A forced tick arrived while a run held the slot. Kept as one bit: a
+    /// hundred events during a long sweep are one sweep afterwards, not a
+    /// hundred.
+    deferred_force: bool,
     /// Monotonic count of finished ticks, so a joiner can wait for "the run
     /// that was in flight when I arrived" without holding the lock across it.
     completed: u64,
@@ -229,12 +233,19 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        {
+        let deferred = {
             let mut run = self.inner.run.lock().expect("watch run state");
             run.in_flight = false;
             run.completed = run.completed.wrapping_add(1);
-        }
+            std::mem::take(&mut run.deferred_force)
+        };
         self.inner.run_cv.notify_all();
+        if deferred {
+            // A change arrived while this run held the slot. Post it now that
+            // the slot is free: the loop is waiting on the wake state, so it
+            // takes it up immediately rather than at the next backstop.
+            self.inner.signal_change();
+        }
     }
 }
 
@@ -327,24 +338,34 @@ impl WatchInner {
         }
     }
 
-    /// Claim the in-flight slot, or `None` when a tick is already running.
-    fn claim(&self) -> Option<InFlight<'_>> {
+    /// Driver path: a *backstop* tick arriving while one is in flight is
+    /// dropped, not queued. Queuing would run two sweeps back to back with no
+    /// gap right after a slow one — the spike the interval exists to avoid.
+    ///
+    /// A **forced** tick is not dropped, because it is evidence that something
+    /// changed: the wake state was already cleared when the debounce window
+    /// opened, so returning here would lose that change until the backstop —
+    /// up to `--interval` later, which may be an hour. It is remembered
+    /// instead, and [`InFlight::drop`] re-posts it the moment the run in
+    /// flight finishes. Repeats coalesce into the one bit, so a busy tree
+    /// during a long manual sweep costs one sweep afterwards.
+    fn run_skip_if_busy(&self, trigger: TickTrigger) {
+        let Some(guard) = self.claim_or_defer(trigger) else {
+            return;
+        };
+        self.run_claimed(trigger, guard);
+    }
+
+    /// Claim the in-flight slot, or remember a forced trigger that could not
+    /// have it.
+    fn claim_or_defer(&self, trigger: TickTrigger) -> Option<InFlight<'_>> {
         let mut run = self.run.lock().expect("watch run state");
         if run.in_flight {
+            run.deferred_force |= trigger.forces_scan();
             return None;
         }
         run.in_flight = true;
         Some(InFlight { inner: self })
-    }
-
-    /// Driver path: a tick arriving while one is in flight is dropped, not
-    /// queued. Queuing would run two sweeps back to back with no gap right
-    /// after a slow one — the spike the interval exists to avoid.
-    fn run_skip_if_busy(&self, trigger: TickTrigger) {
-        let Some(guard) = self.claim() else {
-            return;
-        };
-        self.run_claimed(trigger, guard);
     }
 
     /// Manual path: a tick arriving while one is in flight waits for it, so
@@ -738,6 +759,16 @@ mod fs_events {
             self.pending.iter().map(|root| root.path.clone()).collect()
         }
 
+        /// Keep the callback's copy of a root in step with the registered
+        /// one, so it matches against the same spellings.
+        fn remember(&self, root: &WatchRoot) {
+            let mut known = self.depth.lock().expect("watch roots");
+            match known.iter_mut().find(|seen| seen.path == root.path) {
+                Some(seen) => *seen = root.clone(),
+                None => known.push(root.clone()),
+            }
+        }
+
         /// Take on roots that were not known at startup — a `.trajectories`
         /// directory created in a project an hour into the run. Returns how
         /// many are new, so the caller knows whether to retry attaching.
@@ -780,6 +811,7 @@ mod fs_events {
         pub(super) fn reconcile(&mut self) -> usize {
             let mut changed = 0usize;
             let mut lost = Vec::new();
+            let mut resolved = Vec::new();
             let watcher = &mut self.watcher;
             let mut stale = self.stale.lock().expect("stale roots");
             self.watched.retain_mut(|entry| {
@@ -791,11 +823,19 @@ mod fs_events {
                 // Best effort: the old watch may already be gone with its
                 // directory, and failing to drop it is not a reason to keep
                 // claiming it.
-                let _ = watcher.unwatch(entry.root.registered_path());
-                if current.is_some() && register(watcher, &entry.root) {
+                let _ = watcher.unwatch(
+                    entry
+                        .root
+                        .canonical_registered_path()
+                        .unwrap_or_else(|| entry.root.registered_path()),
+                );
+                if current.is_some() && register(watcher, &mut entry.root) {
                     // Same name, new directory object: re-registered against
-                    // the one that is there now.
-                    entry.identity = current;
+                    // the one that is there now, and re-resolved with it — a
+                    // symlinked root whose target moved is a new spelling as
+                    // well as a new object.
+                    entry.identity = root_identity(entry.root.registered_path());
+                    resolved.push(entry.root.clone());
                     changed += 1;
                     return true;
                 }
@@ -803,6 +843,9 @@ mod fs_events {
                 false
             });
             drop(stale);
+            for root in resolved {
+                self.remember(&root);
+            }
             for root in lost {
                 self.pending.push(root);
                 changed += 1;
@@ -819,10 +862,12 @@ mod fs_events {
             let mut attached = 0usize;
             let watcher = &mut self.watcher;
             let watched = &mut self.watched;
-            self.pending.retain(|root| {
+            let mut resolved = Vec::new();
+            self.pending.retain_mut(|root| {
                 if !register(watcher, root) {
                     return true;
                 }
+                resolved.push(root.clone());
                 watched.push(Registered {
                     identity: root_identity(root.registered_path()),
                     root: root.clone(),
@@ -830,6 +875,9 @@ mod fs_events {
                 attached += 1;
                 false
             });
+            for root in resolved {
+                self.remember(&root);
+            }
             attached
         }
     }
@@ -851,6 +899,7 @@ mod fs_events {
         // and `retry_pending` adds to that set later, so it is shared rather
         // than captured by value.
         let depth: Arc<Mutex<Vec<WatchRoot>>> = Arc::new(Mutex::new(roots.to_vec()));
+        // Replaced below with the resolved roots, once each has been asked.
         let depth_for_events = depth.clone();
         let stale: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let stale_for_events = stale.clone();
@@ -885,9 +934,11 @@ mod fs_events {
                             .iter()
                             .map(|path| discover::watch_path(path))
                             .filter(|path| {
-                                roots
-                                    .iter()
-                                    .any(|root| root.registered_path() == path.as_path())
+                                // Either spelling, for the same reason the
+                                // match above takes either: a removal
+                                // reported under the resolved path is the
+                                // same removal.
+                                roots.iter().any(|root| root.registers_at(path))
                             })
                             .collect::<Vec<_>>()
                     })
@@ -904,16 +955,23 @@ mod fs_events {
         })?;
         let mut watched = Vec::new();
         let mut pending = Vec::new();
+        let mut known = Vec::new();
         for root in roots {
-            if register(&mut watcher, root) {
+            let mut root = root.clone();
+            if register(&mut watcher, &mut root) {
+                known.push(root.clone());
                 watched.push(Registered {
                     identity: root_identity(root.registered_path()),
-                    root: root.clone(),
+                    root,
                 });
             } else {
-                pending.push(root.clone());
+                known.push(root.clone());
+                pending.push(root);
             }
         }
+        // The callback matches against these, so it has to see the resolved
+        // spellings rather than the ones the caller handed in.
+        *depth.lock().expect("watch roots") = known;
         Ok(FsWatch {
             watcher,
             watched,
@@ -977,12 +1035,21 @@ mod fs_events {
 
     static REGISTRATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    fn register(watcher: &mut notify::RecommendedWatcher, root: &WatchRoot) -> bool {
+    fn register(watcher: &mut notify::RecommendedWatcher, root: &mut WatchRoot) -> bool {
+        // Ask the filesystem for the root's real spelling first, and register
+        // *that*. Both backends then report paths this root recognises: it
+        // keeps the spelling it was given as well, because inotify echoes
+        // whichever path the watch was registered with while FSEvents always
+        // reports the resolved one. One call per registration, and none per
+        // event.
+        root.resolve();
         // A file root registers its parent, so it is the parent's existence
         // that decides whether the root is coverable yet — and a file that
         // does not exist inside a directory that does is covered from the
         // start, which is the point of watching the parent.
-        let target = root.registered_path();
+        let target = root
+            .canonical_registered_path()
+            .unwrap_or_else(|| root.registered_path());
         if !target.exists() {
             return false;
         }

@@ -1116,18 +1116,36 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // outright; `coverage` catches the per-file failures a source absorbs on
     // its way to a successful partial run, which never reach `failures` at
     // all.
-    let all_sources_read = report.failures.is_empty() && coverage.complete();
+    let sweep_read_everything = report.failures.is_empty() && coverage.complete();
     report.finish(db_path)?;
     // Establish connector-owned locators from actual provider enumeration after
     // ingestion, including on a checkpoint-only retry. Never infer an adapter
     // from an old aggregate presence row.
     let discovery_env = DiscoveryEnv::with_roots(conn, home.to_path_buf(), opencode);
-    discover::discover_sessions_with_providers(
+    let discovered = discover::discover_sessions_with_providers(
         &discovery_env,
         &DiscoverOptions::default(),
         &providers,
         |_| {},
     )?;
+    // Discovery reads the same files the fingerprint counted, and its
+    // failures are *non-fatal* — a candidate it could not read leaves a
+    // diagnostic and the run returns `Ok`. Caching the fingerprint over that
+    // would make a transient failure permanent in the same way a swallowed
+    // per-file sweep error would: the next tick matches the stored value and
+    // skips before retrying, so the file is never read again until its
+    // metadata happens to change. This run is local-scope, so every
+    // diagnostic here is a file that was not read or a provider that could
+    // not enumerate; neither is a clean read.
+    for diagnostic in &discovered.diagnostics {
+        sync_note!(
+            "  [discovery] {} not read: {}",
+            diagnostic.locator.as_deref().unwrap_or(&diagnostic.source),
+            diagnostic.error
+        );
+        coverage.note_unread();
+    }
+    let all_sources_read = sweep_read_everything && coverage.complete();
     // Written after every cursor this sweep advanced, and in its own
     // checkpoint. A crash between them leaves cursors ahead of a stale
     // fingerprint, which costs one extra full walk that then finds nothing —

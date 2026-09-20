@@ -188,6 +188,84 @@ impl Gate {
     }
 }
 
+/// A change that lands while a manual tick holds the slot must not be lost.
+///
+/// The wake state is cleared when the debounce window opens, so by the time
+/// the driver tries to claim the slot the event is no longer recorded
+/// anywhere. Dropping the tick there — which is the right answer for a
+/// backstop tick, and was being applied to both — loses a real change until
+/// the next backstop, up to `--interval` later. A host that calls `tick()`
+/// around its own work would silently stop capturing for that window.
+#[test]
+fn a_change_during_a_manual_tick_is_swept_when_it_finishes() {
+    let gate = Arc::new(Gate::default());
+    let (ticks, ticks_rx) = mpsc::channel();
+    let (entered, entered_rx) = mpsc::channel();
+
+    let gate_for_tick = gate.clone();
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let bodies_for_tick = bodies.clone();
+    let tick: TickFn = Arc::new(move |force| {
+        let _ = ticks.send(force);
+        // Only the first body blocks: that is the manual tick, held open
+        // while the change below lands.
+        if bodies_for_tick.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = entered.send(());
+            gate_for_tick.wait();
+        }
+        Ok(TickOutcome::default())
+    });
+    let running = RunningLoop::start(
+        |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(false)
+                // Long enough that a backstop tick cannot rescue the change.
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+                .with_debounce_ms(50)
+        },
+        tick,
+    );
+
+    let holder = {
+        let watch = running.watch.clone();
+        std::thread::spawn(move || watch.tick())
+    };
+    entered_rx
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the manual tick never started");
+    assert_eq!(
+        ticks_rx.recv_timeout(ARRIVES_WITHIN),
+        Ok(false),
+        "the manual tick runs unforced"
+    );
+
+    // The change lands while the manual tick still owns the slot.
+    running.watch.notify_change();
+    assert_eq!(
+        ticks_rx.recv_timeout(Duration::from_millis(400)),
+        Err(RecvTimeoutError::Timeout),
+        "nothing can run while the manual tick holds the slot"
+    );
+
+    gate.open();
+    holder.join().expect("manual tick");
+
+    assert_eq!(
+        ticks_rx.recv_timeout(ARRIVES_WITHIN),
+        Ok(true),
+        "the change must drive a forced sweep as soon as the slot is free"
+    );
+    // Positive control: exactly one, not one per event and not a repeat — the
+    // deferred signal is a single bit.
+    assert_eq!(
+        ticks_rx.recv_timeout(Duration::from_millis(400)),
+        Err(RecvTimeoutError::Timeout),
+        "one deferred change is one sweep"
+    );
+}
+
 #[test]
 fn a_manual_tick_joins_the_run_already_in_flight() {
     let bodies = Arc::new(AtomicUsize::new(0));
@@ -822,6 +900,111 @@ fn a_busy_root_does_not_starve_another_root_of_its_reconciliation() {
     );
 }
 
+/// A root reached through a symlink has two spellings, and the backends do not
+/// agree on which one they report: inotify echoes whichever path the watch was
+/// registered with, macOS FSEvents always reports the resolved one. A root that
+/// held only the spelling it was given would register, be reported as watched,
+/// and never match an event — the failure that looks most like everything
+/// working.
+///
+/// End to end through a real watcher: the root is spelled through the symlink,
+/// the registration resolves it, and the events that come back carry the
+/// resolved spelling.
+#[cfg(all(feature = "fs-events", unix))]
+#[test]
+fn a_root_reached_through_a_symlink_matches_its_own_events() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real/sessions");
+    std::fs::create_dir_all(&real).expect("real root");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path().join("real"), &link).expect("symlink");
+    let through_link = link.join("sessions");
+
+    let running = RunningLoop::reporting({
+        let through_link = through_link.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(through_link)])
+                .with_debounce_ms(100)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    let status = running.watch.status().expect("status");
+    assert_eq!(
+        status.driver,
+        WatchDriver::FsEvents,
+        "a symlinked root still attaches: {status:?}"
+    );
+
+    // Written through the *real* path, which is the spelling the resolved
+    // registration reports back.
+    std::fs::write(real.join("rollout.jsonl"), "{}\n").expect("write through the real path");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "an event under the symlinked root's real path must drive a forced sweep"
+    );
+
+    // Positive control: the filter is still a filter. A sibling of the root,
+    // not under it, drives nothing.
+    std::fs::write(dir.path().join("real/unrelated.jsonl"), "{}\n").expect("write beside it");
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(800)),
+        Err(RecvTimeoutError::Timeout),
+        "a write outside the root must not drive a sweep, whichever spelling it arrives in"
+    );
+}
+
+/// What macOS FSEvents does, asserted on a platform that cannot do it.
+///
+/// FSEvents reports the real path — `/private/var/…` for anything under
+/// `/var`, and the resolved target of any symlink on the way — whatever
+/// spelling the watch was registered with. No Linux backend produces that, so
+/// this is the one place a hand-written event path is the honest test rather
+/// than a shortcut: it encodes the other platform's behaviour. The test above
+/// is the end-to-end half.
+#[cfg(unix)]
+#[test]
+fn a_root_matches_an_event_reported_under_its_resolved_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real/sessions");
+    std::fs::create_dir_all(&real).expect("real root");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path().join("real"), &link).expect("symlink");
+
+    let mut root = ai_hist::discover::WatchRoot::tree(link.join("sessions"));
+    assert!(
+        !root.covers(&real.join("rollout.jsonl")),
+        "before resolution the root knows only the spelling it was given"
+    );
+    root.resolve();
+
+    let resolved = std::fs::canonicalize(&real).expect("canonical root");
+    assert_eq!(root.canonical.as_deref(), Some(resolved.as_path()));
+    assert!(
+        root.covers(&resolved.join("rollout.jsonl")),
+        "an event reported under the resolved path is this root's event"
+    );
+    // Both spellings, not one instead of the other: inotify still reports the
+    // registered one.
+    assert!(root.covers(&link.join("sessions/rollout.jsonl")));
+    // Positive control: resolving did not widen the root. A sibling of the
+    // resolved directory is still outside it. Spelled without a `..`, because
+    // `covers` compares lexically and an event path is normalised before it
+    // gets here — `sessions/../unrelated.jsonl` does start with `sessions`.
+    assert!(!root.covers(
+        &resolved
+            .parent()
+            .expect("the resolved root has a parent")
+            .join("unrelated.jsonl")
+    ));
+    assert!(root.registers_at(&resolved));
+    assert!(root.registers_at(&link.join("sessions")));
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
@@ -1409,6 +1592,56 @@ fn a_hook_ingest_of_an_unchanged_transcript_reports_unchanged() {
         second.status,
         ai_hist::TranscriptStatus::Unchanged,
         "re-running a hook over an untouched transcript must not re-read it"
+    );
+}
+
+/// Discovery reads the same files the fingerprint counted, and its per-file
+/// failures are non-fatal: the candidate leaves a diagnostic and the run
+/// returns `Ok`. Storing the fingerprint over that makes a transient failure
+/// permanent — the next tick matches the stored value and skips before
+/// retrying, so the file is never read again until its metadata happens to
+/// change. Same class as a swallowed per-file sweep error, which
+/// `SweepCoverage` already exists to catch.
+#[test]
+fn a_file_discovery_could_not_read_does_not_arm_the_fast_path() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // One readable transcript, so the sweep has something that works and the
+    // assertion below cannot pass because nothing happened at all.
+    write_claude_transcript(home.path(), "proj", "readable-1", 1);
+    let db = home.path().join("history.db");
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "positive control: a readable tree does arm the fast path"
+    );
+
+    // A transcript that stats like any other — it is a regular file, so
+    // enumeration counts it and the fingerprint stamps it — but cannot be
+    // read as text. Permissions are not a lever here: these tests run as
+    // root.
+    let unreadable = home.path().join(".claude/projects/proj/unreadable-1.jsonl");
+    std::fs::write(&unreadable, [0xff, 0xfe, 0xfd, b'\n']).expect("write invalid utf-8");
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a new file must reopen the sweep"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a file that could not be read must not be cached as read"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "and must go on being retried, rather than settling on the failure"
+    );
+
+    // Positive control on the other side: once it reads, the fast path arms
+    // again — the retry is not a permanent state of its own.
+    std::fs::write(&unreadable, claude_record("unreadable-1", 1)).expect("rewrite as text");
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a tree that reads cleanly must arm the fast path again"
     );
 }
 
