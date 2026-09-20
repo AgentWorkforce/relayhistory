@@ -373,7 +373,19 @@ The invariant is enforced by *counting the rows a record produced*, not by
 predicting them from the shape of its content. Content can be present and still
 reach nothing — `""`, `[]`, or blocks that are all blank — and each such shape
 is one more rule to miss. A Claude record that wrote no row falls back to
-`unknown` carrying its provider type.
+`unknown` carrying its provider type, and a Codex line measured against
+SQLite's own `total_changes` does the same: a blank `agent_message` or a
+`*_end` with no `call_id` is stored by nothing, whatever the handler list says.
+
+Codex keeps one explicit exception list, for lines that are state updates
+rather than records and whose information is stored elsewhere: `session_meta`
+and `turn_context` populate the catalog, `token_count` is folded into the
+adjacent assistant event's `token_json`, `thread_settings_applied` carries the
+model forward, a `*_delta` is a fragment of an event recorded whole, and
+`user_message` / `message` reach the deduplicator that stores one row for the
+two representations Codex writes of the same message. That list is the inverse
+of the handler list in the way that matters: a wrong entry costs a redundant
+marker, where a wrong entry in the handler list costs a vanished line.
 
 Markers are evidence, so they are removed with the rest when a complete remote
 snapshot replaces a session: a marker left behind would tell a caller that

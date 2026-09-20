@@ -2130,6 +2130,15 @@ fn ingest_codex_rollout(
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut line_index = 0usize;
+    // What to record if the line being processed turns out to write nothing,
+    // and the row count to measure that against.
+    //
+    // The check runs at the top of the *next* iteration rather than at the end
+    // of this one, because the arms below exit through a dozen `continue`s and
+    // a tail check would be skipped by every one of them -- which is the exact
+    // shape of the bug this exists to prevent.
+    let mut unwritten_line: Option<UnwrittenCodexLine> = None;
+    let mut changes_before_line = conn.total_changes();
     loop {
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
@@ -2163,6 +2172,33 @@ fn ingest_codex_rollout(
         }
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
+        // Settle the previous line before starting this one. `total_changes`
+        // is SQLite's own count of rows written on this connection, so this
+        // measures what the arms actually did rather than trusting a list of
+        // what they are supposed to do.
+        flush_unwritten_codex_line(
+            conn,
+            session_id,
+            &mut unwritten_line,
+            conn.total_changes() == changes_before_line,
+        )?;
+        changes_before_line = conn.total_changes();
+        // A state-only line is never registered: it writes no row by design,
+        // and the allocation would land on the highest-volume lines in the file.
+        unwritten_line =
+            (!codex_line_is_state_only(line_type, payload_type)).then(|| UnwrittenCodexLine {
+                index,
+                ts_ms,
+                subkind: if payload_type.is_empty() {
+                    line_type.to_string()
+                } else {
+                    payload_type.to_string()
+                },
+                turn_id: payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
@@ -2538,7 +2574,85 @@ fn ingest_codex_rollout(
             _ => {}
         }
     }
+    flush_unwritten_codex_line(
+        conn,
+        session_id,
+        &mut unwritten_line,
+        conn.total_changes() == changes_before_line,
+    )?;
     Ok(outcome)
+}
+
+/// One Codex rollout line that has not yet been shown to write anything.
+struct UnwrittenCodexLine {
+    index: usize,
+    ts_ms: i64,
+    subkind: String,
+    turn_id: Option<String>,
+}
+
+/// Record a line that claimed to be modeled and then stored nothing.
+///
+/// Membership in [`codex_payload_is_modeled`] is a claim that an arm stores
+/// the line, but every one of those arms can write nothing for a payload that
+/// is empty or the wrong shape -- a blank `agent_message`, a `*_end` with no
+/// `call_id`. Trusting the claim fails unsafe: the line disappears. Measuring
+/// what was written fails safe: at worst a redundant marker.
+fn flush_unwritten_codex_line(
+    conn: &Connection,
+    session_id: &str,
+    line: &mut Option<UnwrittenCodexLine>,
+    wrote_nothing: bool,
+) -> Result<()> {
+    let Some(line) = line.take() else {
+        return Ok(());
+    };
+    if !wrote_nothing {
+        return Ok(());
+    }
+    let marker_uid = format!("{}:marker", line.index);
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (line.ts_ms != 0).then_some(line.ts_ms),
+            message_id: None,
+            parent_id: None,
+            turn_id: line.turn_id.as_deref(),
+            kind: "unknown",
+            subkind: Some(&line.subkind),
+            payload_json: None,
+        },
+    )
+}
+
+/// Codex lines that legitimately write no row of their own.
+///
+/// These are state updates, not records, and their information is stored
+/// elsewhere: `session_meta` and `turn_context` populate the session catalog,
+/// `token_count` is folded into the adjacent assistant event's `token_json`,
+/// `thread_settings_applied` only carries the model forward, a `*_delta` is a
+/// fragment of an event recorded whole, and `user_message` / `message` reach
+/// the deduplicator, which stores one row for the two representations Codex
+/// writes of the same message.
+///
+/// This list is the inverse of [`codex_payload_is_modeled`] in the way that
+/// matters: a wrong entry here costs a redundant marker, where a wrong entry
+/// there costs a vanished line.
+fn codex_line_is_state_only(line_type: &str, payload_type: &str) -> bool {
+    match line_type {
+        "session_meta" | "turn_context" => true,
+        "event_msg" => {
+            matches!(
+                payload_type,
+                "token_count" | "thread_settings_applied" | "user_message"
+            ) || payload_type.ends_with("_delta")
+        }
+        "response_item" => payload_type == "message" || payload_type.ends_with("_delta"),
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7782,6 +7896,131 @@ mod tests {
                     && marker.subkind.as_deref() != Some("assistant")),
             "modeled record types must stay silent: {page:?}"
         );
+    }
+
+    /// The Codex twin of the Claude counting rule. Being on the "modeled" list
+    /// is a claim that an arm below stores the line, but every one of those
+    /// arms can write nothing for a payload that is empty or the wrong shape:
+    /// a blank `agent_message`, a `*_end` with no `call_id`. The claim was
+    /// trusted, so those lines produced neither an event nor a marker.
+    ///
+    /// Trusting the list is what fails unsafe. Counting what was actually
+    /// written fails safe -- at worst a redundant marker.
+    #[test]
+    fn modeled_codex_lines_that_write_nothing_still_leave_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-empty.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-empty","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"   "}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":""}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:03.000Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"s","tool":"t"}}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:04.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"","query":"q"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:05.000Z","type":"event_msg","payload":{"type":"exec_command_end","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:06.000Z","type":"event_msg","payload":{"type":"patch_apply_end","turn_id":"t1","success":true}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        // Every line above is either session metadata or a modeled type whose
+        // handler had nothing to store, so nothing reaches an event.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "none of these lines yields an event");
+        let calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE source='codex' AND session_id='sess-empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 0, "and none of them yields a tool call");
+
+        let subkinds: Vec<String> = markers_of(&conn, "codex", "sess-empty")
+            .into_iter()
+            .map(|(_, subkind, _)| subkind)
+            .collect();
+        for expected in [
+            "agent_message",
+            "agent_reasoning",
+            "mcp_tool_call_end",
+            "web_search_end",
+            "exec_command_end",
+            "patch_apply_end",
+        ] {
+            assert!(
+                subkinds.iter().any(|subkind| subkind == expected),
+                "{expected} wrote nothing and left no marker: {subkinds:?}"
+            );
+        }
+        // Session metadata is a state update, not a record: it populates the
+        // catalog rather than the ledger, and must stay silent or every
+        // rollout gains two markers it does not need.
+        assert!(
+            !subkinds
+                .iter()
+                .any(|s| s == "session_meta" || s == "turn_context"),
+            "state-only lines must not produce markers: {subkinds:?}"
+        );
+    }
+
+    /// The other half of the rule: a modeled type that *does* write must stay
+    /// silent, or the fallback would double every rollout.
+    #[test]
+    fn modeled_codex_lines_that_write_stay_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-written.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-written","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"thinking it over"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"call_1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:04.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"t1","exit_code":0}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fco_1","call_id":"call_1","output":"done"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:06.000Z","type":"event_msg","payload":{"type":"agent_message","message":"finished"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:07.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":15}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-written");
+        assert!(
+            markers.iter().all(|(kind, _, _)| kind != "unknown"),
+            "every line here either wrote a row or is state-only: {markers:?}"
+        );
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-written'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events >= 4, "the modeled lines really did write: {events}");
     }
 
     /// Content that is *present* but reaches no event is the same as no
