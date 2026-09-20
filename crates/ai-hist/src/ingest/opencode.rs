@@ -1080,7 +1080,47 @@ pub(crate) fn normalize(
     loaded: &OpencodeSession,
     raw_path: &str,
 ) -> Result<OpencodeIngestCounts> {
+    // One session, one atomic replacement. Reading a session is a read of its
+    // *current* files, so it has to end with the database agreeing — and the
+    // half-state between "the retired rows are gone" and "the new ones are
+    // written" must never be visible to a reader.
+    //
+    // A savepoint rather than a transaction, because the callers differ:
+    // hydration already holds one (a nested `BEGIN` would fail), global sync
+    // does not. A savepoint nests either way.
+    conn.execute_batch("SAVEPOINT ai_hist_opencode_session")?;
+    let result = normalize_session(conn, loaded, raw_path);
+    if result.is_ok() {
+        conn.execute_batch("RELEASE ai_hist_opencode_session")?;
+    } else {
+        let _ = conn.execute_batch(
+            "ROLLBACK TO ai_hist_opencode_session; RELEASE ai_hist_opencode_session;",
+        );
+    }
+    result
+}
+
+/// The provider-owned rows this read produced, by each table's own stable key.
+///
+/// What is *not* in here is what the session's files no longer say, and that
+/// is the point: see [`retire_absent_rows`].
+#[derive(Debug, Default)]
+struct OpencodeSnapshotKeys {
+    events: BTreeSet<String>,
+    tool_calls: BTreeSet<String>,
+    file_edits: BTreeSet<String>,
+    markers: BTreeSet<String>,
+    /// `timestamp_ms:prompt_hash` — `history`'s identity within one session.
+    prompts: BTreeSet<String>,
+}
+
+fn normalize_session(
+    conn: &Connection,
+    loaded: &OpencodeSession,
+    raw_path: &str,
+) -> Result<OpencodeIngestCounts> {
     let mut counts = OpencodeIngestCounts::default();
+    let mut keys = OpencodeSnapshotKeys::default();
     let session_id = loaded.session.id.as_str();
     let project = loaded
         .messages
@@ -1119,6 +1159,7 @@ pub(crate) fn normalize(
                     // A compaction part sits on the user message OpenCode
                     // inserts at the boundary; the marker is the boundary
                     // itself, not a turn.
+                    let marker_uid = format!("part:{}", part.id);
                     counts.markers += insert_session_marker(
                         conn,
                         session_id,
@@ -1126,13 +1167,15 @@ pub(crate) fn normalize(
                         Some(&message.id),
                         message.time_created,
                         part.raw.get("auto").and_then(Value::as_bool),
-                        &format!("part:{}", part.id),
+                        &marker_uid,
                     )?;
+                    keys.markers.insert(marker_uid);
                     continue;
                 }
                 let Some(text) = part_text(part) else {
                     continue;
                 };
+                let event_uid = format!("text:{}", part.id);
                 insert_session_event_with_provenance(
                     conn,
                     "opencode",
@@ -1150,13 +1193,17 @@ pub(crate) fn normalize(
                     None,
                     None,
                     None,
-                    &format!("text:{}", part.id),
+                    &event_uid,
                 )?;
+                keys.events.insert(event_uid);
                 counts.events += 1;
                 // The prompt ledger predates session events and other tools
                 // read it; keep writing it from the same parse.
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
+                    let hash = prompt_hash(trimmed);
+                    keys.prompts
+                        .insert(format!("{}:{hash}", message.time_created));
                     counts.prompts += insert_history(
                         conn,
                         &HistoryEntry {
@@ -1165,7 +1212,7 @@ pub(crate) fn normalize(
                             session_id: Some(session_id.to_string()),
                             project: message_project.clone(),
                             prompt: trimmed.to_string(),
-                            prompt_hash: Some(prompt_hash(trimmed)),
+                            prompt_hash: Some(hash),
                             timestamp_ms: message.time_created,
                         },
                     )?;
@@ -1187,6 +1234,7 @@ pub(crate) fn normalize(
         let final_part_for_call = last_part_index_per_call(parts);
         for (index, part) in parts.iter().enumerate() {
             if let Some(text) = part_text(part) {
+                let event_uid = format!("text:{}", part.id);
                 insert_session_event_with_provenance(
                     conn,
                     "opencode",
@@ -1204,8 +1252,9 @@ pub(crate) fn normalize(
                     token_json.as_deref(),
                     message.provider_id.as_deref(),
                     stop_reason.as_deref(),
-                    &format!("text:{}", part.id),
+                    &event_uid,
                 )?;
+                keys.events.insert(event_uid);
                 counts.events += 1;
                 last_assistant_text = Some(text.to_string());
                 continue;
@@ -1245,6 +1294,8 @@ pub(crate) fn normalize(
                 stop_reason.as_deref(),
                 &format!("tool_use:{}", tool.call_id),
             )?;
+            keys.events.insert(format!("tool_use:{}", tool.call_id));
+            keys.tool_calls.insert(tool.call_id.to_string());
             counts.events += 1;
             insert_tool_call(
                 conn,
@@ -1274,6 +1325,7 @@ pub(crate) fn normalize(
                         None,
                         message_project.as_deref(),
                     )?;
+                    keys.file_edits.insert(tool.call_id.to_string());
                     counts.file_edits += 1;
                 }
             }
@@ -1301,6 +1353,7 @@ pub(crate) fn normalize(
                         stop_reason.as_deref(),
                         &format!("tool_result:{}", tool.call_id),
                     )?;
+                    keys.events.insert(format!("tool_result:{}", tool.call_id));
                     counts.events += 1;
                 }
             }
@@ -1349,7 +1402,88 @@ pub(crate) fn normalize(
         )?;
     }
 
+    retire_absent_rows(conn, session_id, &keys, loaded.session.parent_id.as_deref())?;
     Ok(counts)
+}
+
+/// Remove the provider-owned rows this session's files no longer produce.
+///
+/// A read of an OpenCode session is a read of the session as it is *now*.
+/// OpenCode rewrites a part in place — a tool part loses its `state.output`, a
+/// text part is edited, a `parentID` is dropped — and it removes files. An
+/// upsert-only ingest has no way to express any of that: the replacement row
+/// is simply never emitted, the superseded row keeps its uniqueness key, and a
+/// reader cannot tell it from a live one. `get_session_events` would go on
+/// returning a tool result whose output the provider deleted, which is the
+/// worst shape of this bug: not stale metadata, but content that was taken
+/// away and is still being served.
+///
+/// Deleted by absence from the new snapshot rather than by clearing the
+/// session first, which matters beyond elegance: every unchanged row keeps its
+/// rowid, so a resync of an unchanged session writes nothing, and the delivery
+/// capture triggers emit nothing. OpenCode's global sync re-reads every session
+/// every run, so clear-and-rewrite would churn the outbox for the whole store
+/// on every sync.
+///
+/// Scope is narrow. Only `source = 'opencode'` rows belonging to this session,
+/// by each table's own stable key. The relationship is keyed on the **child**,
+/// because the row a session's file owns is the one naming *its* parent —
+/// keying on the parent would delete the links this session's own children
+/// recorded about themselves.
+fn retire_absent_rows(
+    conn: &Connection,
+    session_id: &str,
+    keys: &OpencodeSnapshotKeys,
+    parent_id: Option<&str>,
+) -> Result<usize> {
+    let mut retired = 0;
+    for (sql, present) in [
+        (
+            "DELETE FROM session_events WHERE source = 'opencode' AND session_id = ?1 \
+             AND event_uid NOT IN (SELECT value FROM json_each(?2))",
+            &keys.events,
+        ),
+        (
+            "DELETE FROM tool_calls WHERE source = 'opencode' AND session_id = ?1 \
+             AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
+            &keys.tool_calls,
+        ),
+        (
+            "DELETE FROM file_edits WHERE source = 'opencode' AND session_id = ?1 \
+             AND tool_use_id NOT IN (SELECT value FROM json_each(?2))",
+            &keys.file_edits,
+        ),
+        (
+            "DELETE FROM session_markers WHERE source = 'opencode' AND session_id = ?1 \
+             AND marker_uid NOT IN (SELECT value FROM json_each(?2))",
+            &keys.markers,
+        ),
+        (
+            "DELETE FROM history WHERE source = 'opencode' AND session_id = ?1 \
+             AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) \
+             NOT IN (SELECT value FROM json_each(?2))",
+            &keys.prompts,
+        ),
+    ] {
+        let present = serde_json::to_string(present).unwrap_or_else(|_| "[]".into());
+        retired += conn.execute(sql, params![session_id, present])?;
+    }
+    retired += match parent_id {
+        // The link is still asserted, but possibly to a different parent than
+        // the one recorded before.
+        Some(parent) => conn.execute(
+            "DELETE FROM session_relationships WHERE source = 'opencode' \
+             AND child_session_id = ?1 AND evidence_kind = 'opencode_parent_id' \
+             AND parent_session_id <> ?2",
+            params![session_id, parent],
+        )?,
+        None => conn.execute(
+            "DELETE FROM session_relationships WHERE source = 'opencode' \
+             AND child_session_id = ?1 AND evidence_kind = 'opencode_parent_id'",
+            params![session_id],
+        )?,
+    };
+    Ok(retired)
 }
 
 /// Where each `callID`'s last part sits in this message's ordered parts.

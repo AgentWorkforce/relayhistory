@@ -295,6 +295,10 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     an_unreadable_part_does_not_checkpoint_a_session_without_it();
     an_unreadable_part_does_not_catalog_a_session_without_it();
     a_same_length_rewrite_in_one_tick_re_hydrates();
+    one_unreadable_session_does_not_take_the_tree_down_with_it();
+    a_removed_tool_output_stops_being_served();
+    a_directory_named_by_opencode_db_is_read_as_the_legacy_tree();
+    a_limit_is_not_spent_on_a_file_that_is_not_a_session();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -1953,4 +1957,341 @@ fn catalog_stamp(db_path: &Path, session_id: &str) -> Option<String> {
         .optional()
         .unwrap()
         .flatten()
+}
+
+/// Make `path` a file that still enumerates and still has a `.json` name, but
+/// that neither `metadata()` nor a read can resolve.
+///
+/// A symlink to itself: `stat(2)` follows it and returns `ELOOP`, for any uid
+/// and whatever its age, so it fails the stamp *and* the loader deterministically
+/// — where the socket fixture used elsewhere fails only the read, and only
+/// while it is recent. Both properties are asserted, because a fixture that
+/// quietly stops being unreadable is a test that quietly stops testing.
+#[cfg(unix)]
+fn make_unresolvable(path: &Path) {
+    if path.exists() {
+        fs::remove_file(path).unwrap();
+    }
+    let name = path.file_name().unwrap().to_owned();
+    std::os::unix::fs::symlink(&name, path).unwrap();
+    assert!(
+        fs::metadata(path).is_err(),
+        "the fixture must not stat, or the stamp would never reach it"
+    );
+    assert!(
+        fs::read_to_string(path).is_err(),
+        "the fixture must not read, or the loader would never reach it"
+    );
+    assert!(
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name() == name),
+        "the fixture must still be listed, or nothing would look at it at all"
+    );
+}
+
+/// One broken session is one broken session. The stamp and the loader report
+/// I/O errors now, and both multi-session loops propagated the first one — so
+/// a single unresolvable part took the whole tree's enumeration and the whole
+/// tree's sync down with it, and every healthy session beside it went
+/// uncataloged and unindexed for as long as that one path stayed broken.
+/// `read_shallow` already isolates this per locator; the loops have to as well.
+#[cfg(unix)]
+fn one_unreadable_session_does_not_take_the_tree_down_with_it() {
+    let root = temp_root("isolate-failure");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+
+    // A second, healthy session beside it. `ses_broken` sorts first, so a loop
+    // that stops at the first failure never reaches `ses_simple`.
+    write_json(
+        &tree.join("session/global/ses_broken.json"),
+        r#"{"id":"ses_broken","directory":"/tmp/project","time":{"created":1777100000000,"updated":1777100002000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_broken/msg_broken.json"),
+        r#"{"id":"msg_broken","sessionID":"ses_broken","role":"user","time":{"created":1777100001000}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_broken/prt_broken.json"),
+        r#"{"id":"prt_broken","sessionID":"ses_broken","messageID":"msg_broken","type":"text","text":"never read"}"#,
+    );
+    assert!(
+        "ses_broken.json" < "ses_simple.json",
+        "the broken session must sort first or the loops would reach the healthy one anyway"
+    );
+    make_unresolvable(&tree.join("part/msg_broken/prt_broken.json"));
+
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    // Sync: the healthy session is indexed, and the failure is still reported.
+    let error = sync_local_at(&db_path)
+        .err()
+        .map(|error| format!("{error:#}"));
+    let healthy: Vec<String> =
+        session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect();
+    assert!(
+        !healthy.is_empty(),
+        "the healthy session must still be indexed, got {healthy:?} (sync error: {error:?})"
+    );
+    assert!(
+        session_events(&open_db(&db_path).unwrap(), "ses_broken", Some("opencode"))
+            .unwrap()
+            .is_empty(),
+        "and the broken one must not be indexed from a read that failed"
+    );
+
+    // Discovery: same shape. The healthy session is cataloged with a stamp,
+    // the broken one is a diagnostic against its own locator, and nothing is
+    // remembered as a non-session.
+    let (_, summary) = discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        catalog_stamp(&db_path, "ses_simple").is_some(),
+        "the healthy session must be cataloged"
+    );
+    assert!(
+        summary.diagnostics.iter().any(|entry| entry
+            .locator
+            .as_deref()
+            .is_some_and(|locator| locator.ends_with("ses_broken.json"))),
+        "the broken session must be reported against its own locator: {:?}",
+        summary.diagnostics
+    );
+    assert_eq!(
+        catalog_stamp(&db_path, "ses_broken"),
+        None,
+        "and no catalog row may be stamped as current from a read that failed"
+    );
+    assert_eq!(
+        skip_rows(&db_path),
+        0,
+        "nor may the failure be remembered as 'not a session'"
+    );
+
+    // And it recovers without the healthy session ever having been disturbed.
+    fs::remove_file(tree.join("part/msg_broken/prt_broken.json")).unwrap();
+    write_json(
+        &tree.join("part/msg_broken/prt_broken.json"),
+        r#"{"id":"prt_broken","sessionID":"ses_broken","messageID":"msg_broken","type":"text","text":"now readable"}"#,
+    );
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(catalog_stamp(&db_path, "ses_broken").is_some());
+    assert!(
+        !session_events(&open_db(&db_path).unwrap(), "ses_broken", Some("opencode"))
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A read of an OpenCode session is a read of the session *as it is now*, and
+/// OpenCode rewrites parts in place. An upsert-only ingest cannot express a
+/// removal: the replacement row is never emitted, the superseded row keeps its
+/// uniqueness key, and `getSessionEvents` goes on serving a tool result whose
+/// output the provider deleted.
+fn a_removed_tool_output_stops_being_served() {
+    let root = temp_root("retire-absent");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    let part = tree.join("part/msg_retire_a1/prt_retire_tool.json");
+    write_json(
+        &tree.join("session/global/ses_retire.json"),
+        r#"{"id":"ses_retire","parentID":"ses_retire_parent","directory":"/tmp/project","time":{"created":1777200000000,"updated":1777200002000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_retire/msg_retire_a1.json"),
+        r#"{"id":"msg_retire_a1","sessionID":"ses_retire","role":"assistant","time":{"created":1777200001000},"providerID":"anthropic","modelID":"claude-opus-4-5","path":{"cwd":"/tmp/project"}}"#,
+    );
+    write_json(
+        &part,
+        r#"{"id":"prt_retire_tool","sessionID":"ses_retire","messageID":"msg_retire_a1","type":"tool","callID":"call_retire","tool":"bash","state":{"status":"completed","input":{"command":"cat secret"},"output":"secret-old-output"}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_retire_a1/prt_retire_text.json"),
+        r#"{"id":"prt_retire_text","sessionID":"ses_retire","messageID":"msg_retire_a1","type":"text","text":"kept"}"#,
+    );
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).unwrap();
+    let texts = |db_path: &Path| -> Vec<String> {
+        session_events(&open_db(db_path).unwrap(), "ses_retire", Some("opencode"))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect()
+    };
+    assert!(
+        texts(&db_path).iter().any(|t| t == "secret-old-output"),
+        "precondition: the output must be served before it is removed, got {:?}",
+        texts(&db_path)
+    );
+    assert_eq!(relationship_count(&db_path, "ses_retire"), 1);
+
+    // OpenCode rewrites the part without the output, and drops the parent link.
+    write_json(
+        &part,
+        r#"{"id":"prt_retire_tool","sessionID":"ses_retire","messageID":"msg_retire_a1","type":"tool","callID":"call_retire","tool":"bash","state":{"status":"completed","input":{"command":"cat secret"}}}"#,
+    );
+    write_json(
+        &tree.join("session/global/ses_retire.json"),
+        r#"{"id":"ses_retire","directory":"/tmp/project","time":{"created":1777200000000,"updated":1777200003000}}"#,
+    );
+    sync_local_at(&db_path).unwrap();
+
+    let after = texts(&db_path);
+    assert!(
+        !after.iter().any(|t| t == "secret-old-output"),
+        "a tool result the provider removed must stop being served, got {after:?}"
+    );
+    // Positive controls: reconciliation is by absence, not by clearing. The
+    // untouched text event and the tool call itself are still there.
+    assert!(
+        after.iter().any(|t| t == "kept"),
+        "the parts that did not change must survive, got {after:?}"
+    );
+    assert_eq!(
+        tool_call_ids(&db_path, "ses_retire"),
+        vec!["call_retire".to_string()],
+        "the call is still in the transcript; only its output went away"
+    );
+    assert_eq!(
+        relationship_count(&db_path, "ses_retire"),
+        0,
+        "a parentID the session no longer names must not survive either"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `OPENCODE_DB` is an arbitrary path, and `exists()` is true for a directory.
+/// Sync asked one question and `OpencodeLayout::detect` — which discovery and
+/// hydration both use — asked another, so a host whose `OPENCODE_DB` names a
+/// directory had its sessions cataloged from the legacy tree and then indexed
+/// from nothing, with the sync failing on a path it should never have opened.
+fn a_directory_named_by_opencode_db_is_read_as_the_legacy_tree() {
+    let root = temp_root("db-is-a-directory");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+
+    // A directory where the database would be. `exists()` says yes.
+    let db_like = home.join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(&db_like).unwrap();
+    assert!(db_like.exists() && !db_like.is_file());
+    use_layout(&home, Some(&db_like), Some(&tree));
+
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    let events: Vec<String> =
+        session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect();
+    assert!(
+        !events.is_empty(),
+        "the legacy tree must be indexed when the database path is not a file, got {events:?}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `read_shallow` is what decides whether a `ses_*.json` file is a session.
+/// Truncating the candidate list before that let a newest malformed file spend
+/// the whole of a `--limit 1`, and the valid session behind it was never
+/// discovered at all — not deferred to a later page, absent.
+fn a_limit_is_not_spent_on_a_file_that_is_not_a_session() {
+    let root = temp_root("limit-and-junk");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    write_json(
+        &tree.join("session/global/ses_valid.json"),
+        r#"{"id":"ses_valid","directory":"/tmp/project","time":{"created":1777300000000,"updated":1777300001000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_valid/msg_valid.json"),
+        r#"{"id":"msg_valid","sessionID":"ses_valid","role":"user","time":{"created":1777300001000}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_valid/prt_valid.json"),
+        r#"{"id":"prt_valid","sessionID":"ses_valid","messageID":"msg_valid","type":"text","text":"a real turn"}"#,
+    );
+    // A `ses_*.json` file that is not a session, written last so it stamps as
+    // the newest and takes the head of the page.
+    let junk = tree.join("session/global/ses_zzz_junk.json");
+    let valid_mtime = fs::metadata(tree.join("session/global/ses_valid.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    write_json(&junk, "{ not a session at all");
+    pin_mtime(&junk, valid_mtime + std::time::Duration::from_secs(60));
+
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    let (sessions, _) = discover_sessions_scoped_at(
+        &db_path,
+        &DiscoverOptions {
+            sources: vec!["opencode".into()],
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_valid"],
+        "a file that is not a session must not spend the page's one slot"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// How many `observation_discovery_skips` rows exist at all.
+fn skip_rows(db_path: &Path) -> i64 {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM observation_discovery_skips",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Relationship rows this session's own file owns — the ones naming its parent.
+fn relationship_count(db_path: &Path, session_id: &str) -> i64 {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_relationships WHERE source='opencode' \
+             AND child_session_id=? AND evidence_kind='opencode_parent_id'",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn tool_call_ids(db_path: &Path, session_id: &str) -> Vec<String> {
+    open_db(db_path)
+        .unwrap()
+        .prepare("SELECT tool_use_id FROM tool_calls WHERE source='opencode' AND session_id=? ORDER BY tool_use_id")
+        .unwrap()
+        .query_map([session_id], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
 }

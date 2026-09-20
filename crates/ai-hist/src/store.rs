@@ -2255,14 +2255,39 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
     if !storage_dir.join("session").is_dir() {
         return Ok(0);
     }
+    // One session's failure is that session's failure. The loader reports I/O
+    // errors now, and propagating the first one would leave every healthy
+    // session in the same tree unindexed for as long as the one path stays
+    // broken -- the opposite of what making the read failure visible was for.
+    // So each session is indexed or reported on its own, and the error at the
+    // end names them all rather than the first.
     let mut inserted = 0;
+    let mut failures: Vec<String> = Vec::new();
     for session_file in crate::ingest::opencode::list_json_tree_session_files(storage_dir) {
-        let Some(loaded) = crate::ingest::opencode::load_from_json_tree(&session_file)? else {
-            continue;
-        };
-        inserted +=
-            crate::ingest::opencode::normalize(conn, &loaded, &session_file.to_string_lossy())?
-                .prompts;
+        let indexed =
+            crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
+                match loaded {
+                    Some(loaded) => crate::ingest::opencode::normalize(
+                        conn,
+                        &loaded,
+                        &session_file.to_string_lossy(),
+                    )
+                    .map(|counts| counts.prompts),
+                    None => Ok(0),
+                }
+            });
+        match indexed {
+            Ok(prompts) => inserted += prompts,
+            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} OpenCode session(s) under {} could not be read (the rest were indexed): {}",
+            failures.len(),
+            storage_dir.display(),
+            failures.join("; ")
+        );
     }
     Ok(inserted)
 }

@@ -1429,7 +1429,7 @@ impl ShallowSessionProvider for OpencodeProvider {
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
         if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
-            return enumerate_opencode_json_tree(&scan, &root, requested_limit);
+            return enumerate_opencode_json_tree(&scan, &root);
         }
         let mut guard = self.snapshot(&scan)?;
         let Some(snapshot) = guard.as_mut() else {
@@ -1659,11 +1659,29 @@ impl ShallowSessionProvider for OpencodeProvider {
 /// The cost is one `stat` per file in the tree, no reads and no parsing, and
 /// it is paid before the limit because a limit applied to stale recency is
 /// the bug above.
-fn enumerate_opencode_json_tree(
-    scan: &ScanEnv<'_>,
-    root: &Path,
-    requested_limit: Option<usize>,
-) -> Result<Vec<Candidate>> {
+fn enumerate_opencode_json_tree(scan: &ScanEnv<'_>, root: &Path) -> Result<Vec<Candidate>> {
+    // One session's failure is that session's failure. The stamp reads files
+    // now, so an unlistable `message/` directory or an unreadable recent part
+    // can fail it -- and propagating that out of the enumeration would take
+    // every healthy session in the same tree down with it, neither cataloged
+    // nor indexed for as long as the one path stays broken. `read_shallow`
+    // already isolates exactly this failure per locator; the enumeration has
+    // to as well.
+    //
+    // The candidate is still emitted, and deliberately not with a stamp that
+    // could match a stored one: this run cannot say the session is unchanged,
+    // and a stamp that compares equal is how the cached-skip path turns a read
+    // failure into a permanent omission. A token unique to this run bypasses
+    // that, `read_shallow` reaches the same failure, and the engine reports it
+    // as a diagnostic against this locator alone -- no skip row, no catalog row
+    // stamped as current.
+    let unreadable = format!(
+        "unreadable:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
     let mut rows = Vec::new();
     for path in crate::ingest::opencode::list_json_tree_session_files(root) {
         let Some(session_id) = path
@@ -1676,30 +1694,55 @@ fn enumerate_opencode_json_tree(
         if !path.is_file() {
             continue;
         }
-        let stamp = crate::ingest::opencode::stamp_json_tree_session(&path, &session_id)?;
-        rows.push((session_id, path, stamp));
+        let (order_ns, recency_hint_ms, stamp) =
+            match crate::ingest::opencode::stamp_json_tree_session(&path, &session_id) {
+                Ok(stamp) => (stamp.newest_ns, stamp.newest_ms(), stamp.token()),
+                Err(_) => {
+                    // Order it by the one file that is certainly its own, so a
+                    // broken session neither jumps the queue nor sinks out of
+                    // sight of a bounded page.
+                    let own_ns = session_file_mtime_ns(&path);
+                    (
+                        own_ns,
+                        i64::try_from(own_ns / 1_000_000).ok(),
+                        unreadable.clone(),
+                    )
+                }
+            };
+        rows.push((session_id, path, order_ns, recency_hint_ms, stamp));
     }
-    // Newest first, then by id, so a limit takes the same bounded head every
-    // run and the tie-break is total.
-    rows.sort_by(|a, b| {
-        b.2.newest_ns
-            .cmp(&a.2.newest_ns)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    if let Some(limit) = requested_limit {
-        rows.truncate(limit);
-    }
+    // Newest first, then by id, so the engine takes the same bounded head
+    // every run and the tie-break is total.
+    //
+    // Not truncated here. A `ses_*.json` file is a *candidate*, and
+    // `read_shallow` is what decides whether it is a session -- truncating
+    // first lets a newest malformed file consume the whole of a `--limit 1`
+    // and the valid session behind it is never discovered at all. The engine
+    // stops after the requested number of sessions it actually emitted, which
+    // is the contract the candidate window is written to. (The SQLite side
+    // still limits in SQL, because there a `session` row *is* a session.)
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     scan.note_records(rows.len() as u64);
     Ok(rows
         .into_iter()
-        .map(|(session_id, path, stamp)| Candidate {
+        .map(|(session_id, path, _, recency_hint_ms, stamp)| Candidate {
             source: "opencode",
             locator: path.to_string_lossy().into_owned(),
             session_id: Some(session_id),
-            recency_hint_ms: stamp.newest_ms(),
-            stamp: stamp.token(),
+            recency_hint_ms,
+            stamp,
         })
         .collect())
+}
+
+/// A session file's own modification time in nanoseconds, or zero.
+fn session_file_mtime_ns(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
 }
 
 /// One session's catalog row from the legacy tree. This reads the session
