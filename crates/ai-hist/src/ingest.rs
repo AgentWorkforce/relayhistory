@@ -3508,7 +3508,7 @@ fn ingest_claude_transcript_as(
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
-    for (line_index, line) in text.lines().enumerate() {
+    for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -3535,12 +3535,25 @@ fn ingest_claude_transcript_as(
                 != Some("assistant");
         let uuid = obj.get("uuid").and_then(Value::as_str);
         let message = obj.get("message").and_then(Value::as_object);
+        // Records without provider identity fall back to a content hash, never
+        // the line index: compaction drops prefixes and inserts summary rows,
+        // so indexes shift and surviving rows would land on earlier rows'
+        // event uids, overwriting retained evidence through the conflict
+        // upsert instead of retaining it. The hash keeps a surviving row on
+        // its identity across a rewrite; a row whose bytes changed is a new
+        // identity whose predecessor stays retained. Byte-identical id-less
+        // rows share one identity.
+        let digest = Sha256::digest(line.as_bytes());
         let fallback_uid = format!(
             "{}:{}",
             path.file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("session"),
-            line_index
+            digest
+                .iter()
+                .take(8)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         );
         let message_uuid = uuid
             .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))

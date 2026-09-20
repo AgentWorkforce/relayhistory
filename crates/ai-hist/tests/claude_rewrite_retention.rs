@@ -62,17 +62,30 @@ fn history_prompts(conn: &Connection, source: &str, session: &str) -> Vec<String
         .unwrap()
 }
 
-fn user_row(session: &str, uuid: &str, text: &str, ts: &str) -> String {
+fn uuid_field(uuid: Option<&str>) -> String {
+    uuid.map(|id| format!("\"uuid\":\"{id}\","))
+        .unwrap_or_default()
+}
+
+fn user_row(session: &str, uuid: Option<&str>, text: &str, ts: &str) -> String {
+    let uuid_field = uuid_field(uuid);
     format!(
-        "{{\"sessionId\":\"{session}\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"user\",\
+        "{{\"sessionId\":\"{session}\",{uuid_field}\"cwd\":\"/work/app\",\"type\":\"user\",\
          \"message\":{{\"role\":\"user\",\"content\":{text}}},\"timestamp\":\"{ts}\"}}\n",
         text = serde_json::Value::String(text.to_string())
     )
 }
 
-fn assistant_text_row(session: &str, uuid: &str, text: &str, usage: &str, ts: &str) -> String {
+fn assistant_text_row(
+    session: &str,
+    uuid: Option<&str>,
+    text: &str,
+    usage: &str,
+    ts: &str,
+) -> String {
+    let uuid_field = uuid_field(uuid);
     format!(
-        "{{\"sessionId\":\"{session}\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+        "{{\"sessionId\":\"{session}\",{uuid_field}\"cwd\":\"/work/app\",\"type\":\"assistant\",\
          \"message\":{{\"role\":\"assistant\",\"model\":\"opus\",\"content\":[{{\
          \"type\":\"text\",\"text\":{text}}}],\"usage\":{usage}}},\"timestamp\":\"{ts}\"}}\n",
         text = serde_json::Value::String(text.to_string())
@@ -81,23 +94,31 @@ fn assistant_text_row(session: &str, uuid: &str, text: &str, usage: &str, ts: &s
 
 fn assistant_tool_row(
     session: &str,
-    uuid: &str,
+    uuid: Option<&str>,
     tool_use_id: &str,
     name: &str,
     input: &str,
     ts: &str,
 ) -> String {
+    let uuid_field = uuid_field(uuid);
     format!(
-        "{{\"sessionId\":\"{session}\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+        "{{\"sessionId\":\"{session}\",{uuid_field}\"cwd\":\"/work/app\",\"type\":\"assistant\",\
          \"message\":{{\"role\":\"assistant\",\"model\":\"opus\",\"content\":[{{\
          \"type\":\"tool_use\",\"id\":\"{tool_use_id}\",\"name\":\"{name}\",\"input\":{input}}}]}},\
          \"timestamp\":\"{ts}\"}}\n"
     )
 }
 
-fn tool_result_row(session: &str, uuid: &str, tool_use_id: &str, result: &str, ts: &str) -> String {
+fn tool_result_row(
+    session: &str,
+    uuid: Option<&str>,
+    tool_use_id: &str,
+    result: &str,
+    ts: &str,
+) -> String {
+    let uuid_field = uuid_field(uuid);
     format!(
-        "{{\"sessionId\":\"{session}\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"user\",\
+        "{{\"sessionId\":\"{session}\",{uuid_field}\"cwd\":\"/work/app\",\"type\":\"user\",\
          \"message\":{{\"role\":\"user\",\"content\":[{{\
          \"type\":\"tool_result\",\"tool_use_id\":\"{tool_use_id}\",\"content\":{result}}}]}},\
          \"timestamp\":\"{ts}\"}}\n",
@@ -121,17 +142,17 @@ fn summary_row(session: &str, leaf_uuid: &str) -> String {
 fn full_transcript(session: &str, first_q: &str, second_q: &str, second_answer: &str) -> String {
     format!(
         "{}{}{}{}{}{}",
-        user_row(session, "u1", first_q, "2026-09-18T10:00:00Z"),
+        user_row(session, Some("u1"), first_q, "2026-09-18T10:00:00Z"),
         assistant_text_row(
             session,
-            "a1",
+            Some("a1"),
             "first answer",
             r#"{"input_tokens":10,"output_tokens":20}"#,
             "2026-09-18T10:00:01Z"
         ),
         assistant_tool_row(
             session,
-            "t1",
+            Some("t1"),
             "toolu_1",
             "Edit",
             r#"{"file_path":"/work/app/notes.txt"}"#,
@@ -139,15 +160,15 @@ fn full_transcript(session: &str, first_q: &str, second_q: &str, second_answer: 
         ),
         tool_result_row(
             session,
-            "r1",
+            Some("r1"),
             "toolu_1",
             "edit applied",
             "2026-09-18T10:00:03Z"
         ),
-        user_row(session, "u2", second_q, "2026-09-18T10:00:04Z"),
+        user_row(session, Some("u2"), second_q, "2026-09-18T10:00:04Z"),
         assistant_text_row(
             session,
-            "a2",
+            Some("a2"),
             second_answer,
             r#"{"input_tokens":5,"output_tokens":7}"#,
             "2026-09-18T10:00:05Z"
@@ -161,10 +182,10 @@ fn compacted_transcript(session: &str, second_q: &str, second_answer: &str) -> S
     format!(
         "{}{}{}",
         summary_row(session, "u2"),
-        user_row(session, "u2", second_q, "2026-09-18T10:00:04Z"),
+        user_row(session, Some("u2"), second_q, "2026-09-18T10:00:04Z"),
         assistant_text_row(
             session,
-            "a2",
+            Some("a2"),
             second_answer,
             r#"{"input_tokens":5,"output_tokens":7}"#,
             "2026-09-18T10:00:05Z"
@@ -484,6 +505,151 @@ fn claude_mtime_only_rewrite_retention(home: &Path) {
     );
 }
 
+fn claude_has_text(conn: &Connection, session: &str, needle: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE source = 'claude' AND session_id = ? AND text LIKE '%' || ? || '%')",
+        [session, needle],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// Records without provider identity: no `uuid`, no `message.id`. Their
+/// fallback identity is a content hash, so a compaction that drops the prefix
+/// and inserts a summary row keeps every surviving row on its identity
+/// instead of shifting it onto an earlier row's.
+fn full_transcript_nouid(
+    session: &str,
+    first_q: &str,
+    second_q: &str,
+    second_answer: &str,
+) -> String {
+    format!(
+        "{}{}{}{}",
+        user_row(session, None, first_q, "2026-09-18T10:00:00Z"),
+        assistant_text_row(
+            session,
+            None,
+            "first answer nouid",
+            r#"{"input_tokens":10,"output_tokens":20}"#,
+            "2026-09-18T10:00:01Z"
+        ),
+        user_row(session, None, second_q, "2026-09-18T10:00:04Z"),
+        assistant_text_row(
+            session,
+            None,
+            second_answer,
+            r#"{"input_tokens":5,"output_tokens":7}"#,
+            "2026-09-18T10:00:05Z"
+        ),
+    )
+}
+
+fn compacted_transcript_nouid(session: &str, second_q: &str, second_answer: &str) -> String {
+    format!(
+        "{}{}{}",
+        summary_row(session, "u2"),
+        user_row(session, None, second_q, "2026-09-18T10:00:04Z"),
+        assistant_text_row(
+            session,
+            None,
+            second_answer,
+            r#"{"input_tokens":5,"output_tokens":7}"#,
+            "2026-09-18T10:00:05Z"
+        ),
+    )
+}
+
+fn claude_nouid_retention(home: &Path) {
+    let folder = home.join("db-nouid");
+    fs::create_dir_all(&folder).unwrap();
+    let db = folder.join("history.db");
+    let transcript = home.join(".claude/projects/app/rewrite-nouid.jsonl");
+    write(
+        &transcript,
+        &full_transcript_nouid(
+            "rewrite-nouid",
+            "first question nouid",
+            "second question nouid",
+            "second answer nouid",
+        ),
+    );
+    sync(&db);
+
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        history_prompts(&conn, "claude", "rewrite-nouid"),
+        vec![
+            "first question nouid".to_string(),
+            "second question nouid".to_string()
+        ]
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'rewrite-nouid'"
+        ),
+        4
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(DISTINCT event_uid) FROM session_events \
+             WHERE source = 'claude' AND session_id = 'rewrite-nouid'"
+        ),
+        4,
+        "id-less rows still get distinct identities"
+    );
+    drop(conn);
+
+    // Compaction drops the prefix and inserts a summary row: with a
+    // line-index fallback every surviving row would shift onto an earlier
+    // row's identity and overwrite it. The content hash keeps each survivor
+    // on its own identity; the revised survivor is a new identity whose
+    // predecessor stays retained.
+    rewrite_in_place(
+        &transcript,
+        &compacted_transcript_nouid(
+            "rewrite-nouid",
+            "second question nouid",
+            "second answer nouid revised",
+        ),
+        240,
+    );
+    sync(&db);
+
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        history_prompts(&conn, "claude", "rewrite-nouid"),
+        vec![
+            "first question nouid".to_string(),
+            "second question nouid".to_string()
+        ],
+        "the compacted-away id-less prompt is retained"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'rewrite-nouid'"
+        ),
+        5,
+        "dropped rows are retained and the revised survivor is added, never overwritten"
+    );
+    for needle in [
+        "first question nouid",
+        "first answer nouid",
+        "second question nouid",
+        "second answer nouid",
+        "second answer nouid revised",
+    ] {
+        assert!(
+            claude_has_text(&conn, "rewrite-nouid", needle),
+            "retained after compaction: {needle}"
+        );
+    }
+}
+
 fn codex_rollout(session: &str, second_answer: &str) -> String {
     format!(
         "{{\"timestamp\":\"2026-09-18T10:00:00Z\",\"type\":\"session_meta\",\
@@ -598,5 +764,6 @@ fn in_place_rewrites_retain_already_ingested_evidence() {
     claude_sync_retention(home);
     claude_hydrate_retention(home);
     claude_mtime_only_rewrite_retention(home);
+    claude_nouid_retention(home);
     codex_rewrite_retention(home);
 }
