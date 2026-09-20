@@ -288,6 +288,10 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_sqlite_store_named_like_json_is_still_read_as_sqlite();
     a_catalog_locator_from_the_other_layout_is_refused_not_read();
     an_appended_turn_advances_catalog_recency_past_a_stale_session_json();
+    an_unindexed_store_syncs_to_the_same_evidence_as_an_indexed_one();
+    an_unindexed_store_is_not_read_once_per_session();
+    a_sqlite_store_inside_the_storage_dir_still_hydrates();
+    an_upgraded_database_delivers_the_new_event_columns();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -1348,6 +1352,344 @@ fn an_appended_turn_advances_catalog_recency_past_a_stale_session_json() {
         Some(9000),
         "a session `updated` ahead of its messages is still the later value"
     );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The single-pass fallback for an unindexed provider store has to produce
+/// the same evidence as the per-session path, or it is not a fallback — it is
+/// a second parser. The fixture store ships the provider's indexes; stripping
+/// them changes only the plan, so the rows must be identical.
+fn an_unindexed_store_syncs_to_the_same_evidence_as_an_indexed_one() {
+    let root = temp_root("unindexed");
+    let sessions = ["ses_sqlite_root", "ses_sqlite_child"];
+
+    let indexed_home = root.join("indexed");
+    let indexed_store = indexed_home.join(".local/share/opencode/opencode.db");
+    build_sqlite_store(&indexed_store);
+    use_layout(&indexed_home, Some(&indexed_store), None);
+    let indexed_db = root.join("indexed.db");
+    sync_local_at(&indexed_db).unwrap();
+    let from_indexed = evidence(&indexed_db, &sessions);
+
+    // The same store with the provider's indexes dropped.
+    let bare_home = root.join("bare");
+    let bare_store = bare_home.join(".local/share/opencode/opencode.db");
+    build_sqlite_store(&bare_store);
+    {
+        let db = Connection::open(&bare_store).unwrap();
+        for index in [
+            "session_time_updated_id_idx",
+            "message_session_time_created_id_idx",
+            "part_session_idx",
+            "part_message_id_id_idx",
+        ] {
+            db.execute_batch(&format!("DROP INDEX IF EXISTS {index};"))
+                .unwrap();
+        }
+        // Positive control: the predicate the per-session path would use is
+        // now genuinely a scan, so this store really does take the other plan.
+        let plan: String = db
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM part WHERE session_id = ?",
+                ["x"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("SCAN"),
+            "the indexes must actually be gone, got plan: {plan}"
+        );
+    }
+    use_layout(&bare_home, Some(&bare_store), None);
+    let bare_db = root.join("bare.db");
+    sync_local_at(&bare_db).unwrap();
+    let from_bare = evidence(&bare_db, &sessions);
+
+    assert!(
+        !from_indexed.events.is_empty(),
+        "the indexed sweep must produce evidence, or the comparison is vacuous"
+    );
+    assert_eq!(
+        from_indexed, from_bare,
+        "the single-pass fallback must produce the same rows as the per-session path"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` are independent paths, so the
+/// database can sit inside the storage directory. Classifying the catalog
+/// locator by directory prefix read that live SQLite path as a legacy session
+/// file, refused it as superseded, and left the session permanently
+/// unhydratable — rediscovery writes back the same database path, so there
+/// was no way out.
+fn a_sqlite_store_inside_the_storage_dir_still_hydrates() {
+    let root = temp_root("db-under-storage");
+    let home = root.join("home");
+    // The storage dir is a parent of the database.
+    let storage = home.join(".local/share/opencode");
+    let store = storage.join("opencode.db");
+    build_sqlite_store(&store);
+    use_layout(&home, Some(&store), Some(&storage));
+
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let locator = raw_path(&db_path, "ses_sqlite_root");
+    assert!(
+        locator.ends_with("opencode.db"),
+        "precondition: the catalog must hold the store path, got {locator}"
+    );
+
+    clear_opencode_evidence(&db_path);
+    let hydrated = hydrate(&db_path, "ses_sqlite_root");
+    assert!(
+        hydrated.evidence.events > 0,
+        "a store that happens to live under the storage dir must still hydrate, got {:?}",
+        hydrated.evidence
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A delivery capture trigger writes the column list it was created with into
+/// its own SQL. `CREATE TRIGGER IF NOT EXISTS` will not replace it, so a
+/// database that already existed before this PR added `provider` and
+/// `stop_reason` keeps capturing the old shape: delivery goes on reporting
+/// success while neither field ever reaches the destination, and an upgraded
+/// installation's incremental exports quietly differ from a fresh one's.
+fn an_upgraded_database_delivers_the_new_event_columns() {
+    use ai_hist::delivery::{
+        create_job, DeliveryJobConfig, DeliveryLimits, ExportSelection, SUPPORTED_KINDS,
+    };
+
+    let root = temp_root("upgraded-capture");
+    let db_path = root.join("history.db");
+    let stripped = {
+        let conn = open_db(&db_path).unwrap();
+        create_job(
+            &conn,
+            &DeliveryJobConfig {
+                destination_id: "fixture".into(),
+                instance_id: "upgrade".into(),
+                account_id: "account".into(),
+                mapping_version: "1".into(),
+                selection: ExportSelection {
+                    all_sources: true,
+                    kinds: SUPPORTED_KINDS.iter().map(|kind| (*kind).into()).collect(),
+                    ..ExportSelection::default()
+                },
+                limits: DeliveryLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+
+        // Rewind the store to what an installation from before this PR has on
+        // disk: `session_events` without the two new columns, and capture
+        // triggers whose SQL never mentioned them.
+        let mut stripped = Vec::new();
+        for operation in ["insert", "update", "delete"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [format!("delivery_session_events_{operation}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut old_shape = sql;
+            for row in ["NEW", "OLD"] {
+                for column in ["provider", "stop_reason"] {
+                    old_shape = old_shape.replace(&format!(",'{column}',{row}.\"{column}\""), "");
+                }
+            }
+            assert!(
+                !old_shape.contains("'provider'") && !old_shape.contains("'stop_reason'"),
+                "the pre-upgrade trigger must not mention the new columns: {old_shape}"
+            );
+            conn.execute_batch(&format!(
+                "DROP TRIGGER delivery_session_events_{operation};"
+            ))
+            .unwrap();
+            stripped.push(old_shape);
+        }
+        for column in ["provider", "stop_reason"] {
+            conn.execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
+                .unwrap();
+        }
+        for sql in &stripped {
+            conn.execute_batch(&format!("{sql};")).unwrap();
+        }
+        stripped
+    };
+
+    // Opening the database again is the upgrade: it re-adds the columns.
+    let conn = open_db(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO session_events(source,session_id,ts_ms,role,kind,event_uid,text,provider,stop_reason) \
+         VALUES('opencode','ses_upgrade',1000,'assistant','text','evt_upgrade','hi','anthropic','stop')",
+        [],
+    )
+    .unwrap();
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM delivery_journal WHERE kind='session_event' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let captured: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        (
+            captured.get("provider").and_then(|v| v.as_str()),
+            captured.get("stop_reason").and_then(|v| v.as_str())
+        ),
+        (Some("anthropic"), Some("stop")),
+        "an upgraded database must capture the new columns, got {payload}"
+    );
+
+    // And the reason it captured them: the trigger itself was replaced, not
+    // merely written around.
+    let rebuilt: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' \
+             AND name='delivery_session_events_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !stripped.iter().any(|sql| rebuilt.contains(sql.as_str())),
+        "the pre-upgrade trigger must not have survived the upgrade"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The plan has to be the one sync actually takes, not merely the one
+/// `sync_plan` would name. Without `part(session_id)`, a session-keyed read is
+/// a full scan of `part`, and global sync issues one per session -- so the
+/// store is read once per session rather than once. Both plans produce the
+/// same rows (the phase above proves that), so the only way to tell them apart
+/// from outside is to count the reading.
+///
+/// A `part` table well past SQLite's default 2 MB page cache means a repeated
+/// scan really does go back to the file, so the two plans are separated by
+/// roughly the session count. Bounded at 8x the store, which one sweep clears
+/// by a wide margin and 200 scans cannot. The `> 0` assertion is the positive
+/// control for the probe; the event count is the positive control for the
+/// work, since a sync that read little because it found nothing would pass the
+/// bound trivially.
+fn an_unindexed_store_is_not_read_once_per_session() {
+    let root = temp_root("unindexed-cost");
+    let home = root.join("home");
+    let store = home.join(".local/share/opencode/opencode.db");
+    build_sqlite_store(&store);
+
+    const SESSIONS: usize = 300;
+    const PARTS: usize = 30;
+    {
+        let db = Connection::open(&store).unwrap();
+        for index in [
+            "session_time_updated_id_idx",
+            "message_session_time_created_id_idx",
+            "part_session_idx",
+            "part_message_id_id_idx",
+        ] {
+            db.execute_batch(&format!("DROP INDEX IF EXISTS {index};"))
+                .unwrap();
+        }
+        // Rows that stay wholly inside the b-tree leaf pages: a scan then has
+        // to read them, where a row whose text spills into overflow pages
+        // would be skipped over and the scan would cost almost nothing.
+        let filler = "x".repeat(700);
+        db.execute_batch("BEGIN").unwrap();
+        for n in 0..SESSIONS {
+            let session = format!("ses_bulk_{n}");
+            db.execute(
+                "INSERT INTO session (id, parent_id, directory, time_created, time_updated) \
+                 VALUES (?1, NULL, '/tmp/project', 1776643200000, 1776643260000)",
+                [&session],
+            )
+            .unwrap();
+            let message = format!("msg_bulk_{n}");
+            let message_data = format!(
+                "{{\"id\":\"{message}\",\"sessionID\":\"{session}\",\"role\":\"user\",\
+                 \"time\":{{\"created\":1776643200000}}}}"
+            );
+            db.execute(
+                "INSERT INTO message (id, session_id, time_created, data) \
+                 VALUES (?1, ?2, 1776643200000, ?3)",
+                rusqlite::params![&message, &session, &message_data],
+            )
+            .unwrap();
+            for part in 0..PARTS {
+                let id = format!("prt_bulk_{n}_{part}");
+                let data = format!("{{\"id\":\"{id}\",\"type\":\"text\",\"text\":\"{filler}\"}}");
+                db.execute(
+                    "INSERT INTO part (id, message_id, session_id, time_created, data) \
+                     VALUES (?1, ?2, ?3, 1776643200000, ?4)",
+                    rusqlite::params![&id, &message, &session, &data],
+                )
+                .unwrap();
+            }
+        }
+        db.execute_batch("COMMIT").unwrap();
+
+        // Positive control for the premise: the per-session predicate on this
+        // store really is a scan, so the two plans really do differ here.
+        let plan: String = db
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM part WHERE session_id = ?",
+                ["x"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("SCAN"), "expected an unindexed store: {plan}");
+    }
+    let size = fs::metadata(&store).unwrap().len();
+    assert!(
+        size >= 6 * 1024 * 1024,
+        "the store must be well past SQLite's page cache, got {size} bytes"
+    );
+
+    use_layout(&home, Some(&store), None);
+    let db_path = root.join("history.db");
+    let before = bytes_read();
+    sync_local_at(&db_path).unwrap();
+    let after = bytes_read();
+
+    let conn = open_db(&db_path).unwrap();
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_events \
+             WHERE source='opencode' AND session_id LIKE 'ses_bulk_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        (SESSIONS * PARTS) as i64,
+        "the sweep must have read every synthetic session, or the bound is vacuous"
+    );
+    drop(conn);
+
+    if let (Some(before), Some(after)) = (before, after) {
+        let read = after.saturating_sub(before);
+        assert!(read > 0, "the read probe reported nothing at all");
+        // One sweep of the source plus the destination writes it provokes
+        // measured 52 MB here; a scan per session measured 2.73 GB, which is
+        // the positive control for this bound. The gap is the session count,
+        // so anywhere between them separates the two plans decisively.
+        assert!(
+            read < size * 32,
+            "the sync read {read} bytes of a {size}-byte store, about \
+             {:.0}x: {SESSIONS} scans of it, not one sweep",
+            read as f64 / size as f64
+        );
+    }
 
     fs::remove_dir_all(&root).ok();
 }

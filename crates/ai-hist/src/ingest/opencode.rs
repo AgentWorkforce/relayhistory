@@ -28,7 +28,7 @@ use super::{
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
 use crate::{insert_history, prompt_hash, HistoryEntry};
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -231,7 +231,14 @@ pub(crate) fn load_from_sqlite(
                     raw: object,
                 });
         };
-        if part_columns.contains("session_id") {
+        // Seek by whichever column the provider actually indexes. Choosing on
+        // column *presence* alone picks a predicate SQLite can only answer by
+        // scanning `part`, which for one session is merely slow but for the
+        // global sweep is one full scan per session.
+        let seek_part_by_session = part_columns.contains("session_id")
+            && (has_leading_index(src, "part", "session_id")?
+                || !has_leading_index(src, "part", "message_id")?);
+        if seek_part_by_session {
             let mut stmt = src.prepare(
                 "SELECT id, message_id, data FROM part WHERE session_id = ? AND json_valid(data)",
             )?;
@@ -269,6 +276,192 @@ pub(crate) fn load_from_sqlite(
     }
 
     Ok(Some(finish(info, messages, parts_by_message)))
+}
+
+/// How global sync should read a provider store.
+///
+/// Per-session queries are the right shape when the provider indexes the
+/// column they seek on. When it does not, each one costs a full scan of
+/// `part` — and global sync runs one per session, so a store with 10,000
+/// sessions and a million parts pays 10,000 scans. The removed
+/// whole-database backup used to hide this by copying the store and building
+/// `part(session_id)` on the copy; nothing may build an index on the
+/// provider's own database, so the unindexed store gets a different plan
+/// instead of a slower version of the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpencodeSyncPlan {
+    /// One bounded, index-seeking query per session.
+    PerSession,
+    /// One scan of `message` and one of `part` for the whole store, grouped
+    /// in memory. Reads every row once rather than once per session.
+    SinglePass,
+}
+
+/// Whether `table` has an index whose *leading* column is `column`, which is
+/// what makes an equality predicate on it a seek rather than a scan. SQLite's
+/// primary-key autoindexes are included by the pragma.
+///
+/// Discovery already treats these provider indexes as optional; ingestion has
+/// to as well, for the same reason: RelayHistory never issues provider DDL,
+/// so an index that is not there cannot be created.
+pub(crate) fn has_leading_index(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_index_list('{table}') indexes \
+             JOIN pragma_index_info(indexes.name) columns \
+             WHERE columns.seqno = 0 AND columns.name = ? LIMIT 1"
+        ))?
+        .query_row([column], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Which plan this store supports. Session-keyed reads need `part` seekable
+/// by session, or messages seekable by session *and* parts by message.
+pub(crate) fn sync_plan(src: &Connection) -> Result<OpencodeSyncPlan> {
+    let part_by_session = has_leading_index(src, "part", "session_id")?;
+    let message_by_session = has_leading_index(src, "message", "session_id")?;
+    let part_by_message = has_leading_index(src, "part", "message_id")?;
+    if part_by_session || (message_by_session && part_by_message) {
+        Ok(OpencodeSyncPlan::PerSession)
+    } else {
+        Ok(OpencodeSyncPlan::SinglePass)
+    }
+}
+
+/// Read the whole store in one pass per table and group it in memory.
+///
+/// The fallback for a store whose provider indexes are missing. It trades
+/// memory for scans, which is the right way round here: the alternative this
+/// replaced copied the entire database to a temporary file first, so holding
+/// the rows costs no more than that did and reads each one exactly once.
+pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSession>> {
+    let session_columns = table_columns(src, "session")?;
+    if !session_columns.contains("id") {
+        return Ok(Vec::new());
+    }
+    let parent = optional_column(&session_columns, "parent_id");
+    let directory = optional_column(&session_columns, "directory");
+    let created = optional_column(&session_columns, "time_created");
+    let updated = optional_column(&session_columns, "time_updated");
+    let sql = format!(
+        "SELECT id, {parent}, {directory}, {created}, {updated} FROM session \
+         WHERE id IS NOT NULL AND id <> ''"
+    );
+    let mut infos: BTreeMap<String, OpencodeSessionInfo> = src
+        .prepare(&sql)?
+        .query_map([], |row| {
+            Ok(OpencodeSessionInfo {
+                id: row.get::<_, String>(0)?,
+                parent_id: row.get::<_, Option<String>>(1)?,
+                directory: row.get::<_, Option<String>>(2)?,
+                created_ms: row.get::<_, Option<i64>>(3)?,
+                updated_ms: row.get::<_, Option<i64>>(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|mut info| {
+            info.parent_id = info.parent_id.filter(|value| !value.is_empty());
+            (info.id.clone(), info)
+        })
+        .collect();
+
+    // One scan of `message`, grouped by session, remembering which session
+    // each message belongs to so the parts can be placed without a second
+    // lookup per row.
+    let message_columns = table_columns(src, "message")?;
+    let mut messages_by_session: BTreeMap<String, Vec<OpencodeMessage>> = BTreeMap::new();
+    let mut session_of_message: BTreeMap<String, String> = BTreeMap::new();
+    if message_columns.contains("id")
+        && message_columns.contains("data")
+        && message_columns.contains("session_id")
+    {
+        let fallback = optional_column(&message_columns, "time_created");
+        let sql =
+            format!("SELECT id, session_id, data, {fallback} FROM message WHERE json_valid(data)");
+        let rows = src
+            .prepare(&sql)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, session_id, data, fallback_ts) in rows {
+            if !infos.contains_key(&session_id) {
+                continue;
+            }
+            let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if let Some(message) = parse_message(&id, &object, fallback_ts) {
+                session_of_message.insert(message.id.clone(), session_id.clone());
+                messages_by_session
+                    .entry(session_id)
+                    .or_default()
+                    .push(message);
+            }
+        }
+    }
+
+    // One scan of `part`, placed by the message map above.
+    let part_columns = table_columns(src, "part")?;
+    let mut parts_by_session: BTreeMap<String, BTreeMap<String, Vec<OpencodePart>>> =
+        BTreeMap::new();
+    if part_columns.contains("id")
+        && part_columns.contains("data")
+        && part_columns.contains("message_id")
+    {
+        let rows = src
+            .prepare("SELECT id, message_id, data FROM part WHERE json_valid(data)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, message_id, data) in rows {
+            let Some(session_id) = session_of_message.get(&message_id) else {
+                continue;
+            };
+            let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let kind = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            parts_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .entry(message_id)
+                .or_default()
+                .push(OpencodePart {
+                    id,
+                    kind,
+                    raw: object,
+                });
+        }
+    }
+
+    let mut out = Vec::with_capacity(infos.len());
+    let ids: Vec<String> = infos.keys().cloned().collect();
+    for id in ids {
+        let info = infos.remove(&id).expect("id came from this map");
+        out.push(finish(
+            info,
+            messages_by_session.remove(&id).unwrap_or_default(),
+            parts_by_session.remove(&id).unwrap_or_default(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Every session id the provider store names. Used by global sync, which is
@@ -1120,6 +1313,86 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// A provider store with the fixture schema, and optionally the indexes
+    /// a real OpenCode install ships.
+    fn store(indexed: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                                   time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT,
+                                   time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                                time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        if indexed {
+            conn.execute_batch(
+                "CREATE INDEX part_session_idx ON part (session_id);
+                 CREATE INDEX message_session_idx ON message (session_id, time_created, id);",
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// What SQLite says it will do for the per-session part predicate. The
+    /// plan choice is only worth making if it tracks this.
+    fn part_by_session_plan(conn: &Connection) -> String {
+        conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT id, message_id, data FROM part WHERE session_id = ?",
+            ["x"],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unindexed_store_is_swept_in_one_pass_not_once_per_session() {
+        // The provider's own index makes the per-session predicate a seek...
+        let indexed = store(true);
+        assert!(
+            part_by_session_plan(&indexed).contains("SEARCH"),
+            "with the index the predicate must be a seek: {}",
+            part_by_session_plan(&indexed)
+        );
+        assert_eq!(sync_plan(&indexed).unwrap(), OpencodeSyncPlan::PerSession);
+
+        // ...and without it, a scan -- which global sync would pay once per
+        // session. That is the whole reason the plan differs.
+        let bare = store(false);
+        assert!(
+            part_by_session_plan(&bare).contains("SCAN"),
+            "without the index the predicate must be a scan: {}",
+            part_by_session_plan(&bare)
+        );
+        assert_eq!(sync_plan(&bare).unwrap(), OpencodeSyncPlan::SinglePass);
+    }
+
+    #[test]
+    fn messages_by_session_and_parts_by_message_are_also_seekable() {
+        // The other indexed shape: no `part(session_id)`, but the pair that
+        // lets a session be reached through its messages.
+        let conn = store(false);
+        conn.execute_batch(
+            "CREATE INDEX message_session_idx ON message (session_id);
+             CREATE INDEX part_message_idx ON part (message_id);",
+        )
+        .unwrap();
+        assert_eq!(sync_plan(&conn).unwrap(), OpencodeSyncPlan::PerSession);
+    }
+
+    #[test]
+    fn a_leading_index_is_what_counts_not_merely_being_mentioned() {
+        let conn = store(false);
+        // `session_id` is in this index, but not first, so an equality
+        // predicate on it alone still cannot seek.
+        conn.execute_batch("CREATE INDEX part_trailing ON part (time_created, session_id);")
+            .unwrap();
+        assert!(!has_leading_index(&conn, "part", "session_id").unwrap());
+        assert_eq!(sync_plan(&conn).unwrap(), OpencodeSyncPlan::SinglePass);
     }
 
     fn part(raw: &str) -> OpencodePart {

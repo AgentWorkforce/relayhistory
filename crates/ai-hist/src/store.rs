@@ -2274,9 +2274,23 @@ fn sync_opencode_sessions_from_source(
 ) -> Result<usize> {
     let raw_path = raw_path.to_string_lossy().into_owned();
     let mut inserted = 0;
-    for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
-        if let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, &session_id)? {
-            inserted += crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+    // Session-keyed queries are bounded only when the provider indexes the
+    // column they seek on. Without that index each one scans `part`, and this
+    // loop runs one per session -- quadratic on exactly the large stores the
+    // bounded path exists to protect. Read the whole store once instead.
+    match crate::ingest::opencode::sync_plan(src)? {
+        crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
+            for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
+                if let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, &session_id)? {
+                    inserted +=
+                        crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+                }
+            }
+        }
+        crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
+            for loaded in crate::ingest::opencode::load_all_from_sqlite(src)? {
+                inserted += crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+            }
         }
     }
     Ok(inserted)

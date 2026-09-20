@@ -1082,19 +1082,36 @@ fn source_snapshot(
                 ),
             )
         };
-        // A locator inside the legacy tree is a session file, not the store:
-        // it is stamped by its own bytes, the way every other file-backed
-        // provider is.
-        if opencode_locator_is_in_storage_tree(&path, &configured_storage) {
+        // Classify the locator by what it *is*, not by which directory it sits
+        // under. `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` are independent
+        // paths, so the database can perfectly well live inside the storage
+        // directory -- and a prefix test then reads a live SQLite locator as a
+        // legacy session file, refuses it as superseded, and leaves the
+        // session permanently unhydratable, because rediscovery writes back
+        // the same database path.
+        //
+        // So: the configured store is matched on resolved identity first, and
+        // only then is the locator considered as a session file, which means
+        // sitting under the tree's own `session/` subtree rather than merely
+        // somewhere beneath the storage root.
+        let resolved = fs::canonicalize(&path).ok();
+        let is_configured_store =
+            resolved.is_some() && resolved == fs::canonicalize(&configured_path).ok();
+        let is_tree_session_file = !is_configured_store
+            && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
+
+        if is_tree_session_file {
             if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(store)) = &current_layout {
                 return Err(superseded(&path, store));
             }
             return opencode_json_tree_snapshot(options, &path);
         }
-        if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
-            return Err(superseded(&path, tree));
+        if is_configured_store {
+            if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
+                return Err(superseded(&path, tree));
+            }
         }
-        if fs::canonicalize(&path).ok() != fs::canonicalize(&configured_path).ok() {
+        if !is_configured_store {
             return Err(hydration_error(
                 "SESSION_SOURCE_MISMATCH",
                 format!(
