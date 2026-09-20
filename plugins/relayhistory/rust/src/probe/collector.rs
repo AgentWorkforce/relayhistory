@@ -166,7 +166,8 @@ pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) ->
         super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
     let result = deliver(&db_path, config);
     if before_exit {
-        let connected = progress.finish_before_exit(result.is_ok(), Duration::from_secs(5));
+        let connected =
+            progress.finish_before_exit(result.is_ok(), super::progress::COMPLETION_TIMEOUT);
         if result.is_ok() {
             ensure!(connected, user_error("Cloud connection could not be confirmed. Check the endpoint and retry; local data remains queued."));
         }

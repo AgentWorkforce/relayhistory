@@ -9,6 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
+// In-flight heartbeat + final token renewal/report + local bookkeeping margin.
+pub const COMPLETION_TIMEOUT: Duration =
+    Duration::from_secs(HEARTBEAT_TIMEOUT.as_secs() * 2 + REFRESH_TIMEOUT.as_secs() + 1);
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
@@ -197,7 +203,7 @@ fn heartbeat(url: &str, progress: &Progress, finished: bool) -> bool {
     // Periodic capture updates only read cached credentials. A final upload
     // update may renew an idle token, without waiting for the refresh lock.
     let token = if finished && progress.phase != "capture_paused" {
-        match cloud::try_progress_access_token(url, Duration::from_secs(2)) {
+        match cloud::try_progress_access_token(url, REFRESH_TIMEOUT) {
             Ok(Some(token)) => token,
             _ => return false,
         }
@@ -223,7 +229,7 @@ fn heartbeat(url: &str, progress: &Progress, finished: bool) -> bool {
     };
     let result = ureq::AgentBuilder::new()
         .redirects(0)
-        .timeout(Duration::from_secs(3))
+        .timeout(HEARTBEAT_TIMEOUT)
         .build()
         .post(&format!("{url}/v1/onboarding/heartbeat"))
         .set("Authorization", &format!("Bearer {token}"))
