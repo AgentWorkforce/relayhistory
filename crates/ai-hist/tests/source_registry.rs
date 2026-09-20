@@ -80,6 +80,11 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         text: Some(text.into()),
         model: None,
         token_json: None,
+        // A connector that knows the provider's request identity supplies it
+        // here; the round trip through evidence must preserve it, or a
+        // remotely hydrated session loses the grouping its records had.
+        request_id: Some(format!("req-{uid}")),
+        provider_message_id: Some(format!("msg-{uid}")),
         event_uid: uid.into(),
     }
 }

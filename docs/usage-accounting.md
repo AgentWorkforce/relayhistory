@@ -74,6 +74,15 @@ reproduces its final cumulative total. A snapshot that repeats or goes backwards
 is not a delta: the prior baseline is kept, so the next advancing snapshot
 covers exactly the spend since it.
 
+Counters are read as non-negative integers and differenced with checked
+arithmetic. A snapshot carrying a counter that is negative, fractional, or
+outside `u64` cannot be differenced at all, so the provider's own object is
+stored verbatim in its place and the baseline is left alone — the request then
+reports `USAGE_NON_INTEGER_COUNTER` rather than a delta of zeros that is
+indistinguishable from a reported zero. A counter above `i64::MAX` is still a
+valid count and is preserved; it is refused later, at the JavaScript boundary
+that genuinely cannot carry it.
+
 `input_tokens` in a Codex record stays *inclusive* of `cached_input_tokens`
 even after differencing. Normalization makes it exclusive, so a consumer that
 sums the categories cannot count cache reads twice.
@@ -109,6 +118,15 @@ events it is derived from, and there is exactly one implementation of the
 normalization rules. A view left over from a build whose grouping key differed
 counts as outstanding migration work — otherwise an upgraded store would keep
 over-counting, silently and plausibly.
+
+Identities are stored **verbatim**. `"req"` and `" req "` are two requests,
+not one: trimming on the way in would merge them and report a total belonging
+to neither. A value that is empty once trimmed is not an identity and is
+stored as absent.
+
+They travel with the evidence contract too, so a remotely hydrated session
+keeps the grouping its records had rather than arriving with null identities
+and reading as one request per content block.
 
 ### Upgrading an existing store
 

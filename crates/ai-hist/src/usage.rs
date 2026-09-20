@@ -1072,6 +1072,8 @@ mod tests {
             text: Some(text.to_string()),
             model: None,
             token_json: token_json.map(str::to_string),
+            request_id: None,
+            provider_message_id: None,
             event_uid: format!("{message_id}:0"),
         }
     }

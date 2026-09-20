@@ -1597,6 +1597,17 @@ pub struct SessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The provider's own id for the API request this row belongs to —
+    /// Claude's `requestId` — stored verbatim, `None` when it recorded none.
+    ///
+    /// Distinct from `message_id`, which is the record's own `uuid`. Carried
+    /// on this struct, and not only in the table, so a connector supplying
+    /// normalized events can preserve it: without that, a remotely hydrated
+    /// Claude session loses the identity its records had and its requests
+    /// read as one per content block.
+    pub request_id: Option<String>,
+    /// The provider's own message id — Claude's `message.id` — verbatim.
+    pub provider_message_id: Option<String>,
     pub event_uid: String,
 }
 
@@ -1684,7 +1695,7 @@ pub fn session_events(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionEvent>> {
-    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
+    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, request_id, provider_message_id,                    event_uid FROM session_events WHERE session_id = ?"
         .to_string();
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
@@ -1709,7 +1720,9 @@ pub fn session_events(
             text: row.get(11)?,
             model: row.get(12)?,
             token_json: row.get(13)?,
-            event_uid: row.get(14)?,
+            request_id: row.get(14)?,
+            provider_message_id: row.get(15)?,
+            event_uid: row.get(16)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1726,7 +1739,8 @@ pub fn session_events_page(
     let limit = limit.clamp(1, 1_000);
     let mut sql =
         "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
-                          ts_ms, role, kind, text, model, token_json, event_uid \
+                          ts_ms, role, kind, text, model, token_json, request_id, \
+                          provider_message_id, event_uid \
                    FROM session_events WHERE session_id = ?"
             .to_string();
     let mut params_vec = vec![session_id.to_string()];
@@ -1760,7 +1774,9 @@ pub fn session_events_page(
             text: row.get(11)?,
             model: row.get(12)?,
             token_json: row.get(13)?,
-            event_uid: row.get(14)?,
+            request_id: row.get(14)?,
+            provider_message_id: row.get(15)?,
+            event_uid: row.get(16)?,
         })
     })?;
     let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;

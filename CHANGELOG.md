@@ -66,6 +66,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   diagnostic and its rollup reports no totals rather than one figure per
   content block.
 
+- Carry `request_id` and `provider_message_id` through the session-event
+  evidence contract and on the normalized `SessionEvent`, so a remotely
+  hydrated Claude session and a connector supplying normalized events both
+  keep the request identity their records had.
+
 - Add per-request usage records and a session rollup. The `session_requests`
   view is one row per model request — Claude's per-content-block copies of
   `message.usage` collapse into one — read with `session_requests_page` /

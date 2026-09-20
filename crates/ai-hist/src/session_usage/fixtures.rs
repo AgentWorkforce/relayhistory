@@ -103,6 +103,38 @@ fn a_multi_block_turn_is_one_request_per_request_id() {
     assert!(!summary.overflowed);
 }
 
+/// Two requests whose ids differ only in whitespace are two requests.
+///
+/// Trimming on the way in would make `"req_pad"` and `" req_pad "` the same
+/// grouping key, merging both requests into one row and reporting a total
+/// that belongs to neither.
+#[test]
+fn request_ids_differing_only_in_whitespace_stay_distinct() {
+    let conn = claude_store("claude/padded-request-id.jsonl");
+    let page = session_requests_page(&conn, "claude", CLAUDE_SESSION, 50, None).unwrap();
+    let mut keys: Vec<&str> = page
+        .requests
+        .iter()
+        .map(|request| request.request_key.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![" req_pad ", "req_pad"]);
+    assert!(page
+        .requests
+        .iter()
+        .all(|request| request.request_key_source == RequestKeySource::RequestId));
+
+    // Each kept its own usage rather than one row carrying the pair's sum.
+    for request in &page.requests {
+        assert_eq!(request.usage.as_ref().unwrap().output_tokens, 7);
+    }
+    let summary = session_usage_summary(&conn, "claude", CLAUDE_SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.request_count, 2);
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 14);
+}
+
 /// A transcript old enough to carry no `requestId` still groups correctly on
 /// the provider's `message.id`, which is the same for every record of one
 /// request.
@@ -253,6 +285,87 @@ fn a_regressed_codex_counter_is_a_diagnostic_not_a_negative_delta() {
         summary.diagnostics,
         vec![UsageDiagnostic::UnnormalizableUsage]
     );
+}
+
+/// A Codex snapshot whose counter is not a non-negative integer cannot be
+/// differenced. It must reach the session API as an explicit refusal, not as
+/// a delta of zeros that is indistinguishable from a reported zero.
+///
+/// The three shapes the old `as_i64().unwrap_or(0)` read silently wrong:
+/// negative, fractional, and above `i64::MAX`. The first two are corruption;
+/// the third is a perfectly good `u64` the old code turned into a zero, so it
+/// is preserved here and refused later, at the boundary that actually cannot
+/// carry it.
+#[test]
+fn an_invalid_codex_counter_is_refused_rather_than_read_as_zero() {
+    for (fixture, session, field) in [
+        (
+            "codex/counter-negative.jsonl",
+            "sess_codex_negative",
+            "input_tokens",
+        ),
+        (
+            "codex/counter-fractional.jsonl",
+            "sess_codex_fractional",
+            "output_tokens",
+        ),
+    ] {
+        let conn = codex_store(fixture);
+        let stored: String = conn
+            .query_row(
+                "SELECT token_json FROM session_events \
+                 WHERE source='codex' AND token_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("{fixture}: {error}"));
+        assert!(
+            stored.contains(field),
+            "{fixture}: the provider's own object is kept, not a zeroed delta: {stored}"
+        );
+
+        let page = session_requests_page(&conn, "codex", session, 50, None).unwrap();
+        let refused = page
+            .requests
+            .iter()
+            .find(|request| request.usage.is_none())
+            .unwrap_or_else(|| panic!("{fixture}: no request refused its usage"));
+        assert_eq!(
+            refused.usage_error.as_deref(),
+            Some("USAGE_NON_INTEGER_COUNTER"),
+            "{fixture}"
+        );
+        assert!(refused
+            .diagnostics
+            .contains(&UsageDiagnostic::UnnormalizableUsage));
+
+        let summary = session_usage_summary(&conn, "codex", session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.usage, None, "{fixture}");
+        assert!(summary
+            .diagnostics
+            .contains(&UsageDiagnostic::UnnormalizableUsage));
+    }
+}
+
+/// A counter above `i64::MAX` is still a valid `u64`, so the parser keeps it
+/// rather than zeroing it — and the JavaScript boundary is where it is
+/// refused, because that is the layer that genuinely cannot carry it.
+#[test]
+fn a_codex_counter_above_i64_max_survives_the_parser_intact() {
+    let conn = codex_store("codex/counter-above-i64.jsonl");
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_huge")
+        .unwrap()
+        .unwrap();
+    let usage = summary
+        .usage
+        .as_ref()
+        .expect("a large but valid counter is still usage");
+    // 9223372036854775808 == i64::MAX + 1, reported as ordinary input because
+    // the snapshot reported no cache reads.
+    assert_eq!(usage.input_tokens, 9_223_372_036_854_775_808);
+    assert!(summary.diagnostics.is_empty());
 }
 
 /// Prompt attribution is a faithful move of the commercial outbox's rule,

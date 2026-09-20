@@ -1976,31 +1976,88 @@ pub(crate) struct CodexIngestOutcome {
 
 /// Cumulative token totals from a Codex `token_count` event
 /// (`info.total_token_usage`). `input` is inclusive of `cached_input`.
+///
+/// Counters are `u64` because that is what a token count is. They were `i64`
+/// read with `unwrap_or(0)`, which turned every counter the provider wrote
+/// badly — negative, fractional, out of range — into a zero, and the
+/// differencing below then clamped the result back to a plausible
+/// non-negative delta. The stored JSON was valid, so nothing downstream could
+/// tell a corrupted snapshot from a reported zero.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct CodexTokenTotals {
-    input: i64,
-    cached_input: i64,
-    cache_write: i64,
-    output: i64,
-    reasoning_output: i64,
-    total: i64,
+    input: u64,
+    cached_input: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning_output: u64,
+    total: u64,
+}
+
+/// Usage measured but not yet attached to an assistant event.
+enum PendingCodexUsage {
+    /// A per-request delta between two strictly-advancing snapshots.
+    Delta(CodexTokenTotals),
+    /// The provider's own snapshot object, kept **verbatim** because it could
+    /// not be differenced: a counter is not a non-negative integer, or the
+    /// arithmetic would leave `u64`.
+    ///
+    /// Storing the raw object is what makes the refusal reach a caller:
+    /// `normalize_usage` rejects it with a stable code, so the request reports
+    /// `usage: null` with `unnormalizable-usage` instead of a delta of zeros
+    /// that looks like a measurement. Nothing is fabricated — this is what the
+    /// provider wrote.
+    Unusable(String),
+}
+
+impl PendingCodexUsage {
+    fn into_token_json(self) -> String {
+        match self {
+            Self::Delta(totals) => totals.to_token_json(),
+            Self::Unusable(raw) => raw,
+        }
+    }
+
+    /// Fold a newly measured delta into whatever is already pending.
+    ///
+    /// An unusable snapshot poisons the sum. A total that silently omits a
+    /// segment it could not measure is worse than one that says so.
+    fn merged(self, delta: CodexTokenTotals, raw: &Value) -> Self {
+        match self {
+            Self::Unusable(raw) => Self::Unusable(raw),
+            Self::Delta(pending) => match pending.plus(&delta) {
+                Some(sum) => Self::Delta(sum),
+                None => Self::Unusable(raw.to_string()),
+            },
+        }
+    }
 }
 
 impl CodexTokenTotals {
+    /// Read one snapshot, or `None` when any counter the provider wrote is
+    /// not a non-negative integer.
+    ///
+    /// An absent or null counter is "not reported" and reads as zero, which
+    /// is the shape `total_token_usage` genuinely has. A *present* counter
+    /// that is negative, fractional, or larger than `u64` is corruption, and
+    /// the caller keeps the provider's object instead of inventing a number
+    /// for it.
     fn from_usage(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
-        let get = |key: &str| obj.get(key).and_then(Value::as_i64).unwrap_or(0);
+        let get = |key: &str| match obj.get(key) {
+            None | Some(Value::Null) => Some(0),
+            Some(value) => value.as_u64(),
+        };
         Some(Self {
-            input: get("input_tokens"),
-            cached_input: get("cached_input_tokens"),
-            cache_write: get("cache_write_input_tokens"),
-            output: get("output_tokens"),
-            reasoning_output: get("reasoning_output_tokens"),
-            total: get("total_tokens"),
+            input: get("input_tokens")?,
+            cached_input: get("cached_input_tokens")?,
+            cache_write: get("cache_write_input_tokens")?,
+            output: get("output_tokens")?,
+            reasoning_output: get("reasoning_output_tokens")?,
+            total: get("total_tokens")?,
         })
     }
 
-    fn fields(&self) -> [i64; 6] {
+    fn fields(&self) -> [u64; 6] {
         [
             self.input,
             self.cached_input,
@@ -2025,26 +2082,31 @@ impl CodexTokenTotals {
             .any(|(x, y)| x < y)
     }
 
-    fn minus(&self, prev: &Self) -> Self {
-        Self {
-            input: (self.input - prev.input).max(0),
-            cached_input: (self.cached_input - prev.cached_input).max(0),
-            cache_write: (self.cache_write - prev.cache_write).max(0),
-            output: (self.output - prev.output).max(0),
-            reasoning_output: (self.reasoning_output - prev.reasoning_output).max(0),
-            total: (self.total - prev.total).max(0),
-        }
+    /// Difference two snapshots, or `None` if any field would go backwards.
+    ///
+    /// Checked rather than clamped per field: the caller only calls this once
+    /// [`Self::advanced_from`] holds, so an underflow here means an invariant
+    /// broke, and `max(0)` would hide it behind a plausible zero.
+    fn minus(&self, prev: &Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_sub(prev.input)?,
+            cached_input: self.cached_input.checked_sub(prev.cached_input)?,
+            cache_write: self.cache_write.checked_sub(prev.cache_write)?,
+            output: self.output.checked_sub(prev.output)?,
+            reasoning_output: self.reasoning_output.checked_sub(prev.reasoning_output)?,
+            total: self.total.checked_sub(prev.total)?,
+        })
     }
 
-    fn plus(&self, other: &Self) -> Self {
-        Self {
-            input: self.input + other.input,
-            cached_input: self.cached_input + other.cached_input,
-            cache_write: self.cache_write + other.cache_write,
-            output: self.output + other.output,
-            reasoning_output: self.reasoning_output + other.reasoning_output,
-            total: self.total + other.total,
-        }
+    fn plus(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            input: self.input.checked_add(other.input)?,
+            cached_input: self.cached_input.checked_add(other.cached_input)?,
+            cache_write: self.cache_write.checked_add(other.cache_write)?,
+            output: self.output.checked_add(other.output)?,
+            reasoning_output: self.reasoning_output.checked_add(other.reasoning_output)?,
+            total: self.total.checked_add(other.total)?,
+        })
     }
 
     fn to_token_json(self) -> String {
@@ -2058,6 +2120,28 @@ impl CodexTokenTotals {
         })
         .to_string()
     }
+}
+
+/// Attach measured usage to the assistant event that earned it, or hold it
+/// until one appears.
+fn attach_codex_usage(
+    conn: &Connection,
+    session_id: &str,
+    pending: &mut Option<PendingCodexUsage>,
+    untokened_assistant_uid: &mut Option<String>,
+    usage: PendingCodexUsage,
+) -> Result<()> {
+    match untokened_assistant_uid.take() {
+        Some(uid) => {
+            conn.execute(
+                "UPDATE session_events SET token_json = ? \
+                 WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
+                params![usage.into_token_json(), session_id, uid],
+            )?;
+        }
+        None => *pending = Some(usage),
+    }
+    Ok(())
 }
 
 /// Ingest one rollout file's conversation into `session_events`,
@@ -2111,7 +2195,7 @@ pub(crate) fn ingest_codex_rollout(
     let mut outcome = CodexIngestOutcome::default();
     let mut model: Option<String> = None;
     let mut prev_totals: Option<CodexTokenTotals> = None;
-    let mut pending_delta: Option<CodexTokenTotals> = None;
+    let mut pending_usage: Option<PendingCodexUsage> = None;
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
@@ -2205,7 +2289,8 @@ pub(crate) fn ingest_codex_rollout(
                 "agent_message" => {
                     if let Some(message) = payload_str("message").filter(|m| !m.trim().is_empty()) {
                         let uid = format!("{index}:agent_message");
-                        let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                        let token_json =
+                            pending_usage.take().map(PendingCodexUsage::into_token_json);
                         insert_codex_event(
                             conn,
                             session_id,
@@ -2250,11 +2335,25 @@ pub(crate) fn ingest_codex_rollout(
                     }
                 }
                 "token_count" => {
-                    let Some(totals) = payload
+                    let Some(usage) = payload
                         .get("info")
                         .and_then(|info| info.get("total_token_usage"))
-                        .and_then(CodexTokenTotals::from_usage)
                     else {
+                        continue;
+                    };
+                    let Some(totals) = CodexTokenTotals::from_usage(usage) else {
+                        // A counter that is not a non-negative integer cannot
+                        // be differenced. Keep the provider's object so the
+                        // session API answers with an explicit normalization
+                        // error, and leave the baseline untouched so a later
+                        // good snapshot still measures from a real point.
+                        attach_codex_usage(
+                            conn,
+                            session_id,
+                            &mut pending_usage,
+                            &mut untokened_assistant_uid,
+                            PendingCodexUsage::Unusable(usage.to_string()),
+                        )?;
                         continue;
                     };
                     match prev_totals {
@@ -2271,20 +2370,25 @@ pub(crate) fn ingest_codex_rollout(
                         Some(prev) if !totals.advanced_from(&prev) => {}
                         _ => {
                             let baseline = prev_totals.unwrap_or_default();
-                            let mut delta = totals.minus(&baseline);
+                            let measured = totals.minus(&baseline);
                             prev_totals = Some(totals);
-                            if let Some(pending) = pending_delta.take() {
-                                delta = delta.plus(&pending);
-                            }
-                            if let Some(uid) = untokened_assistant_uid.take() {
-                                conn.execute(
-                                    "UPDATE session_events SET token_json = ? \
-                                     WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
-                                    params![delta.to_token_json(), session_id, uid],
-                                )?;
-                            } else {
-                                pending_delta = Some(delta);
-                            }
+                            let next = match measured {
+                                Some(delta) => match pending_usage.take() {
+                                    Some(pending) => pending.merged(delta, usage),
+                                    None => PendingCodexUsage::Delta(delta),
+                                },
+                                // `advanced_from` held, so this cannot
+                                // underflow; if it ever does, say so rather
+                                // than publish a clamped zero.
+                                None => PendingCodexUsage::Unusable(usage.to_string()),
+                            };
+                            attach_codex_usage(
+                                conn,
+                                session_id,
+                                &mut pending_usage,
+                                &mut untokened_assistant_uid,
+                                next,
+                            )?;
                         }
                     }
                 }
@@ -2435,7 +2539,7 @@ pub(crate) fn ingest_codex_rollout(
                     let uid = format!("{index}:{payload_type}");
                     let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
                     let event_text = format_tool_event_text(name, target.as_deref(), &args);
-                    let token_json = pending_delta.take().map(CodexTokenTotals::to_token_json);
+                    let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
                     insert_codex_event(
                         conn,
                         session_id,
@@ -3334,9 +3438,15 @@ impl<'a> RequestIdentity<'a> {
         Self::default()
     }
 
-    /// Read both from one Claude transcript record. An empty string is not an
-    /// identity and is stored as absent, so the grouping key never becomes
-    /// `""` for every record in a session.
+    /// Read both from one Claude transcript record.
+    ///
+    /// The value is stored **verbatim**. Trimming would make `"req"` and
+    /// `" req "` the same grouping key, merging two providers' requests into
+    /// one row and summing usage that belongs to neither — the same reason
+    /// the napi boundary rejects a padded session id rather than trimming it.
+    /// A value that is empty once trimmed is not an identity at all and is
+    /// stored as absent, so the key never becomes `""` for every record in a
+    /// session.
     fn from_claude_record(
         object: &'a Map<String, Value>,
         message: Option<&'a Map<String, Value>>,
@@ -3344,8 +3454,7 @@ impl<'a> RequestIdentity<'a> {
         let text = |value: Option<&'a Value>| {
             value
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.trim().is_empty())
         };
         Self {
             request_id: text(object.get("requestId")).or_else(|| text(object.get("request_id"))),

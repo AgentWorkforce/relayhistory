@@ -211,6 +211,87 @@ fn malformed_complete_batch_never_creates_database() -> Result<()> {
     assert!(!path.exists());
     Ok(())
 }
+/// Remote Claude hydration must carry the provider's request identity.
+///
+/// `ClaudeFull` evidence is parsed in an isolated database and then projected
+/// back out through the evidence row contract. While that projection omitted
+/// `request_id` / `provider_message_id`, a remotely hydrated session arrived
+/// with null identities: its four records read as four `record-id` requests,
+/// each flagged unresolved, and the session reported no total at all — the
+/// same multiplied-then-withheld shape the local path was fixed to avoid.
+#[test]
+fn remote_claude_hydration_preserves_the_provider_request_identity() -> Result<()> {
+    use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    // One API request the provider split across two records, exactly as
+    // Claude writes a multi-block turn.
+    let records = (0..2)
+        .map(|index| {
+            json!({
+                "sessionId": "s",
+                "uuid": format!("rec-{index}"),
+                "requestId": "req_remote",
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "id": "msg_remote",
+                    "model": "claude-test",
+                    "usage": {"input_tokens": 3, "output_tokens": 11},
+                    "content": [{"type": "text", "text": format!("part {index}")}],
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records,
+            source_stamp: "raw1".into(),
+            source_bytes: 100,
+        },
+    )?;
+    // The identity survives the projection itself, before anything applies it.
+    let carried = evidence
+        .records
+        .iter()
+        .filter(|record| record.kind == EvidenceKind::SessionEvent)
+        .filter(|record| {
+            record.payload.get("request_id").and_then(|v| v.as_str()) == Some("req_remote")
+        })
+        .count();
+    assert_eq!(carried, 2, "both event rows carry the provider request id");
+
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        evidence,
+    })?;
+
+    let conn = ai_hist::open_db(&path)?;
+    let stored: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM session_events \
+         WHERE request_id = 'req_remote' AND provider_message_id = 'msg_remote'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, 2, "applying the evidence keeps both identities");
+
+    // And the point of carrying them: one request, one total.
+    let page = ai_hist::session_requests_page(&conn, "claude", "s", 50, None)?;
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].request_key, "req_remote");
+    assert!(page.requests[0].diagnostics.is_empty());
+    let summary = ai_hist::session_usage_summary(&conn, "claude", "s")?
+        .expect("a hydrated session has a summary");
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 11);
+    Ok(())
+}
+
 #[test]
 fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()> {
     use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
