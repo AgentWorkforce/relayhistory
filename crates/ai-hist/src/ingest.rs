@@ -5736,6 +5736,7 @@ fn ingest_grok_session(
     let mut user_ordinal = 0usize;
     let mut message_ordinal = 0usize;
     let mut thought_ordinal = 0usize;
+    let mut first_prompt: Option<String> = None;
     // Chat-side turn index: `None` until the first typed prompt, because the
     // system preamble belongs to no turn.
     let mut turn: Option<usize> = None;
@@ -5831,6 +5832,9 @@ fn ingest_grok_session(
                     &mut outcome,
                 );
                 inherited = Some(ts);
+                if first_prompt.is_none() {
+                    first_prompt = Some(text.clone());
+                }
                 let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
                 insert_session_event(
                     conn,
@@ -5866,41 +5870,12 @@ fn ingest_grok_session(
                 )?;
             }
             grok::GrokRecord::Reasoning { summary, encrypted } => {
-                let Some(summary) = summary else {
-                    if *encrypted {
-                        // The trace exists but is opaque. Recording the fact
-                        // that Grok thought here is honest; inventing readable
-                        // thinking for it would not be.
-                        outcome.encrypted_reasoning += 1;
-                        let ts = resolve_grok_ts(
-                            line.ts_ms,
-                            None,
-                            turn_start(turn),
-                            inherited,
-                            session.created_ms,
-                            &mut outcome,
-                        );
-                        outcome.markers += insert_session_marker(
-                            conn,
-                            &SessionMarker {
-                                source: SOURCE.into(),
-                                session_id: sid.to_string(),
-                                marker_uid: format!("r{idx}"),
-                                kind: "encrypted_reasoning".into(),
-                                ts_ms: Some(ts),
-                                text: None,
-                                detail_json: None,
-                            },
-                        )?;
-                        inherited = Some(ts);
-                    }
-                    continue;
-                };
+                // Every reasoning record occupies an `agent_thoughts` ordinal,
+                // including encrypted-only traces with no readable summary.
+                // Skipping that consume handed the next thought the encrypted
+                // record's chunk — its timestamp and event id.
                 let group = session.updates.agent_thoughts.get(thought_ordinal);
                 thought_ordinal += 1;
-                // The matched group knows which turn this is, and the
-                // transcript side may not: a model-initiated turn has no user
-                // record to advance it.
                 if let Some(group) = group {
                     turn = Some(group.turn);
                 }
@@ -5913,6 +5888,27 @@ fn ingest_grok_session(
                     &mut outcome,
                 );
                 inherited = Some(ts);
+                let Some(summary) = summary else {
+                    if *encrypted {
+                        // The trace exists but is opaque. Recording the fact
+                        // that Grok thought here is honest; inventing readable
+                        // thinking for it would not be.
+                        outcome.encrypted_reasoning += 1;
+                        outcome.markers += insert_session_marker(
+                            conn,
+                            &SessionMarker {
+                                source: SOURCE.into(),
+                                session_id: sid.to_string(),
+                                marker_uid: format!("r{idx}"),
+                                kind: "encrypted_reasoning".into(),
+                                ts_ms: Some(ts),
+                                text: None,
+                                detail_json: None,
+                            },
+                        )?;
+                    }
+                    continue;
+                };
                 let uid = grok_event_uid(group.and_then(|group| group.event_id.as_deref()), idx);
                 insert_session_event(
                     conn,
@@ -6157,12 +6153,12 @@ fn ingest_grok_session(
     // right for an append-only transcript and wrong for a snapshot — after a
     // compaction the directory says the session now ends earlier, or ran no
     // model at all, and the merge would keep reporting yesterday's end time
-    // and yesterday's model forever. So the four fields the snapshot owns are
+    // and yesterday's model forever. So the fields the snapshot owns are
     // assigned from it, empty values included, while every other provider
     // keeps the monotonic merge.
     conn.execute(
         "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
-         last_assistant_text = ?, models_json = ? \
+         last_assistant_text = ?, models_json = ?, first_prompt = ? \
          WHERE source = 'grok' AND session_id = ?",
         params![
             session.first_ts,
@@ -6170,6 +6166,7 @@ fn ingest_grok_session(
             session.last_assistant_text.as_deref(),
             (!session.models.is_empty())
                 .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
+            first_prompt.as_deref(),
             sid,
         ],
     )?;
@@ -8036,6 +8033,60 @@ mod tests {
             vec![5000, 5000],
             "a call and its result join by id, so their turn is known exactly"
         );
+    }
+
+    /// Encrypted-only reasoning still occupies an `agent_thoughts` ordinal.
+    /// Leaving that cursor unmoved handed the next readable thought the
+    /// encrypted record's timestamp and event id.
+    #[test]
+    fn encrypted_reasoning_consumes_its_thought_chunk_ordinal() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"reasoning","encrypted_content":"opaque"}"#,
+                r#"{"type":"reasoning","summary":"visible thought"}"#,
+                r#"{"type":"assistant","content":"done"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                // A new turnStartMs starts a second thought group. Consecutive
+                // chunks in the same turn would merge into one group, which
+                // would not exercise the ordinal join this test is about.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"ev_visible","agentTimestampMs":2000,"turnStartMs":2000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":3000,"turnStartMs":2000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        let encrypted: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_markers WHERE source = 'grok' AND kind = 'encrypted_reasoning'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            encrypted, 1100,
+            "the opaque trace uses its own chunk's time"
+        );
+        assert_eq!(
+            grok_event_time(&conn, "visible thought"),
+            2000,
+            "the next thought must not inherit the encrypted chunk"
+        );
+        let uid: String = conn
+            .query_row(
+                "SELECT event_uid FROM session_events WHERE source = 'grok' AND text = 'visible thought'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uid, "ev:ev_visible");
     }
 
     /// A directory that cannot be read is not an empty directory.
