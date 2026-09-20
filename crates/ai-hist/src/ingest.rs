@@ -3868,7 +3868,7 @@ fn sync_cursor_with_scan_hook(
         // byte alone, and `cursor_generation` is deliberately blind to that so
         // the common case stays on the resume path. Only a file whose scanned
         // prefix or identity has changed is a rewrite.
-        if cursor_transcript_was_replaced(&transcript.path, transcript.generation.as_ref()) {
+        if cursor_transcript_was_replaced(&transcript.path, transcript.generation.as_ref())? {
             let rescan = scan_cursor_transcript(&transcript.path, None).with_context(|| {
                 format!(
                     "re-scan replaced Cursor transcript {}",
@@ -3914,10 +3914,9 @@ fn sync_cursor_with_scan_hook(
         // rebuild above: the run could not identify what it read, which is not
         // a reason to trust it.
         anyhow::ensure!(
-            transcript
-                .generation
-                .as_ref()
-                .is_some_and(|generation| cursor_generation_intact(&transcript.path, generation)),
+            transcript.generation.as_ref().is_some_and(|generation| {
+                cursor_generation_intact(&transcript.path, generation).unwrap_or(false)
+            }),
             "Cursor transcript {} was replaced while it was being indexed",
             transcript.path.display()
         );
@@ -4017,29 +4016,48 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         }
     }
     let opened_cursor = source.cursor.to_value();
-    let checkpoint = if consumed != offset || saved != Some(&opened_cursor) {
+    // The generation comes from the cursor this scan commits, whose prefix
+    // hash is the digest of the bytes the reader *actually read* — not a
+    // re-read of the file afterwards. That distinction is the whole point: a
+    // re-read would hash whatever is on disk at that later moment, so a
+    // replacement landing between the read and the identification would be
+    // recorded as the generation the scan saw and then compare equal at the
+    // index check, laundering the new file in under the old scan's offsets.
+    // Hashing what was read closes that window by construction.
+    let committed = if consumed != offset || saved != Some(&opened_cursor) {
         Some(
             source
                 .committed_cursor(consumed, true)
-                .with_context(|| format!("validate Cursor transcript {}", jsonl.display()))?
-                .to_value(),
+                .with_context(|| format!("validate Cursor transcript {}", jsonl.display()))?,
         )
     } else {
         None
     };
+    let generation = match &committed {
+        Some(cursor) => cursor
+            .prefix_hash
+            .as_ref()
+            .map(|prefix_hash| CursorGeneration {
+                device: cursor.generation.device,
+                inode: cursor.generation.inode,
+                prefix_hash: prefix_hash.clone(),
+                prefix_len: cursor.offset,
+            }),
+        // Nothing advanced and the saved cursor still describes the file, so
+        // there is nothing to index and no offsets to protect.
+        None => cursor_generation(jsonl, consumed)?,
+    };
     Ok(ScannedCursorTranscript {
         timestamp_ms,
         parse_errors,
-        checkpoint,
+        checkpoint: committed.map(|cursor| cursor.to_value()),
         restarted: offset == 0,
         advanced: consumed != offset,
         resumed_from: offset,
         consumed_through: consumed,
-        // What the scan validated. The index phase re-checks this, because a
-        // replacement between the two would otherwise be invisible: the
-        // reader's own detection only covers a replacement while it is still
-        // reading, and a replacement can also land after it has finished.
-        generation: cursor_generation(jsonl, consumed),
+        // Re-checked by the index phase, because a replacement can still land
+        // after the scan has finished.
+        generation,
     })
 }
 
@@ -4065,19 +4083,57 @@ pub(crate) struct CursorGeneration {
 }
 
 /// Identify the generation of `path`, hashing the first `through` bytes.
-pub(crate) fn cursor_generation(path: &Path, through: u64) -> Option<CursorGeneration> {
-    let metadata = fs::metadata(path).ok()?;
+/// `Ok(None)` means one thing only: the file is shorter than the prefix the
+/// scan read, which is the truncate half of a rewrite and therefore a
+/// different generation. Every other failure — a stat that fails, a read that
+/// fails — is an `Err`, because folding those into `None` would launder an
+/// I/O or permission fault into "this was replaced" and hand back a confident
+/// rebuild for a file nobody could read. A caller that cannot read a file
+/// should say so, with the path and the reason.
+pub(crate) fn cursor_generation(path: &Path, through: u64) -> Result<Option<CursorGeneration>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("identify Cursor transcript {}", path.display()))?;
     let (device, inode) = metadata_identity(&metadata);
     if metadata.len() < through {
-        return None;
+        return Ok(None);
     }
-    let (prefix_hash, _) = hash_file_prefix(path, through).ok()?;
-    Some(CursorGeneration {
+    let Some(prefix_hash) = hash_prefix_bytes(path, through)
+        .with_context(|| format!("identify Cursor transcript {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CursorGeneration {
         device,
         inode,
         prefix_hash,
         prefix_len: through,
-    })
+    }))
+}
+
+/// SHA-256 of the first `through` bytes, or `None` if the file is shorter.
+///
+/// Deliberately *not* [`hash_file_prefix`], which also asserts the prefix ends
+/// on a newline. That assertion belongs to cursor validation, not to identity:
+/// a rewrite whose bytes happen not to align to the old line boundary is a
+/// different generation, not a read failure, and surfacing it as an error
+/// would turn an ordinary rewrite into a failed sync. Only a real I/O failure
+/// is an error here.
+fn hash_prefix_bytes(path: &Path, through: u64) -> Result<Option<String>> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = through;
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            // Shorter than the prefix the scan read: a different generation.
+            return Ok(None);
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(Some(finish_prefix_hash(&hasher)))
 }
 
 /// Is the file still the generation `generation` describes?
@@ -4085,8 +4141,9 @@ pub(crate) fn cursor_generation(path: &Path, through: u64) -> Option<CursorGener
 /// A file that cannot be stated, has shrunk below what the scan read, or whose
 /// scanned prefix no longer hashes the same is a different generation. An
 /// append is not.
-pub(crate) fn cursor_generation_intact(path: &Path, generation: &CursorGeneration) -> bool {
-    cursor_generation(path, generation.prefix_len).is_some_and(|current| &current == generation)
+pub(crate) fn cursor_generation_intact(path: &Path, generation: &CursorGeneration) -> Result<bool> {
+    Ok(cursor_generation(path, generation.prefix_len)?
+        .is_some_and(|current| &current == generation))
 }
 
 /// Must this transcript be rebuilt rather than resumed?
@@ -4106,13 +4163,13 @@ pub(crate) fn cursor_generation_intact(path: &Path, generation: &CursorGeneratio
 pub(crate) fn cursor_transcript_was_replaced(
     path: &Path,
     generation: Option<&CursorGeneration>,
-) -> bool {
+) -> Result<bool> {
     if !path.exists() {
-        return false;
+        return Ok(false);
     }
     match generation {
-        Some(generation) => !cursor_generation_intact(path, generation),
-        None => true,
+        Some(generation) => Ok(!cursor_generation_intact(path, generation)?),
+        None => Ok(true),
     }
 }
 
@@ -7293,6 +7350,98 @@ mod tests {
         );
     }
 
+    /// Group N. A transcript that cannot be *read* is an error, not a rebuild.
+    ///
+    /// `cursor_generation` folded every failure into `None`, and `None` means
+    /// "different generation" — so a permission or I/O failure was laundered
+    /// into a silent full rebuild, repeated on every sync, with nothing ever
+    /// reported. That is the same confident-default shape as the read failure
+    /// the earlier `a_failed_cursor_read_rolls_back_the_delete_and_the_
+    /// checkpoint` test exists to prevent, arriving by a different door.
+    ///
+    /// The fixture replaces the transcript with a *directory*: `metadata`
+    /// still succeeds, so this reaches the read rather than the stat, and it
+    /// needs no non-root permission trick.
+    ///
+    /// Positive control, and worth stating precisely because my first
+    /// attempt at this test was worthless. With `cursor_generation` returning
+    /// `Option`, the sync *did* already fail here — but by a different route:
+    /// the unreadable file was classified as a replacement, the rebuild was
+    /// attempted, and the rescan then failed. So "the sync returns Err" is
+    /// true both before and after and proves nothing. What changed is the
+    /// claim the failure makes. Unfixed, the chain read `re-scan replaced
+    /// Cursor transcript …: read Cursor transcript …: Is a directory` —
+    /// asserting a replacement it never established, after clearing evidence
+    /// for it. Fixed, it reads `identify Cursor transcript …: Is a directory`
+    /// and never reaches the rebuild. The third assertion below is the one
+    /// that is red.
+    #[test]
+    fn an_unreadable_cursor_generation_fails_the_sync_instead_of_rebuilding() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>seed</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-unreadable", body);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let committed = state.clone();
+
+        // Give the next sync something to resume for.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>second</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-zunread",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"unrelated"}]}}"#,
+                "\n"
+            ),
+        );
+        let mut next = state.clone();
+        let error = super::sync_cursor_with_scan_hook(&conn, &mut next, &root, &mut |path| {
+            if path == later {
+                fs::remove_file(&transcript).unwrap();
+                fs::create_dir(&transcript).unwrap();
+            }
+        })
+        .expect_err("an unreadable transcript must fail the sync, not silently rebuild");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("s-unreadable"),
+            "the failure must name the transcript: {rendered}"
+        );
+        assert!(
+            rendered.contains("Is a directory"),
+            "the failure must name the reason: {rendered}"
+        );
+        assert!(
+            !rendered.contains("replaced"),
+            "an unreadable file must not be reported as a replacement it never \
+             established: {rendered}"
+        );
+
+        // The transaction rolled back, so the committed evidence and the
+        // caller's checkpoint are untouched and the next sync retries.
+        assert_eq!(cursor_row_count(&conn, "history", "s-unreadable"), 1);
+        assert_eq!(next, committed);
+    }
+
     /// Group M, at the level the defect actually lives. The window Bugbot
     /// described — a rewrite in flight as the *scan itself* ends, so the scan
     /// cannot identify what it read — is not reachable through `sync_cursor`,
@@ -7313,32 +7462,28 @@ mod tests {
         );
         let path = dir.path().join("t.jsonl");
         fs::write(&path, body).unwrap();
-        let generation = super::cursor_generation(&path, body.len() as u64).unwrap();
+        let generation = super::cursor_generation(&path, body.len() as u64)
+            .unwrap()
+            .unwrap();
+        let replaced = |generation: Option<&super::CursorGeneration>| {
+            super::cursor_transcript_was_replaced(&path, generation).unwrap()
+        };
 
         // The scan identified what it read and nothing moved: resume.
-        assert!(!super::cursor_transcript_was_replaced(
-            &path,
-            Some(&generation)
-        ));
+        assert!(!replaced(Some(&generation)));
         // The scan could not identify what it read: rebuild.
         assert!(
-            super::cursor_transcript_was_replaced(&path, None),
+            replaced(None),
             "an unidentifiable generation must be treated as a replacement"
         );
         // Truncated below the scanned prefix: rebuild.
         fs::write(&path, "{}\n").unwrap();
-        assert!(super::cursor_transcript_was_replaced(
-            &path,
-            Some(&generation)
-        ));
+        assert!(replaced(Some(&generation)));
         // Gone is not a replacement — there is nothing to re-scan, and the
         // read path owns that failure.
         fs::remove_file(&path).unwrap();
-        assert!(!super::cursor_transcript_was_replaced(
-            &path,
-            Some(&generation)
-        ));
-        assert!(!super::cursor_transcript_was_replaced(&path, None));
+        assert!(!replaced(Some(&generation)));
+        assert!(!replaced(None));
     }
 
     /// Group M. A generation that cannot be identified is not "unchanged".
@@ -7680,8 +7825,11 @@ mod tests {
         );
         let path = dir.path().join("t.jsonl");
         fs::write(&path, body).unwrap();
-        let generation = super::cursor_generation(&path, body.len() as u64).unwrap();
-        assert!(super::cursor_generation_intact(&path, &generation));
+        let generation = super::cursor_generation(&path, body.len() as u64)
+            .unwrap()
+            .unwrap();
+        let intact = |path: &Path| super::cursor_generation_intact(path, &generation).unwrap();
+        assert!(intact(&path));
 
         // Appending leaves every scanned byte untouched.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -7694,23 +7842,20 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        assert!(
-            super::cursor_generation_intact(&path, &generation),
-            "an append must leave the generation intact"
-        );
+        assert!(intact(&path), "an append must leave the generation intact");
 
         // A rewrite that keeps the length but changes a scanned byte does not.
         let rewritten = body.replace("one", "ONE");
         assert_eq!(rewritten.len(), body.len());
         fs::write(&path, &rewritten).unwrap();
         assert!(
-            !super::cursor_generation_intact(&path, &generation),
+            !intact(&path),
             "an in-place rewrite must not pass as the same generation"
         );
 
         // Nor does a truncation below what the scan read.
         fs::write(&path, "{}\n").unwrap();
-        assert!(!super::cursor_generation_intact(&path, &generation));
+        assert!(!intact(&path));
 
         // Nor does an unlink-and-recreate carrying different content. The
         // inode may or may not be reused — that is the filesystem's choice,
@@ -7725,7 +7870,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(!super::cursor_generation_intact(&path, &generation));
+        assert!(!intact(&path));
     }
 
     /// Group J's other half: an ordinary append, with no replacement, must

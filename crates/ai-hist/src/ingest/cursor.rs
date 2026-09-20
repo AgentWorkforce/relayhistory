@@ -191,8 +191,14 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
         let raw = lines[index];
         let line = raw.trim();
         let mut header: Option<String> = None;
+        // Matched against the *raw* line, not the trimmed one. A unified-diff
+        // context line is its content prefixed with a space, so
+        // ` *** Update File: example.md` is a quotation of a marker inside a
+        // hunk, not a marker. Trimming first turned that into a header,
+        // opening a phantom file and carrying the rest of the patch away from
+        // the file it belongs to. Only the extracted path is trimmed.
         for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-            if let Some(rest) = line.strip_prefix(marker) {
+            if let Some(rest) = raw.strip_prefix(marker) {
                 let rest = rest.trim();
                 if !rest.is_empty() {
                     header = Some(rest.to_string());
@@ -410,13 +416,23 @@ fn parse_clock(clock: &str) -> Option<(u32, u32, u32)> {
     if fields.next().is_some() {
         return None;
     }
+    // A meridiem constrains the hour to 1..=12. `0 PM` and `15 AM` are not
+    // clocks, and turning them into plausible instants would suppress the
+    // mtime fallback and the `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic in the
+    // same way a malformed seconds field did.
     match meridiem.as_deref() {
         Some("PM") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
             if hour < 12 {
                 hour += 12;
             }
         }
         Some("AM") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
             if hour == 12 {
                 hour = 0;
             }
@@ -508,6 +524,35 @@ mod tests {
     /// `fields.next().and_then(parse).unwrap_or(0)` this failed at
     /// `a malformed seconds field must not parse as second 0` — the string
     /// parsed to a real instant.
+    /// A meridiem constrains the hour to 1..=12. `0 PM` and `15 AM` are not
+    /// clocks, and accepting them produced a plausible instant — which, as
+    /// with the malformed-seconds case, suppresses the mtime fallback and the
+    /// `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic.
+    ///
+    /// Reported by Devin. Positive control: without the range check this
+    /// failed at `an hour outside 1..=12 is not a meridiem clock` — both
+    /// strings parsed to real instants.
+    #[test]
+    fn an_impossible_meridiem_hour_rejects_the_timestamp() {
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 0:37 PM (UTC-4)"),
+            None,
+            "an hour outside 1..=12 is not a meridiem clock"
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 15:37 AM (UTC-4)"),
+            None,
+            "an hour outside 1..=12 is not a meridiem clock"
+        );
+        // Controls: the meridiem boundaries and the 24-hour path.
+        assert_eq!(parse_clock("12:00 AM"), Some((0, 0, 0)));
+        assert_eq!(parse_clock("12:00 PM"), Some((12, 0, 0)));
+        assert_eq!(parse_clock("3:37 PM"), Some((15, 37, 0)));
+        // Without a meridiem the 24-hour reading still stands.
+        assert_eq!(parse_clock("15:37"), Some((15, 37, 0)));
+        assert_eq!(parse_clock("0:05"), Some((0, 5, 0)));
+    }
+
     #[test]
     fn a_malformed_seconds_field_rejects_the_timestamp() {
         assert_eq!(
@@ -630,6 +675,40 @@ mod tests {
     /// this failed with `left: ["one.rs", "old"], right: ["one.rs"]` — the
     /// deleted line opened a phantom file and split the patch, so the real
     /// file's edit lost everything after it.
+    /// An envelope marker is only a marker at the start of its line. A
+    /// unified-diff *context* line is the same text with a leading space —
+    /// ` *** Update File: example.md` — and trimming before matching turned
+    /// that into a header, opening a phantom edit and moving the rest of the
+    /// patch away from the file it belongs to.
+    ///
+    /// Reported by Devin. Positive control: with the marker matched against
+    /// the trimmed line this failed with
+    /// `left: ["notes.md", "example.md"], right: ["notes.md"]`.
+    #[test]
+    fn a_context_line_quoting_an_envelope_marker_does_not_open_a_file() {
+        // Written without line continuations: `\\<newline>` in a Rust string
+        // strips the next line's leading whitespace, which would eat the very
+        // space that makes this a context line.
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: notes.md\n",
+            "@@\n",
+            "-before\n",
+            " *** Update File: example.md\n",
+            "+after\n",
+            "*** End Patch"
+        );
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        // The quoted marker stays with the real file, and so does everything
+        // after it.
+        assert!(files[0].patch.contains("*** Update File: example.md"));
+        assert!(files[0].patch.contains("+after"));
+    }
+
     #[test]
     fn hunk_content_that_looks_like_a_file_header_does_not_open_a_file() {
         let patch = "--- a/one.rs\n\
