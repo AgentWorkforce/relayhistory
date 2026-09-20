@@ -644,7 +644,7 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
         &claim.lease,
         DeliveryFailure::Transient,
         None,
-        system_clock(),
+        &system_clock,
     )
     .expect("an unclaimed batch is still ours to fail");
     assert_eq!(status.failure.as_deref(), Some("transient"));
@@ -679,7 +679,7 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
             &claim.lease,
             DeliveryFailure::Transient,
             None,
-            system_clock(),
+            &system_clock,
         )
         .is_err(),
         "a fenced lease must not be able to move another worker's state"
@@ -799,6 +799,158 @@ fn a_validation_blocked_past_the_deadline_is_refused_not_dated_from_before_it() 
     // to the lease.
     validate_dispatch(&validator, &claim.lease, &|| claimed_at)
         .expect("the lease is refused only by a clock read after the wait");
+}
+
+/// Recording an outcome needs only ownership, so an expired but unclaimed
+/// worker may still record its own failure — which is exactly why the clock
+/// has to be read inside the lock. `apply_failure` schedules the next attempt
+/// from `now_ms`, and a value sampled before a wait longer than the backoff
+/// commits a retry that is already overdue: the batch is claimable the moment
+/// the transaction commits, and backoff is defeated by the one condition it
+/// exists for.
+#[test]
+fn a_failure_recorded_after_a_lock_wait_is_scheduled_from_after_it() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let lease_ms = 100;
+    let hold = Duration::from_millis(lease_ms as u64 * 10);
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, lease_ms);
+
+    // Sampled before the lock is even taken, so the hold is entirely after it.
+    let before = system_clock();
+    let path = fixture.path();
+    let (locked, lock_taken) = std::sync::mpsc::channel();
+    let holding = std::thread::spawn(move || {
+        let blocker = open_db(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(hold);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    lock_taken.recv().unwrap();
+
+    // Asked before the wait, committed after it. A clock read inside the
+    // lock dates the retry from after the hold.
+    let recorder = open_db(&fixture.path()).unwrap();
+    let status = record_failure(
+        &recorder,
+        &claim.lease,
+        DeliveryFailure::Transient,
+        None,
+        &system_clock,
+    )
+    .expect("an unclaimed batch is still ours to fail");
+    holding.join().unwrap();
+    assert_eq!(status.failure.as_deref(), Some("transient"));
+    let (next_attempt_ms, attempts): (i64, i64) = recorder
+        .query_row(
+            "SELECT next_attempt_ms, attempts FROM delivery_jobs WHERE id=?",
+            [&job.job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // Backoff doubles per attempt (the claim counts as one) and jitter is at
+    // most a fifth of it. A clock sampled before the wait can schedule no
+    // later than `before + backoff * 6 / 5`; one read inside the lock
+    // schedules no earlier than `before + hold + backoff`, and the hold is
+    // longer than the jitter can be.
+    let backoff = 1_000 << attempts;
+    let earliest = before + hold.as_millis() as i64 + backoff;
+    assert!(
+        next_attempt_ms >= earliest,
+        "retry scheduled from before the lock wait: next {next_attempt_ms} < {earliest}"
+    );
+
+    // Positive control: the retry is dated from the clock the call was given
+    // and nothing else. With a deterministic clock and no wait, the same
+    // path schedules exactly one backoff (plus bounded jitter) after it.
+    let other = create_job(&fixture.conn, &config("two"), 0).unwrap();
+    let claim = prepare_and_claim(&fixture.conn, &other.job_id, lease_ms);
+    record_failure(
+        &fixture.conn,
+        &claim.lease,
+        DeliveryFailure::Transient,
+        None,
+        &|| 5_000,
+    )
+    .unwrap();
+    let (scheduled, attempts): (i64, i64) = fixture
+        .conn
+        .query_row(
+            "SELECT next_attempt_ms, attempts FROM delivery_jobs WHERE id=?",
+            [&other.job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // Backoff doubles per attempt (the claim counts as one) and jitter is at
+    // most a fifth of it, so the window below is dated from the given clock
+    // and nothing else.
+    let backoff = 1_000 << attempts;
+    assert!(
+        (5_000 + backoff..=5_000 + backoff + backoff / 5).contains(&scheduled),
+        "retry not dated from the given clock: {scheduled} (attempts {attempts})"
+    );
+}
+
+/// Partial and unsupported acceptance schedule a retry through the same
+/// path, so an acknowledgment reads its clock inside the lock for the same
+/// reason a failure does.
+#[test]
+fn a_partial_acknowledgment_after_a_lock_wait_is_scheduled_from_after_it() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let lease_ms = 100;
+    let hold = Duration::from_millis(lease_ms as u64 * 10);
+    let claim = prepare_and_claim(&fixture.conn, &job.job_id, lease_ms);
+    let claimed_at = claim.lease.expires_at_ms - lease_ms;
+    store_prepared_payload(
+        &fixture.conn,
+        &claim.lease,
+        &claim.batch.mapping_version,
+        "application/json",
+        &serde_json::to_string(&claim.batch).unwrap(),
+        &|| claimed_at,
+    )
+    .expect("a live lease persists its payload");
+    let mut partial = ack(&claim.batch);
+    partial.accepted_revision_ids.pop();
+
+    // Sampled before the lock is even taken, so the hold is entirely after it.
+    let before = system_clock();
+    let path = fixture.path();
+    let (locked, lock_taken) = std::sync::mpsc::channel();
+    let holding = std::thread::spawn(move || {
+        let blocker = open_db(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(hold);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    lock_taken.recv().unwrap();
+
+    let acker = open_db(&fixture.path()).unwrap();
+    let status = acknowledge(&acker, &claim.lease, &partial, &system_clock)
+        .expect("a partial acknowledgment is recorded as a transient failure");
+    holding.join().unwrap();
+    assert_eq!(status.failure.as_deref(), Some("transient"));
+    let (next_attempt_ms, attempts): (i64, i64) = acker
+        .query_row(
+            "SELECT next_attempt_ms, attempts FROM delivery_jobs WHERE id=?",
+            [&job.job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // Backoff doubles per attempt (the claim counts as one) and jitter is at
+    // most a fifth of it. A clock sampled before the wait can schedule no
+    // later than `before + backoff * 6 / 5`; one read inside the lock
+    // schedules no earlier than `before + hold + backoff`, and the hold is
+    // longer than the jitter can be.
+    let backoff = 1_000 << attempts;
+    let earliest = before + hold.as_millis() as i64 + backoff;
+    assert!(
+        next_attempt_ms >= earliest,
+        "retry scheduled from before the lock wait: next {next_attempt_ms} < {earliest}"
+    );
 }
 
 #[test]
