@@ -947,8 +947,11 @@ fn a_partial_acknowledgment_after_a_lock_wait_is_scheduled_from_after_it() {
 fn a_claim_blocked_past_its_lease_is_dated_from_after_the_wait() {
     let fixture = fixture();
     let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
-    let lease_ms = 100;
-    let hold = Duration::from_millis(lease_ms as u64 * 10);
+    // The lease is long and the hold short, on purpose: the deadline must be
+    // dated after the hold whatever the lease length, and a long lease keeps
+    // the liveness check below from expiring under scheduling delay.
+    let lease_ms = 5_000;
+    let hold = Duration::from_millis(1_000);
     for _ in 0..100 {
         if prepare_batch(&fixture.conn, &job.job_id, system_clock())
             .unwrap()
