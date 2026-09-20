@@ -82,7 +82,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 3;
+pub const SHALLOW_SCANNER_VERSION: u32 = 4;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -90,6 +90,15 @@ pub const SHALLOW_SCANNER_VERSION: u32 = 3;
 /// is this version, and reusing 2 would leave those catalogs permanently missing
 /// the sessions. Kept as a compile-time guard so the pair cannot drift apart.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
+
+/// Version 3 shipped the prompt-only Cursor reader: it recorded a first
+/// prompt and an mtime, and nothing else. Version 4 extracts the injected turn
+/// times, the models and the last assistant reply, and a Cursor transcript's
+/// bytes do not change when the release does — so without this bump every row
+/// an earlier install wrote would be served from cache with those fields null
+/// forever. Kept as a compile-time guard for the same reason as the pair
+/// above.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

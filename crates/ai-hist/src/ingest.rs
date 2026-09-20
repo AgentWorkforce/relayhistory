@@ -11264,4 +11264,102 @@ mod tests {
             "a guessed stamp must not become the session's recency"
         );
     }
+
+    /// Group Q. Two `sync_cursor` runs cannot interleave a rebuild, because
+    /// they cannot both run.
+    ///
+    /// The concern is real in shape: a rebuild clears a session's evidence and
+    /// re-indexes it, and checkpoint merging keeps the *newer* offset, so an
+    /// older scan that cleared evidence a newer scan had already committed
+    /// would leave those records skipped permanently. What makes it
+    /// unreachable is that `sync_cursor` is private and has exactly one
+    /// non-test caller, `sync_basic`, which in turn has exactly two:
+    /// `sync_exclusive_with_home` and `prepare_local_sync_snapshot`. Both
+    /// acquire `SyncRunLock` — an exclusive advisory lock on
+    /// `<canonical-db>.sync.lock` — *before* opening the database, and hold it
+    /// for the whole call. The second sync does not queue behind the first and
+    /// proceed later against stale state; `try_lock_exclusive` returns
+    /// `WouldBlock`, and the run reports "another sync is already running" and
+    /// does nothing at all.
+    ///
+    /// This asserts the consequence that matters — a contended sync performs
+    /// no rebuild — rather than the lock mechanics, which
+    /// `sync_lock_canonicalizes_aliases_and_blocks_every_sync_entry_point_before_open`
+    /// already covers.
+    #[test]
+    fn a_contended_sync_cannot_rebuild_a_cursor_session() {
+        let home = tempfile::tempdir().unwrap();
+        let db_path = home.path().join("history.db");
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"original.rs"}}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(home.path(), "s-contended", original);
+
+        assert!(sync_local_at_with_home(&db_path, home.path()).unwrap());
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-contended"), 1);
+        drop(conn);
+
+        // Rewrite the transcript so the next sync *would* rebuild: a different
+        // prefix is a new generation, which clears the session's evidence.
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:01 PM (UTC-4)</timestamp><user_query>rewritten</user_query>"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        // With the run lock held, that rebuild must not happen.
+        let owner = try_acquire_sync_lock(&db_path).unwrap().unwrap();
+        assert!(
+            !sync_local_at_with_home(&db_path, home.path()).unwrap(),
+            "a contended sync must report that it was skipped"
+        );
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(
+            cursor_row_count(&conn, "tool_calls", "s-contended"),
+            1,
+            "a contended sync must not clear evidence it did not re-index"
+        );
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-contended' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["first".to_string()]);
+        drop(conn);
+
+        // Control: the same sync, uncontended, does perform the rebuild — so
+        // the assertion above is about the lock and not about a transcript
+        // that was never going to be rebuilt.
+        drop(owner);
+        assert!(sync_local_at_with_home(&db_path, home.path()).unwrap());
+        let conn = open_db(&db_path).unwrap();
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-contended' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["rewritten".to_string()]);
+        let edits = crate::session_file_edits(&conn, "s-contended", Some("cursor")).unwrap();
+        assert!(
+            !edits.iter().any(|edit| edit.file_path == "original.rs"),
+            "the uncontended rebuild must clear the replaced generation"
+        );
+    }
 }

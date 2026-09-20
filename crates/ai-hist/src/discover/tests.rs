@@ -889,6 +889,105 @@ fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
     assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
 }
 
+/// A catalog row written by the scanner that shipped *before* this change
+/// carries `v3:` and the fields that reader never extracted: no
+/// `first_activity_ms`, no `models`, no `last_assistant_text`. The stamp is
+/// compared before the provider reader is invoked, so if the scanner version
+/// does not move, those rows are served from cache and stay null forever —
+/// the transcript's bytes never change, so nothing else can ever invalidate
+/// them.
+///
+/// Positive control: with `SHALLOW_SCANNER_VERSION` left at 3 this failed at
+/// `a row from the previous scanner must be read again: left: None, right:
+/// Some(1789587420000)` — the upgraded install kept serving the prompt-only
+/// row.
+#[test]
+fn a_cursor_row_from_the_previous_scanner_is_read_again_after_the_upgrade() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-upgrade",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(
+        found.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
+
+    // Rewrite the catalog into what the previous scanner left behind: the same
+    // bytes, its own version prefix, and none of the fields this one learned
+    // to extract. The stamp lives in three places and the cache check reads
+    // the observation, so all three move together.
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'cursor' \
+             AND session_id = 'cursor-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1
+        .to_string();
+    let previous = format!("v3:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, first_activity_ms = NULL, \
+         last_assistant_text = NULL WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = upgraded.row("cursor-upgrade");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_587_420_000),
+        "a row from the previous scanner must be read again"
+    );
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(
+        upgraded.summary.counters.shallow_reads, 1,
+        "the re-read is the point: the row must not have come from cache"
+    );
+
+    // Control: the bump costs exactly one re-read. The pass after it is
+    // cached again, so this is a one-time migration and not a permanent
+    // rescan of every unchanged transcript.
+    let settled = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+    assert_eq!(
+        settled.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
+}
+
 #[test]
 fn cursor_rescan_keeps_one_row_per_session() {
     let conn = catalog();
