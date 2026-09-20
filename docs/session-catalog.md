@@ -34,13 +34,67 @@ const sessions = await listSessionCatalog({ limit: 100 });
 await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
 ```
 
-Hydration requires the catalog row, never invokes discovery or global sync,
-and upgrades `discoveryState` to `full` only when the connector returned all
-available evidence. Here `full` means indexed through the returned source
-stamp, not that a live coding session has ended. Partial remote connectors
-remain `shallow` and report their capability explicitly. File providers
-validate the saved locator against the expected provider root; OpenCode uses
-session-keyed queries against its live read-only database.
+Hydration requires the catalog row and never invokes discovery or global sync.
+It upgrades `discoveryState` to `full` when the acquisition it was asked for
+was indexed through its recorded source stamp. `full` is therefore a statement
+about discovery being complete for that request, not that a live coding
+session has ended, and not that every evidence kind exists: kinds the request
+never acquired -- including ones declined by an option such as
+`includeRelated: false` -- are described by `coverage` and `capability` below,
+which is where a consumer looks to find out what was left out. A remote
+connector that could not return its evidence at all stays `shallow` and reports
+its capability explicitly. File providers validate the saved locator against
+the expected provider root; OpenCode uses session-keyed queries against its
+live read-only database.
+
+`capability` and `coverage` answer a different question from `discoveryState`,
+and hydration contract 3 made the local path compute both rather than assert
+them. `coverage` lists the evidence kinds the selected provider's parser can
+produce; `capability` is `full` only when that list contains every kind in
+`FULL_SESSION_KINDS` (`history`, `session_event`, `tool_call`, `file_edit`,
+`relationship`), and `partial` otherwise, with a `HYDRATION_PARTIAL_COVERAGE`
+diagnostic naming the missing ones. A zero count for a *covered* kind means
+this session has none of it; a kind absent from `coverage` means nothing
+looked. So a completed Cursor hydration reports:
+
+```json
+{
+  "capability": "partial",
+  "coverage": ["history"],
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor evidence covers history; this hydration produces no session_event, tool_call, file_edit, relationship" }]
+}
+```
+
+Coverage is narrowed by the request as well as by the provider.
+`includeRelated: false` asks for the selected thread alone, and hydration
+honours that literally -- Claude subagent sidecars are not walked and Codex
+child rollouts are not read -- so `relationship` drops out of `coverage` and a
+Claude or Codex session hydrated that way reports `partial`. That is the
+difference between "this session has no delegation" and "nothing looked"; the
+diagnostic says which by naming `include_related`.
+
+Codex child acquisition reads the selected session's date directory and the
+following date in both the active and archived rollout stores, which finds
+children spawned across midnight or moved between stores without making an
+old session scan years of newer rollouts. If later date directories exist in
+either store, the
+bounded search may miss delayed descendants; the result omits `relationship`
+from `coverage`, reports `partial`, and includes
+`HYDRATION_BOUNDED_RELATIONSHIPS`. A full sync can index relationships across
+the archive.
+
+A source plugin declares its own `coverage` the same way, and the same
+distinction applies to it: `covered_kinds` names what the acquisition
+*examined*, so a complete export of a session that has no file edits still
+covers `file_edit` and reports `full`. A connector also receives
+`includeRelated` and must omit `relationship` from both its coverage and its
+records when it is `false` -- otherwise a `scope: 'all'` merge would union the
+kind back in and report `full` despite the opt-out.
+
+`discoveryState` stays `full` for that row: it records that the session was
+indexed through its recorded source stamp, which is what the unchanged
+short-circuit reads. A parser upgrade still forces a re-parse, because the
+stored `parser_version` is checked independently of `discoveryState`.
 
 Codex child rollouts, and Claude subagent transcripts whose records carry a
 per-child `agentId`, retain their provider-native IDs and are linked through
@@ -412,6 +466,145 @@ which this table must stay consistent with.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+Tool-result fidelity is a separate capability. The columns live on the
+`session_events` rows whose `kind` is `tool_result`, and every one of them is
+null when the provider does not record it — never a stand-in zero or a guessed
+status, because a fabricated measurement reads exactly like a real one:
+
+| Source | `payload_bytes` / `payload_hash` | `payload_truncated` | `call_index` / `event_index` | `result_status` | `event_source` | `error_signal` | `subagent_session_id` / `agent_id` |
+|---|---|---|---|---|---|---|---|
+| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
+| **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
+| **cursor**, **grok**, **opencode**, **relay** | – | – | – | – | – | – | – |
+
+`payload_bytes` is the raw UTF-8 length of what the provider handed back —
+a string payload as-is, any other JSON payload stable-stringified with sorted
+keys — measured before the `text` column is materialized, and `payload_hash`
+is the first 16 hex characters of that payload's sha256. Both match
+relayburn's `stable_stringify` / `content_hash`, so a value measured on either
+side compares equal rather than merely looking alike. `payload_truncated`
+records that the *harness* had already cut the output, which is the difference
+between "this tool returned 8 KB" and "this tool returned far more and 8 KB is
+a floor".
+
+Codex reports how a call ended out of band (`exec_command_end`,
+`patch_apply_end`, `mcp_tool_call_end`), so its result rows are written with
+`result_status = 'unknown'` and settled when the turn closes at
+`task_complete`. End of file is **not** a turn boundary: a live rollout's last
+turn can still receive the `exec_command_end` that fails one of its calls after
+the bytes a sync read, so a partial read records the failures it saw and leaves
+anything else `unknown`. Only `task_complete` can call a result a success. The
+remaining providers land with their parity issues; they share the
+`ToolResultFacts::from_payload` helper, so the columns will mean the same thing
+for them.
+
+A result with nothing displayable in it — a silent command's empty string, a
+structured payload carrying no text — is still recorded. `payload_bytes = 0` is
+a measurement; dropping the row would lose the call's linkage and its place in
+the ordering too.
+
+Because the columns are nullable and the schema migration marks itself
+complete, an upgraded install would otherwise keep skipping unchanged
+transcripts on the sync fast path and leave every historical tool result null.
+Plain `sync` therefore runs one backfill pass per provider, recorded in the
+sync state, during which a transcript whose indexed tool results have no
+`event_index` is re-read. Selecting files that way is narrower than
+invalidating the whole stamp map, which would re-read the entire archive.
+
+The generation is recorded only after a pass that both completed and covered
+everything it discovered: every rollout root the database has indexed from was
+reachable, and every transcript it found was read. A provider read that fails
+is propagated rather than defaulted to an empty string, because an I/O or
+UTF-8 failure reduced to `""` is indistinguishable from a file that genuinely
+holds nothing. The walk indexes the rest of the tree and then reports the
+failure, so the sync is classified as failed for that source rather than
+reporting a complete cache it does not have.
+
+Only a file that the walk would otherwise *skip* next time holds the pass
+open — one whose recorded stamp still matches, which is the case where nothing
+about the file will change to reopen it. A file with no stamp, or a stamp that
+has moved, is revisited by the walk itself, so keeping the generation pending
+would buy it nothing while keeping the per-session probe live, which re-reads
+any session carrying a contributed null row on every sync.
+
+The pass is bounded by a recorded generation rather than by "some row is still
+null", and that distinction matters: `session_events` is keyed by
+`(source, session_id)`, local and remote observations of one session share
+that identity, and an adapter may contribute a tool result with no fidelity at
+all. Re-reading the local transcript never populates a row that came from
+somewhere else, so a null-row condition could stay true forever and re-read an
+unchanged file on every sync without ever repairing it.
+Evidence coverage is the hydration-side version of that matrix: what each
+local parser writes, and therefore the `coverage` a completed local hydration
+reports. It is declared per adapter (`ShallowSessionProvider::evidence_kinds`),
+so a provider that grows a parser flips one entry and the reported capability
+follows.
+
+| Source | `history` | `session_event` | `tool_call` | `file_edit` | `relationship` | `capability` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
+| **cursor** | ✓ | – | – | – | – | `partial` |
+| **grok** | ✓ | – | – | – | – | `partial` |
+| **opencode** | ✓ | – | – | – | – | `partial` |
+| **relay** | – | – | – | – | – | targeted hydration unsupported |
+
+### Per-message raw facts on `session_events`
+
+The envelope facts a harness records per message or per API request, kept
+verbatim on every event so a consumer can group, price and time turns without
+re-reading the transcript. `stop_reason` is the provider's own wire string,
+never a normalized enum, and its *absence* is the signal that a turn is still
+in flight.
+
+| Source | `request_id` | `stop_reason` | `agent_version` | `is_sidechain` | `is_meta` | `turn_id` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
+| **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
+| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+
+A null is "the provider did not record it", which is not the same as `false`
+or as an empty string: a Claude record with no `isSidechain` key stores null,
+while `"isSidechain": false` stores `0`.
+
+Because of that, none of the six can answer "was this row indexed before the
+facts existed?" -- a real record legitimately has no `request_id`, no
+`stop_reason` and no `turn_id`, and Codex records none of the other three.
+`raw_facts_version` answers it instead: the local parser stamps it on every
+event it writes, so a full sync can pick out the transcripts whose rows predate
+the facts and re-read them. It is bookkeeping rather than a provider fact and is
+not part of the session-event evidence spec, so a row an installed source
+adapter contributed is permanently unstamped.
+
+That is why the column selects files but does not bound the work. Local and
+remote observations of one session share `(source, session_id)`, so a contributed
+row would otherwise hold an unchanged local transcript off the stamp fast path on
+every sync while never being stamped itself. What ends the work is a per-provider
+generation recorded in the sync state (`claude_raw_message_facts`,
+`codex_raw_message_facts`), written only after a walk completes **and only when
+every archive root the state already names was present on that run**, so the
+backfill runs exactly once, an interrupted sync retries it, and a walk that
+could not read the files it was meant to repair does not retire it. That check
+is per file, not per root: a mount point exists whether or not anything is
+mounted on it, and a partially mounted archive returns some of the paths the
+state names and not others. A path this run did not see withholds the
+generation **and** loses its stamp, so if it comes back it is read afresh rather
+than skipped on a stamp nothing watched. Dropping the stamp is also what bounds
+the deleted-file case: it costs one further sync, after which the path is no
+longer one the state knows about. Removing the entry from the in-memory map is
+not enough to achieve that — the checkpoint merge folds a run's keys over
+what is on disk and has no way to express a delete, so a dropped path would
+come back on every write. The run carries the removals as an instruction the
+merge applies and then discards. A transcript that is enumerated but cannot be
+read counts as unobserved too, not as an empty one — the parsers read with
+`unwrap_or_default()`, so without that check a file that became unreadable
+between the walk and the read would be stamped as seen. A root the state never knew about — an install
+with no `.codex/archived_sessions` — is not a missing archive and does not hold
+the pass open. Claude reaches a subagent
+sidecar's rows through `session_relationships.evidence_locator`, because a
+sidecar never gets a `sessions` row of its own.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
@@ -430,7 +623,8 @@ unlinked evidence and the child id is left null — it is never taken from the
 
 How each adapter works:
 
-- **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
+- **claude** — `$CLAUDE_CONFIG_DIR/projects/**/*.jsonl` (default
+  `~/.claude/projects/**/*.jsonl`). Head for identity, `cwd`,
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
@@ -440,8 +634,9 @@ How each adapter works:
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet.
-- **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
-  `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
+- **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
+  `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
+  is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Subagent threads are real
   rollouts but not user sessions, so they are excluded — exactly as the full
@@ -451,7 +646,8 @@ How each adapter works:
   Cursor transcripts carry **no timestamps at all**, so `first_activity_ms` is
   always `null` and `last_activity_ms` is the file mtime. `cwd` is decoded from
   the project directory name.
-- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
+- **grok** — `$GROK_HOME/sessions/<encoded-path>/<id>/` (default
+  `~/.grok/sessions/<encoded-path>/<id>/`). Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
@@ -628,6 +824,18 @@ are backfilled with a local presence during migration. Scope queries use this
 table to select sessions and aggregate their `locations`; they do not duplicate
 the session or its events.
 
+`session_events` carries the per-tool-result fidelity columns `tool_use_id`,
+`payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
+`event_index`, `result_status`, `event_source`, `error_signal`,
+`subagent_session_id` and `agent_id`, and `session_hydration_checkpoints`
+carries `last_tool_result_index`. They are not all TEXT, so they are added by
+the `session_events_tool_result_fidelity_v1` marker migration rather than by
+the missing-column check that serves the catalog's TEXT columns. The marker is
+required, so a database written before this shape is routed through the
+writable open instead of being read as current and failing with
+`no such column`. Rows indexed before the migration keep their text and report
+no measurement.
+
 `session_relationships` is the delegation table, keyed by
 `(source, parent_session_id, relationship_uid)`. `relationship_uid` is
 `child:<child_session_id>` for an observed child and
@@ -678,6 +886,31 @@ The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
 
+### Add a fixture and a snapshot
+
+A provider is not added until its log shape is in the checked-in corpus. Add at
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
+in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
+quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
+generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+
+```sh
+UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
+```
+
+`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
+the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
+documented fixture exemption for a source that has no provider log on disk
+(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
+`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
+without being described, and `no_orphaned_snapshots` stops a snapshot from
+outliving its fixture.
+
+The snapshots are the *current* extraction, gaps included — they are the
+review artifact for a parser change, not a statement of intent. Facts a
+provider's logs contain that relayhistory does not capture yet are written as
+`#[ignore = "closed by #<issue>"]` tests in the same file.
+
 ---
 
 ## Programmatic access
@@ -689,6 +922,42 @@ discoverable".
   result as JSONL when line-oriented records are more convenient. Both run on
   a blocking worker thread and accept `scope` / `sources` / `limit`, with `beforeMs` and
   `after` (the previous page's `nextCursor`) on the listing.
+- **Native (napi), tool-result fidelity** — `getSessionEventsPage(...)` carries
+  the columns above on every event; `getSessionUserTurnsPage(source,
+  sessionId, options?)` returns one keyset page of user turns, each with the
+  ordered `[{kind, toolUseId, byteLen, isError}]` blocks its message carried.
+  A block's `isError` collapses five statuses into three states, and keeps
+  "known" apart from "not yet known": `true` for `errored` and `cancelled`
+  (both terminal, both stated by the provider), `false` for `completed`, and
+  `null` only for `running`, `unknown` and rows indexed before the column
+  existed. `null` is not "no error" — it is "no answer", and the full
+  `result_status` stays on the event for a consumer that needs to tell a
+  cancellation from a failure.
+  Both are cache-only and derived from `session_events`, so they cannot
+  disagree with the transcript. Both reads a page makes — the turn headers and
+  each turn's blocks — run inside one deferred read transaction, so a sync
+  writing concurrently cannot hand back a header whose blocks have moved or
+  vanished behind a cursor that already advanced past it.
+  A turn is what arrived on one user message. Each one also names its
+  `precedingMessageId` and `followingMessageId` — the nearest messages recorded
+  either side of it, from either side of the conversation — so a consumer can
+  stitch a turn back into the message stream without re-reading the events.
+  Both are `null` only when the session recorded no named message on that
+  side; an event the provider left unnamed is passed over rather than nulling
+  the field, since it is not a message a consumer could reference and the named
+  message behind it still borders the turn. A later block of the same turn is
+  never reported as the message that follows it.
+  Membership is asserted through `event_source`, never inferred from `role`:
+  only `tool_result` means "a block inside a message". A Claude subagent
+  notification and a Codex `function_call_output` are both stored with
+  `role = 'tool_result'` and both carry their own `message_id`, so grouping on
+  role invented turns that never happened — a Codex rollout with one prompt and
+  three outputs reported four. Codex has no in-message grouping at all: a Codex
+  turn is the prompt alone, and its tool results are read through the event
+  APIs, where a standalone result belongs. `approxTokens` is deliberately absent: every
+  estimate available here is a bytes-per-token heuristic, and a heuristic
+  served beside measured values is indistinguishable from a measurement at the
+  call site.
 - **Native (napi), delegation** — `getSessionRelationships(options)` returns one
   session's edges in both directions plus the provider's capabilities;
   `getSessionTree(options)` returns the pre-order descendant tree bounded by
@@ -698,7 +967,9 @@ discoverable".
   session with no recorded delegation also returns.
 - **TypeScript SDK** — `listSessionCatalog()` / `discoverSessions()` wrap the
   same contract for Node consumers, as do `getSessionRelationships()`,
-  `getSessionTree()`, `getSessionChildrenPage()`, and the `sessionDescendants()`
+  `getSessionTree()`, `getSessionChildrenPage()`,
+  `getSessionUserTurnsPage()` / `getSessionUserTurns()` / `sessionUserTurns()`,
+  and the `sessionDescendants()`
   / `sessionEventsIncludingDescendants()` iterators; see the SDK's own
   documentation for the exact signatures.
 - **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`

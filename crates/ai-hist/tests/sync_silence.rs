@@ -17,6 +17,9 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
         .env("USERPROFILE", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("xdg"))
         .env("OPENCODE_DB", dir.path().join("absent-opencode.db"))
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
         .output()
         .unwrap();
     assert!(

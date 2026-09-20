@@ -1,0 +1,7 @@
+{
+  "id": "prt_tool_1",
+  "sessionID": "ses_tool",
+  "messageID": "msg_tool_asst",
+  "type": "step-start",
+  "snapshot": "xyz"
+}

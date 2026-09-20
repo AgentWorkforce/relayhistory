@@ -66,6 +66,8 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  UserTurnsPageOptions,
+  SessionUserTurn,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -113,6 +115,7 @@ import {
   getSessionEventsPage,
   getSessionToolCallsPage,
   getSessionFileEditsPage,
+  getSessionUserTurnsPage,
   getSessionChildrenPage,
 } from './operations.js';
 
@@ -135,6 +138,29 @@ export async function getSessionEvents(
   const events: SessionEvent[] = [];
   for await (const event of sessionEvents(sessionId, options)) events.push(event);
   return events;
+}
+
+export async function* sessionUserTurns(
+  source: Source,
+  sessionId: string,
+  options: Omit<UserTurnsPageOptions, 'after'> = {},
+): AsyncGenerator<SessionUserTurn> {
+  let after: EventCursor | undefined;
+  do {
+    const page = await getSessionUserTurnsPage(source, sessionId, { ...options, after });
+    for (const turn of page.userTurns) yield turn;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionUserTurns(
+  source: Source,
+  sessionId: string,
+  options: Omit<UserTurnsPageOptions, 'after'> = {},
+): Promise<SessionUserTurn[]> {
+  const turns: SessionUserTurn[] = [];
+  for await (const turn of sessionUserTurns(source, sessionId, options)) turns.push(turn);
+  return turns;
 }
 
 export async function* sessionToolCalls(

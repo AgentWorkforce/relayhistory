@@ -1,0 +1,17 @@
+{
+  "id": "msg_compact_a1",
+  "sessionID": "ses_compact",
+  "role": "assistant",
+  "time": { "created": 1776999002000 },
+  "parentID": "msg_compact_u1",
+  "providerID": "anthropic",
+  "modelID": "claude-sonnet-4-5",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 10,
+    "output": 200,
+    "reasoning": 0,
+    "cache": { "read": 12000, "write": 5000 }
+  }
+}

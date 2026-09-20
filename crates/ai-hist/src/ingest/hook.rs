@@ -22,7 +22,7 @@
 //! hook fails the tool call the agent was in the middle of.
 
 use super::hydrate::{
-    hydrate_session_at_with_home_and_connectors, validate_provider_path, HydrateSessionOptions,
+    hydrate_session_at_with_roots_and_connectors, validate_provider_path, HydrateSessionOptions,
     HydrateSessionResult,
 };
 use super::*;
@@ -104,9 +104,10 @@ pub fn ingest_transcript_at(
     expected_session: Option<&str>,
     include_related: bool,
 ) -> Result<TranscriptIngest> {
-    ingest_transcript_at_with_home(
+    let roots = crate::ProviderRoots::from_env(home_dir());
+    ingest_transcript_at_with_roots(
         db_path,
-        &home_dir(),
+        &roots,
         source,
         transcript,
         expected_session,
@@ -123,6 +124,26 @@ pub fn ingest_transcript_at(
 pub fn ingest_transcript_at_with_home(
     db_path: &Path,
     home: &Path,
+    source: &str,
+    transcript: &Path,
+    expected_session: Option<&str>,
+    include_related: bool,
+) -> Result<TranscriptIngest> {
+    let opencode_db = home.join(".local/share/opencode/opencode.db");
+    let roots = crate::ProviderRoots::from_home(home.to_path_buf(), opencode_db);
+    ingest_transcript_at_with_roots(
+        db_path,
+        &roots,
+        source,
+        transcript,
+        expected_session,
+        include_related,
+    )
+}
+
+fn ingest_transcript_at_with_roots(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
     source: &str,
     transcript: &Path,
     expected_session: Option<&str>,
@@ -156,7 +177,7 @@ pub fn ingest_transcript_at_with_home(
     }
     // The payload comes from another process. Before the path is read as
     // evidence it has to be inside the root that provider actually owns.
-    validate_provider_path(source, transcript, home)?;
+    validate_provider_path(source, transcript, roots)?;
 
     let providers = shallow_providers();
     let provider = providers
@@ -174,13 +195,10 @@ pub fn ingest_transcript_at_with_home(
     // Resolved the way the sweep resolves it, against the home this call was
     // given rather than the process one. No hook harness is database-backed
     // today, so this only keeps the environment honest.
-    let opencode_db = std::env::var_os("OPENCODE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     let mut session_id = None;
     {
         let conn = open_db(db_path)?;
-        let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), opencode_db.clone());
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots.clone());
         // Read before anything is written. The payload says which session
         // fired *and* which file holds it, and those are two claims: a
         // delayed or replayed hook can pair a live session id with a
@@ -229,7 +247,7 @@ pub fn ingest_transcript_at_with_home(
         ));
     };
 
-    let hydration = hydrate_session_at_with_home_and_connectors(
+    let hydration = hydrate_session_at_with_roots_and_connectors(
         db_path,
         &HydrateSessionOptions {
             source: source.to_string(),
@@ -237,7 +255,7 @@ pub fn ingest_transcript_at_with_home(
             scope: SessionScope::Local,
             include_related,
         },
-        home,
+        roots,
         &crate::remote::SourceConnectorSelection::default(),
     )?;
     let status = if hydration.status == "unchanged" {

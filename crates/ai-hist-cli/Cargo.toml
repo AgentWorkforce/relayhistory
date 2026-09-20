@@ -29,5 +29,6 @@ ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 fs2 = "0.4"
+libc = "0.2"
 tempfile = "3"
 url = "2"
