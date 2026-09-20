@@ -488,6 +488,53 @@ fn a_glitch_while_reasoning_is_waiting_does_not_outlive_the_recovery() {
     assert_eq!((usage.input_tokens, usage.output_tokens), (400, 140));
 }
 
+/// "A measured delta supersedes every held refusal" rests on an unreadable
+/// snapshot never moving the baseline — and that is false across a baseline
+/// *reinstall*. When the opening snapshot is unreadable, the next readable one
+/// installs a baseline and measures nothing, silently absorbing everything
+/// spent up to that point, including a turn that was refused in between. A
+/// later advancing snapshot is then differenced from *that* baseline, so its
+/// delta does not cover the refused turn at all — yet it was clearing the
+/// refusal, leaving that turn looking unused rather than rejected and its
+/// spend nowhere.
+#[test]
+fn a_refusal_predating_a_baseline_reinstall_is_not_cleared_by_it() {
+    let conn = codex_store("codex/refusal-across-baseline-reinstall.jsonl");
+    let stored = assistant_usage(&conn);
+    assert_eq!(stored.len(), 2, "two turns");
+
+    let first = usage_of(&stored, "First answer.")
+        .expect("the refused turn keeps its refusal across the reinstall");
+    assert!(
+        first.contains("55.5"),
+        "and it is that turn's own unreadable object: {first}"
+    );
+    let second = usage_of(&stored, "Second answer.").expect("the second turn was measured");
+    let delta = crate::usage::normalize_usage_str("codex", &second)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (delta.input_tokens, delta.output_tokens),
+        (400, 140),
+        "measured from the installed baseline, not from zero: {second}"
+    );
+
+    // The reader sees one refused request and one measured one, rather than a
+    // session that reports a total as though nothing had been rejected.
+    let page = session_requests_page(&conn, "codex", "sess_codex_reinstall", 50, None).unwrap();
+    assert_eq!(
+        page.requests
+            .iter()
+            .filter(|request| request
+                .diagnostics
+                .contains(&UsageDiagnostic::UnnormalizableUsage))
+            .count(),
+        1,
+        "the refusal is reported: {:?}",
+        page.requests
+    );
+}
+
 /// A resumed rollout opens with the cumulative total it carried over. If that
 /// snapshot is unreadable there is no baseline, and differencing the next good
 /// one against zero charges the whole carried-over history to a single

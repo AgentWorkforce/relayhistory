@@ -90,10 +90,10 @@ not attached, and remembered **against the turn that was waiting when it
 arrived** — several turns can go unmeasured before anything recovers, and each
 keeps its own refusal rather than overwriting the last.
 
-Because an unreadable snapshot never advances the baseline, the next readable
-one is measured from the point before *every* held refusal: its delta already
-covers all of their spans. So a measured delta supersedes all of them. Nothing
-is lost — an earlier turn's spend is reported inside the recovering turn's
+Because an unreadable snapshot does not advance the baseline, the next readable
+one is measured from the point before every refusal held **against that same
+baseline**: its delta already covers their spans. So a measured delta
+supersedes those. Nothing is lost — an earlier turn's spend is reported inside the recovering turn's
 request — and no turn is marked as rejected in a session that was in fact
 measured end to end. This is what keeps a glitch that arrives while
 `agent_reasoning` holds the waiting slot from flagging a turn that its own
@@ -109,6 +109,16 @@ If the *first* snapshot is unreadable there is no baseline at all, so the next
 readable one installs one and measures nothing. Differencing it from zero
 would report a resumed session's whole carried-over total as a single
 request's spend.
+
+That install is the one case where "the baseline does not move" stops holding,
+and it is why refusals are tagged with the baseline they were owed against. The
+reinstall absorbs every earlier span into itself, so a later delta measured
+from the new baseline covers none of them: a refusal recorded *before* the
+reinstall survives it, and is cleared only by a delta measured from the same
+baseline it was held against. Without that tag, a turn refused between an
+unreadable opening snapshot and the reinstall was left with no measurement and
+no refusal — reading as unused when in fact its spend was in no request at
+all.
 
 `input_tokens` in a Codex record stays *inclusive* of `cached_input_tokens`
 even after differencing. Normalization makes it exclusive, so a consumer that
