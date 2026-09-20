@@ -342,9 +342,28 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     let Ok(metadata) = path.metadata() else {
         return Ok(false);
     };
-    Ok(file.offset == metadata.len()
-        && file.mtime_ns == super::metadata_mtime_ns(&metadata)
-        && (file.device, file.inode) == file_identity(&metadata))
+    if file.offset != metadata.len()
+        || file.mtime_ns != super::metadata_mtime_ns(&metadata)
+        || (file.device, file.inode) != file_identity(&metadata)
+    {
+        return Ok(false);
+    }
+    // Size, mtime and inode do not prove the bytes are the same ones. A
+    // writer that restores timestamps, or a filesystem whose timestamp
+    // resolution puts both writes in the same tick, produces a rewritten file
+    // with an identical stat — and this fast path runs *before*
+    // `TranscriptReader::open`, so the prefix hash it validates never got a
+    // say. The file was then skipped on every sync, forever, serving rows
+    // from bytes that no longer exist.
+    //
+    // The same bounded window the cursor already stores, so this costs two
+    // seeks and at most 128 KiB, and only on the files that were about to be
+    // skipped anyway.
+    let Ok(mut handle) = fs::File::open(path) else {
+        return Ok(false);
+    };
+    Ok(prefix_window_digest(&mut handle, file.offset)
+        .is_ok_and(|digest| digest == file.prefix_hash))
 }
 
 /// Forget one locator-keyed cursor, so the next pass reads the file from zero.

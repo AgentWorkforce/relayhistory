@@ -141,15 +141,22 @@ pub(crate) fn ingest_claude_transcript_incremental(
             break;
         };
         let index = line_index;
-        line_index += 1;
         // A record with no newline is considered only if it is complete
         // JSON. A half-written line is not, and a writer appends a line at a
         // time, so parsing is the available evidence that the provider
         // finished saying this.
         let parsed = serde_json::from_str::<Value>(line.trim_end()).ok();
         if kind == ReadRecord::Unterminated && parsed.is_none() {
+            // Nothing about this record is committed, so its index is not
+            // spent either. Advancing it here handed the record a different
+            // fallback identity once it completed than a re-parse from zero
+            // would derive, and a record with neither `uuid` nor `message.id`
+            // would then exist twice under two derived ids.
             break;
         }
+        // A malformed record that *did* end in a newline is committed bytes,
+        // so it keeps consuming its index.
+        line_index += 1;
         let Some(value) = parsed else {
             continue;
         };

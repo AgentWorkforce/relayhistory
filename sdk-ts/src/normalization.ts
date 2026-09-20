@@ -441,6 +441,16 @@ export function evidenceIdentity(source: unknown, sessionId: unknown, operation:
  * only meaningful against 'release'.
  */
 
+function requireFiniteNumber(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new NativeContractMismatchError(
+      'ai-hist-native returned an invalid hydration result.',
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value;
+}
+
 export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   const contractVersion = Number(value.contractVersion);
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
@@ -480,10 +490,13 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
       fileEdits: Number(evidence.fileEdits),
       relatedSessions: Number(evidence.relatedSessions),
     },
-    // Absent only from an addon that predates the counter; the contract-version
-    // check above already rejects those, so the fallback is belt and braces
-    // rather than a supported shape.
-    bytesRead: typeof value.bytesRead === 'number' ? value.bytesRead : 0,
+    // A missing counter is a broken contract, not a read of nothing. Zero is
+    // the one value a caller cannot tell apart from "this hydration read
+    // nothing", so defaulting to it turns an addon that has fallen behind the
+    // contract into a watch loop that sees no activity and reports none.
+    // Version 3 requires the field; if it is absent the result is not
+    // version 3, whatever it says it is.
+    bytesRead: requireFiniteNumber(value.bytesRead),
     relatedSessionIds: Array.isArray(value.relatedSessionIds)
       ? value.relatedSessionIds.map(String)
       : [],

@@ -1217,7 +1217,12 @@ fn source_snapshot(
         }
     }
     if options.source == "codex" && options.include_related {
-        for child in codex_children(&path, &options.session_id)? {
+        // Finding the children means reading one head record from every
+        // sibling rollout in the directory, whether or not it turns out to be
+        // one. That is provider I/O this hydration did.
+        let (children, enumeration_bytes) = codex_children_counted(&path, &options.session_id)?;
+        scanned_bytes += enumeration_bytes as i64;
+        for child in children {
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
             bytes += child.metadata()?.len() as i64;
@@ -1599,11 +1604,14 @@ pub(crate) struct ClaudeSubagentEvidence {
 /// delegation is described by comes from the sibling
 /// `agent-<agentId>.meta.json`, or from the transcript's first record when
 /// that sidecar does not exist.
+/// Returns the evidence and the bytes reading it cost: the transcript's head
+/// record and the whole metadata document beside it. Both are provider files,
+/// so both belong in `bytesRead`.
 pub(crate) fn claude_subagent_evidence(
     path: PathBuf,
     meta: &ClaudeSessionMeta,
-) -> ClaudeSubagentEvidence {
-    let first = first_claude_record(&path);
+) -> (ClaudeSubagentEvidence, u64) {
+    let (first, mut bytes_read) = first_claude_record_counted(&path);
     let record_str = |key: &str| {
         first
             .as_ref()
@@ -1613,6 +1621,10 @@ pub(crate) fn claude_subagent_evidence(
             .map(str::to_string)
     };
     let sidecar = claude_subagent_meta(&path);
+    bytes_read += claude_subagent_meta_path(&path)
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let meta_str = |key: &str| {
         sidecar
             .as_ref()
@@ -1621,7 +1633,7 @@ pub(crate) fn claude_subagent_evidence(
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
-    ClaudeSubagentEvidence {
+    let evidence = ClaudeSubagentEvidence {
         agent_id: meta.agent_id.clone(),
         agent_type: meta_str("agentType").or_else(|| record_str("attributionAgent")),
         description: meta_str("description"),
@@ -1637,7 +1649,8 @@ pub(crate) fn claude_subagent_evidence(
                 .and_then(|ts| ts.as_str().and_then(parse_iso_ms).or_else(|| ts.as_i64()))
         }),
         path,
-    }
+    };
+    (evidence, bytes_read)
 }
 
 /// Every subagent transcript belonging to one parent session.
@@ -1687,15 +1700,23 @@ fn claude_subagents(
         if meta.session_id != session_id {
             continue;
         }
-        evidence.push(claude_subagent_evidence(candidate, &meta));
+        let (found, evidence_bytes) = claude_subagent_evidence(candidate, &meta);
+        bytes_read += evidence_bytes;
+        evidence.push(found);
     }
     Ok((evidence, bytes_read))
 }
 
 /// The first parseable record of a transcript, from a bounded read of its
-/// head rather than the whole file.
-fn first_claude_record(path: &Path) -> Option<Value> {
-    read_leading_records(path, 1).ok()?.0.into_iter().next()
+/// head rather than the whole file, and the bytes that cost.
+///
+/// An unreadable file is a file with no first record, not an error that takes
+/// the enumeration down with it.
+fn first_claude_record_counted(path: &Path) -> (Option<Value>, u64) {
+    match read_leading_records(path, 1) {
+        Ok((values, bytes_read)) => (values.into_iter().next(), bytes_read),
+        Err(_) => (None, 0),
+    }
 }
 
 /// Where the `agent-<agentId>.meta.json` sidecar sits beside a subagent
@@ -1718,7 +1739,8 @@ fn ingest_codex(
     path: &Path,
     cursor: &mut TranscriptCursorState,
 ) -> Result<IngestOutcome> {
-    let meta = read_codex_session_meta(path)?.ok_or_else(|| {
+    let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
+    let meta = meta.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
             "Codex rollout has no session metadata",
@@ -1730,7 +1752,10 @@ fn ingest_codex(
             "Codex rollout identity does not match the selected root session",
         ));
     }
-    let mut indexed = IngestOutcome::default();
+    let mut indexed = IngestOutcome {
+        bytes_read: meta_bytes as i64,
+        ..Default::default()
+    };
     let (outcome, pass) = ingest_codex_rollout_incremental(conn, path, &meta, cursor)?;
     indexed.absorb(pass);
     if let Some(first) = outcome.first_ts {
@@ -1757,9 +1782,19 @@ fn ingest_codex_children(
     options: &HydrateSessionOptions,
     root_path: &Path,
 ) -> Result<IngestOutcome> {
-    let mut indexed = IngestOutcome::default();
-    for candidate in codex_children(root_path, &options.session_id)? {
-        let Some(meta) = read_codex_session_meta(&candidate)? else {
+    // Enumeration happens twice per hydration — once to stamp the source,
+    // once here — and each pass reads every candidate's head. Counting both
+    // is what makes `bytesRead` the bytes this hydration read rather than the
+    // bytes it would have read if it were written differently.
+    let (children, enumeration_bytes) = codex_children_counted(root_path, &options.session_id)?;
+    let mut indexed = IngestOutcome {
+        bytes_read: enumeration_bytes as i64,
+        ..Default::default()
+    };
+    for candidate in children {
+        let (meta, meta_bytes) = read_codex_session_meta_counted(&candidate)?;
+        indexed.bytes_read += meta_bytes as i64;
+        let Some(meta) = meta else {
             continue;
         };
         // A child rollout is its own transcript with its own committed
@@ -1783,16 +1818,26 @@ fn ingest_codex_children(
     Ok(indexed)
 }
 
-fn codex_children(root_path: &Path, parent_session_id: &str) -> Result<Vec<PathBuf>> {
+/// Returns the descendants and the bytes spent reading every candidate's head
+/// record to find them. Enumeration reads one record per sibling rollout, and
+/// a parent with ten candidates pays for ten of them whether or not any turn
+/// out to be children.
+fn codex_children_counted(
+    root_path: &Path,
+    parent_session_id: &str,
+) -> Result<(Vec<PathBuf>, u64)> {
     let Some(directory) = root_path.parent() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
+    let mut bytes_read = 0u64;
     let mut children_by_parent: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
     for candidate in collect_matching_files(directory, "rollout-", "jsonl")? {
         if candidate == root_path {
             continue;
         }
-        let Some(meta) = read_codex_session_meta(&candidate)? else {
+        let (meta, read) = read_codex_session_meta_counted(&candidate)?;
+        bytes_read += read;
+        let Some(meta) = meta else {
             continue;
         };
         if !meta.is_subagent {
@@ -1829,7 +1874,7 @@ fn codex_children(root_path: &Path, parent_session_id: &str) -> Result<Vec<PathB
         }
     }
     descendants.sort();
-    Ok(descendants)
+    Ok((descendants, bytes_read))
 }
 
 fn ingest_cursor(
@@ -2834,11 +2879,8 @@ mod tests {
             b"{\"sessionId\":\"session-sidecar\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"parent prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
         );
         let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
-        fs::write(
-            &sidecar,
-            "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"first\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n",
-        )
-        .unwrap();
+        let first_record = "{\"sessionId\":\"session-sidecar\",\"agentId\":\"child-1\",\"isSidechain\":true,\"uuid\":\"s1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"first\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n";
+        fs::write(&sidecar, first_record).unwrap();
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "claude", session_id, Some(&transcript));
@@ -2852,10 +2894,14 @@ mod tests {
 
         let grown =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
-        // Only the sidecar's new line is read, by its metadata walk and its
-        // record walk. The parent transcript, which did not change,
-        // contributes nothing to this number.
-        assert_eq!(grown.bytes_read, 2 * addition.len() as i64);
+        // The sidecar's new line, read by its metadata walk and its record
+        // walk, plus its *first* record, which building the child's evidence
+        // reads from the head however far the file has grown. The parent
+        // transcript, which did not change, contributes nothing.
+        assert_eq!(
+            grown.bytes_read,
+            2 * addition.len() as i64 + first_record.len() as i64
+        );
         assert_eq!(
             session_event_snapshot(&db, "child-1")
                 .iter()
@@ -3327,8 +3373,11 @@ mod tests {
         let first =
             hydrate_session_at_with_home(&db, &options("codex", "big"), dir.path()).unwrap();
         assert_eq!(first.status, "hydrated");
-        // The whole rollout, plus the one metadata line read from its head.
-        assert_eq!(first.bytes_read, size + meta_line.len() as i64);
+        // The whole rollout, plus its `session_meta` record read twice from
+        // the head: once to stamp the source, once to identify it for
+        // ingestion. One record either way, never the file.
+        let head_reads = 2 * meta_line.len() as i64;
+        assert_eq!(first.bytes_read, size + head_reads);
 
         let addition = format!(
             "{{\"timestamp\":\"2026-08-31T10:00:03Z\",\"type\":\"event_msg\",\
@@ -3343,11 +3392,8 @@ mod tests {
 
         let appended =
             hydrate_session_at_with_home(&db, &options("codex", "big"), dir.path()).unwrap();
-        // The append, plus the same one metadata line. Not the rollout.
-        assert_eq!(
-            appended.bytes_read,
-            addition.len() as i64 + meta_line.len() as i64
-        );
+        // The append, plus the same two head records. Not the rollout.
+        assert_eq!(appended.bytes_read, addition.len() as i64 + head_reads);
         // Positive control: the counter is capable of reporting the whole
         // file, and did so on the first pass, so a bounded second reading is
         // a fact about the read rather than about the counter.
@@ -3552,15 +3598,20 @@ mod tests {
         );
         let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
         let mut body = String::new();
+        let mut first_record_len = 0usize;
         for index in 0..2000 {
-            body.push_str(&format!(
+            let record = format!(
                 "{{\"sessionId\":\"{session_id}\",\"agentId\":\"child-1\",\"isSidechain\":true,\
                  \"uuid\":\"s-{index}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
                  \"message\":{{\"id\":\"m-{index}\",\"role\":\"assistant\",\
                  \"stop_reason\":\"end_turn\",\"content\":\"{}\"}},\
                  \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n",
                 "z".repeat(512)
-            ));
+            );
+            if index == 0 {
+                first_record_len = record.len();
+            }
+            body.push_str(&record);
         }
         fs::write(&sidecar, &body).unwrap();
         let db = dir.path().join("history.db");
@@ -3586,9 +3637,139 @@ mod tests {
         let appended =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         // The sidecar's metadata walk and its record walk each read the
-        // appended record, and nothing reads the sidecar from the start.
-        assert_eq!(appended.bytes_read, 2 * addition.len() as i64);
+        // appended record, plus the one head record the child's evidence
+        // needs. Nothing reads the sidecar's two thousand records again.
+        assert_eq!(
+            appended.bytes_read,
+            2 * addition.len() as i64 + first_record_len as i64
+        );
         assert!(first.bytes_read > 100 * appended.bytes_read);
+    }
+
+    /// Enumerating Codex children reads every sibling rollout's head record,
+    /// and those bytes are part of what the hydration read.
+    ///
+    /// The accounting gap one level out from the last round: the reads that
+    /// *find* the related sessions were missing from the counter, so a parent
+    /// with ten candidates could report the root's head alone.
+    #[test]
+    fn codex_child_enumeration_reads_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let root = day.join("rollout-root.jsonl");
+        fs::write(
+            &root,
+            concat!(
+                "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/work/app\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"root prompt\"}}\n",
+                "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            ),
+        )
+        .unwrap();
+        // Unrelated siblings. Their heads are read to discover they are not
+        // children, which is work the hydration did either way.
+        let mut sibling_head_bytes = 0i64;
+        for index in 0..8 {
+            let sibling = day.join(format!("rollout-other-{index}.jsonl"));
+            let head = format!(
+                "{{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+                 \"payload\":{{\"id\":\"other-{index}\",\"cwd\":\"/work/app\"}}}}\n"
+            );
+            let body = format!(
+                "{head}{{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"event_msg\",\
+                 \"payload\":{{\"type\":\"user_message\",\"message\":\"{}\"}}}}\n",
+                "q".repeat(4096)
+            );
+            fs::write(&sibling, body).unwrap();
+            sibling_head_bytes += head.len() as i64;
+        }
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        // Enumeration runs twice — once to stamp, once to ingest — and each
+        // pass reads every sibling's head.
+        let root_len = fs::metadata(&root).unwrap().len() as i64;
+        assert!(
+            first.bytes_read >= root_len + 2 * sibling_head_bytes,
+            "bytes_read {} omits the {} bytes of sibling heads the enumeration read",
+            first.bytes_read,
+            2 * sibling_head_bytes
+        );
+        // Positive control: the siblings' bodies are far larger than their
+        // heads, and none of that is counted, so this is the head reads being
+        // included rather than the whole directory being read.
+        let directory_bytes: i64 = (0..8)
+            .map(|index| {
+                fs::metadata(day.join(format!("rollout-other-{index}.jsonl")))
+                    .unwrap()
+                    .len() as i64
+            })
+            .sum();
+        assert!(first.bytes_read < root_len + directory_bytes);
+    }
+
+    /// A Claude sidecar's head record and its metadata document are provider
+    /// reads, and belong in the counter with everything else.
+    #[test]
+    fn claude_sidecar_evidence_reads_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-evidence-bytes";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"parent\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let sidecar = transcript.parent().unwrap().join("agent-child.jsonl");
+        let sidecar_body = format!(
+            "{{\"sessionId\":\"{session_id}\",\"agentId\":\"child-1\",\"isSidechain\":true,\
+             \"uuid\":\"s-1\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+             \"message\":{{\"id\":\"m-1\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\
+             \"content\":\"child\"}},\"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+        );
+        fs::write(&sidecar, &sidecar_body).unwrap();
+        let meta_doc = "{\"agentType\":\"Plan\",\"description\":\"plan it\",\
+                        \"toolUseId\":\"toolu_1\",\"spawnDepth\":1,\"model\":\"m\"}";
+        fs::write(sidecar.with_extension("meta.json"), meta_doc).unwrap();
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let parent_len = fs::metadata(&transcript).unwrap().len() as i64;
+        // The metadata document is read once while building the child's
+        // evidence, on top of the two walks over each transcript and the
+        // sidecar's head record.
+        let floor = 2 * parent_len + 2 * sidecar_body.len() as i64 + meta_doc.len() as i64;
+        assert!(
+            result.bytes_read >= floor,
+            "bytes_read {} omits the sidecar head or metadata document (floor {floor})",
+            result.bytes_read
+        );
+        // Positive control: the child really was described from that
+        // document, so the bytes were spent on something.
+        let agent_type: Option<String> = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT child_agent_type FROM session_relationships WHERE source='claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_type.as_deref(), Some("Plan"));
     }
 
     #[test]

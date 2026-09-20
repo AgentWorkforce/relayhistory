@@ -1907,11 +1907,18 @@ const LEADING_BYTE_LIMIT: u64 = 1024 * 1024;
 /// file is that record.
 fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
     let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
+    // `take` is what enforces the ceiling. Checking `bytes_read` at the top of
+    // the loop only decided whether to start *another* line, and
+    // `read_until` appends until it finds a newline or reaches EOF — so a
+    // provider file whose first record is the whole file allocated the whole
+    // file, which is the unbounded read this helper exists to prevent,
+    // wearing a bound. With the limit on the reader, a record that would
+    // cross it comes back truncated, fails to parse, and is skipped.
+    let mut reader = BufReader::new(file).take(LEADING_BYTE_LIMIT);
     let mut values = Vec::new();
     let mut raw = Vec::new();
     let mut bytes_read = 0u64;
-    while values.len() < limit && bytes_read < LEADING_BYTE_LIMIT {
+    while values.len() < limit {
         raw.clear();
         let read = reader.read_until(b'\n', &mut raw)?;
         if read == 0 {
@@ -1946,7 +1953,23 @@ fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
 /// tail — the Codex twin of the whole-file Claude metadata scan, and invisible
 /// for the same reason: `bytes_read` counted the cursor's work, not this.
 fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMeta>, u64)> {
-    let (values, bytes_read) = read_leading_records(path, 1)?;
+    // A rollout that cannot be read is a rollout with no metadata, which is
+    // what the `read_to_string(path).ok()` this replaced already meant. The
+    // bounded reader propagates `File::open` failures, and every caller
+    // propagates them further, so one locked or deleted sibling rollout
+    // started failing a whole parent hydration or Codex sync — a file that
+    // could not be read taking down the files that could. The failure is
+    // reported rather than swallowed.
+    let (values, bytes_read) = match read_leading_records(path, 1) {
+        Ok(read) => read,
+        Err(error) => {
+            sync_note!(
+                "  [codex] skipping unreadable rollout {}: {error}",
+                path.display()
+            );
+            return Ok((None, 0));
+        }
+    };
     let meta = values.first().and_then(codex_session_meta_from_record);
     Ok((meta, bytes_read))
 }
@@ -2802,7 +2825,9 @@ fn sync_claude_session_metadata(
                 // parent, so this walk reaches the same edge from the child's
                 // side, through the very code hydration uses: a named child
                 // is an observed row, an unnamed one is unlinked evidence.
-                let evidence = hydrate::claude_subagent_evidence(path.clone(), &meta);
+                // The sync walk reports its reads through its own counters, not
+                // through a hydration result, so the byte count is dropped here.
+                let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
                 hydrate::ingest_claude_subagent(conn, &meta.session_id, &evidence)?;
                 continue;
             }
@@ -7012,6 +7037,179 @@ mod tests {
     /// `claude` — taking the scan with it. Hydration happened to put its scan
     /// back afterwards; sync never did, so every sync re-derived a
     /// transcript's identity from byte zero however little had arrived.
+    /// A bounded head read must bound the read, not just the loop around it.
+    ///
+    /// `read_until` appends until it finds a newline or reaches EOF, so
+    /// checking a byte budget between lines decided only whether to start
+    /// *another* line. One record the size of the file allocated the size of
+    /// the file — the unbounded read this helper exists to prevent, wearing a
+    /// bound.
+    #[test]
+    fn a_head_read_is_bounded_by_bytes_not_only_by_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one-huge-line.jsonl");
+        // One record, no newline, far past the ceiling.
+        let huge = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"x\",\"cwd\":\"/w\",\"pad\":\"{}\"}}}}",
+            "p".repeat(4 * 1024 * 1024)
+        );
+        fs::write(&path, &huge).unwrap();
+        assert!(huge.len() as u64 > 4 * super::LEADING_BYTE_LIMIT);
+
+        let (values, bytes_read) = super::read_leading_records(&path, 1).unwrap();
+        assert!(
+            bytes_read <= super::LEADING_BYTE_LIMIT,
+            "a head read took {bytes_read} bytes, over the {} byte ceiling",
+            super::LEADING_BYTE_LIMIT
+        );
+        // Truncated at the ceiling, so it is not valid JSON and is not
+        // mistaken for a record.
+        assert!(values.is_empty());
+
+        // Positive control: the same reader returns the record when it fits,
+        // so the bound is what stopped it rather than a reader that never
+        // reads anything.
+        let small = dir.path().join("small.jsonl");
+        fs::write(
+            &small,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\",\"cwd\":\"/w\"}}\n",
+        )
+        .unwrap();
+        let (values, _) = super::read_leading_records(&small, 1).unwrap();
+        assert_eq!(values.len(), 1);
+    }
+
+    /// One unreadable rollout must not take down the files that can be read.
+    #[test]
+    fn an_unreadable_rollout_is_skipped_rather_than_failing_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("rollout-gone.jsonl");
+        // Never created: `File::open` fails exactly as it would for a rollout
+        // deleted or locked between enumeration and reading.
+        let (meta, bytes_read) = super::read_codex_session_meta_counted(&missing).unwrap();
+        assert!(meta.is_none());
+        assert_eq!(bytes_read, 0);
+
+        // Positive control: a readable rollout beside it still yields its
+        // metadata, so "no metadata" is a fact about the unreadable file and
+        // not about the reader.
+        let good = dir.path().join("rollout-good.jsonl");
+        fs::write(
+            &good,
+            "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"good\",\"cwd\":\"/work/app\"}}\n",
+        )
+        .unwrap();
+        let (meta, _) = super::read_codex_session_meta_counted(&good).unwrap();
+        assert_eq!(meta.unwrap().session_id, "good");
+    }
+
+    /// A rewrite that preserves size and mtime is still a rewrite.
+    #[test]
+    fn a_same_stat_rewrite_is_not_served_from_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-rewrite.jsonl");
+        let original = "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"s-rw\",\
+                        \"cwd\":\"/tmp/proj\",\"timestamp\":\"2026-06-25T10:00:00.000Z\",\
+                        \"message\":{\"role\":\"user\",\"content\":\"aaaaa\"}}\n";
+        fs::write(&path, original).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        cursor::stamp_whole_file(&conn, "claude", &path).unwrap();
+        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(cursor::transcript_unchanged(&conn, "claude", &path).unwrap());
+
+        // Same length, different bytes, and the timestamp put back — which a
+        // writer that preserves mtime, or a coarse filesystem clock, produces
+        // for free.
+        let rewritten = original.replace("aaaaa", "bbbbb");
+        assert_eq!(rewritten.len(), original.len());
+        fs::write(&path, &rewritten).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len() as usize, original.len());
+        assert_eq!(metadata.modified().unwrap(), stamped);
+
+        assert!(
+            !cursor::transcript_unchanged(&conn, "claude", &path).unwrap(),
+            "a same-size, same-mtime rewrite must not be served from the cursor"
+        );
+    }
+
+    /// An uncommitted record does not spend its line index.
+    ///
+    /// `ingest_claude_record` derives a fallback identity from the absolute
+    /// record index when a record carries neither `uuid` nor `message.id`.
+    /// Advancing the index past a half-written record that was never
+    /// committed gave that record a different identity once it completed than
+    /// a re-parse from zero would derive, so a later rotation wrote it a
+    /// second time under the other id.
+    #[test]
+    fn a_half_written_record_does_not_spend_its_line_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexless.jsonl");
+        // No `uuid` and no `message.id`: identity comes from the line index.
+        let first = "{\"sessionId\":\"s-idx\",\"cwd\":\"/w\",\"type\":\"user\",\
+                     \"message\":{\"role\":\"user\",\"content\":\"one\"}}\n";
+        fs::write(&path, first).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut state = cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        assert_eq!(state.claude.as_ref().unwrap().next_line_index, 1);
+
+        // Half of the next record arrives.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        write!(file, "{{\"sessionId\":\"s-idx\",\"cw").unwrap();
+        drop(file);
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        assert_eq!(
+            state.claude.as_ref().unwrap().next_line_index,
+            1,
+            "an uncommitted record must not advance the index"
+        );
+
+        // It completes. Its identity must be the one a full re-parse derives.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "d\":\"/w\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"two\"}}}}"
+        )
+        .unwrap();
+        drop(file);
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+
+        let incremental_uids = claude_event_uids(&conn, "s-idx");
+        assert_eq!(incremental_uids.len(), 2);
+
+        // Positive control: the same file parsed from zero into a fresh
+        // database produces the same identities, which is the property a
+        // shifted index breaks.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        let mut from_zero = cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&fresh, &path, None, &mut from_zero)
+            .unwrap();
+        assert_eq!(incremental_uids, claude_event_uids(&fresh, "s-idx"));
+    }
+
+    fn claude_event_uids(conn: &Connection, session_id: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT event_uid FROM session_events WHERE source='claude' AND session_id=? \
+             ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
     #[test]
     fn a_sync_keeps_the_metadata_walk_position_across_the_record_walk() {
         let dir = tempfile::tempdir().unwrap();

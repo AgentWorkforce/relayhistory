@@ -3,6 +3,7 @@ import { mkdtemp, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { normalizeHydration } from './normalization.js';
 import {
   HistoryPluginRegistry,
   sync,
@@ -504,4 +505,40 @@ test('a hydration drawing on several sources reports the bytes all of them read'
   assert.notEqual(merged.bytesRead, connector.bytesRead);
   // A single result is returned unchanged rather than doubled.
   assert.equal(__testing.combineHydration(undefined, local).bytesRead, 4096);
+});
+
+test('a hydration result missing bytesRead is a broken contract, not a zero read', () => {
+  // Zero is the one value a caller cannot tell apart from "this hydration read
+  // nothing", so defaulting to it turns an addon that has fallen behind the
+  // contract into a watch loop that sees no activity and reports none. Version
+  // 3 requires the field; a response without it is not version 3.
+  const complete = {
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'claude',
+    sessionId: 's',
+    status: 'hydrated',
+    capability: 'full',
+    discoveryState: 'full',
+    presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    evidence: { prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
+    bytesRead: 4096,
+    relatedSessionIds: [],
+    diagnostics: [],
+  };
+  // Positive control: the same shape normalizes cleanly when the field is
+  // there, so the throw below is about the missing field and not the fixture.
+  assert.equal(normalizeHydration(complete).bytesRead, 4096);
+  // A real zero still passes. Only absence is a contract failure.
+  assert.equal(normalizeHydration({ ...complete, bytesRead: 0 }).bytesRead, 0);
+
+  for (const broken of [undefined, null, '4096', Number.NaN, Number.POSITIVE_INFINITY]) {
+    const { bytesRead: _dropped, ...rest } = complete;
+    const value = broken === undefined ? rest : { ...rest, bytesRead: broken };
+    assert.throws(
+      () => normalizeHydration(value as never),
+      (error: unknown) => (error as { code?: string }).code === 'NATIVE_CONTRACT_MISMATCH',
+      `bytesRead ${String(broken)} must be rejected`,
+    );
+  }
 });

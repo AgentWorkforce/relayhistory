@@ -619,7 +619,27 @@ that looked bounded:
 **Every provider read a hydration cannot avoid is in `bytesRead`.** A counter
 that omits one is worse than no counter: it reports the work that was
 optimised instead of the work that was done, and the omitted read is exactly
-the one nobody is watching.
+the one nobody is watching. That includes the reads that *find* the related
+sessions — each Codex sibling rollout's head record during enumeration, and a
+Claude sidecar's head record and metadata document while its evidence is built.
+
+A bounded head read is bounded by a limit on the reader, not by a check
+between lines: `read_until` appends until a newline or EOF, so a budget
+consulted only before starting another line lets one record the size of the
+file allocate the size of the file.
+
+A cheap "has this changed?" check that compares only size, mtime and inode is
+not enough to skip a file. A writer that restores timestamps, or a filesystem
+whose clock puts both writes in one tick, produces a rewrite with an identical
+stat; the bounded prefix window is validated before a file is skipped, which
+costs two seeks and at most 128 KiB and only on files that were about to be
+skipped anyway.
+
+A record the reader did not commit does not consume its line index either. The
+fallback identity for a record with neither `uuid` nor `message.id` is derived
+from that index, so advancing it past a half-written record gave the record a
+different identity once it completed than a re-parse from zero would derive —
+and the record then existed twice.
 
 ### One deferral state machine
 
