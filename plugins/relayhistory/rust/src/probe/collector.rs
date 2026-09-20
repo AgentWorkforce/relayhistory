@@ -357,8 +357,7 @@ mod tests {
                 }
                 continue;
             }
-            if let Some(claim) =
-                delivery::claim_batch(conn, job_id, "test", 60_000, &now).unwrap()
+            if let Some(claim) = delivery::claim_batch(conn, job_id, "test", 60_000, &now).unwrap()
             {
                 return claim
                     .batch
