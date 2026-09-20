@@ -1037,6 +1037,82 @@ fn ownership_revocation_does_not_mutate_sibling_acquisition_state() -> Result<()
     Ok(())
 }
 
+/// A plugin submitting a continuity relationship must reach the database with
+/// `origin_session_id` intact.
+///
+/// The normalized contract's `Spec.columns` is the one list validation,
+/// persistence, equality and the `read_session` projection all read, so
+/// omitting the column did not degrade gracefully: the whole record was
+/// refused with `unsupported session_relationships column origin_session_id`,
+/// and a `fork` could not be submitted at all.
+#[test]
+fn a_submitted_continuity_relationship_round_trips_its_origin() -> Result<()> {
+    use EvidenceKind::Relationship;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    let record = EvidenceRecord {
+        kind: Relationship,
+        payload: json!({
+            "source": "claude",
+            "parent_session_id": "s",
+            "relationship_uid": "fork:branch",
+            "child_session_id": "branch",
+            "relationship": "fork",
+            "identity_status": "observed",
+            "evidence_kind": "claude_transcript_continuity",
+            "evidence_locator": "/tmp/branch.jsonl",
+            "evidence_ref": "sharedSessionId",
+            "origin_session_id": "s",
+            "child_has_events": false,
+            "created_ms": 1,
+            "updated_ms": 1,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        record_id: None,
+        revision_id: None,
+    };
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![Relationship],
+        vec![record.clone()],
+    )?;
+
+    let conn = ai_hist::open_db(&path)?;
+    let stored: (String, String, Option<String>) = conn.query_row(
+        "SELECT relationship, parent_session_id, origin_session_id \
+         FROM session_relationships WHERE relationship_uid = 'fork:branch'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        stored,
+        ("fork".to_string(), "s".to_string(), Some("s".to_string()))
+    );
+
+    // The same submission again is recognized as equal rather than rewritten,
+    // which is the equality path reading the same column list.
+    apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![Relationship],
+        vec![record],
+    )?;
+    let rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM session_relationships WHERE relationship_uid = 'fork:branch'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(rows, 1);
+    Ok(())
+}
+
 /// A plugin snapshot must not leave the canonical project key null or stale.
 ///
 /// `apply_normalized` writes `session_events` rows straight from an adapter's

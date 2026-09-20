@@ -146,7 +146,42 @@
       "ts_ms": 1776815941000
     }
   ],
-  "session_relationships": [],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": null,
+      "child_session_id": null,
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/fork-branch-a.jsonl",
+      "evidence_ref": "sharedSessionId",
+      "identity_status": "unlinked",
+      "parent_session_id": "00000000-0000-0000-0000-000000000fff",
+      "relationship": "fork",
+      "relationship_uid": "fork:fork-branch-a",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776902400000
+    },
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": null,
+      "child_session_id": null,
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/fork-branch-b.jsonl",
+      "evidence_ref": "sharedSessionId",
+      "identity_status": "unlinked",
+      "parent_session_id": "00000000-0000-0000-0000-000000000fff",
+      "relationship": "fork",
+      "relationship_uid": "fork:fork-branch-b",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776902405000
+    }
+  ],
   "sessions": [
     {
       "agent_version": "2.1.97",

@@ -24,6 +24,7 @@ workspace_mod!(observations);
 workspace_mod!(privacy);
 workspace_mod!(source_evidence);
 workspace_mod!(relationship_graph);
+workspace_mod!(continuity);
 mod ingest;
 mod relationship_capture;
 workspace_mod!(diagnostics);
@@ -82,6 +83,10 @@ pub use store::{
 #[cfg(feature = "unstable-internal")]
 #[doc(hidden)]
 pub mod internal {
+    pub use crate::continuity::{
+        pending_reasons as continuity_pending_reasons, reconcile as reconcile_continuity,
+        ContinuityEvidence, ContinuityReconciliation, CONTINUITY_UNRESOLVED,
+    };
     pub use crate::ingest::*;
     pub use crate::relationship_capture::{record_relationship, ObservedRelationship};
     pub use crate::store::*;

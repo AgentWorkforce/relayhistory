@@ -99,20 +99,24 @@ server.tool('get_session_events', 'Get one bounded page of normalized events.', 
   after: z.object({ tsMs: z.number().int(), id: z.number().int() }).optional(),
 }, READ, ({ session_id, source, limit, after }) => call(() => getSessionEventsPage(session_id, { source, limit, after })));
 
+const RELATIONSHIP_KIND = z.enum(['delegated', 'materialized_local', 'continuation', 'fork', 'resume']);
+
 server.tool('get_session_relationships',
-  'Direct delegation relationships for one session, in both directions (as parent and as child).', {
+  'Direct relationships for one session: delegation in both directions (as parent and as child), plus the continuity edges (resume, fork, continuation) that connect it to the conversation it came from.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
 }, READ, ({ source, session_id }) => call(() => getSessionRelationships({ source, sessionId: session_id })));
 
 server.tool('get_session_tree',
-  'Complete descendant delegation tree for one session, with cycle protection and deterministic ordering. Child events are not flattened into the parent.', {
+  'Complete descendant tree for one session, with cycle protection and deterministic ordering. Follows delegation edges by default; pass relationship_kinds to also include resumed, continued, or forked descendants of the root. Child events are not flattened into the parent.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   max_depth: z.number().int().min(1).max(64).optional(),
   max_nodes: z.number().int().min(1).max(10000).optional(),
-}, READ, ({ source, session_id, max_depth, max_nodes }) => call(() => getSessionTree({
+  relationship_kinds: z.array(RELATIONSHIP_KIND).min(1).optional(),
+}, READ, ({ source, session_id, max_depth, max_nodes, relationship_kinds }) => call(() => getSessionTree({
   source, sessionId: session_id, maxDepth: max_depth, maxNodes: max_nodes,
+  relationshipKinds: relationship_kinds,
 })));
 
 const EVIDENCE_CURSOR = z.object({ tsMs: z.number().int().nullable().optional(), id: z.number().int() });
