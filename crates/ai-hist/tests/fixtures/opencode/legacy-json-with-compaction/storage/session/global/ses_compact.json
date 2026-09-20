@@ -1,0 +1,8 @@
+{
+  "id": "ses_compact",
+  "version": "1.0.0",
+  "projectID": "global",
+  "directory": "/tmp/project",
+  "title": "compaction fixture",
+  "time": { "created": 1776999000000, "updated": 1776999010000 }
+}

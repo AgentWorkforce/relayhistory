@@ -71,6 +71,12 @@ export interface NativeSessionEvent {
   model?: string
   tokenJson?: string
   eventUid: string
+  requestId?: string
+  stopReason?: string
+  agentVersion?: string
+  isSidechain?: boolean
+  isMeta?: boolean
+  turnId?: string
 }
 export interface EventCursor {
   tsMs: number

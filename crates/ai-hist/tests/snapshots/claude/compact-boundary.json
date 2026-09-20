@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "claude/compact-boundary.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/compact-boundary",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "hello",
+      "session_id": "compact-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "continue",
+      "session_id": "compact-session",
+      "source": "claude",
+      "timestamp_ms": 1776643203000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "compact-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "a `system` record with `subtype: compact_boundary` splits the transcript",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "compact-session",
+      "source": "claude",
+      "text": "hello",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "compact-session",
+      "source": "claude",
+      "text": "hi",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":200},\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":9000,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "compact-session",
+      "source": "claude",
+      "text": "continue",
+      "token_json": null,
+      "ts_ms": 1776643203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "compact-session",
+      "source": "claude",
+      "text": "ok",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":100},\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":300,\"input_tokens\":20,\"output_tokens\":5}",
+      "ts_ms": 1776643204000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "hello",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643204000,
+      "last_assistant_text": "ok",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/compact-boundary.jsonl",
+      "repo_url": null,
+      "session_id": "compact-session",
+      "source": "claude",
+      "source_stamp": "<n>:1599",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}
