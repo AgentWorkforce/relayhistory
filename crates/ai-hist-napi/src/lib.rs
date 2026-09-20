@@ -18,7 +18,7 @@ use ai_hist::{
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
     session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
-    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter,
+    stats_scoped_by as core_stats_scoped_by, HistoryEntry, QueryFilter,
     RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
     RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
@@ -34,7 +34,10 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+/// 16 adds `project_key` to catalog rows and session events, plus
+/// `project_key_method` on the catalog row and the `project_key` listing
+/// filter.
+pub const NATIVE_CONTRACT_VERSION: u32 = 16;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -251,6 +254,8 @@ pub struct NativeSessionEvent {
     pub source: String,
     pub session_id: String,
     pub project: Option<String>,
+    /// Canonical project identity, denormalized from the owning session.
+    pub project_key: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub message_id: Option<String>,
@@ -271,6 +276,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             source: event.source,
             session_id: event.session_id,
             project: event.project,
+            project_key: event.project_key,
             cwd: event.cwd,
             git_branch: event.git_branch,
             message_id: event.message_id,
@@ -434,6 +440,10 @@ pub struct NativeStats {
     pub total: i64,
     pub by_source: Vec<SourceCount>,
     pub by_project: Vec<ProjectCount>,
+    /// Which key `by_project` is bucketed by: `project_key` or `cwd`. Read it
+    /// rather than assuming -- the two produce different counts for the same
+    /// database.
+    pub grouped_by: String,
     pub first_timestamp_ms: Option<i64>,
     pub last_timestamp_ms: Option<i64>,
 }
@@ -443,6 +453,9 @@ pub struct StatsOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub tag: Option<String>,
+    /// Bucket `by_project` by the raw working directory instead of the
+    /// canonical project key. Defaults to false.
+    pub by_cwd: Option<bool>,
 }
 
 async fn read_database<T, F>(path: PathBuf, empty: T, operation: F) -> napi::Result<T>
@@ -709,7 +722,13 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
         scope: None,
         db_path: None,
         tag: None,
+        by_cwd: None,
     });
+    let grouping = if options.by_cwd.unwrap_or(false) {
+        ai_hist::ProjectGrouping::Cwd
+    } else {
+        ai_hist::ProjectGrouping::ProjectKey
+    };
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     read_database(
@@ -719,11 +738,12 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
             total: 0,
             by_source: Vec::new(),
             by_project: Vec::new(),
+            grouped_by: grouping.as_str().to_string(),
             first_timestamp_ms: None,
             last_timestamp_ms: None,
         },
         move |conn| {
-            let result = core_stats_scoped(conn, options.tag.as_deref(), scope)?;
+            let result = core_stats_scoped_by(conn, options.tag.as_deref(), scope, grouping)?;
             Ok(NativeStats {
                 scope: scope_name(scope),
                 total: result.total,
@@ -737,6 +757,7 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
                     .into_iter()
                     .map(|(project, count)| ProjectCount { project, count })
                     .collect(),
+                grouped_by: result.grouping.as_str().to_string(),
                 first_timestamp_ms: result.first_timestamp_ms,
                 last_timestamp_ms: result.last_timestamp_ms,
             })
@@ -764,6 +785,11 @@ pub struct CatalogSession {
     pub raw_path: Option<String>,
     pub source_stamp: Option<String>,
     pub discovery_state: String,
+    /// Canonical project identity: `host/owner/repo`, or the working
+    /// directory when no git remote resolves.
+    pub project_key: Option<String>,
+    /// `remote`, `path`, or `inherited`.
+    pub project_key_method: Option<String>,
     pub locations: Vec<String>,
     pub from_cache: bool,
 }
@@ -788,6 +814,8 @@ impl From<ai_hist::ShallowSession> for CatalogSession {
             raw_path: session.raw_path,
             source_stamp: session.source_stamp,
             discovery_state: session.discovery_state,
+            project_key: session.project_key,
+            project_key_method: session.project_key_method,
             locations: session.locations,
             from_cache: session.from_cache,
         }
@@ -809,6 +837,9 @@ pub struct ListCatalogOptions {
     pub limit: Option<i64>,
     pub before_ms: Option<i64>,
     pub after: Option<CatalogCursor>,
+    /// Exact canonical project key (`host/owner/repo`, or the working
+    /// directory when the checkout has no remote).
+    pub project_key: Option<String>,
 }
 
 #[napi(object)]
@@ -831,6 +862,7 @@ pub async fn list_session_catalog_page(
         limit: None,
         before_ms: None,
         after: None,
+        project_key: None,
     });
     validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
     let scope = parse_scope(options.scope)?;
@@ -845,6 +877,7 @@ pub async fn list_session_catalog_page(
             source: cursor.source,
             session_id: cursor.session_id,
         }),
+        project_key: options.project_key,
     };
     read_database_with_schema(
         path,

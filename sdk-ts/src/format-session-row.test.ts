@@ -7,6 +7,7 @@ const session: CatalogSession = {
   firstActivityMs: null, lastActivityMs: 0, firstPrompt: 'Fix the search', lastAssistantText: null,
   models: [], originator: null, agentVersion: null, repoUrl: null, initialCommit: null,
   workspaceRoots: [], rawPath: null, sourceStamp: null, discoveryState: 'shallow', fromCache: true,
+  projectKey: 'github.com/AgentWorkforce/relayhistory', projectKeyMethod: 'remote',
   locations: ['local'],
 };
 
