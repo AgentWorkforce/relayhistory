@@ -136,11 +136,29 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
     );
-    capture(directory, &config.history_url)?;
+    let paused = {
+        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        delivery::status(&conn, &config.job_id)?.state == "paused"
+    };
+    if paused {
+        ensure!(
+            ai_hist::sync_local_at(&directory.join("history.db"))?,
+            "capture not complete"
+        );
+    } else {
+        capture(directory, &config.history_url)?;
+    }
+    super::bridge::enforce_selection(directory, config)?;
     deliver_captured(directory, config, false)
 }
 
 pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
+    {
+        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        if delivery::status(&conn, &config.job_id)?.state == "paused" {
+            return Ok(());
+        }
+    }
     ensure!(
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
@@ -152,6 +170,9 @@ pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) ->
     {
         let conn = ai_hist::open_db(&db_path)?;
         let job = delivery::status(&conn, &config.job_id)?;
+        if job.state == "paused" {
+            return Ok(());
+        }
         ensure!(
             job.config.account_id == config.delivery_account
                 && job.config.mapping_version == destination::MAPPING_VERSION,
@@ -175,13 +196,14 @@ pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) ->
         progress.finish(result.is_ok());
     }
     let status = result?;
-    println!(
+    humanln!(
         "Probe connected: {} records received, {} queued.",
-        status.acknowledged_records, status.pending_records
+        status.acknowledged_records,
+        status.pending_records
     );
     Ok(())
 }
-fn running(directory: &Path) -> Result<bool> {
+pub(super) fn running(directory: &Path) -> Result<bool> {
     if !directory.join("collector.lock").exists() {
         return Ok(false);
     }
@@ -196,7 +218,7 @@ fn running(directory: &Path) -> Result<bool> {
     }
 }
 pub fn print_status(directory: &Path) -> Result<()> {
-    println!(
+    humanln!(
         "{}",
         if running(directory)? {
             "Probe is running."
@@ -208,7 +230,7 @@ pub fn print_status(directory: &Path) -> Result<()> {
 }
 pub fn stop(directory: &Path) -> Result<()> {
     if !running(directory)? {
-        println!("Probe is stopped.");
+        humanln!("Probe is stopped.");
         return Ok(());
     }
     let runtime: serde_json::Value =
@@ -222,7 +244,7 @@ pub fn stop(directory: &Path) -> Result<()> {
     )?;
     for _ in 0..45 {
         if !running(directory)? {
-            println!("Probe stopped.");
+            humanln!("Probe stopped.");
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -243,8 +265,12 @@ extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
-    let config = read_config(directory)?;
     let _lock = lock(directory)?;
+    ensure!(
+        !directory.join("sharing-change.json").exists(),
+        "sharing update incomplete"
+    );
+    let config = read_config(directory)?;
     std::env::set_var("RELAYHISTORY_HOME", directory);
     #[cfg(unix)]
     unsafe {
@@ -273,6 +299,13 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         } else {
             deliver_captured(directory, &config, false)
         };
+        save_json(
+            &directory.join("cycle.json"),
+            &json!({
+                "at_ms":now(), "ok":result.is_ok(),
+                "message":if result.is_err() { Some("Sync paused or offline. Retrying; local data remains queued.") } else { None }
+            }),
+        )?;
         if result.is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");
         }
@@ -339,12 +372,14 @@ pub fn start_background(directory: &Path) -> Result<()> {
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
             .is_some_and(|value| value["startup_id"] == startup_id && value["ready"] == true);
         if ready {
-            println!("Probe is running in the background. You can close this terminal.");
-            println!("Run setup again after restarting the computer.");
+            humanln!("Probe is running in the background. You can close this terminal.");
+            humanln!("Run setup again after restarting the computer.");
             let config = read_config(directory)?;
-            println!(
+            humanln!(
                 "Stop: agent-relay-probe stop --site-url {} --workspace {} --account {}",
-                config.site_url, config.workspace_id, config.account_id
+                config.site_url,
+                config.workspace_id,
+                config.account_id
             );
             return Ok(());
         }
