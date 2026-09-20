@@ -1589,7 +1589,7 @@ fn codex_child_scan_complete(directory: &Path) -> Result<bool> {
         let Some(day) = sorted_dirs(&month)?.pop() else {
             continue;
         };
-        if !date_key(&day).is_some_and(|key| key <= through) {
+        if date_key(&day).is_none_or(|key| key > through) {
             return Ok(false);
         }
     }
