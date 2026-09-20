@@ -535,6 +535,40 @@ fn a_refusal_predating_a_baseline_reinstall_is_not_cleared_by_it() {
     );
 }
 
+/// A turn can be refused twice, once on either side of a baseline reinstall,
+/// and the two refusals are owed against *different* baselines. Holding one
+/// slot per turn meant the second overwrote the first and inherited the newer
+/// generation, so the next measured delta — which covers only that newer span
+/// — cleared a refusal that in truth predated the reinstall. The turn ended
+/// with no measurement and no refusal again, by a different route.
+#[test]
+fn a_second_refusal_does_not_erase_one_owed_against_an_older_baseline() {
+    let conn = codex_store("codex/refusal-overwritten-after-reinstall.jsonl");
+    let stored = assistant_usage(&conn);
+    assert_eq!(stored.len(), 2, "two turns");
+
+    let first = usage_of(&stored, "First answer.")
+        .expect("the refused turn is not silenced by its own second refusal");
+    assert!(
+        first.contains("55.5"),
+        "it keeps the first thing that went wrong for it, which predates the \
+         reinstall and is what the later delta cannot account for: {first}"
+    );
+    assert!(
+        !first.contains("-7"),
+        "not the later one, whose span the delta does cover: {first}"
+    );
+    let second = usage_of(&stored, "Second answer.").expect("the second turn was measured");
+    let delta = crate::usage::normalize_usage_str("codex", &second)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (delta.input_tokens, delta.output_tokens),
+        (400, 140),
+        "measured from the installed baseline: {second}"
+    );
+}
+
 /// A resumed rollout opens with the cumulative total it carried over. If that
 /// snapshot is unreadable there is no baseline, and differencing the next good
 /// one against zero charges the whole carried-over history to a single

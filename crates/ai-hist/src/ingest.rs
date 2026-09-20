@@ -2122,6 +2122,69 @@ impl CodexTokenTotals {
     }
 }
 
+/// One Codex snapshot that could not be differenced, recorded as it arrived.
+///
+/// The log is **append-only**: an entry is never edited, replaced or removed
+/// while the rollout is being read. Nothing is decided during ingestion — the
+/// refusals are computed once, at the end, by [`surviving_refusals`].
+///
+/// Four defects in a row came from deciding incrementally instead: attaching a
+/// refusal immediately stole the turn a later snapshot was owed; holding a
+/// single slot let one turn's refusal overwrite another's; clearing every held
+/// refusal on a measured delta dropped ones the delta could not account for;
+/// and clearing by generation still let a second refusal for one turn inherit
+/// a newer generation than the evidence supported. Each fix was locally right
+/// and produced the next defect, because the rule lived in three places and
+/// nowhere in full.
+struct UnreadableSnapshot {
+    /// The assistant event waiting for a measurement when this arrived. That
+    /// is the turn this snapshot failed to measure, named now rather than
+    /// looked up later, because the waiting slot moves on as turns appear.
+    uid: String,
+    /// Which baseline `prev_totals` held at that moment — see
+    /// `baseline_generation`.
+    generation: u64,
+    /// The provider's own object, verbatim, so the request can report what was
+    /// rejected rather than a zero that reads like a measurement.
+    raw: String,
+}
+
+/// **The invariant.** A turn keeps a refusal exactly when no measured delta
+/// was differenced from the baseline generation that refusal was recorded
+/// under.
+///
+/// Everything the ingest loop knows about refusals is in its two arguments,
+/// and this is the only place that interprets them.
+///
+/// Why the generation is the whole test: an unreadable snapshot does not
+/// advance the baseline, so a delta differenced from generation `g` spans
+/// every refusal recorded under `g` — those turns' spend is reported inside
+/// that delta's request and they are owed nothing. A baseline *reinstall*
+/// advances it without measuring anything, absorbing every earlier span into
+/// itself, so no later delta can ever account for a refusal recorded under an
+/// older generation. Those survive.
+///
+/// A turn refused more than once keeps the **earliest** surviving refusal: it
+/// is the first thing that went wrong for that turn, and a later one is a
+/// consequence. Crucially a later refusal never erases an earlier one, which
+/// is only true because the log is append-only.
+fn surviving_refusals(
+    log: &[UnreadableSnapshot],
+    measured_generations: &HashSet<u64>,
+) -> Vec<(String, String)> {
+    let mut refused = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in log {
+        if measured_generations.contains(&entry.generation) {
+            continue;
+        }
+        if seen.insert(entry.uid.as_str()) {
+            refused.push((entry.uid.clone(), entry.raw.clone()));
+        }
+    }
+    refused
+}
+
 /// Attach measured usage to the assistant event that earned it, or hold it
 /// until one appears.
 fn attach_codex_usage(
@@ -2196,20 +2259,15 @@ pub(crate) fn ingest_codex_rollout(
     let mut model: Option<String> = None;
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut pending_usage: Option<PendingCodexUsage> = None;
-    // Snapshots that could not be differenced, keyed by the assistant event
-    // that was waiting for a measurement when each arrived, and tagged with
-    // the baseline they were measured against.
-    //
-    // Keyed, not single: two turns can go unmeasured before anything
-    // recovers, and one slot meant the second overwrote the first, leaving a
-    // turn with a null measurement — which reads as evidence never reported
-    // rather than evidence rejected. Keyed by the *waiting* event rather than
-    // read at the end, because the slot moves on as new turns appear and
-    // flushing onto whatever occupies it then marks the wrong turn.
-    let mut unusable_snapshots: HashMap<String, (u64, String)> = HashMap::new();
+    // Every snapshot that could not be differenced, in arrival order and never
+    // rewritten, plus the baselines a delta was actually measured from. These
+    // two are facts about the rollout; what they *mean* is decided once, after
+    // the loop, by `surviving_refusals` — which is the only place the rule
+    // lives.
+    let mut unreadable_snapshots: Vec<UnreadableSnapshot> = Vec::new();
+    let mut measured_generations: HashSet<u64> = HashSet::new();
     // Which baseline `prev_totals` currently holds. Bumped every time it is
-    // replaced, so a refusal can say which baseline it was owed against — see
-    // the clear on a measured delta for why that distinction is load-bearing.
+    // replaced, so each fact above can name the baseline it belongs to.
     let mut baseline_generation: u64 = 0;
     // Set when a snapshot is unreadable while no baseline has been
     // established. A resumed rollout opens with the cumulative total it
@@ -2377,14 +2435,17 @@ pub(crate) fn ingest_codex_rollout(
                         // snapshot's delta already covers this whole span;
                         // the number is recoverable and the turn must get it.
                         //
-                        // It is only remembered — against the turn it belongs
-                        // to — and only surfaces at the end of the rollout if
-                        // nothing ever superseded it; see the flush after the
-                        // loop. With no turn waiting, it measured a span no
-                        // turn is missing and there is nothing to remember.
+                        // It is only recorded. Whether it ends up refusing
+                        // anything is `surviving_refusals`' decision, taken
+                        // once the whole rollout is known. With no turn
+                        // waiting, it measured a span no turn is missing and
+                        // there is nothing to record.
                         if let Some(uid) = &untokened_assistant_uid {
-                            unusable_snapshots
-                                .insert(uid.clone(), (baseline_generation, usage.to_string()));
+                            unreadable_snapshots.push(UnreadableSnapshot {
+                                uid: uid.clone(),
+                                generation: baseline_generation,
+                                raw: usage.to_string(),
+                            });
                         }
                         // With no baseline yet, this was the resume snapshot,
                         // and nothing now says where the session started.
@@ -2413,9 +2474,9 @@ pub(crate) fn ingest_codex_rollout(
                             // This installs a baseline without measuring, so
                             // everything spent up to here — a refused turn
                             // included — is absorbed into it and can never
-                            // appear in a later delta. Bumping the generation
-                            // is what keeps that turn's refusal from being
-                            // cleared by a delta that does not cover it.
+                            // appear in a later delta. The generation bump is
+                            // what records that, and `surviving_refusals` is
+                            // what acts on it.
                             baseline_generation += 1;
                         }
                         // A regressed snapshot is treated as a transient
@@ -2429,28 +2490,13 @@ pub(crate) fn ingest_codex_rollout(
                             let baseline = prev_totals.unwrap_or_default();
                             let measured = totals.minus(&baseline);
                             prev_totals = Some(totals);
-                            // An unreadable snapshot does not advance the
-                            // baseline, so this delta is measured from the
-                            // point before every refusal held *against that
-                            // same baseline*: its value already covers their
-                            // spans. Nothing was lost and those turns are owed
-                            // no refusal — their spend is reported inside this
-                            // request. Keeping them would put an unreadable
-                            // request into a session measured end to end,
-                            // which is how a glitch while `agent_reasoning`
-                            // held the waiting slot came to flag a turn its own
-                            // `agent_message` had been measured for.
-                            //
-                            // Only against that same baseline, though. A
-                            // reinstall (above) replaces `prev_totals` without
-                            // measuring anything, absorbing every earlier span
-                            // into itself, so a delta from the new baseline
-                            // covers none of them. Clearing an older refusal
-                            // here would leave its turn looking unused rather
-                            // than rejected, with its spend in no request at
-                            // all.
-                            unusable_snapshots
-                                .retain(|_, (generation, _)| *generation < baseline_generation);
+                            // Record which baseline was measured from, and
+                            // only when something really was measured — the
+                            // `None` arm below produces no delta, so it spans
+                            // nothing and settles nothing.
+                            if measured.is_some() {
+                                measured_generations.insert(baseline_generation);
+                            }
                             baseline_generation += 1;
                             let next = match measured {
                                 Some(delta) => match pending_usage.take() {
@@ -2689,12 +2735,10 @@ pub(crate) fn ingest_codex_rollout(
             _ => {}
         }
     }
-    // Nothing superseded these, so each surfaces on the turn that was waiting
-    // when its snapshot arrived — named at that moment, not looked up now,
-    // because the waiting slot has since moved on. `token_json IS NULL` keeps
-    // a refusal from overwriting a real measurement that turn acquired by
-    // another route.
-    for (uid, (_, raw)) in unusable_snapshots {
+    // The whole rollout is known, so the refusals can be worked out from what
+    // was recorded. `token_json IS NULL` keeps one from overwriting a real
+    // measurement the turn acquired by another route.
+    for (uid, raw) in surviving_refusals(&unreadable_snapshots, &measured_generations) {
         conn.execute(
             "UPDATE session_events SET token_json = ? \
              WHERE source = 'codex' AND session_id = ? AND event_uid = ? \
@@ -4871,6 +4915,77 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+    fn refusal(uid: &str, generation: u64, raw: &str) -> UnreadableSnapshot {
+        UnreadableSnapshot {
+            uid: uid.to_string(),
+            generation,
+            raw: raw.to_string(),
+        }
+    }
+
+    /// The whole refusal rule, read directly rather than through a rollout.
+    ///
+    /// Four rounds of review found four different ways to get this wrong while
+    /// it was spread across the ingest loop. It is one function now, and this
+    /// is the test that says what it means — a reviewer has one thing to
+    /// check.
+    #[test]
+    fn a_refusal_survives_exactly_when_no_delta_was_measured_from_its_baseline() {
+        let log = vec![
+            refusal("a", 0, "{\"first\":true}"),
+            refusal("b", 1, "{\"second\":true}"),
+            refusal("c", 2, "{\"third\":true}"),
+        ];
+
+        // Nothing measured: every turn is owed its refusal.
+        assert_eq!(
+            surviving_refusals(&log, &HashSet::new())
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        // A delta from generation 1 spans only what was recorded under 1.
+        let measured = HashSet::from([1]);
+        assert_eq!(
+            surviving_refusals(&log, &measured)
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "a generation that was measured settles its own refusals and no others"
+        );
+
+        // Measuring a generation nothing was recorded under changes nothing.
+        assert_eq!(surviving_refusals(&log, &HashSet::from([7])).len(), 3);
+    }
+
+    /// One turn, refused on either side of a baseline reinstall. The later
+    /// refusal must not stand in for the earlier one: the delta that follows
+    /// covers the newer generation only, and the earlier span was absorbed
+    /// into the reinstalled baseline where no delta can reach it.
+    #[test]
+    fn a_later_refusal_never_erases_an_earlier_one_for_the_same_turn() {
+        let log = vec![
+            refusal("a", 0, "{\"before\":true}"),
+            refusal("a", 1, "{\"after\":true}"),
+        ];
+        let surviving = surviving_refusals(&log, &HashSet::from([1]));
+        assert_eq!(
+            surviving,
+            vec![("a".to_string(), "{\"before\":true}".to_string())],
+            "the pre-reinstall refusal survives, and is what the turn reports"
+        );
+
+        // And when both are settled, the turn is silent rather than refused:
+        // its spend is inside the requests those deltas produced.
+        assert!(surviving_refusals(&log, &HashSet::from([0, 1])).is_empty());
+
+        // One entry per turn either way — a turn has one `token_json`.
+        assert_eq!(surviving_refusals(&log, &HashSet::new()).len(), 1);
+    }
+
     fn saved_cursor_offset(value: &Value) -> u64 {
         match super::FileCursor::decode(value).expect("valid file cursor") {
             super::DecodedFileCursor::Legacy(offset) => offset,

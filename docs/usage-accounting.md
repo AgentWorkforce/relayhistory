@@ -84,41 +84,52 @@ indistinguishable from a reported zero. A counter above `i64::MAX` is still a
 valid count and is preserved; it is refused later, at the JavaScript boundary
 that genuinely cannot carry it.
 
-An unreadable snapshot is a transient glitch, like a regressed one, and does
-not decide anything about the turn waiting for its measurement. It is held,
-not attached, and remembered **against the turn that was waiting when it
-arrived** — several turns can go unmeasured before anything recovers, and each
-keeps its own refusal rather than overwriting the last.
+### When an unreadable snapshot refuses a turn
 
-Because an unreadable snapshot does not advance the baseline, the next readable
-one is measured from the point before every refusal held **against that same
-baseline**: its delta already covers their spans. So a measured delta
-supersedes those. Nothing is lost — an earlier turn's spend is reported inside the recovering turn's
-request — and no turn is marked as rejected in a session that was in fact
-measured end to end. This is what keeps a glitch that arrives while
-`agent_reasoning` holds the waiting slot from flagging a turn that its own
-`agent_message` was measured for.
+An unreadable snapshot is a transient glitch, like a regressed one. It decides
+nothing on arrival: it is **recorded**, against the turn that was waiting for a
+measurement and the baseline in force at that moment. Baselines are numbered,
+and the number changes every time `prev_totals` is replaced. Nothing is ever
+rewritten or removed while the rollout is read.
 
-Refusals surface only at the end of the rollout, each on the turn it belonged
-to, and only for turns nothing ever recovered. A turn with no measurement and
-no refusal means its spend was folded into a later request; a turn carrying
-the provider's own unreadable object means the figure was rejected. The two
-are different answers and the store keeps them different.
+> **The invariant.** A turn keeps a refusal exactly when no measured delta was
+> differenced from the baseline generation that refusal was recorded under.
+
+Everything else follows from it, and `ingest.rs::surviving_refusals` is the one
+place that applies it — a reviewer has a single function to check.
+
+- An unreadable snapshot does not advance the baseline, so a delta differenced
+  from generation *g* spans every refusal recorded under *g*. Those turns are
+  owed nothing: their spend is reported inside that delta's request. This is
+  what stops a glitch arriving while `agent_reasoning` holds the waiting slot
+  from flagging a turn its own `agent_message` was measured for.
+- A baseline **reinstall** advances the baseline without measuring anything,
+  absorbing every earlier span into itself, so no later delta can account for a
+  refusal recorded under an older generation. Those survive.
+- A turn refused more than once keeps the earliest surviving refusal — the
+  first thing that went wrong for it. A later refusal never erases an earlier
+  one, which holds only because the record is append-only.
+
+Refusals are applied at the end of the rollout, each to the turn it was
+recorded against. The store therefore says three distinct things, and they are
+different answers:
+
+| the turn's `token_json` | what it means |
+| --- | --- |
+| a delta | the measurement for that request |
+| absent | the spend was folded into a later request |
+| the provider's own unreadable object | the figure was rejected, and nothing recovered it |
 
 If the *first* snapshot is unreadable there is no baseline at all, so the next
-readable one installs one and measures nothing. Differencing it from zero
-would report a resumed session's whole carried-over total as a single
-request's spend.
+readable one installs one and measures nothing. Differencing it from zero would
+report a resumed session's whole carried-over total as a single request's
+spend.
 
-That install is the one case where "the baseline does not move" stops holding,
-and it is why refusals are tagged with the baseline they were owed against. The
-reinstall absorbs every earlier span into itself, so a later delta measured
-from the new baseline covers none of them: a refusal recorded *before* the
-reinstall survives it, and is cleared only by a delta measured from the same
-baseline it was held against. Without that tag, a turn refused between an
-unreadable opening snapshot and the reinstall was left with no measurement and
-no refusal — reading as unused when in fact its spend was in no request at
-all.
+This rule replaced four successive attempts to decide refusals while reading
+the rollout — attach on arrival, one slot per rollout, clear every held refusal
+on a delta, clear by generation. Each was a correct response to the defect
+before it and introduced the next, because the rule lived in three places and
+nowhere in full. Record the facts, decide once.
 
 `input_tokens` in a Codex record stays *inclusive* of `cached_input_tokens`
 even after differencing. Normalization makes it exclusive, so a consumer that
