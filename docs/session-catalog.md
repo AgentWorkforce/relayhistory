@@ -568,8 +568,33 @@ How each adapter works:
   database leaves the state file behind, and a stamp read alone would answer
   "already done" for a session with no rows at all — for a finished session,
   forever. Plain `sync` records the session id beside each stamp and re-reads
-  the directory when `session_events` holds nothing for it, the same guard the
-  Codex and Claude walks apply.
+  the directory when the evidence is gone, the same guard the Codex and Claude
+  walks apply. "The evidence" means what Grok actually writes: not every
+  session produces `session_events` — one made only of `system` lines,
+  synthetic turns or encrypted reasoning is stored entirely as markers — so
+  the check covers `session_markers` too, and the state entry records whether
+  the indexing run wrote any evidence at all. Asking only about events would
+  re-read a marker-only session on every run for ever, which is the thing the
+  guard exists to prevent.
+
+  **Markers are delivered like any other evidence.** `session_markers` is in
+  `delivery::schema::TABLES`, so durable delivery bootstraps and journals it
+  and an export of a Grok session carries its compaction boundaries alongside
+  its events. The entry is **appended** to that list and must stay last:
+  `delivery_jobs.bootstrap_kind` is a persisted index into it, so inserting a
+  row anywhere else silently re-points every in-flight job's bootstrap cursor
+  at a different table. The delivery kind is `session_marker`, in
+  `SUPPORTED_KINDS` and in the TypeScript `HistoryEvidenceKind`.
+
+  **One rule decides what a JSONL row is, in `ingest::jsonl`.** Two passes read
+  the same files — the parse, which turns rows into evidence, and the count,
+  which reports `records_parsed` — and when they each decided for themselves
+  they disagreed: the parse read a valid final record with no trailing
+  newline, while the count stopped at the missing newline without testing it,
+  so a transcript ending in an unterminated record reported one record fewer
+  than had just been read, and that figure was checkpointed. Both now call
+  `jsonl::classify`. The count still streams, because an `updates.jsonl` must
+  not be held in memory; only the rule is shared.
 
   **Repeated prompts at one timestamp are one `history` row.** `history` is
   keyed `UNIQUE(source, timestamp_ms, prompt)`, without `session_id`, so two
