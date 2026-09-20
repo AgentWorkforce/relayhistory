@@ -86,6 +86,11 @@ source without deciding which one fails the test.
 | --- | --- | --- | --- |
 | `claude/simple-turn` | burn | `claude/simple-turn.jsonl` | one user turn and one complete assistant turn with full usage, preceded by a `permission-mode` control record |
 | `claude/multi-block-turn` | burn | `claude/multi-block-turn.jsonl` | four assistant records share one `message.id` and one `requestId`; only the first carries the usage payload |
+| `claude/multi-block-turn-no-request-id` | relayhistory | `claude/multi-block-turn-no-request-id.jsonl` | assistant records omit `requestId` but share one `message.id`, which is the fallback request identity |
+| `claude/padded-request-id` | relayhistory | `claude/padded-request-id.jsonl` | two request ids differ only by surrounding whitespace and must remain distinct grouping keys |
+| `claude/multi-record-request` | relayhistory | `claude/multi-record-request.jsonl` | two assistant records copy one request's usage, which prompt attribution must charge exactly once |
+| `claude/multi-record-bad-copy` | relayhistory | `claude/multi-record-bad-copy.jsonl` | one request has a readable usage copy and an unreadable sibling, so its measurement is disputed |
+| `claude/multi-record-broken-sibling` | relayhistory | `claude/multi-record-broken-sibling.jsonl` | one request record has broken ancestry while a sibling establishes both ownership and usage |
 | `claude/interleaved-turns` | burn | `claude/interleaved-turns.jsonl` | two assistant messages interleave their blocks instead of arriving contiguously |
 | `claude/incomplete-then-complete` | burn | `claude/incomplete-then-complete.jsonl` | a complete assistant message is followed by an in-progress one (`stop_reason: null`) |
 | `claude/files-touched` | burn | `claude/files-touched.jsonl` | two Read tool uses and a Grep in one assistant message — three calls, no file mutated |
@@ -128,6 +133,17 @@ source without deciding which one fails the test.
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |
 | `codex/parent-thread-id` | relayhistory | `codex/parent-thread-id` | a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent` |
 | `codex/archived-session` | relayhistory | `codex/archived-session` | a rollout under `~/.codex/archived_sessions/`, the second codex discovery root |
+| `codex/counter-regressed` | relayhistory | `codex/counter-regressed.jsonl` | a cached-input counter grows faster than total input, making the cumulative delta unnormalizable |
+| `codex/counter-negative` | relayhistory | `codex/counter-negative.jsonl` | a cumulative snapshot contains a negative input counter that must be preserved and refused |
+| `codex/counter-fractional` | relayhistory | `codex/counter-fractional.jsonl` | a cumulative snapshot contains a fractional output counter that must be preserved and refused |
+| `codex/counter-above-i64` | relayhistory | `codex/counter-above-i64.jsonl` | a valid cumulative counter exceeds `i64::MAX` and must survive parsing as a `u64` |
+| `codex/counter-recovers` | relayhistory | `codex/counter-recovers.jsonl` | an unreadable cumulative snapshot is superseded by a later valid snapshot for the same waiting turn |
+| `codex/counter-unusable-then-new-turn` | relayhistory | `codex/counter-unusable-then-new-turn.jsonl` | a later advancing delta covers an earlier unreadable snapshot and clears only refusals in that span |
+| `codex/reasoning-then-unreadable` | relayhistory | `codex/reasoning-then-unreadable.jsonl` | a reasoning row waits through an unreadable snapshot before a valid delta measures the turn |
+| `codex/refusal-across-baseline-reinstall` | relayhistory | `codex/refusal-across-baseline-reinstall.jsonl` | a refusal predating a cumulative-baseline reinstall must not be cleared by a later delta |
+| `codex/refusal-overwritten-after-reinstall` | relayhistory | `codex/refusal-overwritten-after-reinstall.jsonl` | two refusals for one turn straddle a baseline reinstall and remain tied to their own generations |
+| `codex/resume-baseline-corrupt` | relayhistory | `codex/resume-baseline-corrupt.jsonl` | a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta |
+| `codex/two-unreadable-turns` | relayhistory | `codex/two-unreadable-turns.jsonl` | two unrecovered turns each retain their own unreadable usage refusal |
 
 ### `cursor`
 

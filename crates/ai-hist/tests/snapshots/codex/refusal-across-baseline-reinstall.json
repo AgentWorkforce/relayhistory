@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "codex/refusal-across-baseline-reinstall.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/refusal-across-baseline-reinstall",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "first",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "timestamp_ms": 1776682800300
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "second",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "timestamp_ms": 1776682802000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a refusal predating a cumulative-baseline reinstall must not be cleared by a later delta",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "text": "first",
+      "token_json": null,
+      "ts_ms": 1776682800300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "5:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "5:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "text": "First answer.",
+      "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":900,\"output_tokens\":55.5,\"reasoning_output_tokens\":0,\"total_tokens\":955}",
+      "ts_ms": 1776682800900
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "8:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "8:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "text": "second",
+      "token_json": null,
+      "ts_ms": 1776682802000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "9:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "9:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "text": "Second answer.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":0,\"input_tokens\":400,\"output_tokens\":140,\"reasoning_output_tokens\":0,\"total_tokens\":540}",
+      "ts_ms": 1776682802900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776682800000,
+      "first_prompt": "first",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776682804000,
+      "last_assistant_text": "Second answer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-refusal-across-baseline-reinstall.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_reinstall",
+      "source": "codex",
+      "source_stamp": "<n>:1921",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

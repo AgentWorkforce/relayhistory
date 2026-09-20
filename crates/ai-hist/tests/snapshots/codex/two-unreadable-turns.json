@@ -1,38 +1,38 @@
 {
   "corpus_files": [
-    "codex/compaction.jsonl"
+    "codex/two-unreadable-turns.jsonl"
   ],
   "discovery_diagnostics": [],
   "file_edits": [],
-  "fixture": "codex/compaction",
+  "fixture": "codex/two-unreadable-turns",
   "history": [
     {
       "project": "/tmp/project",
-      "prompt": "start",
-      "session_id": "sess_codex_compact",
+      "prompt": "first",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "timestamp_ms": 1776654000300
+      "timestamp_ms": 1776675600300
     },
     {
       "project": "/tmp/project",
-      "prompt": "keep going",
-      "session_id": "sess_codex_compact",
+      "prompt": "second",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "timestamp_ms": 1776654004200
+      "timestamp_ms": 1776675602000
     }
   ],
   "hydration": [
     {
       "related_session_ids": [],
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
       "status": "hydrated"
     }
   ],
   "layout": "CodexRollout",
   "notes": [],
-  "origin": "burn",
-  "quirk": "a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn",
+  "origin": "relayhistory",
+  "quirk": "two unrecovered turns each retain their own unreadable usage refusal",
   "session_events": [
     {
       "cwd": "/tmp/project",
@@ -44,11 +44,11 @@
       "parent_id": null,
       "project": "/tmp/project",
       "role": "user",
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "text": "start",
+      "text": "first",
       "token_json": null,
-      "ts_ms": 1776654000300
+      "ts_ms": 1776675600300
     },
     {
       "cwd": "/tmp/project",
@@ -60,43 +60,43 @@
       "parent_id": null,
       "project": "/tmp/project",
       "role": "assistant",
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "text": "Reading the repository.",
-      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":1000,\"input_tokens\":3000,\"output_tokens\":200,\"reasoning_output_tokens\":50,\"total_tokens\":3200}",
-      "ts_ms": 1776654000900
+      "text": "First answer.",
+      "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":-1,\"output_tokens\":70,\"reasoning_output_tokens\":0,\"total_tokens\":69}",
+      "ts_ms": 1776675600900
     },
     {
       "cwd": "/tmp/project",
-      "event_uid": "11:user_message",
+      "event_uid": "6:user_message",
       "git_branch": null,
       "kind": "text",
-      "message_id": "11:user_message",
+      "message_id": "6:user_message",
       "model": null,
       "parent_id": null,
       "project": "/tmp/project",
       "role": "user",
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "text": "keep going",
+      "text": "second",
       "token_json": null,
-      "ts_ms": 1776654004200
+      "ts_ms": 1776675602000
     },
     {
       "cwd": "/tmp/project",
-      "event_uid": "12:agent_message",
+      "event_uid": "7:agent_message",
       "git_branch": null,
       "kind": "text",
-      "message_id": "12:agent_message",
+      "message_id": "7:agent_message",
       "model": "gpt-5.4",
       "parent_id": null,
       "project": "/tmp/project",
       "role": "assistant",
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "text": "Continuing after compaction.",
-      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":500,\"input_tokens\":3500,\"output_tokens\":250,\"reasoning_output_tokens\":40,\"total_tokens\":3750}",
-      "ts_ms": 1776654004900
+      "text": "Second answer.",
+      "token_json": "{\"cached_input_tokens\":0,\"input_tokens\":200,\"output_tokens\":90.5,\"reasoning_output_tokens\":0,\"total_tokens\":290}",
+      "ts_ms": 1776675602900
     }
   ],
   "session_relationships": [],
@@ -105,19 +105,19 @@
       "agent_version": null,
       "cwd": "/tmp/project",
       "discovery_state": "full",
-      "first_activity_ms": 1776654000000,
-      "first_prompt": "start",
+      "first_activity_ms": 1776675600000,
+      "first_prompt": "first",
       "git_branch": null,
       "initial_commit": null,
-      "last_activity_ms": 1776654006000,
-      "last_assistant_text": "Continuing after compaction.",
+      "last_activity_ms": 1776675606000,
+      "last_assistant_text": "Second answer.",
       "models_json": "[\"gpt-5.4\"]",
       "originator": null,
-      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-compaction.jsonl",
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-two-unreadable-turns.jsonl",
       "repo_url": null,
-      "session_id": "sess_codex_compact",
+      "session_id": "sess_codex_two_bad",
       "source": "codex",
-      "source_stamp": "<n>:2246",
+      "source_stamp": "<n>:1443",
       "workspace_roots_json": null
     }
   ],

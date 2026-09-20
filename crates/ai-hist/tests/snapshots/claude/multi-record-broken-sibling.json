@@ -1,0 +1,115 @@
+{
+  "corpus_files": [
+    "claude/multi-record-broken-sibling.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/multi-record-broken-sibling",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "one link missing",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "one request record has broken ancestry while a sibling establishes both ownership and usage",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "one link missing",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1a:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1a",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Working on it.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":7,\"output_tokens\":40}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1b:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1b",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-asst-never-stored",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Bash true",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":7,\"output_tokens\":40}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "one link missing",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643201000,
+      "last_assistant_text": "Working on it.",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/multi-record-broken-sibling.jsonl",
+      "repo_url": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "source_stamp": "<n>:1505",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"true\"}",
+      "is_error": null,
+      "message_id": "u-asst-1b",
+      "name": "Bash",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "target": "true",
+      "tool_use_id": "toolu_broken_1",
+      "ts_ms": 1776643201000
+    }
+  ]
+}
