@@ -1198,11 +1198,12 @@ fn sync_basic(
     if report
         .capture(
             "claude-metadata",
-            sync_claude_session_metadata_with_repairs(
+            sync_claude_session_metadata_with_repairs_and_coverage(
                 conn,
                 &mut state,
                 &roots.claude.join("projects"),
                 &repairs,
+                &mut coverage,
             ),
         )
         .is_some()
@@ -1212,7 +1213,13 @@ fn sync_basic(
     capture_progress("codex", 0, None);
     if let Some(inserted) = report.capture(
         "codex",
-        sync_codex_with_repairs(conn, &mut state, &roots.codex, &repairs),
+        sync_codex_with_repairs_and_coverage(
+            conn,
+            &mut state,
+            &roots.codex,
+            &repairs,
+            &mut coverage,
+        ),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -2609,14 +2616,26 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, root: &Path) ->
     sync_codex_with_repairs(conn, state, root, &SweepRepairs::default())
 }
 
+#[cfg(test)]
 fn sync_codex_with_repairs(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     repairs: &SweepRepairs,
 ) -> Result<usize> {
+    let mut coverage = SweepCoverage::default();
+    sync_codex_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+}
+
+fn sync_codex_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
     let (cwds, branches, mut inserted) =
-        sync_codex_rollouts_with_repairs(conn, state, root, repairs)?;
+        sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, coverage)?;
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
@@ -2778,11 +2797,23 @@ fn sync_codex_rollouts(
     sync_codex_rollouts_with_repairs(conn, state, root, &SweepRepairs::default())
 }
 
+#[cfg(test)]
 fn sync_codex_rollouts_with_repairs(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     repairs: &SweepRepairs,
+) -> Result<CodexRolloutWalk> {
+    let mut coverage = SweepCoverage::default();
+    sync_codex_rollouts_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+}
+
+fn sync_codex_rollouts_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -3041,6 +3072,9 @@ fn sync_codex_rollouts_with_repairs(
     }
     crate::continuity::reconcile(conn, "codex")?;
     record_raw_facts_backfill(state, CODEX_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if !walked_every_known_root {
+        coverage.note_unread();
+    }
     if scanned > 0 {
         sync_note!(
             "  [codex-rollouts] scanned {scanned} files; +{inserted} prompts, +{events} events"
@@ -4161,16 +4195,41 @@ fn sync_claude_session_metadata(
     sync_claude_session_metadata_with_repairs(conn, state, root, &SweepRepairs::default())
 }
 
+#[cfg(test)]
 fn sync_claude_session_metadata_with_repairs(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     repairs: &SweepRepairs,
 ) -> Result<()> {
+    let mut coverage = SweepCoverage::default();
+    sync_claude_session_metadata_with_repairs_and_coverage(
+        conn,
+        state,
+        root,
+        repairs,
+        &mut coverage,
+    )
+}
+
+fn sync_claude_session_metadata_with_repairs_and_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<()> {
     // Load-bearing for the raw-facts generation below: an absent root returns
     // before anything is recorded, so a run that could not see the archive
     // does not retire the one-time backfill pass over it.
     if !root.exists() {
+        if state
+            .get("claude_sessions_v3")
+            .and_then(Value::as_object)
+            .is_some_and(|known| state_names_files_under(known, root))
+        {
+            coverage.note_unread();
+        }
         return Ok(());
     }
     // The v3 key forces one full re-scan on upgrade so exact remote/local ids
@@ -4330,6 +4389,9 @@ fn sync_claude_session_metadata_with_repairs(
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if !walked_every_known_root {
+        coverage.note_unread();
+    }
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }

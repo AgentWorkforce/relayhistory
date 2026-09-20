@@ -3429,6 +3429,65 @@ fn an_unreadable_destination_marker_sweeps_instead_of_panicking() {
     }
 }
 
+#[test]
+fn an_unavailable_known_archive_cannot_finish_malformed_marker_recovery() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let rollout = write_codex_rollout(home.path(), "sess-offline-archive");
+    let archive_day = home.path().join(".codex/archived_sessions/2026/09/19");
+    std::fs::create_dir_all(&archive_day).expect("archive day");
+    let archived_rollout = archive_day.join(rollout.file_name().expect("rollout name"));
+    std::fs::rename(&rollout, &archived_rollout).expect("archive rollout");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+    let before = codex_event_count(&db, "sess-offline-archive");
+    assert!(before > 1, "the test needs a short, still-nonempty session");
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-offline-archive' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'codex' AND session_id = 'sess-offline-archive')",
+        [],
+    )
+    .expect("delete one event");
+    drop(conn);
+
+    let state_path = home.path().join(".sync-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read sync state"))
+            .expect("parse sync state");
+    state["destination_generation"] = serde_json::Value::from("");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize sync state"),
+    )
+    .expect("write sync state");
+
+    let archive = home.path().join(".codex/archived_sessions");
+    let offline = home.path().join(".codex/archived_sessions.offline");
+    std::fs::rename(&archive, &offline).expect("make archive unavailable");
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert_eq!(
+        codex_event_count(&db, "sess-offline-archive"),
+        before - 1,
+        "the unavailable source cannot repair the short session"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "an incomplete repair must not establish a new fast-path baseline"
+    );
+
+    std::fs::rename(&offline, &archive).expect("restore archive");
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert_eq!(codex_event_count(&db, "sess-offline-archive"), before);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a complete retry may replace the malformed marker"
+    );
+}
+
 /// Rows arriving between sweeps — the hook fast path, hydration — are not a
 /// loss, and must not cost a full walk of every source. Only shrinkage is the
 /// signal.
