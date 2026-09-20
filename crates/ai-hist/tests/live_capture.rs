@@ -1310,6 +1310,101 @@ fn a_file_beside_the_flat_log_does_not_force_a_sweep() {
     );
 }
 
+/// A watch lost to a deleted directory has to come back *now*, not at the next
+/// backstop. `~/.codex/sessions` is removed and recreated, a ten-second session
+/// writes its rollout there and cleanup takes it away again: with the default
+/// 30 s backstop, the registration is dead for the whole of that session and
+/// the sweep afterwards finds nothing. The backend says a watched path was
+/// removed exactly once, so that report has to be acted on when it arrives.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_root_recreated_between_backstops_is_watched_without_waiting_for_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("sessions");
+    std::fs::create_dir_all(&root).expect("root");
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let counted = refreshes.clone();
+    let running = RunningLoop::reporting({
+        let root = root.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(root.clone())])
+                .with_roots_refresh(Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    vec![ai_hist::discover::WatchRoot::tree(root.clone())]
+                }))
+                .with_debounce_ms(100)
+                // Ten minutes: nothing in this test may depend on a backstop
+                // tick, which is the whole point.
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // Positive control first: the watch works, so a failure later is the
+    // recreate and not a watcher that never ran.
+    std::fs::write(root.join("rollout-1.jsonl"), "{}\n").expect("write under the root");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a write under the original directory must drive a forced sweep"
+    );
+
+    // The session's directory is replaced, and the writing starts immediately
+    // afterwards — long before any backstop.
+    running.settle("after the write under the original directory");
+    std::fs::remove_dir_all(&root).expect("remove the root");
+
+    // Wait for the loop to *notice* before recreating, which is what pins the
+    // two halves of this down separately. Reaching `pending` at all means the
+    // removal was acted on when it was reported rather than at the backstop,
+    // ten minutes away; recreating only afterwards means the directory that
+    // comes back has to be picked up by the retry rather than by the same
+    // reconcile — the ordering a session's cleanup-then-restart produces, and
+    // the one that needs the recovery cadence.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while !running
+        .watch
+        .status()
+        .expect("status")
+        .pending
+        .contains(&root)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a removed root was not noticed until the backstop: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+    std::fs::create_dir_all(&root).expect("recreate the root");
+
+    // From quiet: the removal itself matched the root and drove a tick of its
+    // own, and reading that one as the write's would prove nothing. This is
+    // the trap rounds 7 and 8 fell into.
+    running.settle("after recreating the directory");
+    std::fs::write(root.join("rollout-2.jsonl"), "{}\n").expect("write under the new root");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a recreated directory must be watched again without waiting for a backstop: {:?}",
+        running.watch.status()
+    );
+
+    // And the prompt path must not have dragged the expensive half of the
+    // backstop's work along with it: re-deriving the root set walks every
+    // project tree, and nothing here should have asked for that.
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        0,
+        "recovering a lost registration must not re-derive the root set"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session

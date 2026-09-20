@@ -43,6 +43,17 @@ use anyhow::Result;
 
 use crate::discover::{self, WatchDepth, WatchRoot};
 
+/// How often a registration that was *lost* is retried.
+///
+/// Not derived from the user's intervals, because neither of them is about
+/// this: a root that was attached and is now gone is a directory being
+/// replaced, and the window between the two is where a short session lives.
+/// `~/.codex/sessions` removed and recreated, a ten-second session written
+/// there, cleanup taking it away again — a retry on the 30 s backstop misses
+/// the whole of it. One `stat` per lost root, four times a second, and only
+/// until it is attached again.
+const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
+
 /// The longest any configurable interval may be.
 ///
 /// `Instant + Duration` panics when the sum is not representable, and every
@@ -124,6 +135,14 @@ pub enum TickTrigger {
     Poll,
     /// An explicit [`WatchLoop::tick`] call.
     Manual,
+    /// The backend reported that a registration is gone.
+    ///
+    /// Not a sweep: nothing new has been written, a watch has been lost. It
+    /// wakes the loop so the registration can be re-made now rather than at
+    /// the next backstop, which is up to `slow_poll_ms` away — long enough
+    /// for a whole short session to be written to a recreated directory and
+    /// cleaned up again, unseen.
+    RegistrationLost,
 }
 
 impl TickTrigger {
@@ -141,6 +160,7 @@ impl TickTrigger {
             TickTrigger::FsEvent => "fs-event",
             TickTrigger::Poll => "poll",
             TickTrigger::Manual => "manual",
+            TickTrigger::RegistrationLost => "registration-lost",
         }
     }
 }
@@ -215,6 +235,11 @@ struct WakeState {
     /// A change signal is pending. Single-bit on purpose: a thousand events
     /// between two ticks cost one wakeup, not a thousand.
     pending: bool,
+    /// A registration was reported gone and has to be re-made. Kept apart
+    /// from `pending` because it asks for different work: `pending` says
+    /// something was written and wants a sweep, this says a watch was lost
+    /// and wants the watch back.
+    registration_lost: bool,
     stopped: bool,
 }
 
@@ -284,6 +309,19 @@ impl WatchInner {
         self.wake_cv.notify_all();
     }
 
+    /// Post that a registration is gone. Called by the watcher's callback
+    /// when the backend reports a watched path removed.
+    fn signal_registration_lost(&self) {
+        {
+            let mut wake = self.wake.lock().expect("watch wake state");
+            if wake.stopped {
+                return;
+            }
+            wake.registration_lost = true;
+        }
+        self.wake_cv.notify_all();
+    }
+
     fn request_stop(&self) {
         {
             let mut wake = self.wake.lock().expect("watch wake state");
@@ -300,6 +338,13 @@ impl WatchInner {
         loop {
             if wake.stopped {
                 return None;
+            }
+            // Before `pending`, and without the debounce window: this one
+            // does not run a sweep, it puts a watch back, and every moment
+            // it waits is a moment writes to that directory are invisible.
+            if wake.registration_lost {
+                wake.registration_lost = false;
+                return Some(TickTrigger::RegistrationLost);
             }
             if wake.pending {
                 // Clear before the window, not after: events that land during
@@ -598,7 +643,13 @@ impl WatchLoop {
             && (!self.roots.is_empty() || self.roots_refresh.is_some())
         {
             let inner = self.inner.clone();
-            fs_events::attach(&self.roots, move || inner.signal_change()).ok()
+            let lost = self.inner.clone();
+            fs_events::attach(
+                &self.roots,
+                move || inner.signal_change(),
+                move || lost.signal_registration_lost(),
+            )
+            .ok()
         } else {
             None
         };
@@ -618,7 +669,13 @@ impl WatchLoop {
         // the machine this loop exists for — one busy session writing every
         // couple of hundred milliseconds would postpone attaching a provider
         // installed beside it for as long as the writing lasts.
-        let mut next_reconcile = deadline_after(Instant::now(), self.slow_poll_ms);
+        // Two deadlines, because the backstop does two jobs of very different
+        // cost. Re-deriving the root set walks every project tree, so it stays
+        // on the backstop whatever else happens. Re-checking the registrations
+        // is a stat per root, and has to be prompt: a root that is uncovered
+        // now is a root whose writes are invisible now.
+        let mut next_refresh = deadline_after(Instant::now(), self.slow_poll_ms);
+        let mut next_check = next_refresh;
         while !self.inner.stopped() {
             let sweep_every = match self.current_driver() {
                 WatchDriver::FsEvents => self.slow_poll_ms,
@@ -631,7 +688,7 @@ impl WatchLoop {
             // status output and the docs promise the backstop, so the wait is
             // shortened to it while anything is uncovered; the sweep itself
             // still happens on the interval that was asked for.
-            let reconcile_every = match self.current_driver() {
+            let refresh_every = match self.current_driver() {
                 // Events are flowing, so the backstop *is* the cadence for
                 // everything the backstop does. Shortening it here would make
                 // `--interval 1` re-derive the root set — a walk of every
@@ -648,8 +705,9 @@ impl WatchLoop {
                     _ => sweep_every,
                 },
             };
-            let woke_early = reconcile_every < sweep_every;
-            let idle = Duration::from_millis(sweep_every.min(reconcile_every));
+            let check_every = self.check_cadence(watcher.as_ref(), refresh_every);
+            let woke_early = refresh_every.min(check_every) < sweep_every;
+            let idle = Duration::from_millis(sweep_every.min(refresh_every).min(check_every));
             let Some(trigger) = self.inner.wait_for_wake(idle, debounce) else {
                 break;
             };
@@ -664,15 +722,29 @@ impl WatchLoop {
             // The deadline gives the same at-most-once-per-interval rate
             // without depending on how the loop woke up.
             let now = Instant::now();
-            if now >= next_reconcile {
-                next_reconcile = deadline_after(now, reconcile_every);
+            let refresh_due = now >= next_refresh;
+            // A reported removal makes the check due now. The backend will
+            // not say so twice, and waiting out the backstop means a
+            // recreated directory is unwatched for up to `slow_poll_ms` —
+            // long enough for a short session to be written there and cleaned
+            // up again with nothing to show for it.
+            let check_due = refresh_due
+                || now >= next_check
+                || trigger == TickTrigger::RegistrationLost;
+            if refresh_due {
+                next_refresh = deadline_after(now, refresh_every);
+            }
+            if check_due {
                 if let Some(watch) = watcher.as_mut() {
                     // Re-derive first, then attach: a root can be new as a
                     // *name* (a project that grew a `.trajectories` directory)
                     // rather than merely new on disk, and only the caller
-                    // knows how to look for those.
-                    if let Some(refresh) = &self.roots_refresh {
-                        watch.adopt(refresh());
+                    // knows how to look for those. Only on the backstop,
+                    // because this is the expensive half.
+                    if refresh_due {
+                        if let Some(refresh) = &self.roots_refresh {
+                            watch.adopt(refresh());
+                        }
                     }
                     // Reconciles rather than only retrying: a root can be
                     // lost after a successful registration, not just before
@@ -681,6 +753,20 @@ impl WatchLoop {
                         self.publish_status(Some(&*watch));
                     }
                 }
+                // Dated from what the check *found*, not from what was true
+                // before it ran. A check that just discovered a lost
+                // registration has to come back on the recovery cadence; one
+                // dated from the cadence that applied a moment earlier would
+                // wait out the backstop it was supposed to pre-empt.
+                next_check = deadline_after(
+                    Instant::now(),
+                    self.check_cadence(watcher.as_ref(), refresh_every),
+                );
+            }
+            if trigger == TickTrigger::RegistrationLost {
+                // A lost watch is not a change to sweep for. Putting it back
+                // was the whole of this wake.
+                continue;
             }
             if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
@@ -696,6 +782,38 @@ impl WatchLoop {
         let driver = self.current_driver();
         drop(watcher);
         Ok(driver)
+    }
+
+    /// How often the registrations are re-checked.
+    ///
+    /// Shortened by *coverage*, not by driver: while any root is uncovered,
+    /// its writes are going nowhere, and that is true whether the other roots
+    /// are feeding events or not. It is a stat per root, so the shorter
+    /// cadence costs nothing like re-deriving the root set — and it lasts
+    /// only until the root is attached again.
+    #[cfg(feature = "fs-events")]
+    fn check_cadence(&self, watcher: Option<&fs_events::FsWatch>, refresh_every: u64) -> u64 {
+        match watcher {
+            // A registration that was lost is a directory being replaced, and
+            // the replacement is usually immediate. Retried on its own short
+            // cadence until it is back, because the user's intervals are not
+            // about this and the backstop is long enough to miss an entire
+            // session.
+            Some(watch) if watch.recovering() => self
+                .slow_poll_ms
+                .min(self.poll_interval_ms)
+                .min(LOST_REGISTRATION_RECHECK_MS),
+            Some(watch) if !watch.pending().is_empty() => {
+                self.slow_poll_ms.min(self.poll_interval_ms)
+            }
+            _ => refresh_every,
+        }
+    }
+
+    /// Without a backend there are no registrations to re-check.
+    #[cfg(not(feature = "fs-events"))]
+    fn check_cadence(&self, _watcher: Option<&fs_events::FsWatch>, refresh_every: u64) -> u64 {
+        refresh_every
     }
 
     fn current_driver(&self) -> WatchDriver {
@@ -767,6 +885,9 @@ mod fs_events {
         /// registration from a dead one needs the identity.
         watched: Vec<Registered>,
         pending: Vec<WatchRoot>,
+        /// A root that *was* attached is uncovered now, so it is being
+        /// retried on the recovery cadence rather than on the backstop.
+        recovering: bool,
         /// Registered paths the backend reported as removed, shared with the
         /// event callback. A watch dies with the directory it names, and the
         /// name can come back over a *different* object — or over one the
@@ -780,6 +901,11 @@ mod fs_events {
     }
 
     impl FsWatch {
+        /// Whether a registration that once existed is waiting to be re-made.
+        pub(super) fn recovering(&self) -> bool {
+            self.recovering
+        }
+
         pub(super) fn watched(&self) -> Vec<PathBuf> {
             self.watched
                 .iter()
@@ -873,11 +999,19 @@ mod fs_events {
             for root in resolved {
                 self.remember(&root);
             }
+            // Anything that falls out of `watched` here was attached a moment
+            // ago, which is what makes it a recovery rather than a root that
+            // has never existed.
+            self.recovering |= !lost.is_empty();
             for root in lost {
                 self.pending.push(root);
                 changed += 1;
             }
-            changed + self.retry_pending()
+            let attached = self.retry_pending();
+            if self.pending.is_empty() {
+                self.recovering = false;
+            }
+            changed + attached
         }
 
         /// Try the roots that were not there before. Returns how many were
@@ -921,6 +1055,7 @@ mod fs_events {
     pub(super) fn attach(
         roots: &[WatchRoot],
         on_change: impl Fn() + Send + 'static,
+        on_registration_lost: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
         // The callback has to be able to see the roots to enforce their depth,
         // and `retry_pending` adds to that set later, so it is shared rather
@@ -966,8 +1101,15 @@ mod fs_events {
                 (matched, removed)
             };
             if !removed.is_empty() {
-                let mut stale = stale_for_events.lock().expect("stale roots");
-                stale.extend(removed);
+                {
+                    let mut stale = stale_for_events.lock().expect("stale roots");
+                    stale.extend(removed);
+                }
+                // Recorded *and* announced. Recording alone leaves the
+                // registration dead until the next backstop, and for a
+                // directory that is recreated straight away that window is
+                // long enough to miss a whole session.
+                on_registration_lost();
             }
             if matched {
                 on_change();
@@ -996,6 +1138,7 @@ mod fs_events {
             watcher,
             watched,
             pending,
+            recovering: false,
             stale,
             depth,
         })
@@ -1115,6 +1258,10 @@ mod fs_events {
             0
         }
 
+        pub(super) fn recovering(&self) -> bool {
+            false
+        }
+
         pub(super) fn adopt(&mut self, _roots: Vec<WatchRoot>) -> usize {
             0
         }
@@ -1130,6 +1277,7 @@ mod fs_events {
     pub(super) fn attach(
         _roots: &[WatchRoot],
         _on_change: impl Fn() + Send + 'static,
+        _on_registration_lost: impl Fn() + Send + 'static,
     ) -> Result<FsWatch> {
         anyhow::bail!("ai-hist was built without the fs-events feature")
     }

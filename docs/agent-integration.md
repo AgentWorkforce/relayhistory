@@ -95,7 +95,13 @@ itself to filesystem events as soon as one appears. Those retries are on the
 provider exists picks it up in seconds rather than in an hour, while its
 sweeps stay on the hour it was given. Re-deriving the root set is a walk of every project
 tree, so it belongs on the backstop and stays there once the watcher is
-attached, however short an `--interval` was asked for. That tick also
+attached, however short an `--interval` was asked for. Re-checking the
+*registrations* is a stat per root, and does not wait for the backstop at all:
+a watch the backend reports as lost is re-made when the report arrives, and
+retried four times a second until it is back. A directory that is deleted and
+recreated — a session's cleanup, then the next session — is otherwise
+unwatched for up to the backstop, which is long enough to miss the whole of a
+short session. That tick also
 re-checks each registration against the directory it was made against — a watch is bound to
 the directory object, not to its name, so a root deleted and recreated
 (`rm -rf ~/.codex/sessions`, then the next session) has a live name and a dead
