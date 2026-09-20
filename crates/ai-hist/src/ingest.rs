@@ -4303,27 +4303,22 @@ fn ingest_claude_transcript_as(
                 )?;
             }
         }
-        if skipped_sidechain {
-            delete_claude_record_rows(conn, session_id, message_uuid)?;
-            if id_less {
-                heal_legacy_positional_record(
-                    conn,
-                    session_id,
-                    stem,
-                    ts_ms,
-                    message,
-                    message_role,
-                    model,
-                    token_json.as_deref(),
-                )?;
-            }
-            continue;
-        }
         // Claude reports a finished subagent as a `type: "system"` line with
         // no message body, so the block walk below never sees it. It is the
         // only record that ties a delegated child back to the Agent call that
         // spawned it, which makes it a tool result in everything but shape.
-        if obj.get("type").and_then(Value::as_str) == Some("system") {
+        //
+        // This runs before the sidechain guard, and has to. A system line
+        // carries no `message`, so `skipped_sidechain` is true for every one
+        // of them that is marked `isSidechain` -- and a nested Agent call
+        // writes its completion line inside the child's sidecar, where every
+        // record is a sidechain. Skipping those would drop the only record of
+        // the nested spawn while keeping the rows for the spawns that happen
+        // to sit on the parent transcript. The guard below still owns every
+        // other sidechain row; a system line that names no child falls
+        // through to it.
+        let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
+        if system_record {
             if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
                 let tool_use_id = tool_facts.tool_use_id.clone().unwrap_or_default();
                 let (call_index, event_index) = indexer.next(&tool_use_id);
@@ -4351,7 +4346,29 @@ fn ingest_claude_transcript_as(
                     Some(&tool_facts),
                     raw_facts,
                 )?;
+                continue;
             }
+        }
+        if skipped_sidechain {
+            delete_claude_record_rows(conn, session_id, message_uuid)?;
+            if id_less {
+                heal_legacy_positional_record(
+                    conn,
+                    session_id,
+                    stem,
+                    ts_ms,
+                    message,
+                    message_role,
+                    model,
+                    token_json.as_deref(),
+                )?;
+            }
+            continue;
+        }
+        // A system line that names no delegated child has nothing else this
+        // parser stores -- it carries no `message` body to walk -- and is
+        // dropped exactly as it was before the notification handler existed.
+        if system_record {
             continue;
         }
         let Some(content) = message.and_then(|m| m.get("content")) else {
@@ -10623,6 +10640,80 @@ mod tests {
         .unwrap();
         ingest_claude_transcript(&conn, &noise).unwrap();
         assert!(tool_results(&conn, "claude", "noise-session").is_empty());
+    }
+
+    #[test]
+    fn claude_subagent_notifications_survive_the_sidechain_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar-session.jsonl");
+        // A nested Agent call writes its completion line inside the child's
+        // sidecar, where every record carries `isSidechain: true`. The
+        // sidechain guard skips any record whose message is not an assistant
+        // one, and a system line has no message at all -- so the only record
+        // tying the grandchild back to the call that spawned it was being
+        // dropped precisely where nesting puts it.
+        let lines = [
+            claude_line(json!({
+                "type": "assistant", "uuid": "sc1", "sessionId": "sidecar-session",
+                "isSidechain": true, "cwd": "/tmp/project",
+                "timestamp": "2026-04-24T02:00:00.000Z",
+                "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_nested", "name": "Agent",
+                      "input": { "subagent_type": "Explore" } },
+                ]},
+            })),
+            claude_line(json!({
+                "type": "system", "subtype": "subagent_completed",
+                "sessionId": "sidecar-session", "isSidechain": true,
+                "timestamp": "2026-04-24T02:00:01.000Z",
+                "parent_tool_use_id": "toolu_nested", "agent_id": "agent-nested-1",
+                "subagent_session_id": "session-nested-child", "status": "completed",
+                "content": "nested subagent completed",
+            })),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let rows = tool_results(&conn, "claude", "sidecar-session");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a sidechain system line still links its delegated child: {rows:?}",
+        );
+        assert_eq!(
+            rows[0].subagent_session_id.as_deref(),
+            Some("session-nested-child")
+        );
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("toolu_nested"));
+
+        // Every other sidechain record is still skipped: the guard below the
+        // notification handler is unchanged, and a sidechain user row is the
+        // parent's own prompt rather than a human turn of the child's.
+        let sidechain_user = dir.path().join("sidecar-user.jsonl");
+        fs::write(
+            &sidechain_user,
+            format!(
+                "{}\n",
+                claude_line(json!({
+                    "type": "user", "uuid": "sc2", "sessionId": "sidecar-user-session",
+                    "isSidechain": true, "timestamp": "2026-04-24T02:00:02.000Z",
+                    "message": { "role": "user", "content": "delegated instructions" },
+                })),
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &sidechain_user).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = ?",
+                params!["sidecar-user-session"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "a sidechain user row is not the child's turn");
     }
 
     #[test]
