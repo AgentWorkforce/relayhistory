@@ -3248,7 +3248,7 @@ mod tests {
                     unsupported_revision_ids: vec![],
                     acceptance_level: AcceptanceLevel::Durable,
                 },
-                now,
+                &|| now,
             )
             .unwrap();
             kinds.extend(claim.batch.records.into_iter().map(|record| record.kind));
