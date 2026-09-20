@@ -235,6 +235,28 @@ export interface SessionEvent {
   tokenUsage: Record<string, unknown> | null;
   eventUid: string;
   /**
+   * Per-tool-result fidelity. Null on every row that is not a tool result,
+   * and on a tool-result row whose provider does not record that fact — the
+   * absence is the answer, never a stand-in zero or a guessed status.
+   */
+  toolUseId: string | null;
+  /** Raw UTF-8 byte length of the provider's result payload. */
+  payloadBytes: number | null;
+  /** True when the harness had already truncated the payload. */
+  payloadTruncated: boolean | null;
+  /** First 16 hex characters of the payload's sha256. */
+  payloadHash: string | null;
+  /** n-th result recorded for this `toolUseId`, from zero. */
+  callIndex: number | null;
+  /** Position of this result in the transcript's tool-result order. */
+  eventIndex: number | null;
+  resultStatus: ToolResultStatus | null;
+  eventSource: ToolResultEventSource | null;
+  /** Which provider signal set the error, when one did. */
+  errorSignal: ToolResultErrorSignal | null;
+  subagentSessionId: string | null;
+  agentId: string | null;
+  /**
    * Per-message facts the provider recorded on the envelope, stored as it
    * wrote them. `stopReason` is the verbatim wire string, never a normalized
    * enum, and stays null while a turn is still in flight. `isSidechain` and
@@ -248,6 +270,17 @@ export interface SessionEvent {
   isMeta: boolean | null;
   turnId: string | null;
 }
+
+export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
+
+export type ToolResultEventSource = 'tool_result' | 'subagent_notification' | 'function_call_output';
+
+export type ToolResultErrorSignal =
+  | 'tool_result.is_error'
+  | 'exit_code'
+  | 'patch_apply'
+  | 'mcp_err'
+  | 'subagent_status';
 
 export interface EventCursor {
   tsMs: number;
@@ -504,6 +537,67 @@ export interface SessionFileEditsPage {
   sessionId: string;
   fileEdits: SessionFileEdit[];
   nextCursor: EvidenceCursor | null;
+}
+
+/**
+ * One block inside a user turn. `approxTokens` is deliberately absent: every
+ * estimate available here is a bytes-per-token heuristic, and a heuristic
+ * served alongside measured values is indistinguishable from one at the call
+ * site. Bring a tokenizer and apply it to `byteLen`.
+ */
+export interface SessionUserTurnBlock {
+  kind: 'text' | 'tool_result';
+  toolUseId: string | null;
+  /** Measured payload bytes when recorded, else the stored text's UTF-8 length. */
+  byteLen: number;
+  /**
+   * Whether the result is known not to have succeeded. `true` for a
+   * `resultStatus` of `errored` or `cancelled` — both terminal, both stated
+   * by the provider — and `false` for `completed`.
+   *
+   * `null` means the outcome is not known *yet* (`running`, `unknown`, or a
+   * row indexed before the status existed). It does not mean "not an error",
+   * so a consumer that treats it as a success is reading a missing fact as a
+   * measured one. Read `resultStatus` from the event to tell a cancellation
+   * from a failure.
+   */
+  isError: boolean | null;
+}
+
+/** One user-side message and the ordered blocks it carried. */
+export interface SessionUserTurn {
+  /** Row id of the turn's first event; the cursor's tiebreaker. */
+  id: number;
+  source: Source;
+  sessionId: string;
+  messageId: string | null;
+  /**
+   * The nearest messages recorded either side of this turn, whichever side of
+   * the conversation each came from — normally the assistant message the human
+   * answered, and the one their prompt drew. `null` only when the session
+   * recorded no named message on that side. An event the provider left
+   * unnamed is passed over rather than nulling the field: it is not a message
+   * you could reference, while the named message behind it still borders this
+   * turn. A later block of this same turn is never its own neighbour.
+   */
+  precedingMessageId: string | null;
+  followingMessageId: string | null;
+  tsMs: number;
+  blocks: SessionUserTurnBlock[];
+}
+
+export interface UserTurnsPageOptions {
+  dbPath?: string;
+  limit?: number;
+  after?: EventCursor;
+}
+
+export interface SessionUserTurnsPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  userTurns: SessionUserTurn[];
+  nextCursor: EventCursor | null;
 }
 
 export interface Stats {

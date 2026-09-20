@@ -10,9 +10,12 @@ use std::time::Instant;
 
 /// Bumped to 3 when capability became derived from declared evidence coverage.
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
-/// Version 3 re-parsed existing sessions for raw provider facts.
-/// Version 4 invalidates checkpoints from the unbounded Codex child scan.
-/// Version 5 banks continuity evidence for sessions checkpointed by version 4.
+/// Version 3 re-parsed existing sessions for per-message raw provider facts.
+/// Version 4 also invalidates checkpoints from the unbounded Codex child scan,
+/// so their relationship coverage is recomputed under the bounded search.
+/// Version 5 adds tool-result fidelity and reattributes identified Claude
+/// subagent events to their child sessions, and banks continuity evidence for
+/// sessions checkpointed by version 4.
 const HYDRATION_PARSER_VERSION: i64 = 5;
 
 #[derive(Debug, Clone)]
@@ -250,14 +253,16 @@ fn hydrate_session_at_with_roots_and_connectors(
         params![options.source, options.session_id],
     )?;
     let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
+    let last_tool_result_index = max_tool_result_index(&tx, &options.source, &options.session_id)?;
     tx.execute(
         "INSERT INTO session_hydration_checkpoints \
-         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms) \
-         VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, last_tool_result_index, updated_ms) \
+         VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, location) DO UPDATE SET \
            source_stamp = excluded.source_stamp, parser_version = excluded.parser_version, \
            last_event_at_ms = excluded.last_event_at_ms, source_bytes = excluded.source_bytes, \
            records_parsed = excluded.records_parsed, include_related = excluded.include_related, \
+           last_tool_result_index = excluded.last_tool_result_index, \
            updated_ms = excluded.updated_ms",
         params![
             options.source,
@@ -268,6 +273,7 @@ fn hydrate_session_at_with_roots_and_connectors(
             snapshot.bytes,
             snapshot.records,
             options.include_related,
+            last_tool_result_index,
             now_ms(),
         ],
     )?;
@@ -915,13 +921,15 @@ fn write_hydration_checkpoint(
     records_parsed: i64,
 ) -> Result<()> {
     let last_event_at_ms = max_event_time(conn, &options.source, &options.session_id)?;
+    let last_tool_result_index = max_tool_result_index(conn, &options.source, &options.session_id)?;
     conn.execute(
         "INSERT INTO session_hydration_checkpoints \
-         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, last_tool_result_index, updated_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, location) DO UPDATE SET \
            source_stamp=excluded.source_stamp, parser_version=excluded.parser_version, last_event_at_ms=excluded.last_event_at_ms, \
-           source_bytes=excluded.source_bytes, records_parsed=excluded.records_parsed, include_related=excluded.include_related, updated_ms=excluded.updated_ms",
+           source_bytes=excluded.source_bytes, records_parsed=excluded.records_parsed, include_related=excluded.include_related, \
+           last_tool_result_index=excluded.last_tool_result_index, updated_ms=excluded.updated_ms",
         params![
             options.source,
             options.session_id,
@@ -932,6 +940,7 @@ fn write_hydration_checkpoint(
             source_bytes,
             records_parsed,
             options.include_related,
+            last_tool_result_index,
             now_ms(),
         ],
     )?;
@@ -2091,6 +2100,21 @@ fn count_table(conn: &Connection, table: &str, source: &str, session_id: &str) -
 fn max_event_time(conn: &Connection, source: &str, session_id: &str) -> Result<Option<i64>> {
     Ok(conn.query_row(
         "SELECT MAX(ts_ms) FROM session_events WHERE source = ? AND session_id = ?",
+        params![source, session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The highest tool-result `event_index` this session has indexed.
+///
+/// Persisted on the checkpoint so a parser that resumes mid-transcript can
+/// continue the sequence (`ToolResultIndexer::resume_from`) instead of
+/// restarting it and colliding with indexes already written. Every parser in
+/// this crate currently re-reads its transcript from the start, so today this
+/// records where the last full parse ended rather than driving it.
+fn max_tool_result_index(conn: &Connection, source: &str, session_id: &str) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT MAX(event_index) FROM session_events WHERE source = ? AND session_id = ?",
         params![source, session_id],
         |row| row.get(0),
     )?)
