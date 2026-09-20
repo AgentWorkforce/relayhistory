@@ -1091,6 +1091,35 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     Ok(BoundedJsonl { head, tail })
 }
 
+/// Read Claude's provider-native identity without accepting the shallow
+/// catalog adapter's filename fallback.
+///
+/// Ordinary discovery deliberately recovers older parseable transcripts that
+/// omit `sessionId` by using their file stem. A lifecycle-hook payload has a
+/// stricter trust boundary: before it writes anything, the named file itself
+/// must prove which session it belongs to. Claude writes the id on every
+/// normal record, so the same bounded head/tail read used by shallow discovery
+/// is sufficient without turning the hook fast path into a full-file scan.
+pub(crate) fn claude_transcript_session_id(
+    scan: &ScanEnv<'_>,
+    path: &Path,
+) -> Result<Option<String>> {
+    let bounded = read_bounded_jsonl(scan, path)?;
+    let session_id = bounded
+        .head_records()
+        .chain(bounded.tail_records_rev())
+        .filter_map(parse_record)
+        .filter_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .next();
+    Ok(session_id)
+}
+
 pub(crate) fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
 }

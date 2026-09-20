@@ -2598,6 +2598,42 @@ fn a_hook_payload_naming_another_session_ingests_nothing() {
     assert_eq!(catalog_session_count(&db, "claude", "previous"), 1);
 }
 
+/// The shallow Claude catalog intentionally falls back to a transcript's file
+/// stem for old parseable files without `sessionId`. A hook payload is not
+/// allowed to promote that guess into identity: the transcript itself must
+/// prove the session before the hook writes anything.
+#[test]
+fn a_hook_transcript_without_native_identity_creates_no_catalog_row() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join(".claude/projects/proj");
+    std::fs::create_dir_all(&project).expect("create project");
+    let transcript = project.join("identity-free.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"role":"user","content":"hello"}}"#.to_string() + "\n",
+    )
+    .expect("write transcript");
+    let db = home.path().join("history.db");
+
+    let report = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("identity-free"),
+        true,
+    )
+    .expect("hook ingest");
+
+    assert_eq!(report.status, ai_hist::TranscriptStatus::Unidentified);
+    assert_eq!(report.session_id, None);
+    assert_eq!(
+        catalog_session_count(&db, "claude", "identity-free"),
+        0,
+        "a filename-derived identity must not be persisted by the hook path"
+    );
+}
+
 #[test]
 fn a_missing_transcript_is_reported_not_raised() {
     let home = tempfile::tempdir().expect("tempdir");

@@ -979,6 +979,16 @@ mod fs_events {
     use notify::event::EventKind;
     use notify::{RecursiveMode, Watcher};
 
+    /// Whether an event can change transcript bytes or their names.
+    ///
+    /// Metadata-only modifications (permissions, ownership, timestamps) are
+    /// noise to every source reader and must not bypass the fingerprint with a
+    /// forced sweep. Unknown modify kinds remain conservative and do wake it.
+    pub(super) fn event_can_change_evidence(kind: &EventKind) -> bool {
+        matches!(kind, EventKind::Create(_) | EventKind::Remove(_))
+            || matches!(kind, EventKind::Modify(modify) if !matches!(modify, notify::event::ModifyKind::Metadata(_)))
+    }
+
     /// Holds the OS-level watches open; dropping it stops them.
     ///
     /// Roots that did not exist at attach time stay in `pending` rather than
@@ -1195,10 +1205,7 @@ mod fs_events {
             // Metadata churn — an atime bump from a backup or an antivirus
             // scan — does not change the bytes a sweep would read. Filtering
             // here keeps wakeups honest on a noisy home directory.
-            if !matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            ) {
+            if !event_can_change_evidence(&event.kind) {
                 return;
             }
             let (matched, removed) = {
@@ -1409,6 +1416,31 @@ mod fs_events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn metadata_only_events_do_not_force_a_sweep() {
+        use notify::event::{
+            AccessKind, CreateKind, EventKind, MetadataKind, ModifyKind, RemoveKind,
+        };
+
+        assert!(!fs_events::event_can_change_evidence(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!fs_events::event_can_change_evidence(&EventKind::Access(
+            AccessKind::Any
+        )));
+        for kind in [
+            EventKind::Create(CreateKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::Any),
+        ] {
+            assert!(
+                fs_events::event_can_change_evidence(&kind),
+                "{kind:?} can change evidence and must wake a forced sweep"
+            );
+        }
+    }
 
     /// An interval large enough to overflow the clock must not kill the loop.
     ///

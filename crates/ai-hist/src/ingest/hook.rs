@@ -202,35 +202,35 @@ fn ingest_transcript_at_with_roots(
         // Read before anything is written. The payload says which session
         // fired *and* which file holds it, and those are two claims: a
         // delayed or replayed hook can pair a live session id with a
-        // transcript that belongs to another one. Asking the adapter what
-        // this file says it is — without persisting the answer — is what lets
-        // the two be compared before either session is touched. The cost is
-        // one extra bounded read of one file on a path that is already
-        // reading it.
-        if let Some(expected) = expected_session {
-            let observed = single.read_shallow(&env.scan(), Some(&conn), &single.candidate)?;
-            match observed {
-                Some(observed) if observed.session_id != expected => {
-                    return Ok(TranscriptIngest {
-                        source: source.to_string(),
-                        transcript: transcript.to_string_lossy().into_owned(),
-                        // The identity that was *found*, so the caller can see
-                        // what the file really was rather than only that it
-                        // disagreed.
-                        session_id: Some(observed.session_id),
-                        status: TranscriptStatus::Mismatched,
-                        hydration: None,
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    return Ok(TranscriptIngest::short(
-                        source,
-                        transcript,
-                        TranscriptStatus::Unidentified,
-                    ))
-                }
-            }
+        // transcript that belongs to another one. For Claude, require the
+        // provider-native `sessionId`: its ordinary shallow adapter may fall
+        // back to the filename for old transcripts, but a hook must not turn
+        // that guess into a catalog row. Other providers retain their adapter
+        // identity path; none currently advertises lifecycle-hook support.
+        let observed_session = if source == "claude" {
+            crate::discover::claude_transcript_session_id(&env.scan(), transcript)?
+        } else {
+            single
+                .read_shallow(&env.scan(), Some(&conn), &single.candidate)?
+                .map(|observed| observed.session_id)
+        };
+        let Some(observed_session) = observed_session else {
+            return Ok(TranscriptIngest::short(
+                source,
+                transcript,
+                TranscriptStatus::Unidentified,
+            ));
+        };
+        if expected_session.is_some_and(|expected| expected != observed_session) {
+            return Ok(TranscriptIngest {
+                source: source.to_string(),
+                transcript: transcript.to_string_lossy().into_owned(),
+                // The identity that was *found*, so the caller can see what
+                // the file really was rather than only that it disagreed.
+                session_id: Some(observed_session),
+                status: TranscriptStatus::Mismatched,
+                hydration: None,
+            });
         }
         discover_sessions_with_provider_refs(
             &env,

@@ -1136,11 +1136,11 @@ fn sync_basic(
     // Named before anything is written, because the sweep below is what
     // repairs them and it decides per session whether its unchanged stamp
     // licenses a skip. A failure here costs the repair, not the sweep.
-    let repairs = match destination_shortfall_against(conn, &state) {
-        Ok(repairs) => repairs,
+    let (repairs, repair_plan_known) = match destination_shortfall_against(conn, &state) {
+        Ok(repairs) => (repairs, true),
         Err(error) => {
             sync_note!("  [sync] could not name the sessions to repair: {error:#}");
-            SweepRepairs::default()
+            (SweepRepairs::default(), false)
         }
     };
     if !repairs.is_empty() {
@@ -1299,13 +1299,13 @@ fn sync_basic(
     // evidence is back — loud and expensive, which is the right side to fail
     // on — and the note below names how many sessions are still owed.
     let outstanding = match destination_shortfall_against(conn, &state) {
-        Ok(outstanding) => outstanding,
+        Ok(outstanding) => Some(outstanding),
         Err(error) => {
             sync_note!("  [sync] could not re-check the destination: {error:#}");
-            SweepRepairs::default()
+            None
         }
     };
-    if !outstanding.is_empty() {
+    if let Some(outstanding) = outstanding.as_ref().filter(|repairs| !repairs.is_empty()) {
         eprintln!(
             "ai-hist: {} session(s) are still missing evidence after this sweep; \
              the source may be gone. Sync will keep re-sweeping until they are \
@@ -1313,7 +1313,7 @@ fn sync_basic(
             outstanding.len()
         );
     }
-    if all_sources_read && outstanding.is_empty() {
+    if checkpoint_is_safe(all_sources_read, repair_plan_known, outstanding.as_ref()) {
         if let Some(fingerprint) = fingerprint {
             // The destination marker is taken *after* the sweep, from what the
             // sweep just wrote — the opposite of the source fingerprint, which
@@ -1370,6 +1370,22 @@ fn sync_basic(
     sync_note!("  [rust-sync] +{total_inserted} rows");
     sync_note!("  Total: {total} entries");
     Ok(true)
+}
+
+/// Whether this sweep knows enough to make its source and destination state a
+/// new fast-path baseline.
+///
+/// Both destination reads matter. The first names short sessions so the sweep
+/// can override their otherwise-valid per-file stamps; the second proves the
+/// repair landed. Treating an error from either read as an empty shortfall
+/// turns "unknown" into "nothing missing" and can permanently ratify lost
+/// evidence.
+fn checkpoint_is_safe(
+    all_sources_read: bool,
+    repair_plan_known: bool,
+    outstanding: Option<&SweepRepairs>,
+) -> bool {
+    all_sources_read && repair_plan_known && outstanding.is_some_and(SweepRepairs::is_empty)
 }
 
 /// Cross-process sync guard for one canonical database identity. Reflex, launchd, cron, and
@@ -7016,6 +7032,28 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    #[test]
+    fn checkpoint_requires_both_destination_checks_to_be_known_and_clear() {
+        let clear = SweepRepairs::default();
+        assert!(checkpoint_is_safe(true, true, Some(&clear)));
+        assert!(
+            !checkpoint_is_safe(true, false, Some(&clear)),
+            "a failed pre-sweep repair query must not become a new baseline"
+        );
+        assert!(
+            !checkpoint_is_safe(true, true, None),
+            "a failed post-sweep verification must not become a new baseline"
+        );
+
+        let mut short = SweepRepairs::default();
+        short
+            .sessions
+            .insert(("claude".to_string(), "short".to_string()));
+        assert!(!checkpoint_is_safe(true, true, Some(&short)));
+        assert!(!checkpoint_is_safe(false, true, Some(&clear)));
+    }
+
     /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative
     /// root has to end up in the same spelling as the events the watcher
     /// reports for it — otherwise it registers, never matches, and its
