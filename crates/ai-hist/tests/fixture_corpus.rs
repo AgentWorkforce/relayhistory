@@ -1476,11 +1476,12 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
 /// fact: string content, block-array content and a `<user_query>` wrapper all
 /// unwrap, assistant and tool records do not.
 ///
-/// A user record's *every* text block is a prompt. The prompt-only parser this
-/// replaced stopped at the first block, so a second one ("ignored second
-/// block" here) was dropped on the floor. The event parser emits one row per
-/// block, and history follows it rather than disagreeing with the
-/// `session_events` rows written from the same record.
+/// A user turn is one prompt carrying every text block the record held. The
+/// prompt-only parser this replaced stopped at the first block, so a second
+/// one ("ignored second block" here) was dropped on the floor; emitting a row
+/// per block instead would collide on `history`'s
+/// `(source, timestamp_ms, prompt)` identity whenever a turn repeated itself.
+/// Joining the blocks loses neither. `session_events` still keeps them apart.
 #[test]
 fn cursor_transcript_yields_only_unwrapped_user_prompts() {
     let prompts = rows("cursor/prompt-transcript", "history")
@@ -1491,8 +1492,7 @@ fn cursor_transcript_yields_only_unwrapped_user_prompts() {
         prompts,
         vec![
             "add a retry to the client".to_string(),
-            "ignored second block".to_string(),
-            "now write the test".to_string(),
+            "now write the test\n\nignored second block".to_string(),
             "wrapped query".to_string(),
         ],
         "assistant text, tool uses, tool results and blank prompts are not prompts"

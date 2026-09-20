@@ -31,14 +31,7 @@
     },
     {
       "project": "/tmp/project",
-      "prompt": "ignored second block",
-      "session_id": "cur-00000001",
-      "source": "cursor",
-      "timestamp_ms": 1776643200000
-    },
-    {
-      "project": "/tmp/project",
-      "prompt": "now write the test",
+      "prompt": "now write the test\n\nignored second block",
       "session_id": "cur-00000001",
       "source": "cursor",
       "timestamp_ms": 1776643200000

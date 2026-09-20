@@ -5665,6 +5665,15 @@ pub(crate) fn ingest_cursor_transcript(
         // window is taken after the blocks, from records that actually stored
         // something, and never from a guessed stamp.
         let mut emitted_evidence = false;
+        // A human turn is one prompt, however many text blocks Cursor split it
+        // into. `session_events` keeps the blocks apart because that is what
+        // the record says; `history` does not, for two reasons. A person typed
+        // one message, and searching for it should find one row. And
+        // `history`'s identity is `(source, timestamp_ms, prompt)`, so two
+        // blocks that happen to carry the same text in one turn would collide
+        // on insert and silently store one row for two events -- the tables
+        // would then disagree about how many times the person said it.
+        let mut user_prompt_parts: Vec<String> = Vec::new();
         for (block_index, block) in blocks.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{record_offset}:{block_index}");
@@ -5683,20 +5692,7 @@ pub(crate) fn ingest_cursor_transcript(
                         continue;
                     }
                     if is_user {
-                        if record_offset >= history_from_offset {
-                            outcome.prompts_inserted += insert_history(
-                                conn,
-                                &HistoryEntry {
-                                    id: 0,
-                                    source: "cursor".into(),
-                                    session_id: Some(session_id.to_string()),
-                                    project: project.map(str::to_string),
-                                    prompt_hash: Some(prompt_hash(&text)),
-                                    prompt: text.clone(),
-                                    timestamp_ms: ts_ms,
-                                },
-                            )?;
-                        }
+                        user_prompt_parts.push(text.clone());
                     } else {
                         outcome.last_assistant_text = Some(text.clone());
                     }
@@ -5926,6 +5922,25 @@ pub(crate) fn ingest_cursor_transcript(
                 // there is no `session_events.kind` that it honestly is.
                 _ => {}
             }
+        }
+        // One row for the turn, after the blocks, so the prompt carries
+        // everything the person wrote in it. Records before the offset this
+        // read resumed from are already in `history` under a timestamp this
+        // pass must not restate; see the note on `history_from_offset`.
+        if !user_prompt_parts.is_empty() && record_offset >= history_from_offset {
+            let prompt = user_prompt_parts.join("\n\n");
+            outcome.prompts_inserted += insert_history(
+                conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "cursor".into(),
+                    session_id: Some(session_id.to_string()),
+                    project: project.map(str::to_string),
+                    prompt_hash: Some(prompt_hash(&prompt)),
+                    prompt,
+                    timestamp_ms: ts_ms,
+                },
+            )?;
         }
         if emitted_evidence && !ts_is_guessed {
             outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
@@ -13840,6 +13855,98 @@ mod tests {
                 // having stopped reading timestamps altogether.
                 ("well formed".to_string(), 1_789_587_660_000),
             ]
+        );
+    }
+
+    /// A human turn is one `history` row, however many text blocks Cursor
+    /// split it into.
+    ///
+    /// Reported by Devin against the merge head as "repeated Cursor prompts
+    /// are dropped". `history`'s identity is `(source, timestamp_ms, prompt)`
+    /// and the blocks of one record all share that record's turn time, so
+    /// inserting a row per block meant two blocks carrying the same text
+    /// collided on `INSERT OR IGNORE` and stored one row for two events. The
+    /// tables then disagreed about how many times the person said it, and the
+    /// searchable copy was the one that lost.
+    ///
+    /// Joining the turn's blocks fixes both halves: nothing a person wrote
+    /// goes unindexed, and one turn is one row whatever its blocks contain.
+    /// `session_events` still keeps the blocks apart, because that is what the
+    /// record says.
+    ///
+    /// Positive control: against the per-block insert this fails at
+    /// `a repeated block must not vanish from history: left: ["first half",
+    /// "second half", "same words"], right: ["first half\n\nsecond half",
+    /// "same words\n\nsame words"]` -- three rows for four blocks, with the
+    /// second `same words` silently gone.
+    #[test]
+    fn a_cursor_turn_is_one_prompt_however_many_blocks_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-blocks.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>first half</user_query>"},{"type":"text","text":"second half"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp>\n<user_query>same words</user_query>"},{"type":"text","text":"same words"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_cursor_transcript(
+            &conn,
+            &path,
+            "s-blocks",
+            Some("/tmp/proj"),
+            4_242,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-blocks' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                "first half\n\nsecond half".to_string(),
+                // The duplicate turn keeps both copies, in one row, instead of
+                // losing the repetition to the unique index.
+                "same words\n\nsame words".to_string(),
+            ],
+            "a repeated block must not vanish from history"
+        );
+
+        // The events are unchanged: one row per block, both copies present.
+        let texts: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source = 'cursor' \
+                 AND session_id = 's-blocks' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            texts,
+            vec![
+                "first half".to_string(),
+                "second half".to_string(),
+                "same words".to_string(),
+                "same words".to_string(),
+            ],
+            "session_events keeps the blocks the record actually carried"
         );
     }
 
