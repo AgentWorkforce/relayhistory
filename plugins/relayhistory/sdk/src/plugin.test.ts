@@ -381,11 +381,13 @@ test('multi-origin delivery merges canonical identities without comparing origin
   assert.equal(result.capability, 'shallow_only');
 });
 
-// A complete export that found no file edits and no delegation examined those
-// kinds and found none. Declaring coverage from the rows that happened to be
-// present reported every such normal session as `partial`, which costs the
-// snapshot its priority in a merge against a less complete presence.
-test('a sparse session keeps its zero-row kinds covered and still hydrates as full', async (t) => {
+// A sparse session reports the kinds its export carried and no more. Declaring
+// the untouched kinds covered would be right for an unfiltered export -- and
+// costs such a session priority in a merge -- but a delivery job exports only
+// its configured selection, so this listing cannot tell "the session has none"
+// from "no job exported it". Until the read protocol carries the contributing
+// selections, understating is the side to be wrong on.
+test('a sparse session reports the kinds its export carried, and no more', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'rh-sparse-coverage-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const recordsPath = join(dir, 'records.json');
@@ -405,14 +407,72 @@ test('a sparse session keeps its zero-row kinds covered and still hydrates as fu
     source: 'claude', sessionId: 'session-fixture', scope: 'remote', plugins: registry, dbPath,
   });
 
-  assert.equal(result.capability, 'full');
-  for (const kind of ['history', 'session_event', 'tool_call', 'file_edit', 'relationship']) {
-    assert.ok(result.coverage.includes(kind as never), `${kind} stays covered`);
-  }
-  // Covered and empty, which is the distinction the contract exists to carry.
+  assert.equal(result.capability, 'partial');
+  assert.deepEqual(result.coverage, ['history', 'session_event']);
   assert.equal(result.evidence.toolCalls, 0);
   assert.equal(result.evidence.fileEdits, 0);
   assert.equal(result.evidence.prompts, 1);
+});
+
+// A delivery job exports only the kinds in its configured selection, so an
+// absent kind means either "this session has none" or "no job ever exported
+// it" -- and the listing cannot tell them apart. Treating one delivered row as
+// proof that every kind was examined turns a filtered export into a `full`
+// claim over evidence nobody looked at.
+test('a filtered export does not claim coverage of the kinds it never carried', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rh-filtered-export-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const recordsPath = join(dir, 'records.json');
+  const binaryPath = await fixtureHelper(t, 'clear', recordsPath);
+  const dbPath = join(dir, 'history.db');
+  const registry = new HistoryPluginRegistry();
+  registry.register({ sources: [relayHistorySource({ binaryPath, expectedAccount: account })] });
+  const hydrate = () => hydrateSession({
+    source: 'claude', sessionId: 'session-fixture', scope: 'remote', plugins: registry, dbPath,
+  });
+
+  // A job selecting history, session_event and session: one delivered event,
+  // and nothing about tool calls, file edits or delegation.
+  await writeFile(recordsPath, JSON.stringify([
+    record('history', 'prompt', { timestamp_ms: 10, prompt: 'question' }),
+    record('session_event', 'answer', {
+      event_uid: 'answer', ts_ms: 20, role: 'assistant', kind: 'text', text: 'answer',
+    }),
+    record('session', 'metadata', { first_prompt: 'question' }),
+  ]));
+  const filtered = await hydrate();
+  for (const kind of ['tool_call', 'file_edit', 'relationship']) {
+    assert.equal(
+      filtered.coverage.includes(kind as never), false,
+      `${kind} was never exported by this job, so it is not covered`,
+    );
+  }
+  assert.equal(filtered.capability, 'partial');
+
+  // Positive control: an export that did carry every kind still reports them,
+  // so the assertions above are about the job's selection and not about the
+  // plugin having stopped reporting coverage at all.
+  await writeFile(recordsPath, JSON.stringify([
+    record('history', 'prompt2', { timestamp_ms: 11, prompt: 'question' }),
+    record('session_event', 'answer2', {
+      event_uid: 'answer2', ts_ms: 21, role: 'assistant', kind: 'text', text: 'answer',
+    }),
+    record('tool_call', 'tool2', { tool_use_id: 'tool-2', name: 'Edit' }),
+    record('file_edit', 'edit2', { tool_use_id: 'tool-2', file_path: '/work/a.rs', tool_name: 'Edit' }),
+    {
+      ...record('relationship', 'delegation2', {}),
+      payload: {
+        source: 'claude', parent_session_id: 'session-fixture', relationship_uid: 'delegation2',
+        child_session_id: 'child2', relationship: 'delegated', identity_status: 'observed',
+        evidence_kind: 'transcript', created_ms: 1, updated_ms: 1,
+      },
+    },
+  ]));
+  const complete = await hydrate();
+  for (const kind of ['history', 'session_event', 'tool_call', 'file_edit', 'relationship']) {
+    assert.ok(complete.coverage.includes(kind as never), `${kind} was exported and is covered`);
+  }
+  assert.equal(complete.capability, 'full');
 });
 
 // `includeRelated: false` is part of the request, not of the local path. A
@@ -468,8 +528,11 @@ test('a remote snapshot honours includeRelated: false and the merge does not rei
   // above are about the option and not about an export that never had one.
   const requested = await hydrate('remote', true);
   assert.equal(requested.coverage.includes('relationship'), true);
-  assert.equal(requested.capability, 'full');
   assert.equal(await relationshipRows(dbPath), 1);
+  // Still `partial`: this export carried only history and the delegation edge,
+  // so the other kinds are genuinely uncovered. What the option controls is
+  // whether `relationship` is among them, which is what is asserted above.
+  assert.equal(requested.capability, 'partial');
 });
 
 test('source discovery orders by evidence recency before applying its limit', async (t) => {

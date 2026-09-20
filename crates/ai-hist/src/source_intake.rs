@@ -240,6 +240,7 @@ pub(crate) fn apply_normalized(
     }
     let mut own = snapshots.remove(&owner(key)).unwrap_or_default();
     let prior_records = own.records.clone();
+    let prior_kinds = own.covered_kinds.clone();
     own.format = "records".into();
     own.records
         .retain(|item| !evidence.covered_kinds.contains(&item.record.kind));
@@ -256,7 +257,12 @@ pub(crate) fn apply_normalized(
     }
     own.records
         .sort_by_cached_key(|item| item.record.identity());
+    // Coverage is part of the result, not just bookkeeping: an acquisition that
+    // covers a kind the last one did not changes the capability even when it
+    // adds no row -- the session simply has none of that kind. Reporting that
+    // as `unchanged` invites a consumer to skip the upgrade it just asked for.
     let unchanged = own.records == prior_records
+        && own.covered_kinds == prior_kinds
         && previous.as_ref().is_some_and(|checkpoint| {
             checkpoint.source_stamp.as_deref() == Some(&evidence.source_stamp)
         });
@@ -310,7 +316,9 @@ pub(crate) fn apply_normalized(
         &evidence.source_stamp,
         evidence.source_bytes,
         evidence.records.len() as i64,
-        false,
+        // What this acquisition actually did, so the stored checkpoint cannot
+        // contradict a hydration that did index delegation.
+        include_related,
         full,
     )?;
     tx.commit()?;

@@ -435,22 +435,29 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
         'relationship',
         'commit_link',
       ] as const;
-      // What the export examined, not what it happened to contain. This read
-      // is the complete delivered history for the session, so once it yields
-      // any supported evidence every supported kind was looked at, and a kind
-      // with no rows means the session has none of it. Declaring coverage from
-      // row presence instead reported a normal session with no file edits or
-      // delegation as `partial` and cost it priority in a merge. `records`
-      // below still carries only the rows that exist.
+      // Coverage is what this listing actually carried.
       //
-      // An export with nothing of any supported kind stays uncovered: a read
-      // that yielded no evidence has not shown it examined anything here, and
-      // the caller gets `capability_limited` rather than a complete-looking
-      // snapshot over nothing.
-      const examined = rows.some((row) => (allowed as readonly string[]).includes(row.kind));
-      const covered = !examined
-        ? []
-        : allowed.filter((kind) => kind !== 'relationship' || context.includeRelated !== false);
+      // It would be better to declare what the export *examined* -- a covered
+      // kind with no rows then means "this session has none", which is the
+      // distinction the contract exists to carry. But a delivery job exports
+      // only the kinds in its configured selection, so an absent kind here
+      // means either that or "no job ever exported it", and this listing
+      // cannot tell them apart: the records come from the cloud's
+      // `/v1/delivery/records`, while the selections belong to jobs that may
+      // have run on other machines entirely. Deriving coverage from the
+      // contributing selections needs that metadata on the read response,
+      // which is a server-side change, not one this plugin can make.
+      //
+      // Until then, row presence is the honest answer available. It
+      // understates a sparse session -- one with no file edits reports
+      // `partial` -- and understating is the side to be wrong on: claiming a
+      // kind nobody exported is the "well-formed answer computed over nothing"
+      // this contract removes.
+      const delivered = new Set(rows.map((row) => row.kind));
+      const covered = allowed.filter(
+        (kind) =>
+          delivered.has(kind) && (kind !== 'relationship' || context.includeRelated !== false),
+      );
       const records = canonicalDeliveredEvidence(rows)
         .filter(
           (row) =>

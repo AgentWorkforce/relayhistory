@@ -236,6 +236,126 @@ fn declining_related_evidence_does_not_inherit_coverage_from_an_earlier_acquisit
     Ok(())
 }
 
+/// Coverage is acquisition metadata, so a snapshot that covers more than the
+/// last one is a different result even when the rows and the stamp are
+/// identical -- the capability it reports has changed. Calling that `unchanged`
+/// invites a consumer to skip the upgrade.
+#[test]
+fn expanding_coverage_without_new_rows_is_not_an_unchanged_result() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    let thread_kinds = vec![
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::FileEdit,
+    ];
+    let rows = || {
+        full_session_records()
+            .into_iter()
+            .filter(|record| record.kind != EvidenceKind::Relationship)
+            .collect::<Vec<_>>()
+    };
+
+    let first = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        thread_kinds.clone(),
+        rows(),
+        Some(false),
+    )?;
+    assert_eq!(first.status, "hydrated");
+    assert_eq!(first.capability, "partial");
+
+    // Control: the identical acquisition, repeated. Same rows, same stamp, same
+    // coverage -- genuinely unchanged, and it must stay that way or the
+    // assertion below would pass for a result that simply never reports it.
+    let repeated = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        thread_kinds.clone(),
+        rows(),
+        Some(false),
+    )?;
+    assert_eq!(repeated.status, "unchanged");
+    assert_eq!(repeated.capability, "partial");
+
+    // The same rows and stamp again, but now covering delegation too. No row is
+    // added -- this session simply has no child -- yet the capability rises.
+    let upgraded = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        rows(),
+        Some(true),
+    )?;
+    assert_eq!(upgraded.capability, "full");
+    assert_ne!(
+        upgraded.status, "unchanged",
+        "coverage grew and the capability rose, so the result is not unchanged"
+    );
+    Ok(())
+}
+
+/// The checkpoint records what the acquisition did. Storing a literal `false`
+/// made it disagree with a hydration that did index delegation.
+#[test]
+fn the_checkpoint_records_whether_related_evidence_was_acquired() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        full_session_records(),
+        Some(true),
+    )?;
+    assert!(
+        state(&path, "a")?.checkpoint.unwrap().include_related,
+        "an acquisition that indexed delegation records that it did"
+    );
+
+    // Control: declining it stores false, so the field tracks the request
+    // rather than being pinned either way.
+    apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::History, EvidenceKind::SessionEvent],
+        full_session_records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    EvidenceKind::History | EvidenceKind::SessionEvent
+                )
+            })
+            .collect(),
+        Some(false),
+    )?;
+    assert!(!state(&path, "a")?.checkpoint.unwrap().include_related);
+    Ok(())
+}
+
 #[test]
 fn revisions_fence_stale_results_and_instances_are_independent() -> Result<()> {
     let dir = tempfile::tempdir()?;
