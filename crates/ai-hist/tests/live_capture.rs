@@ -21,6 +21,43 @@ use ai_hist::{shallow_providers, SyncOutput};
 /// sleep: a passing run returns as soon as the event lands.
 const ARRIVES_WITHIN: Duration = Duration::from_secs(10);
 
+/// Owns the paths a [`ProviderRoots`] borrows.
+///
+/// `ProviderRoots` is a borrowed view, so a literal built from
+/// `&home.join("..")` would not outlive the statement. This also keeps each
+/// test honest about the distinction that matters: a provider root is
+/// *configurable*, and only defaults to sitting under `$HOME`.
+struct HomeLayout {
+    home: PathBuf,
+    claude: PathBuf,
+    codex: PathBuf,
+    grok: PathBuf,
+    opencode_db: PathBuf,
+}
+
+impl HomeLayout {
+    /// The default layout: every provider root where it falls under `$HOME`.
+    fn under(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            claude: home.join(".claude"),
+            codex: home.join(".codex"),
+            grok: home.join(".grok"),
+            opencode_db: home.join(".local/share/opencode/opencode.db"),
+        }
+    }
+
+    fn roots(&self) -> ProviderRoots<'_> {
+        ProviderRoots {
+            home: &self.home,
+            claude: &self.claude,
+            codex: &self.codex,
+            grok: &self.grok,
+            opencode_db: &self.opencode_db,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // watch loop
 // ---------------------------------------------------------------------------
@@ -427,13 +464,8 @@ fn disabling_fs_events_polls_a_real_directory() {
 fn appending_to_a_watched_transcript_drives_one_forced_tick() {
     let home = tempfile::tempdir().expect("tempdir");
     let transcript = write_claude_transcript(home.path(), "proj", "watched", 1);
-    let roots = ai_hist::discover::watch_roots(
-        &shallow_providers(),
-        &ProviderRoots {
-            home: home.path(),
-            opencode_db: &home.path().join("no-opencode.db"),
-        },
-    );
+    let layout = HomeLayout::under(home.path());
+    let roots = ai_hist::discover::watch_roots(&shallow_providers(), &layout.roots());
     assert!(
         roots
             .iter()
@@ -475,14 +507,9 @@ fn appending_to_a_watched_transcript_drives_one_forced_tick() {
 #[test]
 fn every_file_backed_provider_contributes_a_watch_root() {
     let home = PathBuf::from("/tmp/relayhistory-watch-roots");
-    let opencode_db = home.join(".local/share/opencode/opencode.db");
-    let roots = ai_hist::discover::watch_roots(
-        &shallow_providers(),
-        &ProviderRoots {
-            home: &home,
-            opencode_db: &opencode_db,
-        },
-    );
+    let layout = HomeLayout::under(&home);
+    let opencode_db = layout.opencode_db.clone();
+    let roots = ai_hist::discover::watch_roots(&shallow_providers(), &layout.roots());
 
     for expected in [
         home.join(".claude/projects"),
@@ -504,6 +531,50 @@ fn every_file_backed_provider_contributes_a_watch_root() {
     let before = paths.len();
     paths.dedup();
     assert_eq!(paths.len(), before, "watch roots must be deduplicated");
+}
+
+/// A relocated provider root moves the watch with it.
+///
+/// `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `GROK_HOME` already move what a sweep
+/// reads. A watch root rebuilt from `$HOME` instead would leave live capture
+/// staring at a directory the provider never writes to: every sweep correct,
+/// every one of them waiting out the backstop.
+#[test]
+fn configured_provider_roots_move_the_watch_roots() {
+    let home = PathBuf::from("/tmp/relayhistory-relocated-home");
+    let layout = HomeLayout {
+        home: home.clone(),
+        claude: PathBuf::from("/tmp/relayhistory-relocated/claude"),
+        codex: PathBuf::from("/tmp/relayhistory-relocated/codex"),
+        grok: PathBuf::from("/tmp/relayhistory-relocated/grok"),
+        opencode_db: PathBuf::from("/tmp/relayhistory-relocated/opencode/opencode.db"),
+    };
+    let roots = ai_hist::discover::watch_roots(&shallow_providers(), &layout.roots());
+
+    for expected in [
+        layout.claude.join("projects"),
+        layout.codex.join("sessions"),
+        layout.codex.join("archived_sessions"),
+        layout.grok.join("sessions"),
+        layout
+            .opencode_db
+            .parent()
+            .expect("opencode dir")
+            .to_path_buf(),
+    ] {
+        assert!(
+            roots.iter().any(|root| root.path == expected),
+            "{expected:?} missing from {roots:?}"
+        );
+    }
+    assert!(
+        !roots
+            .iter()
+            .any(|root| root.path.starts_with(home.join(".claude"))
+                || root.path.starts_with(home.join(".codex"))
+                || root.path.starts_with(home.join(".grok"))),
+        "a configured root must not leave a $HOME-relative watch behind: {roots:?}"
+    );
 }
 
 /// A trajectory root is watched because it is *configured*, not because it
