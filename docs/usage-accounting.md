@@ -86,11 +86,29 @@ that genuinely cannot carry it.
 
 An unreadable snapshot is a transient glitch, like a regressed one, and does
 not decide anything about the turn waiting for its measurement. It is held,
-not attached: because the baseline is untouched, the next advancing snapshot's
-delta already spans it, and that delta goes to the waiting turn. The refusal
-surfaces only at the end of the rollout, on a turn that never received a
-measurement at all — so a provider that says something unreadable and then
-reports the real figure still charges the right turn the right number.
+not attached, and remembered **against the turn that was waiting when it
+arrived** — several turns can go unmeasured before anything recovers, and each
+keeps its own refusal rather than overwriting the last.
+
+Because an unreadable snapshot never advances the baseline, the next readable
+one is measured from the point before *every* held refusal: its delta already
+covers all of their spans. So a measured delta supersedes all of them. Nothing
+is lost — an earlier turn's spend is reported inside the recovering turn's
+request — and no turn is marked as rejected in a session that was in fact
+measured end to end. This is what keeps a glitch that arrives while
+`agent_reasoning` holds the waiting slot from flagging a turn that its own
+`agent_message` was measured for.
+
+Refusals surface only at the end of the rollout, each on the turn it belonged
+to, and only for turns nothing ever recovered. A turn with no measurement and
+no refusal means its spend was folded into a later request; a turn carrying
+the provider's own unreadable object means the figure was rejected. The two
+are different answers and the store keeps them different.
+
+If the *first* snapshot is unreadable there is no baseline at all, so the next
+readable one installs one and measures nothing. Differencing it from zero
+would report a resumed session's whole carried-over total as a single
+request's spend.
 
 `input_tokens` in a Codex record stays *inclusive* of `cached_input_tokens`
 even after differencing. Normalization makes it exclusive, so a consumer that
@@ -270,8 +288,15 @@ rule `session_requests` groups by. One Claude API response is written as several
 records with distinct uuids and a full copy of `message.usage` on each, so
 folding the records charged a prompt its own cost multiplied by the response's
 block count. When the records of one request disagree — on the measurement, or
-on the prompt they resolve to — the request contributes nothing, for the same
-reason a broken ancestry does.
+on the prompt they resolve to — the request contributes nothing.
+
+A record can be silent or contradictory, and the two are not the same.
+A record with no usage, or with a broken ancestry, says nothing: Claude chains
+a request's records through each other and the parser stores no row for an
+empty block, so a mid-chain gap is ordinary and a sibling may still establish
+the request. A record whose usage is present but unreadable, or that names an
+owner the evidence cannot pin down, *contradicts*: the request's cost or owner
+is in dispute and a sibling whose copy happens to parse is not the tie-breaker.
 
 The identity rule exists twice, once in Rust (`usage::request_key`) and once in
 the view's SQL. They are pinned against each other by a test, because drift

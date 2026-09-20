@@ -556,6 +556,22 @@ pub(crate) fn request_key(event: &SessionEvent) -> String {
     }
 }
 
+/// What one record says about the cost of the request it belongs to.
+///
+/// The three cases are not interchangeable, which is the whole point of the
+/// enum: `Absent` is a record that says nothing, and `Unreadable` is a record
+/// that says something that cannot be believed. Folding the second into the
+/// first let a sibling whose copy happened to parse stand in for a request
+/// whose copies contradict each other.
+enum RecordUsage {
+    /// No usage on this record, or usage carrying no recognized counter.
+    Absent,
+    /// Usage is present and cannot be turned into a measurement: the record's
+    /// rows disagree about it, or normalization refused it.
+    Unreadable,
+    Measured(NormalizedUsage),
+}
+
 /// One assistant or user message, rebuilt from the content-block rows that
 /// carry it.
 struct UsageMessage {
@@ -564,10 +580,21 @@ struct UsageMessage {
     ts: i64,
     role: String,
     text: String,
-    usage: Option<NormalizedUsage>,
+    usage: RecordUsage,
     /// The API request this record belongs to. Several records can share one
     /// — see [`request_key`].
     request: String,
+}
+
+/// What one record contributes to its request.
+enum Contribution<'a> {
+    /// Nothing that bears on the request's cost or its owner.
+    Silent,
+    /// A measurement and the prompt it is owed to.
+    Measured(PromptKey, &'a NormalizedUsage),
+    /// Evidence that cannot be reconciled: an unreadable measurement, or an
+    /// owner the record names but that cannot be pinned down.
+    Contradictory,
 }
 
 /// Attribute each message's usage to the prompt that caused it.
@@ -611,21 +638,30 @@ pub fn attribute_usage_to_prompts(
             // Claude copies message.usage onto every content block. Counting
             // rows would multiply one model request by its thinking/text/tool
             // block count.
-            let tokens: Option<Vec<Value>> = rows
+            let raw: Vec<&str> = rows
                 .iter()
                 .filter_map(|r| r.token_json.as_deref())
+                .collect();
+            let parsed: Option<Vec<Value>> = raw
+                .iter()
                 .map(|raw| serde_json::from_str(raw).ok())
                 .collect();
-            let usage = tokens.and_then(|tokens| {
-                let first = tokens.first()?;
-                if tokens.iter().any(|value| value != first) {
-                    return None;
+            let usage = match parsed.as_deref() {
+                None => RecordUsage::Unreadable,
+                Some([]) => RecordUsage::Absent,
+                // One record reports one measurement. Rows that disagree about
+                // it are not evidence of either reading.
+                Some([first, rest @ ..]) if rest.iter().all(|value| value == first) => {
+                    match normalize_usage(source, first) {
+                        Ok(Some(usage)) if !usage.is_zero() => RecordUsage::Measured(usage),
+                        // `{}` and a record with no recognized counter are
+                        // silence, not a contradiction.
+                        Ok(_) => RecordUsage::Absent,
+                        Err(_) => RecordUsage::Unreadable,
+                    }
                 }
-                normalize_usage(source, first)
-                    .ok()
-                    .flatten()
-                    .filter(|usage| !usage.is_zero())
-            });
+                Some(_) => RecordUsage::Unreadable,
+            };
             let text = rows
                 .iter()
                 .filter(|r| r.kind == "text")
@@ -674,59 +710,43 @@ pub fn attribute_usage_to_prompts(
     // `None` marks a request whose records contradict each other.
     let mut requests: HashMap<&str, Option<(PromptKey, &NormalizedUsage)>> = HashMap::new();
     for message in messages.values().filter(|m| m.role == "assistant") {
-        let Some(usage) = &message.usage else {
-            continue;
-        };
-        let owner = if message.parent.is_some() {
-            parent_prompt(message, &messages)
-        } else if source == "codex" && message.ts > 0 && timestamps_known {
-            // Codex persists no parent IDs. Only its ordered human-turn
-            // stream establishes ownership: a tie at either boundary is
-            // ambiguous, and an explicit but broken parent link must never
-            // fall back to time.
-            let boundary = boundaries.partition_point(|u| u.ts_ms < message.ts);
-            if boundaries
-                .get(boundary)
-                .is_some_and(|u| u.ts_ms == message.ts)
-            {
-                None
-            } else {
-                boundary.checked_sub(1).and_then(|i| {
-                    let user = boundaries[i];
-                    if user.ts_ms <= 0 || (i > 0 && boundaries[i - 1].ts_ms == user.ts_ms) {
-                        return None;
-                    }
-                    messages.get(user.message_id.as_deref()?)
-                })
+        let contribution = contribution_of(
+            message,
+            source,
+            &messages,
+            &boundaries,
+            timestamps_known,
+            &prompt_counts,
+        );
+        match contribution {
+            // A record that says nothing leaves the request as it found it.
+            // A broken ancestry is silence, not contradiction: Claude chains a
+            // request's records through each other and the parser stores no
+            // row for an empty block, so a mid-chain gap is ordinary. Refusing
+            // the request over it would drop measurements that a sibling
+            // establishes outright.
+            Contribution::Silent => {}
+            Contribution::Contradictory => {
+                requests.insert(message.request.as_str(), None);
             }
-        } else {
-            None
-        };
-        let Some(owner) = owner else { continue };
-        let key = (owner.ts, owner.text.clone());
-        // Identical text and timestamps cannot distinguish two user messages.
-        // Assigning both to a single history row would conceal a bad join.
-        if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
-            continue;
-        }
-        match requests.entry(message.request.as_str()) {
-            Entry::Vacant(slot) => {
-                slot.insert(Some((key, usage)));
-            }
-            Entry::Occupied(mut slot) => {
-                // The copies of one request must agree on both the
-                // measurement and the prompt that caused it. If they do not,
-                // the evidence does not say which reading is real, so the
-                // request contributes nothing rather than one of them — the
-                // same refusal this function applies to a broken ancestry.
-                let agrees = slot
-                    .get()
-                    .as_ref()
-                    .is_some_and(|(owner, seen)| *owner == key && *seen == usage);
-                if !agrees {
-                    slot.insert(None);
+            Contribution::Measured(key, usage) => match requests.entry(message.request.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Some((key, usage)));
                 }
-            }
+                Entry::Occupied(mut slot) => {
+                    // The copies of one request must agree on both the
+                    // measurement and the prompt that caused it. If they do
+                    // not, the evidence does not say which reading is real, so
+                    // the request contributes nothing rather than one of them.
+                    let agrees = slot
+                        .get()
+                        .as_ref()
+                        .is_some_and(|(owner, seen)| *owner == key && *seen == usage);
+                    if !agrees {
+                        slot.insert(None);
+                    }
+                }
+            },
         }
     }
 
@@ -754,6 +774,64 @@ pub fn attribute_usage_to_prompts(
         .into_iter()
         .filter_map(|(key, usage)| usage.map(|u| (key, u)))
         .collect()
+}
+
+/// What one assistant record contributes to the request it belongs to.
+fn contribution_of<'a>(
+    message: &'a UsageMessage,
+    source: &str,
+    messages: &'a HashMap<String, UsageMessage>,
+    boundaries: &[&SessionEvent],
+    timestamps_known: bool,
+    prompt_counts: &HashMap<PromptKey, i32>,
+) -> Contribution<'a> {
+    let usage = match &message.usage {
+        RecordUsage::Absent => return Contribution::Silent,
+        // The request's own cost is in dispute. A sibling whose copy parses is
+        // not the tie-breaker: reporting it would publish one of two
+        // contradicting readings as the measurement.
+        RecordUsage::Unreadable => return Contribution::Contradictory,
+        RecordUsage::Measured(usage) => usage,
+    };
+    let owner = if message.parent.is_some() {
+        parent_prompt(message, messages)
+    } else if source == "codex" && message.ts > 0 && timestamps_known {
+        // Codex persists no parent IDs. Only its ordered human-turn
+        // stream establishes ownership: a tie at either boundary is
+        // ambiguous, and an explicit but broken parent link must never
+        // fall back to time.
+        let boundary = boundaries.partition_point(|u| u.ts_ms < message.ts);
+        if boundaries
+            .get(boundary)
+            .is_some_and(|u| u.ts_ms == message.ts)
+        {
+            None
+        } else {
+            boundary.checked_sub(1).and_then(|i| {
+                let user = boundaries[i];
+                if user.ts_ms <= 0 || (i > 0 && boundaries[i - 1].ts_ms == user.ts_ms) {
+                    return None;
+                }
+                messages.get(user.message_id.as_deref()?)
+            })
+        }
+    } else {
+        None
+    };
+    // No owner is missing evidence about *this record*, not about the
+    // request: a sibling may establish it.
+    let Some(owner) = owner else {
+        return Contribution::Silent;
+    };
+    let key = (owner.ts, owner.text.clone());
+    // Identical text and timestamps cannot distinguish two user messages.
+    // Assigning both to a single history row would conceal a bad join. The
+    // record does name an owner here, so this is a contradiction rather
+    // than silence.
+    if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
+        return Contribution::Contradictory;
+    }
+    Contribution::Measured(key, usage)
 }
 
 /// Walk `parent_id` to the user message that owns a response.

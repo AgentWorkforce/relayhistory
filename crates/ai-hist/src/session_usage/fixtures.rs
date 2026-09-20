@@ -38,6 +38,28 @@ fn codex_store(relative: &str) -> Connection {
 
 const CLAUDE_SESSION: &str = "22222222-2222-2222-2222-222222222222";
 
+/// Every assistant turn's text and whatever measurement landed on it.
+fn assistant_usage(conn: &Connection) -> Vec<(String, Option<String>)> {
+    conn.prepare(
+        "SELECT text, token_json FROM session_events \
+         WHERE source='codex' AND role='assistant' AND kind='text' ORDER BY ts_ms",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    .unwrap()
+    .collect::<std::result::Result<_, _>>()
+    .unwrap()
+}
+
+fn usage_of(stored: &[(String, Option<String>)], text: &str) -> Option<String> {
+    stored
+        .iter()
+        .find(|(stored_text, _)| stored_text == text)
+        .unwrap_or_else(|| panic!("no turn {text}"))
+        .1
+        .clone()
+}
+
 fn assistant_rows_with_usage(conn: &Connection) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM session_events \
@@ -394,54 +416,76 @@ fn a_bad_snapshot_followed_by_a_good_one_still_measures_the_waiting_turn() {
     assert!(summary.diagnostics.is_empty());
 }
 
-/// The refusal belongs to the turn that was waiting when the bad snapshot
-/// arrived, not to whichever turn happens to be waiting at end of file. Once a
-/// second assistant turn takes the waiting slot, the first can never receive a
-/// measurement, so flushing the held refusal onto the current slot marked the
-/// *new* turn unreadable and left the turn that owned the glitch silent — two
-/// wrong answers from one mistake.
+/// An unreadable snapshot never advances the baseline, so the next readable
+/// one measures from the point *before* it: its delta already covers the span
+/// the glitch failed to measure. Nothing was lost, and no earlier turn is owed
+/// a refusal — its spend is reported inside the recovering turn's request.
+/// Marking it rejected would add an unreadable request to a session that was
+/// in fact measured end to end.
 #[test]
-fn an_unreadable_snapshot_is_charged_to_the_turn_that_was_waiting_for_it() {
+fn a_recovering_delta_supersedes_the_refusals_its_span_covers() {
     let conn = codex_store("codex/counter-unusable-then-new-turn.jsonl");
-    let mut stored: Vec<(String, Option<String>)> = conn
-        .prepare(
-            "SELECT text, token_json FROM session_events \
-             WHERE source='codex' AND role='assistant' AND kind='text' ORDER BY ts_ms",
-        )
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<std::result::Result<_, _>>()
-        .unwrap();
-    stored.sort();
+    let stored = assistant_usage(&conn);
     assert_eq!(stored.len(), 2, "two turns");
-
-    let first = stored
-        .iter()
-        .find(|(text, _)| text == "First answer.")
-        .unwrap();
-    let second = stored
-        .iter()
-        .find(|(text, _)| text == "Second answer.")
-        .unwrap();
-    let first_usage = first.1.as_deref().expect("the first turn is not silent");
-    assert!(
-        first_usage.contains("-1"),
-        "the first turn keeps the provider's own unreadable object: {first_usage}"
-    );
-    let second_usage = second.1.as_deref().expect("the second turn was measured");
-    assert!(
-        !second_usage.contains("-1"),
-        "the second turn is untouched by the earlier glitch: {second_usage}"
-    );
     assert_eq!(
-        crate::usage::normalize_usage_str("codex", second_usage)
+        stored
+            .iter()
+            .filter(|(_, usage)| usage.as_deref().is_some_and(|u| u.contains("-1")))
+            .count(),
+        0,
+        "no turn is marked unreadable: {stored:?}"
+    );
+    let measured = usage_of(&stored, "Second answer.").expect("the second turn was measured");
+    assert_eq!(
+        crate::usage::normalize_usage_str("codex", &measured)
             .unwrap()
             .unwrap()
             .output_tokens,
         140,
-        "and still carries its own delta"
+        "and its delta covers the whole span, the glitch included"
     );
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_wrong_turn")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !summary
+            .diagnostics
+            .contains(&UsageDiagnostic::UnnormalizableUsage),
+        "the session was measured, so it reports no refusal: {:?}",
+        summary.diagnostics
+    );
+    assert_eq!(summary.usage.as_ref().unwrap().output_tokens, 140);
+}
+
+/// The same rule seen from the row that `agent_reasoning` occupies. Reasoning
+/// takes the waiting slot, so a glitch while it holds it named *it*; the
+/// recovering delta then landed on the turn's `agent_message` and the thinking
+/// row was left carrying a refusal for a turn that had been measured — an
+/// extra unreadable request in a session with nothing wrong with it.
+#[test]
+fn a_glitch_while_reasoning_is_waiting_does_not_outlive_the_recovery() {
+    let conn = codex_store("codex/reasoning-then-unreadable.jsonl");
+    let unreadable: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_events \
+             WHERE source='codex' AND token_json LIKE '%-1%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unreadable, 0, "no row keeps the superseded glitch");
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_reasoning_bad")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !summary
+            .diagnostics
+            .contains(&UsageDiagnostic::UnnormalizableUsage),
+        "{:?}",
+        summary.diagnostics
+    );
+    let usage = summary.usage.as_ref().expect("the session reports a total");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (400, 140));
 }
 
 /// A resumed rollout opens with the cumulative total it carried over. If that
@@ -558,6 +602,79 @@ fn a_request_split_across_records_is_charged_to_its_prompt_once() {
     assert_eq!(summary.request_count, 1);
     let totals = summary.usage.as_ref().expect("one readable request");
     assert_eq!((totals.input_tokens, totals.output_tokens), (7, 40));
+}
+
+/// A request is charged only when every record of it that says anything about
+/// the measurement agrees. One record carrying an unreadable copy of
+/// `message.usage` means the request's cost is in dispute, and a sibling whose
+/// copy happens to parse is not the tie-breaker — charging it would report one
+/// of two contradicting readings as the measurement.
+#[test]
+fn a_request_with_one_unreadable_copy_charges_nothing() {
+    let conn = claude_store("claude/multi-record-bad-copy.jsonl");
+    let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
+    assert_eq!(
+        crate::usage::attribute_usage_to_prompts(&events, "claude"),
+        std::collections::HashMap::new(),
+        "the copies disagree, so nothing is established"
+    );
+}
+
+/// But a record whose *ancestry* is broken says nothing about the cost and
+/// nothing about the owner — it is silence, not contradiction. Claude chains
+/// a request's records through each other and the parser stores no row for an
+/// empty block, so a mid-chain gap is ordinary, and refusing the whole request
+/// over it would drop measurements that a sibling establishes outright.
+#[test]
+fn a_broken_sibling_does_not_cancel_a_request_its_siblings_establish() {
+    let conn = claude_store("claude/multi-record-broken-sibling.jsonl");
+    let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
+    let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+    assert_eq!(attributed.len(), 1);
+    let ((_, prompt), usage) = attributed.iter().next().unwrap();
+    assert_eq!(prompt, "one link missing");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (7, 40),
+        "once, from the record that does establish it"
+    );
+}
+
+/// When nothing ever recovers, each unmeasured turn keeps **its own**
+/// refusal. Holding a single one meant the second overwrote the first, so the
+/// first ended with a null measurement — which reads as evidence that was
+/// never reported rather than evidence that was rejected — and the reader was
+/// shown one refusal where there were two.
+#[test]
+fn two_unrecovered_turns_each_keep_their_own_refusal() {
+    let conn = codex_store("codex/two-unreadable-turns.jsonl");
+    let stored = assistant_usage(&conn);
+    assert_eq!(stored.len(), 2, "two turns");
+    let first = usage_of(&stored, "First answer.").expect("the first turn is not silent");
+    assert!(
+        first.contains("-1"),
+        "the first turn keeps its own unreadable object: {first}"
+    );
+    let second = usage_of(&stored, "Second answer.").expect("nor is the second");
+    assert!(
+        second.contains("90.5"),
+        "and the second keeps the one that belongs to it: {second}"
+    );
+
+    // Both are visible to the reader, rather than one turn looking as though
+    // nothing was ever reported for it.
+    let page = session_requests_page(&conn, "codex", "sess_codex_two_bad", 50, None).unwrap();
+    let refused = page
+        .requests
+        .iter()
+        .filter(|request| {
+            request.usage.is_none()
+                && request
+                    .diagnostics
+                    .contains(&UsageDiagnostic::UnnormalizableUsage)
+        })
+        .count();
+    assert_eq!(refused, 2, "both refusals are reported, not just the last");
 }
 
 /// The attribution key and the view's grouping key are the same rule written
