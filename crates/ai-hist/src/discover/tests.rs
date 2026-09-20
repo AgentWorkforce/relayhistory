@@ -2728,3 +2728,104 @@ fn a_cached_child_is_streamed_the_key_a_promoted_ancestor_will_lend() {
         "the grandparent was not promoted, so nothing above was actually tested"
     );
 }
+
+/// The streamed key must see what the stored key sees — including past a
+/// generation the catalog does not hold.
+///
+/// A delegated thread is evidence, not a session, so the generation between a
+/// root and its grandchild routinely has no catalog row. The refresh walks
+/// past it; a read-time walk that inner-joined `sessions` could not, so a
+/// cached grandchild was streamed with the stand-in it already wore while the
+/// same pass stored the promoted ancestor's key. Two answers for one session,
+/// one in `sessions discover --json` and one in the database, with nothing in
+/// either recording that they disagree.
+#[test]
+fn a_cached_grandchild_is_streamed_the_key_the_refresh_lends_across_a_gap() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted onto a `remote` of its own; the
+    // catalog still has it wearing a borrowed key.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The generation in between is evidence only: a relationship, no row.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "middle", "gp->m"),
+        ("middle", "child", "m->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'middle'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the premise of this test is that the middle generation has no catalog row"
+    );
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed walk stopped at the uncataloged generation the refresh walks past"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
+}

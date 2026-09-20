@@ -2435,9 +2435,7 @@ pub(crate) fn inheritable_parent_project_key(
     source: &str,
     session_id: &str,
 ) -> Result<Option<String>> {
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(session_id.to_string());
-    settled_key_of_parents(conn, source, session_id, &mut visited, 0)
+    lendable_ancestor_key_for(conn, source, session_id)
 }
 
 /// One candidate parent as the walk below reads it: its id, the key and
@@ -2449,68 +2447,6 @@ type ParentIdentityRow = (
     Option<String>,
     Option<String>,
 );
-
-/// The first parent, in pass 2's order, that settles on a key.
-fn settled_key_of_parents(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    visited: &mut HashSet<String>,
-    depth: usize,
-) -> Result<Option<String>> {
-    if depth >= PROJECT_KEY_INHERITANCE_PASSES {
-        return Ok(None);
-    }
-    let parents: Vec<ParentIdentityRow> = conn
-        .prepare(
-            "SELECT r.parent_session_id, p.project_key, p.project_key_method, p.cwd, p.repo_url \
-             FROM session_relationships r \
-             JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
-             WHERE r.source = ?1 AND r.child_session_id = ?2 \
-             ORDER BY r.created_ms, r.parent_session_id",
-        )?
-        .query_map(params![source, session_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    for (parent_id, key, method, cwd, repo_url) in parents {
-        if !visited.insert(parent_id.clone()) {
-            continue;
-        }
-        // What pass 1 will leave on this parent, decided by the same rule
-        // pass 1 uses — not by what resolution alone would say. Pass 1 never
-        // rewrites a `remote`, so a parent whose checkout now canonicalizes
-        // differently keeps the key it has; answering with the fresh one would
-        // stream a key the refresh then writes back over, which is the whole
-        // failure this walk exists to avoid.
-        if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
-            return Ok(Some(settled));
-        }
-        // Then what pass 2 will leave on it: whatever *its* ancestors settle
-        // on. Asked before the key this parent is already wearing, because a
-        // borrowed key is exactly the one pass 2 replaces — promote an
-        // ancestor and every stand-in below it moves with it. Returning the
-        // stand-in here would stream a key the same refresh then rewrites.
-        if let Some(inherited) =
-            settled_key_of_parents(conn, source, &parent_id, visited, depth + 1)?
-        {
-            return Ok(Some(inherited));
-        }
-        // Failing both, the borrowed key it already wears. The session it was
-        // borrowed from may be outside this database entirely, and the child
-        // is no worse off holding it.
-        if method.as_deref() == Some("inherited") && key.is_some() {
-            return Ok(key);
-        }
-    }
-    Ok(None)
-}
 
 /// The `remote` key this row will hold once pass 1 has run, if it will hold
 /// one at all.
@@ -2685,16 +2621,29 @@ fn lendable_ancestor_key_for(
 /// same parent order, cycle protection and depth bound the rest of this module
 /// uses.
 ///
-/// Two kinds of ancestor are climbed *past* rather than stopping the search,
-/// and both are ordinary:
+/// **One walk, asked by two callers**, and that is the point of it: discovery
+/// asks it for the key to *stream* before the refresh runs, and the refresh
+/// asks it for the key to *store*. When they were two functions they drifted —
+/// one of them inner-joined `sessions` and so could not see an evidence-only
+/// parent, and a grandchild's row in the catalog and the same row in
+/// `sessions discover --json` named different projects, with nothing anywhere
+/// recording the disagreement.
+///
+/// Three kinds of ancestor are climbed *past* rather than stopping the search,
+/// and all three are ordinary:
 ///
 ///   - one the catalog does not hold at all, because a delegated thread is
-///     evidence rather than a session;
+///     evidence rather than a session (hence the correlated subqueries: an
+///     inner join drops exactly this case);
 ///   - one whose own key is only its `path`, which is the absence of an answer
 ///     rather than one — [`inheritable_parent_key_sql`] lends `remote` and
 ///     `inherited` and nothing else, and a walk that stopped at a path key
 ///     would label a machine-local directory `inherited` and call it a
-///     project.
+///     project;
+///   - one wearing a *borrowed* key, until its own ancestors have been asked:
+///     promote an ancestor and every stand-in beneath it moves, so returning
+///     the stand-in first answers with the key the refresh is about to
+///     replace.
 fn lendable_ancestor_key(
     conn: &Connection,
     source: &str,
@@ -2705,30 +2654,51 @@ fn lendable_ancestor_key(
     if depth >= PROJECT_KEY_INHERITANCE_PASSES {
         return Ok(None);
     }
-    let parents: Vec<(String, Option<String>, Option<String>)> = conn
+    let parents: Vec<ParentIdentityRow> = conn
         .prepare(
             "SELECT r.parent_session_id, \
                     (SELECT p.project_key FROM sessions p \
                      WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
                     (SELECT p.project_key_method FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.cwd FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.repo_url FROM sessions p \
                      WHERE p.source = r.source AND p.session_id = r.parent_session_id) \
              FROM session_relationships r \
              WHERE r.source = ?1 AND r.child_session_id = ?2 \
              ORDER BY r.created_ms, r.parent_session_id",
         )?
         .query_map(params![source, session_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (parent_id, key, method) in parents {
+    for (parent_id, key, method, cwd, repo_url) in parents {
         if !visited.insert(parent_id.clone()) {
             continue;
         }
-        if key.is_some() && matches!(method.as_deref(), Some("remote") | Some("inherited")) {
-            return Ok(key);
+        // What pass 1 will leave on this parent, by the rule pass 1 uses
+        // rather than by what resolution alone would say. Pass 1 never
+        // rewrites a `remote`, so a parent whose checkout now canonicalizes
+        // differently keeps the key it has; answering with the fresh one would
+        // stream a key the refresh then writes back over. Asked here rather
+        // than only by the discovery caller because a refresh reaching this
+        // walk has already run pass 1, so the two agree either way — and one
+        // rule that is right in both places beats two that must be kept so.
+        if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
+            return Ok(Some(settled));
         }
         if let Some(found) = lendable_ancestor_key(conn, source, &parent_id, visited, depth + 1)? {
             return Ok(Some(found));
+        }
+        if key.is_some() && method.as_deref() == Some("inherited") {
+            return Ok(key);
         }
     }
     Ok(None)
