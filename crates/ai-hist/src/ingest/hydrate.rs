@@ -123,19 +123,6 @@ fn hydrate_session_at_with_home(
     )
 }
 
-fn hydrate_session_at_with_home_and_connectors(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-    home: &Path,
-    connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<HydrateSessionResult> {
-    let roots = crate::ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    );
-    hydrate_session_at_with_roots_and_connectors(db_path, options, &roots, connectors)
-}
-
 fn hydrate_session_at_with_roots_and_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
@@ -1768,6 +1755,7 @@ pub(crate) fn hydrate_with_provider(
     provider: &dyn ShallowSessionProvider,
 ) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    let roots = crate::ProviderRoots::from_env(home_dir());
     // Keep transport response acquisition and replacement in the same critical section.
     let _lock = acquire_remote_hydration_lock(db_path, options)?;
     let started = Instant::now();
@@ -1779,7 +1767,7 @@ pub(crate) fn hydrate_with_provider(
     );
     let revision =
         observations::revision(&conn, &observation.key)?.context("missing observation revision")?;
-    let evidence = match provider.acquire(&home_dir(), &observation) {
+    let evidence = match provider.acquire(&roots.home, &observation) {
         Ok(evidence) => evidence,
         Err(error) => {
             observations::set_access(&conn, &observation.key, "unavailable")?;
@@ -1794,10 +1782,10 @@ pub(crate) fn hydrate_with_provider(
                     && observation.key.connector_instance == "default",
                 "CONNECTOR_FAILURE: local parser requires its built-in observation identity"
             );
-            hydrate_session_at_with_home_and_connectors(
+            hydrate_session_at_with_roots_and_connectors(
                 db_path,
                 options,
-                &home_dir(),
+                &roots,
                 &crate::remote::SourceConnectorSelection::new(Vec::new())?,
             )
         }

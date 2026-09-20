@@ -1,4 +1,8 @@
-use ai_hist::{hydrate_session_at, open_db, sync_scoped_at, HydrateSessionOptions, SessionScope};
+use ai_hist::{
+    hydrate_session_at, open_db,
+    sources::{ConnectorIdentity, SourceRegistry},
+    sync_scoped_at, HydrateSessionOptions, SessionScope,
+};
 use std::{fs, path::Path, process::Command};
 
 fn write(path: &Path, body: &str) {
@@ -92,17 +96,21 @@ fn configured_provider_roots_child() {
     drop(conn);
 
     for (source, session_id) in [("claude", "claude-env"), ("codex", "codex-env")] {
-        let result = hydrate_session_at(
-            db,
-            &HydrateSessionOptions {
-                source: source.into(),
-                session_id: session_id.into(),
-                scope: SessionScope::Local,
-                include_related: false,
-            },
-        )
-        .unwrap();
+        let options = HydrateSessionOptions {
+            source: source.into(),
+            session_id: session_id.into(),
+            scope: SessionScope::Local,
+            include_related: false,
+        };
+        let result = hydrate_session_at(db, &options).unwrap();
         assert_eq!(result.status, "hydrated", "{source} hydration failed");
+        let registry_result = SourceRegistry::local()
+            .hydrate_at(db, &options, &ConnectorIdentity::new(source, "default"))
+            .unwrap();
+        assert_eq!(
+            registry_result.status, "unchanged",
+            "{source} registry hydration did not use the configured root"
+        );
     }
 }
 
