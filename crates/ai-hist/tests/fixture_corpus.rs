@@ -428,7 +428,15 @@ const CORPUS: &[Fixture] = &[
         layout: Layout::HomeTree,
         origin: Origin::RelayHistory,
         files: &["grok/full-session"],
-        quirk: "a complete grok session directory: `summary.json`, `chat_history.jsonl` (including a `synthetic_reason` turn), plus the `updates.jsonl`, `prompt_context.json`, `signals.json` and `subagents/` files no relayhistory parser reads yet",
+        quirk: "older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/`",
+    },
+    Fixture {
+        source: "grok",
+        name: "events-session",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["grok/events-session"],
+        quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
     },
     // -- opencode ----------------------------------------------------------
     Fixture {
@@ -1809,10 +1817,8 @@ fn cursor_assistant_and_tool_records_reach_session_events() {
 }
 
 /// Grok's chat history carries assistant text, tool uses, tool results and
-/// real per-record timestamps; only prompts and a synthesized timestamp
-/// sequence survive today.
+/// real per-record timestamps.
 #[test]
-#[ignore = "closed by #167"]
 fn grok_events_and_real_timestamps_reach_session_events() {
     let events = rows("grok/full-session", "session_events");
     assert!(

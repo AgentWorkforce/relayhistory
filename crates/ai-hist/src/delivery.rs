@@ -46,6 +46,7 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "trajectory",
     "source_observation",
     "observation_evidence",
+    "session_marker",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

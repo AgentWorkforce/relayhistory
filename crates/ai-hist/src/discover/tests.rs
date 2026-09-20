@@ -870,6 +870,259 @@ fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
     );
 }
 
+/// `summary.json` says when the session was opened and last touched;
+/// `updates.jsonl` says when it actually did things. The stream wins, and a
+/// session restored from a checkpoint — whose `created_at` predates its own
+/// first event — is the case that makes the difference visible.
+#[test]
+fn grok_activity_comes_from_the_update_stream_when_there_is_one() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-stream",
+        r#"{"info":{"id":"grok-stream","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:30:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-stream/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789560138,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":9210},"_meta":{"agentTimestampMs":1789560138000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-stream");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_560_138_000));
+}
+
+/// Grok compaction can drop earlier and later stream records. Discovery
+/// assigns the current snapshot's bounds rather than merging them with MIN/MAX,
+/// which would keep activity the files no longer contain.
+#[test]
+fn grok_discovery_replaces_activity_bounds_after_compaction() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-compact",
+        r#"{"info":{"id":"grok-compact","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T11:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-compact/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789563600,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789563600000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_563_600_000));
+
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789561800,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789561800000}}}"#,
+            "\n",
+            r#"{"timestamp":1789562700,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789562700000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_600_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_561_800_000),
+        "compaction moved the start later; the catalog has to follow"
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_562_700_000),
+        "compaction moved the end earlier; MIN/MAX merge would have kept 11:00"
+    );
+}
+
+/// An unreadable `summary.json` fails the shallow read instead of naming the
+/// session from its folder. A sibling with a valid summary still catalogs.
+#[cfg(unix)]
+#[test]
+fn grok_discovery_fails_an_unreadable_summary_rather_than_naming_the_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-ok",
+        r#"{"info":{"id":"grok-ok","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ok\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-blocked",
+        r#"{"info":{"id":"grok-blocked","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"secret\"}\n",
+        1_750_000_500_000,
+    );
+    let summary = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-blocked/summary.json");
+    // A file the walk can stat but cannot read: the stamp still covers it, so
+    // the candidate reaches the shallow reader instead of being skipped, and
+    // the identity sidecar is the one that must fail closed.
+    let mut permissions = fs::metadata(&summary).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&summary, permissions.clone()).unwrap();
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    permissions.set_mode(0o644);
+    fs::set_permissions(&summary, permissions).unwrap();
+    assert_eq!(found.ids(), vec!["grok:grok-ok"]);
+    assert!(
+        found
+            .summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.source == "grok"
+                && diagnostic.locator.as_deref().is_some_and(|locator| {
+                    locator.contains("grok-blocked")
+                })),
+        "unreadable identity has to be a diagnostic, not a folder-named row: {:?}",
+        found.summary.diagnostics
+    );
+    assert!(
+        found.rows.iter().all(|row| row.session_id != "grok-blocked"
+            && row.session_id != "local-folder"),
+        "the folder name must not become the session id: {:?}",
+        found.ids()
+    );
+}
+
+/// Discovery strips the `<user_query>` envelope, because hydration does.
+///
+/// Grok wraps a typed prompt in `<user_query>…</user_query>`. The full read
+/// unwraps it; the shallow read did not, so `sessions.first_prompt` held the
+/// XML envelope while `history.prompt` held the typed text -- for the *same*
+/// prompt of the *same* session. Catalog search and the session list showed
+/// the wrapper, and nothing said which of the two was the prompt.
+#[test]
+fn grok_discovery_unwraps_a_user_query_envelope_exactly_as_hydration_does() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-wrapped",
+        r#"{"info":{"id":"grok-wrapped","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"<user_query>ship it</user_query>\"}\n",
+        1_750_000_500_000,
+    );
+    // The positive control, in the same store: a prompt with no envelope is
+    // passed through untouched, so the fix cannot be "strip angle brackets".
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-plain",
+        r#"{"info":{"id":"grok-plain","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ship it\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-embedded",
+        r#"{"info":{"id":"grok-embedded","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"Compare a <user_query>x</user_query> element with HTML\"}\n",
+        1_750_000_500_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(
+        found.row("grok-wrapped").first_prompt.as_deref(),
+        Some("ship it"),
+        "the catalog stores what the person typed, not Grok's envelope"
+    );
+    assert_eq!(
+        found.row("grok-plain").first_prompt.as_deref(),
+        Some("ship it"),
+        "and an unwrapped prompt is unchanged"
+    );
+    assert_eq!(
+        found.row("grok-embedded").first_prompt.as_deref(),
+        Some("Compare a <user_query>x</user_query> element with HTML"),
+        "a tag inside the typed prompt is not the envelope"
+    );
+
+    // And the two readers agree, so they cannot drift apart again: the
+    // record interpretation the full read uses gives the same answer.
+    let wrapped = serde_json::json!({
+        "type": "user",
+        "content": "<user_query>ship it</user_query>",
+    });
+    let line = crate::ingest::grok::parse_chat_record(&wrapped);
+    match line.record {
+        crate::ingest::grok::GrokRecord::User { text, .. } => assert_eq!(
+            text.as_deref(),
+            found.row("grok-wrapped").first_prompt.as_deref(),
+            "shallow and full reads must store the same prompt"
+        ),
+        other => panic!("expected a user record, got {other:?}"),
+    }
+}
+
+/// A session whose update stream grew has new evidence even when the
+/// transcript is byte-identical, so the change stamp has to cover it.
+#[test]
+fn grok_rescan_sees_a_grown_update_stream() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-grow",
+        r#"{"info":{"id":"grok-grow","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"hey\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-grow/updates.jsonl");
+    write(&updates, "{}\n");
+    set_mtime(&updates, 1_750_000_500_000);
+    discover(&conn, home.path(), &only(&["grok"]));
+
+    write(&updates, "{}\n{}\n");
+    set_mtime(&updates, 1_750_000_900_000);
+    let second = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(second.summary.skipped_unchanged, 0);
+    assert_eq!(second.summary.counters.shallow_reads, 1);
+}
+
 #[test]
 fn grok_rescan_is_stamp_guarded() {
     let conn = catalog();
