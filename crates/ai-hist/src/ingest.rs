@@ -3822,8 +3822,8 @@ struct PreparedCursorTranscript {
     /// How far the byte scan actually got, and therefore how far the
     /// checkpoint this run will commit reaches. Indexing must not go past it.
     scanned_through: u64,
-    /// The generation the scan validated. Re-checked before indexing.
-    generation: Option<(Option<u64>, Option<u64>, u64, u64)>,
+    /// The generation the scan read. Re-checked before indexing.
+    generation: Option<CursorGeneration>,
 }
 
 struct PreparedCursorSync {
@@ -3863,10 +3863,15 @@ fn sync_cursor_with_scan_hook(
         // path, and the alternative is committing evidence that is wrong.
         // A file that is simply *gone* is not a replacement: there is nothing
         // to re-scan, and the read below reports it with the message the
-        // rollback path is written against. Only a file that is present and
-        // different is a rewrite.
-        let current_generation = file_generation_stamp(&transcript.path);
-        if current_generation.is_some() && current_generation != transcript.generation {
+        // rollback path is written against. An *append* is not a replacement
+        // either — it changes length and mtime while leaving every scanned
+        // byte alone, and `cursor_generation` is deliberately blind to that so
+        // the common case stays on the resume path. Only a file whose scanned
+        // prefix or identity has changed is a rewrite.
+        let replaced = transcript.generation.as_ref().is_some_and(|generation| {
+            transcript.path.exists() && !cursor_generation_intact(&transcript.path, generation)
+        });
+        if replaced {
             let rescan = scan_cursor_transcript(&transcript.path, None).with_context(|| {
                 format!(
                     "re-scan replaced Cursor transcript {}",
@@ -3902,6 +3907,19 @@ fn sync_cursor_with_scan_hook(
             transcript.scanned_through,
         )
         .with_context(|| format!("index Cursor transcript {}", transcript.path.display()))?;
+        // The check above is a moment before the read, so a replacement can
+        // still land between the two and be read with the old scan's offsets.
+        // Re-check afterwards and fail rather than commit a mixture of two
+        // generations: the transaction and the checkpoint roll back together,
+        // and the next sync sees the new file from zero. An append again does
+        // not trip this, because the generation is identified by content.
+        if let Some(generation) = &transcript.generation {
+            anyhow::ensure!(
+                cursor_generation_intact(&transcript.path, generation),
+                "Cursor transcript {} was replaced while it was being indexed",
+                transcript.path.display()
+            );
+        }
         inserted += outcome.prompts_inserted;
         // A restarted read saw the whole file, so it owns both endpoints; an
         // incremental one saw only the tail and may only widen the window.
@@ -3957,9 +3975,10 @@ struct ScannedCursorTranscript {
     /// The byte position the scan consumed through, which is what this run's
     /// checkpoint will record.
     consumed_through: u64,
-    /// The file identity this scan validated against, re-checked before the
-    /// scan's offsets are used to index.
-    generation: Option<(Option<u64>, Option<u64>, u64, u64)>,
+    /// The generation this scan read, re-checked before its offsets are used
+    /// to index. Identified by content, so an append does not look like a
+    /// replacement.
+    generation: Option<CursorGeneration>,
 }
 
 fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
@@ -4019,19 +4038,54 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         // replacement between the two would otherwise be invisible: the
         // reader's own detection only covers a replacement while it is still
         // reading, and a replacement can also land after it has finished.
-        generation: file_generation_stamp(jsonl),
+        generation: cursor_generation(jsonl, consumed),
     })
 }
 
-/// A cheap identity for the generation of a file on disk right now.
+/// The identity of the generation a scan read, by **content** rather than by
+/// "anything changed".
 ///
-/// Device and inode catch a replacement that reuses the path; length and mtime
-/// catch a truncate-and-rewrite that reuses the inode. `None` means the file
-/// could not be stated, which is itself a change worth reacting to.
-fn file_generation_stamp(path: &Path) -> Option<(Option<u64>, Option<u64>, u64, u64)> {
+/// Cursor appends to a transcript constantly, and an append changes both the
+/// length and the mtime while leaving every byte the scan read untouched. A
+/// stamp that compares those fields calls that a replacement, and the caller
+/// would then rebuild the whole session — clearing its evidence, restamping
+/// untimed turns with the new mtime and indexing past the bound that exists
+/// to leave the append for the next sync. So the identity is the file's
+/// device and inode plus a hash of exactly the prefix the scan consumed: an
+/// append leaves it intact, and a rewrite, a truncation or a new inode does
+/// not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CursorGeneration {
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+    /// SHA-256 of bytes `[0, prefix_len)`.
+    prefix_hash: String,
+    prefix_len: u64,
+}
+
+/// Identify the generation of `path`, hashing the first `through` bytes.
+pub(crate) fn cursor_generation(path: &Path, through: u64) -> Option<CursorGeneration> {
     let metadata = fs::metadata(path).ok()?;
     let (device, inode) = metadata_identity(&metadata);
-    Some((device, inode, metadata.len(), metadata_mtime_ns(&metadata)))
+    if metadata.len() < through {
+        return None;
+    }
+    let (prefix_hash, _) = hash_file_prefix(path, through).ok()?;
+    Some(CursorGeneration {
+        device,
+        inode,
+        prefix_hash,
+        prefix_len: through,
+    })
+}
+
+/// Is the file still the generation `generation` describes?
+///
+/// A file that cannot be stated, has shrunk below what the scan read, or whose
+/// scanned prefix no longer hashes the same is a different generation. An
+/// append is not.
+pub(crate) fn cursor_generation_intact(path: &Path, generation: &CursorGeneration) -> bool {
+    cursor_generation(path, generation.prefix_len).is_some_and(|current| &current == generation)
 }
 
 fn prepare_cursor_sync(
@@ -6713,6 +6767,13 @@ mod tests {
         transcript
     }
 
+    fn set_file_mtime_ms(path: &Path, ms: i64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64);
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     fn cursor_row_count(conn: &Connection, table: &str, session_id: &str) -> i64 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE source = 'cursor' AND session_id = ?"),
@@ -7193,6 +7254,173 @@ mod tests {
             !prompts.iter().any(|p| p.starts_with("original")),
             "prompts from the replaced generation must not survive: {prompts:?}"
         );
+    }
+
+    /// Group K. An append *between the scan and the index* is not a rewrite.
+    ///
+    /// This is the case group J's own control missed: that test appends
+    /// between syncs, so the file is already settled by the time the next
+    /// scan runs and the index-time check compares equal. An append that
+    /// lands inside the window the check guards changes length and mtime
+    /// without changing any byte the scan read, and a stamp that compares
+    /// those fields calls it a replacement.
+    ///
+    /// Positive control: with the generation stamp comparing length and mtime
+    /// this failed at `an append must not restamp an untimed event:
+    /// left: 9999, right: 4242` — the append triggered a full rebuild, which
+    /// cleared the session and re-indexed the whole file, restamping the
+    /// untimed turn with the new mtime and indexing the appended record past
+    /// the `index_through` bound that exists to leave it for the next sync.
+    #[test]
+    fn an_append_between_the_scan_and_the_index_is_not_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        // Untimed, so its stored timestamp is the mtime and a rebuild is
+        // visible as a restamp.
+        let seed = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"seed turn"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-lateappend", seed);
+        set_file_mtime_ms(&transcript, 4_242);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "history", "s-lateappend"), 1);
+
+        // Give the next sync something to resume for, then append again from
+        // the scan hook of a later transcript — i.e. after this file has been
+        // scanned and checkpointed, before the write phase reads it.
+        let second = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"second turn"}]}}"#,
+            "\n"
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(second.as_bytes()).unwrap();
+        drop(file);
+
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-zlate",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"unrelated"}]}}"#,
+                "\n"
+            ),
+        );
+        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
+            if path == later {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap();
+                file.write_all(
+                    concat!(
+                        r#"{"role":"user","message":{"content":[{"type":"text","text":"raced append"}]}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                drop(file);
+                set_file_mtime_ms(&transcript, 9_999);
+            }
+        })
+        .unwrap();
+
+        // An append is not a rewrite, so the already-stored untimed event
+        // keeps the stamp it was written with.
+        let seed_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_events WHERE source = 'cursor' \
+                 AND session_id = 's-lateappend' AND text = 'seed turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seed_ts, 4_242,
+            "an append must not restamp an untimed event"
+        );
+        // And the raced append stays behind the checkpoint for the next sync,
+        // exactly as the `index_through` bound intends.
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-lateappend' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["seed turn".to_string(), "second turn".to_string()],
+            "the raced append belongs to the next sync"
+        );
+    }
+
+    /// The rule both halves of group K turn on, at the unit level: a
+    /// generation survives an append and does not survive a rewrite.
+    #[test]
+    fn a_cursor_generation_survives_an_append_but_not_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"one"}]}}"#,
+            "\n"
+        );
+        let path = dir.path().join("t.jsonl");
+        fs::write(&path, body).unwrap();
+        let generation = super::cursor_generation(&path, body.len() as u64).unwrap();
+        assert!(super::cursor_generation_intact(&path, &generation));
+
+        // Appending leaves every scanned byte untouched.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"two"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        assert!(
+            super::cursor_generation_intact(&path, &generation),
+            "an append must leave the generation intact"
+        );
+
+        // A rewrite that keeps the length but changes a scanned byte does not.
+        let rewritten = body.replace("one", "ONE");
+        assert_eq!(rewritten.len(), body.len());
+        fs::write(&path, &rewritten).unwrap();
+        assert!(
+            !super::cursor_generation_intact(&path, &generation),
+            "an in-place rewrite must not pass as the same generation"
+        );
+
+        // Nor does a truncation below what the scan read.
+        fs::write(&path, "{}\n").unwrap();
+        assert!(!super::cursor_generation_intact(&path, &generation));
+
+        // Nor does an unlink-and-recreate carrying different content. The
+        // inode may or may not be reused — that is the filesystem's choice,
+        // and the check must not depend on it — but the scanned prefix
+        // differs either way.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"different"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert!(!super::cursor_generation_intact(&path, &generation));
     }
 
     /// Group J's other half: an ordinary append, with no replacement, must
