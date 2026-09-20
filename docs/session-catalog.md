@@ -735,6 +735,39 @@ hydration pays the window only when the stamp was about to skip the file: a
 pass that is going to read the transcript anyway validates the same cursor
 inside `TranscriptReader::open`.
 
+### Validating costs provider reads, and they are counted
+
+A pass hashes bounded windows to satisfy itself that the file is the one its
+cursor describes: the saved cursor's window and the file's own at `open`, and
+the opened region again at `commit` (reused as the stored cursor's hash when
+the pass consumed exactly the file it opened). Those are provider reads, so
+they are in `bytesRead` like every other — counted inside the digest function,
+which is the only place they are spent, rather than added by hand at each call
+site. Internally a pass also reports `validation_bytes`, so "how much of this
+transcript did we read" and "what did checking it cost" are not one number
+hiding the other.
+
+The cost is **bounded by the window, not by the file**: a fixed handful of
+digests per walk, each at most 128 KiB, whatever the transcript's size. On the
+200 MB transcripts this work exists for it is noise; on a small transcript the
+windows can add up to more than the file, which is the accepted trade for a
+constant-cost check. A hydration of an unchanged 200 MB transcript reads
+kilobytes, not megabytes, and never the file.
+
+### The window is compared on every commit
+
+Not only when the stat moved. A rewrite that preserves length and restores
+mtime is exactly the rewrite a stat cannot see — the skip path already assumes
+writers do that — so gating the comparison on a moved stat left the one case
+nothing else catches free to publish a cursor over stale rows.
+
+### A transcript that moved under any walk is reported
+
+`HYDRATION_SOURCE_REWRITTEN` covers the session's own transcript, its sidecars,
+their metadata documents and Codex children, and it covers the metadata walk as
+well as the record walk. A pass that recorded no cursor is news; which of the
+two walks noticed is an implementation detail.
+
 ### The quiescence clock
 
 `unchanged_since_ms` is stamped from the same instant as the size and mtime it

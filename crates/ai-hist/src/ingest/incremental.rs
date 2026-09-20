@@ -262,10 +262,6 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 None => (reader.position(), line_index),
             },
         };
-    pass.bytes_read = reader
-        .position()
-        .saturating_sub(start_offset)
-        .saturating_add(reader.tail_bytes());
     pass.in_progress = deferred_order.clone();
 
     claude.next_line_index = commit_line_index;
@@ -289,6 +285,14 @@ pub(crate) fn ingest_claude_transcript_incremental(
         }
         CommitOutcome::Superseded => pass.superseded = true,
     }
+    // Counted after the commit, because validating the cursor is the last
+    // provider read a pass makes and `bytesRead` is every provider read.
+    pass.validation_bytes = reader.validation_bytes();
+    pass.bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes())
+        .saturating_add(pass.validation_bytes);
     Ok(pass)
 }
 

@@ -2673,10 +2673,6 @@ fn ingest_codex_rollout_incremental(
     // advanced over it. Leaving it out made an unterminated Codex tail
     // invisible in the counter, which is the same omission this counter has
     // had to be corrected for elsewhere.
-    pass.bytes_read = reader
-        .position()
-        .saturating_sub(start_offset)
-        .saturating_add(reader.tail_bytes());
     pass.records = line_index.saturating_sub(resume.next_line_index) as i64;
     // Rewritten under the pass: record nothing, and read the region again next
     // time rather than blessing rows that came from bytes that are gone.
@@ -2687,6 +2683,14 @@ fn ingest_codex_rollout_incremental(
         }
         cursor::CommitOutcome::Superseded => pass.superseded = true,
     }
+    // After the commit: validating the cursor is a provider read like any
+    // other, and the counter is every provider read this pass made.
+    pass.validation_bytes = reader.validation_bytes();
+    pass.bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes())
+        .saturating_add(pass.validation_bytes);
     Ok((outcome, pass))
 }
 
@@ -2866,7 +2870,7 @@ fn sync_claude_session_metadata(
         };
         let mut scan_cursor = cursor::load_cursor(conn, &scan_key)?;
         let mut scan = scan_cursor.claude.clone().unwrap_or_default().scan;
-        let scanned_meta = scan_claude_session_file_resumed(&path, &mut scan)?.0;
+        let scanned_meta = scan_claude_session_file_resumed(&path, &mut scan)?.meta;
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -3137,10 +3141,25 @@ impl ClaudeMetaFold {
 /// Returns the metadata and the bytes this call read. `state` is updated in
 /// place and must be persisted by the caller; a rejected or absent cursor
 /// reads the file from the start, which is the same answer at a higher price.
+/// What one resumable metadata walk found, cost, and whether it could record
+/// where it got to.
+pub(crate) struct ClaudeScanPass {
+    pub meta: Option<ClaudeSessionMeta>,
+    /// Records read, plus the bounded windows hashed to validate the cursor.
+    pub bytes_read: u64,
+    /// The validation part of `bytes_read`.
+    pub validation_bytes: u64,
+    /// The file was rewritten under the walk, so no position was recorded.
+    /// Reported for the same reason the record walk reports it: a transcript
+    /// that moved under a reader is news, and the walk that noticed is an
+    /// implementation detail.
+    pub superseded: bool,
+}
+
 pub(crate) fn scan_claude_session_file_resumed(
     path: &Path,
     state: &mut Option<cursor::ClaudeScanState>,
-) -> Result<(Option<ClaudeSessionMeta>, u64)> {
+) -> Result<ClaudeScanPass> {
     let saved = state.clone().unwrap_or_default();
     let mut reader = cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
     let mut fold = if reader.start_offset() == 0 {
@@ -3174,21 +3193,32 @@ pub(crate) fn scan_claude_session_file_resumed(
         Some(start) => start + reader.tail_bytes(),
         None => reader.position(),
     };
-    let bytes_read = reader
-        .position()
-        .saturating_sub(start_offset)
-        .saturating_add(reader.tail_bytes());
     // The metadata walk keeps its own position in the same document, and the
     // same rule applies to it: a fold over bytes that were rewritten during
     // the walk is not a fold anyone should resume from.
-    if let cursor::CommitOutcome::Published(file) = reader.commit(committed)? {
-        *state = Some(cursor::ClaudeScanState {
-            file: Some(file),
-            resume_from,
-            fold: fold.clone(),
-        });
+    let mut superseded = false;
+    match reader.commit(committed)? {
+        cursor::CommitOutcome::Published(file) => {
+            *state = Some(cursor::ClaudeScanState {
+                file: Some(file),
+                resume_from,
+                fold: fold.clone(),
+            });
+        }
+        cursor::CommitOutcome::Superseded => superseded = true,
     }
-    Ok((fold.finish(), bytes_read))
+    let validation_bytes = reader.validation_bytes();
+    let bytes_read = reader
+        .position()
+        .saturating_sub(start_offset)
+        .saturating_add(reader.tail_bytes())
+        .saturating_add(validation_bytes);
+    Ok(ClaudeScanPass {
+        meta: fold.finish(),
+        bytes_read,
+        validation_bytes,
+        superseded,
+    })
 }
 
 pub(crate) fn reconcile_claude_remote_relationships(conn: &Connection) -> Result<()> {
@@ -7368,14 +7398,19 @@ mod tests {
         write!(file, "{tail}").unwrap();
         drop(file);
         let mut state_holder = Some(resumed.clone());
-        let (_, bytes_read) = scan_claude_session_file_resumed(&path, &mut state_holder).unwrap();
-        assert_eq!(bytes_read, tail.len() as u64);
+        let pass = scan_claude_session_file_resumed(&path, &mut state_holder).unwrap();
+        // Records read, with the cursor validation the pass also paid for
+        // reported separately rather than folded into the same figure.
+        assert_eq!(pass.bytes_read - pass.validation_bytes, tail.len() as u64);
         // Positive control: the same call from no state reads the whole file,
         // so the bounded figure is a fact about resumption.
         resumed.file = None;
         let mut from_zero = None;
-        let (_, whole) = scan_claude_session_file_resumed(&path, &mut from_zero).unwrap();
-        assert_eq!(whole, (body.len() + addition.len() + tail.len()) as u64);
+        let whole = scan_claude_session_file_resumed(&path, &mut from_zero).unwrap();
+        assert_eq!(
+            whole.bytes_read - whole.validation_bytes,
+            (body.len() + addition.len() + tail.len()) as u64
+        );
     }
 
     #[test]

@@ -269,11 +269,21 @@ fn decode_record(raw: &[u8]) -> Option<&str> {
 }
 
 fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
+    Ok(prefix_window_digest_counted(file, offset)?.0)
+}
+
+/// The same digest, and the provider bytes hashing it read.
+///
+/// Every caller of this is a read of a provider file, and `bytesRead` is
+/// documented as the provider bytes a pass could not avoid reading. Counting
+/// them at the one place they are spent is what stops the next reader of this
+/// code having to remember a second list.
+fn prefix_window_digest_counted(file: &mut fs::File, offset: u64) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
     hasher.update(b"relayhistory/transcript-prefix/v1\0");
     hasher.update(offset.to_le_bytes());
     if offset == 0 {
-        return Ok(format!("{:x}", hasher.finalize()));
+        return Ok((format!("{:x}", hasher.finalize()), 0));
     }
     let window = PREFIX_WINDOW_BYTES.min(offset);
     let mut read_window = |start: u64, hasher: &mut Sha256| -> Result<()> {
@@ -295,7 +305,9 @@ fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
     };
     read_window(0, &mut hasher)?;
     read_window(offset - window, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    #[cfg(test)]
+    VALIDATION_METER.with(|meter| meter.set(meter.get() + 2 * window));
+    Ok((format!("{:x}", hasher.finalize()), 2 * window))
 }
 
 #[cfg(unix)]
@@ -551,12 +563,21 @@ pub(crate) enum CommitOutcome {
 
 /// A transcript opened at its cursor.
 pub(crate) struct TranscriptReader {
+    /// Only so a test hook can tell one transcript's commit from another's; a
+    /// hydration commits a parent, its sidecars and their metadata in turn.
+    #[cfg(test)]
+    path: PathBuf,
     file: fs::File,
     reader: BufReader<fs::File>,
     position: u64,
     start_offset: u64,
     /// Bytes of an unterminated trailing record handed to the caller.
     tail_bytes: u64,
+    /// Provider bytes spent validating this transcript rather than reading
+    /// records from it: the windows hashed at open, and at commit. Bounded —
+    /// at most `2 * PREFIX_WINDOW_BYTES` per digest — and real I/O, so it is
+    /// reported like any other read.
+    validation_bytes: u64,
     /// The `unchanged_since_ms` this pass will write back.
     unchanged_since_ms: i64,
     /// The file is byte-for-byte where its cursor left it, so nothing has been
@@ -611,6 +632,7 @@ impl TranscriptReader {
         // ordinary resume — the validation below hashes the same region, and
         // reusing it keeps this to one bounded read.
         let mut opened_window: Option<String> = None;
+        let mut validation_bytes = 0u64;
         // A cursor at offset 0 is still a cursor. It records the file's
         // identity, size and mtime, and those are what say whether anything
         // has been appended since the last pass. Reading it as "no cursor"
@@ -623,7 +645,15 @@ impl TranscriptReader {
                 let identity_changed = saved.device.is_some()
                     && device.is_some()
                     && (saved.device, saved.inode) != (device, inode);
-                let saved_window = prefix_window_digest(&mut file, saved.offset).ok();
+                let saved_window = match prefix_window_digest_counted(&mut file, saved.offset) {
+                    Ok((digest, read)) => {
+                        validation_bytes += read;
+                        Some(digest)
+                    }
+                    Err(_) => None,
+                };
+                // The same region, so the hash is the same: reuse it rather
+                // than reading those bytes a second time.
                 if saved.offset == size {
                     opened_window = saved_window.clone();
                 }
@@ -658,17 +688,24 @@ impl TranscriptReader {
 
         let opened_window = match opened_window {
             Some(window) => window,
-            None => prefix_window_digest(&mut file, size)?,
+            None => {
+                let (digest, read) = prefix_window_digest_counted(&mut file, size)?;
+                validation_bytes += read;
+                digest
+            }
         };
 
         let mut handle = file.try_clone()?;
         handle.seek(std::io::SeekFrom::Start(offset))?;
         Ok(Self {
+            #[cfg(test)]
+            path: path.to_path_buf(),
             file,
             reader: BufReader::new(handle),
             position: offset,
             start_offset: offset,
             tail_bytes: 0,
+            validation_bytes,
             opened_size: size,
             opened_mtime_ns: mtime_ns,
             opened_window,
@@ -694,6 +731,12 @@ impl TranscriptReader {
     /// and so counted, even though the position did not advance over them.
     pub(crate) fn tail_bytes(&self) -> u64 {
         self.tail_bytes
+    }
+
+    /// Provider bytes this pass spent validating the file rather than reading
+    /// records from it. Read after `commit`, which adds its own.
+    pub(crate) fn validation_bytes(&self) -> u64 {
+        self.validation_bytes
     }
 
     /// Move the quiet-since stamp `ms` into the past.
@@ -807,7 +850,7 @@ impl TranscriptReader {
     /// it again, and the Codex reader commits at the last `task_complete`.
     pub(crate) fn commit(&mut self, offset: u64) -> Result<CommitOutcome> {
         #[cfg(test)]
-        run_before_commit_hook();
+        run_before_commit_hook(&self.path);
         let metadata = self.file.metadata()?;
         let size = metadata.len();
         let mtime_ns = super::metadata_mtime_ns(&metadata);
@@ -816,26 +859,27 @@ impl TranscriptReader {
         // window cover the walk, and a full re-parse of a large live
         // transcript outlasts the window on its own.
         let stat_moved = size != self.opened_size || mtime_ns != self.opened_mtime_ns;
-        if stat_moved {
-            // Something wrote to the file during the walk. An append leaves
-            // everything this pass read where it was; a rewrite does not, and
-            // the stat alone cannot tell them apart — same-length in-place
-            // edits are exactly the case that looks like nothing happened.
-            let (device, inode) = file_identity(&metadata);
-            let identity_changed = self.device.is_some()
-                && device.is_some()
-                && (self.device, self.inode) != (device, inode);
-            if identity_changed || size < offset || size < self.opened_size {
-                return Ok(CommitOutcome::Superseded);
-            }
-            // The same bounded window over the same region, so an append
-            // compares equal and an in-place rewrite within the window does
-            // not. Bounded in the same way the cursor's own hash is, and paid
-            // only when a writer touched the file mid-walk.
-            let window = prefix_window_digest(&mut self.file, self.opened_size)?;
-            if window != self.opened_window {
-                return Ok(CommitOutcome::Superseded);
-            }
+        let (device, inode) = file_identity(&metadata);
+        let identity_changed = self.device.is_some()
+            && device.is_some()
+            && (self.device, self.inode) != (device, inode);
+        if identity_changed || size < offset || size < self.opened_size {
+            return Ok(CommitOutcome::Superseded);
+        }
+        // Checked on every commit, not only when the stat moved. A rewrite
+        // that preserves length and restores mtime is exactly the case a stat
+        // cannot see — the skip path already assumes writers do that, and
+        // gating this comparison on `stat_moved` left the one rewrite nothing
+        // else would catch free to publish a cursor over stale rows.
+        //
+        // The same bounded window over the same region, so an append compares
+        // equal and an in-place rewrite within the window does not. One
+        // bounded read is the price of the guarantee, and it is counted.
+        let (window, window_bytes) =
+            prefix_window_digest_counted(&mut self.file, self.opened_size)?;
+        self.validation_bytes += window_bytes;
+        if window != self.opened_window {
+            return Ok(CommitOutcome::Superseded);
         }
         // The clock and the stat it is compared against have to come from the
         // same instant.
@@ -844,6 +888,19 @@ impl TranscriptReader {
         } else {
             self.unchanged_since_ms
         };
+        // The cursor's own hash covers `[0, offset)`, and the comparison above
+        // covered `[0, opened_size)`. When a pass consumed the file it opened,
+        // those are the same region and the digest is the same digest — so it
+        // is reused rather than read a second time. `prefix_window_digest`
+        // folds the offset into the hash, so this is only ever done when the
+        // offsets are equal.
+        let prefix_hash = if offset == self.opened_size {
+            window
+        } else {
+            let (digest, prefix_bytes) = prefix_window_digest_counted(&mut self.file, offset)?;
+            self.validation_bytes += prefix_bytes;
+            digest
+        };
         Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
@@ -851,7 +908,7 @@ impl TranscriptReader {
             mtime_ns,
             size,
             unchanged_since_ms,
-            prefix_hash: prefix_window_digest(&mut self.file, offset)?,
+            prefix_hash,
         }))
     }
 }
@@ -864,20 +921,47 @@ impl TranscriptReader {
 // `cfg(test)`.
 #[cfg(test)]
 thread_local! {
-    static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+    static BEFORE_COMMIT: std::cell::RefCell<Option<BeforeCommitHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Something to run against the transcript being committed.
 #[cfg(test)]
-pub(crate) fn set_before_commit_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+pub(crate) type BeforeCommitHook = Box<dyn Fn(&Path)>;
+
+// Validation bytes hashed on this thread, so a test can say what a hydration
+// spent checking its cursors without the figure having to be recomputed from
+// the rule it is meant to be testing. Incremented where the bytes are read.
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_METER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Start counting validation bytes from zero on this thread.
+#[cfg(test)]
+pub(crate) fn reset_validation_meter() {
+    VALIDATION_METER.with(|meter| meter.set(0));
+}
+
+/// Validation bytes hashed on this thread since the last reset.
+#[cfg(test)]
+pub(crate) fn validation_meter() -> u64 {
+    VALIDATION_METER.with(|meter| meter.get())
+}
+
+/// The hook is handed the transcript being committed. A hydration commits the
+/// parent, each sidecar and each sidecar's metadata document in turn, so a
+/// test that means to disturb one of them has to say which.
+#[cfg(test)]
+pub(crate) fn set_before_commit_hook_for_test(hook: Option<BeforeCommitHook>) {
     BEFORE_COMMIT.with(|slot| *slot.borrow_mut() = hook);
 }
 
 #[cfg(test)]
-fn run_before_commit_hook() {
+fn run_before_commit_hook(path: &Path) {
     let hook = BEFORE_COMMIT.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
-        hook();
+        hook(path);
         BEFORE_COMMIT.with(|slot| {
             if slot.borrow().is_none() {
                 *slot.borrow_mut() = Some(hook);
@@ -993,9 +1077,16 @@ pub(crate) fn store_cursor(
 /// What one incremental pass over a transcript did.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IncrementalPass {
-    /// Bytes this pass actually read, which is the whole point: an append of
-    /// 1 KiB to a 200 MB transcript reads about 1 KiB.
+    /// Bytes this pass actually read: records, plus the bounded windows it
+    /// hashed to satisfy itself that the file is the one its cursor
+    /// describes. An append of 1 KiB to a 200 MB transcript reads about 1 KiB
+    /// of records and a fixed handful of windows, never a function of the
+    /// file's size.
     pub bytes_read: u64,
+    /// The validation part of [`Self::bytes_read`], reported separately so
+    /// "how much of this transcript did we read" and "what did checking it
+    /// cost" are not one number that hides the other.
+    pub validation_bytes: u64,
     /// Complete JSON records handed to the per-record indexer.
     pub records: i64,
     /// Messages still unfinished when the pass ended. Their rows were not
