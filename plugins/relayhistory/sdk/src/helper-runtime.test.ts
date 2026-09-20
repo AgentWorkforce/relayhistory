@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,52 +8,42 @@ import test from 'node:test';
 import { helperRequest, terminateHelperTree } from './helper.js';
 
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-/**
- * Wait for a pid to stop existing.
- *
- * A signalled process is not gone the instant the kill returns -- it lingers
- * until its parent (init, once the helper it belonged to died) reaps it, and a
- * zombie still answers `kill(pid, 0)`. Polling proves death without putting a
- * fixed budget on the reaper. It throws rather than returning false, so a
- * descendant that never dies fails loudly here instead of silently.
- */
-async function reaped(pid: number): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    if (!alive(pid)) return;
-    await pause(25);
-  }
-  throw new Error(`descendant ${pid} outlived tree cleanup`);
-}
-/**
- * A helper whose descendant records that it was still alive.
- *
- * `markerDelay` writes the marker on a timer, which is what the POSIX
- * cancellation and deadline tests need. Omitting it *gates* the marker on a
- * release file instead: the descendant writes it only once the test says so.
- * A timer races the cleanup it is meant to observe -- on Windows a
- * `taskkill /T /F` round trip can outlast a few hundred milliseconds, and a
- * marker written before the kill even landed is indistinguishable from a
- * descendant that survived it. The gate removes the race by making the marker
- * causal instead of chronological.
- */
-async function fixture(markerDelay?: number) {
+async function fixture(markerDelay: number, lifetime = 10_000) {
   const directory = await mkdtemp(join(tmpdir(), 'history-helper-tree-'));
   const binary = join(directory, 'helper');
   const pidFile = join(directory, 'descendant.pid');
   const marker = join(directory, 'continued');
-  const gate = join(directory, 'release');
-  const act = `fs.writeFileSync(${JSON.stringify(marker)},'continued')`;
-  const continues = markerDelay === undefined
-    ? `const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(t);${act};}},25);`
-    : `setTimeout(()=>${act},${markerDelay});`;
-  const code = `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));${continues}setTimeout(()=>{},10000);`;
-  const source = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(code)}],{stdio:'ignore'});setTimeout(()=>{},10000);`;
+  const code = `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'continued'),${markerDelay});setTimeout(()=>{},${lifetime});`;
+  const source = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(code)}],{stdio:'ignore'});setTimeout(()=>{},${lifetime});`;
   await writeFile(binary, `#!${process.execPath}\n${source}\n`);
   await chmod(binary, 0o700);
   const pid = async () => { for (let attempt=0;attempt<200;attempt++) { try {return Number(await readFile(pidFile,'utf8'));} catch {await pause(10);} } throw new Error('descendant did not start'); };
-  const continued = async () => { for (let attempt=0;attempt<200;attempt++) { try {return await readFile(marker,'utf8');} catch {await pause(25);} } throw new Error('descendant never continued'); };
-  return {binary,marker,pid,source,continued,release:()=>writeFile(gate,'go'),async close(){try{process.kill(Number(await readFile(pidFile,'utf8')),'SIGKILL');}catch{}await rm(directory,{recursive:true,force:true});}};
+  return {binary,marker,pid,source,async close(){try{process.kill(Number(await readFile(pidFile,'utf8')),'SIGKILL');}catch{}await rm(directory,{recursive:true,force:true});}};
+}
+
+/** Why `pid` still looks alive, or '' once it is gone. A descendant killed
+ * together with its parent is reparented and lingers as a zombie until
+ * something reaps it, and `process.kill(pid,0)` keeps succeeding for that
+ * zombie - but a zombie has been terminated, which is the property under test. */
+function aliveReason(pid: number): string {
+  try { process.kill(pid,0); }
+  catch (error) { const code=(error as NodeJS.ErrnoException).code; return code==='ESRCH'?'':`kill(0) failed with ${code}`; }
+  try {
+    if (process.platform==='linux') { const stat=readFileSync(`/proc/${pid}/stat`,'utf8'); return stat.slice(stat.lastIndexOf(')')+2).startsWith('Z')?'':'running'; }
+    if (process.platform==='darwin') return spawnSync('ps',['-o','state=','-p',String(pid)]).stdout.toString().trim().startsWith('Z')?'':'running';
+  } catch { /* no readable process state: trust the kill(0) probe above */ }
+  return 'running';
+}
+const isRunning = (pid: number) => aliveReason(pid)!=='';
+/** Tearing down a tree is asynchronous - on Windows it is a spawned taskkill -
+ * so wait for the descendant to actually go away rather than assuming some
+ * fixed delay covers it. Bounded, and loud about the last state it saw. */
+async function waitForExit(pid: number, budgetMs: number): Promise<void> {
+  const deadline=Date.now()+budgetMs;
+  for (let reason=aliveReason(pid);reason!=='';reason=aliveReason(pid)) {
+    if (Date.now()>=deadline) throw new Error(`descendant ${pid} survived tree cleanup for ${budgetMs}ms (${reason})`);
+    await pause(25);
+  }
 }
 
 test('cancellation kills the helper descendant but leaves an unrelated process alone', {skip:process.platform==='win32'}, async()=>{
@@ -82,41 +73,28 @@ test('missing helper still reports unavailable instead of cleanup failure',async
 });
 
 // This exercises taskkill /T on Windows too, without requiring a shebang fixture.
+// The property is that the descendant is terminated and an unrelated process is
+// not, so assert liveness directly instead of inferring termination from a
+// marker the descendant would have written. The kill is issued ~10-20ms after
+// the descendant starts, so a loaded Windows runner that needs longer than the
+// marker delay just to spawn taskkill /T failed a correct cleanup.
+// Timing budget: terminateHelperTree bounds the Windows taskkill at 2s and the
+// whole cleanup at 3s (past that it rejects, failing this test), and the wait
+// below is bounded at 5s, so any run that reaches the marker check is at most
+// ~8s in - far inside the 15s marker delay, which therefore cannot fire in a
+// passing run. The descendant lives 30s so the marker would in fact be written
+// were the tree never killed.
 test('tree cleanup terminates a real descendant using the platform implementation',async()=>{
-  const files=await fixture();
-  // An identical tree that is never cleaned up. Without it, a gate that never
-  // fired would make the absent marker below prove nothing -- the assertion
-  // would pass for a descendant that was killed and for one that simply never
-  // got the chance to write.
-  const control=await fixture();
+  const files=await fixture(15_000,30_000);
   const child=spawn(process.execPath,['-e',files.source],{stdio:'ignore',windowsHide:true,detached:process.platform!=='win32'});
-  const survivor=spawn(process.execPath,['-e',control.source],{stdio:'ignore',windowsHide:true,detached:process.platform!=='win32'});
-  const unrelated=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore'});
+  const unrelated=spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'ignore'});
   let closed=false;const childClosed=new Promise<void>(resolve=>child.once('close',()=>{closed=true;resolve();}));
   try {
-    const target=await files.pid();const controlPid=await control.pid();
+    const descendant=await files.pid();
     await terminateHelperTree(child,childClosed,()=>closed);
     assert.equal(closed,true);
-
-    // The descendant is dead, not merely quiet. An absent marker alone cannot
-    // tell a killed process from a live one whose event loop never got
-    // scheduled, so death is asserted directly and the marker is the second,
-    // independent signal.
-    await reaped(target);
-    // Positive control for that probe in the same breath: an identical
-    // descendant nobody cleaned up is still there, so `reaped` is reading
-    // real liveness rather than always reporting gone.
-    assert.equal(alive(controlPid),true,'the uncleaned descendant is still running');
-
-    // Released only now, so a descendant can act solely by having outlived a
-    // completed cleanup. A slow platform kill can no longer read as survival.
-    await files.release();await control.release();
-    // The control is the clock, not a fixed pause: once a live descendant has
-    // acted on the release, an equally live killed one would have too. The
-    // settle covers scheduling jitter between the two.
-    assert.equal(await control.continued(),'continued');
-    await pause(250);
+    await waitForExit(descendant,5_000);
     await assert.rejects(readFile(files.marker),{code:'ENOENT'});
-    assert.ok(unrelated.pid);assert.doesNotThrow(()=>process.kill(unrelated.pid!,0));
-  } finally {child.kill('SIGKILL');survivor.kill('SIGKILL');unrelated.kill('SIGKILL');await control.close();await files.close();}
+    assert.ok(unrelated.pid);assert.ok(isRunning(unrelated.pid!),'an unrelated process must survive tree cleanup');
+  } finally {child.kill('SIGKILL');unrelated.kill('SIGKILL');await files.close();}
 });

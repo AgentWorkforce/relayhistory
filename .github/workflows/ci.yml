@@ -39,6 +39,12 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --all-features
 
+      # Runs after "Rust tests" on purpose: that step has already compiled the
+      # sync_bench target in this profile, so the gate spends its time
+      # measuring rather than building. See docs/benchmarks.md.
+      - name: Sync and hydration throughput gate
+        run: node scripts/benchmark-sync.mjs --gate
+
       - name: Published crate builds without optional features
         run: cargo build -p ai-hist --no-default-features
 
