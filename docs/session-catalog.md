@@ -374,6 +374,14 @@ sync state, during which a transcript whose indexed tool results have no
 `event_index` is re-read. Selecting files that way is narrower than
 invalidating the whole stamp map, which would re-read the entire archive.
 
+The generation is recorded only after a pass that both completed and covered
+everything it discovered: every rollout root the database has indexed from was
+reachable, and every transcript it found was read. A provider read that fails
+is propagated rather than defaulted to an empty string, because an I/O or
+UTF-8 failure reduced to `""` is indistinguishable from a file that genuinely
+holds nothing — and a file restored afterwards keeps its length and mtime, so
+the unchanged stamp would never reopen it.
+
 The pass is bounded by a recorded generation rather than by "some row is still
 null", and that distinction matters: `session_events` is keyed by
 `(source, session_id)`, local and remote observations of one session share

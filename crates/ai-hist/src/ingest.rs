@@ -2821,6 +2821,9 @@ fn sync_claude_session_metadata(
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
+    // A pass that could not read a file it discovered has not covered that
+    // file, and must not retire the backfill generation over it.
+    let mut unread_file = false;
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2839,8 +2842,23 @@ fn sync_claude_session_metadata(
             continue;
         }
         scanned += 1;
+        // Read before stamping. The stamp is this walk's claim to have
+        // indexed the file; recording it first means a read that fails
+        // afterwards still looks done, and since a restored file keeps its
+        // length and mtime, the unchanged stamp would skip it forever.
+        let scanned_meta = match scan_claude_session_file(&path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                unread_file = true;
+                sync_note!(
+                    "  [claude-sessions] could not read {}: {error:#}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         session_state.insert(key, json!(stamp));
-        if let Some(meta) = scan_claude_session_file(&path)? {
+        if let Some(meta) = scanned_meta {
             // A subagent sidecar carries the parent's `sessionId` but is not
             // that session: registering it would overwrite the parent's
             // locator with the sidecar path, and ingesting it unattributed
@@ -2877,7 +2895,9 @@ fn sync_claude_session_metadata(
         "claude_sessions_v3".to_string(),
         Value::Object(session_state),
     );
-    record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
+    if !unread_file {
+        record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
+    }
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
@@ -3020,7 +3040,11 @@ pub(crate) struct ClaudeSessionMeta {
 }
 
 fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
-    let text = fs::read_to_string(path).unwrap_or_default();
+    // Propagated, not defaulted. An I/O or UTF-8 failure reduced to an empty
+    // string is indistinguishable here from a file that genuinely holds no
+    // session, and the caller would record it as successfully read.
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading claude transcript {}", path.display()))?;
     let mut session_id = None;
     let mut remote_session_id = None;
     let mut cwd = None;
@@ -3237,7 +3261,8 @@ fn ingest_claude_transcript_as(
     path: &Path,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let text = fs::read_to_string(path).unwrap_or_default();
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading claude transcript {}", path.display()))?;
     // Ordering is assigned over the whole transcript, and this parser always
     // re-reads the file from the start, so a re-sync reproduces the same
     // indexes instead of advancing them.
@@ -6863,6 +6888,146 @@ mod tests {
                 .text
                 .as_deref(),
             Some("sentinel"),
+        );
+    }
+
+    /// Pin a file's mtime so a rewrite does not move its sync stamp. The
+    /// reported failure needs the stamp to be identical before and after the
+    /// unreadable window -- that is what makes the file invisible to the
+    /// fast path once the generation has been retired.
+    fn restore_mtime(path: &std::path::Path, times: std::fs::FileTimes) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_claude_transcript_keeps_the_backfill_pass_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let readable = dir.path().join("sess-readable.jsonl");
+        let unreadable = dir.path().join("sess-unreadable.jsonl");
+        let transcript = |session: &str| {
+            [
+                claude_line(json!({
+                    "type": "assistant", "uuid": format!("{session}-a1"),
+                    "sessionId": session, "cwd": "/tmp/project",
+                    "timestamp": "2026-04-22T00:00:01.000Z",
+                    "message": { "role": "assistant", "content": [
+                        { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                          "input": { "command": "ls" } },
+                    ]},
+                })),
+                claude_line(json!({
+                    "type": "user", "uuid": format!("{session}-u2"),
+                    "parentUuid": format!("{session}-a1"),
+                    "sessionId": session, "cwd": "/tmp/project",
+                    "timestamp": "2026-04-22T00:00:02.000Z",
+                    "message": { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "tu_1", "content": "ok" },
+                    ]},
+                })),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        fs::write(&readable, transcript("sess-readable")).unwrap();
+        let good = transcript("sess-unreadable");
+        fs::write(&unreadable, &good).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        for session in ["sess-readable", "sess-unreadable"] {
+            assert_eq!(
+                tool_results(&conn, "claude", session)[0].payload_bytes,
+                Some(2)
+            );
+        }
+        // The stamp is mtime plus length, and both are held fixed from here
+        // on, so every later sync sees the stamp it already stored.
+        let pinned = {
+            let meta = fs::metadata(&unreadable).unwrap();
+            std::fs::FileTimes::new()
+                .set_accessed(meta.accessed().unwrap())
+                .set_modified(meta.modified().unwrap())
+        };
+        let stamp_before = claude_sync_stamp(&unreadable).unwrap();
+
+        // The state an upgrade leaves behind.
+        blank_tool_result_fidelity(&conn, "claude");
+        blank_tool_result_fidelity_state(&mut state);
+
+        // The file is momentarily unreadable. Invalid UTF-8 of exactly the
+        // same length rather than a permission bit, because the suite runs as
+        // root and root reads a chmod 000 file happily -- the test would pass
+        // without proving anything.
+        fs::write(&unreadable, vec![0xff_u8; good.len()]).unwrap();
+        restore_mtime(&unreadable, pinned);
+        assert_eq!(claude_sync_stamp(&unreadable).unwrap(), stamp_before);
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Positive control: the readable file in the same run was repaired,
+        // so the walk is not simply failing wholesale.
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-readable")[0].payload_bytes,
+            Some(2)
+        );
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-unreadable")[0].payload_bytes,
+            None
+        );
+        assert!(
+            state.get(super::CLAUDE_FIDELITY_GENERATION_KEY).is_none(),
+            "a pass that could not read every file it discovered is not complete"
+        );
+
+        // The file reads again, with the stamp it has had all along. Nothing
+        // about the file changed, so the missing-fidelity probe is the only
+        // thing that can reopen it -- which is exactly what retiring the
+        // generation would have taken away.
+        fs::write(&unreadable, &good).unwrap();
+        restore_mtime(&unreadable, pinned);
+        assert_eq!(claude_sync_stamp(&unreadable).unwrap(), stamp_before);
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            tool_results(&conn, "claude", "sess-unreadable")[0].payload_bytes,
+            Some(2)
+        );
+        assert_eq!(
+            state
+                .get(super::CLAUDE_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_new_claude_transcript_is_not_stamped_as_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-new.jsonl");
+        // A file seen for the first time and unreadable on that pass. The
+        // stamp is this walk's claim to have indexed it, so recording it
+        // before the read means the content is skipped once it arrives.
+        fs::write(&path, b"\xff\xfe not utf-8\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let stamps = state
+            .get("claude_sessions_v3")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !stamps.contains_key(&path.to_string_lossy().to_string()),
+            "an unreadable file must not be stamped as though it were read"
         );
     }
 
