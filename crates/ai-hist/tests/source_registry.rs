@@ -70,6 +70,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         source: "claude".into(),
         session_id: "session".into(),
         project: None,
+        project_key: None,
         cwd: None,
         git_branch: None,
         message_id: Some(uid.into()),
