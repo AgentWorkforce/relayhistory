@@ -3822,6 +3822,8 @@ struct PreparedCursorTranscript {
     /// How far the byte scan actually got, and therefore how far the
     /// checkpoint this run will commit reaches. Indexing must not go past it.
     scanned_through: u64,
+    /// The generation the scan validated. Re-checked before indexing.
+    generation: Option<(Option<u64>, Option<u64>, u64, u64)>,
 }
 
 struct PreparedCursorSync {
@@ -3847,7 +3849,41 @@ fn sync_cursor_with_scan_hook(
     // prompts after a file's mtime changes can duplicate them.
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
-    for transcript in prepared.transcripts {
+    let mut cursor_state = prepared.cursor_state;
+    for mut transcript in prepared.transcripts {
+        // Cursor can replace a transcript between the scan and this read. The
+        // scan's `restarted`, `history_from_offset` and `scanned_through` then
+        // describe a file that is gone, and using them commits a mixture of
+        // two generations: evidence keyed on the old offsets is never cleared,
+        // because `restarted` is false, and every prompt in the new file
+        // before the old resume point is skipped. A replacement is a rewrite,
+        // so re-scan the generation that is actually there and treat it as
+        // one. The re-scan is provider I/O under the destination lock, which
+        // the fast path deliberately avoids — it happens only on this rare
+        // path, and the alternative is committing evidence that is wrong.
+        // A file that is simply *gone* is not a replacement: there is nothing
+        // to re-scan, and the read below reports it with the message the
+        // rollback path is written against. Only a file that is present and
+        // different is a rewrite.
+        let current_generation = file_generation_stamp(&transcript.path);
+        if current_generation.is_some() && current_generation != transcript.generation {
+            let rescan = scan_cursor_transcript(&transcript.path, None).with_context(|| {
+                format!(
+                    "re-scan replaced Cursor transcript {}",
+                    transcript.path.display()
+                )
+            })?;
+            transcript.restarted = true;
+            transcript.history_from_offset = 0;
+            transcript.scanned_through = rescan.consumed_through;
+            transcript.timestamp_ms = rescan.timestamp_ms;
+            transcript.generation = rescan.generation;
+            // The checkpoint the scan prepared describes the old generation,
+            // so replace it with the one this re-scan validated.
+            if let Some(checkpoint) = rescan.checkpoint {
+                cursor_state.insert(transcript.path.to_string_lossy().to_string(), checkpoint);
+            }
+        }
         // A transcript read from its start is a rebuild: its prompts may carry
         // timestamps a previous parser took from the file mtime, and its
         // events, tool calls and file edits are keyed on byte offsets from a
@@ -3889,7 +3925,7 @@ fn sync_cursor_with_scan_hook(
     tx.commit().context("commit Cursor sync")?;
     state.insert(
         CURSOR_SYNC_STATE_KEY.to_string(),
-        Value::Object(prepared.cursor_state),
+        Value::Object(cursor_state),
     );
     if prepared.files_seen > 0 {
         let suffix = if prepared.errors > 0 {
@@ -3921,6 +3957,9 @@ struct ScannedCursorTranscript {
     /// The byte position the scan consumed through, which is what this run's
     /// checkpoint will record.
     consumed_through: u64,
+    /// The file identity this scan validated against, re-checked before the
+    /// scan's offsets are used to index.
+    generation: Option<(Option<u64>, Option<u64>, u64, u64)>,
 }
 
 fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
@@ -3976,7 +4015,23 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         advanced: consumed != offset,
         resumed_from: offset,
         consumed_through: consumed,
+        // What the scan validated. The index phase re-checks this, because a
+        // replacement between the two would otherwise be invisible: the
+        // reader's own detection only covers a replacement while it is still
+        // reading, and a replacement can also land after it has finished.
+        generation: file_generation_stamp(jsonl),
     })
+}
+
+/// A cheap identity for the generation of a file on disk right now.
+///
+/// Device and inode catch a replacement that reuses the path; length and mtime
+/// catch a truncate-and-rewrite that reuses the inode. `None` means the file
+/// could not be stated, which is itself a change worth reacting to.
+fn file_generation_stamp(path: &Path) -> Option<(Option<u64>, Option<u64>, u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let (device, inode) = metadata_identity(&metadata);
+    Some((device, inode, metadata.len(), metadata_mtime_ns(&metadata)))
 }
 
 fn prepare_cursor_sync(
@@ -4048,6 +4103,7 @@ fn prepare_cursor_sync(
                     restarted: scan.restarted,
                     history_from_offset: scan.resumed_from,
                     scanned_through: scan.consumed_through,
+                    generation: scan.generation,
                 });
             }
         }
@@ -7029,6 +7085,169 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompt_ts, by_text[0].1);
+    }
+
+    /// Group J. Cursor can replace a transcript *during* the byte scan. The
+    /// reader detects that and resets the checkpoint to offset 0 of the new
+    /// file, but `restarted` and `resumed_from` were computed from the opening
+    /// position and still describe the file that is gone. The run then commits
+    /// a mixture of two generations: evidence keyed on the old file's offsets
+    /// is not cleared, because `restarted` is false, and every prompt in the
+    /// new file before the old resume point is skipped, because
+    /// `history_from_offset` still points into the old one.
+    ///
+    /// Positive control: before the fix this failed at the first assertion
+    /// with `stale evidence from the replaced generation survived: left: 2,
+    /// right: 1` — the replaced transcript's tool call was still attributed to
+    /// the session, and `"replacement first turn"` was missing from history
+    /// because it sits before the old offset.
+    #[test]
+    fn a_cursor_transcript_replaced_during_the_scan_is_treated_as_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        // A first generation long enough that its resume offset lands well
+        // inside the replacement, so a skipped prefix is observable.
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>original first</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"original.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:39 PM (UTC-4)</timestamp><user_query>original second</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-replaced", original);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-replaced"), 1);
+        assert_eq!(cursor_row_count(&conn, "history", "s-replaced"), 2);
+
+        // Grow it so the next sync has something to resume for, then replace
+        // the whole file while that scan is in flight. The hook fires per
+        // transcript before that transcript is opened, so a second transcript
+        // gives us a point after the first has been opened and identified.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"more original"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        let replacement = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:01 PM (UTC-4)</timestamp><user_query>replacement first turn</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"replacement.rs"}}]}}"#,
+            "\n"
+        );
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-zlater",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:05 PM (UTC-4)</timestamp><user_query>unrelated</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
+            if path == later {
+                // Replace, not truncate-in-place: a fresh inode is what a
+                // real Cursor rewrite produces.
+                fs::remove_file(&transcript).unwrap();
+                fs::write(&transcript, replacement).unwrap();
+            }
+        })
+        .unwrap();
+
+        // Nothing from the replaced generation may survive.
+        let edits = crate::session_file_edits(&conn, "s-replaced", Some("cursor")).unwrap();
+        assert!(
+            !edits.iter().any(|edit| edit.file_path == "original.rs"),
+            "stale evidence from the replaced generation survived: {:?}",
+            edits
+                .iter()
+                .map(|e| e.file_path.as_str())
+                .collect::<Vec<_>>()
+        );
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 's-replaced' \
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            prompts.contains(&"replacement first turn".to_string()),
+            "a prompt before the old resume offset must not be skipped: {prompts:?}"
+        );
+        assert!(
+            !prompts.iter().any(|p| p.starts_with("original")),
+            "prompts from the replaced generation must not survive: {prompts:?}"
+        );
+    }
+
+    /// Group J's other half: an ordinary append, with no replacement, must
+    /// still resume from the checkpoint rather than rebuilding from zero.
+    /// The fix must key on a detected replacement, not on "the file changed".
+    #[test]
+    fn a_cursor_append_without_a_replacement_still_resumes_from_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-plainappend", first);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let resumed_from = saved_cursor_offset(
+            &state[super::CURSOR_SYNC_STATE_KEY][transcript.to_string_lossy().as_ref()],
+        );
+        assert_eq!(resumed_from, first.len() as u64);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>second</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        // One new prompt inserted, not a rebuild of both.
+        assert_eq!(super::sync_cursor(&conn, &mut state, &root).unwrap(), 1);
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 's-plainappend' \
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
+        assert!(
+            saved_cursor_offset(
+                &state[super::CURSOR_SYNC_STATE_KEY][transcript.to_string_lossy().as_ref()]
+            ) > resumed_from,
+            "an append must advance the checkpoint, not reset it"
+        );
     }
 
     /// Group H. Cursor can append between the byte scan and the read. Those
