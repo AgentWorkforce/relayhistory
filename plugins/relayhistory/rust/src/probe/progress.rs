@@ -95,7 +95,7 @@ impl Progress {
 pub struct Monitor {
     snapshot: Arc<Mutex<Progress>>,
     stop: Option<mpsc::Sender<bool>>,
-    completion: mpsc::Receiver<()>,
+    completion: mpsc::Receiver<bool>,
 }
 impl Monitor {
     pub fn start(directory: &Path, history_url: &str, job: Option<&str>) -> Self {
@@ -107,7 +107,7 @@ impl Monitor {
     fn start_with_report(
         directory: &Path,
         job: Option<&str>,
-        mut report: impl FnMut(&Progress, bool) + Send + 'static,
+        mut report: impl FnMut(&Progress, bool) -> bool + Send + 'static,
     ) -> Self {
         let snapshot = Arc::new(Mutex::new(Progress {
             phase: if job.is_some() {
@@ -127,6 +127,7 @@ impl Monitor {
         thread::spawn(move || {
             let started = Instant::now();
             let mut finish = None;
+            let mut acknowledged = false;
             loop {
                 // The next upload monitor now owns progress. Do not send a
                 // delayed final "scanning" heartbeat after successful capture.
@@ -144,7 +145,7 @@ impl Monitor {
                     .into();
                 }
                 println!("{} ({}s)", progress.line(), started.elapsed().as_secs());
-                report(&progress, finish.is_some());
+                acknowledged = report(&progress, finish.is_some());
                 if finish.is_some() {
                     break;
                 }
@@ -154,7 +155,7 @@ impl Monitor {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
-            let _ = completed.send(());
+            let _ = completed.send(acknowledged);
         });
         Self {
             snapshot,
@@ -171,13 +172,13 @@ impl Monitor {
             p.total_files = capture.total_files;
         }
     }
-    pub fn finish_before_exit(mut self, success: bool, timeout: Duration) {
+    pub fn finish_before_exit(mut self, success: bool, timeout: Duration) -> bool {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(success);
         }
         // Setup/--once gets a chance to flush final queue counts, with a strict
         // deadline. Ordinary background finish/drop still never waits.
-        let _ = self.completion.recv_timeout(timeout);
+        self.completion.recv_timeout(timeout).unwrap_or(false)
     }
     // Background/capture callers only signal stop; the worker exits after its
     // bounded request/final report without holding up the caller.
@@ -192,17 +193,17 @@ impl Drop for Monitor {
         self.stop.take();
     }
 }
-fn heartbeat(url: &str, progress: &Progress, finished: bool) {
+fn heartbeat(url: &str, progress: &Progress, finished: bool) -> bool {
     // Periodic capture updates only read cached credentials. A final upload
     // update may renew an idle token, without waiting for the refresh lock.
     let token = if finished && progress.phase != "capture_paused" {
         match cloud::try_progress_access_token(url, Duration::from_secs(2)) {
             Ok(Some(token)) => token,
-            _ => return,
+            _ => return false,
         }
     } else {
         let Ok(Some(auth)) = cloud::load_selected_auth(Some(url)) else {
-            return;
+            return false;
         };
         let valid = auth
             .access_token_expires_at
@@ -216,7 +217,7 @@ fn heartbeat(url: &str, progress: &Progress, finished: bool) {
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic())
         {
-            return;
+            return false;
         }
         auth.access_token
     };
@@ -227,9 +228,11 @@ fn heartbeat(url: &str, progress: &Progress, finished: bool) {
         .post(&format!("{url}/v1/onboarding/heartbeat"))
         .set("Authorization", &format!("Bearer {token}"))
         .send_json(serde_json::json!({"progress":progress}));
-    if result.is_err() {
+    let acknowledged = result.is_ok_and(|response| (200..300).contains(&response.status()));
+    if !acknowledged {
         eprintln!("Cloud progress update unavailable; collection continues locally.");
     }
+    acknowledged
 }
 
 #[cfg(test)]
@@ -251,6 +254,7 @@ mod tests {
                 } else {
                     finished.send(progress.phase.clone()).unwrap();
                 }
+                true
             });
             started.recv_timeout(Duration::from_secs(2)).unwrap();
             let start = Instant::now();
@@ -282,17 +286,21 @@ mod tests {
                 if finished {
                     reported.send(()).unwrap();
                 }
+                true
             });
-        monitor.finish_before_exit(true, Duration::from_secs(1));
+        assert!(monitor.finish_before_exit(true, Duration::from_secs(1)));
         received.try_recv().unwrap();
         let (release, blocked) = mpsc::channel::<()>();
         let monitor = Monitor::start_with_report(directory.path(), Some("job"), move |_, _| {
             let _ = blocked.recv();
+            true
         });
         let start = Instant::now();
-        monitor.finish_before_exit(true, Duration::from_millis(50));
+        assert!(!monitor.finish_before_exit(true, Duration::from_millis(50)));
         assert!(start.elapsed() < Duration::from_millis(500));
         drop(release);
+        let monitor = Monitor::start_with_report(directory.path(), Some("job"), |_, _| false);
+        assert!(!monitor.finish_before_exit(true, Duration::from_secs(1)));
     }
 
     #[test]
