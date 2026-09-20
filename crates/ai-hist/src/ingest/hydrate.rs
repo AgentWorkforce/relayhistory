@@ -570,7 +570,17 @@ fn hydrate_remote_claude_observed(
         .iter()
         .any(|other| observation.is_some_and(|current| other.key != current.key));
     if !had_local_presence && !other_observation {
-        for table in ["history", "session_events", "tool_calls", "file_edits"] {
+        // `session_markers` belongs in this list for the same reason the
+        // others do: a marker is evidence, and one left behind after the
+        // provider stopped sending the record it describes tells a caller
+        // something is still there that is not.
+        for table in [
+            "history",
+            "session_events",
+            "tool_calls",
+            "file_edits",
+            "session_markers",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE source = 'claude' AND session_id = ?"),
                 [&options.session_id],
@@ -3268,6 +3278,72 @@ mod tests {
         assert_eq!(result.related_session_ids, vec!["related-child"]);
         assert_eq!(result.evidence.events, 1);
         assert_eq!(result.diagnostics[0].code, "CONNECTOR_NOT_CONFIGURED");
+    }
+
+    /// A complete remote snapshot is a replacement, not an addition: the rows
+    /// it no longer contains are deleted before the new ones land. A marker is
+    /// evidence exactly like an event, so one left behind tells a caller
+    /// something is still there that the provider has removed.
+    #[test]
+    fn a_full_remote_snapshot_removes_markers_it_no_longer_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let mut conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "claude", "session_01marked");
+        let options = HydrateSessionOptions {
+            source: "claude".into(),
+            session_id: "session_01marked".into(),
+            scope: SessionScope::Remote,
+            include_related: true,
+        };
+        let prompt = serde_json::json!({
+            "sessionId": "session_01marked", "uuid": "u1", "type": "user", "timestamp": 1,
+            "message": {"role": "user", "content": "remote prompt"}
+        });
+        let boundary = serde_json::json!({
+            "sessionId": "session_01marked", "uuid": "s1", "type": "system",
+            "subtype": "compact_boundary", "timestamp": 2
+        });
+
+        let marker_kinds = |conn: &Connection| -> Vec<String> {
+            crate::session_markers_page(conn, "claude", "session_01marked", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .map(|marker| marker.kind)
+                .collect()
+        };
+
+        hydrate_remote_claude(
+            &mut conn,
+            &options,
+            vec![prompt.clone(), boundary],
+            "teleport:marked".into(),
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker_kinds(&conn),
+            vec!["compaction_boundary".to_string()],
+            "the first snapshot records the boundary"
+        );
+
+        // The provider no longer sends the boundary record.
+        hydrate_remote_claude(
+            &mut conn,
+            &options,
+            vec![prompt],
+            "teleport:unmarked".into(),
+            50,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(
+            marker_kinds(&conn).is_empty(),
+            "a marker the provider removed must not survive a full snapshot: {:?}",
+            marker_kinds(&conn)
+        );
     }
 
     #[test]

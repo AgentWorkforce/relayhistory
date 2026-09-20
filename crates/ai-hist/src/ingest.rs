@@ -3148,17 +3148,21 @@ fn ingest_claude_transcript_as(
             }
         }
         let record_content = message.and_then(|m| m.get("content"));
-        // Explicit `null` is not content: it reaches no event, so a record
-        // carrying it is as unrecorded as one with no `content` key at all.
-        let yields_events = record_content.is_some_and(|value| !value.is_null());
+        // How many rows this record actually produced, across both tables.
+        //
+        // The invariant is that every record leaves at least one row behind,
+        // and the only trustworthy way to know whether it did is to count what
+        // was written. Predicting it from the shape of `content` needs a rule
+        // per emptiness -- absent, `null`, `""`, `[]`, blocks that are all
+        // blank -- and every rule that is missed is a record that silently
+        // disappears while the code looks correct.
+        let mut record_rows = 0usize;
         // Classified before the guard below rather than inside it: what a
         // record *is* does not depend on whether it also carries a message.
-        let record_draft = claude_marker_for_record(
-            obj,
-            last_assistant_cache_read.get(session_id).copied(),
-            yields_events,
-        );
+        let record_draft =
+            claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied());
         if let Some(draft) = &record_draft {
+            record_rows += 1;
             let marker_uid = format!("{message_uuid}:marker");
             insert_session_marker(
                 conn,
@@ -3206,8 +3210,19 @@ fn ingest_claude_transcript_as(
                             &format!("{message_uuid}:system"),
                             Some("system_subagent_notification"),
                         )?;
+                        record_rows += 1;
                     }
                 }
+            }
+            if record_rows == 0 {
+                insert_unknown_record_marker(
+                    conn,
+                    session_id,
+                    message_uuid,
+                    ts_ms,
+                    parent_id,
+                    obj.get("type").and_then(Value::as_str).unwrap_or(""),
+                )?;
             }
             continue;
         };
@@ -3268,13 +3283,10 @@ fn ingest_claude_transcript_as(
                     token_json.as_deref(),
                     &format!("{message_uuid}:0"),
                 )?;
+                record_rows += 1;
             }
-            continue;
         }
-        let Some(blocks) = content.as_array() else {
-            continue;
-        };
-        for (block_index, block) in blocks.iter().enumerate() {
+        for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{message_uuid}:{block_index}");
             // Everything the normalized event model cannot carry off this
@@ -3298,6 +3310,7 @@ fn ingest_claude_transcript_as(
                         payload_json: draft.payload_json.as_deref(),
                     },
                 )?;
+                record_rows += 1;
             }
             match block_type {
                 "text" => {
@@ -3325,6 +3338,7 @@ fn ingest_claude_transcript_as(
                                 token_json.as_deref(),
                                 &event_uid,
                             )?;
+                            record_rows += 1;
                         }
                     }
                 }
@@ -3351,6 +3365,7 @@ fn ingest_claude_transcript_as(
                             token_json.as_deref(),
                             &event_uid,
                         )?;
+                        record_rows += 1;
                     }
                 }
                 "tool_use" => {
@@ -3376,6 +3391,7 @@ fn ingest_claude_transcript_as(
                         token_json.as_deref(),
                         &event_uid,
                     )?;
+                    record_rows += 1;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
                             serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
@@ -3435,6 +3451,7 @@ fn ingest_claude_transcript_as(
                         &event_uid,
                         Some("tool_result_block"),
                     )?;
+                    record_rows += 1;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
                         if let Some(err) = is_error {
@@ -3458,8 +3475,59 @@ fn ingest_claude_transcript_as(
                 _ => {}
             }
         }
+        // The invariant: every record leaves a row. A record whose content was
+        // present but empty -- `""`, `[]`, or blocks that are all blank --
+        // reaches none of the inserts above, and without this it would be
+        // absent from both tables with nothing to show it was ever there.
+        if record_rows == 0 {
+            insert_unknown_record_marker(
+                conn,
+                session_id,
+                message_uuid,
+                ts_ms,
+                parent_id,
+                obj.get("type").and_then(Value::as_str).unwrap_or(""),
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Record that a provider record existed when nothing else did.
+///
+/// Called only when a record produced no event and no other marker, so it
+/// never competes with a classified marker for the same `marker_uid`. The
+/// provider's own record type goes in `subkind`; a record that does not even
+/// name its type is recorded as `record`, because "something was here" is
+/// still worth more than silence.
+fn insert_unknown_record_marker(
+    conn: &Connection,
+    session_id: &str,
+    message_uuid: &str,
+    ts_ms: i64,
+    parent_id: Option<&str>,
+    record_type: &str,
+) -> Result<()> {
+    let marker_uid = format!("{message_uuid}:marker");
+    insert_session_marker(
+        conn,
+        "claude",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (ts_ms != 0).then_some(ts_ms),
+            message_id: Some(message_uuid),
+            parent_id,
+            turn_id: None,
+            kind: "unknown",
+            subkind: Some(if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            }),
+            payload_json: None,
+        },
+    )
 }
 
 /// Longest string any marker payload field keeps.
@@ -3577,24 +3645,20 @@ fn marker_string(value: Option<&Value>) -> Value {
 /// is classified independently of whether the record also carries message
 /// content. Classifying only records without content would mean a future type
 /// that happens to carry some became an ordinary text event with its native
-/// type recorded nowhere. `yields_events` therefore only decides whether a
-/// record of an already-modeled type needs a marker of its own.
+/// type recorded nowhere.
 fn claude_marker_for_record(
     obj: &Map<String, Value>,
     tokens_before_compact: Option<i64>,
-    yields_events: bool,
 ) -> Option<MarkerDraft> {
     let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
     let subtype = obj.get("subtype").and_then(Value::as_str);
     match record_type {
         // `user` and `assistant` are the record types the event model is built
-        // on, so they are silent -- a marker per message would double every
-        // transcript. They are still not allowed to vanish: a record of either
-        // type that produced no event at all is recorded as having existed,
-        // which is the whole claim this table makes.
-        "user" | "assistant" => {
-            (!yields_events).then(|| MarkerDraft::new("unknown", Some(record_type)))
-        }
+        // on, so they are silent here -- a marker per message would double
+        // every transcript. They are still not allowed to vanish: the caller
+        // counts the rows a record actually produced and falls back to
+        // [`insert_unknown_record_marker`] when that count is zero.
+        "user" | "assistant" => None,
         "summary" => Some(
             MarkerDraft::new("summary", subtype.or(Some("summary"))).with_payload(vec![
                 ("summary", marker_string(obj.get("summary"))),
@@ -7717,6 +7781,58 @@ mod tests {
                 .all(|marker| marker.subkind.as_deref() != Some("user")
                     && marker.subkind.as_deref() != Some("assistant")),
             "modeled record types must stay silent: {page:?}"
+        );
+    }
+
+    /// Content that is *present* but reaches no event is the same as no
+    /// content at all, for the purpose of "did this record leave a row?".
+    /// Treating `""` or `[]` as event-bearing suppressed the fallback marker
+    /// while nothing was inserted, so the record was absent from both tables.
+    #[test]
+    fn claude_records_with_empty_content_still_leave_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-content.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"future_notice","uuid":"f1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":""}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"user","content":[]}}"#, "\n",
+                r#"{"type":"user","uuid":"u1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:02.000Z","message":{"role":"user","content":""}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:03.000Z","message":{"role":"user","content":[]}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:04.000Z","message":{"role":"assistant","model":"m","content":"   "}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:05.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"   "}]}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f3","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:06.000Z","message":{"role":"user","content":[{"type":"text","text":""},{"type":"thinking","thinking":"  "}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        // Nothing here reaches an event, so every one of these records has to
+        // be accounted for by a marker or it has silently disappeared.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='empty-content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "none of these records yields an event");
+
+        let recorded: Vec<String> =
+            crate::session_markers_page(&conn, "claude", "empty-content", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .filter_map(|marker| marker.message_id)
+                .collect();
+        assert_eq!(
+            recorded,
+            vec!["f1", "f2", "u1", "u2", "a1", "a2", "f3"],
+            "every record that produced no event must still be recorded, \
+             including blocks that are present but entirely blank"
         );
     }
 

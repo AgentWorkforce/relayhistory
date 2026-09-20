@@ -369,6 +369,16 @@ is classified independently of whether it also carries message content, so a
 future record type that happens to carry some is not filed away as an ordinary
 text event with its native type recorded nowhere.
 
+The invariant is enforced by *counting the rows a record produced*, not by
+predicting them from the shape of its content. Content can be present and still
+reach nothing — `""`, `[]`, or blocks that are all blank — and each such shape
+is one more rule to miss. A Claude record that wrote no row falls back to
+`unknown` carrying its provider type.
+
+Markers are evidence, so they are removed with the rest when a complete remote
+snapshot replaces a session: a marker left behind would tell a caller that
+something is still there which the provider has stopped sending.
+
 A compaction boundary states no size of its own, so a Claude
 `compaction_boundary` payload carries `tokens_before_compact` taken from the
 `cache_read_input_tokens` of the assistant message immediately before it.
