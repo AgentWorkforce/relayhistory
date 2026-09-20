@@ -148,11 +148,13 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     } else {
         capture(directory, &config.history_url)?;
     }
-    super::bridge::enforce_selection(directory, config)?;
     deliver_captured(directory, config, false)
 }
 
 pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
+    // Every drain must apply selected-mode exclusions, including retries after
+    // a failed capture. Never reach the delivery worker with an unvetted row.
+    super::bridge::enforce_selection(directory, config)?;
     {
         let conn = ai_hist::open_db(&directory.join("history.db"))?;
         if delivery::status(&conn, &config.job_id)?.state == "paused" {

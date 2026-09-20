@@ -106,13 +106,17 @@ pub struct Monitor {
 impl Monitor {
     pub fn start(directory: &Path, history_url: &str, job: Option<&str>) -> Self {
         let url = history_url.to_owned();
-        Self::start_with_report(directory, job, move |progress, finished| {
-            heartbeat(&url, progress, finished)
-        })
+        Self::start_with_report(
+            directory,
+            job,
+            !super::bridge::json_mode(),
+            move |progress, finished| heartbeat(&url, progress, finished),
+        )
     }
     fn start_with_report(
         directory: &Path,
         job: Option<&str>,
+        show_human_progress: bool,
         mut report: impl FnMut(&Progress, bool) -> bool + Send + 'static,
     ) -> Self {
         let snapshot = Arc::new(Mutex::new(Progress {
@@ -150,7 +154,11 @@ impl Monitor {
                     }
                     .into();
                 }
-                println!("{} ({}s)", progress.line(), started.elapsed().as_secs());
+                if let Some(line) =
+                    human_progress_line(&progress, started.elapsed(), show_human_progress)
+                {
+                    println!("{line}");
+                }
                 acknowledged = report(&progress, finish.is_some());
                 if finish.is_some() {
                     break;
@@ -193,6 +201,10 @@ impl Monitor {
             let _ = stop.send(success);
         }
     }
+}
+
+fn human_progress_line(progress: &Progress, elapsed: Duration, enabled: bool) -> Option<String> {
+    enabled.then(|| format!("{} ({}s)", progress.line(), elapsed.as_secs()))
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
@@ -252,16 +264,17 @@ mod tests {
             let (release, blocked) = mpsc::channel::<()>();
             let (finished, done) = mpsc::channel();
             let mut first = true;
-            let monitor = Monitor::start_with_report(directory.path(), None, move |progress, _| {
-                if first {
-                    first = false;
-                    entered.send(()).unwrap();
-                    blocked.recv().unwrap();
-                } else {
-                    finished.send(progress.phase.clone()).unwrap();
-                }
-                true
-            });
+            let monitor =
+                Monitor::start_with_report(directory.path(), None, false, move |progress, _| {
+                    if first {
+                        first = false;
+                        entered.send(()).unwrap();
+                        blocked.recv().unwrap();
+                    } else {
+                        finished.send(progress.phase.clone()).unwrap();
+                    }
+                    true
+                });
             started.recv_timeout(Duration::from_secs(2)).unwrap();
             let start = Instant::now();
             if let Some(success) = success {
@@ -288,7 +301,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (reported, received) = mpsc::channel();
         let monitor =
-            Monitor::start_with_report(directory.path(), Some("job"), move |_, finished| {
+            Monitor::start_with_report(directory.path(), Some("job"), false, move |_, finished| {
                 if finished {
                     reported.send(()).unwrap();
                 }
@@ -297,16 +310,40 @@ mod tests {
         assert!(monitor.finish_before_exit(true, Duration::from_secs(1)));
         received.try_recv().unwrap();
         let (release, blocked) = mpsc::channel::<()>();
-        let monitor = Monitor::start_with_report(directory.path(), Some("job"), move |_, _| {
-            let _ = blocked.recv();
-            true
-        });
+        let monitor =
+            Monitor::start_with_report(directory.path(), Some("job"), false, move |_, _| {
+                let _ = blocked.recv();
+                true
+            });
         let start = Instant::now();
         assert!(!monitor.finish_before_exit(true, Duration::from_millis(50)));
         assert!(start.elapsed() < Duration::from_millis(500));
         drop(release);
-        let monitor = Monitor::start_with_report(directory.path(), Some("job"), |_, _| false);
+        let monitor =
+            Monitor::start_with_report(directory.path(), Some("job"), false, |_, _| false);
         assert!(!monitor.finish_before_exit(true, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn json_progress_suppresses_console_text_but_still_reports_completion() {
+        let progress = Progress {
+            phase: "scanning".into(),
+            ..Default::default()
+        };
+        assert!(human_progress_line(&progress, Duration::from_secs(1), false).is_none());
+        assert!(human_progress_line(&progress, Duration::from_secs(1), true).is_some());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (reported, received) = mpsc::channel();
+        let monitor =
+            Monitor::start_with_report(directory.path(), Some("job"), false, move |_, finished| {
+                if finished {
+                    reported.send(()).unwrap();
+                }
+                true
+            });
+        assert!(monitor.finish_before_exit(true, Duration::from_secs(1)));
+        received.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
