@@ -299,15 +299,19 @@ export interface SessionEventsPage {
   nextCursor: EventCursor | null;
 }
 
-export type RelationshipType = 'delegated';
+/** One session started another thread of work. */
+export type DelegationRelationshipType = 'delegated' | 'materialized_local';
+/** One conversation carrying on as another, rather than delegating. */
+export type ContinuityRelationshipType = 'continuation' | 'fork' | 'resume';
+export type RelationshipType = DelegationRelationshipType | ContinuityRelationshipType;
 export type IdentityStatus = 'observed' | 'unlinked';
 export type StableChildIdentity = 'always' | 'sometimes' | 'never';
 
 /**
- * One observed delegation edge. `childSessionId` is null when the provider
- * recorded the delegation but no stable child identity, in which case
- * `identityStatus` is `unlinked` and the child's output stays attributed to
- * the parent.
+ * One observed edge. `childSessionId` is null when the provider recorded the
+ * relationship but no stable child identity, in which case `identityStatus`
+ * is `unlinked` and the child's output stays attributed to the parent — which
+ * is also how two branches sharing one provider session id are recorded.
  */
 export interface SessionRelationship {
   source: CatalogSource;
@@ -326,6 +330,11 @@ export interface SessionRelationship {
   spawnedAtMs: number | null;
   createdMs: number;
   relationshipUid: string;
+  /**
+   * The conversation a fork or continuation came from, when the provider
+   * named one distinct from `parentSessionId`. Null for delegation.
+   */
+  originSessionId: string | null;
 }
 
 /** What a provider is able to record about its own delegations. */
@@ -353,10 +362,17 @@ export interface SessionRelationships {
   contractVersion: number;
   source: CatalogSource;
   sessionId: string;
-  /** Edges where this session is the delegating parent. */
+  /** Delegation edges where this session is the delegating parent. */
   asParent: SessionRelationship[];
-  /** Edges where this session is the delegated child. */
+  /** Delegation edges where this session is the delegated child. */
   asChild: SessionRelationship[];
+  /**
+   * Continuity edges touching this session in either direction: the resumes,
+   * forks and continuations that are not delegation. Kept out of `asParent`
+   * and `asChild` so a delegation-only consumer reads exactly what it read
+   * before continuity existed.
+   */
+  continuity: SessionRelationship[];
   capabilities: RelationshipCapabilities;
   diagnostics: RelationshipDiagnostic[];
 }
@@ -379,6 +395,12 @@ export interface GetSessionTreeOptions extends GetSessionRelationshipsOptions {
   maxDepth?: number;
   /** Default 1000, maximum 10000. */
   maxNodes?: number;
+  /**
+   * Which edges the walk follows. Omitted means delegation only, which is
+   * what every caller got before continuity existed; naming continuity kinds
+   * expands from an origin to its resumed, continued, or forked descendants.
+   */
+  relationshipKinds?: RelationshipType[];
 }
 
 export interface SessionTree {
@@ -409,6 +431,8 @@ export interface GetSessionChildrenPageOptions extends GetSessionRelationshipsOp
   /** Default 100, maximum 1000. */
   limit?: number;
   after?: RelationshipCursor;
+  /** Omitted means delegation only. See `GetSessionTreeOptions`. */
+  relationshipKinds?: RelationshipType[];
 }
 
 export interface SessionDescendantsOptions extends GetSessionRelationshipsOptions {

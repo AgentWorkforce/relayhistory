@@ -4,6 +4,40 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Session topology
+
+- Record fork, resume and continuation relationships, not delegation alone.
+  `session_relationships.relationship` now takes `continuation | fork | resume`
+  beside `delegated | materialized_local`, and carries `origin_session_id` —
+  the conversation a branch came from when the provider names one distinct
+  from the parent. Edges come from explicit provider fields
+  (`continuedFromSessionId`, `forkSessionId`, `sourceSessionId`), a `/resume`
+  or `/continue` the human ran, a transcript's first `parentUuid` resolved
+  against the session that holds that record, or two transcripts carrying one
+  provider session id. Similarity is never used.
+
+  Continuity is cross-file, so each transcript's evidence is banked in a new
+  `session_continuity_evidence` table and reconciliation runs over the stored
+  rows — which is what lets it work during targeted hydration of one file.
+  Evidence that cannot resolve yet keeps a reason and is reported as
+  `RELATIONSHIP_CONTINUITY_UNRESOLVED`; hydrating the file that supplies the
+  missing record resolves it without re-reading the first file. Re-reading a
+  rewritten transcript retracts the edges it no longer establishes.
+
+  `getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`,
+  defaulting to delegation only, so an existing caller's output is unchanged.
+  `getSessionRelationships` reports continuity on its own `continuity` array.
+  Plain `sync` re-reads a transcript once when it has no continuity evidence
+  row, so an upgraded install backfills instead of skipping every unchanged
+  file on the stamp fast path. `HYDRATION_PARSER_VERSION` 4 -> 5;
+  `SESSION_RELATIONSHIP_CONTRACT_VERSION` 1 -> 2; native contract 15 -> 16.
+
+- Rebuild a delivery capture trigger that predates one of its table's columns.
+  The triggers embed their column list and are created `IF NOT EXISTS`, and
+  the schema check compared only their names, so adding a column to a captured
+  table left the old trigger delivering rows that looked complete and were
+  missing a field, for the life of the database.
+
 ### Rust API
 
 - Record per-tool-result fidelity on `session_events`: `tool_use_id`,

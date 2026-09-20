@@ -60,7 +60,25 @@
       "ts_ms": 1776729601000
     }
   ],
-  "session_relationships": [],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 1,
+      "child_model": null,
+      "child_session_id": "99999999-9999-9999-9999-999999999999",
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/resume-marker.jsonl",
+      "evidence_ref": "resume-marker",
+      "identity_status": "observed",
+      "parent_session_id": "11111111-1111-1111-1111-111111111111",
+      "relationship": "resume",
+      "relationship_uid": "resume:99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776729600000
+    }
+  ],
   "sessions": [
     {
       "agent_version": "2.1.97",
