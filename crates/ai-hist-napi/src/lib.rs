@@ -34,10 +34,11 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-/// 16 adds `project_key` to catalog rows and session events, plus
+/// 17 adds `provider` and `stopReason` to session events.
+/// 16 added `project_key` to catalog rows and session events, plus
 /// `project_key_method` on the catalog row and the `project_key` listing
-/// filter, and `provider` and `stopReason` to session events.
-pub const NATIVE_CONTRACT_VERSION: u32 = 16;
+/// filter.
+pub const NATIVE_CONTRACT_VERSION: u32 = 17;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
