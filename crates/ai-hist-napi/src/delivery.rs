@@ -157,7 +157,11 @@ pub async fn history_delivery(
                     lease_ms,
                     now_ms,
                 } => serde_json::to_value(core::claim_batch(
-                    &conn, &job_id, &worker_id, lease_ms, now_ms,
+                    &conn,
+                    &job_id,
+                    &worker_id,
+                    lease_ms,
+                    &request_clock(now_ms, received),
                 )?)?,
                 Request::RenewLease {
                     lease,
