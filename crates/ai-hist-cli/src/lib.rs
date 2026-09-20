@@ -2166,19 +2166,37 @@ const PROVIDER_ENV_VARS: [&str; 4] = [
     "OPENCODE_DB",
 ];
 
-fn service_provider_environment(spec: &ServiceSpec) -> Vec<(&'static str, String)> {
-    if spec.subcommand != "sync" {
-        return Vec::new();
+fn scheduler_environment_value(name: &str, value: std::ffi::OsString) -> Result<Option<String>> {
+    let value = value.into_string().map_err(|_| {
+        anyhow::anyhow!(
+            "cannot install sync service: {name} contains non-UTF-8 bytes; use a UTF-8 provider path"
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Ok(None);
     }
-    PROVIDER_ENV_VARS
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var_os(name).and_then(|value| {
-                let value = value.to_string_lossy();
-                (!value.trim().is_empty()).then(|| (name, value.into_owned()))
-            })
-        })
-        .collect()
+    if value.contains(['\n', '\r']) {
+        anyhow::bail!(
+            "cannot install sync service: {name} contains a newline, which scheduler files cannot represent safely"
+        );
+    }
+    Ok(Some(value))
+}
+
+fn service_provider_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
+    if spec.subcommand != "sync" {
+        return Ok(Vec::new());
+    }
+    let mut environment = Vec::new();
+    for name in PROVIDER_ENV_VARS {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        if let Some(value) = scheduler_environment_value(name, value)? {
+            environment.push((name, value));
+        }
+    }
+    Ok(environment)
 }
 
 fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
@@ -2220,6 +2238,12 @@ fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -
 /// the binary path don't break the scheduled command.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote one shell word and then protect `%` from cron's command-to-stdin
+/// splitting. The added backslash is consumed by cron before the shell sees it.
+fn cron_shell_word(s: &str) -> String {
+    shell_single_quote(s).replace('%', "\\%")
 }
 
 /// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
@@ -2283,7 +2307,7 @@ fn install_launchd_service(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
-    let environment = service_provider_environment(spec);
+    let environment = service_provider_environment(spec)?;
     let environment_xml = launchd_environment_xml(&environment);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2383,15 +2407,15 @@ fn install_cron_service(
         );
     }
     let marker = cron_marker(spec);
-    let environment = service_provider_environment(spec);
+    let environment = service_provider_environment(spec)?;
     let command = environment
         .iter()
-        .map(|(name, value)| format!("{name}={}", shell_single_quote(value)))
-        .chain(std::iter::once(shell_single_quote(bin)))
+        .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
+        .chain(std::iter::once(cron_shell_word(bin)))
         .chain(
             service_command_args(spec, args)
                 .iter()
-                .map(|arg| shell_single_quote(arg)),
+                .map(|arg| cron_shell_word(arg)),
         )
         .collect::<Vec<_>>()
         .join(" ");
@@ -3273,7 +3297,7 @@ mod tests {
     fn service_environment_rendering_preserves_relocated_provider_roots() {
         let environment = vec![
             ("CLAUDE_CONFIG_DIR", "/srv/Claude & tools".to_string()),
-            ("CODEX_HOME", "/srv/codex's home".to_string()),
+            ("CODEX_HOME", "/srv/codex's 100% \\archive".to_string()),
         ];
         let xml = launchd_environment_xml(&environment);
         assert!(xml.contains("<key>EnvironmentVariables</key>"));
@@ -3283,13 +3307,30 @@ mod tests {
 
         let cron = environment
             .iter()
-            .map(|(name, value)| format!("{name}={}", shell_single_quote(value)))
+            .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(
             cron,
-            "CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\\''s home'"
+            r"CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\''s 100\% \archive'"
         );
+    }
+
+    #[test]
+    fn scheduler_environment_rejects_line_breaks() {
+        let error =
+            scheduler_environment_value("CODEX_HOME", "/srv/codex\narchive".into()).unwrap_err();
+        assert!(error.to_string().contains("contains a newline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_environment_rejects_non_utf8_paths_without_changing_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(b"/srv/codex-\xff".to_vec());
+        let error = scheduler_environment_value("CODEX_HOME", value).unwrap_err();
+        assert!(error.to_string().contains("contains non-UTF-8 bytes"));
     }
 
     #[test]
