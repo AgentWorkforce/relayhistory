@@ -61,7 +61,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::project_identity::ProjectKeyMethod;
 use crate::{
-    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -460,6 +461,21 @@ pub trait ShallowSessionProvider: Sync {
 
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
+    /// Which evidence kinds this source's local parser is *able* to produce.
+    ///
+    /// Declared, not measured: it is the ceiling on what a completed local
+    /// hydration can have indexed, and it is a property of the adapter rather
+    /// than of any one session or database — the same shape as
+    /// [`crate::relationship_capabilities`]. Hydration derives its reported
+    /// `capability` from it, so a prompt-only provider reports `partial`
+    /// instead of claiming `full` over evidence it never parses.
+    ///
+    /// The default is "nothing declared", which reports `partial`. A new
+    /// adapter therefore understates its coverage until someone writes the
+    /// list down, rather than silently overstating it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
     /// Where this adapter's evidence lives. Local file-backed adapters keep
     /// the default; remote connectors (see [`crate::remote`]) override it, and
     /// the engine records their presences and stamps under that location.
@@ -521,6 +537,30 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
         Box::new(OpencodeProvider::default()),
         Box::new(RelayProvider),
     ]
+}
+
+/// Declared local evidence coverage for one source, resolved from the shallow
+/// provider registry.
+///
+/// A pure table: it opens nothing, so it answers the same way for a source
+/// whose database is missing, and a source with no registered adapter (or one
+/// that has not declared its kinds) declares nothing.
+pub fn declared_evidence_kinds(source: &str) -> &'static [EvidenceKind] {
+    shallow_providers()
+        .iter()
+        .find(|provider| provider.source() == source)
+        .map_or(&[][..], |provider| provider.evidence_kinds())
+}
+
+/// The `FULL_SESSION_KINDS` a source's local parser does not produce, in the
+/// canonical order. Empty means the source's declared coverage is complete.
+pub fn missing_evidence_kinds(source: &str) -> Vec<EvidenceKind> {
+    let declared = declared_evidence_kinds(source);
+    FULL_SESSION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !declared.contains(kind))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +803,11 @@ impl ShallowSessionProvider for ClaudeProvider {
     fn source(&self) -> &'static str {
         "claude"
     }
+    /// The transcript parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -933,6 +978,11 @@ impl ShallowSessionProvider for CodexProvider {
     fn source(&self) -> &'static str {
         "codex"
     }
+    /// The rollout parser writes prompts, events, tool calls, file edits and
+    /// child-thread relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -1084,6 +1134,11 @@ impl ShallowSessionProvider for CursorProvider {
     fn source(&self) -> &'static str {
         "cursor"
     }
+    /// The local parser reads user prompts only. Cursor's store exposes no
+    /// assistant turns, tool calls, file edits or delegation to this reader.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
+    }
 
     fn enumerate(
         &self,
@@ -1176,6 +1231,11 @@ impl ShallowSessionProvider for GrokProvider {
     }
     fn source(&self) -> &'static str {
         "grok"
+    }
+    /// The local parser reads user prompts only; Grok's chat files expose no
+    /// tool calls, file edits or delegation to this reader.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
     }
 
     fn enumerate(
@@ -1443,6 +1503,11 @@ impl ShallowSessionProvider for OpencodeProvider {
     fn source(&self) -> &'static str {
         "opencode"
     }
+    /// The session-keyed query reads user text parts only; assistant turns,
+    /// tool calls and file edits in OpenCode's store are not read.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
+    }
 
     fn enumerate(
         &self,
@@ -1703,6 +1768,11 @@ struct RelayProvider;
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
+    }
+    /// Relay rows are enumerated out of already-ingested `history`; there is no
+    /// relay parser, and targeted hydration is unsupported for it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
     }
 
     fn enumerate(

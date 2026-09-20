@@ -345,6 +345,12 @@ export interface HydrateSessionResult {
   presence: string
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
+  /**
+   * Evidence kinds this hydration can have indexed, as wire names
+   * (`history`, `session_event`, `tool_call`, `file_edit`,
+   * `relationship`, `commit_link`).
+   */
+  coverage: Array<string>
   relatedSessionIds: Array<string>
   diagnostics: Array<HydrationDiagnostic>
 }
