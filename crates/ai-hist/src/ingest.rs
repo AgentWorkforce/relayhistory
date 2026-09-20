@@ -3529,12 +3529,12 @@ fn legacy_positional_message_ids(
 }
 
 /// Stored facts of one transcript record that a legacy positional row can be
-/// matched against: every event text the record produces, and every tool use
-/// id it carries. Each mirrors the ingestion mapping below so the comparison
-/// is exact for an unchanged record. `None` texts never match: a null-text
-/// match is too weak a signal to delete on.
+/// matched against: every event text the record produces (including the
+/// null texts ingestion still writes for empty tool results), and every
+/// tool use id it carries. Each mirrors the ingestion mapping below so the
+/// comparison is exact for an unchanged record.
 struct ClaudeRecordFacts {
-    texts: Vec<String>,
+    texts: Vec<Option<String>>,
     tool_use_ids: Vec<String>,
 }
 
@@ -3548,7 +3548,7 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
     };
     if let Some(text) = content.as_str() {
         if !text.trim().is_empty() {
-            facts.texts.push(text.to_string());
+            facts.texts.push(Some(text.to_string()));
         }
         return facts;
     }
@@ -3561,7 +3561,7 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
             "text" => {
                 let text = block.get("text").and_then(Value::as_str).unwrap_or("");
                 if !text.trim().is_empty() {
-                    facts.texts.push(text.to_string());
+                    facts.texts.push(Some(text.to_string()));
                 }
             }
             "thinking" => {
@@ -3570,27 +3570,27 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
                 if text.is_some_and(|s| !s.trim().is_empty()) {
-                    facts.texts.push(text.unwrap().to_string());
+                    facts.texts.push(Some(text.unwrap().to_string()));
                 }
             }
             "tool_use" => {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = block.get("input").unwrap_or(&Value::Null);
-                facts.texts.push(format_tool_event_text(
+                facts.texts.push(Some(format_tool_event_text(
                     name,
                     pick_tool_target(name, args).as_deref(),
                     args,
-                ));
+                )));
                 if let Some(id) = block.get("id").and_then(Value::as_str) {
                     facts.tool_use_ids.push(id.to_string());
                 }
             }
+            // An empty tool result still writes a null-text event, so the
+            // null is part of the record's identity for matching.
             "tool_result" => {
-                if let Some(text) =
-                    materialize_tool_result_text(block.get("content").unwrap_or(&Value::Null))
-                {
-                    facts.texts.push(text);
-                }
+                facts.texts.push(materialize_tool_result_text(
+                    block.get("content").unwrap_or(&Value::Null),
+                ));
             }
             _ => {}
         }
@@ -3665,7 +3665,7 @@ fn heal_legacy_positional_rows(
     let mut record_key: MessageContentKey = facts
         .texts
         .iter()
-        .map(|text| (Some(text.clone()), Some(ts_ms)))
+        .map(|text| (text.clone(), Some(ts_ms)))
         .collect();
     record_key.sort();
     let mut heal_messages: HashSet<String> = HashSet::new();
@@ -3690,6 +3690,10 @@ fn heal_legacy_positional_rows(
         )?;
     }
     if !facts.tool_use_ids.is_empty() {
+        // A tool use id is session-unique, so it identifies the record even
+        // when its event texts match nothing uniquely: heal the whole legacy
+        // message, siblings included — they belong to the same record by
+        // construction, and the current revision re-inserts them below.
         let id_placeholders = facts
             .tool_use_ids
             .iter()
@@ -3697,20 +3701,34 @@ fn heal_legacy_positional_rows(
             .collect::<Vec<_>>()
             .join(",");
         let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut tool_messages: HashSet<String> = HashSet::new();
         for table in ["tool_calls", "file_edits"] {
             let sql = format!(
-                "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
-                 AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
+                "SELECT DISTINCT message_id FROM {table} WHERE source = 'claude' \
+                 AND session_id = ? AND message_id IN ({msg_placeholders}) \
+                 AND tool_use_id IN ({id_placeholders})"
             );
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(
-                    [session_id.to_string()]
-                        .into_iter()
-                        .chain(legacy_ids.iter().cloned())
-                        .chain(facts.tool_use_ids.iter().cloned()),
-                ),
-            )?;
+            let mut statement = conn.prepare(&sql)?;
+            let mut rows = statement.query(rusqlite::params_from_iter(
+                [session_id.to_string()]
+                    .into_iter()
+                    .chain(legacy_ids.iter().cloned())
+                    .chain(facts.tool_use_ids.iter().cloned()),
+            ))?;
+            while let Some(row) = rows.next()? {
+                tool_messages.insert(row.get(0)?);
+            }
+        }
+        for message_id in &tool_messages {
+            for table in ["session_events", "tool_calls", "file_edits"] {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE source = 'claude' \
+                         AND session_id = ? AND message_id = ?"
+                    ),
+                    params![session_id, message_id],
+                )?;
+            }
         }
     }
     Ok(())
@@ -7442,6 +7460,7 @@ mod tests {
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"Read\",\"input\":{\"file_path\":\"/work/app/notes.txt\"}}]},\"timestamp\":\"2026-09-18T10:00:01Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"same words\"},\"timestamp\":\"2026-09-18T10:00:02Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"analysis\"},{\"type\":\"text\",\"text\":\"new answer\"}]},\"timestamp\":\"2026-09-18T10:00:03Z\"}\n",
+                "{\"sessionId\":\"parent\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"memo\"},{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_7\",\"content\":\"\"}]},\"timestamp\":\"2026-09-18T10:00:04Z\"}\n",
             ),
         )
         .unwrap();
@@ -7481,6 +7500,37 @@ mod tests {
         let partial_ts = ts("2026-09-18T10:00:03Z");
         legacy_event(&conn, "parent", "side:8", "analysis", partial_ts, 0);
         legacy_event(&conn, "parent", "side:8", "old answer", partial_ts, 1);
+        // The tool use text is shared with another message, so the event
+        // match stays ambiguous — but the tool use id names the record, and
+        // the whole legacy message heals, siblings included.
+        let tool_ts = ts("2026-09-18T10:00:01Z");
+        legacy_event(
+            &conn,
+            "parent",
+            "side:1",
+            "Read /work/app/notes.txt",
+            tool_ts,
+            0,
+        );
+        legacy_event(
+            &conn,
+            "parent",
+            "side:9",
+            "Read /work/app/notes.txt",
+            tool_ts,
+            0,
+        );
+        // An empty tool result writes a null-text event; the null is part
+        // of the record key, so the unchanged record still heals exactly.
+        let null_ts = ts("2026-09-18T10:00:04Z");
+        legacy_event(&conn, "parent", "side:10", "memo", null_ts, 0);
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'parent', 'side:10', ?1, 'tool_result', 'tool_result', NULL, 'side:10:1')",
+            [null_ts],
+        )
+        .unwrap();
         // Referenced tool call: healed by tool use id (unique per session).
         conn.execute(
             "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
@@ -7516,8 +7566,9 @@ mod tests {
                 ("side:7".to_string(), "delegated work".to_string()),
                 ("side:8".to_string(), "analysis".to_string()),
                 ("side:8".to_string(), "old answer".to_string()),
+                ("side:9".to_string(), "Read /work/app/notes.txt".to_string()),
             ],
-            "only the uniquely matched legacy event is healed"
+            "only uniquely matched legacy messages heal"
         );
         let calls: Vec<String> = conn
             .prepare(
@@ -7537,12 +7588,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(healed, 5);
+        assert_eq!(healed, 7);
         let positional_under_child: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'child' \
-                 AND (event_uid = 'side:0:0' OR event_uid LIKE 'side:1:%' \
-                      OR event_uid LIKE 'side:2:%' OR event_uid LIKE 'side:3:%')",
+                 AND (event_uid = 'side:0:0' OR event_uid LIKE 'side:1:%' OR event_uid LIKE 'side:2:%' \
+                      OR event_uid LIKE 'side:3:%' OR event_uid LIKE 'side:4:%')",
                 [],
                 |row| row.get(0),
             )
