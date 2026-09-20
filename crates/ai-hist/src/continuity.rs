@@ -2307,4 +2307,95 @@ mod tests {
             "the resolved uuid replaced the source fork rather than joining it"
         );
     }
+
+    #[test]
+    fn a_rewritten_origin_that_drops_a_record_leaves_the_row_indexed() {
+        // Characterizing, not asserting a desired outcome. Re-reading a Claude
+        // transcript upserts the records it now contains and removes nothing,
+        // so a record deleted from the file keeps its `session_events` row.
+        // This is the ingest replacement semantics on main, and it is what
+        // `session_holding_record` — and `getSessionEventsPage`, and the tool
+        // call and file edit pages, and the hydration evidence counts — all
+        // read afterwards.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, follower) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        ingest_file(&conn, &follower);
+        assert_eq!(edges(&conn, "origin").len(), 1);
+
+        // The origin is rewritten without its assistant record.
+        std::fs::write(
+            &origin,
+            concat!(
+                "{\"sessionId\":\"origin\",\"uuid\":\"origin-u\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"start\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &origin);
+
+        let still_indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source = 'claude' AND message_id = 'origin-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_indexed, 1,
+            "ingest replaces what a transcript contains and retracts nothing"
+        );
+        assert_eq!(
+            session_holding_record(&conn, "claude", "origin-a")
+                .unwrap()
+                .as_deref(),
+            Some("origin"),
+            "so the record still resolves, and the continuation is restored"
+        );
+        assert_eq!(edges(&conn, "origin").len(), 1);
+    }
+
+    #[test]
+    fn one_session_id_is_held_by_more_than_one_transcript() {
+        // The positive control for the test above: retracting "the rows of
+        // this session that this file no longer contains" is not a deletion
+        // anyone can scope by session. A forked conversation writes two files
+        // under one `sessionId`, and re-reading either one would delete every
+        // record the other contributed — the corpus this feature exists to
+        // read. A retraction needs a per-row owner, which `session_events`
+        // does not carry.
+        let (_dir, conn) = database();
+        ingest(&conn, "fork-branch-a.jsonl");
+        ingest(&conn, "fork-branch-b.jsonl");
+        let held = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT message_id FROM session_events \
+                 WHERE source = 'claude' AND session_id = ?1 AND message_id IS NOT NULL \
+                 ORDER BY message_id",
+            )
+            .unwrap()
+            .query_map([SHARED_FORK], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(
+            held(&conn),
+            vec![
+                "u-fork-a-1".to_string(),
+                "u-fork-a-asst".to_string(),
+                "u-fork-b-1".to_string(),
+                "u-fork-b-asst".to_string(),
+            ]
+        );
+
+        // Re-reading branch A changes nothing, precisely because ingest only
+        // upserts what the file contains.
+        ingest(&conn, "fork-branch-a.jsonl");
+        assert_eq!(held(&conn).len(), 4);
+        assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+    }
 }
