@@ -3237,7 +3237,18 @@ pub(crate) fn scan_claude_session_file_resumed(
                 fold: fold.clone(),
             });
         }
-        cursor::CommitOutcome::Superseded => superseded = true,
+        cursor::CommitOutcome::Superseded => {
+            superseded = true;
+            // Forget the position *and* the fold. Leaving the previous state
+            // in place looked harmless — the next pass would resume from it —
+            // but the bytes that moved are behind that position, so resuming
+            // would never re-read them. Worse, the record walk goes on to
+            // publish a cursor over the new bytes, and both skip paths consult
+            // that cursor: the transcript would be skipped from then on with
+            // the stale fold standing. `None` is the honest state, and it is
+            // what makes the next pass fold the file again from zero.
+            *state = None;
+        }
     }
     let validation_bytes = reader.validation_bytes();
     let bytes_read = reader

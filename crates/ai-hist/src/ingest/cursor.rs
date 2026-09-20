@@ -330,22 +330,27 @@ pub(crate) fn file_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u6
 /// answers, so it gets one, pinned at the file's end. That keeps one change
 /// detector for every file the ingest path reads instead of a cursor for some
 /// and a stamp map for the rest.
-pub(crate) fn whole_file_cursor(path: &Path) -> Result<TranscriptFileCursor> {
+pub(crate) fn whole_file_cursor(path: &Path) -> Result<(TranscriptFileCursor, u64)> {
     let mut file = fs::File::open(path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
     let (device, inode) = file_identity(&metadata);
-    Ok(TranscriptFileCursor {
-        offset: size,
-        device,
-        inode,
-        mtime_ns: super::metadata_mtime_ns(&metadata),
-        size,
-        // A whole-file stamp is about "have these bytes changed", not about
-        // waiting for a writer, so it carries no quiet-since observation.
-        unchanged_since_ms: 0,
-        prefix_hash: prefix_window_digest(&mut file, size)?,
-    })
+    let (prefix_hash, bytes_read) = prefix_window_digest_counted(&mut file, size)?;
+    Ok((
+        TranscriptFileCursor {
+            offset: size,
+            device,
+            inode,
+            mtime_ns: super::metadata_mtime_ns(&metadata),
+            size,
+            // A whole-file stamp is about "have these bytes changed", not
+            // about waiting for a writer, so it carries no quiet-since
+            // observation.
+            unchanged_since_ms: 0,
+            prefix_hash,
+        },
+        bytes_read,
+    ))
 }
 
 /// What validating a cursor's committed prefix decided, and what it cost.
@@ -447,7 +452,34 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     // seeks and at most 128 KiB, and only on the files that were about to be
     // skipped anyway. Shared with hydration's own skip path, which asks the
     // same question about the same cursor.
-    Ok(committed_prefix_matches(file, path).valid)
+    //
+    // Both positions in the document have to be current, not just the record
+    // walk's: a superseded metadata scan leaves a fold that has to be made
+    // again, and skipping on the record cursor alone would leave it stale for
+    // as long as nothing else about the file changed.
+    Ok(committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid)
+}
+
+/// Whether the metadata walk's own position is recorded and still describes
+/// the file.
+///
+/// A Claude transcript carries two positions in one cursor document — where
+/// the record walk got to, and where the metadata fold got to — and a skip
+/// path that consults only the first will happily skip a file whose *metadata*
+/// is stale. A scan that was superseded clears its position, so "no position"
+/// here means "this fold has to be made again" and not "this file is new".
+pub(crate) fn scan_position_current(cursor: &TranscriptCursorState, path: &Path) -> PrefixCheck {
+    let Some(claude) = cursor.claude.as_ref() else {
+        // Not a Claude transcript, so there is no second position to check.
+        return PrefixCheck {
+            valid: true,
+            bytes_read: 0,
+        };
+    };
+    let Some(file) = claude.scan.as_ref().and_then(|scan| scan.file.as_ref()) else {
+        return PrefixCheck::UNVALIDATED;
+    };
+    committed_prefix_matches(file, path)
 }
 
 /// Forget one locator-keyed cursor, so the next pass reads the file from zero.
@@ -479,16 +511,24 @@ pub(crate) fn locator_cursor_exists(conn: &Connection, source: &str, path: &Path
     )?)
 }
 
-/// Record a whole-file cursor for `path` under `source`.
-pub(crate) fn stamp_whole_file(conn: &Connection, source: &str, path: &Path) -> Result<()> {
+/// Record a whole-file cursor for `path` under `source`, and report the
+/// provider bytes hashing it read.
+///
+/// The count leaves by the front door because the caller has to put it in
+/// `bytesRead`: this was the one digest call whose bytes were spent and then
+/// dropped, while the skip path already charged the same window when it
+/// checked the cursor this writes.
+pub(crate) fn stamp_whole_file(conn: &Connection, source: &str, path: &Path) -> Result<u64> {
     let locator = path.to_string_lossy().to_string();
     let key = CursorKey::Locator {
         source,
         locator: &locator,
     };
     let mut cursor = load_cursor(conn, &key)?;
-    cursor.file = Some(whole_file_cursor(path)?);
-    store_cursor(conn, &key, &cursor)
+    let (file, bytes_read) = whole_file_cursor(path)?;
+    cursor.file = Some(file);
+    store_cursor(conn, &key, &cursor)?;
+    Ok(bytes_read)
 }
 
 /// How a record ended.

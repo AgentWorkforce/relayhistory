@@ -1371,6 +1371,19 @@ fn unchanged_cursor_check(
             bytes_read,
         });
     }
+    // The metadata fold keeps its own position in the same document, and it
+    // can be behind the record walk's — a scan superseded mid-walk clears it.
+    // Skipping on the record cursor alone left the session's identity fields
+    // standing at whatever the stale fold said, for as long as nothing else
+    // about the file changed.
+    let scan = crate::ingest::cursor::scan_position_current(&session, path);
+    bytes_read += scan.bytes_read as i64;
+    if !scan.valid {
+        return Ok(UnchangedCursorCheck {
+            valid: false,
+            bytes_read,
+        });
+    }
     // Every other file the stamp folds in — Claude sidecars, their metadata
     // documents, Codex child rollouts — is a transcript like any other and
     // carries the same hazard. Each has a locator-keyed cursor, and a file
@@ -1690,11 +1703,17 @@ pub(crate) fn ingest_claude_subagent(
     // transcript that grew must not drag the metadata through a re-read.
     let meta_path = claude_subagent_meta_path(&evidence.path);
     if meta_path.is_file() {
-        crate::ingest::cursor::stamp_whole_file(
+        // Hashing the document to stamp it is a provider read, and it belongs
+        // in the total like every other.
+        let stamped = crate::ingest::cursor::stamp_whole_file(
             conn,
             crate::ingest::CLAUDE_SUBAGENT_META_SOURCE,
             &meta_path,
-        )?;
+        )? as i64;
+        outcome.bytes_read += stamped;
+        // Hashing, not records: it belongs on the validation side of the
+        // split as well as in the total.
+        outcome.validation_bytes += stamped;
     } else {
         // The sidecar that described this child is gone. `record_relationship`
         // merges with COALESCE, so re-recording evidence that no longer
@@ -5098,6 +5117,226 @@ mod tests {
             appended.validation_bytes <= 8 * super::cursor::PREFIX_WINDOW_BYTES,
             "validation is a fixed handful of bounded digests: {} bytes",
             appended.validation_bytes
+        );
+    }
+
+    /// A metadata fold from bytes that moved under it does not get to stand
+    /// because the *record* walk published a cursor over the new bytes.
+    ///
+    /// A Claude transcript keeps two positions in one cursor document. When
+    /// the file was rewritten between the metadata scan's read and its
+    /// commit, the scan recorded nothing — correctly — but still returned the
+    /// fold from the old bytes, the session was updated from it, and the
+    /// record walk then published a perfectly good cursor over the new bytes.
+    /// Both skip paths consult that cursor, so the transcript was skipped from
+    /// then on and the stale `gitBranch` was never folded again.
+    ///
+    /// The rewrite here lands in the region this pass appended — *after* the
+    /// scan position the previous pass recorded — so the old position still
+    /// validates against the bytes behind it. That is the case only
+    /// invalidating a superseded scan can catch, and an earlier version of
+    /// this test rewrote the first record instead, where the position's own
+    /// window covers the change and the test passed without the invalidation.
+    #[test]
+    fn a_superseded_metadata_scan_is_read_again_rather_than_left_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-stale-metadata";
+        let first = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+             \"gitBranch\":\"old\",\"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"hello\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let appended = |branch: &str| {
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/work/app\",\
+                 \"gitBranch\":\"{branch}\",\"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\"again\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+            )
+        };
+        let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        // A clean pass first, so there *is* a recorded scan position for the
+        // stale one to be.
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+
+        let mid = appended("mid");
+        let new = appended("new");
+        assert_eq!(mid.len(), new.len());
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        write!(file, "{mid}").unwrap();
+        drop(file);
+        let stamped = fs::metadata(&transcript).unwrap().modified().unwrap();
+
+        // The rewrite keeps the size and restores the mtime, so the stamp this
+        // hydration records still matches the file afterwards — which is what
+        // makes the skip fire on the next pass and the staleness permanent.
+        let target = transcript.clone();
+        let bytes = format!("{first}{new}");
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = std::sync::Arc::clone(&fired);
+        super::cursor::set_before_commit_hook_for_test(Some(Box::new(move |committing| {
+            if committing != target || armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            fs::write(&target, &bytes).unwrap();
+            fs::File::open(&target)
+                .unwrap()
+                .set_modified(stamped)
+                .unwrap();
+        })));
+        let during =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        super::cursor::set_before_commit_hook_for_test(None);
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the rewrite must land between the metadata read and its commit"
+        );
+        assert!(diagnostic(&during, "HYDRATION_SOURCE_REWRITTEN").is_some());
+
+        // The next pass must read the transcript again rather than trust a
+        // scan position the superseded pass never replaced.
+        let after =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_ne!(
+            after.status, "unchanged",
+            "a transcript whose metadata scan was superseded is not unchanged"
+        );
+        let branch: Option<String> = {
+            let conn = open_db(&db).unwrap();
+            conn.query_row(
+                "SELECT git_branch FROM sessions WHERE source = 'claude' AND session_id = ?",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            branch.as_deref(),
+            Some("new"),
+            "the fold from the bytes that are actually there must reach the session"
+        );
+
+        // Positive control: with the scan position recorded again, the
+        // shortcut works as before — this is a superseded scan being re-read,
+        // not the skip path being switched off.
+        let quiet =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(quiet.status, "unchanged");
+    }
+
+    /// Hashing a sidecar's metadata document is a provider read like any
+    /// other, and the one digest caller that still threw its count away.
+    ///
+    /// `whole_file_cursor` hashes `agent-*.meta.json` to stamp it, and
+    /// `stamp_whole_file` runs on every ingest of a child that has one — while
+    /// the skip path already charges the same window when it checks that
+    /// cursor. The rule adopted last round is that the digest counts its own
+    /// bytes; this caller discarded them on the way out.
+    #[test]
+    fn a_sidecar_metadata_hash_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-meta-hash-bytes";
+        let transcript = seed_claude_transcript(
+            dir.path(),
+            session_id,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"parent\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let child = |name: &str| {
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"agentId\":\"{name}\",\"isSidechain\":true,\
+                 \"uuid\":\"s-{name}\",\"cwd\":\"/work/app\",\"type\":\"assistant\",\
+                 \"message\":{{\"role\":\"assistant\",\"content\":\"child\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+            )
+        };
+        // Two sidecars: one with a metadata document, one without. The pair is
+        // the measurement — the difference between them is the hash.
+        let described = transcript.parent().unwrap().join("agent-described.jsonl");
+        fs::write(&described, child("described").as_bytes()).unwrap();
+        let meta = described.with_extension("meta.json");
+        let meta_body = format!(
+            "{{\"agentId\":\"described\",\"agentType\":\"Plan\",\"model\":\"opus\",\
+             \"spawnDepth\":1,\"padding\":\"{}\"}}\n",
+            "p".repeat(4096)
+        );
+        fs::write(&meta, meta_body.as_bytes()).unwrap();
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        super::cursor::reset_validation_meter();
+        let described_run =
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        let metered = super::cursor::validation_meter() as i64;
+
+        // Every byte the digests hashed on this pass is in the reported total.
+        // The meter counts them where they are spent, so a caller that drops
+        // its count shows up here as a shortfall rather than as nothing.
+        assert!(
+            described_run.bytes_read >= metered,
+            "bytes_read {} is short of the {metered} bytes the pass hashed",
+            described_run.bytes_read
+        );
+        // The sidecar's metadata document is over a window's worth of bytes on
+        // its own, so its hash cannot hide inside rounding.
+        assert!(
+            meta_body.len() > 4096,
+            "the metadata document must be large enough to be visible"
+        );
+
+        // Positive control: a child with no metadata document at all. Its
+        // hydration hashes one digest fewer, and the difference is the
+        // sidecar hash rather than some constant the counter always adds.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare_transcript = seed_claude_transcript(
+            bare_dir.path(),
+            session_id,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"parent\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let bare = bare_transcript
+            .parent()
+            .unwrap()
+            .join("agent-described.jsonl");
+        fs::write(&bare, child("described").as_bytes()).unwrap();
+        let bare_db = bare_dir.path().join("history.db");
+        let conn = open_db(&bare_db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&bare_transcript));
+        drop(conn);
+        super::cursor::reset_validation_meter();
+        let bare_run =
+            hydrate_session_at_with_home(&bare_db, &options("claude", session_id), bare_dir.path())
+                .unwrap();
+        assert!(
+            bare_run.bytes_read >= super::cursor::validation_meter() as i64,
+            "the control must account for its own hashing too"
+        );
+        assert!(
+            described_run.bytes_read > bare_run.bytes_read,
+            "hydrating a child with a metadata document reads more than one \
+             without: {} vs {}",
+            described_run.bytes_read,
+            bare_run.bytes_read
         );
     }
 
