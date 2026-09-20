@@ -1289,6 +1289,15 @@ fn a_catalog_locator_from_the_other_layout_is_refused_not_read() {
 ///
 /// The two values are both real and neither supersedes the other: the answer
 /// is the later of them, and either one alone when the other is absent.
+///
+/// **Discovery runs alone here, with no `sync_local_at` first, and that is
+/// the whole point of the test.** The catalog upsert keeps
+/// `MAX(existing, incoming)`, and a full sync writes the correct value from
+/// the message timestamps — so a version of this test that synced first
+/// passed with the defect fully intact, because it was reading the number
+/// sync had already stored. Discovery without a preceding sync is exactly the
+/// cheap path the catalog exists for, and there the shallow value is the only
+/// one written.
 fn an_appended_turn_advances_catalog_recency_past_a_stale_session_json() {
     let root = temp_root("stale-updated");
     let home = root.join("home");
@@ -1310,7 +1319,6 @@ fn an_appended_turn_advances_catalog_recency_past_a_stale_session_json() {
 
     use_layout(&home, None, Some(&tree));
     let db_path = root.join("history.db");
-    sync_local_at(&db_path).unwrap();
     discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
 
     let (_, last_activity) = catalog_row(&db_path, "ses_stale");
@@ -1335,7 +1343,6 @@ fn an_appended_turn_advances_catalog_recency_past_a_stale_session_json() {
         &tree.join("part/msg_ahead_u1/prt_ahead_u1.json"),
         r#"{"id":"prt_ahead_u1","sessionID":"ses_ahead","messageID":"msg_ahead_u1","type":"text","text":"older than the session json"}"#,
     );
-    sync_local_at(&db_path).unwrap();
     discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
     assert_eq!(
         catalog_row(&db_path, "ses_ahead").1,
