@@ -3529,26 +3529,56 @@ fn legacy_positional_message_ids(
 }
 
 /// Stored facts of one transcript record that a legacy positional row can be
-/// matched against: every event text the record produces (including the
-/// null texts ingestion still writes for empty tool results), and every
-/// tool use id it carries. Each mirrors the ingestion mapping below so the
-/// comparison is exact for an unchanged record.
+/// matched against: every event the record produces, with the role, kind,
+/// model and token spend ingestion stores beside the text, plus every tool
+/// use id it carries. Each mirrors the ingestion mapping below so the
+/// comparison is exact for an unchanged record, including the null texts
+/// ingestion still writes for empty tool results. Verbatim envelope facts
+/// (`request_id` and friends) are deliberately excluded: pre-upgrade rows
+/// predate those columns, so requiring them would block every legacy heal.
 struct ClaudeRecordFacts {
-    texts: Vec<Option<String>>,
+    events: Vec<ClaudeFactEvent>,
     tool_use_ids: Vec<String>,
+    model: Option<String>,
+    token_json: Option<String>,
 }
 
-fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFacts {
+struct ClaudeFactEvent {
+    text: Option<String>,
+    role: String,
+    kind: String,
+}
+
+fn claude_record_facts(
+    message: Option<&Map<String, Value>>,
+    message_role: &str,
+    model: Option<&str>,
+    token_json: Option<&str>,
+) -> ClaudeRecordFacts {
     let mut facts = ClaudeRecordFacts {
-        texts: Vec::new(),
+        events: Vec::new(),
         tool_use_ids: Vec::new(),
+        model: model.map(str::to_string),
+        token_json: token_json.map(str::to_string),
+    };
+    let human_role = if message_role == "assistant" {
+        "assistant"
+    } else {
+        "user"
+    };
+    let mut push = |text: Option<String>, role: &str, kind: &str| {
+        facts.events.push(ClaudeFactEvent {
+            text,
+            role: role.to_string(),
+            kind: kind.to_string(),
+        });
     };
     let Some(content) = message.and_then(|m| m.get("content")) else {
         return facts;
     };
     if let Some(text) = content.as_str() {
         if !text.trim().is_empty() {
-            facts.texts.push(Some(text.to_string()));
+            push(Some(text.to_string()), human_role, "text");
         }
         return facts;
     }
@@ -3561,7 +3591,7 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
             "text" => {
                 let text = block.get("text").and_then(Value::as_str).unwrap_or("");
                 if !text.trim().is_empty() {
-                    facts.texts.push(Some(text.to_string()));
+                    push(Some(text.to_string()), human_role, "text");
                 }
             }
             "thinking" => {
@@ -3570,27 +3600,35 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
                 if text.is_some_and(|s| !s.trim().is_empty()) {
-                    facts.texts.push(Some(text.unwrap().to_string()));
+                    push(Some(text.unwrap().to_string()), "assistant", "thinking");
                 }
             }
             "tool_use" => {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = block.get("input").unwrap_or(&Value::Null);
-                facts.texts.push(Some(format_tool_event_text(
-                    name,
-                    pick_tool_target(name, args).as_deref(),
-                    args,
-                )));
+                push(
+                    Some(format_tool_event_text(
+                        name,
+                        pick_tool_target(name, args).as_deref(),
+                        args,
+                    )),
+                    "assistant",
+                    "tool_use",
+                );
                 if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    facts.tool_use_ids.push(id.to_string());
+                    if !name.is_empty() {
+                        facts.tool_use_ids.push(id.to_string());
+                    }
                 }
             }
             // An empty tool result still writes a null-text event, so the
             // null is part of the record's identity for matching.
             "tool_result" => {
-                facts.texts.push(materialize_tool_result_text(
-                    block.get("content").unwrap_or(&Value::Null),
-                ));
+                push(
+                    materialize_tool_result_text(block.get("content").unwrap_or(&Value::Null)),
+                    "tool_result",
+                    "tool_result",
+                );
             }
             _ => {}
         }
@@ -3600,13 +3638,16 @@ fn claude_record_facts(message: Option<&Map<String, Value>>) -> ClaudeRecordFact
 
 /// Heal one id-less record's pre-upgrade positional leftovers: candidates
 /// first (one indexed pass per table, the common empty case stays cheap),
-/// then the unique-or-preserved content match.
+/// then the unique-or-preserved full-record match.
 fn heal_legacy_positional_record(
     conn: &Connection,
     session_id: &str,
     stem: &str,
     ts_ms: i64,
     message: Option<&Map<String, Value>>,
+    message_role: &str,
+    model: Option<&str>,
+    token_json: Option<&str>,
 ) -> Result<()> {
     let legacy = legacy_positional_message_ids(conn, session_id, stem)?;
     if legacy.is_empty() {
@@ -3617,16 +3658,29 @@ fn heal_legacy_positional_record(
         session_id,
         &legacy,
         ts_ms,
-        &claude_record_facts(message),
+        &claude_record_facts(message, message_role, model, token_json),
     )
 }
 
+/// A legacy event's persisted identity for matching: every field ingestion
+/// stores beside the bytes. Verbatim envelope facts are excluded on purpose
+/// (see [`claude_record_facts`]): pre-upgrade rows predate those columns.
+type LegacyEventKey = (
+    Option<String>,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 /// Remove pre-upgrade positional leftovers that match one id-less record
 /// unambiguously: a legacy message heals only on an exact full-record match
-/// of its event (text, timestamp) multiset — and only when it is the single
-/// legacy message carrying that record — or when it carries one of the
-/// record's tool use ids (unique per session by schema). Anything ambiguous
-/// stays preserved under the retention contract.
+/// of its events — text, timestamp, role, kind, model and token spend — and
+/// only when it is the single legacy message carrying that record. Tool
+/// calls and file edits match per row by tool use id, which names its record
+/// (unique per session by schema) even when the event texts do not.
+/// Anything ambiguous stays preserved under the retention contract.
 fn heal_legacy_positional_rows(
     conn: &Connection,
     session_id: &str,
@@ -3634,12 +3688,12 @@ fn heal_legacy_positional_rows(
     ts_ms: i64,
     facts: &ClaudeRecordFacts,
 ) -> Result<()> {
-    if legacy_ids.is_empty() || (facts.texts.is_empty() && facts.tool_use_ids.is_empty()) {
+    if legacy_ids.is_empty() || (facts.events.is_empty() && facts.tool_use_ids.is_empty()) {
         return Ok(());
     }
     let placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT message_id, text, ts_ms FROM session_events \
+        "SELECT message_id, text, ts_ms, role, kind, model, token_json FROM session_events \
          WHERE source = 'claude' AND session_id = ? AND message_id IN ({placeholders})"
     );
     let mut statement = conn.prepare(&sql)?;
@@ -3652,20 +3706,34 @@ fn heal_legacy_positional_rows(
     // exact full-record match. Matching one shared block would erase the
     // message's changed siblings, which the content-hash model treats as a
     // distinct retained predecessor.
-    type MessageContentKey = Vec<(Option<String>, Option<i64>)>;
+    type MessageContentKey = Vec<LegacyEventKey>;
     let mut by_message: HashMap<String, MessageContentKey> = HashMap::new();
     while let Some(row) = rows.next()? {
         let message_id: String = row.get(0)?;
-        let text: Option<String> = row.get(1)?;
-        let ts: Option<i64> = row.get(2)?;
-        by_message.entry(message_id).or_default().push((text, ts));
+        by_message.entry(message_id).or_default().push((
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ));
     }
     drop(rows);
     drop(statement);
     let mut record_key: MessageContentKey = facts
-        .texts
+        .events
         .iter()
-        .map(|text| (text.clone(), Some(ts_ms)))
+        .map(|event| {
+            (
+                event.text.clone(),
+                Some(ts_ms),
+                event.role.clone(),
+                event.kind.clone(),
+                facts.model.clone(),
+                facts.token_json.clone(),
+            )
+        })
         .collect();
     record_key.sort();
     let mut heal_messages: HashSet<String> = HashSet::new();
@@ -3689,11 +3757,12 @@ fn heal_legacy_positional_rows(
             params![session_id, message_id],
         )?;
     }
+    // A tool use id names its own call and edit rows even when the record's
+    // event texts match nothing uniquely — but only those rows. Sibling
+    // events the rewritten record dropped or changed belong to a retained
+    // predecessor, so they stay unless the full-record match above heals
+    // their message.
     if !facts.tool_use_ids.is_empty() {
-        // A tool use id is session-unique, so it identifies the record even
-        // when its event texts match nothing uniquely: heal the whole legacy
-        // message, siblings included — they belong to the same record by
-        // construction, and the current revision re-inserts them below.
         let id_placeholders = facts
             .tool_use_ids
             .iter()
@@ -3701,34 +3770,20 @@ fn heal_legacy_positional_rows(
             .collect::<Vec<_>>()
             .join(",");
         let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut tool_messages: HashSet<String> = HashSet::new();
         for table in ["tool_calls", "file_edits"] {
             let sql = format!(
-                "SELECT DISTINCT message_id FROM {table} WHERE source = 'claude' \
-                 AND session_id = ? AND message_id IN ({msg_placeholders}) \
-                 AND tool_use_id IN ({id_placeholders})"
+                "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
+                 AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
             );
-            let mut statement = conn.prepare(&sql)?;
-            let mut rows = statement.query(rusqlite::params_from_iter(
-                [session_id.to_string()]
-                    .into_iter()
-                    .chain(legacy_ids.iter().cloned())
-                    .chain(facts.tool_use_ids.iter().cloned()),
-            ))?;
-            while let Some(row) = rows.next()? {
-                tool_messages.insert(row.get(0)?);
-            }
-        }
-        for message_id in &tool_messages {
-            for table in ["session_events", "tool_calls", "file_edits"] {
-                conn.execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE source = 'claude' \
-                         AND session_id = ? AND message_id = ?"
-                    ),
-                    params![session_id, message_id],
-                )?;
-            }
+            conn.execute(
+                &sql,
+                rusqlite::params_from_iter(
+                    [session_id.to_string()]
+                        .into_iter()
+                        .chain(legacy_ids.iter().cloned())
+                        .chain(facts.tool_use_ids.iter().cloned()),
+                ),
+            )?;
         }
     }
     Ok(())
@@ -3809,35 +3864,12 @@ fn ingest_claude_transcript_as(
                 .and_then(|m| m.get("id"))
                 .and_then(Value::as_str)
                 .is_none();
-        // ts_ms is needed by the legacy heal below; it only reads the record.
+        // ts_ms, role, model and token spend feed the legacy heal below;
+        // they only read the record.
         let ts_ms = obj
             .get("timestamp")
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
             .unwrap_or(0);
-        // Heal what an earlier parser version wrote for this record: it
-        // attributed every sidechain row to the parent, and stored the rows
-        // this guard now skips. Re-reading the file removes the stale rows
-        // under the identity they were written with, so a re-parse moves them
-        // onto the child instead of duplicating them across both.
-        // Pre-upgrade positional leftovers match by stored content, unique or
-        // preserved: the live index cannot identify them after a rewrite.
-        if session_id != record_session_id {
-            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
-            if id_less {
-                heal_legacy_positional_record(conn, record_session_id, stem, ts_ms, message)?;
-            }
-        }
-        if skipped_sidechain {
-            delete_claude_record_rows(conn, session_id, message_uuid)?;
-            if id_less {
-                heal_legacy_positional_record(conn, session_id, stem, ts_ms, message)?;
-            }
-            continue;
-        }
-        let cwd = obj.get("cwd").and_then(Value::as_str);
-        let project = cwd;
-        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
-        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
         let message_role = message
             .and_then(|m| m.get("role"))
             .and_then(Value::as_str)
@@ -3847,6 +3879,49 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        // Heal what an earlier parser version wrote for this record: it
+        // attributed every sidechain row to the parent, and stored the rows
+        // this guard now skips. Re-reading the file removes the stale rows
+        // under the identity they were written with, so a re-parse moves them
+        // onto the child instead of duplicating them across both.
+        // Pre-upgrade positional leftovers match by full stored record,
+        // unique or preserved: the live index cannot identify them after a
+        // rewrite.
+        if session_id != record_session_id {
+            delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+            if id_less {
+                heal_legacy_positional_record(
+                    conn,
+                    record_session_id,
+                    stem,
+                    ts_ms,
+                    message,
+                    message_role,
+                    model,
+                    token_json.as_deref(),
+                )?;
+            }
+        }
+        if skipped_sidechain {
+            delete_claude_record_rows(conn, session_id, message_uuid)?;
+            if id_less {
+                heal_legacy_positional_record(
+                    conn,
+                    session_id,
+                    stem,
+                    ts_ms,
+                    message,
+                    message_role,
+                    model,
+                    token_json.as_deref(),
+                )?;
+            }
+            continue;
+        }
+        let cwd = obj.get("cwd").and_then(Value::as_str);
+        let project = cwd;
+        let git_branch = obj.get("gitBranch").and_then(Value::as_str);
+        let parent_id = obj.get("parentUuid").and_then(Value::as_str);
         let is_meta = obj.get("isMeta").and_then(Value::as_bool);
         // Verbatim envelope facts. `stop_reason` is deliberately not mapped to
         // an enum: a JSON null means the turn is still in flight, and that is
@@ -7456,7 +7531,7 @@ mod tests {
         fs::write(
             &transcript,
             concat!(
-                "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"delegated work\"},\"timestamp\":\"2026-09-18T10:00:00Z\"}\n",
+                "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"opus\",\"content\":\"delegated work\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5}},\"timestamp\":\"2026-09-18T10:00:00Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"Read\",\"input\":{\"file_path\":\"/work/app/notes.txt\"}}]},\"timestamp\":\"2026-09-18T10:00:01Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"same words\"},\"timestamp\":\"2026-09-18T10:00:02Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"analysis\"},{\"type\":\"text\",\"text\":\"new answer\"}]},\"timestamp\":\"2026-09-18T10:00:03Z\"}\n",
@@ -7467,7 +7542,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let ts = |iso: &str| super::parse_iso_ms(iso).unwrap();
-        // Unique content match: healed.
+        let token_json =
+            serde_json::to_string(&serde_json::json!({"input_tokens": 3, "output_tokens": 5}))
+                .unwrap();
+        // Unique full-record match, model and token spend included: healed.
         legacy_event(
             &conn,
             "parent",
@@ -7475,9 +7553,52 @@ mod tests {
             "delegated work",
             ts("2026-09-18T10:00:00Z"),
             0,
+            "assistant",
+            "text",
+            Some("opus"),
+            Some(&token_json),
         );
-        // Same text, different timestamp: not the same record, preserved.
-        legacy_event(&conn, "parent", "side:7", "delegated work", 1, 0);
+        // Same text, timestamp, role and kind, different model: a changed
+        // record whose predecessor stays retained.
+        legacy_event(
+            &conn,
+            "parent",
+            "side:12",
+            "delegated work",
+            ts("2026-09-18T10:00:00Z"),
+            0,
+            "assistant",
+            "text",
+            Some("opus-old"),
+            Some(&token_json),
+        );
+        // Same text and timestamp, different role: a changed record whose
+        // predecessor stays retained.
+        legacy_event(
+            &conn,
+            "parent",
+            "side:7",
+            "delegated work",
+            ts("2026-09-18T10:00:00Z"),
+            0,
+            "user",
+            "text",
+            None,
+            None,
+        );
+        // Same text and role, different timestamp: not the same record.
+        legacy_event(
+            &conn,
+            "parent",
+            "side:4",
+            "delegated work",
+            1,
+            0,
+            "assistant",
+            "text",
+            None,
+            None,
+        );
         // Twice-stored duplicate: ambiguous, both preserved.
         legacy_event(
             &conn,
@@ -7486,6 +7607,10 @@ mod tests {
             "same words",
             ts("2026-09-18T10:00:02Z"),
             0,
+            "user",
+            "text",
+            None,
+            None,
         );
         legacy_event(
             &conn,
@@ -7494,15 +7619,41 @@ mod tests {
             "same words",
             ts("2026-09-18T10:00:02Z"),
             0,
+            "user",
+            "text",
+            None,
+            None,
         );
         // One shared block with a changed sibling: the record is a new
         // identity whose predecessor stays retained, so both stay.
         let partial_ts = ts("2026-09-18T10:00:03Z");
-        legacy_event(&conn, "parent", "side:8", "analysis", partial_ts, 0);
-        legacy_event(&conn, "parent", "side:8", "old answer", partial_ts, 1);
+        legacy_event(
+            &conn,
+            "parent",
+            "side:8",
+            "analysis",
+            partial_ts,
+            0,
+            "assistant",
+            "text",
+            None,
+            None,
+        );
+        legacy_event(
+            &conn,
+            "parent",
+            "side:8",
+            "old answer",
+            partial_ts,
+            1,
+            "assistant",
+            "text",
+            None,
+            None,
+        );
         // The tool use text is shared with another message, so the event
-        // match stays ambiguous — but the tool use id names the record, and
-        // the whole legacy message heals, siblings included.
+        // match stays ambiguous and the event is preserved — but the tool
+        // use id names its own call row, which heals.
         let tool_ts = ts("2026-09-18T10:00:01Z");
         legacy_event(
             &conn,
@@ -7511,6 +7662,10 @@ mod tests {
             "Read /work/app/notes.txt",
             tool_ts,
             0,
+            "assistant",
+            "tool_use",
+            None,
+            None,
         );
         legacy_event(
             &conn,
@@ -7519,11 +7674,17 @@ mod tests {
             "Read /work/app/notes.txt",
             tool_ts,
             0,
+            "assistant",
+            "tool_use",
+            None,
+            None,
         );
         // An empty tool result writes a null-text event; the null is part
         // of the record key, so the unchanged record still heals exactly.
         let null_ts = ts("2026-09-18T10:00:04Z");
-        legacy_event(&conn, "parent", "side:10", "memo", null_ts, 0);
+        legacy_event(
+            &conn, "parent", "side:10", "memo", null_ts, 0, "user", "text", None, None,
+        );
         conn.execute(
             "INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
@@ -7561,6 +7722,9 @@ mod tests {
         assert_eq!(
             remaining,
             [
+                ("side:1".to_string(), "Read /work/app/notes.txt".to_string()),
+                ("side:12".to_string(), "delegated work".to_string()),
+                ("side:4".to_string(), "delegated work".to_string()),
                 ("side:5".to_string(), "same words".to_string()),
                 ("side:6".to_string(), "same words".to_string()),
                 ("side:7".to_string(), "delegated work".to_string()),
@@ -7601,6 +7765,30 @@ mod tests {
         assert_eq!(positional_under_child, 0);
     }
 
+    #[test]
+    fn byte_identical_id_less_records_share_one_content_identity() {
+        // Two provider records with identical bytes and no identity collapse
+        // onto one event by design: an ordinal would be positional identity
+        // by another name, and a dropped prefix would shift every survivor
+        // onto an earlier row's identity. Documented in architecture.md.
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("dupes.jsonl");
+        let line = "{\"sessionId\":\"dupes\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"same\"},\"timestamp\":\"2026-09-18T10:00:00Z\"}\n";
+        fs::write(&transcript, format!("{line}{line}")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'dupes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
     fn legacy_event(
         conn: &Connection,
         session_id: &str,
@@ -7608,12 +7796,26 @@ mod tests {
         text: &str,
         ts_ms: i64,
         block: i64,
+        role: &str,
+        kind: &str,
+        model: Option<&str>,
+        token_json: Option<&str>,
     ) {
         conn.execute(
             "INSERT INTO session_events \
-             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('claude', ?1, ?2, ?3, 'assistant', 'text', ?4, ?2 || ':' || ?5)",
-            rusqlite::params![session_id, message_id, ts_ms, text, block],
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, token_json) \
+             VALUES ('claude', ?1, ?2, ?3, ?6, ?7, ?4, ?2 || ':' || ?5, ?8, ?9)",
+            rusqlite::params![
+                session_id,
+                message_id,
+                ts_ms,
+                text,
+                block,
+                role,
+                kind,
+                model,
+                token_json
+            ],
         )
         .unwrap();
     }
