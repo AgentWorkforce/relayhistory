@@ -551,7 +551,7 @@ fn prepare_and_claim(conn: &Connection, job_id: &str, lease_ms: i64) -> ClaimedB
     for _ in 0..100 {
         let now = system_clock();
         if prepare_batch(conn, job_id, now).unwrap().batch_id.is_some() {
-            return claim_batch(conn, job_id, "worker", lease_ms, now)
+            return claim_batch(conn, job_id, "worker", lease_ms, &|| now)
                 .unwrap()
                 .expect("a prepared batch is claimable");
         }
@@ -660,13 +660,9 @@ fn an_expired_but_unclaimed_lease_can_still_record_its_own_outcome() {
     // at most 400 ms of jitter, well inside the 10 s horizon below, and the
     // batch is `retry_wait` under an `active` job, which is what `claim_batch`
     // requires.
-    let stolen = claim_batch(
-        &fixture.conn,
-        &job.job_id,
-        "other",
-        30,
-        system_clock() + 10_000,
-    )
+    let stolen = claim_batch(&fixture.conn, &job.job_id, "other", 30, &|| {
+        system_clock() + 10_000
+    })
     .unwrap()
     .expect("a retry_wait batch is claimable once its backoff has passed");
     assert_ne!(
@@ -733,7 +729,7 @@ fn an_expired_lease_cannot_gate_a_dispatch_it_may_no_longer_own() {
     );
 
     // The very gap the gate exists for: another worker can take it now …
-    let stolen = claim_batch(&fixture.conn, &job.job_id, "other", 30_000, expired)
+    let stolen = claim_batch(&fixture.conn, &job.job_id, "other", 30_000, &|| expired)
         .unwrap()
         .expect("an expired batch is claimable by another worker");
     assert_ne!(stolen.lease.fence, claim.lease.fence);
@@ -951,6 +947,84 @@ fn a_partial_acknowledgment_after_a_lock_wait_is_scheduled_from_after_it() {
         next_attempt_ms >= earliest,
         "retry scheduled from before the lock wait: next {next_attempt_ms} < {earliest}"
     );
+}
+
+/// A claim's deadline is computed from the clock, and the clock used to be
+/// read before the write lock was asked for. A claim that waited longer than
+/// its lease then committed a deadline already in the past and reported
+/// success: the pre-transport checks refused the lease and another worker
+/// reclaimed the batch at once. The deadline is now dated from inside the
+/// lock, so a lease means what it says whatever the claim waited.
+#[test]
+fn a_claim_blocked_past_its_lease_is_dated_from_after_the_wait() {
+    let fixture = fixture();
+    let job = create_job(&fixture.conn, &config("one"), 0).unwrap();
+    let lease_ms = 100;
+    let hold = Duration::from_millis(lease_ms as u64 * 10);
+    for _ in 0..100 {
+        if prepare_batch(&fixture.conn, &job.job_id, system_clock())
+            .unwrap()
+            .batch_id
+            .is_some()
+        {
+            break;
+        }
+    }
+
+    // Sampled before the lock is even taken, so the hold is entirely after it.
+    let before = system_clock();
+    let path = fixture.path();
+    let (locked, lock_taken) = std::sync::mpsc::channel();
+    let holding = std::thread::spawn(move || {
+        let blocker = open_db(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(hold);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+    lock_taken.recv().unwrap();
+
+    let claimer = open_db(&fixture.path()).unwrap();
+    let claim = claim_batch(&claimer, &job.job_id, "worker", lease_ms, &system_clock)
+        .unwrap()
+        .expect("a prepared batch is claimable");
+    holding.join().unwrap();
+    let earliest = before + hold.as_millis() as i64 + lease_ms;
+    assert!(
+        claim.lease.expires_at_ms >= earliest,
+        "lease dated from before the lock wait: expires {} < {earliest}",
+        claim.lease.expires_at_ms
+    );
+    // And it is a lease the worker can actually use: live, not already lapsed.
+    validate_dispatch(&claimer, &claim.lease, &system_clock)
+        .map(|_| ())
+        .or_else(|error| {
+            // A payload has not been persisted yet; only an expiry refusal is
+            // a failure of this test.
+            if error.to_string().contains("expired") {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a lease dated inside the lock is live when it is handed back");
+
+    // Positive control: the deadline is the given clock plus the lease and
+    // nothing else, so the assertion above cannot be met by padding.
+    let other = create_job(&fixture.conn, &config("two"), 0).unwrap();
+    for _ in 0..100 {
+        if prepare_batch(&fixture.conn, &other.job_id, 5_000)
+            .unwrap()
+            .batch_id
+            .is_some()
+        {
+            break;
+        }
+    }
+    let claim = claim_batch(&fixture.conn, &other.job_id, "worker", lease_ms, &|| 5_000)
+        .unwrap()
+        .expect("a prepared batch is claimable");
+    assert_eq!(claim.lease.expires_at_ms, 5_000 + lease_ms);
 }
 
 #[test]
