@@ -1682,8 +1682,22 @@ fn enumerate_opencode_json_tree(scan: &ScanEnv<'_>, root: &Path) -> Result<Vec<C
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default()
     );
+    let listing = crate::ingest::opencode::list_json_tree_session_files(root);
     let mut rows = Vec::new();
-    for path in crate::ingest::opencode::list_json_tree_session_files(root) {
+    // A directory the walk could not list is emitted as a candidate of its
+    // own. `read_shallow` reaches the same failure and the engine reports it
+    // against that path -- which is the difference between "there are no
+    // sessions under here" and "we could not look".
+    for dir in &listing.unreadable {
+        rows.push((
+            String::new(),
+            dir.path.clone(),
+            session_file_mtime_ns(&dir.path),
+            None,
+            unreadable.clone(),
+        ));
+    }
+    for path in listing.sessions {
         let Some(session_id) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1728,7 +1742,10 @@ fn enumerate_opencode_json_tree(scan: &ScanEnv<'_>, root: &Path) -> Result<Vec<C
         .map(|(session_id, path, _, recency_hint_ms, stamp)| Candidate {
             source: "opencode",
             locator: path.to_string_lossy().into_owned(),
-            session_id: Some(session_id),
+            // Empty for an unlistable directory: it names no session, and
+            // claiming one would have the engine reject the read as a mismatched
+            // identity instead of reporting what actually went wrong.
+            session_id: Some(session_id).filter(|id| !id.is_empty()),
             recency_hint_ms,
             stamp,
         })
@@ -1753,6 +1770,15 @@ fn read_shallow_opencode_json_tree(
 ) -> Result<Option<ShallowSession>> {
     let path = Path::new(&candidate.locator);
     scan.note_open();
+    if path.is_dir() {
+        // Enumeration hands the directory it could not walk straight through
+        // to here, so the failure is reported against that path.
+        fs::read_dir(path)
+            .with_context(|| format!("listing OpenCode session directory {}", path.display()))?;
+        // It lists now, so the outage was transient. It is still not a session,
+        // and the next run walks what is under it.
+        return Ok(None);
+    }
     let Some(loaded) = crate::ingest::opencode::load_from_json_tree(path)? else {
         return Ok(None);
     };

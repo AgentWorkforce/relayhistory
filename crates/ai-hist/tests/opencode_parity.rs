@@ -299,6 +299,8 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_removed_tool_output_stops_being_served();
     a_directory_named_by_opencode_db_is_read_as_the_legacy_tree();
     a_limit_is_not_spent_on_a_file_that_is_not_a_session();
+    a_scope_that_cannot_be_walked_is_reported_not_omitted();
+    a_failed_session_query_does_not_checkpoint_an_empty_session();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -2294,4 +2296,166 @@ fn tool_call_ids(db_path: &Path, session_id: &str) -> Vec<String> {
         .unwrap()
         .collect::<rusqlite::Result<Vec<String>>>()
         .unwrap()
+}
+
+/// Put a directory under `session/` whose path is too long to list.
+///
+/// `read_dir` on it fails with `ENAMETOOLONG` for any uid, which is what this
+/// needs: `chmod 000` does nothing here (the suite runs as root and keeps
+/// `CAP_DAC_READ_SEARCH`), and a symlink is not recursed into at all because
+/// `DirEntry::file_type` does not follow one. The chain is built under a short
+/// path — every `mkdir` along it succeeds — and then moved under a padded one,
+/// which renames the whole subtree in a single call without revalidating the
+/// length of anything inside it.
+///
+/// Returns the deepest directory that now exists and cannot be listed.
+fn make_unwalkable_scope(session_dir: &Path) -> PathBuf {
+    const LEVELS: usize = 15;
+    const WIDTH: usize = 250;
+
+    let staging = std::env::temp_dir().join(format!("ocw{}", std::process::id()));
+    fs::remove_dir_all(&staging).ok();
+    fs::create_dir_all(&staging).unwrap();
+    let mut deep = staging.clone();
+    for level in 0..LEVELS {
+        deep = deep.join(
+            std::char::from_u32('a' as u32 + level as u32)
+                .unwrap()
+                .to_string()
+                .repeat(WIDTH),
+        );
+        fs::create_dir(&deep).unwrap();
+    }
+    assert!(
+        fs::read_dir(&deep).is_ok(),
+        "the chain must be listable where it was built, or it proves nothing"
+    );
+
+    let mut pad = session_dir.join("pad");
+    for _ in 0..3 {
+        pad = pad.join("p".repeat(WIDTH));
+    }
+    fs::create_dir_all(&pad).unwrap();
+    let moved = pad.join("deep");
+    fs::rename(&staging, &moved).unwrap();
+
+    let unwalkable = deep
+        .strip_prefix(&staging)
+        .map(|rest| moved.join(rest))
+        .unwrap();
+    assert!(
+        unwalkable.as_os_str().len() > 4096,
+        "the path must exceed PATH_MAX, got {}",
+        unwalkable.as_os_str().len()
+    );
+    let error = fs::read_dir(&unwalkable)
+        .err()
+        .expect("the fixture must actually fail to list or this test proves nothing");
+    assert_eq!(error.raw_os_error(), Some(36), "expected ENAMETOOLONG");
+    unwalkable
+}
+
+/// A scope directory that cannot be walked is not a scope with no sessions in
+/// it. The walk dropped the listing error and handed its caller a
+/// complete-looking list, so every session under that scope was absent from
+/// sync and from discovery with nothing saying why — the same shape as the
+/// read failures fixed in the pushes before this, one level up.
+#[cfg(unix)]
+fn a_scope_that_cannot_be_walked_is_reported_not_omitted() {
+    let root = temp_root("unwalkable-scope");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    let unwalkable = make_unwalkable_scope(&tree.join("session"));
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    // The healthy session beside it is still indexed, and the failure is still
+    // reported rather than swallowed.
+    sync_local_at(&db_path).unwrap();
+    assert!(
+        !session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+            .unwrap()
+            .is_empty(),
+        "a scope that cannot be walked must not cost the sessions that can"
+    );
+
+    let (_, summary) = discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        catalog_stamp(&db_path, "ses_simple").is_some(),
+        "the healthy session must still be cataloged"
+    );
+    assert!(
+        summary.diagnostics.iter().any(|entry| entry
+            .locator
+            .as_deref()
+            .is_some_and(|locator| unwalkable.to_string_lossy().starts_with(locator))),
+        "the directory that could not be walked must be reported: {:?}",
+        summary
+            .diagnostics
+            .iter()
+            .map(|entry| entry.locator.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Removing the unwalkable subtree leaves a clean tree and a clean run.
+    fs::remove_dir_all(tree.join("session/pad")).ok();
+    let (_, summary) = discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        summary.diagnostics.is_empty(),
+        "and a tree with nothing wrong with it must report nothing: {:?}",
+        summary.diagnostics
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `query_row(..).ok()` turned every SQLite failure into "this session is not
+/// in the store". Hydration then indexed nothing, called that the session's
+/// current state, and wrote the checkpoint — so the retry the failure called
+/// for never happened, and the empty session stayed empty.
+fn a_failed_session_query_does_not_checkpoint_an_empty_session() {
+    let root = temp_root("failed-query");
+    let home = root.join("home");
+    let store = home.join(".local/share/opencode/opencode.db");
+    build_sqlite_store(&store);
+    {
+        // A provider value this row mapping cannot take. SQLite columns are
+        // dynamically typed, so the store holds it happily.
+        let db = Connection::open(&store).unwrap();
+        db.execute(
+            "UPDATE session SET parent_id = x'ff' WHERE id = 'ses_sqlite_child'",
+            [],
+        )
+        .unwrap();
+    }
+    use_layout(&home, Some(&store), None);
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).ok();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).ok();
+    clear_opencode_evidence(&db_path);
+
+    let error = hydrate_result(&db_path, "ses_sqlite_child")
+        .expect_err("a failed query must fail the hydration, not empty the session");
+    assert!(
+        error.contains("ses_sqlite_child"),
+        "the error must name the session that failed, got {error}"
+    );
+    assert_eq!(
+        checkpoint_stamp(&db_path, "ses_sqlite_child"),
+        None,
+        "and nothing may be checkpointed as this session's current state"
+    );
+
+    // Positive control: the sibling session in the same store is untouched by
+    // any of it, so this is one session's failure and not the store's.
+    let hydrated = hydrate(&db_path, "ses_sqlite_root");
+    assert!(
+        hydrated.evidence.events > 0,
+        "the healthy session must still hydrate, got {:?}",
+        hydrated.evidence
+    );
+
+    fs::remove_dir_all(&root).ok();
 }

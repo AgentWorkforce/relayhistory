@@ -169,7 +169,15 @@ pub(crate) fn load_from_sqlite(
                 updated_ms: row.get::<_, Option<i64>>(4)?,
             })
         })
-        .ok();
+        // `optional()`, not `.ok()`. A failed query is not an absent session:
+        // a lock held past the busy timeout, a provider value of a type this
+        // row mapping cannot take, a corrupted page — every one of them became
+        // `None` here, which the callers read as "this session is not in the
+        // store". Hydration then commits its checkpoint over zero events and
+        // stamps that as the current state of a session that is really still
+        // there, so the retry the failure called for never happens.
+        .optional()
+        .with_context(|| format!("reading OpenCode session {session_id}"))?;
     let Some(mut info) = info else {
         return Ok(None);
     };
@@ -494,30 +502,75 @@ fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
 // ---------------------------------------------------------------------------
 
 /// Every session file under the tree, sorted, so enumeration is deterministic.
-pub(crate) fn list_json_tree_session_files(storage_root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_session_files(&storage_root.join("session"), &mut out);
-    out.sort();
-    out
+pub(crate) fn list_json_tree_session_files(storage_root: &Path) -> OpencodeTreeListing {
+    let mut listing = OpencodeTreeListing::default();
+    collect_session_files(&storage_root.join("session"), &mut listing);
+    listing.sessions.sort();
+    listing.unreadable.sort_by(|a, b| a.path.cmp(&b.path));
+    listing
 }
 
-fn collect_session_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+/// What a walk of the legacy tree found, and what it could not look at.
+///
+/// The two are returned together on purpose. Propagating the first listing
+/// error would take every session in the tree down with one unreadable scope
+/// directory, which is the failure the previous round fixed; dropping it — as
+/// this did — hands the caller a complete-looking list with a whole subtree
+/// missing from it, and nothing says so. Sessions *and* the paths that could
+/// not be walked, so a caller can index what it has and still report what it
+/// could not see.
+#[derive(Debug, Default)]
+pub(crate) struct OpencodeTreeListing {
+    pub sessions: Vec<PathBuf>,
+    pub unreadable: Vec<OpencodeUnreadableDir>,
+}
+
+/// A directory under `session/` that exists and could not be walked.
+#[derive(Debug)]
+pub(crate) struct OpencodeUnreadableDir {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+fn collect_session_files(dir: &Path, listing: &mut OpencodeTreeListing) {
+    let note = |path: &Path, error: std::io::Error, listing: &mut OpencodeTreeListing| {
+        listing.unreadable.push(OpencodeUnreadableDir {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        });
     };
-    for entry in entries.flatten() {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A directory that is not there holds nothing, which is ordinary: the
+        // tree may have no `session/` at all, and a scope can be removed while
+        // the walk is in it.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => return note(dir, error, listing),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                note(dir, error, listing);
+                continue;
+            }
+        };
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                note(&path, error, listing);
+                continue;
+            }
         };
         if kind.is_dir() {
-            collect_session_files(&path, out);
+            collect_session_files(&path, listing);
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("ses_") && name.ends_with(".json"))
         {
-            out.push(path);
+            listing.sessions.push(path);
         }
     }
 }
@@ -1899,6 +1952,88 @@ mod tests {
             "a settled file must be stat-only: {once_settled} bytes for a \
              {size}-byte part"
         );
+    }
+
+    #[test]
+    fn a_failed_session_query_is_an_error_not_a_session_that_is_not_there() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id, directory TEXT,
+                                   time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT,
+                                   time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                                time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, time_created, time_updated) \
+             VALUES ('ses_ok', NULL, '/tmp/p', 1, 2)",
+            [],
+        )
+        .unwrap();
+        // SQLite columns are dynamically typed, so a provider can put a value
+        // in `parent_id` that this row mapping cannot take. That is a query
+        // failure, not a missing session.
+        conn.execute(
+            "INSERT INTO session (id, parent_id, directory, time_created, time_updated) \
+             VALUES ('ses_bad', x'ff', '/tmp/p', 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        // Control: a session that is genuinely absent is still `None`, and a
+        // well-formed one still loads — or "it errored" would mean nothing.
+        assert!(load_from_sqlite(&conn, "ses_missing").unwrap().is_none());
+        assert!(load_from_sqlite(&conn, "ses_ok").unwrap().is_some());
+
+        let error = format!(
+            "{:#}",
+            load_from_sqlite(&conn, "ses_bad")
+                .expect_err("a failed query must not read as 'this session is not in the store'")
+        );
+        assert!(
+            error.contains("ses_bad"),
+            "the error must name the session that failed, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_session_directory_that_cannot_be_listed_is_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("storage");
+        fs::create_dir_all(root.join("session/global")).unwrap();
+        fs::write(
+            root.join("session/global/ses_here.json"),
+            r#"{"id":"ses_here"}"#,
+        )
+        .unwrap();
+
+        // Control: a tree that lists cleanly reports no failures, and a
+        // `session/` that is simply not there is empty rather than broken.
+        let listing = list_json_tree_session_files(&root);
+        assert_eq!(listing.sessions.len(), 1);
+        assert!(listing.unreadable.is_empty());
+        let absent = list_json_tree_session_files(&dir.path().join("no-such-storage"));
+        assert!(absent.sessions.is_empty() && absent.unreadable.is_empty());
+
+        // A `session` path that is not a directory: `read_dir` fails with
+        // `ENOTDIR` for any uid. (`chmod 000` does not, because this suite
+        // runs as root and keeps `CAP_DAC_READ_SEARCH`.)
+        let other = dir.path().join("flat");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("session"), "not a directory").unwrap();
+        let listing = list_json_tree_session_files(&other);
+        assert!(
+            listing.sessions.is_empty(),
+            "nothing is found, which is the whole difficulty"
+        );
+        assert_eq!(
+            listing.unreadable.len(),
+            1,
+            "and the path that could not be walked must be reported, not dropped"
+        );
+        assert_eq!(listing.unreadable[0].path, other.join("session"));
     }
 
     fn part(raw: &str) -> OpencodePart {

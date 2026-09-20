@@ -2262,8 +2262,16 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
     // So each session is indexed or reported on its own, and the error at the
     // end names them all rather than the first.
     let mut inserted = 0;
-    let mut failures: Vec<String> = Vec::new();
-    for session_file in crate::ingest::opencode::list_json_tree_session_files(storage_dir) {
+    let listing = crate::ingest::opencode::list_json_tree_session_files(storage_dir);
+    // A subtree that could not be walked is not a subtree with no sessions in
+    // it. It joins the per-session failures rather than being dropped, so the
+    // sessions under it are reported missing instead of silently absent.
+    let mut failures: Vec<String> = listing
+        .unreadable
+        .iter()
+        .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
+        .collect();
+    for session_file in listing.sessions {
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
                 match loaded {
@@ -2283,7 +2291,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
     }
     if !failures.is_empty() {
         anyhow::bail!(
-            "{} OpenCode session(s) under {} could not be read (the rest were indexed): {}",
+            "{} OpenCode path(s) under {} could not be read (the rest were indexed): {}",
             failures.len(),
             storage_dir.display(),
             failures.join("; ")
