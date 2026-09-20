@@ -4097,15 +4097,20 @@ fn ingest_grok_session(
     let mut turn_tool_tail: HashMap<usize, String> = HashMap::new();
 
     for (idx, line) in session.lines.iter().enumerate() {
-        let turn_start = turn
-            .and_then(|turn| session.updates.turns.get(turn))
-            .and_then(|timing| timing.start_ms);
+        // Looked up on use rather than cached: a record that establishes
+        // which turn it is in (a prose chunk that joined to a group) changes
+        // the answer for the rest of its own branch, and a cached value would
+        // hand it the *previous* turn's start as its fallback.
+        let turn_start = |turn: Option<usize>| {
+            turn.and_then(|turn| session.updates.turns.get(turn))
+                .and_then(|timing| timing.start_ms)
+        };
         match &line.record {
             grok::GrokRecord::System { text } => {
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     None,
-                    turn_start,
+                    turn_start(turn),
                     inherited,
                     session.created_ms,
                     &mut outcome,
@@ -4133,7 +4138,7 @@ fn ingest_grok_session(
                     let ts = resolve_grok_ts(
                         line.ts_ms,
                         None,
-                        turn_start,
+                        turn_start(turn),
                         inherited,
                         session.created_ms,
                         &mut outcome,
@@ -4153,6 +4158,10 @@ fn ingest_grok_session(
                                 .map(|reason| json!({ "synthetic_reason": reason }).to_string()),
                         },
                     )?;
+                    // A marker is still a record with a place in the file, so
+                    // the next record with no time of its own inherits *this*
+                    // one's, not that of whatever came before it.
+                    inherited = Some(ts);
                     continue;
                 }
                 let group = session.updates.user_messages.get(user_ordinal);
@@ -4161,13 +4170,10 @@ fn ingest_grok_session(
                 // only the fallback for a session whose stream is missing.
                 turn =
                     Some(group.map_or_else(|| turn.map_or(0, |turn| turn + 1), |group| group.turn));
-                let turn_start = turn
-                    .and_then(|turn| session.updates.turns.get(turn))
-                    .and_then(|timing| timing.start_ms);
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     group.and_then(|group| group.ts_ms),
-                    turn_start,
+                    turn_start(turn),
                     inherited,
                     session.created_ms,
                     &mut outcome,
@@ -4215,7 +4221,7 @@ fn ingest_grok_session(
                         let ts = resolve_grok_ts(
                             line.ts_ms,
                             None,
-                            turn_start,
+                            turn_start(turn),
                             inherited,
                             session.created_ms,
                             &mut outcome,
@@ -4232,6 +4238,7 @@ fn ingest_grok_session(
                                 detail_json: None,
                             },
                         )?;
+                        inherited = Some(ts);
                     }
                     continue;
                 };
@@ -4240,7 +4247,7 @@ fn ingest_grok_session(
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     group.and_then(|group| group.ts_ms),
-                    turn_start,
+                    turn_start(turn),
                     inherited,
                     session.created_ms,
                     &mut outcome,
@@ -4276,7 +4283,7 @@ fn ingest_grok_session(
                     let ts = resolve_grok_ts(
                         line.ts_ms,
                         group.and_then(|group| group.ts_ms),
-                        turn_start,
+                        turn_start(turn),
                         inherited,
                         session.created_ms,
                         &mut outcome,
@@ -4312,7 +4319,7 @@ fn ingest_grok_session(
                     let ts = resolve_grok_ts(
                         line.ts_ms,
                         timing.and_then(|timing| timing.started_ms),
-                        turn_start,
+                        turn_start(turn),
                         inherited,
                         session.created_ms,
                         &mut outcome,
@@ -4393,7 +4400,7 @@ fn ingest_grok_session(
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     timing.and_then(|timing| timing.finished_ms),
-                    turn_start,
+                    turn_start(turn),
                     inherited,
                     session.created_ms,
                     &mut outcome,
@@ -4470,15 +4477,27 @@ fn ingest_grok_session(
         session.last_assistant_text.as_deref(),
         Some(raw_path),
     )?;
-    if !session.models.is_empty() {
-        conn.execute(
-            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
-            params![
-                serde_json::to_string(&session.models).unwrap_or_default(),
-                sid
-            ],
-        )?;
-    }
+    // `upsert_session` merges: it takes MIN/MAX of the activity bounds and
+    // keeps the old `last_assistant_text` when the new read has none. That is
+    // right for an append-only transcript and wrong for a snapshot — after a
+    // compaction the directory says the session now ends earlier, or ran no
+    // model at all, and the merge would keep reporting yesterday's end time
+    // and yesterday's model forever. So the four fields the snapshot owns are
+    // assigned from it, empty values included, while every other provider
+    // keeps the monotonic merge.
+    conn.execute(
+        "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
+         last_assistant_text = ?, models_json = ? \
+         WHERE source = 'grok' AND session_id = ?",
+        params![
+            session.first_ts,
+            session.last_ts,
+            session.last_assistant_text.as_deref(),
+            (!session.models.is_empty())
+                .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
+            sid,
+        ],
+    )?;
     Ok(outcome)
 }
 
@@ -4719,25 +4738,21 @@ pub(crate) fn grok_session_stamp_and_modified(chat: &Path) -> Result<(String, Op
     Ok((inventory.stamp, inventory.modified_ms))
 }
 
-/// What one Grok session directory holds, as the numbers a hydration reports.
+/// What one Grok session directory holds, from its metadata alone.
 ///
-/// `bytes` and `records` describe **everything the read consumes**, not just
-/// the transcript: a 10 KB `chat_history.jsonl` beside a 2 MB `updates.jsonl`
-/// is a 2 MB read, and reporting 10 KB of it understates the work by two
-/// orders of magnitude in `HYDRATION_METRICS` and in the stored checkpoint.
+/// Every field here comes from a `stat`: no file's contents are read. That is
+/// the difference between a scan that costs one syscall per file and one that
+/// parses every update stream in the store — discovery stamps every candidate
+/// on every run, and a session's stream is routinely megabytes. The record
+/// count is deliberately *not* here; see [`grok_source_records`].
+///
+/// `bytes` still describes **everything the read consumes**, not just the
+/// transcript: a 10 KB `chat_history.jsonl` beside a 2 MB `updates.jsonl` is a
+/// 2 MB read, and a length is metadata.
 pub(crate) struct GrokSourceInventory {
     pub stamp: String,
     pub modified_ms: Option<i64>,
     pub bytes: i64,
-    /// One per complete JSONL record in `chat_history.jsonl` and
-    /// `updates.jsonl`, plus **one per whole-file JSON sidecar** —
-    /// `summary.json`, `signals.json`, `prompt_context.json`, and each
-    /// `compaction_checkpoints/` and `subagents/` entry. A sidecar is one
-    /// document: the read either parsed it or did not, and counting it as
-    /// zero would make a directory of fifty checkpoints look like no work at
-    /// all. A `.jsonl` entry inside those directories is counted by record,
-    /// as the older Grok layout writes subagent transcripts that way.
-    pub records: i64,
 }
 
 /// The change stamp of one Grok session directory, over **every** file its
@@ -4753,9 +4768,10 @@ pub(crate) struct GrokSourceInventory {
 /// The two directories are listed, not stat-ed: a directory's own mtime moves
 /// when an entry is added or removed, but not when an entry's contents change.
 ///
-/// The same walk produces the stamp and the byte and record counts, so the
-/// numbers a hydration reports can never describe a different set of files
-/// from the one its change stamp covers.
+/// The same walk produces the stamp and the byte count, and
+/// [`grok_source_records`] walks the same list, so the numbers a hydration
+/// reports can never describe a different set of files from the one its change
+/// stamp covers.
 pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> {
     let metadata = chat.metadata()?;
     anyhow::ensure!(
@@ -4766,7 +4782,6 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
     let mut stamp = stamp_of(&metadata);
     let mut modified = modified_ms_of(&metadata);
     let mut bytes = metadata.len() as i64;
-    let mut records = hydrate::complete_jsonl_records(chat)?;
     let freshen = |candidate: Option<i64>, modified: &mut Option<i64>| {
         if let Some(candidate) = candidate {
             *modified = Some(modified.map_or(candidate, |current| current.max(candidate)));
@@ -4783,7 +4798,6 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
         // transcript — is usually the freshest signal of activity.
         freshen(modified_ms_of(&sibling), &mut modified);
         bytes += sibling.len() as i64;
-        records += grok_record_count(&path)?;
     }
     let mut digest = Sha256::new();
     for sibling in GROK_DIGESTED_SIBLINGS {
@@ -4794,7 +4808,6 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
         digest.update(format!("{sibling}={}\n", stamp_of(&found)));
         freshen(modified_ms_of(&found), &mut modified);
         bytes += found.len() as i64;
-        records += grok_record_count(&path)?;
     }
     for directory in GROK_DIGESTED_DIRECTORIES {
         // Sorted, so the digest describes the directory's contents rather than
@@ -4812,7 +4825,6 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
             digest.update(format!("{directory}/{name}={}\n", stamp_of(&found)));
             freshen(modified_ms_of(&found), &mut modified);
             bytes += found.len() as i64;
-            records += grok_record_count(&entry)?;
         }
     }
     // Sixteen hex characters of SHA-256: enough that two different sets of
@@ -4823,8 +4835,41 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
         stamp,
         modified_ms: modified,
         bytes,
-        records,
     })
+}
+
+/// How many records a Grok session directory holds — the content pass.
+///
+/// Separate from [`grok_source_inventory`] because it is the expensive half:
+/// it reads every byte of `chat_history.jsonl` and `updates.jsonl`. Only a
+/// hydration that is actually going to parse the session calls it. Discovery,
+/// plain `sync` and a hydration that decides nothing changed all stamp from
+/// metadata and never open a file, which is what makes the unchanged
+/// short-circuit worth taking.
+///
+/// One per complete JSONL record in the two streams, plus **one per whole-file
+/// JSON sidecar** — `summary.json`, `signals.json`, `prompt_context.json`, and
+/// each `compaction_checkpoints/` and `subagents/` entry. A sidecar is one
+/// document: the read either parsed it or did not, and counting it as zero
+/// would make a directory of fifty checkpoints look like no work at all. A
+/// `.jsonl` entry inside those directories is counted by record, as the older
+/// Grok layout writes subagent transcripts that way.
+pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
+    let mut records = hydrate::complete_jsonl_records(chat)?;
+    for name in GROK_STAMPED_SIBLINGS.iter().chain(GROK_DIGESTED_SIBLINGS) {
+        let path = chat.with_file_name(name);
+        if path.is_file() {
+            records += grok_record_count(&path)?;
+        }
+    }
+    for directory in GROK_DIGESTED_DIRECTORIES {
+        let mut entries = read_dir_files(&chat.with_file_name(directory));
+        entries.sort();
+        for entry in entries {
+            records += grok_record_count(&entry)?;
+        }
+    }
+    Ok(records)
 }
 
 /// How many records one file in a Grok session directory contributes: its
@@ -5935,6 +5980,110 @@ mod tests {
     /// retiring the sync-state key can make `sync` look at it again — and the
     /// prompts it wrote with synthesized timestamps must be replaced, not
     /// joined by a second copy carrying the real ones.
+    /// Build a Grok session directory from raw lines and index it.
+    fn ingest_grok_lines(home: &Path, chat: &str, updates: &str) -> Connection {
+        let dir = home.join(".grok/sessions/%2Ftmp%2Ffallback/grok-fb-0001");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), chat).unwrap();
+        fs::write(dir.join("updates.jsonl"), updates).unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            br#"{"info":{"id":"grok-fb-0001","cwd":"/tmp/fallback"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let conn = open_db(&home.join("history.db")).unwrap();
+        let chat_path = dir.join("chat_history.jsonl");
+        let session = super::scan_grok_session_file(&chat_path).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat_path.to_string_lossy()).unwrap();
+        conn
+    }
+
+    fn grok_event_time(conn: &Connection, text: &str) -> i64 {
+        conn.query_row(
+            "SELECT ts_ms FROM session_events WHERE source = 'grok' AND text = ?",
+            params![text],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// An assistant message with no recorded time of its own falls back to
+    /// **its own** turn's start. Resolving against a turn index captured
+    /// before the message told us which turn it was in hands it the previous
+    /// turn's start — a time from before the person had even asked.
+    #[test]
+    fn an_untimed_assistant_message_falls_back_to_its_own_turns_start() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"assistant","content":"answer one"}"#,
+                // The second turn is the model continuing on its own: Grok
+                // wrote no user record for it, so the chat side never learns
+                // the turn advanced and only the matched group knows.
+                r#"{"type":"assistant","content":"answer two"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":2500,"turnStartMs":1000}}}"#,
+                // The second turn opens with the model continuing: the chunk
+                // says which turn it belongs to, and records no time of its
+                // own — which is the only reason the fallback is reached.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"ev_late","turnStartMs":5000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        // The positive control: the first turn's events are exact, so the
+        // second one's fallback is the only thing under test.
+        assert_eq!(grok_event_time(&conn, "first"), 1000);
+        assert_eq!(grok_event_time(&conn, "answer one"), 2000);
+
+        assert_eq!(
+            grok_event_time(&conn, "answer two"),
+            5000,
+            "an untimed reply belongs to the turn it answered, not the one before it"
+        );
+    }
+
+    /// A marker is a record with a place in the file: the next record with no
+    /// time of its own inherits the marker's, not that of whatever preceded
+    /// it.
+    #[test]
+    fn a_marker_carries_its_time_forward_to_the_next_untimed_record() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first","timestamp_ms":1000}"#,
+                r#"{"type":"user","content":"injected","synthetic_reason":"compaction","timestamp_ms":2000}"#,
+                r#"{"type":"assistant","content":"after the marker"}"#,
+                "",
+            ]
+            .join("\n"),
+            "",
+        );
+        // The positive control: the marker really was stored at 2000, so the
+        // event below inherits a time that exists rather than a default.
+        let marker: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_markers WHERE source = 'grok' AND kind = 'synthetic_turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 2000);
+        assert_eq!(
+            grok_event_time(&conn, "after the marker"),
+            2000,
+            "the nearest preceding record is the marker, not the prompt before it"
+        );
+    }
+
     #[test]
     fn retiring_the_grok_state_key_re_reads_a_session_sync_already_consumed() {
         let dir = tempfile::tempdir().unwrap();

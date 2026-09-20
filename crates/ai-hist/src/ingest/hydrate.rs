@@ -79,11 +79,45 @@ struct CatalogTarget {
 struct SourceSnapshot {
     stamp: String,
     bytes: i64,
-    records: i64,
+    records: SnapshotRecords,
     path: Option<PathBuf>,
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
+}
+
+/// How many records a source holds, and whether counting them is free.
+///
+/// Counting means reading every byte of the source. For a single-file provider
+/// that read has already happened by the time the snapshot exists, so the
+/// number is simply carried. Grok's source is a directory whose update stream
+/// dominates it, and the count is wanted only when the session is actually
+/// going to be parsed — so it is deferred, and a run that decides nothing
+/// changed never opens the files at all.
+#[derive(Debug)]
+enum SnapshotRecords {
+    Counted(i64),
+    DeferredGrok(PathBuf),
+}
+
+impl SnapshotRecords {
+    /// The count, doing the content pass if it has not happened. Called only
+    /// on the path that parses the session.
+    fn count(&self) -> Result<i64> {
+        match self {
+            Self::Counted(records) => Ok(*records),
+            Self::DeferredGrok(path) => grok_source_records(path),
+        }
+    }
+
+    /// Add a sidecar's records to an already-counted source. A deferred count
+    /// covers its own directory, so nothing is ever added to one.
+    fn plus(self, more: i64) -> Self {
+        match self {
+            Self::Counted(records) => Self::Counted(records + more),
+            deferred => deferred,
+        }
+    }
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -206,11 +240,18 @@ fn hydrate_session_at_with_home_and_connectors(
         // above all that a token count it can see is a context proxy and not
         // billing usage.
         let cached_diagnostics = stored_source_diagnostics(&conn, options)?;
+        // The record count comes from the checkpoint the last parse wrote:
+        // this run parsed nothing, and counting the records again would mean
+        // reading every file the short-circuit exists to skip. `bytes` is
+        // metadata and stays current.
+        let records_parsed = stored_records_parsed(&conn, options)?;
         return build_result_with(
             &conn,
             options,
             "unchanged",
-            snapshot,
+            snapshot.stamp,
+            snapshot.bytes,
+            records_parsed,
             started.elapsed().as_millis() as i64,
             cached_diagnostics,
         );
@@ -244,6 +285,9 @@ fn hydrate_session_at_with_home_and_connectors(
         params![options.source, options.session_id],
     )?;
     let last_event_at_ms = max_event_time(&tx, &options.source, &options.session_id)?;
+    // The content pass, on the one path that has already read every one of
+    // these files anyway.
+    let records_parsed = snapshot.records.count()?;
     tx.execute(
         "INSERT INTO session_hydration_checkpoints \
          (source, session_id, location, source_stamp, parser_version, last_event_at_ms, source_bytes, records_parsed, include_related, updated_ms, source_diagnostics_json) \
@@ -261,7 +305,7 @@ fn hydrate_session_at_with_home_and_connectors(
             HYDRATION_PARSER_VERSION,
             last_event_at_ms,
             snapshot.bytes,
-            snapshot.records,
+            records_parsed,
             options.include_related,
             now_ms(),
             serde_json::to_string(&source_diagnostics).ok(),
@@ -273,7 +317,7 @@ fn hydrate_session_at_with_home_and_connectors(
         &local_observation,
         &snapshot.stamp,
         snapshot.bytes,
-        snapshot.records,
+        records_parsed,
         options.include_related,
         true,
     )?;
@@ -288,7 +332,9 @@ fn hydrate_session_at_with_home_and_connectors(
         &conn,
         options,
         status,
-        snapshot,
+        snapshot.stamp,
+        snapshot.bytes,
+        records_parsed,
         started.elapsed().as_millis() as i64,
         source_diagnostics,
     )
@@ -1104,7 +1150,7 @@ fn source_snapshot(
             // The ingestion query remains session-keyed. Avoid a second count
             // query here so checkpoint resolution never scans the provider's
             // complete `part` table on older stores missing its usual index.
-            records: 0,
+            records: SnapshotRecords::Counted(0),
             path: Some(path),
             claude_subagents: Vec::new(),
         });
@@ -1127,16 +1173,22 @@ fn source_snapshot(
         ));
     }
     validate_provider_path(&options.source, &path, home)?;
-    // Grok's source is a directory, not a file: one inventory produces its
-    // stamp, its byte total and its record total together, so the metrics can
-    // never describe a different set of files from the change stamp.
+    // Grok's source is a directory, not a file. Its inventory is metadata
+    // only — the same walk as its change stamp, so the two can never describe
+    // different sets of files — and the record count is deferred, because
+    // taking it means reading an update stream that is routinely megabytes
+    // and a run that decides nothing changed has no use for it.
     let (mut bytes, mut records, mut stamp) = if options.source == "grok" {
         let inventory = grok_source_inventory(&path)?;
-        (inventory.bytes, inventory.records, inventory.stamp)
+        (
+            inventory.bytes,
+            SnapshotRecords::DeferredGrok(path.clone()),
+            inventory.stamp,
+        )
     } else {
         (
             path.metadata()?.len() as i64,
-            complete_jsonl_records(&path)?,
+            SnapshotRecords::Counted(complete_jsonl_records(&path)?),
             file_stamp(&path)?,
         )
     };
@@ -1147,7 +1199,7 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&evidence.path)?);
             bytes += evidence.path.metadata()?.len() as i64;
-            records += complete_jsonl_records(&evidence.path)?;
+            records = records.plus(complete_jsonl_records(&evidence.path)?);
             // The metadata sidecar describes the child — its type, model and
             // spawn depth, and the tool use that started it — so a sidecar
             // that arrives or changes on its own is still new evidence.
@@ -1164,7 +1216,7 @@ fn source_snapshot(
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
             bytes += child.metadata()?.len() as i64;
-            records += complete_jsonl_records(&child)?;
+            records = records.plus(complete_jsonl_records(&child)?);
         }
     }
     Ok(SourceSnapshot {
@@ -1201,7 +1253,37 @@ fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> 
     Ok(())
 }
 
+// Bytes of file *content* this thread has read, for the tests that assert a
+// scan stayed on metadata. Thread-local rather than global so tests running in
+// parallel cannot see each other's reads; compiled out entirely outside tests.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CONTENT_BYTES_READ: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn content_bytes_read() -> u64 {
+    CONTENT_BYTES_READ.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_content_bytes_read() {
+    CONTENT_BYTES_READ.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn note_content_read(path: &Path) {
+    let read = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    CONTENT_BYTES_READ.with(|counter| counter.set(counter.get() + read));
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_content_read(_path: &Path) {}
+
 pub(crate) fn complete_jsonl_records(path: &Path) -> Result<i64> {
+    note_content_read(path);
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut records = 0;
     let mut line = String::new();
@@ -1219,6 +1301,23 @@ pub(crate) fn complete_jsonl_records(path: &Path) -> Result<i64> {
         }
     }
     Ok(records)
+}
+
+/// How many records the last parse of this session read, from its checkpoint.
+///
+/// A session that has never been parsed has none, and 0 is then the truthful
+/// answer: this run read no records either.
+fn stored_records_parsed(conn: &Connection, options: &HydrateSessionOptions) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT records_parsed FROM session_hydration_checkpoints \
+             WHERE source = ? AND session_id = ? AND location = 'local'",
+            params![options.source, options.session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or(0))
 }
 
 /// The provider diagnostics a previous parse of this session recorded.
@@ -1782,11 +1881,14 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
 /// Assemble the result, including the diagnostics the provider's parser
 /// produced this run — or, on a read that parsed nothing, the ones a previous
 /// parse of the same evidence recorded.
+#[allow(clippy::too_many_arguments)]
 fn build_result_with(
     conn: &Connection,
     options: &HydrateSessionOptions,
     status: &str,
-    snapshot: SourceSnapshot,
+    source_stamp: String,
+    source_bytes: i64,
+    records_parsed: i64,
     duration_ms: i64,
     source_diagnostics: Vec<HydrationDiagnostic>,
 ) -> Result<HydrateSessionResult> {
@@ -1814,8 +1916,8 @@ fn build_result_with(
         code: "HYDRATION_METRICS".to_string(),
         message: "targeted provider evidence acquisition completed".to_string(),
         duration_ms: Some(duration_ms),
-        source_bytes: Some(snapshot.bytes),
-        records_parsed: Some(snapshot.records),
+        source_bytes: Some(source_bytes),
+        records_parsed: Some(records_parsed),
     }];
     diagnostics.extend(source_diagnostics);
     if options.include_related {
@@ -1834,7 +1936,7 @@ fn build_result_with(
         discovery_state: "full".to_string(),
         presence: "local".to_string(),
         indexed_through: HydrationIndexedThrough {
-            source_stamp: Some(snapshot.stamp),
+            source_stamp: Some(source_stamp),
             last_event_at_ms,
         },
         evidence,
@@ -3084,6 +3186,159 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (bytes, records));
+    }
+
+    /// Stamping a Grok session must cost metadata, not its update stream.
+    ///
+    /// Discovery stamps every candidate on every run and plain `sync` stamps
+    /// every session directory it walks, so a stamp that reads file contents
+    /// turns a scan of a store into a parse of it — and the whole point of an
+    /// `unchanged` short-circuit is to avoid exactly that read.
+    #[test]
+    fn stamping_a_grok_session_reads_no_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let updates = chat.parent().unwrap().join("updates.jsonl");
+        fs::write(&updates, fs::read_to_string(&updates).unwrap().repeat(64)).unwrap();
+        let stream_bytes = fs::metadata(&updates).unwrap().len();
+
+        // The stamp itself, as discovery and sync take it.
+        reset_content_bytes_read();
+        let (stamp, modified) = crate::grok_session_stamp_and_modified(&chat).unwrap();
+        assert_eq!(
+            content_bytes_read(),
+            0,
+            "stamping must not read a byte of any file's contents"
+        );
+        assert!(!stamp.is_empty() && modified.is_some());
+
+        // An unchanged hydration: same guarantee, because the short-circuit
+        // runs before anything parses.
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+        let parsed =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(parsed.status, "hydrated");
+
+        reset_content_bytes_read();
+        let cached =
+            hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path())
+                .unwrap();
+        assert_eq!(cached.status, "unchanged");
+        assert_eq!(
+            content_bytes_read(),
+            0,
+            "an unchanged hydration must not read the files it decided not to parse"
+        );
+        // …and it still reports the size of what is on disk, and the record
+        // count the parse that produced the stored evidence measured.
+        let metrics = |result: &HydrateSessionResult| {
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "HYDRATION_METRICS")
+                .expect("the metrics diagnostic");
+            (
+                diagnostic.source_bytes.unwrap(),
+                diagnostic.records_parsed.unwrap(),
+            )
+        };
+        assert_eq!(metrics(&cached), metrics(&parsed));
+
+        // The positive control: the path that does parse still reads it all,
+        // so the assertions above measure laziness and not a broken meter.
+        reset_content_bytes_read();
+        let counted = crate::grok_source_records(&chat).unwrap();
+        assert!(
+            content_bytes_read() >= stream_bytes,
+            "the content pass must read the stream it counts"
+        );
+        assert_eq!(counted, metrics(&parsed).1);
+    }
+
+    /// After a rewrite the directory *is* the session. A merge that keeps the
+    /// old end time and the old model reports a session that no longer exists
+    /// in the files it points at.
+    #[test]
+    fn a_rewritten_grok_session_replaces_its_catalog_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = grok_fixture_home(dir.path(), "events-session");
+        let session_dir = chat.parent().unwrap().to_path_buf();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "grok", "grok-evt-0001", Some(&chat));
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let row =
+            |conn: &Connection| -> (Option<i64>, Option<i64>, Option<String>, Option<String>) {
+                conn.query_row(
+                    "SELECT first_activity_ms, last_activity_ms, last_assistant_text, models_json \
+                 FROM sessions WHERE source = 'grok' AND session_id = 'grok-evt-0001'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+            };
+        // The positive control: the first read really did record the later end
+        // time and the model, so the assertions below are a change and not a
+        // coincidence.
+        assert_eq!(
+            row(&conn),
+            (
+                Some(1_789_560_000_000),
+                Some(1_789_560_138_000),
+                Some("The test fails; fixing next.".to_string()),
+                Some(r#"["grok-4-build"]"#.to_string()),
+            )
+        );
+
+        // Compaction: the session now starts later, ends earlier, and its
+        // remaining records name no model and carry no assistant prose.
+        fs::write(
+            &chat,
+            concat!(
+                r#"{"type":"user","content":"<user_query>now a test</user_query>"}"#,
+                "\n",
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_write_1","name":"Write","arguments":{"path":"/tmp/demo/test/http.test.ts"}}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            concat!(
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"eventId":"ev_0009","agentTimestampMs":1789560120000,"turnStartMs":1789560120000}}}"#,
+                "\n",
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_write_1"},"_meta":{"agentTimestampMs":1789560129000,"turnStartMs":1789560120000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        // The summary is rewritten too, and no longer names a model: with the
+        // model still in `info.model` the session really did run it, and
+        // clearing the column would be the wrong answer.
+        fs::write(
+            session_dir.join("summary.json"),
+            br#"{"info":{"id":"grok-evt-0001","cwd":"/tmp/demo"},"head_branch":"feat/http-retry","created_at":"2026-09-16T12:00:00.000Z"}"#,
+        )
+        .unwrap();
+        hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
+        assert_eq!(
+            row(&conn),
+            (
+                Some(1_789_560_120_000),
+                Some(1_789_560_129_000),
+                None,
+                None,
+            ),
+            "the catalog row must be what the directory now says, not a merge with what it used to say"
+        );
     }
 
     /// A relationship recorded by somebody else about this session is not this
