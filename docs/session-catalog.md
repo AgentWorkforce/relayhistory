@@ -364,10 +364,13 @@ every sync while never being stamped itself. What ends the work is a per-provide
 generation recorded in the sync state (`claude_raw_message_facts`,
 `codex_raw_message_facts`), written only after a walk completes **and only when
 every archive root the state already names was present on that run**, so the
-backfill runs exactly once, an interrupted sync retries it, and a walk over an
-unmounted or not-yet-created root does not retire it having read nothing. A root
-the state never knew about — an install with no `.codex/archived_sessions` — is
-not a missing archive and does not hold the pass open. Claude reaches a subagent
+backfill runs exactly once, an interrupted sync retries it, and a walk that
+could not read an archive does not retire it having seen nothing. "Present" is
+not enough for that check: a mount point exists whether or not anything is
+mounted on it, so a root that shows none of the files the state names counts as
+unavailable too. A root the state never knew about — an install with no
+`.codex/archived_sessions` — is not a missing archive and does not hold the pass
+open. Claude reaches a subagent
 sidecar's rows through `session_relationships.evidence_locator`, because a
 sidecar never gets a `sessions` row of its own.
 
