@@ -167,7 +167,9 @@ pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) ->
     let result = deliver(&db_path, config);
     if before_exit {
         let connected = progress.finish_before_exit(result.is_ok(), Duration::from_secs(5));
-        ensure!(connected, user_error("Cloud connection could not be confirmed. Check the endpoint and retry; local data remains queued."));
+        if result.is_ok() {
+            ensure!(connected, user_error("Cloud connection could not be confirmed. Check the endpoint and retry; local data remains queued."));
+        }
     } else {
         progress.finish(result.is_ok());
     }
