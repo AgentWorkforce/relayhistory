@@ -699,22 +699,35 @@ fn pending_batch(
 
 /// Claims an already persisted batch. Lease expiry permits redelivery with the
 /// same batch ID and body. No database transaction remains open during I/O.
+/// Claim the pending batch, dating the lease from *inside* the write
+/// transaction.
+///
+/// `clock` is read after the lock is acquired. A claim can wait in the native
+/// boundary's blocking queue, on opening the database, or on SQLite's write
+/// lock, and a deadline computed from a timestamp taken before that wait is
+/// short by exactly the wait: for any wait longer than the lease it is
+/// already in the past when it commits. The claim then reports success, the
+/// pre-transport liveness checks refuse the lease, and another worker
+/// reclaims the batch at once — a lease that was never usable, handed out as
+/// though it were.
 pub fn claim_batch(
     conn: &Connection,
     job_id: &str,
     worker_id: &str,
     lease_ms: i64,
-    now_ms: i64,
+    clock: &dyn Fn() -> i64,
 ) -> Result<Option<ClaimedBatch>> {
     ensure!(identifier(worker_id), "invalid delivery worker id");
     ensure!(
-        (1..=86_400_000).contains(&lease_ms) && now_ms >= 0,
-        "invalid delivery lease duration/clock"
+        (1..=86_400_000).contains(&lease_ms),
+        "invalid delivery lease duration"
     );
+    let tx = write_transaction(conn)?;
+    let now_ms = clock();
+    ensure!(now_ms >= 0, "invalid delivery clock");
     let expires_at_ms = now_ms
         .checked_add(lease_ms)
         .context("delivery clock overflow")?;
-    let tx = write_transaction(conn)?;
     let job = job(&tx, job_id)?;
     if job.state != "active" {
         return Ok(None);
