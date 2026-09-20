@@ -3854,18 +3854,21 @@ mod tests {
 
         hydrate_session_at_with_home(&db, &options("grok", "grok-evt-0001"), dir.path()).unwrap();
         let conn = open_db(&db).unwrap();
-        let row = |conn: &Connection| -> (
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) {
-            conn.query_row(
-                "SELECT first_activity_ms, last_activity_ms, last_assistant_text, models_json, first_prompt \
+        let row =
+            |conn: &Connection| -> (Option<i64>, Option<i64>, Option<String>, Option<String>) {
+                conn.query_row(
+                    "SELECT first_activity_ms, last_activity_ms, last_assistant_text, models_json \
                  FROM sessions WHERE source = 'grok' AND session_id = 'grok-evt-0001'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+            };
+        let first_prompt = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'grok' AND session_id = 'grok-evt-0001'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| row.get(0),
             )
             .unwrap()
         };
@@ -3879,8 +3882,11 @@ mod tests {
                 Some(1_789_560_138_000),
                 Some("The test fails; fixing next.".to_string()),
                 Some(r#"["grok-4-build"]"#.to_string()),
-                Some("add a retry to the http client".to_string()),
             )
+        );
+        assert_eq!(
+            first_prompt(&conn).as_deref(),
+            Some("add a retry to the http client")
         );
 
         // Compaction: the session now starts later, ends earlier, and its
@@ -3922,9 +3928,13 @@ mod tests {
                 Some(1_789_560_129_000),
                 None,
                 None,
-                Some("now a test".to_string()),
             ),
             "the catalog row must be what the directory now says, not a merge with what it used to say"
+        );
+        assert_eq!(
+            first_prompt(&conn).as_deref(),
+            Some("now a test"),
+            "compaction that drops the original first turn must not keep it in the catalog"
         );
     }
 
