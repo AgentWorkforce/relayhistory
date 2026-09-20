@@ -13,7 +13,8 @@
 use ai_hist::internal::{session_markers, session_tree, SessionTreeOptions};
 use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, open_db, session_events,
-    session_relationships, sync_local_at, DiscoverOptions, HydrateSessionOptions, SessionScope,
+    session_relationships, sync_local_at, sync_opencode_db, DiscoverOptions, HydrateSessionOptions,
+    SessionScope,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::fs;
@@ -301,6 +302,8 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_limit_is_not_spent_on_a_file_that_is_not_a_session();
     a_scope_that_cannot_be_walked_is_reported_not_omitted();
     a_failed_session_query_does_not_checkpoint_an_empty_session();
+    one_unreadable_session_does_not_end_the_sqlite_sweep();
+    a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -2454,6 +2457,173 @@ fn a_failed_session_query_does_not_checkpoint_an_empty_session() {
         hydrated.evidence.events > 0,
         "the healthy session must still hydrate, got {:?}",
         hydrated.evidence
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The SQLite sweep, under both plans. Making the loader report a row it
+/// cannot map — rather than calling the session absent — put that error in
+/// front of a loop that took it out with `?`, so the first bad row ended the
+/// sweep and every session after it in the store went unindexed. The legacy
+/// tree's sweep has isolated per session since the round before; this is the
+/// same regression one layout over.
+fn one_unreadable_session_does_not_end_the_sqlite_sweep() {
+    let root = temp_root("sqlite-sweep");
+
+    for (tag, indexed) in [("per-session", true), ("single-pass", false)] {
+        let store = root.join(tag).join(".local/share/opencode/opencode.db");
+        build_sqlite_store(&store);
+        let db = Connection::open(&store).unwrap();
+        if !indexed {
+            for index in [
+                "session_time_updated_id_idx",
+                "message_session_time_created_id_idx",
+                "part_session_idx",
+                "part_message_id_id_idx",
+            ] {
+                db.execute_batch(&format!("DROP INDEX IF EXISTS {index};"))
+                    .unwrap();
+            }
+        }
+
+        // Which session the sweep reaches first is SQLite's choice, not the
+        // fixture's — it depends on which index it decides covers the
+        // enumeration. So the roles are read out of the store with the same
+        // query the loader enumerates with, rather than assumed: break the one
+        // that is reached **first**, and require the one behind it to survive.
+        // Assuming the order is how the first version of this test passed with
+        // the defect in place.
+        let order: Vec<String> = db
+            .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            order.len() >= 2,
+            "[{tag}] the fixture must hold a session behind the bad one"
+        );
+        let (bad, survivor) = (order[0].clone(), order[1].clone());
+
+        // SQLite columns are dynamically typed, so the store holds a value the
+        // row mapping cannot take quite happily.
+        db.execute("UPDATE session SET parent_id = x'ff' WHERE id = ?", [&bad])
+            .unwrap();
+        drop(db);
+
+        let db_path = root.join(format!("{tag}.db"));
+        let conn = open_db(&db_path).unwrap();
+        let error = format!(
+            "{:#}",
+            sync_opencode_db(&conn, &store)
+                .expect_err("the unreadable session must be reported, not swallowed")
+        );
+        assert!(
+            !session_events(&conn, &survivor, Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "[{tag}] the session behind the bad one must still be indexed"
+        );
+        assert!(
+            error.contains(&bad),
+            "[{tag}] the error must name the session that failed, got {error}"
+        );
+        assert!(
+            session_events(&conn, &bad, Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "[{tag}] and the bad one must not be indexed from a read that failed"
+        );
+        drop(conn);
+
+        // Positive control: the same store with nothing wrong with it reports
+        // nothing, so the assertions above are about the bad row and not about
+        // this path always failing.
+        let clean_store = root
+            .join(format!("{tag}-clean"))
+            .join(".local/share/opencode/opencode.db");
+        build_sqlite_store(&clean_store);
+        if !indexed {
+            Connection::open(&clean_store)
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS session_time_updated_id_idx;
+                     DROP INDEX IF EXISTS message_session_time_created_id_idx;
+                     DROP INDEX IF EXISTS part_session_idx;
+                     DROP INDEX IF EXISTS part_message_id_id_idx;",
+                )
+                .unwrap();
+        }
+        let conn = open_db(&root.join(format!("{tag}-clean.db"))).unwrap();
+        sync_opencode_db(&conn, &clean_store)
+            .unwrap_or_else(|error| panic!("[{tag}] a clean store must report nothing: {error:#}"));
+        assert!(
+            !session_events(&conn, &bad, Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "[{tag}] and the session that was broken indexes fine when it is not"
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `sessions.last_assistant_text` is a catalog *excerpt* — it is read to show
+/// a session in a list, and discovery caps every value it writes there at
+/// `EXCERPT_MAX_CHARS`. The OpenCode normalizer stored the whole turn, so one
+/// long answer put an unbounded string in a column every listing reads.
+fn a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event() {
+    const CAP: usize = 4096;
+    let root = temp_root("excerpt");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    let long = "x".repeat(CAP * 3);
+    write_json(
+        &tree.join("session/global/ses_long.json"),
+        r#"{"id":"ses_long","directory":"/tmp/project","time":{"created":1777400000000,"updated":1777400002000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_long/msg_long_a1.json"),
+        r#"{"id":"msg_long_a1","sessionID":"ses_long","role":"assistant","time":{"created":1777400001000},"providerID":"anthropic","modelID":"claude-opus-4-5","path":{"cwd":"/tmp/project"}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_long_a1/prt_long.json"),
+        &format!(
+            r#"{{"id":"prt_long","sessionID":"ses_long","messageID":"msg_long_a1","type":"text","text":"{long}"}}"#
+        ),
+    );
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+
+    let stored: String = open_db(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='opencode' AND session_id=?",
+            ["ses_long"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.chars().count(),
+        CAP,
+        "the catalog column is an excerpt and must be capped"
+    );
+
+    // Positive control: the cap is the catalog's, not the parser's. The event
+    // still carries the whole turn, which is where a reader goes for it.
+    let texts: Vec<String> =
+        session_events(&open_db(&db_path).unwrap(), "ses_long", Some("opencode"))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect();
+    assert_eq!(
+        texts.iter().map(|text| text.chars().count()).max(),
+        Some(long.chars().count()),
+        "the event must keep the whole turn"
     );
 
     fs::remove_dir_all(&root).ok();

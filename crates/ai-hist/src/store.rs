@@ -2307,6 +2307,12 @@ fn sync_opencode_sessions_from_source(
 ) -> Result<usize> {
     let raw_path = raw_path.to_string_lossy().into_owned();
     let mut inserted = 0;
+    // One session's failure is that session's failure, the same way the legacy
+    // tree's sweep treats it. The loader reports a row it cannot map rather
+    // than calling the session absent, and taking that error out of the loop
+    // with `?` would end the sweep at the first bad row -- every session after
+    // it in the store unindexed for as long as that one row stays bad.
+    let mut failures: Vec<String> = Vec::new();
     // Session-keyed queries are bounded only when the provider indexes the
     // column they seek on. Without that index each one scans `part`, and this
     // loop runs one per session -- quadratic on exactly the large stores the
@@ -2314,17 +2320,42 @@ fn sync_opencode_sessions_from_source(
     match crate::ingest::opencode::sync_plan(src)? {
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
-                if let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, &session_id)? {
-                    inserted +=
-                        crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+                let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
+                    |loaded| match loaded {
+                        Some(loaded) => {
+                            crate::ingest::opencode::normalize(conn, &loaded, &raw_path)
+                                .map(|counts| counts.prompts)
+                        }
+                        None => Ok(0),
+                    },
+                );
+                match indexed {
+                    Ok(prompts) => inserted += prompts,
+                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
                 }
             }
         }
         crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
-            for loaded in crate::ingest::opencode::load_all_from_sqlite(src)? {
-                inserted += crate::ingest::opencode::normalize(conn, &loaded, &raw_path)?.prompts;
+            let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
+            failures.extend(
+                load.failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
+            );
+            for loaded in load.sessions {
+                match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
+                    Ok(counts) => inserted += counts.prompts,
+                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
+                }
             }
         }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} OpenCode session(s) in {raw_path} could not be read (the rest were indexed): {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
     Ok(inserted)
 }

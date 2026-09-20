@@ -338,16 +338,40 @@ pub(crate) fn sync_plan(src: &Connection) -> Result<OpencodeSyncPlan> {
     }
 }
 
+/// What one whole-store pass could read, and which sessions it could not.
+///
+/// Returned together for the same reason the legacy tree's listing is: one
+/// session whose row this mapping rejects must not cost the rest of the store,
+/// and it must not be silently absent either.
+#[derive(Debug, Default)]
+pub(crate) struct OpencodeStoreLoad {
+    pub sessions: Vec<OpencodeSession>,
+    pub failures: Vec<OpencodeSessionFailure>,
+}
+
+/// One session the store holds and this pass could not read.
+#[derive(Debug)]
+pub(crate) struct OpencodeSessionFailure {
+    pub session_id: String,
+    pub error: String,
+}
+
 /// Read the whole store in one pass per table and group it in memory.
 ///
 /// The fallback for a store whose provider indexes are missing. It trades
 /// memory for scans, which is the right way round here: the alternative this
 /// replaced copied the entire database to a temporary file first, so holding
 /// the rows costs no more than that did and reads each one exactly once.
-pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSession>> {
+pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad> {
+    let mut load = OpencodeStoreLoad::default();
+    // Sessions whose rows this pass could not map. Dropped from the output at
+    // the end rather than as they are found, because a message can fail after
+    // some of its session's rows have already been collected, and a session
+    // read in part is not a session read.
+    let mut failed: BTreeMap<String, String> = BTreeMap::new();
     let session_columns = table_columns(src, "session")?;
     if !session_columns.contains("id") {
-        return Ok(Vec::new());
+        return Ok(load);
     }
     let parent = optional_column(&session_columns, "parent_id");
     let directory = optional_column(&session_columns, "directory");
@@ -357,24 +381,39 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSessi
         "SELECT id, {parent}, {directory}, {created}, {updated} FROM session \
          WHERE id IS NOT NULL AND id <> ''"
     );
-    let mut infos: BTreeMap<String, OpencodeSessionInfo> = src
-        .prepare(&sql)?
-        .query_map([], |row| {
-            Ok(OpencodeSessionInfo {
-                id: row.get::<_, String>(0)?,
-                parent_id: row.get::<_, Option<String>>(1)?,
-                directory: row.get::<_, Option<String>>(2)?,
-                created_ms: row.get::<_, Option<i64>>(3)?,
-                updated_ms: row.get::<_, Option<i64>>(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|mut info| {
-            info.parent_id = info.parent_id.filter(|value| !value.is_empty());
-            (info.id.clone(), info)
-        })
-        .collect();
+    // Mapped one row at a time. A value the mapping cannot take is one
+    // session's problem; failing to *step* the statement is the store's, and
+    // that still propagates.
+    let mut infos: BTreeMap<String, OpencodeSessionInfo> = BTreeMap::new();
+    {
+        let mut stmt = src.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let id = row.get::<_, String>(0);
+            let mapped = (|| -> rusqlite::Result<OpencodeSessionInfo> {
+                Ok(OpencodeSessionInfo {
+                    id: row.get::<_, String>(0)?,
+                    parent_id: row.get::<_, Option<String>>(1)?,
+                    directory: row.get::<_, Option<String>>(2)?,
+                    created_ms: row.get::<_, Option<i64>>(3)?,
+                    updated_ms: row.get::<_, Option<i64>>(4)?,
+                })
+            })();
+            Ok((id, mapped))
+        })?;
+        for row in rows {
+            let (id, mapped) = row?;
+            match mapped {
+                Ok(mut info) => {
+                    info.parent_id = info.parent_id.filter(|value| !value.is_empty());
+                    infos.insert(info.id.clone(), info);
+                }
+                Err(error) => {
+                    let id = id.unwrap_or_else(|_| "<unnamed session row>".into());
+                    failed.insert(id, error.to_string());
+                }
+            }
+        }
+    }
 
     // One scan of `message`, grouped by session, remembering which session
     // each message belongs to so the parts can be placed without a second
@@ -389,17 +428,38 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSessi
         let fallback = optional_column(&message_columns, "time_created");
         let sql =
             format!("SELECT id, session_id, data, {fallback} FROM message WHERE json_valid(data)");
-        let rows = src
-            .prepare(&sql)?
-            .query_map([], |row| {
+        let mut stmt = src.prepare(&sql)?;
+        let mapped = stmt.query_map([], |row| {
+            // `session_id` first and on its own, because a row that fails is
+            // only attributable to one session if it can still say which.
+            let session_id = row.get::<_, String>(1);
+            let rest = (|| -> rusqlite::Result<(String, String, Option<i64>)> {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            })();
+            Ok((session_id, rest))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            let (session_id, rest) = row?;
+            match (session_id, rest) {
+                (Ok(session_id), Ok((id, data, fallback_ts))) => {
+                    rows.push((id, session_id, data, fallback_ts))
+                }
+                (Ok(session_id), Err(error)) => {
+                    failed
+                        .entry(session_id)
+                        .or_insert_with(|| error.to_string());
+                }
+                // A row that cannot even name its session could belong to any
+                // of them, so there is no session to exclude and no honest way
+                // to call the rest of this pass complete.
+                (Err(error), _) => return Err(error).context("reading an OpenCode `message` row"),
+            }
+        }
         for (id, session_id, data, fallback_ts) in rows {
             if !infos.contains_key(&session_id) {
                 continue;
@@ -425,16 +485,30 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSessi
         && part_columns.contains("data")
         && part_columns.contains("message_id")
     {
-        let rows = src
-            .prepare("SELECT id, message_id, data FROM part WHERE json_valid(data)")?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt =
+            src.prepare("SELECT id, message_id, data FROM part WHERE json_valid(data)")?;
+        let mapped = stmt.query_map([], |row| {
+            let message_id = row.get::<_, String>(1);
+            let rest = (|| -> rusqlite::Result<(String, String)> {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))
+            })();
+            Ok((message_id, rest))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            let (message_id, rest) = row?;
+            match (message_id, rest) {
+                (Ok(message_id), Ok((id, data))) => rows.push((id, message_id, data)),
+                (Ok(message_id), Err(error)) => {
+                    if let Some(session_id) = session_of_message.get(&message_id) {
+                        failed
+                            .entry(session_id.clone())
+                            .or_insert_with(|| error.to_string());
+                    }
+                }
+                (Err(error), _) => return Err(error).context("reading an OpenCode `part` row"),
+            }
+        }
         for (id, message_id, data) in rows {
             let Some(session_id) = session_of_message.get(&message_id) else {
                 continue;
@@ -460,17 +534,24 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<Vec<OpencodeSessi
         }
     }
 
-    let mut out = Vec::with_capacity(infos.len());
     let ids: Vec<String> = infos.keys().cloned().collect();
+    load.sessions.reserve(ids.len());
     for id in ids {
+        if failed.contains_key(&id) {
+            continue;
+        }
         let info = infos.remove(&id).expect("id came from this map");
-        out.push(finish(
+        load.sessions.push(finish(
             info,
             messages_by_session.remove(&id).unwrap_or_default(),
             parts_by_session.remove(&id).unwrap_or_default(),
         ));
     }
-    Ok(out)
+    load.failures = failed
+        .into_iter()
+        .map(|(session_id, error)| OpencodeSessionFailure { session_id, error })
+        .collect();
+    Ok(load)
 }
 
 /// Every session id the provider store names. Used by global sync, which is
@@ -1309,7 +1390,16 @@ fn normalize_session(
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
-                last_assistant_text = Some(text.to_string());
+                // `sessions.last_assistant_text` is a catalog *excerpt*, not
+                // the turn: it is read to show a session in a list, and every
+                // other full-ingest parser caps it here. The event above keeps
+                // the whole text, which is where a reader that wants the turn
+                // goes.
+                last_assistant_text = Some(
+                    text.chars()
+                        .take(crate::discover::EXCERPT_MAX_CHARS)
+                        .collect(),
+                );
                 continue;
             }
             let Some(tool) = as_tool_part(part) else {
