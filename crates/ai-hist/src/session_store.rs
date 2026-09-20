@@ -1,7 +1,10 @@
 //! Embedder entry point. Cargo semver is the contract; there is no separate
 //! Rust contract-version constant.
 use crate::ingest::{sync_local_at, sync_local_at_with_home};
-use crate::store::{default_db_path, open_db, open_db_readonly};
+use crate::store::{
+    default_db_path, open_db, open_db_readonly, session_user_turns_page, SessionEventCursor,
+    SessionUserTurnPage,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
@@ -132,6 +135,20 @@ impl SessionStore {
             changed: Vec::new(),
         })
     }
+
+    /// Read one bounded page of user turns and their ordered text/tool-result
+    /// blocks without exposing a raw SQLite connection.
+    pub fn session_user_turns_page(
+        &self,
+        source: Source,
+        session_id: &str,
+        limit: i64,
+        after: Option<&SessionEventCursor>,
+    ) -> Result<SessionUserTurnPage, Error> {
+        let conn = open_db_readonly(&self.db_path)?;
+        session_user_turns_page(&conn, source.as_str(), session_id, limit, after)
+            .map_err(Error::from_anyhow)
+    }
 }
 
 fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
@@ -158,5 +175,31 @@ mod tests {
         })
         .unwrap();
         assert!(db.exists());
+    }
+
+    #[test]
+    fn user_turns_are_readable_through_the_public_facade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db.clone()),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', 'm1', 10, 'user', 'text', 'hello', 'e1')",
+            [],
+        )
+        .unwrap();
+
+        let page = store
+            .session_user_turns_page(Source::Claude, "s1", 10, None)
+            .unwrap();
+        assert_eq!(page.user_turns.len(), 1);
+        assert_eq!(page.user_turns[0].blocks[0].byte_len, 5);
+        assert!(page.next_cursor.is_none());
     }
 }

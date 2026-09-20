@@ -119,6 +119,67 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
+- The native-addon contract is now 16 and the session evidence contract is now
+  2: `session_events` rows carry the per-message raw provider facts (see
+  Added). Hydration parser version 3 re-parses existing databases once on the
+  next `sessions hydrate` so rows already indexed gain the facts instead of
+  staying null forever, and the `session_events_raw_facts_v1` schema marker is
+  required, so the first read of an existing database is routed through a
+  writable open that migrates it. Delivery capture triggers that were created
+  before a captured table gained a column are now rebuilt rather than left in
+  place by `CREATE TRIGGER IF NOT EXISTS`; without that they would go on
+  reporting successful delivery while silently emitting the old column list.
+  The read-only schema check validates each capture trigger's payload rather
+  than only its name, so a database that gained a column under a
+  `--no-default-features` build — which migrates the table but compiles the
+  rebuild out — is routed through the writable open that rebuilds the trigger
+  instead of passing a fast path the names alone satisfy.
+  `session_events` also gains `raw_facts_version`, stamped by the local parser
+  on every event it writes: plain `sync` runs one recorded backfill pass per
+  provider and reads that column to pick the transcripts to re-read, telling a
+  row indexed before the facts existed from one whose facts the provider never
+  recorded. Without the pass a migrated database skipped every unchanged
+  transcript on the stamp fast path and left the six columns null forever while
+  reporting a successful sync. The pass is bounded by a recorded generation
+  rather than by "an unstamped row exists", because local and remote
+  observations share `(source, session_id)` and an adapter contributes rows
+  through the evidence path, which does not carry the column — re-reading the
+  local transcript can never stamp those. Claude selects sidecar transcripts
+  through `session_relationships.evidence_locator` as well as
+  `sessions.raw_path`, since a subagent sidecar has no catalog row of its own,
+  and the generation is recorded only when this run saw every file the sync
+  state already names, since a walk that could not read them has not
+  backfilled them. Availability is judged per file rather than per root: a
+  partially mounted archive returns some known paths and not others. A known
+  path this run did not see also loses its stamp, so a file that comes back is
+  read afresh instead of skipped on a stamp nothing watched — which is also
+  what keeps a genuinely deleted file cheap, costing one further sync rather
+  than leaving the pass pending forever. The checkpoint merge honours that
+  removal: it folds a run's keys over the state already on disk and cannot
+  express a delete, so the dropped paths are carried as an instruction that the
+  merge applies and then discards, rather than living only in the run's own
+  copy of the map. A transcript this run enumerated but could not read counts
+  as unobserved rather than as an empty file: both parsers read with
+  `unwrap_or_default()`, so a permission change, a swapped-out path or an I/O
+  error would otherwise be stamped as seen and leave that path's rows null for
+  good.
+
+- Hydration contract 3; local hydration no longer claims `full` for
+  prompt-only providers. `capability` is computed from the evidence kinds the
+  selected provider's parser actually produces, declared per adapter as
+  `ShallowSessionProvider::evidence_kinds`, instead of being the literal
+  `"full"` for every local source. `HydrateSessionResult` gains
+  `coverage` (the covered kinds, in canonical order) and a
+  `HYDRATION_PARTIAL_COVERAGE` diagnostic naming what is absent, and
+  `discovery_state` is read back off the catalog row rather than asserted.
+  Cursor, Grok and OpenCode now return `capability: "partial"` with
+  `coverage: ["history"]`; Claude and Codex return `"full"` when related
+  evidence is requested and fully acquired, and `"partial"` without
+  `relationship` when `includeRelated: false`, which never reads delegation
+  evidence. Codex also reports partial relationship coverage when a bounded
+  targeted search leaves newer rollout dates unexamined.
+  Consumers ranking merges on `capability` (`{full, partial, shallow_only}`)
+  will see prompt-only presences drop below full ones, which is the point.
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no
   longer substitutes the OpenCode database file size, and summaries add
@@ -211,6 +272,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
   deadline (so a slow renewal compounded rather than corrected), and a
   contended `SQLITE_BUSY` write was treated as a lost lease rather than
   retried while the claim still had time to run.
+
+- Capture the per-message raw facts a provider records on the envelope rather
+  than in the message body. `session_events` gains `request_id`, `stop_reason`,
+  `agent_version`, `is_sidechain`, `is_meta` and `turn_id`, and every one is
+  stored as the provider wrote it -- `stop_reason` in particular is the
+  verbatim wire string and stays null while a turn is still in flight, because
+  its absence is how an in-progress turn is recognized. Claude supplies
+  `requestId`/`request_id`, `message.stop_reason`, `version`/`sourceVersion`,
+  `isSidechain` and `isMeta`; Codex stamps `turn_id` from each `turn_context`
+  onto every record until the next one names a different turn. The fields are
+  exposed on `SessionEvent` in Rust, on `NativeSessionEvent`, and as
+  `requestId`, `stopReason`, `agentVersion`, `isSidechain`, `isMeta` and
+  `turnId` on the SDK's `SessionEvent`. `message.usage` continues to be stored
+  verbatim, so nested `cache_creation.ephemeral_5m_input_tokens` and
+  `ephemeral_1h_input_tokens` survive a round trip; there is now a test that
+  says so.
 
 - Add first-class delegation topology. `session_relationships` gains an
   identity status (`observed` or `unlinked`), child agent type, name, model and

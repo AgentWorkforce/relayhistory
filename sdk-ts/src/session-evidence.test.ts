@@ -5,12 +5,14 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
-  InvalidArgumentError, SESSION_EVIDENCE_CONTRACT_VERSION,
+  EVIDENCE_KINDS, FULL_SESSION_KINDS, InvalidArgumentError, NativeContractMismatchError,
+  SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
   getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
   getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
-  parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
+  hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
+import { combineHydration, normalizeHydration } from './normalization.js';
 
 // Undated tool calls and file edits are legal — both `ts_ms` columns are
 // nullable — but no provider adapter writes one, so the only way to build the
@@ -46,7 +48,9 @@ const CODEX_ROLLOUT = [
   { timestamp: '2026-08-30T11:00:04.000Z', type: 'event_msg', payload: { type: 'patch_apply_end', call_id: 'call_2', success: true, changes: { '/work/codex/a.rs': { type: 'update', unified_diff: '@@\n+one\n-zero' }, '/work/codex/b.rs': { type: 'update', unified_diff: '@@\n+two' } } } },
 ];
 
-async function seededDatabase(): Promise<{ dbPath: string; cleanup: () => Promise<void> }> {
+async function seededDatabase(): Promise<{
+  dbPath: string; home: string; cleanup: () => Promise<void>;
+}> {
   const root = await mkdtemp(join(tmpdir(), 'relayhistory-evidence-'));
   const home = join(root, 'home');
   const claude = join(home, '.claude', 'projects', 'work-app');
@@ -65,7 +69,7 @@ async function seededDatabase(): Promise<{ dbPath: string; cleanup: () => Promis
     if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
     if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
   }
-  return { dbPath, cleanup: () => rm(root, { recursive: true, force: true }) };
+  return { dbPath, home, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
 test('tool call pages expose structured arguments, errors, and identity', async () => {
@@ -288,6 +292,278 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
     }
   } finally {
     await cleanup();
+  }
+});
+
+test('hydration reports coverage alongside a capability computed from it', async () => {
+  const { dbPath, home, cleanup } = await seededDatabase();
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const hydrated = await hydrateSession({ source: 'claude', sessionId: SHARED_SESSION, dbPath });
+    assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
+    assert.equal(SESSION_HYDRATION_CONTRACT_VERSION, 3);
+    assert.equal(hydrated.capability, 'full');
+    assert.deepEqual(hydrated.coverage, [...FULL_SESSION_KINDS]);
+    for (const kind of hydrated.coverage) {
+      assert.ok((EVIDENCE_KINDS as readonly string[]).includes(kind), `${kind} is a known kind`);
+    }
+
+    // includeRelated: false never walks the subagent sidecars, so the result
+    // must not claim relationship coverage it did not look for -- and it must
+    // stay `partial`, since a merger reading `full` would treat unexamined
+    // delegation as fully indexed.
+    const alone = await hydrateSession({
+      source: 'claude', sessionId: SHARED_SESSION, dbPath, includeRelated: false,
+    });
+    assert.equal(alone.capability, 'partial');
+    assert.deepEqual(alone.coverage, FULL_SESSION_KINDS.filter((kind) => kind !== 'relationship'));
+    const declined = alone.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE');
+    assert.ok(declined, 'the declined evidence is named');
+    assert.ok(declined.message.includes('relationship'), declined.message);
+    assert.ok(declined.message.includes('include_related is off'), declined.message);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = saved.USERPROFILE;
+    await cleanup();
+  }
+});
+
+test('a native full capability unsupported by its coverage is a contract mismatch, not a value', () => {
+  const base = {
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'cursor', sessionId: 's', status: 'hydrated',
+    capability: 'full', discoveryState: 'full', presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    evidence: { prompts: 1, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
+    relatedSessionIds: [], diagnostics: [],
+  };
+  // Exactly the defect contract 3 removes: a well-formed result asserting
+  // `full` over evidence kinds nothing looked at must not reach a caller.
+  assert.throws(
+    () => normalizeHydration({ ...base, coverage: ['history'] }),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.code === 'NATIVE_CONTRACT_MISMATCH',
+  );
+  assert.throws(
+    () => normalizeHydration({ ...base, capability: 'partial', coverage: ['prompts'] }),
+    (error: unknown) => error instanceof NativeContractMismatchError
+      && error.message.includes('prompts'),
+  );
+  assert.equal(
+    normalizeHydration({ ...base, coverage: [...FULL_SESSION_KINDS] }).capability,
+    'full',
+  );
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
+    ['history'],
+  );
+  // An absent or non-list `coverage` is malformed, not "covers nothing":
+  // defaulting it would pass validation and strip the coverage a merge needs.
+  for (const coverage of [undefined, null, 'history', {}]) {
+    assert.throws(
+      () => normalizeHydration({ ...base, capability: 'partial', coverage }),
+      (error: unknown) => error instanceof NativeContractMismatchError
+        && error.code === 'NATIVE_CONTRACT_MISMATCH'
+        && error.message.includes('without a coverage list'),
+      `coverage: ${JSON.stringify(coverage)} is rejected`,
+    );
+  }
+  // An empty list is legitimate -- a listing-only connector covers nothing.
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'shallow_only', coverage: [] }).coverage,
+    [],
+  );
+
+  // The mirror-image defects are rejected too. They read as harmless
+  // understatements, but `combineHydration` ranks the parts of a merge by the
+  // reported capability before recomputing, so an under-reported result loses
+  // the `best` selection and the top-level fields that come with it.
+  for (const [capability, coverage, expected] of [
+    ['partial', [...FULL_SESSION_KINDS], 'full'],
+    ['shallow_only', ['history'], 'partial'],
+    ['shallow_only', [...FULL_SESSION_KINDS], 'full'],
+    ['full', [], 'shallow_only'],
+  ] as const) {
+    assert.throws(
+      () => normalizeHydration({ ...base, capability, coverage: [...coverage] }),
+      (error: unknown) => error instanceof NativeContractMismatchError
+        && error.code === 'NATIVE_CONTRACT_MISMATCH'
+        && error.message.includes('inconsistent with its coverage')
+        && error.message.includes(`expected ${expected}`),
+      `${capability} over [${coverage.join(', ')}] is rejected`,
+    );
+  }
+  // A genuine partial -- some kinds covered, not all -- still normalizes.
+  assert.equal(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history', 'tool_call'] })
+      .capability,
+    'partial',
+  );
+});
+
+function diagnostic(code: string, message: string): Record<string, unknown> {
+  return { code, message, durationMs: null, sourceBytes: null, recordsParsed: null };
+}
+
+function hydrationPart(
+  capability: 'full' | 'partial' | 'shallow_only',
+  coverage: readonly string[],
+  evidence: Partial<{ prompts: number; events: number; toolCalls: number; fileEdits: number }> = {},
+): ReturnType<typeof normalizeHydration> {
+  // A real partial result carries its own partial-coverage note, naming only
+  // the kinds *that* presence is missing.
+  const missing = FULL_SESSION_KINDS.filter((kind) => !coverage.includes(kind));
+  return normalizeHydration({
+    contractVersion: SESSION_HYDRATION_CONTRACT_VERSION,
+    source: 'claude', sessionId: SHARED_SESSION, status: 'hydrated',
+    capability, discoveryState: capability === 'full' ? 'full' : 'shallow', presence: 'local',
+    indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    evidence: {
+      prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0, ...evidence,
+    },
+    coverage: [...coverage],
+    relatedSessionIds: [],
+    diagnostics: [
+      diagnostic('HYDRATION_METRICS', `metrics for ${coverage.join('+') || 'nothing'}`),
+      ...(missing.length > 0
+        ? [diagnostic('HYDRATION_PARTIAL_COVERAGE', `no ${missing.join(', ')}`)]
+        : []),
+    ],
+  });
+}
+
+test('merging complementary partial presences yields a capability the union supports', () => {
+  // Neither connector is `full` on its own, but between them every kind in
+  // FULL_SESSION_KINDS is indexed. Carrying an input's `partial` through the
+  // merge ranked complete merged evidence below a single full result -- the
+  // same "capability that does not describe the coverage" defect one level up.
+  const a = hydrationPart('partial', ['history', 'session_event'], { prompts: 2, events: 5 });
+  const b = hydrationPart('partial', ['tool_call', 'file_edit', 'relationship'], { toolCalls: 3, fileEdits: 1 });
+
+  const merged = combineHydration(a, b);
+  assert.deepEqual(merged.coverage, [...FULL_SESSION_KINDS]);
+  assert.equal(merged.capability, 'full');
+  // Each part arrived with its own partial-coverage note naming kinds the
+  // other one covers. Concatenating them would leave a `full` result carrying
+  // a claim that four kinds are absent.
+  assert.deepEqual(
+    merged.diagnostics.filter((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE'),
+    [],
+  );
+  // Every other diagnostic is a per-presence fact and survives.
+  assert.deepEqual(
+    merged.diagnostics.map((item) => item.message),
+    ['metrics for history+session_event', 'metrics for tool_call+file_edit+relationship'],
+  );
+  // The union is what makes it full, so the evidence it reports must be the
+  // union too, not just the winning presence's.
+  assert.equal(merged.evidence.prompts, 2);
+  assert.equal(merged.evidence.events, 5);
+  assert.equal(merged.evidence.toolCalls, 3);
+  assert.equal(merged.evidence.fileEdits, 1);
+  // Order of folding must not change the verdict.
+  assert.equal(combineHydration(b, a).capability, 'full');
+  assert.deepEqual(combineHydration(b, a).coverage, [...FULL_SESSION_KINDS]);
+});
+
+test('merged status reports work from either presence regardless of capability or fold order', () => {
+  const unchanged = {
+    ...hydrationPart('full', FULL_SESSION_KINDS), status: 'unchanged' as const,
+    presence: 'local' as const,
+    indexedThrough: { sourceStamp: 'local-v1', lastEventAtMs: 1 },
+  };
+  const updated = {
+    ...hydrationPart('partial', ['history']), status: 'updated' as const,
+    presence: 'remote' as const,
+    indexedThrough: { sourceStamp: 'remote-v2', lastEventAtMs: 2 },
+  };
+  for (const merged of [combineHydration(unchanged, updated), combineHydration(updated, unchanged)]) {
+    assert.equal(merged.status, 'updated');
+    assert.equal(merged.presence, 'remote');
+    assert.deepEqual(merged.indexedThrough, updated.indexedThrough);
+    assert.equal(merged.capability, 'full');
+  }
+
+  const hydrated = { ...hydrationPart('partial', ['tool_call']), status: 'hydrated' as const };
+  assert.equal(combineHydration(updated, hydrated).status, 'hydrated');
+  assert.equal(combineHydration(hydrated, updated).status, 'hydrated');
+
+  const limited = { ...hydrationPart('shallow_only', []), status: 'capability_limited' as const };
+  assert.equal(combineHydration(unchanged, limited).status, 'unchanged');
+});
+
+test('a merge that is still short of full coverage stays partial, and empty coverage stays shallow_only', () => {
+  const short = combineHydration(
+    hydrationPart('partial', ['history']),
+    hydrationPart('partial', ['tool_call']),
+  );
+  assert.deepEqual(short.coverage, ['history', 'tool_call']);
+  assert.equal(short.capability, 'partial');
+  // Exactly one reconciled note, naming what the *union* still lacks -- not
+  // one per part, each naming kinds the other one supplied.
+  const reconciled = short.diagnostics.filter(
+    (item) => item.code === 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  assert.equal(reconciled.length, 1);
+  assert.equal(
+    reconciled[0].message,
+    'merged hydration covers history, tool_call; it does not cover session_event, file_edit, relationship',
+  );
+  assert.equal(short.diagnostics.filter((item) => item.code === 'HYDRATION_METRICS').length, 2);
+
+  // Two listing-only connectors covered nothing; `partial` would imply some
+  // evidence kind was indexed, so shallow_only survives.
+  const nothing = combineHydration(
+    hydrationPart('shallow_only', []),
+    hydrationPart('shallow_only', []),
+  );
+  assert.deepEqual(nothing.coverage, []);
+  assert.equal(nothing.capability, 'shallow_only');
+  assert.equal(
+    nothing.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE')?.message,
+    'merged hydration covers no evidence kinds; it does not cover '
+    + 'history, session_event, tool_call, file_edit, relationship',
+  );
+
+  // One of them did index something: no longer shallow_only.
+  assert.equal(
+    combineHydration(hydrationPart('shallow_only', []), hydrationPart('partial', ['history']))
+      .capability,
+    'partial',
+  );
+  // A single result is returned untouched.
+  assert.equal(combineHydration(undefined, hydrationPart('partial', ['history'])).capability, 'partial');
+});
+
+test('a merge does not infer provider inability from coverage the request declined', () => {
+  // scope: 'all' over two presences that *can* record delegation, hydrated
+  // with includeRelated: false. Each part's own note carries the reason the
+  // producing side knew ("include_related is off"); the merge does not, and a
+  // reason does not survive a union of presences that may have had different
+  // ones -- so the reconciled note must state what is uncovered and no more.
+  const thread = FULL_SESSION_KINDS.filter((kind) => kind !== 'relationship');
+  const local = hydrationPart('partial', thread);
+  const remote = hydrationPart('partial', thread);
+
+  const merged = combineHydration(local, remote);
+  assert.equal(merged.capability, 'partial');
+  assert.deepEqual(merged.coverage, [...thread]);
+  const reconciled = merged.diagnostics.filter(
+    (item) => item.code === 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  assert.equal(reconciled.length, 1);
+  assert.equal(
+    reconciled[0].message,
+    'merged hydration covers history, session_event, tool_call, file_edit; '
+    + 'it does not cover relationship',
+  );
+  // Both presences record delegation; only the request declined it. Any claim
+  // about a producer being unable to supply the kind would be false here.
+  for (const claim of [/no presence produces/, /cannot/, /does not produce/, /provider/i]) {
+    assert.doesNotMatch(reconciled[0].message, claim);
   }
 });
 

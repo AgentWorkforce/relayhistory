@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  SessionSourceUnavailableError,
+  FULL_SESSION_KINDS, SESSION_HYDRATION_CONTRACT_VERSION, SessionSourceUnavailableError,
   discoverSessions, getSessionEvents, getSessionEventsPage, getSessionFileEdits,
   getSessionToolCalls, hydrateSession, listSessionCatalogPage, recent, search, stats, sync,
   type CatalogCursor, type CatalogSession, type EventCursor,
@@ -98,6 +98,13 @@ test('local discovery, hydration and cached evidence survive malformed commercia
     const hydrated = await hydrateSession({ source: 'claude', sessionId: 'contract-session', dbPath });
     assert.equal(hydrated.presence, 'local');
     assert.equal(hydrated.discoveryState, 'full');
+    assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
+    assert.equal(hydrated.capability, 'full');
+    assert.deepEqual(hydrated.coverage, [...FULL_SESSION_KINDS]);
+    assert.equal(
+      hydrated.diagnostics.some((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE'),
+      false,
+    );
 
     const readEvidence = async () => ({
       events: await getSessionEvents('contract-session', { source: 'claude', dbPath, limit: 1 }),
@@ -140,6 +147,39 @@ test('local discovery, hydration and cached evidence survive malformed commercia
   });
 });
 
+async function cursorSession(home: string, sessionId: string): Promise<void> {
+  const directory = join(home, '.cursor', 'projects', 'work-contract', 'agent-transcripts', sessionId);
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, `${sessionId}.jsonl`), `${JSON.stringify({
+    role: 'user', message: { content: 'cursorneedle prompt' },
+  })}\n`);
+}
+
+// The bug this replaced: a prompt-only provider reported `full`, so the SDK's
+// merge ranking preferred it over a presence that actually had the events.
+test('a prompt-only provider reports partial capability and names the evidence nobody parsed', async () => {
+  await withFixture(async ({ home, dbPath }) => {
+    await cursorSession(home, 'cursor-contract');
+    await discoverSessions({ dbPath, scope: 'local', sources: ['cursor'] });
+    const hydrated = await hydrateSession({ source: 'cursor', sessionId: 'cursor-contract', dbPath });
+
+    assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
+    assert.equal(hydrated.capability, 'partial');
+    assert.deepEqual(hydrated.coverage, ['history']);
+    // Partial is about the kinds no parser produces, not about this pass
+    // having failed: the prompt it can read did land.
+    assert.equal(hydrated.evidence.prompts, 1);
+    assert.equal(hydrated.evidence.events, 0);
+    assert.equal((await search('cursorneedle', { dbPath, scope: 'local' })).length, 1);
+
+    const partial = hydrated.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE');
+    assert.ok(partial, 'a partial hydration names its missing evidence kinds');
+    for (const kind of FULL_SESSION_KINDS.filter((item) => item !== 'history')) {
+      assert.ok(partial.message.includes(kind), `${kind} is named: ${partial.message}`);
+    }
+  });
+});
+
 test('catalog cursors retain tied session identities and hydration failure leaves cached evidence readable', async () => {
   await withFixture(async ({ home, dbPath }) => {
     const paths = await Promise.all(['session-c', 'session-a', 'session-b'].map((id) => claudeSession(home, id)));
@@ -168,5 +208,46 @@ test('catalog cursors retain tied session identities and hydration failure leave
     );
     assert.deepEqual(await getSessionEvents('session-c', { source: 'claude', dbPath }), before);
     assert.deepEqual((await listSessionCatalogPage({ dbPath, scope: 'local', limit: 100 })).sessions, all.sessions);
+  });
+});
+
+test('per-message raw provider facts reach the SDK unnormalized', async () => {
+  await withFixture(async ({ home, dbPath }) => {
+    const directory = join(home, '.claude', 'projects', '-work-facts');
+    await mkdir(directory, { recursive: true });
+    const common = { sessionId: 'facts-session', cwd: '/work/facts', version: '2.1.96' };
+    await writeFile(join(directory, 'facts-session.jsonl'), [
+      { ...common, type: 'user', uuid: 'facts-user', timestamp: '2026-09-01T10:00:00.000Z',
+        message: { role: 'user', content: 'contractneedle facts' } },
+      // Still in flight: no stop_reason, and the SDK must report that as null
+      // rather than inventing a terminal reason.
+      { ...common, type: 'assistant', uuid: 'facts-open', parentUuid: 'facts-user', requestId: 'req_open',
+        isSidechain: false, timestamp: '2026-09-01T10:00:01.000Z',
+        message: { role: 'assistant', stop_reason: null, content: [{ type: 'text', text: 'working' }] } },
+      { ...common, type: 'assistant', uuid: 'facts-done', parentUuid: 'facts-open', requestId: 'req_done',
+        isSidechain: false, timestamp: '2026-09-01T10:00:02.000Z',
+        message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'finished' }] } },
+    ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+
+    await discoverSessions({ dbPath, scope: 'local', sources: ['claude'] });
+    await hydrateSession({ source: 'claude', sessionId: 'facts-session', dbPath });
+
+    const events = await getSessionEvents('facts-session', { source: 'claude', dbPath });
+    assert.deepEqual(
+      events.map((event) => [event.requestId, event.stopReason, event.agentVersion, event.isSidechain]),
+      [
+        // The opening human turn records no flag at all, and a provider that
+        // never says either way leaves it null -- a different fact from false.
+        [null, null, '2.1.96', null],
+        ['req_open', null, '2.1.96', false],
+        ['req_done', 'end_turn', '2.1.96', false],
+      ],
+    );
+    assert.deepEqual(events.map((event) => event.isMeta), [null, null, null]);
+    assert.deepEqual(events.map((event) => event.turnId), [null, null, null]);
+
+    // A page carries the same shape as the whole-session read.
+    const page = await getSessionEventsPage('facts-session', { source: 'claude', dbPath });
+    assert.deepEqual(page.events, events);
   });
 });

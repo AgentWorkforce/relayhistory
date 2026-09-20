@@ -185,11 +185,16 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
       cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(hydrated.contract_version, 2);
+    assert.equal(hydrated.contract_version, 3);
     assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
       `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
+    // Claude's parser produces every kind, so `full` is a computed answer here
+    // rather than the literal every provider used to receive.
+    assert.deepEqual(hydrated.coverage, [
+      'history', 'session_event', 'tool_call', 'file_edit', 'relationship',
+    ]);
     assert.deepEqual(hydrated.evidence, {
       prompts: 1, events: 1, tool_calls: 0, file_edits: 0, related_sessions: 0,
     });

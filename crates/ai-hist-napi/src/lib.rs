@@ -295,6 +295,12 @@ pub struct NativeSessionEvent {
     pub error_signal: Option<String>,
     pub subagent_session_id: Option<String>,
     pub agent_id: Option<String>,
+    pub request_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub agent_version: Option<String>,
+    pub is_sidechain: Option<bool>,
+    pub is_meta: Option<bool>,
+    pub turn_id: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -327,6 +333,12 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             error_signal: event.error_signal,
             subagent_session_id: event.subagent_session_id,
             agent_id: event.agent_id,
+            request_id: event.request_id,
+            stop_reason: event.stop_reason,
+            agent_version: event.agent_version,
+            is_sidechain: event.is_sidechain.map(|value| value != 0),
+            is_meta: event.is_meta.map(|value| value != 0),
+            turn_id: event.turn_id,
         }
     }
 }
@@ -1245,6 +1257,10 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Evidence kinds this hydration can have indexed, as wire names
+    /// (`history`, `session_event`, `tool_call`, `file_edit`,
+    /// `relationship`, `commit_link`).
+    pub coverage: Vec<String>,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -1306,6 +1322,11 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
+        coverage: result
+            .coverage
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
         related_session_ids: result.related_session_ids,
         diagnostics: result
             .diagnostics

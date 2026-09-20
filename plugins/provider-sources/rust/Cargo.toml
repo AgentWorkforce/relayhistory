@@ -1,6 +1,6 @@
 [package]
 name = "history-provider-sources"
-version = "0.18.8"
+version = "0.20.0"
 edition = "2021"
 license = "MIT"
 

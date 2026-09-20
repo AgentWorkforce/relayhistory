@@ -1,0 +1,46 @@
+{
+  "corpus_files": [
+    "codex/session-meta-relationships.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/session-meta-relationships",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_meta_child",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "`sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta`",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "0.130.0",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776988800000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776988800300,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-session-meta-relationships.jsonl",
+      "repo_url": null,
+      "session_id": "sess_meta_child",
+      "source": "codex",
+      "source_stamp": "<n>:1170",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

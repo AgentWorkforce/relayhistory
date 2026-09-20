@@ -1,0 +1,174 @@
+{
+  "corpus_files": [
+    "claude/replacement-meta.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/replacement-meta",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "search the repo",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "replacement-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "edit metadata only reaches the log on the tool_result, not on the tool_use",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "search the repo",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "relaywash__Search {\"query\":\"foo\"}",
+      "token_json": "{\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "Read /src/a.ts",
+      "token_json": "{\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "results...",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "contents...",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "text": "done",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100,\"input_tokens\":50,\"output_tokens\":10}",
+      "ts_ms": 1776643203000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "search the repo",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643203000,
+      "last_assistant_text": "done",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/replacement-meta.jsonl",
+      "repo_url": null,
+      "session_id": "replacement-session",
+      "source": "claude",
+      "source_stamp": "<n>:1674",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"file_path\":\"/src/a.ts\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Read",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "target": "/src/a.ts",
+      "tool_use_id": "tu_read_1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"query\":\"foo\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "relaywash__Search",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "tu_search_1",
+      "ts_ms": 1776643201000
+    }
+  ]
+}

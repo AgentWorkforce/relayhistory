@@ -1,6 +1,9 @@
-use ai_hist::{observations, SessionEvent};
+use ai_hist::{observations, EvidenceKind, EvidenceRecord, SessionEvent};
 use ai_hist::{
-    sources::{AcquiredEvidence, ConnectorEvidence, ConnectorIdentity, SourceRegistry},
+    sources::{
+        AcquiredEvidence, ConnectorEvidence, ConnectorIdentity, NormalizedSourceEvidence,
+        SourceRegistry,
+    },
     Candidate, DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, ScanEnv, SessionLocation,
     SessionScope, ShallowSession, ShallowSessionProvider,
 };
@@ -95,6 +98,12 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         error_signal: None,
         subagent_session_id: None,
         agent_id: None,
+        request_id: None,
+        stop_reason: None,
+        agent_version: None,
+        is_sidechain: None,
+        is_meta: None,
+        turn_id: None,
     }
 }
 impl ShallowSessionProvider for Fixture {
@@ -194,6 +203,130 @@ fn hydration() -> HydrateSessionOptions {
         scope: SessionScope::Remote,
         include_related: false,
     }
+}
+
+/// A connector that hands back a normalized snapshot containing a delegation
+/// edge, whatever the caller asked for.
+///
+/// `ShallowSessionProvider::acquire` takes no `include_related`, so this is not
+/// a misbehaving adapter -- it is every adapter that has not been told, which
+/// includes any third-party one. The option is a property of the request, so
+/// the engine has to enforce it rather than trust each connector to.
+#[derive(Clone)]
+struct RelatedFixture;
+impl RelatedFixture {
+    fn identity(&self) -> ConnectorIdentity {
+        ConnectorIdentity::new("related", "default")
+    }
+    fn locator(&self) -> String {
+        "related://default/session".to_string()
+    }
+}
+impl ShallowSessionProvider for RelatedFixture {
+    fn connector_id(&self) -> &str {
+        "related"
+    }
+    fn source(&self) -> &'static str {
+        "claude"
+    }
+    fn location(&self) -> SessionLocation {
+        SessionLocation::Remote
+    }
+    fn enumerate(&self, _env: &DiscoveryEnv<'_>, _limit: Option<usize>) -> Result<Vec<Candidate>> {
+        Ok(vec![Candidate {
+            source: "claude",
+            locator: self.locator(),
+            session_id: Some("session".into()),
+            recency_hint_ms: Some(1),
+            stamp: "v1".into(),
+        }])
+    }
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(Some(ShallowSession {
+            source: "claude".into(),
+            session_id: "session".into(),
+            raw_path: Some(self.locator()),
+            ..Default::default()
+        }))
+    }
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &observations::SessionObservation,
+    ) -> Result<AcquiredEvidence> {
+        Ok(AcquiredEvidence::Normalized(NormalizedSourceEvidence {
+            source_stamp: "v1".into(),
+            source_bytes: 2,
+            covered_kinds: vec![EvidenceKind::SessionEvent, EvidenceKind::Relationship],
+            records: vec![
+                EvidenceRecord {
+                    kind: EvidenceKind::SessionEvent,
+                    payload: serde_json::json!({"source":"claude","session_id":"session","event_uid":"turn","role":"assistant","kind":"text","ts_ms":1,"text":"answer"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    record_id: None,
+                    revision_id: None,
+                },
+                EvidenceRecord {
+                    kind: EvidenceKind::Relationship,
+                    payload: serde_json::json!({"source":"claude","parent_session_id":"session","relationship_uid":"child-1","child_session_id":"child","relationship":"delegated","identity_status":"observed","evidence_kind":"transcript","created_ms":1,"updated_ms":1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    record_id: None,
+                    revision_id: None,
+                },
+            ],
+        }))
+    }
+}
+
+fn edges(db: &Path) -> Result<i64> {
+    Ok(ai_hist::open_db(db)?.query_row(
+        "SELECT COUNT(*) FROM session_relationships",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// `include_related: false` asks for the selected thread alone. Honouring it
+/// only in the response -- suppressing related ids while still writing the edge
+/// and reporting `relationship` coverage -- tells the caller their opt-out was
+/// applied when the evidence went in anyway.
+#[test]
+fn declining_related_evidence_is_enforced_against_a_provider_that_returns_it() -> Result<()> {
+    let fixture = RelatedFixture;
+    let mut registry = SourceRegistry::new();
+    registry.register(Box::new(fixture.clone()))?;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
+
+    let thread_only = registry.hydrate_at(&db, &hydration(), &fixture.identity())?;
+    assert!(
+        !thread_only.coverage.contains(&EvidenceKind::Relationship),
+        "coverage still claims delegation: {:?}",
+        thread_only.coverage
+    );
+    assert_eq!(thread_only.capability, "partial");
+    assert!(thread_only.related_session_ids.is_empty());
+    assert_eq!(edges(&db)?, 0, "the declined edge was persisted anyway");
+
+    // Positive control: the same snapshot, asked for in full. Without this the
+    // assertions above would also pass for a fixture whose edge never arrived.
+    let mut related = hydration();
+    related.include_related = true;
+    let full = registry.hydrate_at(&db, &related, &fixture.identity())?;
+    assert!(full.coverage.contains(&EvidenceKind::Relationship));
+    assert_eq!(edges(&db)?, 1);
+    assert_eq!(full.related_session_ids, vec!["child".to_string()]);
+    Ok(())
 }
 
 #[test]

@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export const SESSION_CATALOG_CONTRACT_VERSION = 4;
-export const SESSION_HYDRATION_CONTRACT_VERSION = 2;
+export const SESSION_HYDRATION_CONTRACT_VERSION = 3;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 1;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 2;
 
@@ -23,6 +23,31 @@ export const SOURCES = Object.freeze([
 ] as const);
 
 export type Source = (typeof SOURCES)[number];
+
+/**
+ * The evidence kinds a provider adapter can produce, in the canonical order
+ * the native layer reports them. Kept as a value so runtime validation and
+ * the compile-time type cannot drift apart.
+ */
+export const EVIDENCE_KINDS = Object.freeze([
+  'history',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'relationship',
+  'commit_link',
+] as const);
+
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/** The kinds a session must cover for hydration to report `full`. */
+export const FULL_SESSION_KINDS: readonly EvidenceKind[] = Object.freeze([
+  'history',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'relationship',
+] as const);
 export type CatalogSource = Exclude<Source, 'trajectory'>;
 export const CATALOG_SOURCES: readonly CatalogSource[] = Object.freeze(
   SOURCES.filter((source): source is CatalogSource => source !== 'trajectory'),

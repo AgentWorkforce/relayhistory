@@ -256,7 +256,9 @@ mod tests {
                 event_source TEXT,
                 error_signal TEXT,
                 subagent_session_id TEXT,
-                agent_id TEXT
+                agent_id TEXT,
+                request_id TEXT, stop_reason TEXT, agent_version TEXT,
+                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
             );",
         )
         .unwrap();

@@ -121,11 +121,11 @@ burn needs:
 | burn field                                                           | Status                                                                                                         |
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `message_id`, `ts`                                                   | present                                                                                                        |
-| `tool_use_id`                                                        | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — parsed, then discarded; no column |
-| `is_error` (result-level)                                            | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — only a per-call boolean exists    |
-| `status`, `event_source`                                             | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
-| `call_index`, `event_index`                                          | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171) — ordering must be stable           |
-| `content_length`, `output_bytes`, `output_truncated`, `content_hash` | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
+| `tool_use_id`                                                        | present for Claude and Codex                                                                                   |
+| `is_error` (result-level)                                            | present as `result_status` / `error_signal`; user-turn blocks expose the three-state projection                |
+| `status`, `event_source`                                             | present for Claude and Codex                                                                                   |
+| `call_index`, `event_index`                                          | present for Claude and Codex; stable across re-parses                                                          |
+| `content_length`, `output_bytes`, `output_truncated`, `content_hash` | present as `payload_bytes`, `payload_truncated`, and `payload_hash` for Claude and Codex                       |
 | `usage`, `usage_attribution`                                         | **TODO** [#172](https://github.com/AgentWorkforce/relayhistory/issues/172)                                     |
 | `subagent_session_id`, `agent_id`                                    | **TODO** [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                     |
 | `replaced_tools`, `collapsed_calls`                                  | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
@@ -141,7 +141,10 @@ Blocks of a human turn with `byte_len`, `approx_tokens`, `tool_use_id` and
 ledger stores the prompt text and the surrounding events but no per-block
 accounting.
 
-**TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171).
+Shipped for Claude and Codex as `SessionStore::session_user_turns_page` and
+the corresponding Node/TypeScript page and pagination helpers. Blocks carry
+`byte_len`, `tool_use_id`, and three-state `is_error`; `approx_tokens` remains
+consumer-derived rather than presenting a heuristic as measured evidence.
 
 ## 7. Request identity — `RequestIdLookup`
 

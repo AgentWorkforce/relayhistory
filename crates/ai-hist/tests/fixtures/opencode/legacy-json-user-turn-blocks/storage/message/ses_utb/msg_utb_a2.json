@@ -1,0 +1,17 @@
+{
+  "id": "msg_utb_a2",
+  "sessionID": "ses_utb",
+  "role": "assistant",
+  "time": { "created": 1776990003000 },
+  "parentID": "msg_utb_u2",
+  "providerID": "anthropic",
+  "modelID": "claude-opus-4-5",
+  "path": { "cwd": "/tmp/project", "root": "/tmp/project" },
+  "cost": 0,
+  "tokens": {
+    "input": 8,
+    "output": 10,
+    "reasoning": 0,
+    "cache": { "read": 12, "write": 21 }
+  }
+}
