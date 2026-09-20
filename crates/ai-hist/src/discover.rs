@@ -431,11 +431,23 @@ impl WatchRoot {
 
     /// The path actually handed to the filesystem backend.
     ///
-    /// Only a [`WatchDepth::File`] root differs from the path it names; a file
-    /// with no parent at all (a bare relative name) registers itself.
+    /// Only a [`WatchDepth::File`] root differs from the path it names: it is
+    /// registered through its parent directory.
+    ///
+    /// A bare relative name has an *empty* parent rather than no parent —
+    /// `Path::new("trajectory.json").parent()` is `Some("")` — and the empty
+    /// path exists nowhere, so registering it fails and the root sits in
+    /// `pending` for the life of the process while its source is only ever
+    /// polled. The directory that name is relative to is the working
+    /// directory, so that is what gets registered. A nested relative path and
+    /// an absolute one already name their parent and are unchanged.
     pub fn registered_path(&self) -> &Path {
         match self.depth {
-            WatchDepth::File => self.path.parent().unwrap_or(self.path.as_path()),
+            WatchDepth::File => match self.path.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+                Some(parent) => parent,
+                None => self.path.as_path(),
+            },
             _ => self.path.as_path(),
         }
     }

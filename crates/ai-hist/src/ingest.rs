@@ -5442,6 +5442,29 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+    /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and its parent is
+    /// the empty path rather than no path at all. Registering the empty path
+    /// fails every existence check, so such a root would sit in `pending`
+    /// forever and its trajectories would only ever be found by the backstop.
+    #[test]
+    fn a_bare_relative_file_root_is_registered_through_the_working_directory() {
+        let bare = super::trajectory_watch_root(PathBuf::from("trajectory.json"));
+        assert_eq!(bare.depth, crate::discover::WatchDepth::File);
+        assert_eq!(bare.registered_path(), Path::new("."));
+        assert!(bare.covers(Path::new("trajectory.json")));
+        assert!(
+            !bare.covers(Path::new("other.json")),
+            "registering the working directory must not widen what the root covers"
+        );
+
+        // Positive controls: the paths that already named a parent keep it,
+        // so the fix is confined to the case that had none.
+        let nested = super::trajectory_watch_root(PathBuf::from("runs/trajectory.json"));
+        assert_eq!(nested.registered_path(), Path::new("runs"));
+        let absolute = super::trajectory_watch_root(PathBuf::from("/home/someone/trajectory.json"));
+        assert_eq!(absolute.registered_path(), Path::new("/home/someone"));
+    }
+
     /// A `TRAJECTORY_ROOT` naming one JSON file must not promote its parent —
     /// often `$HOME`, sometimes `/` — into a watched tree.
     #[test]
