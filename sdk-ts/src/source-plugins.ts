@@ -1,5 +1,6 @@
 import { nativeCall } from './native.js';
 import {
+  SESSION_HYDRATION_CONTRACT_VERSION,
   RelayHistoryError,
   AuthenticationExpiredError,
   SessionNotFoundError,
@@ -8,7 +9,6 @@ import {
   InvalidArgumentError,
   ConnectorFailureError,
   ConnectorNotConfiguredError,
-  SESSION_HYDRATION_CONTRACT_VERSION,
   type CatalogSource,
 } from './sdk-common.js';
 import type {
@@ -180,7 +180,12 @@ export async function discoverSourcePlugins(
 export async function hydrateSourcePlugin(
   connector: HistorySource,
   identity: { source: CatalogSource; sessionId: string },
-  options: { dbPath?: string; signal?: AbortSignal; acquisitionTimeoutMs?: number } = {},
+  options: {
+    dbPath?: string;
+    signal?: AbortSignal;
+    acquisitionTimeoutMs?: number;
+    includeRelated?: boolean;
+  } = {},
 ) {
   sourceAcquisitionTimeout(options.acquisitionTimeoutMs);
   throwIfSourceAborted(options.signal);
@@ -201,7 +206,12 @@ export async function hydrateSourcePlugin(
   let snapshot;
   try {
     snapshot = await acquire(
-      (signal, acquisitionTimeoutMs) => connector.hydrate(state.observation!, { signal, acquisitionTimeoutMs }),
+      // `includeRelated` is part of the request, not of the transport: a
+      // connector that keeps acquiring delegation evidence would reinstate,
+      // through the merge union, the kind the local path dropped.
+      (signal, acquisitionTimeoutMs) => connector.hydrate(state.observation!, {
+        signal, acquisitionTimeoutMs, includeRelated: options.includeRelated,
+      }),
       options,
     );
   } catch (error) {
@@ -232,6 +242,8 @@ export async function hydrateSourcePlugin(
       // hands this object straight back, so omitting it published a result
       // that did not satisfy the type it claims to be.
       bytes_read: 0,
+      // A listing-only connector covers nothing; it is not a partial parse.
+      coverage: [],
       related_session_ids: [],
       diagnostics: [
         {
@@ -251,6 +263,10 @@ export async function hydrateSourcePlugin(
             ...key,
             db_path: options.dbPath,
             expected_revision: state.revision,
+            // Reaches intake as well as the connector: the result it builds
+            // reports related sessions, and a request that declined them must
+            // not come back listing them.
+            include_related: options.includeRelated,
             source_stamp: snapshot.source_stamp,
             source_bytes: snapshot.source_bytes,
             covered_kinds: snapshot.covered_kinds,

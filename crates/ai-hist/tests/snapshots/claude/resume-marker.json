@@ -1,0 +1,105 @@
+{
+  "corpus_files": [
+    "claude/resume-marker.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/resume-marker",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "/resume 11111111-1111-1111-1111-111111111111",
+      "session_id": "99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "timestamp_ms": 1776729600000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "the first user record is a `/resume <sessionId>` marker naming the prior session",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-resume-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-resume-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "text": "/resume 11111111-1111-1111-1111-111111111111",
+      "token_json": null,
+      "ts_ms": 1776729600000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-r:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-r",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-resume-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "text": "Continuing the prior session.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":5,\"output_tokens\":3}",
+      "ts_ms": 1776729601000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 1,
+      "child_model": null,
+      "child_session_id": "99999999-9999-9999-9999-999999999999",
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/resume-marker.jsonl",
+      "evidence_ref": "resume-marker",
+      "identity_status": "observed",
+      "parent_session_id": "11111111-1111-1111-1111-111111111111",
+      "relationship": "resume",
+      "relationship_uid": "resume:99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776729600000
+    }
+  ],
+  "sessions": [
+    {
+      "agent_version": "2.1.97",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776729600000,
+      "first_prompt": "/resume 11111111-1111-1111-1111-111111111111",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776729601000,
+      "last_assistant_text": "Continuing the prior session.",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/resume-marker.jsonl",
+      "repo_url": null,
+      "session_id": "99999999-9999-9999-9999-999999999999",
+      "source": "claude",
+      "source_stamp": "<n>:815",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

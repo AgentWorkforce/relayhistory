@@ -58,6 +58,10 @@ pub struct ApplyEvidenceRequest {
     #[serde(flatten)]
     pub key: ObservationKey,
     pub expected_revision: String,
+    /// Absent means the caller did not say, which keeps the historical
+    /// behaviour of reporting related sessions.
+    #[serde(default)]
+    pub include_related: Option<bool>,
     #[serde(flatten)]
     pub evidence: NormalizedSourceEvidence,
 }
@@ -78,6 +82,7 @@ pub fn apply_source_evidence(mut request: ApplyEvidenceRequest) -> Result<Hydrat
         &request.key,
         &request.expected_revision,
         request.evidence,
+        request.include_related.unwrap_or(true),
         Instant::now(),
     )
 }
@@ -100,7 +105,13 @@ struct ManagedRecord {
 #[derive(Default, Serialize, Deserialize)]
 struct RecordSnapshot {
     format: String,
+    /// Everything this connector has ever covered. Only grows: not covering a
+    /// kind does not withdraw the records an earlier pass contributed.
     covered_kinds: Vec<EvidenceKind>,
+    /// What the *last* acquisition covered. The accumulated set above cannot
+    /// answer whether this pass narrowed, because it never shrinks.
+    #[serde(default)]
+    acquired_kinds: Option<Vec<EvidenceKind>>,
     records: Vec<ManagedRecord>,
 }
 fn read_snapshot(conn: &Connection, key: &ObservationKey) -> Result<RecordSnapshot> {
@@ -129,6 +140,9 @@ fn read_snapshot(conn: &Connection, key: &ObservationKey) -> Result<RecordSnapsh
             Ok(RecordSnapshot {
                 format: "records".into(),
                 covered_kinds: vec![EvidenceKind::SessionEvent],
+                // A migrated snapshot never recorded what its last acquisition
+                // covered, so the next pass cannot prove it was unchanged.
+                acquired_kinds: None,
                 records,
             })
         }
@@ -154,6 +168,7 @@ pub(crate) fn apply_normalized(
     key: &ObservationKey,
     expected: &str,
     mut evidence: NormalizedSourceEvidence,
+    include_related: bool,
     started: Instant,
 ) -> Result<HydrateSessionResult> {
     validate(key, &mut evidence)?;
@@ -173,6 +188,26 @@ pub(crate) fn apply_normalized(
     // is leave this request reading entries from before this request began,
     // which is the property that matters.
     crate::project_identity::begin_acquisition_pass();
+    // Enforced here rather than asked of each connector.
+    //
+    // `ShallowSessionProvider::acquire` takes no `include_related`, and for
+    // Claude's full export the engine derives the edges from a transcript the
+    // connector merely handed over -- so a connector cannot honour the option
+    // even when it wants to, and a third-party one has never been told about
+    // it. The option is a property of the request, so the boundary that owns
+    // the request enforces it: every path into intake, in-process provider and
+    // napi plugin alike, passes through here. Validation runs first, so a
+    // malformed relationship record is still rejected rather than quietly
+    // dropped. The plugin-side handling stays as an optimization -- do not
+    // fetch or ship what was not asked for -- not as what correctness rests on.
+    if !include_related {
+        evidence
+            .covered_kinds
+            .retain(|kind| *kind != EvidenceKind::Relationship);
+        evidence
+            .records
+            .retain(|record| record.kind != EvidenceKind::Relationship);
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure!(
         observations::revision(&tx, key)?.as_deref() == Some(expected),
@@ -230,6 +265,7 @@ pub(crate) fn apply_normalized(
     }
     let mut own = snapshots.remove(&owner(key)).unwrap_or_default();
     let prior_records = own.records.clone();
+    let prior_kinds = own.acquired_kinds.take();
     own.format = "records".into();
     own.records
         .retain(|item| !evidence.covered_kinds.contains(&item.record.kind));
@@ -246,14 +282,42 @@ pub(crate) fn apply_normalized(
     }
     own.records
         .sort_by_cached_key(|item| item.record.identity());
+    // Coverage is part of the result, not just bookkeeping: an acquisition that
+    // covers a different set from the last one changes the capability even when
+    // it adds or removes no row. Compared against the *last acquisition's* set
+    // rather than the accumulated one, which only grows and so can only ever
+    // notice widening -- a later narrowing pass would report `partial` while
+    // calling itself `unchanged`, and a consumer that skips work on `unchanged`
+    // would keep the earlier `full` ranking. A snapshot written before this
+    // field existed has no previous set to compare, so it is not unchanged.
+    own.acquired_kinds = Some(evidence.covered_kinds.clone());
     let unchanged = own.records == prior_records
+        && prior_kinds.as_deref() == Some(evidence.covered_kinds.as_slice())
         && previous.as_ref().is_some_and(|checkpoint| {
             checkpoint.source_stamp.as_deref() == Some(&evidence.source_stamp)
         });
     observations::save_evidence(&tx, key, &serde_json::to_value(&own)?)?;
+    // The accumulated set models what this connector's snapshot as a whole
+    // still asserts, which is what the stored `discovery_state` is about: an
+    // acquisition that did not cover a kind does not withdraw the records an
+    // earlier one contributed.
     let full = FULL_SESSION_KINDS
         .iter()
         .all(|kind| own.covered_kinds.contains(kind));
+    // The result's `coverage` is a different question: what *this* acquisition
+    // examined. Reporting the accumulated set would let a later
+    // `include_related: false` snapshot inherit `relationship` from an earlier
+    // one and read as `full` despite the opt-out -- the same "nobody looked"
+    // overstatement this contract removes, arriving through retained state
+    // instead of a literal. Canonical order, so the wire shape does not depend
+    // on how a connector ordered its declaration.
+    let coverage = evidence
+        .covered_kinds
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     snapshots.insert(owner(key), own);
     let mut union = BTreeMap::new();
     let mut managed = BTreeSet::new();
@@ -282,7 +346,9 @@ pub(crate) fn apply_normalized(
         &evidence.source_stamp,
         evidence.source_bytes,
         evidence.records.len() as i64,
-        false,
+        // What this acquisition actually did, so the stored checkpoint cannot
+        // contradict a hydration that did index delegation.
+        include_related,
         full,
         // A remote connector delivers records, not a growing local file:
         // there is no byte position in the source to resume from.
@@ -306,7 +372,10 @@ pub(crate) fn apply_normalized(
         } else {
             SessionScope::Remote
         },
-        include_related: true,
+        // The request's own answer, not an assumption: with it hardcoded, a
+        // hydration that declined related evidence still came back listing
+        // related sessions and counting them.
+        include_related,
     };
     crate::hydrate::build_remote_result(
         conn,
@@ -318,8 +387,13 @@ pub(crate) fn apply_normalized(
         } else {
             "hydrated"
         },
-        if full { "full" } else { "partial" },
+        // Capability follows this acquisition's coverage, not the accumulated
+        // set, or it would contradict the `coverage` beside it -- which the SDK
+        // re-derives and rejects on mismatch. `discovery_state` keeps following
+        // the stored row.
+        crate::hydrate::capability_for(&coverage),
         if full { "full" } else { "shallow" },
+        coverage,
         evidence.source_stamp,
         evidence.source_bytes,
         evidence.records.len() as i64,

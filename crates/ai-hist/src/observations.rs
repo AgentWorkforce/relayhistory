@@ -364,7 +364,11 @@ fn save_evidence_inner(
                 .context("normalized records are required")?;
             records.insert(
                 "manifest".into(),
-                json!({"format":format,"covered_kinds":payload["covered_kinds"]}),
+                // `acquired_kinds` rides the manifest beside the accumulated
+                // set: the shredded rows carry records, and a pass that
+                // narrowed coverage is only detectable against what the last
+                // acquisition covered.
+                json!({"format":format,"covered_kinds":payload["covered_kinds"],"acquired_kinds":payload["acquired_kinds"]}),
             );
             for (index, item) in items.iter().enumerate() {
                 let record: crate::source_evidence::EvidenceRecord =
@@ -475,7 +479,7 @@ pub fn evidence(conn: &Connection, key: &ObservationKey) -> Result<Option<serde_
     );
     Ok(Some(match format {
         "records" => {
-            json!({"format":format,"covered_kinds":rows.iter().find_map(|row|row.get("covered_kinds")).context("missing snapshot manifest")?,"records":rows.iter().filter_map(|row|row.get("item")).collect::<Vec<_>>()})
+            json!({"format":format,"covered_kinds":rows.iter().find_map(|row|row.get("covered_kinds")).context("missing snapshot manifest")?,"acquired_kinds":rows.iter().find_map(|row|row.get("acquired_kinds")).cloned().unwrap_or(Value::Null),"records":rows.iter().filter_map(|row|row.get("item")).collect::<Vec<_>>()})
         }
         "events" => {
             json!({"format":format,"events":rows.iter().filter_map(|row|row.get("event")).collect::<Vec<_>>(),"managed":rows.iter().filter(|row|row.get("managed").and_then(Value::as_bool)==Some(true)).filter_map(|row|row.get("event").and_then(|event|event.get("event_uid"))).collect::<Vec<_>>()})

@@ -133,8 +133,10 @@ pub(crate) struct TranscriptFileCursor {
 /// Claude's per-source resume state.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ClaudeCursorState {
-    /// Absolute index of the next record, so the fallback event identity for a
-    /// record with neither `uuid` nor `message.id` survives a resume.
+    /// Absolute index of the next record. Bookkeeping for the commit and the
+    /// rewind below, not identity: a record carrying neither `uuid` nor
+    /// `message.id` is identified by a hash of its bytes, because compaction
+    /// rewrites a transcript's prefix and every position after it shifts.
     #[serde(default)]
     pub next_line_index: usize,
     /// `message.id`s whose assistant message had not finished when the last
@@ -152,13 +154,24 @@ pub(crate) struct ClaudeCursorState {
     /// reads it again rather than resuming after a line it only half saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_from: Option<u64>,
-    /// The record index that goes with `resume_from`, so a rewound pass gives
-    /// the record the same fallback identity it had before.
+    /// The record index that goes with `resume_from`, so a rewound pass counts
+    /// from where it rewound to rather than from where it stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_line_index: Option<usize>,
     /// The metadata walk's position and fold over the same file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ClaudeScanState>,
+    /// Tool-result ordering as of the committed offset.
+    ///
+    /// `call_index` and `event_index` are assigned over the whole transcript,
+    /// so a pass that resumes has to continue the sequence rather than restart
+    /// it — two results numbered zero would collide on the conflict upsert.
+    #[serde(default, skip_serializing_if = "is_default_indexer")]
+    pub tool_results: super::tool_result_facts::ToolResultIndexer,
+}
+
+fn is_default_indexer(indexer: &super::tool_result_facts::ToolResultIndexer) -> bool {
+    *indexer == super::tool_result_facts::ToolResultIndexer::default()
 }
 
 /// The metadata walk's own resumable position and running fold.
@@ -198,6 +211,12 @@ pub(crate) struct CodexCursorState {
     pub untokened_assistant_uid: Option<String>,
     #[serde(default)]
     pub saw_model_output: bool,
+    /// The turn a record falls inside, carried from the last `turn_context`.
+    /// Codex writes it once per turn rather than on every record, so a pass
+    /// that resumed mid-turn cannot re-derive it from the bytes it reads and
+    /// would stamp the rest of the turn with nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// The adjacent-mirror deduper's one-record memory, as
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,6 +517,33 @@ pub(crate) fn forget_locator_cursor(conn: &Connection, source: &str, path: &Path
     Ok(())
 }
 
+/// Every locator this source has a cursor for, as recorded.
+///
+/// The cursor table is what replaced the sync state's `path -> stamp` maps, so
+/// it is also what answers the question those maps used to: which files does
+/// this install know about, as against which files did this walk enumerate. A
+/// path the cursors name and the walk did not return is not absent — it is
+/// unavailable on this run, and its rows are still there.
+pub(crate) fn known_locators(conn: &Connection, source: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare("SELECT locator FROM transcript_cursors WHERE source = ?")?;
+    let rows = statement
+        .query_map(params![source], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Drop the cursor recorded for `locator` exactly as stored.
+///
+/// [`forget_locator_cursor`] takes a path this run holds; this takes a locator
+/// read back out of the table, which may name a file this run cannot see.
+pub(crate) fn forget_locator(conn: &Connection, source: &str, locator: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM transcript_cursors WHERE source = ? AND locator = ?",
+        params![source, locator],
+    )?;
+    Ok(())
+}
+
 /// Whether a cursor has ever been recorded for `path` under `source`.
 ///
 /// Distinguishes "this file has never existed" from "this file was indexed and
@@ -613,6 +659,9 @@ pub(crate) struct TranscriptReader {
     start_offset: u64,
     /// Bytes of an unterminated trailing record handed to the caller.
     tail_bytes: u64,
+    /// Records decoded as UTF-8, and records that were not.
+    decoded: u64,
+    undecodable: u64,
     /// Provider bytes spent validating this transcript rather than reading
     /// records from it: the windows hashed at open, and at commit. Bounded —
     /// at most `2 * PREFIX_WINDOW_BYTES` per digest — and real I/O, so it is
@@ -745,6 +794,8 @@ impl TranscriptReader {
             position: offset,
             start_offset: offset,
             tail_bytes: 0,
+            decoded: 0,
+            undecodable: 0,
             validation_bytes,
             opened_size: size,
             opened_mtime_ns: mtime_ns,
@@ -769,6 +820,20 @@ impl TranscriptReader {
 
     /// Bytes of an unterminated trailing record handed to the caller. Read,
     /// and so counted, even though the position did not advance over them.
+    /// Records this pass decoded as UTF-8, and records it could not.
+    ///
+    /// A single undecodable record is a malformed record and is skipped. A
+    /// pass that decoded *none* of the records it read is a different claim:
+    /// the walk could not read the file at all, which the sync walk reports
+    /// rather than recording as "this transcript holds no session".
+    pub(crate) fn decoded(&self) -> u64 {
+        self.decoded
+    }
+
+    pub(crate) fn undecodable(&self) -> u64 {
+        self.undecodable
+    }
+
     pub(crate) fn tail_bytes(&self) -> u64 {
         self.tail_bytes
     }
@@ -829,9 +894,11 @@ impl TranscriptReader {
             }
             // A genuine tail: the file ends here, under the ceiling.
             let Some(text) = decode_record(&raw) else {
+                self.undecodable += 1;
                 self.tail_bytes = read as u64;
                 return Ok(Some(ReadRecord::Unterminated));
             };
+            self.decoded += 1;
             line.push_str(text);
             self.tail_bytes = read as u64;
             return Ok(Some(ReadRecord::Unterminated));
@@ -841,8 +908,12 @@ impl TranscriptReader {
         // indexed corrupted text as though it were what the provider wrote;
         // leaving `line` empty routes it through the same skip a JSON parse
         // failure takes.
-        if let Some(text) = decode_record(&raw) {
-            line.push_str(text);
+        match decode_record(&raw) {
+            Some(text) => {
+                self.decoded += 1;
+                line.push_str(text);
+            }
+            None => self.undecodable += 1,
         }
         self.position += read as u64;
         Ok(Some(ReadRecord::Terminated))

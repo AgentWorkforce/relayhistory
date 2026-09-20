@@ -4,6 +4,9 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  EVIDENCE_KINDS,
+  EvidenceKind,
+  FULL_SESSION_KINDS,
   Source,
   CatalogSource,
   CATALOG_SOURCES,
@@ -39,6 +42,8 @@ import type {
   HydrationDiagnostic,
   HydrateSessionResult,
   SessionEvent,
+  SessionUserTurn,
+  SessionUserTurnBlock,
   ProjectKeyMethod,
   EventCursor,
   EventsPageOptions,
@@ -74,7 +79,14 @@ import type {
 } from './contracts.js';
 export type UnknownRecord = Record<string, unknown>;
 
-export const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
+/** Delegation kinds: one session started another thread of work. */
+export const DELEGATION_RELATIONSHIP_TYPES: readonly string[] = ['delegated', 'materialized_local'];
+/** Continuity kinds: one conversation carrying on as another. */
+export const CONTINUITY_RELATIONSHIP_TYPES: readonly string[] = ['continuation', 'fork', 'resume'];
+export const RELATIONSHIP_TYPES: readonly string[] = [
+  ...DELEGATION_RELATIONSHIP_TYPES,
+  ...CONTINUITY_RELATIONSHIP_TYPES,
+];
 export const DEFAULT_TREE_MAX_DEPTH = 32;
 export const MAX_TREE_MAX_DEPTH = 64;
 export const DEFAULT_TREE_MAX_NODES = 1_000;
@@ -207,6 +219,47 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     model: nullableString(value.model),
     tokenUsage: tokenUsage(value.tokenJson),
     eventUid: String(value.eventUid),
+    toolUseId: nullableString(value.toolUseId),
+    payloadBytes: nullableNumber(value.payloadBytes),
+    payloadTruncated: nullableBoolean(value.payloadTruncated),
+    payloadHash: nullableString(value.payloadHash),
+    callIndex: nullableNumber(value.callIndex),
+    eventIndex: nullableNumber(value.eventIndex),
+    resultStatus: nullableString(value.resultStatus) as SessionEvent['resultStatus'],
+    eventSource: nullableString(value.eventSource) as SessionEvent['eventSource'],
+    errorSignal: nullableString(value.errorSignal) as SessionEvent['errorSignal'],
+    subagentSessionId: nullableString(value.subagentSessionId),
+    agentId: nullableString(value.agentId),
+    requestId: nullableString(value.requestId),
+    stopReason: nullableString(value.stopReason),
+    agentVersion: nullableString(value.agentVersion),
+    isSidechain: nullableBoolean(value.isSidechain),
+    isMeta: nullableBoolean(value.isMeta),
+    turnId: nullableString(value.turnId),
+  };
+}
+
+export function sessionUserTurnBlock(value: UnknownRecord): SessionUserTurnBlock {
+  return {
+    kind: value.kind === 'tool_result' ? 'tool_result' : 'text',
+    toolUseId: nullableString(value.toolUseId),
+    byteLen: Number(value.byteLen),
+    isError: nullableBoolean(value.isError),
+  };
+}
+
+export function sessionUserTurn(value: UnknownRecord): SessionUserTurn {
+  return {
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    messageId: nullableString(value.messageId),
+    precedingMessageId: nullableString(value.precedingMessageId),
+    followingMessageId: nullableString(value.followingMessageId),
+    tsMs: Number(value.tsMs),
+    blocks: Array.isArray(value.blocks)
+      ? (value.blocks as UnknownRecord[]).map(sessionUserTurnBlock)
+      : [],
   };
 }
 
@@ -353,6 +406,7 @@ export function relationship(value: UnknownRecord): SessionRelationship {
     spawnedAtMs: typeof value.spawnedAtMs === 'number' ? value.spawnedAtMs : null,
     createdMs: Number(value.createdMs),
     relationshipUid: String(value.relationshipUid),
+    originSessionId: nullableString(value.originSessionId),
   };
 }
 
@@ -467,6 +521,150 @@ function requireFiniteNumber(value: unknown): number {
   return value;
 }
 
+/**
+ * Validate the reported coverage rather than cast it: an unknown kind is a
+ * native contract mismatch, not a value to hand a caller that will branch on it.
+ */
+function hydrationCoverage(value: unknown): EvidenceKind[] {
+  // Every contract-3 result carries `coverage`, including an empty one for a
+  // listing-only connector. Defaulting an absent field to `[]` would let a
+  // malformed result through and silently drop the coverage a merge needs, so
+  // absent is a contract violation rather than "covers nothing".
+  if (!Array.isArray(value)) {
+    throw new NativeContractMismatchError(
+      'ai-hist-native returned a hydration result without a coverage list.',
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value.map((kind) => {
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(String(kind))) {
+      throw new NativeContractMismatchError(
+        `ai-hist-native returned an unknown evidence kind: ${String(kind)}.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    return String(kind) as EvidenceKind;
+  });
+}
+
+/**
+ * The capability a merged hydration result is entitled to claim.
+ *
+ * `capability` is *defined* by `coverage` -- `full` exactly when every kind in
+ * `FULL_SESSION_KINDS` is covered -- so a merge has to recompute it. Two
+ * connectors that complement each other can cover all five kinds while neither
+ * is `full` alone, and carrying an input's `partial` through would rank
+ * complete merged evidence below a single full result. `shallow_only` survives
+ * only when nothing was covered and nothing claimed otherwise: a `partial`
+ * over empty coverage would imply some kind was indexed.
+ */
+export function mergedHydrationCapability(
+  coverage: readonly EvidenceKind[],
+  parts: readonly HydrateSessionResult[],
+): HydrateSessionResult['capability'] {
+  if (missingHydrationCoverage(coverage).length === 0) return 'full';
+  if (coverage.length === 0 && parts.every((part) => part.capability === 'shallow_only'))
+    return 'shallow_only';
+  return 'partial';
+}
+
+/** The `FULL_SESSION_KINDS` a coverage set leaves out, in canonical order. */
+export function missingHydrationCoverage(coverage: readonly EvidenceKind[]): EvidenceKind[] {
+  return FULL_SESSION_KINDS.filter((kind) => !coverage.includes(kind));
+}
+
+/**
+ * The capability a coverage set entitles a single result to claim — the same
+ * rule the Rust producer applies (`capability_for` in `hydrate.rs`). Covering
+ * nothing is `shallow_only`, not `partial`: `partial` implies some kind was
+ * indexed.
+ *
+ * A *merge* is a different question and uses {@link mergedHydrationCapability},
+ * which additionally keeps `shallow_only` only when every input claimed it.
+ */
+export function expectedHydrationCapability(
+  coverage: readonly EvidenceKind[],
+): HydrateSessionResult['capability'] {
+  if (missingHydrationCoverage(coverage).length === 0) return 'full';
+  return coverage.length === 0 ? 'shallow_only' : 'partial';
+}
+
+/**
+ * Fold one more presence's hydration result into the running one.
+ *
+ * Evidence counts take the maximum and coverage takes the union, because the
+ * merged result reports what *either* presence indexed; the remaining
+ * scalar fields come from the presence that performed the strongest work;
+ * equal statuses select the richer presence. This keeps `status`, `presence`
+ * and `indexedThrough` describing the same acquisition.
+ */
+export function combineHydration(
+  previous: HydrateSessionResult | undefined,
+  next: HydrateSessionResult,
+): HydrateSessionResult {
+  if (!previous) return next;
+  const rank = { full: 2, partial: 1, shallow_only: 0 };
+  const best = rank[next.capability] > rank[previous.capability] ? next : previous;
+  // A presence that performed work must not disappear behind an unchanged
+  // presence chosen for its capability. A first hydration outranks an update,
+  // which outranks a repeat; a capability-limited result did no indexing.
+  const statusRank = { hydrated: 3, updated: 2, unchanged: 1, capability_limited: 0 };
+  const selected = statusRank[next.status] > statusRank[previous.status] ? next
+    : statusRank[next.status] < statusRank[previous.status] ? previous : best;
+  // Taking only the winner's coverage would understate a merge whose other
+  // half indexed a kind the winner does not.
+  const coverage = EVIDENCE_KINDS.filter(
+    (kind) => previous.coverage.includes(kind) || next.coverage.includes(kind),
+  );
+  const missing = missingHydrationCoverage(coverage);
+  // Each part's partial-coverage diagnostic describes only that part, so once
+  // the union is formed they are stale: concatenating them would leave a
+  // merged `full` result carrying a note naming kinds it does cover. They are
+  // reconciled into at most one, recomputed from the union. Every other
+  // diagnostic is per-presence fact and survives untouched.
+  const diagnostics = [...previous.diagnostics, ...next.diagnostics].filter(
+    (item) => item.code !== 'HYDRATION_PARTIAL_COVERAGE',
+  );
+  if (missing.length > 0) {
+    // States what the merge covers and no more. Only the producing side knows
+    // *why* a kind is absent -- a provider that cannot record it, or a request
+    // that declined it with `includeRelated: false` -- and that reason does not
+    // survive a union of presences that may have had different ones. Inferring
+    // provider inability from reduced coverage would make this text false for
+    // two relationship-capable presences merged under `includeRelated: false`.
+    diagnostics.push({
+      code: 'HYDRATION_PARTIAL_COVERAGE',
+      message: `merged hydration covers ${coverage.join(', ') || 'no evidence kinds'}; `
+        + `it does not cover ${missing.join(', ')}`,
+      durationMs: null,
+      sourceBytes: null,
+      recordsParsed: null,
+    });
+  }
+  return {
+    ...selected,
+    // Derived from the union rather than carried off `best`, which is spread
+    // above: an individual `partial` no longer describes the merged coverage.
+    capability: mergedHydrationCapability(coverage, [previous, next]),
+    evidence: {
+      prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
+      events: Math.max(previous.evidence.events, next.evidence.events),
+      toolCalls: Math.max(previous.evidence.toolCalls, next.evidence.toolCalls),
+      fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
+      relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
+    },
+    coverage,
+    // Summed, not taken from `selected`, which is spread above. Evidence
+    // counts are the same rows counted by two sources, so the larger is the
+    // truth; bytes are disjoint work each source actually did, so the truth is
+    // the total. Spreading the winner alone let a local read of a whole
+    // transcript be reported as the connector's zero.
+    bytesRead: previous.bytesRead + next.bytesRead,
+    relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
+    diagnostics,
+  };
+}
+
 export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   const contractVersion = Number(value.contractVersion);
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
@@ -487,6 +685,23 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
   }
   const indexed = (value.indexedThrough ?? {}) as UnknownRecord;
   const evidence = (value.evidence ?? {}) as UnknownRecord;
+  const coverage = hydrationCoverage(value.coverage);
+  // Contract 3 *defines* `capability` from `coverage`, so it is re-derived and
+  // compared rather than spot-checked. Only rejecting an unsupported `full`
+  // would still admit the mirror-image defects -- a `partial` that covers
+  // everything, or a `shallow_only` that covered something -- and those are
+  // not harmless understatements: `combineHydration` ranks the parts of a
+  // merge by their reported capability before recomputing, so an under-reported
+  // result loses the `best` selection and with it the top-level fields the
+  // merge carries over.
+  const expected = expectedHydrationCapability(coverage);
+  if (String(value.capability) !== expected) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native reported hydration capability ${String(value.capability)}, `
+        + `which is inconsistent with its coverage [${coverage.join(', ')}] (expected ${expected}).`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
   return {
     contractVersion,
     source: String(value.source) as CatalogSource,
@@ -513,6 +728,7 @@ export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
     // Version 3 requires the field; if it is absent the result is not
     // version 3, whatever it says it is.
     bytesRead: requireFiniteNumber(value.bytesRead),
+    coverage,
     relatedSessionIds: Array.isArray(value.relatedSessionIds)
       ? value.relatedSessionIds.map(String)
       : [],

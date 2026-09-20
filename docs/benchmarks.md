@@ -444,6 +444,12 @@ blow-up guard: it catches "the transcript is now buffered whole" and not a 1.5×
 drift. The proportional rule bites on the `full` profile, whose store is two
 orders of magnitude larger.
 
+For the tiniest elapsed-time phases the thresholds file can also raise a ceiling
+for one named phase without loosening the others. Today `unchanged_sync` uses a
+120 ms phase-specific ceiling floor because healthy `ubuntu-latest` runs have
+already reached about 113 ms there; a lower ceiling measures runner jitter
+instead of a real no-op `watch` tick slowdown.
+
 A phase that a profile names but that produced no measurement is a failure, not
 a skip. A run that measured nothing must not read as a pass.
 

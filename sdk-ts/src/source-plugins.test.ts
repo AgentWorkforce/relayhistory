@@ -14,6 +14,7 @@ import {
   hydrateSourcePlugin,
   discoverSourcePlugins,
   SESSION_HYDRATION_CONTRACT_VERSION,
+  FULL_SESSION_KINDS,
   __testing,
   type HydrateSessionResult,
   RelayHistoryError,
@@ -456,7 +457,7 @@ test('a capability-limited plugin result satisfies the hydration contract it dec
   for (const field of [
     'contract_version', 'source', 'session_id', 'status', 'capability',
     'discovery_state', 'presence', 'indexed_through', 'evidence', 'bytes_read',
-    'related_session_ids', 'diagnostics',
+    'coverage', 'related_session_ids', 'diagnostics',
   ]) {
     assert.ok(field in result, `plugin hydration result is missing ${field}`);
   }
@@ -478,6 +479,9 @@ test('a hydration drawing on several sources reports the bytes all of them read'
     discoveryState: 'full',
     presence: 'local',
     indexedThrough: { sourceStamp: null, lastEventAtMs: null },
+    // Capability is derived from coverage, so a fixture that means to merge
+    // to `full` has to declare the coverage that entitles it.
+    coverage: [...FULL_SESSION_KINDS],
     relatedSessionIds: [],
     diagnostics: [],
   };
@@ -523,6 +527,7 @@ test('a hydration result missing bytesRead is a broken contract, not a zero read
     indexedThrough: { sourceStamp: null, lastEventAtMs: null },
     evidence: { prompts: 0, events: 0, toolCalls: 0, fileEdits: 0, relatedSessions: 0 },
     bytesRead: 4096,
+    coverage: [...FULL_SESSION_KINDS],
     relatedSessionIds: [],
     diagnostics: [],
   };

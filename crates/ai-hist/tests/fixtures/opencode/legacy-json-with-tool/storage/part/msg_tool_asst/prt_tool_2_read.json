@@ -1,0 +1,14 @@
+{
+  "id": "prt_tool_2_read",
+  "sessionID": "ses_tool",
+  "messageID": "msg_tool_asst",
+  "type": "tool",
+  "callID": "toolu_read_1",
+  "tool": "read",
+  "state": {
+    "status": "completed",
+    "input": { "filePath": "/src/a.ts" },
+    "output": "...",
+    "title": "src/a.ts"
+  }
+}

@@ -22,6 +22,7 @@ import {
   SESSION_RELATIONSHIP_CONTRACT_VERSION,
   SESSION_EVIDENCE_CONTRACT_VERSION,
   SOURCES,
+  FULL_SESSION_KINDS,
   defaultDbPath,
   Source,
   CatalogSource,
@@ -95,6 +96,8 @@ import type {
   EvidencePageOptions,
   SessionToolCallsPage,
   SessionFileEditsPage,
+  UserTurnsPageOptions,
+  SessionUserTurnsPage,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -123,6 +126,7 @@ import {
   nullableBoolean,
   sessionToolCall,
   sessionFileEdit,
+  sessionUserTurn,
   evidenceCursor,
   nativeEvidenceCursor,
   assertEvidenceContract,
@@ -138,6 +142,7 @@ import {
   relationshipCursor,
   validateSessionRef,
   evidenceIdentity,
+  combineHydration,
 } from './normalization.js';
 export { validateNativeLocation, validateNativeScope, parseStoredJson } from './normalization.js';
 
@@ -475,6 +480,7 @@ export async function getSessionRelationships(
       sessionId: String(value.sessionId),
       asParent: relationships(value.asParent),
       asChild: relationships(value.asChild),
+      continuity: relationships(value.continuity),
       capabilities: relationshipCapabilities(value.capabilities),
       diagnostics: relationshipDiagnostics(value.diagnostics),
     };
@@ -506,6 +512,41 @@ export async function getSessionToolCallsPage(
 }
 
 /**
+ * One bounded page of user turns for one session, oldest first.
+ *
+ * Each turn carries the ordered blocks a provider attached to one user
+ * message — the human's own text and the tool results that came back with it,
+ * each with its measured payload size. Derived from the indexed events, so it
+ * cannot disagree with the transcript it came from.
+ */
+export async function getSessionUserTurnsPage(
+  source: Source,
+  sessionId: string,
+  options: UserTurnsPageOptions = {},
+): Promise<SessionUserTurnsPage> {
+  evidenceIdentity(source, sessionId, 'getSessionUserTurnsPage');
+  return nativeCall(async (native) => {
+    const page = await native.getSessionUserTurnsPage(source, sessionId, options);
+    assertEvidenceContract(Number(page.contractVersion));
+    return {
+      contractVersion: Number(page.contractVersion),
+      source: String(page.source) as Source,
+      sessionId: String(page.sessionId),
+      userTurns: Array.isArray(page.userTurns)
+        ? (page.userTurns as UnknownRecord[]).map(sessionUserTurn)
+        : [],
+      nextCursor:
+        page.nextCursor && typeof page.nextCursor === 'object'
+          ? {
+              tsMs: Number((page.nextCursor as UnknownRecord).tsMs),
+              id: Number((page.nextCursor as UnknownRecord).id),
+            }
+          : null,
+    };
+  });
+}
+
+/**
  * The complete descendant delegation tree for one session: pre-order,
  * cycle-safe, and bounded by `maxDepth` and `maxNodes`. Child events keep
  * their own session identity and are never flattened into the root.
@@ -519,6 +560,7 @@ export async function getSessionTree(options: GetSessionTreeOptions): Promise<Se
       dbPath: options.dbPath,
       maxDepth: options.maxDepth,
       maxNodes: options.maxNodes,
+      relationshipKinds: options.relationshipKinds,
     });
     const contractVersion = Number(value.contractVersion);
     assertRelationshipContract(contractVersion);
@@ -580,6 +622,7 @@ export async function getSessionChildrenPage(
             spawnedAtMs: options.after.spawnedAtMs ?? undefined,
           }
         : undefined,
+      relationshipKinds: options.relationshipKinds,
     });
     return {
       children: relationships(page.children),
@@ -791,12 +834,18 @@ export async function bootstrapLocal(
         includeRelated: false,
       });
       hydratedSessions++;
-      if (result.capability !== 'full') {
+      // Bootstrap declines delegation evidence above, so an absent
+      // `relationship` is this call's own choice and must not be reported as a
+      // provider limitation. What remains missing is the provider's.
+      const unavailable = FULL_SESSION_KINDS.filter(
+        (kind) => kind !== 'relationship' && !result.coverage.includes(kind),
+      );
+      if (unavailable.length > 0) {
         diagnostics.push({
           source: session.source,
           sessionId: session.sessionId,
           code: 'CAPABILITY_LIMITED',
-          message: `Provider exposes ${result.capability} evidence`,
+          message: `Provider exposes no ${unavailable.join(', ')} evidence`,
         });
       }
     } catch (error) {
@@ -946,32 +995,6 @@ function validateAcquisition(options: {
       'acquisition limit must be an integer from 1 to 10000',
       'INVALID_ARGUMENT',
     );
-}
-function combineHydration(
-  previous: HydrateSessionResult | undefined,
-  next: HydrateSessionResult,
-): HydrateSessionResult {
-  if (!previous) return next;
-  const rank = { full: 2, partial: 1, shallow_only: 0 };
-  const best = rank[next.capability] > rank[previous.capability] ? next : previous;
-  return {
-    ...best,
-    evidence: {
-      prompts: Math.max(previous.evidence.prompts, next.evidence.prompts),
-      events: Math.max(previous.evidence.events, next.evidence.events),
-      toolCalls: Math.max(previous.evidence.toolCalls, next.evidence.toolCalls),
-      fileEdits: Math.max(previous.evidence.fileEdits, next.evidence.fileEdits),
-      relatedSessions: Math.max(previous.evidence.relatedSessions, next.evidence.relatedSessions),
-    },
-    // Summed, not taken from `best`. Evidence counts are the same rows counted
-    // by two sources, so the larger is the truth; bytes are disjoint work each
-    // source actually did, so the truth is the total. Spreading `best` alone
-    // let a local read of a whole transcript be reported as the connector's
-    // zero.
-    bytesRead: previous.bytesRead + next.bytesRead,
-    relatedSessionIds: [...new Set([...previous.relatedSessionIds, ...next.relatedSessionIds])],
-    diagnostics: [...previous.diagnostics, ...next.diagnostics],
-  };
 }
 /** Internals reachable from this package's own tests. Not public API. */
 export const __testing = { combineHydration };

@@ -8,6 +8,7 @@ use ai_hist::SessionStore;
 fn main() -> Result<(), ai_hist::Error> {
     let store = SessionStore::open(Default::default())?;
     let _report = store.sync(Default::default())?;
+    let _turns = store.session_user_turns_page(ai_hist::Source::Claude, "session-id", 100, None)?;
     Ok(())
 }
 ```

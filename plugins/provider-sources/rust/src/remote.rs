@@ -1201,6 +1201,10 @@ impl ShallowSessionProvider for InstanceProvider {
     fn source(&self) -> &'static str {
         self.inner.source()
     }
+    /// Instance wrapping does not change what the wrapped connector covers.
+    fn evidence_kinds(&self) -> &'static [ai_hist::EvidenceKind] {
+        self.inner.evidence_kinds()
+    }
     fn location(&self) -> SessionLocation {
         self.inner.location()
     }

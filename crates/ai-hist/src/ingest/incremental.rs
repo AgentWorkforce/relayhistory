@@ -158,7 +158,8 @@ pub(crate) fn ingest_claude_transcript_incremental(
         // JSON. A half-written line is not, and a writer appends a line at a
         // time, so parsing is the available evidence that the provider
         // finished saying this.
-        let parsed = serde_json::from_str::<Value>(line.trim_end()).ok();
+        let record = line.trim_end_matches(['\n', '\r']);
+        let parsed = serde_json::from_str::<Value>(record).ok();
         if kind == ReadRecord::Unterminated && parsed.is_none() {
             // Nothing about this record is committed, so its index is not
             // spent either. Advancing it here handed the record a different
@@ -204,10 +205,18 @@ pub(crate) fn ingest_claude_transcript_incremental(
                             &mut deferred,
                             &mut deferred_order,
                             &mut deferred_bytes,
+                            &mut claude.tool_results,
                         )?;
                     }
                 } else if complete || !defer_unfinished {
-                    ingest_claude_record(conn, path, attributed_session_id, index, obj)?;
+                    ingest_claude_record(
+                        conn,
+                        path,
+                        attributed_session_id,
+                        record,
+                        obj,
+                        &mut claude.tool_results,
+                    )?;
                 } else {
                     deferred_bytes += line.len();
                     deferred.insert(
@@ -222,7 +231,14 @@ pub(crate) fn ingest_claude_transcript_incremental(
                     deferred_order.push(message_id);
                 }
             }
-            None => ingest_claude_record(conn, path, attributed_session_id, index, obj)?,
+            None => ingest_claude_record(
+                conn,
+                path,
+                attributed_session_id,
+                record,
+                obj,
+                &mut claude.tool_results,
+            )?,
         }
         if kind == ReadRecord::Unterminated {
             break;
@@ -242,6 +258,7 @@ pub(crate) fn ingest_claude_transcript_incremental(
                 &mut deferred,
                 &mut deferred_order,
                 &mut deferred_bytes,
+                &mut claude.tool_results,
             )?;
         }
     }
@@ -305,20 +322,22 @@ fn flush_deferred(
     deferred: &mut HashMap<String, DeferredMessage>,
     deferred_order: &mut Vec<String>,
     deferred_bytes: &mut usize,
+    indexer: &mut crate::ingest::tool_result_facts::ToolResultIndexer,
 ) -> Result<()> {
     let Some(entry) = deferred.remove(message_id) else {
         return Ok(());
     };
     deferred_order.retain(|id| id != message_id);
     *deferred_bytes = deferred_bytes.saturating_sub(entry.bytes);
-    for (index, text) in entry.lines {
-        let Ok(value) = serde_json::from_str::<Value>(text.trim_end()) else {
+    for (_, text) in entry.lines {
+        let record = text.trim_end_matches(['\n', '\r']);
+        let Ok(value) = serde_json::from_str::<Value>(record) else {
             continue;
         };
         let Some(obj) = value.as_object() else {
             continue;
         };
-        ingest_claude_record(conn, path, attributed_session_id, index, obj)?;
+        ingest_claude_record(conn, path, attributed_session_id, record, obj, indexer)?;
     }
     Ok(())
 }
