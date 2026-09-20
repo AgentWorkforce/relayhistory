@@ -832,7 +832,7 @@ mod fs_events {
             let mut stale = self.stale.lock().expect("stale roots");
             self.watched.retain_mut(|entry| {
                 let reported_gone = stale.remove(entry.root.registration_key());
-                let current = root_identity(entry.root.registration_key());
+                let current = root_identity(entry.root.registered_path());
                 if !reported_gone && current.is_some() && current == entry.identity {
                     return true;
                 }
@@ -845,7 +845,7 @@ mod fs_events {
                     // the one that is there now, and re-resolved with it — a
                     // symlinked root whose target moved is a new spelling as
                     // well as a new object.
-                    entry.identity = root_identity(entry.root.registration_key());
+                    entry.identity = root_identity(entry.root.registered_path());
                     resolved.push(entry.root.clone());
                     changed += 1;
                     return true;
@@ -880,7 +880,7 @@ mod fs_events {
                 }
                 resolved.push(root.clone());
                 watched.push(Registered {
-                    identity: root_identity(root.registration_key()),
+                    identity: root_identity(root.registered_path()),
                     root: root.clone(),
                 });
                 attached += 1;
@@ -965,7 +965,7 @@ mod fs_events {
             if register(&mut watcher, &mut root) {
                 known.push(root.clone());
                 watched.push(Registered {
-                    identity: root_identity(root.registration_key()),
+                    identity: root_identity(root.registered_path()),
                     root,
                 });
             } else {
@@ -992,7 +992,20 @@ mod fs_events {
         identity: Option<RootIdentity>,
     }
 
-    /// Which directory object a name currently refers to.
+    /// Which directory object a *name* currently refers to.
+    ///
+    /// Always asked through the lexical path, never through the resolved one,
+    /// because the two answer different questions and only this one notices a
+    /// symlink being retargeted. `~/sessions -> /disk-a/sessions` resolves to
+    /// `/disk-a/sessions` and registers there; repoint it at `/disk-b` and
+    /// `/disk-a` still exists with the same inode, so stat-ing the resolved
+    /// path says nothing changed while the name now means somewhere else
+    /// entirely. Stat-ing the name follows the link as it is *now*, so the
+    /// identity moves and the root is re-resolved and re-registered.
+    ///
+    /// The resolved spelling remains the key for the stale set and for
+    /// `unwatch`: those are about which registration this is, which is a
+    /// different question from whether the name still points at it.
     ///
     /// On Unix that is exactly `(device, inode)` — the pair a watch is bound
     /// to. Elsewhere it is the creation time, which changes when a directory

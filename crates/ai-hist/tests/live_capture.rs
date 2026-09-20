@@ -986,6 +986,73 @@ fn a_root_reached_through_a_symlink_matches_its_own_events() {
     );
 }
 
+/// A symlinked root can be *retargeted*, and that is not the same event as a
+/// directory being replaced. `~/sessions -> /disk-a/sessions` registers at
+/// `/disk-a/sessions`; repoint it at `/disk-b/sessions` and the old directory
+/// is still there with the same inode, so anything that asks the *resolved*
+/// path whether it changed is told no, forever. The loop would go on watching
+/// a directory the name no longer means, and every transcript written to the
+/// new target would wait for the backstop — which for a session that is
+/// cleaned up on exit means it is never captured at all.
+#[cfg(all(feature = "fs-events", unix))]
+#[test]
+fn a_retargeted_symlink_root_is_watched_at_its_new_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = dir.path().join("disk-a/sessions");
+    let second = dir.path().join("disk-b/sessions");
+    std::fs::create_dir_all(&first).expect("first target");
+    std::fs::create_dir_all(&second).expect("second target");
+    let link = dir.path().join("sessions");
+    std::os::unix::fs::symlink(&first, &link).expect("symlink");
+
+    let running = RunningLoop::reporting({
+        let link = link.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(link)])
+                .with_debounce_ms(100)
+                // Short, because the backstop tick is what reconciles — but
+                // both cadences are the same, so an unforced tick is never
+                // mistaken for an event-driven one below.
+                .with_slow_poll_ms(200)
+                .with_poll_interval_ms(200)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // Baseline: the root works where it points now.
+    std::fs::write(first.join("rollout-1.jsonl"), "{}\n").expect("write under the first target");
+    forced_tick(&running, "a write under the original target");
+
+    // Retarget. The old directory keeps existing, with the same inode — which
+    // is exactly why asking it whether anything changed cannot work.
+    settle_forced(&running, "after the write under the original target");
+    std::fs::remove_file(&link).expect("drop the symlink");
+    std::os::unix::fs::symlink(&second, &link).expect("retarget the symlink");
+
+    // Reconciliation happens on the backstop, so wait for the loop's own
+    // ticks rather than for a duration: two of them have passed by the time
+    // this returns, and reconciliation runs before each. Writing before that
+    // would test nothing — the file would already exist by the time the new
+    // target was registered, and no event would ever be produced for it.
+    backstop_ticks(&running, 2, "after retargeting the symlink");
+    std::fs::write(second.join("rollout-2.jsonl"), "{}\n").expect("write under the new target");
+    forced_tick(&running, "a write under the retargeted symlink");
+
+    // Positive control: the old target is no longer what the name means, so
+    // writing there drives nothing. Asked from quiet, because the write above
+    // was a create and produced more than one event.
+    settle_forced(&running, "after the write under the new target");
+    std::fs::write(first.join("rollout-3.jsonl"), "{}\n").expect("write under the old target");
+    no_forced_tick(
+        &running,
+        Duration::from_millis(800),
+        "the directory the root no longer points at must not drive a sweep",
+    );
+}
+
 /// What macOS FSEvents does, asserted on a platform that cannot do it.
 ///
 /// FSEvents reports the real path — `/private/var/…` for anything under
@@ -2552,6 +2619,74 @@ fn write_claude_delegation(home: &Path, parent: &str, child: &str) -> PathBuf {
     )
     .expect("write subagent sidecar");
     sidecar
+}
+
+/// Wait until no *forced* tick has arrived for a few debounce windows.
+///
+/// The plain `settle` cannot be used by a test that needs a short backstop:
+/// unforced ticks keep arriving by design, so "no ticks at all" never
+/// happens. Only the forced ones say a filesystem event was seen, and only
+/// those have to be drained before asking whether the next write drives one.
+#[cfg(feature = "fs-events")]
+fn settle_forced(running: &RunningLoop, when: &str) {
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    let mut quiet_until = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < quiet_until {
+        if let Ok(true) = running.ticks.recv_timeout(Duration::from_millis(100)) {
+            quiet_until = std::time::Instant::now() + Duration::from_millis(400);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the loop never stopped sweeping {when}"
+        );
+    }
+}
+
+/// Wait for `count` backstop ticks, which is how a test waits for the work
+/// the loop only does on the backstop — reconciliation — without waiting on a
+/// duration and hoping.
+#[cfg(feature = "fs-events")]
+fn backstop_ticks(running: &RunningLoop, count: usize, when: &str) {
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    let mut seen = 0;
+    while seen < count {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(false) => seen += 1,
+            _ => assert!(
+                std::time::Instant::now() < deadline,
+                "the backstop never ticked {when}"
+            ),
+        }
+    }
+}
+
+/// Assert that no *forced* tick arrives within `window`, ignoring the
+/// backstop ticks a short poll interval keeps producing.
+#[cfg(feature = "fs-events")]
+fn no_forced_tick(running: &RunningLoop, window: Duration, what: &str) {
+    let until = std::time::Instant::now() + window;
+    while std::time::Instant::now() < until {
+        if let Ok(true) = running.ticks.recv_timeout(Duration::from_millis(100)) {
+            panic!("{what}");
+        }
+    }
+}
+
+/// Wait for a *forced* tick — one only a filesystem event produces — while
+/// tolerating the backstop ticks a short poll interval keeps producing.
+#[cfg(feature = "fs-events")]
+fn forced_tick(running: &RunningLoop, what: &str) {
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => return,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "{what} drove no forced sweep: {:?}",
+                running.watch.status()
+            ),
+        }
+    }
 }
 
 fn history_prompt_count(db: &Path, prompt: &str) -> i64 {
