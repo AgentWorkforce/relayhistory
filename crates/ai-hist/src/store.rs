@@ -2169,6 +2169,9 @@ const PROJECT_KEY_INHERITANCE_PASSES: usize = crate::relationships::MAX_TREE_MAX
 ///    during parsing would depend on file ordering.
 /// 3. **Denormalize.** `session_events.project_key` is brought in line with
 ///    its session, so grouping events by project needs no join.
+/// 4. **Lend.** Events of a delegated thread the catalog does not hold at all
+///    take the key of their nearest cataloged ancestor, stepping over any
+///    uncataloged generations between.
 ///
 /// Returns the number of rows written across the three passes. Idempotent: a
 /// second call on an unchanged database returns 0.
@@ -2176,6 +2179,7 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     let mut written = resolve_missing_project_keys(conn)?;
     written += inherit_project_keys(conn)?;
     written += denormalize_event_project_keys(conn)?;
+    written += inherit_event_project_keys(conn)?;
     Ok(written)
 }
 
@@ -2415,90 +2419,68 @@ fn settled_key_of_parents(
         if !visited.insert(parent_id.clone()) {
             continue;
         }
-        // What pass 1 will leave on this parent, decided by the same rule pass
-        // 1 uses — not by what resolution alone would say. Pass 1 never
+        // What pass 1 will leave on this parent, decided by the same rule
+        // pass 1 uses — not by what resolution alone would say. Pass 1 never
         // rewrites a `remote`, so a parent whose checkout now canonicalizes
         // differently keeps the key it has; answering with the fresh one would
         // stream a key the refresh then writes back over, which is the whole
         // failure this walk exists to avoid.
-        if let Some(lendable) = pass_one_key(key, method.as_deref(), cwd, repo_url) {
-            return Ok(Some(lendable));
+        if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
+            return Ok(Some(settled));
         }
-        // Not lendable on its own, so what pass 2 will leave on it: whatever
-        // *its* ancestors settle on. That is why this is a walk and not a
-        // lookup — pass 2 propagates one level per iteration and the child
-        // ends up with whatever the chain settles on.
+        // Then what pass 2 will leave on it: whatever *its* ancestors settle
+        // on. Asked before the key this parent is already wearing, because a
+        // borrowed key is exactly the one pass 2 replaces — promote an
+        // ancestor and every stand-in below it moves with it. Returning the
+        // stand-in here would stream a key the same refresh then rewrites.
         if let Some(inherited) =
             settled_key_of_parents(conn, source, &parent_id, visited, depth + 1)?
         {
             return Ok(Some(inherited));
         }
+        // Failing both, the borrowed key it already wears. The session it was
+        // borrowed from may be outside this database entirely, and the child
+        // is no worse off holding it.
+        if method.as_deref() == Some("inherited") && key.is_some() {
+            return Ok(key);
+        }
     }
     Ok(None)
 }
 
-/// The key this row will hold after pass 1, if that key is one pass 2 would
-/// lend to a child — that is, `remote` or `inherited`. `None` means pass 1
-/// leaves it with nothing better than a path, so a child inherits from further
-/// up instead.
+/// The `remote` key this row will hold once pass 1 has run, if it will hold
+/// one at all.
 ///
-/// The four arms are [`resolve_missing_project_keys`]'s `UPGRADABLE` predicate
-/// read back out: `remote` is never rewritten, `inherited` yields only to a
-/// `remote` the row resolves for itself, `path` yields to anything, and a row
-/// with no key at all takes whatever resolution gives it.
-fn pass_one_key(
-    key: Option<String>,
+/// Two arms, both [`resolve_missing_project_keys`]'s `UPGRADABLE` predicate
+/// read back out: a stored `remote` is never rewritten, and anything weaker —
+/// `path`, `inherited`, or no key at all — is replaced by a `remote` the row
+/// resolves for itself. Nothing else settles a row, so nothing else belongs
+/// here; a key the row merely *borrowed* is the caller's business, because
+/// pass 2 may replace that one too.
+fn pass_one_remote_key(
+    key: &Option<String>,
     method: Option<&str>,
     cwd: Option<String>,
     repo_url: Option<String>,
 ) -> Option<String> {
     if method == Some("remote") && key.is_some() {
-        return key;
+        return key.clone();
     }
-    let resolved = crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref());
-    if let Some((own, crate::project_identity::ProjectKeyMethod::Remote)) = resolved {
-        return Some(own);
+    match crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref()) {
+        Some((own, crate::project_identity::ProjectKeyMethod::Remote)) => Some(own),
+        _ => None,
     }
-    // A borrowed key survives anything short of the row's own remote, and is
-    // still worth lending on: the session it was borrowed from may be outside
-    // this database entirely, and the child is no worse off holding it.
-    if method == Some("inherited") && key.is_some() {
-        return key;
-    }
-    None
 }
 
-/// The canonical key for the session an event belongs to: its own catalog
-/// row's, or, failing that, its delegating parent's.
-///
-/// The parent fallback is not an optimization. A delegated thread is evidence,
-/// not a session — a Codex subagent rollout and a Claude sidechain produce
-/// `session_events` under the child's id while the catalog holds only the root
-/// a human actually ran. Without the second arm those events would be the one
-/// place in the database with no project at all, which is exactly the rollup
-/// burn #506 needs.
-const EVENT_PROJECT_KEY_SQL: &str = "COALESCE( \
-     (SELECT s.project_key FROM sessions s \
-      WHERE s.source = session_events.source \
-        AND s.session_id = session_events.session_id), \
-     (SELECT p.project_key FROM session_relationships r \
-      JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
-      WHERE r.source = session_events.source \
-        AND r.child_session_id = session_events.session_id \
-        AND p.project_key IS NOT NULL \
-      ORDER BY r.created_ms, r.parent_session_id LIMIT 1))";
-
-/// The method of the key [`EVENT_PROJECT_KEY_SQL`] produces: the session's
-/// own, or `inherited` when it came from the delegating parent.
-const EVENT_PROJECT_KEY_METHOD_SQL: &str = "CASE WHEN EXISTS ( \
-     SELECT 1 FROM sessions s \
+/// The key the event's *own* session carries, when it has a catalog row.
+const EVENT_SESSION_KEY_SQL: &str = "(SELECT s.project_key FROM sessions s \
      WHERE s.source = session_events.source \
-       AND s.session_id = session_events.session_id \
-       AND s.project_key IS NOT NULL) \
-   THEN (SELECT s.project_key_method FROM sessions s \
-         WHERE s.source = session_events.source \
-           AND s.session_id = session_events.session_id) \
-   ELSE 'inherited' END";
+       AND s.session_id = session_events.session_id)";
+
+/// The method that key was arrived at by.
+const EVENT_SESSION_METHOD_SQL: &str = "(SELECT s.project_key_method FROM sessions s \
+     WHERE s.source = session_events.source \
+       AND s.session_id = session_events.session_id)";
 
 /// Rank a `(project_key, project_key_method)` pair the way the catalog does.
 ///
@@ -2517,28 +2499,18 @@ fn event_key_rank_sql(key: &str, method: &str) -> String {
     )
 }
 
-/// Pass 3: copy the session's (or its parent's) key onto its events.
+/// Pass 3: bring every event in line with its own session's key.
 ///
-/// The parent arm is a loan, not a correction, and the difference decides what
-/// this pass may overwrite. A delegated thread with no catalog row of its own
-/// still records a `cwd`, and the ingest path resolves that directory: such an
-/// event can hold a `remote` key it worked out for itself, which is a stronger
-/// statement about where the work happened than the delegator's repository.
-/// Copying the parent's key over it would file a subagent that genuinely ran
-/// in another checkout under the wrong project, and — because the pass runs on
-/// every sync — would do it again after every correction.
-///
-/// So the write is ranked exactly as the catalog's merge is: nothing may lower
-/// a key's rank, and an equal rank may only be rewritten when the key itself
-/// differs.
+/// Ranked exactly as the catalog's merge is: nothing may lower a key's rank,
+/// and an equal rank may only be rewritten when the key itself differs.
 fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
-    let incoming = event_key_rank_sql(EVENT_PROJECT_KEY_SQL, EVENT_PROJECT_KEY_METHOD_SQL);
+    let incoming = event_key_rank_sql(EVENT_SESSION_KEY_SQL, EVENT_SESSION_METHOD_SQL);
     let stored = event_key_rank_sql("project_key", "project_key_method");
     let stale = format!(
-        "{EVENT_PROJECT_KEY_SQL} IS NOT NULL \
+        "{EVENT_SESSION_KEY_SQL} IS NOT NULL \
            AND (({incoming}) > ({stored}) \
                 OR (({incoming}) = ({stored}) \
-                    AND (project_key IS NULL OR project_key <> {EVENT_PROJECT_KEY_SQL})))"
+                    AND (project_key IS NULL OR project_key <> {EVENT_SESSION_KEY_SQL})))"
     );
     // Probe first, for the same reason pass 2 does: the ingest path already
     // stamps each event as it inserts it, so this pass normally has nothing to
@@ -2553,11 +2525,122 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
     }
     Ok(conn.execute(
         &format!(
-            "UPDATE session_events SET project_key = {EVENT_PROJECT_KEY_SQL}, \
-             project_key_method = {EVENT_PROJECT_KEY_METHOD_SQL} WHERE {stale}"
+            "UPDATE session_events SET project_key = {EVENT_SESSION_KEY_SQL}, \
+             project_key_method = {EVENT_SESSION_METHOD_SQL} WHERE {stale}"
         ),
         [],
     )?)
+}
+
+/// Events of a session the catalog does not hold rank as `inherited` once this
+/// pass lends them an ancestor's key.
+const EVENT_INHERITED_RANK: i64 = 2;
+
+/// Pass 4: a delegated thread with no catalog row of its own takes the key of
+/// its nearest cataloged ancestor.
+///
+/// This is where a rollup is won or lost. A delegated thread is evidence, not
+/// a session — a Codex subagent rollout and a Claude sidechain produce
+/// `session_events` under the child's id while the catalog holds only the root
+/// a human actually ran — so without this those events are the one place in
+/// the database with no project at all, which is exactly what burn's #506
+/// rollup needs.
+///
+/// It has to *walk*. Joining the relationship parent straight to `sessions`
+/// stops at the first generation the catalog does not hold, and a subagent
+/// that delegates again is routine: for `root -> child -> grandchild` with
+/// neither middle generation cataloged, the grandchild's events found no row
+/// to join and kept a path key or none at all — the deeper the delegation, the
+/// more certainly its work vanished from the project it belongs to.
+///
+/// The loan is ranked like everything else here: it fills an event with no key
+/// or a merely path-derived one, and replaces a borrowed key that has gone
+/// stale, but never displaces a `remote` the thread resolved for itself. A
+/// subagent that genuinely ran in another checkout stays filed where it ran.
+fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
+    let stored_rank = event_key_rank_sql("project_key", "project_key_method");
+    // A session is a candidate when it has no key of its own to take and its
+    // events are not already holding something at least as good.
+    let candidate = format!(
+        "{EVENT_SESSION_KEY_SQL} IS NULL \
+           AND ({stored_rank}) <= {EVENT_INHERITED_RANK} \
+           AND EXISTS (SELECT 1 FROM session_relationships r \
+                 WHERE r.source = session_events.source \
+                   AND r.child_session_id = session_events.session_id)"
+    );
+    let pending: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT DISTINCT source, session_id FROM session_events WHERE {candidate}"
+        ))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    // The write repeats the candidate predicate — the rows were read without a
+    // lock — and adds the one thing the walk decides: an equal-ranked key is
+    // rewritten only when it actually differs, so a settled database writes
+    // nothing.
+    let mut update = conn.prepare(&format!(
+        "UPDATE session_events SET project_key = ?3, project_key_method = 'inherited' \
+         WHERE source = ?1 AND session_id = ?2 AND {candidate} \
+           AND (({stored_rank}) < {EVENT_INHERITED_RANK} OR project_key <> ?3)"
+    ))?;
+    let mut written = 0;
+    for (source, session_id) in pending {
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(session_id.clone());
+        let Some(key) =
+            nearest_cataloged_ancestor_key(conn, &source, &session_id, &mut visited, 0)?
+        else {
+            continue;
+        };
+        written += update.execute(params![source, session_id, key])?;
+    }
+    Ok(written)
+}
+
+/// The key of the nearest ancestor the catalog actually holds, following the
+/// same parent order, cycle protection and depth bound the session inheritance
+/// pass uses — generations the catalog does not hold are stepped over rather
+/// than stopping the search.
+fn nearest_cataloged_ancestor_key(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Result<Option<String>> {
+    if depth >= PROJECT_KEY_INHERITANCE_PASSES {
+        return Ok(None);
+    }
+    let parents: Vec<(String, Option<String>)> = conn
+        .prepare(
+            "SELECT r.parent_session_id, \
+                    (SELECT p.project_key FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id) \
+             FROM session_relationships r \
+             WHERE r.source = ?1 AND r.child_session_id = ?2 \
+             ORDER BY r.created_ms, r.parent_session_id",
+        )?
+        .query_map(params![source, session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (parent_id, key) in parents {
+        if !visited.insert(parent_id.clone()) {
+            continue;
+        }
+        if key.is_some() {
+            return Ok(key);
+        }
+        if let Some(found) =
+            nearest_cataloged_ancestor_key(conn, source, &parent_id, visited, depth + 1)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 fn now_ms() -> i64 {

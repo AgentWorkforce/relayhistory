@@ -116,17 +116,25 @@ fn global_and_conditional_git_config_resolve_a_rewritten_remote() {
         "the replaced file's conditional include must be gone with it"
     );
 
-    // --- the repository's own scope still wins a single-valued key --------
+    // --- a remote's URLs accumulate across scopes, head first -------------
+    //
+    // This is what git does, checked rather than assumed: with
+    // `remote.origin.url` set in both scopes, git 2.43 answers
+    // `git remote get-url origin` with the *global* one, because the two are
+    // one list read in scope order and `get-url` prints its head. An earlier
+    // version of this test asserted the opposite from intuition; the
+    // intuition was wrong, and a reader that matched it would disagree with
+    // the command it replaced.
     std::env::remove_var("GIT_CONFIG_GLOBAL");
     fs::write(
         home.join(".gitconfig"),
         "[url \"git@github.com:\"]\n\tinsteadOf = gh:\n\
-         [remote \"origin\"]\n\turl = gh:Global/Wrong.git\n",
+         [remote \"origin\"]\n\turl = gh:Global/First.git\n",
     )
     .unwrap();
     assert_eq!(
         project_identity(&shorthand).project_key,
-        "github.com/Org/Repo",
-        "a repository's own origin must override a global one"
+        "github.com/Global/First",
+        "a remote's URL list is read in scope order and its head is the remote"
     );
 }

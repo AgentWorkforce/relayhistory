@@ -183,6 +183,14 @@ A worktree exists to be on a different branch from the checkout it shares a
 repository with, so asking the shared directory would answer about the wrong
 tree.
 
+A remote's URL is a list, not a single value: git accumulates every
+`remote.<name>.url` it reads, across scopes as well as within a file, and the
+remote *is* the head of that list — `git remote get-url origin` prints it while
+`git config --get remote.origin.url` prints the last. The canonical key follows
+`get-url`, so a repository with a mirror configured after its origin keys to
+the origin. An IPv6 authority keeps its brackets (`[2001:db8::1]/acme/app`), so
+an address is never cut at the first colon of its own body.
+
 One thing is deliberately left out: `includeIf "hasconfig:remote.*.url:"` is
 not evaluated, because its answer depends on how much configuration has been
 read so far. It cannot turn a resolvable remote into a wrong one — it only

@@ -113,10 +113,7 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
         };
     };
     let config = load_git_config(&found.git_dir, &found.head_dir);
-    let repo_url = config.get("remote \"origin\"").and_then(|origin| {
-        let url = single(origin, "url")?;
-        Some(apply_insteadof(&config, url))
-    });
+    let repo_url = remote_url(&config, "origin").map(|url| apply_insteadof(&config, url));
     match repo_url
         .as_deref()
         .and_then(canonicalize_remote_url)
@@ -715,7 +712,14 @@ fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
             continue;
         }
         let value = strip_inline_comment(line[eq + 1..].trim());
-        visit.visit(section, Some((key, value)));
+        // Variable names are case-insensitive in git, so they are folded here
+        // rather than compared case-insensitively at each lookup. Folding is
+        // what keeps `URL` and `url` in *one* list in the order they were
+        // written: two differently spelled keys would otherwise be two
+        // separate lists, and which came first in the file would be
+        // unknowable — and for a remote's URL that is the difference between
+        // the repository and one of its mirrors.
+        visit.visit(section, Some((&key.to_ascii_lowercase(), value)));
     }
 }
 
@@ -730,18 +734,51 @@ fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
 /// git's own rule for them.
 ///
 /// Section names arrive lowercased (see [`section_name`]) and subsection names
-/// verbatim, matching git's own case rules. Variable names are stored as
-/// written and compared case-insensitively by [`single`] and the `insteadOf`
-/// scan, so `URL` and `url` are one key.
+/// verbatim, and variable names lowercased too, matching git's own case rules.
+/// `URL` and `url` are therefore one key — and one *ordered* list, which is
+/// what lets a remote's first URL be identified as such.
 pub type GitConfig = HashMap<String, HashMap<String, Vec<String>>>;
 
-/// The effective value of a single-valued key: the last written, as git
-/// resolves it. Key comparison is case-insensitive, as git's is.
+/// The URL a remote resolves to: the **first** one configured for it.
+///
+/// `remote.<name>.url` is not a single-valued key. Git accumulates every value
+/// into the remote's URL list, in the order it reads them — across scopes as
+/// well as within a file — and `git remote get-url <name>` prints the first;
+/// the rest are mirrors that `--all` lists. Taking the last, as a single-
+/// valued key would, names the mirror instead of the repository. Verified
+/// against git 2.43 rather than assumed, because this helper replaced a
+/// `git remote get-url origin` subprocess and a disagreement here is a
+/// silently different project key:
+///
+/// ```text
+/// [remote "origin"]
+///     url = https://github.com/acme/main.git
+///     url = https://mirror.example/acme/main.git
+/// $ git remote get-url origin
+/// https://github.com/acme/main.git
+/// ```
+///
+/// (`git config --get remote.origin.url` does answer with the last — it
+/// applies the generic single-valued rule and knows nothing about remotes.
+/// The identity of a remote is what `get-url` reports.)
+///
+/// Variable names are lowercased when parsed, so `URL` and `url` are one list
+/// in the order they were written rather than two that lose their order
+/// against each other.
+fn remote_url<'a>(config: &'a GitConfig, remote: &str) -> Option<&'a String> {
+    config
+        .get(&format!("remote \"{remote}\""))?
+        .get("url")?
+        .first()
+}
+
+/// The effective value of a genuinely single-valued key: the last written, as
+/// git resolves it.
+#[cfg(test)]
 fn single<'a>(section: &'a HashMap<String, Vec<String>>, key: &str) -> Option<&'a String> {
     section
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(key))
-        .and_then(|(_, values)| values.last())
+        .get(&key.to_ascii_lowercase())
+        .and_then(|values| values.last())
 }
 
 /// Normalize a section header body, mirroring `^([A-Za-z0-9._-]+)\s+"(.*)"$`.
@@ -828,12 +865,10 @@ fn apply_insteadof(config: &GitConfig, url: &str) -> String {
             continue;
         };
         // Every `insteadOf` in the section, not merely one: git treats the key
-        // as multi-valued, so one base may carry several rewrites. Keys are
-        // case-insensitive, and hand-edited files spell this one several ways.
-        let prefixes = entries
-            .iter()
-            .filter(|(key, _)| key.eq_ignore_ascii_case("insteadOf"))
-            .flat_map(|(_, values)| values.iter());
+        // as multi-valued, so one base may carry several rewrites. Names are
+        // folded when parsed, so the several spellings hand-edited files use
+        // are already one key here.
+        let prefixes = entries.get("insteadof").into_iter().flatten();
         for prefix in prefixes {
             if prefix.is_empty() || !url.starts_with(prefix.as_str()) {
                 continue;
@@ -901,7 +936,15 @@ fn split_scp_like(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     let rest = &input[at + 1..];
-    let colon = rest.find(':')?;
+    // `git@[2001:db8::1]:path` is legal scp-like syntax, and the address is
+    // full of colons: the separator is the one *after* the closing bracket.
+    let colon = match rest.strip_prefix('[') {
+        Some(_) => rest
+            .find(']')
+            .map(|end| end + 1)
+            .filter(|at| rest[*at..].starts_with(':'))?,
+        None => rest.find(':')?,
+    };
     let host = &rest[..colon];
     let path = &rest[colon + 1..];
     if host.is_empty() || host.chars().any(char::is_whitespace) || path.is_empty() {
@@ -930,7 +973,22 @@ fn strip_dot_git(path: &str) -> String {
     path.strip_suffix(".git").unwrap_or(path).to_string()
 }
 
+/// The host part of an authority, with an optional `:port` removed.
+///
+/// A bracketed IPv6 literal is consumed through its matching `]` first,
+/// because its address is full of colons: cutting at the first one turns
+/// `[2001:db8::1]:2222` into `[2001`, which is not a host, and turns every
+/// address sharing a first group into the same key. The brackets are kept, so
+/// the host stays unambiguous and cannot be confused with a path.
 fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        return match host.find(']') {
+            Some(end) => &host[..=end],
+            // Unterminated: not an authority this module can take apart, so
+            // leave it whole rather than inventing a host from half of it.
+            None => host,
+        };
+    }
     match host.find(':') {
         Some(idx) => &host[..idx],
         None => host,
@@ -964,26 +1022,136 @@ mod tests {
 
     #[test]
     fn a_later_scope_wins_a_single_value_and_adds_to_a_multi_valued_one() {
-        let mut merged = parse_git_config(
-            "[url \"a\"]\n\tinsteadOf = one:\n[remote \"origin\"]\n\turl = first\n",
-        );
+        let mut merged =
+            parse_git_config("[url \"a\"]\n\tinsteadOf = one:\n[core]\n\teditor = first\n");
         merge_config(
             &mut merged,
-            parse_git_config(
-                "[url \"a\"]\n\tinsteadOf = two:\n[remote \"origin\"]\n\turl = second\n",
-            ),
+            parse_git_config("[url \"a\"]\n\tinsteadOf = two:\n[core]\n\tEDITOR = second\n"),
         );
         assert_eq!(
-            single(merged.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            single(merged.get("core").unwrap(), "editor").map(String::as_str),
             Some("second"),
-            "the later scope must win a single-valued key"
+            "the later scope must win a genuinely single-valued key, whatever its spelling"
         );
-        let mut rewrites = merged.get("url \"a\"").unwrap()["insteadOf"].clone();
+        let mut rewrites = merged.get("url \"a\"").unwrap()["insteadof"].clone();
         rewrites.sort();
         assert_eq!(
             rewrites,
             vec!["one:".to_string(), "two:".to_string()],
             "a rewrite configured in one scope must not delete another scope's"
+        );
+    }
+
+    /// A remote's URL is a *list*, and its identity is the head of that list.
+    ///
+    /// Verified against git 2.43 rather than assumed, because this replaced a
+    /// `git remote get-url origin` subprocess:
+    ///
+    /// ```text
+    /// [remote "origin"]
+    ///     url = https://github.com/acme/main.git
+    ///     url = https://mirror.example/acme/main.git
+    /// $ git remote get-url origin      → https://github.com/acme/main.git
+    /// $ git config --get remote.origin.url
+    ///                                  → https://mirror.example/acme/main.git
+    /// ```
+    ///
+    /// Taking the last — the generic single-valued rule, which is what
+    /// `config --get` applies and what this module used to do — names the
+    /// mirror. Every session in the repository would then be filed under a
+    /// project whose name is a host nobody pushes to.
+    #[test]
+    fn a_remote_resolves_to_its_first_url_not_its_last() {
+        let config = parse_git_config(
+            "[remote \"origin\"]\n\
+             \turl = https://github.com/acme/main.git\n\
+             \turl = https://mirror.example/acme/main.git\n",
+        );
+        assert_eq!(
+            remote_url(&config, "origin").map(String::as_str),
+            Some("https://github.com/acme/main.git")
+        );
+        assert_eq!(
+            canonicalize_remote_url(remote_url(&config, "origin").unwrap()).as_deref(),
+            Some("github.com/acme/main")
+        );
+
+        // Spelled two different ways, the order between them still holds:
+        // folding the names is what keeps them one list.
+        let mixed = parse_git_config(
+            "[remote \"origin\"]\n\
+             \tURL = https://first.example/a.git\n\
+             \turl = https://second.example/b.git\n",
+        );
+        assert_eq!(
+            remote_url(&mixed, "origin").map(String::as_str),
+            Some("https://first.example/a.git"),
+            "git returns the first URL written, whichever way it is spelled"
+        );
+
+        // And across scopes, which accumulate in the same list: git 2.43
+        // answers `get-url` with the global one here, surprising as that is.
+        let mut scoped = parse_git_config(
+            "[remote \"origin\"]\n\turl = https://global.example/acme/global.git\n",
+        );
+        merge_config(
+            &mut scoped,
+            parse_git_config("[remote \"origin\"]\n\turl = https://github.com/acme/main.git\n"),
+        );
+        assert_eq!(
+            remote_url(&scoped, "origin").map(String::as_str),
+            Some("https://global.example/acme/global.git")
+        );
+
+        // A rewrite still applies to whichever URL was selected.
+        let shorthand = parse_git_config(
+            "[remote \"origin\"]\n\turl = gh:acme/main.git\n\turl = gh:acme/mirror.git\n\
+             [url \"https://github.com/\"]\n\tinsteadOf = gh:\n",
+        );
+        assert_eq!(
+            apply_insteadof(&shorthand, remote_url(&shorthand, "origin").unwrap()),
+            "https://github.com/acme/main.git"
+        );
+    }
+
+    /// An IPv6 authority is full of colons, and a port is only the last one.
+    #[test]
+    fn ipv6_remotes_keep_their_whole_address() {
+        assert_eq!(
+            canonicalize_remote_url("ssh://git@[2001:db8::1]:2222/acme/app.git").as_deref(),
+            Some("[2001:db8::1]/acme/app"),
+        );
+        assert_eq!(
+            canonicalize_remote_url("ssh://git@[2001:db8::1]/acme/app.git").as_deref(),
+            Some("[2001:db8::1]/acme/app"),
+        );
+        assert_eq!(
+            canonicalize_remote_url("https://[2001:db8::2]/acme/app.git").as_deref(),
+            Some("[2001:db8::2]/acme/app"),
+        );
+        // Two addresses that share a first group must not collide, which is
+        // what cutting at the first colon did to every one of them.
+        assert_ne!(
+            canonicalize_remote_url("ssh://git@[2001:db8::1]:2222/acme/app.git"),
+            canonicalize_remote_url("ssh://git@[2001:db8::2]:2222/acme/app.git"),
+        );
+        // The scp-like form takes brackets too.
+        assert_eq!(
+            canonicalize_remote_url("git@[2001:db8::1]:acme/app.git").as_deref(),
+            Some("[2001:db8::1]/acme/app"),
+        );
+        // And the ordinary cases are untouched.
+        assert_eq!(
+            canonicalize_remote_url("ssh://git@host:2222/org/repo.git").as_deref(),
+            Some("host/org/repo"),
+        );
+        assert_eq!(
+            canonicalize_remote_url("ssh://git@192.0.2.10:2222/org/repo.git").as_deref(),
+            Some("192.0.2.10/org/repo"),
+        );
+        assert_eq!(
+            canonicalize_remote_url("https://github.com/Org/Repo").as_deref(),
+            Some("github.com/Org/Repo"),
         );
     }
 

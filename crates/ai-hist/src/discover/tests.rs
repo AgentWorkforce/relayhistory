@@ -2633,3 +2633,98 @@ fn a_cached_child_is_streamed_the_settled_key_its_parent_keeps() {
         "a settled remote key must not be rewritten by a later pass"
     );
 }
+
+/// A stand-in follows the ancestor it stands in for, all the way down.
+///
+/// When pass 1 promotes a grandparent onto a `remote` of its own, pass 2
+/// carries that key through every borrowed key beneath it. A read-time walk
+/// that stops at the first ancestor already wearing a borrowed key answers
+/// with the stand-in the refresh is about to replace — so the row goes out on
+/// the wire naming one project while the database ends up naming another.
+#[test]
+fn a_cached_child_is_streamed_the_key_a_promoted_ancestor_will_lend() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted: its checkout has an `origin`
+    // but the catalog still has it wearing a key it borrowed.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The middle generation and the child both borrowed that same old key.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "parent", "gp->p"),
+        ("parent", "child", "p->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed key was the stand-in the refresh was about to replace"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
+}

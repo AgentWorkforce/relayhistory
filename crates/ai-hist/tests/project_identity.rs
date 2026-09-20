@@ -618,3 +618,100 @@ fn a_child_re_inherits_when_its_parent_moves_to_a_key_of_its_own() {
         "re-inheritance must reach a fixed point, not churn on every sync"
     );
 }
+
+/// A delegated thread that delegates again is still the root's work.
+///
+/// Neither middle generation need hold a catalog row: a Codex subagent
+/// rollout and a Claude sidechain are evidence, not sessions. Joining the
+/// relationship parent straight to `sessions` therefore stops at the first
+/// uncataloged generation, and the grandchild's events — the deepest, most
+/// specialized work in the tree — are the one place in the database with no
+/// project at all. The deeper the delegation, the more certainly its work
+/// disappears from the repository it was done for.
+#[test]
+fn events_of_a_nested_delegated_thread_reach_the_nearest_cataloged_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("nested.db")).unwrap();
+
+    // Only the root is cataloged.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'r', '/work/app', 'github.com/acme/app', 'remote', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    let edge = |parent: &str, child: &str, created: i64| {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    };
+    edge("r", "c", 1);
+    edge("c", "g", 2);
+
+    // The grandchild's transcript produced events and no catalog row.
+    for (uid, text) in [("g-1", "deep work"), ("g-2", "more of it")] {
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+             VALUES ('codex', 'g', ?1, 1, 'assistant', 'text', ?2)",
+            rusqlite::params![uid, text],
+        )
+        .unwrap();
+    }
+
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    let keyed: Vec<(Option<String>, Option<String>)> = conn
+        .prepare(
+            "SELECT project_key, project_key_method FROM session_events \
+             WHERE source = 'codex' AND session_id = 'g' ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        keyed,
+        vec![
+            (
+                Some("github.com/acme/app".to_string()),
+                Some(ProjectKeyMethod::Inherited.as_str().to_string())
+            );
+            2
+        ],
+        "a twice-delegated thread's events never reached the root's repository"
+    );
+
+    // Settled, and a `remote` an evidence-only thread resolved for itself is
+    // not displaced by the loan.
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text, \
+         project_key, project_key_method) \
+         VALUES ('codex', 'g', 'g-own', 1, 'assistant', 'text', 'elsewhere', \
+                 'github.com/acme/other', 'remote')",
+        [],
+    )
+    .unwrap();
+    refresh_project_identity(&conn).unwrap();
+    let own: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT project_key, project_key_method FROM session_events WHERE event_uid = 'g-own'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        own,
+        (
+            Some("github.com/acme/other".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the loan displaced a repository the thread had resolved for itself"
+    );
+}

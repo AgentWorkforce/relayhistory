@@ -108,7 +108,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   directory — a worktree is on a different branch from the checkout it shares a
   repository with, which is the point of it. A rewrite is overwhelmingly a global
   setting, and a reader that stopped at `.git/config` saw `gh:Org/Repo.git` as
-  an unresolvable remote and fell back to a path key. Existing databases migrate additively and deliberately
+  an unresolvable remote and fell back to a path key. A remote's URL is read as the
+  list git treats it as, so a repository with a mirror configured after its
+  origin keys to the origin (matching `git remote get-url`, not
+  `git config --get`), and an IPv6 authority keeps its brackets instead of
+  being cut at the first colon of its own address. Events of a delegated thread
+  the catalog does not hold take the key of their nearest cataloged *ancestor*,
+  so a subagent that delegates again still rolls up to the repository the work
+  was done for. Existing databases migrate additively and deliberately
   backfill no keys: a column stays `null` until the next sync or hydration
   resolves it for real, rather than being stamped with a path key for a
   checkout that does have a remote. A `path` key is likewise never final —
