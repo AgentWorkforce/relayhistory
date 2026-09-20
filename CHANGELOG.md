@@ -32,10 +32,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   a transcript whose indexed tool results have no `event_index`, so an upgraded
   install backfills them instead of skipping every unchanged file on the stamp
   fast path and reporting a successful sync over permanently null columns. The
-  pass is recorded only after a walk that read every file it discovered — a
-  failed provider read is propagated rather than silently read as an empty
-  file — and that walk reached every rollout root the database has indexed
-  from. The pass is bounded by a recorded generation rather than by
+  pass is recorded only after a walk that read every file whose recorded stamp
+  would otherwise skip it next time — a failed provider read is propagated
+  rather than silently read as an empty file, and the walk reports that failure
+  after indexing the rest of the tree, so the source is classified as failed
+  instead of reporting a cache it does not have — and that walk reached every
+  rollout root the database has indexed from. The pass is bounded by a recorded generation rather than by
   "a null row exists",
   because local and remote observations share `(source, session_id)` and an
   adapter may contribute a tool result with no fidelity that re-reading the

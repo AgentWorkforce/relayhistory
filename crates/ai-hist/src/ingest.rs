@@ -2821,9 +2821,16 @@ fn sync_claude_session_metadata(
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
-    // A pass that could not read a file it discovered has not covered that
-    // file, and must not retire the backfill generation over it.
+    // A pass that could not read a file it will otherwise skip next time has
+    // not covered that file, and must not retire the backfill generation over
+    // it. A file that the walk reopens by itself -- one with no stamp, or a
+    // stamp that no longer matches -- is not in that position.
     let mut unread_file = false;
+    // The first read failure, returned once the in-memory state has been
+    // brought up to date. Continuing past it indexes the rest of the tree,
+    // but the run did omit a transcript it discovered, and a caller told the
+    // sync completed would treat an incomplete cache as current.
+    let mut read_error: Option<anyhow::Error> = None;
     let mut scanned = 0;
     let mut upserted = 0;
     for path in collect_matching_files(root, "", "jsonl")? {
@@ -2849,11 +2856,20 @@ fn sync_claude_session_metadata(
         let scanned_meta = match scan_claude_session_file(&path) {
             Ok(meta) => meta,
             Err(error) => {
-                unread_file = true;
+                // Only a file that would otherwise be skipped holds the pass
+                // open. An unstamped file, or one whose stamp has moved, is
+                // reopened by the next walk regardless -- and a pending
+                // generation keeps the per-session fidelity probe live, which
+                // drags any session carrying a contributed null row through a
+                // re-read on every sync.
+                if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
+                    unread_file = true;
+                }
                 sync_note!(
                     "  [claude-sessions] could not read {}: {error:#}",
                     path.display()
                 );
+                read_error.get_or_insert(error);
                 continue;
             }
         };
@@ -2901,7 +2917,12 @@ fn sync_claude_session_metadata(
     if scanned > 0 {
         sync_note!("  [claude-sessions] scanned {scanned} files, {upserted} sessions updated");
     }
-    Ok(())
+    // Reported after the state above is current, so the work that did land is
+    // kept and only the run's own status says a transcript was missed.
+    match read_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// What a Claude transcript is skipped on when nothing about it changed.
@@ -6969,7 +6990,13 @@ mod tests {
         restore_mtime(&unreadable, pinned);
         assert_eq!(claude_sync_stamp(&unreadable).unwrap(), stamp_before);
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        // The run reports the omission rather than claiming a clean sync.
+        let error = sync_claude_session_metadata(&conn, &mut state, dir.path())
+            .expect_err("a discovered transcript was not indexed");
+        assert!(
+            format!("{error:#}").contains("sess-unreadable.jsonl"),
+            "the error names the file it could not read: {error:#}"
+        );
 
         // Positive control: the readable file in the same run was repaired,
         // so the walk is not simply failing wholesale.
@@ -7008,6 +7035,132 @@ mod tests {
     }
 
     #[test]
+    fn an_all_readable_claude_walk_still_reports_success() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("sess-fine.jsonl"),
+            claude_line(json!({
+                "type": "user", "uuid": "u1", "sessionId": "sess-fine",
+                "cwd": "/tmp/project", "timestamp": "2026-04-23T00:00:00.000Z",
+                "message": { "role": "user", "content": "hello" },
+            })) + "\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path())
+            .expect("a walk that read everything it found reports success");
+        assert_eq!(
+            state
+                .get(super::CLAUDE_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_new_claude_transcript_does_not_pin_the_backfill_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexed = dir.path().join("sess-adapter.jsonl");
+        fs::write(
+            &indexed,
+            [
+                claude_line(json!({
+                    "type": "assistant", "uuid": "a1", "sessionId": "sess-adapter",
+                    "cwd": "/tmp/project", "timestamp": "2026-04-23T00:00:01.000Z",
+                    "message": { "role": "assistant", "content": [
+                        { "type": "tool_use", "id": "tu_1", "name": "Bash",
+                          "input": { "command": "ls" } },
+                    ]},
+                })),
+                claude_line(json!({
+                    "type": "user", "uuid": "u2", "parentUuid": "a1",
+                    "sessionId": "sess-adapter", "cwd": "/tmp/project",
+                    "timestamp": "2026-04-23T00:00:02.000Z",
+                    "message": { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "tu_1", "content": "ok" },
+                    ]},
+                })),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // A contributed row for the same session that carries no fidelity.
+        // Re-reading the local transcript can never populate it, so the
+        // per-session probe answers "still missing" on every sync for as long
+        // as the probe is consulted at all.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sess-adapter', 9, 'tool_result', 'tool_result', \
+                     'remote output', 'remote-uid-1')",
+            [],
+        )
+        .unwrap();
+
+        // The state an upgrade leaves behind, plus a brand-new file that
+        // cannot be read. It has never been stamped, so the walk reopens it
+        // by itself next time -- holding the generation pending does nothing
+        // for it, and a pending generation keeps the probe live.
+        blank_tool_result_fidelity(&conn, "claude");
+        blank_tool_result_fidelity_state(&mut state);
+        fs::write(
+            dir.path().join("sess-broken.jsonl"),
+            b"\xff\xfe not utf-8\n",
+        )
+        .unwrap();
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path())
+            .expect_err("the broken file is reported, not swallowed");
+        assert_eq!(
+            tool_result_for(&conn, "claude", "sess-adapter", "tu_1").payload_bytes,
+            Some(2),
+            "the readable transcript is still repaired"
+        );
+        assert_eq!(
+            state
+                .get(super::CLAUDE_FIDELITY_GENERATION_KEY)
+                .and_then(Value::as_i64),
+            Some(super::TOOL_RESULT_FIDELITY_GENERATION),
+            "a never-stamped unreadable file is revisited on its own and must \
+             not hold the pass open"
+        );
+
+        // With the pass retired, the probe is no longer consulted, so the
+        // contributed null row cannot drag the unchanged transcript through a
+        // re-read on every sync. A sentinel a re-read would overwrite proves
+        // the file stayed on the fast path.
+        conn.execute(
+            "UPDATE session_events SET text = 'sentinel' \
+             WHERE source = 'claude' AND event_uid = 'u2:0'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path())
+            .expect_err("the broken file is still there and still reported");
+        let local = conn
+            .query_row(
+                "SELECT text FROM session_events WHERE source='claude' AND event_uid='u2:0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, "sentinel",
+            "an unchanged transcript must not be re-read on every sync"
+        );
+    }
+
+    #[test]
     fn an_unreadable_new_claude_transcript_is_not_stamped_as_indexed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sess-new.jsonl");
@@ -7019,7 +7172,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path())
+            .expect_err("a discovered transcript was not indexed");
         let stamps = state
             .get("claude_sessions_v3")
             .and_then(Value::as_object)
@@ -7749,6 +7903,21 @@ mod tests {
 
     fn codex_meta(path: &std::path::Path) -> super::CodexSessionMeta {
         super::read_codex_session_meta(path).unwrap().unwrap()
+    }
+
+    /// The tool-result row answering one call, whatever its position. A
+    /// contributed row can sort ahead of the parsed ones, so indexing into
+    /// the list would assert against the wrong row.
+    fn tool_result_for(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+        tool_use_id: &str,
+    ) -> crate::SessionEvent {
+        tool_results(conn, source, session_id)
+            .into_iter()
+            .find(|event| event.tool_use_id.as_deref() == Some(tool_use_id))
+            .unwrap_or_else(|| panic!("no tool result for {tool_use_id}"))
     }
 
     /// Tool-result rows for one session, in transcript order.

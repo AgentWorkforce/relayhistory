@@ -379,8 +379,16 @@ everything it discovered: every rollout root the database has indexed from was
 reachable, and every transcript it found was read. A provider read that fails
 is propagated rather than defaulted to an empty string, because an I/O or
 UTF-8 failure reduced to `""` is indistinguishable from a file that genuinely
-holds nothing — and a file restored afterwards keeps its length and mtime, so
-the unchanged stamp would never reopen it.
+holds nothing. The walk indexes the rest of the tree and then reports the
+failure, so the sync is classified as failed for that source rather than
+reporting a complete cache it does not have.
+
+Only a file that the walk would otherwise *skip* next time holds the pass
+open — one whose recorded stamp still matches, which is the case where nothing
+about the file will change to reopen it. A file with no stamp, or a stamp that
+has moved, is revisited by the walk itself, so keeping the generation pending
+would buy it nothing while keeping the per-session probe live, which re-reads
+any session carrying a contributed null row on every sync.
 
 The pass is bounded by a recorded generation rather than by "some row is still
 null", and that distinction matters: `session_events` is keyed by
