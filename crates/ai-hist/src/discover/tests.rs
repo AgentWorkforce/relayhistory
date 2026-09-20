@@ -802,6 +802,62 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     assert!(row.models.is_empty());
 }
 
+/// Discovery's session summary and the one full ingestion writes have to be
+/// the same string, or hydrating a session silently rewrites its summary.
+///
+/// A Cursor assistant record can hold several text blocks — prose, a tool
+/// call, then more prose. Ingestion walks the blocks in order and keeps the
+/// last non-empty one, so discovery must too.
+///
+/// Positive control: with `.find()` in `cursor_assistant_text` this failed
+/// with `discovery and ingestion must agree on the session summary:
+/// left: Some("Let me check the test."), right: Some("Fixed it.")` — the
+/// catalog advertised the opening line and hydration replaced it with the
+/// closing one.
+#[test]
+fn cursor_summary_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-multi",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>fix it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}},{"type":"text","text":"Fixed it."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-multi").last_assistant_text.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-multi",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on the session summary"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("Fixed it."),
+        "the summary is the reply's last word, not its first"
+    );
+}
+
 #[test]
 fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
     let conn = catalog();

@@ -1156,12 +1156,17 @@ fn cursor_assistant_text(line: &[u8]) -> Option<String> {
     if crate::ingest::cursor::record_role(obj) != Some("assistant") {
         return None;
     }
+    // One assistant record can hold several text blocks — prose, a tool call,
+    // then more prose. Full ingestion walks them in order and keeps the last
+    // non-empty one, so the summary is the reply's closing line. Taking the
+    // first here instead would make the catalog advertise the opening line and
+    // hydration silently rewrite it.
     crate::ingest::cursor::record_blocks(obj)
         .iter()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .map(str::trim)
-        .find(|text| !text.is_empty())
+        .rfind(|text| !text.is_empty())
         .map(str::to_string)
 }
 
