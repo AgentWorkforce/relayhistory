@@ -90,3 +90,7 @@ required-features = ["unstable-internal"]
 [[test]]
 name = "sync_silence"
 required-features = ["unstable-internal"]
+
+[[test]]
+name = "claude_rewrite_retention"
+required-features = ["unstable-internal"]

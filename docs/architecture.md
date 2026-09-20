@@ -108,6 +108,37 @@ and do not open SQLite. Optional Rust compatibility implementations depend on
 public core storage operations; they do not move transport or credential
 dependencies back into the local engine. See [source plugins](remote-connectors.md).
 
+## Evidence retention
+
+Provider files are not the source of truth for what was already observed. A
+re-parse of the same provider file never deletes evidence an earlier parse
+stored for the same session: local re-ingests upsert by provider-native
+identity (Claude records carry their `uuid` into every derived `event_uid`),
+so rows the rewritten file no longer contains are left untouched in
+`session_events`, `tool_calls`, `file_edits` and `history`. Records without
+provider identity derive a content-hash fallback instead of a line index, so
+a compaction that drops the prefix or inserts summary rows cannot shift
+survivors onto earlier rows' identities. Byte-identical id-less rows share
+that identity by design: an ordinal would be positional identity by another
+name. Pre-upgrade positional leftovers heal onto a re-attributed record
+only on a unique full-record match — event text, timestamp, role, kind,
+model and token spend, or a session-unique tool use id — otherwise they
+stay preserved. Claude Code
+rewrites a transcript in place on resume/compact, and the compacted file is
+routinely missing assistant turns the pre-compaction file contained; those
+turns stay queryable. The only local deletion path is a targeted heal that
+names its exact rows (sidechain re-attribution moving a delegated thread's
+records onto the child). Retention/compaction deletion of a large database is
+explicit and opt-in, never a side effect of re-parsing. Codex rollout events
+are keyed by line position rather than provider identity, so the pinned
+guarantee there covers relocation (the `sessions/` to `archived_sessions/`
+move re-ingests under the same session id with no loss or duplication);
+content-stable identity for prefix-dropping rollout rewrites is future work
+for incremental hydration. `crates/ai-hist/tests/claude_rewrite_retention.rs`
+pins all of this: in-place compaction through `sync` and through targeted
+`hydrateSession`, an mtime-only rewrite at identical size, and the Codex
+archive relocation.
+
 ## Operation semantics
 
 | Operation | Provider I/O | Database work | Missing database |
