@@ -477,6 +477,7 @@ export async function getSessionRelationships(
       sessionId: String(value.sessionId),
       asParent: relationships(value.asParent),
       asChild: relationships(value.asChild),
+      continuity: relationships(value.continuity),
       capabilities: relationshipCapabilities(value.capabilities),
       diagnostics: relationshipDiagnostics(value.diagnostics),
     };
@@ -521,6 +522,7 @@ export async function getSessionTree(options: GetSessionTreeOptions): Promise<Se
       dbPath: options.dbPath,
       maxDepth: options.maxDepth,
       maxNodes: options.maxNodes,
+      relationshipKinds: options.relationshipKinds,
     });
     const contractVersion = Number(value.contractVersion);
     assertRelationshipContract(contractVersion);
@@ -582,6 +584,7 @@ export async function getSessionChildrenPage(
             spawnedAtMs: options.after.spawnedAtMs ?? undefined,
           }
         : undefined,
+      relationshipKinds: options.relationshipKinds,
     });
     return {
       children: relationships(page.children),

@@ -237,7 +237,7 @@ test('sessions relationships and sessions tree render topology in both modes', a
       cli, 'sessions', 'relationships', 'codex', 'topology-root', '--db', db, '--json', '--no-warning',
     ], { env });
     const wire = JSON.parse(relationships.stdout) as Record<string, unknown>;
-    assert.equal(wire.contract_version, 1);
+    assert.equal(wire.contract_version, 2);
     assert.equal(wire.session_id, 'topology-root');
     assert.deepEqual(wire.as_child, []);
     const [edge] = wire.as_parent as Array<Record<string, unknown>>;
@@ -813,4 +813,48 @@ test('unknown subcommands name what was unknown instead of generic parse error',
     run(process.execPath, [cli, 'sessions', 'unknown-subcommand', '--no-warning']),
     (error: unknown) => isUsageFailure(error, "unknown sessions subcommand 'unknown-subcommand'"),
   );
+});
+
+test('sessions relationships names the other end of a continuity edge', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'relayhistory-cli-continuity-'));
+  const home = join(root, 'home');
+  const projects = join(home, '.claude', 'projects', 'app');
+  const db = join(root, 'history.db');
+  await mkdir(projects, { recursive: true });
+  const line = (row: Record<string, unknown>) => `${JSON.stringify(row)}\n`;
+  await writeFile(join(projects, 'origin.jsonl'),
+    line({
+      sessionId: 'origin', uuid: 'origin-u', parentUuid: null, type: 'user', cwd: '/work/app',
+      message: { role: 'user', content: 'start' }, timestamp: '2026-08-31T10:00:00Z',
+    })
+    + line({
+      sessionId: 'origin', uuid: 'origin-a', parentUuid: 'origin-u', type: 'assistant', cwd: '/work/app',
+      message: { role: 'assistant', content: 'ok' }, timestamp: '2026-08-31T10:00:01Z',
+    }));
+  await writeFile(join(projects, 'continued.jsonl'), line({
+    sessionId: 'continued', uuid: 'cont-u', parentUuid: 'origin-a', type: 'user', cwd: '/work/app',
+    message: { role: 'user', content: 'carry on' }, timestamp: '2026-08-31T11:00:00Z',
+  }));
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  try {
+    await run(process.execPath, [cli, 'sync', '--db', db, '--no-warning'], { env });
+
+    // Asked about the origin, the line names the branch.
+    const parentSide = await run(process.execPath, [
+      cli, 'sessions', 'relationships', 'claude', 'origin', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(parentSide.stdout, /1 continuity relationship\(s\)/);
+    assert.match(parentSide.stdout, /continuity {2}continued {2}continuation/);
+
+    // Asked about the branch, the same row names the origin — not the
+    // session that was just asked about.
+    const childSide = await run(process.execPath, [
+      cli, 'sessions', 'relationships', 'claude', 'continued', '--db', db, '--no-warning',
+    ], { env });
+    assert.match(childSide.stdout, /1 continuity relationship\(s\)/);
+    assert.match(childSide.stdout, /continuity {2}origin {2}continuation/);
+    assert.doesNotMatch(childSide.stdout, /continuity {2}continued/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

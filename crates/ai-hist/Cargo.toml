@@ -64,6 +64,10 @@ name = "hydration_preflight"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "session_continuity"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "env_roots"
 required-features = ["unstable-internal"]
 

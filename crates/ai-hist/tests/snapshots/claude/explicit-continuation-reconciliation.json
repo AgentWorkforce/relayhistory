@@ -106,7 +106,42 @@
       "ts_ms": 1776996001000
     }
   ],
-  "session_relationships": [],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 1,
+      "child_model": null,
+      "child_session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/explicit-line-relationships.jsonl",
+      "evidence_ref": "forkSessionId",
+      "identity_status": "observed",
+      "parent_session_id": "fork-source-session",
+      "relationship": "fork",
+      "relationship_uid": "fork:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776996000000
+    },
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 1,
+      "child_model": null,
+      "child_session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "evidence_kind": "claude_transcript_continuity",
+      "evidence_locator": "<home>/.claude/projects/corpus/explicit-line-relationships.jsonl",
+      "evidence_ref": "continuedFromSessionId",
+      "identity_status": "observed",
+      "parent_session_id": "original-session",
+      "relationship": "continuation",
+      "relationship_uid": "continuation:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776996000000
+    }
+  ],
   "sessions": [
     {
       "agent_version": "2.1.97",
