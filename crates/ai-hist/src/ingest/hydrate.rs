@@ -1057,11 +1057,42 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
+        // Which layout is current *now*, by the same precedence global sync
+        // uses -- not which one this catalog row was written from. A row
+        // written while only the tree existed still names a session file
+        // after `opencode.db` appears, and classifying that locator on its
+        // own would leave targeted hydration reading the superseded tree
+        // while `sync --local` reads SQLite: two paths disagreeing about one
+        // session.
+        //
+        // When the layouts disagree the row is stale as a whole, not just in
+        // its locator -- its prompt, models, timestamps and stamp all came
+        // from the other store -- so hydrating from the current one behind
+        // its back would stamp the checkpoint against a store the row does
+        // not describe. Refuse, and name the way out.
+        let current_layout =
+            crate::ingest::opencode::OpencodeLayout::detect(&configured_path, &configured_storage);
+        let superseded = |stale: &Path, current: &Path| {
+            hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "OpenCode catalog row points at {}, but {} is now the current store;                      run discoverSessions() again to re-establish this session's provenance",
+                    stale.display(),
+                    current.display()
+                ),
+            )
+        };
         // A locator inside the legacy tree is a session file, not the store:
         // it is stamped by its own bytes, the way every other file-backed
         // provider is.
         if opencode_locator_is_in_storage_tree(&path, &configured_storage) {
+            if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(store)) = &current_layout {
+                return Err(superseded(&path, store));
+            }
             return opencode_json_tree_snapshot(options, &path);
+        }
+        if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
+            return Err(superseded(&path, tree));
         }
         if fs::canonicalize(&path).ok() != fs::canonicalize(&configured_path).ok() {
             return Err(hydration_error(

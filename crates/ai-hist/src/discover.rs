@@ -1737,10 +1737,18 @@ fn read_shallow_opencode_json_tree(
             .session
             .created_ms
             .or_else(|| times.iter().min().copied()),
-        last_activity_ms: loaded
-            .session
-            .updated_ms
-            .or_else(|| times.iter().max().copied()),
+        // The later of the two, not whichever exists. OpenCode appends a
+        // turn without rewriting the session JSON, so `updated` routinely
+        // lags its own newest message -- and preferring it catalogued a busy
+        // session as last active whenever its JSON last changed, which sorts
+        // it behind genuinely older sessions in the newest-first listing and
+        // lets a bounded page drop it. Neither value supersedes the other, so
+        // either one alone stands when the other is absent.
+        last_activity_ms: match (loaded.session.updated_ms, times.iter().max().copied()) {
+            (Some(updated), Some(newest)) => Some(updated.max(newest)),
+            (Some(updated), None) => Some(updated),
+            (None, newest) => newest,
+        },
         first_prompt,
         models,
         // The concrete session file, so hydration can stamp exactly what

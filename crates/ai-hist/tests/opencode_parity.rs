@@ -286,6 +286,8 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_session_file_rewritten_in_place_moves_its_stamp_and_recency();
     a_tool_call_persisted_progressively_keeps_its_final_state();
     a_sqlite_store_named_like_json_is_still_read_as_sqlite();
+    a_catalog_locator_from_the_other_layout_is_refused_not_read();
+    an_appended_turn_advances_catalog_recency_past_a_stale_session_json();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -946,8 +948,9 @@ fn a_turn_appended_as_new_files_is_not_reported_unchanged() {
         "the catalog source stamp must move when a turn is appended"
     );
     assert!(
-        after.1 >= before.1,
-        "the recency hint must not go backwards: {:?} -> {:?}",
+        after.1 > before.1,
+        "the catalog recency must advance when a newer turn lands, not merely \
+         fail to go backwards: {:?} -> {:?}",
         before.1,
         after.1
     );
@@ -1165,6 +1168,15 @@ fn opencode_only() -> DiscoverOptions {
 }
 
 fn hydrate(db_path: &Path, session_id: &str) -> ai_hist::HydrateSessionResult {
+    hydrate_result(db_path, session_id).unwrap()
+}
+
+/// The error as a string, because `anyhow` is a dependency of the crate and
+/// not a dev-dependency, so the test binary cannot name the type.
+fn hydrate_result(
+    db_path: &Path,
+    session_id: &str,
+) -> Result<ai_hist::HydrateSessionResult, String> {
     hydrate_session_at(
         db_path,
         &HydrateSessionOptions {
@@ -1174,7 +1186,7 @@ fn hydrate(db_path: &Path, session_id: &str) -> ai_hist::HydrateSessionResult {
             include_related: false,
         },
     )
-    .unwrap()
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// `(source_stamp, last_activity_ms)` as the catalog holds them.
@@ -1188,4 +1200,148 @@ fn catalog_row(db_path: &Path, session_id: &str) -> (Option<String>, Option<i64>
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
+}
+
+/// A catalog row written while only one layout existed still names that
+/// layout's locator after the other one appears. Global sync re-detects on
+/// every run and would move to `opencode.db`; targeted hydration classified
+/// the saved locator without ever asking which layout is current, so it went
+/// on reading the stale JSON tree while `sync --local` read SQLite — the two
+/// paths disagreeing about the same session.
+///
+/// The catalog row is stale as a whole in that situation, not just its
+/// locator: its prompt, models, timestamps and stamp all came from the tree.
+/// Hydrating from SQLite behind its back would leave the checkpoint stamped
+/// against a store the row does not describe, so this fails loudly and points
+/// at rediscovery instead.
+fn a_catalog_locator_from_the_other_layout_is_refused_not_read() {
+    let root = temp_root("layout-precedence");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    let store = home.join(".local/share/opencode/opencode.db");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+
+    // Discovery runs while only the tree exists, so the catalog locator is a
+    // session file.
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    let locator = raw_path(&db_path, "ses_simple");
+    assert!(
+        locator.ends_with("ses_simple.json"),
+        "precondition: the catalog must hold a JSON-tree locator, got {locator}"
+    );
+
+    // Positive control: while the tree is still the current layout, that
+    // locator hydrates fine. Without this the assertion below would pass for
+    // a hydration that refuses every legacy locator.
+    clear_opencode_evidence(&db_path);
+    assert!(
+        hydrate(&db_path, "ses_simple").evidence.events > 0,
+        "a legacy locator must still hydrate while the tree is the current layout"
+    );
+
+    // Now the host upgrades: `opencode.db` appears beside the stale tree.
+    build_sqlite_store(&store);
+    use_layout(&home, Some(&store), Some(&tree));
+    clear_opencode_evidence(&db_path);
+
+    let message = hydrate_result(&db_path, "ses_simple")
+        .err()
+        .expect("hydration must not read the tree once SQLite is the current layout");
+    assert!(
+        message.contains("SESSION_SOURCE_MISMATCH"),
+        "the stale locator must be refused as a source mismatch, got: {message}"
+    );
+    assert!(
+        message.contains("discoverSessions"),
+        "the error must tell the caller how to recover, got: {message}"
+    );
+
+    // And it refused rather than quietly indexing the stale tree.
+    let conn = open_db(&db_path).unwrap();
+    assert!(
+        session_events(&conn, "ses_simple", Some("opencode"))
+            .unwrap()
+            .is_empty(),
+        "nothing from the superseded layout may be indexed"
+    );
+    drop(conn);
+
+    // Rediscovery is the recovery path, and it works: the catalog moves to
+    // the SQLite store and its own sessions hydrate.
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        hydrate(&db_path, "ses_sqlite_root").evidence.events > 0,
+        "after rediscovery the SQLite sessions hydrate"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `last_activity_ms` preferred `session.updated_ms` whenever the provider
+/// wrote one, so a session whose JSON says `updated: 1000` while its newest
+/// message says `created: 5000` was catalogued as last active at 1000. The
+/// catalog listing is newest-first with a limit, so that session sorts behind
+/// genuinely older ones and a bounded page can drop it entirely.
+///
+/// The two values are both real and neither supersedes the other: the answer
+/// is the later of them, and either one alone when the other is absent.
+fn an_appended_turn_advances_catalog_recency_past_a_stale_session_json() {
+    let root = temp_root("stale-updated");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+
+    // The session JSON's own `updated` is far behind its newest message.
+    write_json(
+        &tree.join("session/global/ses_stale.json"),
+        r#"{"id":"ses_stale","directory":"/tmp/project","time":{"created":1000,"updated":1000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_stale/msg_stale_u1.json"),
+        r#"{"id":"msg_stale_u1","sessionID":"ses_stale","role":"user","time":{"created":5000}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_stale_u1/prt_stale_u1.json"),
+        r#"{"id":"prt_stale_u1","sessionID":"ses_stale","messageID":"msg_stale_u1","type":"text","text":"a turn the session json never heard about"}"#,
+    );
+
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+
+    let (_, last_activity) = catalog_row(&db_path, "ses_stale");
+    assert_eq!(
+        last_activity,
+        Some(5000),
+        "the newest message wins over a stale session `updated`"
+    );
+
+    // The converse still holds: a session JSON ahead of its messages keeps
+    // its own `updated`, so this is a max and not a blanket switch to the
+    // message timestamps.
+    write_json(
+        &tree.join("session/global/ses_ahead.json"),
+        r#"{"id":"ses_ahead","directory":"/tmp/project","time":{"created":1000,"updated":9000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_ahead/msg_ahead_u1.json"),
+        r#"{"id":"msg_ahead_u1","sessionID":"ses_ahead","role":"user","time":{"created":5000}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_ahead_u1/prt_ahead_u1.json"),
+        r#"{"id":"prt_ahead_u1","sessionID":"ses_ahead","messageID":"msg_ahead_u1","type":"text","text":"older than the session json"}"#,
+    );
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert_eq!(
+        catalog_row(&db_path, "ses_ahead").1,
+        Some(9000),
+        "a session `updated` ahead of its messages is still the later value"
+    );
+
+    fs::remove_dir_all(&root).ok();
 }
