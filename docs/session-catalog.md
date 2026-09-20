@@ -61,7 +61,7 @@ looked. So a completed Cursor hydration reports:
 {
   "capability": "partial",
   "coverage": ["history"],
-  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor local evidence covers history; no local parser produces session_event, tool_call, file_edit, relationship" }]
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor evidence covers history; this hydration produces no session_event, tool_call, file_edit, relationship" }]
 }
 ```
 

@@ -1576,17 +1576,16 @@ fn codex_child_scan_complete(directory: &Path) -> Result<bool> {
         return Ok(false);
     };
     for root in codex_rollout_roots(directory) {
-        let Some(year) = sorted_dirs(&root)?.pop() else {
-            continue;
-        };
-        let Some(month) = sorted_dirs(&year)?.pop() else {
-            continue;
-        };
-        let Some(day) = sorted_dirs(&month)?.pop() else {
-            continue;
-        };
-        if date_key(&day).is_none_or(|key| key > through) {
-            return Ok(false);
+        'years: for year in sorted_dirs(&root)?.into_iter().rev() {
+            for month in sorted_dirs(&year)?.into_iter().rev() {
+                if let Some(day) = sorted_dirs(&month)?.pop() {
+                    if date_key(&day).is_none_or(|key| key > through) {
+                        return Ok(false);
+                    }
+                    // This is the newest populated date in this root.
+                    break 'years;
+                }
+            }
         }
     }
     Ok(true)
@@ -2913,6 +2912,11 @@ mod tests {
         );
         let later = sessions.join("2026/09/20/rollout-later.jsonl");
         codex_rollout(&later, "later", Some("root"), "2026-09-20T12:00:00Z");
+        // Empty newer year/month directories must not hide the most recent
+        // populated date, which is still outside the bounded search.
+        fs::create_dir_all(sessions.join("2027/01")).unwrap();
+        fs::create_dir_all(sessions.join("2026/10")).unwrap();
+        assert!(!codex_child_scan_complete(root.parent().unwrap()).unwrap());
         assert!(!codex_child_candidates(root.parent().unwrap())
             .unwrap()
             .contains(&later));
