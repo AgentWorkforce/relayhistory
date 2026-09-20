@@ -3314,13 +3314,15 @@ fn a_negative_count_in_the_marker_does_not_license_a_skip() {
     );
 
     let before = codex_event_count(&db, "sess-negative");
-    assert!(before > 0);
+    assert!(before > 1, "the test needs a short, still-nonempty session");
     let conn = ai_hist::open_db(&db).expect("open db");
     conn.execute(
-        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-negative'",
+        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-negative' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'codex' AND session_id = 'sess-negative')",
         [],
     )
-    .expect("delete the events");
+    .expect("delete one event");
     drop(conn);
 
     let state_path = home.path().join(".sync-state.json");

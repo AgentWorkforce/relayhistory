@@ -773,11 +773,23 @@ fn destination_covers(stored: &str, current: &str) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct SweepRepairs {
     sessions: HashSet<(String, String)>,
+    all: bool,
 }
 
 impl SweepRepairs {
+    fn all() -> Self {
+        Self {
+            sessions: HashSet::new(),
+            all: true,
+        }
+    }
+
+    fn repairs_all(&self) -> bool {
+        self.all
+    }
+
     fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        !self.all && self.sessions.is_empty()
     }
 
     fn len(&self) -> usize {
@@ -787,8 +799,10 @@ impl SweepRepairs {
     fn contains(&self, source: &str, session_id: &str) -> bool {
         // Cheap enough to build the key: this is asked once per rollout whose
         // stamp matched, not per row.
-        self.sessions
-            .contains(&(source.to_string(), session_id.to_string()))
+        self.all
+            || self
+                .sessions
+                .contains(&(source.to_string(), session_id.to_string()))
     }
 }
 
@@ -797,11 +811,11 @@ fn destination_shortfall_against(
     conn: &Connection,
     state: &Map<String, Value>,
 ) -> Result<SweepRepairs> {
-    let Some(stored) = state
-        .get(DESTINATION_GENERATION_KEY)
-        .and_then(Value::as_str)
-    else {
+    let Some(stored) = state.get(DESTINATION_GENERATION_KEY) else {
         return Ok(SweepRepairs::default());
+    };
+    let Some(stored) = stored.as_str() else {
+        return Ok(SweepRepairs::all());
     };
     destination_shortfall(conn, stored)
 }
@@ -817,7 +831,12 @@ fn destination_shortfall_against(
 /// the skip is guarded by.
 fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs> {
     let Some(stored) = parse_destination_marker(stored) else {
-        return Ok(SweepRepairs::default());
+        // Absence is handled by `destination_shortfall_against`; a value that
+        // is present but unreadable cannot name the short sessions. Re-read
+        // every repairable session instead. Treating it as an empty set would
+        // let the sweep checkpoint today's reduced holdings over the malformed
+        // marker and permanently ratify any short, still-nonempty session.
+        return Ok(SweepRepairs::all());
     };
     let mut repairs = SweepRepairs::default();
     let current = session_holdings(conn)?;
@@ -1145,7 +1164,9 @@ fn sync_basic(
             (SweepRepairs::default(), false)
         }
     };
-    if !repairs.is_empty() {
+    if repairs.repairs_all() {
+        sync_note!("  [sync] destination marker unreadable; repairing all replayable sessions");
+    } else if !repairs.is_empty() {
         sync_note!(
             "  [sync] {} session(s) lost evidence since the last sweep; repairing",
             repairs.len()
@@ -1300,14 +1321,25 @@ fn sync_basic(
     // marker and the fingerprint stale costs a full sweep per tick until the
     // evidence is back — loud and expensive, which is the right side to fail
     // on — and the note below names how many sessions are still owed.
-    let outstanding = match destination_shortfall_against(conn, &state) {
-        Ok(outstanding) => Some(outstanding),
-        Err(error) => {
-            sync_note!("  [sync] could not re-check the destination: {error:#}");
-            None
+    let outstanding = if repairs.repairs_all() && all_sources_read {
+        // There was no readable baseline to compare against, but every source
+        // was replayed without a gap. That is the one case where the sweep
+        // itself proves a fresh marker is safe and lets an unreadable marker
+        // recover instead of forcing full sweeps forever.
+        Some(SweepRepairs::default())
+    } else {
+        match destination_shortfall_against(conn, &state) {
+            Ok(outstanding) => Some(outstanding),
+            Err(error) => {
+                sync_note!("  [sync] could not re-check the destination: {error:#}");
+                None
+            }
         }
     };
-    if let Some(outstanding) = outstanding.as_ref().filter(|repairs| !repairs.is_empty()) {
+    if let Some(outstanding) = outstanding
+        .as_ref()
+        .filter(|repairs| !repairs.is_empty() && !repairs.repairs_all())
+    {
         eprintln!(
             "ai-hist: {} session(s) are still missing evidence after this sweep; \
              the source may be gone. Sync will keep re-sweeping until they are \
@@ -4373,6 +4405,9 @@ fn claude_transcript_needs_repair(
     path: &Path,
     repairs: &SweepRepairs,
 ) -> Result<bool> {
+    if repairs.repairs_all() {
+        return Ok(true);
+    }
     if repairs.is_empty() {
         return Ok(false);
     }
@@ -8459,6 +8494,33 @@ mod tests {
             .insert(("claude".to_string(), "short".to_string()));
         assert!(!checkpoint_is_safe(true, true, Some(&short)));
         assert!(!checkpoint_is_safe(false, true, Some(&clear)));
+    }
+
+    #[test]
+    fn a_malformed_destination_marker_repairs_every_replayable_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut state = Map::new();
+
+        assert!(
+            destination_shortfall_against(&conn, &state)
+                .unwrap()
+                .is_empty(),
+            "no prior marker means there is no prior destination to repair"
+        );
+
+        state.insert(
+            DESTINATION_GENERATION_KEY.to_string(),
+            Value::from("not-a-destination-marker"),
+        );
+        let repairs = destination_shortfall_against(&conn, &state).unwrap();
+        assert!(repairs.repairs_all());
+        assert!(repairs.contains("claude", "any-session"));
+        assert!(repairs.contains("codex", "any-session"));
+
+        state.insert(DESTINATION_GENERATION_KEY.to_string(), Value::from(7));
+        assert!(destination_shortfall_against(&conn, &state)
+            .unwrap()
+            .repairs_all());
     }
 
     /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative
