@@ -1,7 +1,7 @@
 use super::{lock, read_config, save_json, user_error, Config};
 use ai_hist::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
-use relayhistory_plugin::{cloud, destination};
+use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
 use std::{
@@ -57,8 +57,7 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
     let snapshot = conn.unchecked_transaction()?;
     let mut identities = Vec::new();
     loop {
-        let page =
-            ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
+        let page = ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
         if page.is_empty() {
             break;
         }
@@ -123,16 +122,30 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
     }
     Ok(status)
 }
+pub fn capture(directory: &Path, history_url: &str) -> Result<()> {
+    let progress = super::progress::Monitor::start(directory, history_url, None);
+    let result =
+        ai_hist::sync_local_at_with_progress(&directory.join("history.db"), progress.observer());
+    progress.finish(matches!(result, Ok(true)));
+    ensure!(result?, "capture not complete");
+    Ok(())
+}
+
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     ensure!(
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
     );
-    let db_path = directory.join("history.db");
+    capture(directory, &config.history_url)?;
+    deliver_captured(directory, config, false)
+}
+
+pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
     ensure!(
-        ai_hist::sync_local_at(&db_path)?,
-        "capture not complete"
+        destination::selected_account(Some(&config.history_url))? == config.delivery_account,
+        "wrong destination"
     );
+    let db_path = directory.join("history.db");
     // The receiver rejects a batch whose account or mapping does not match, but
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
@@ -149,17 +162,19 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     // its verdict is a generic permission refusal. Name the cause here first so
     // the user sees which uploader to stop instead of a reconnect suggestion.
     super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-    let status = deliver(&db_path, config)?;
-    let token = cloud::access_token(Some(&config.history_url))?;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout(Duration::from_secs(15))
-        .build();
-    agent
-        .post(&format!("{}/v1/onboarding/heartbeat", config.history_url))
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|_| user_error("Could not confirm the connection with Cloud."))?;
+    let progress =
+        super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
+    let result = deliver(&db_path, config);
+    if before_exit {
+        let connected =
+            progress.finish_before_exit(result.is_ok(), super::progress::COMPLETION_TIMEOUT);
+        if result.is_ok() {
+            ensure!(connected, user_error("Cloud connection could not be confirmed. Check the endpoint and retry; local data remains queued."));
+        }
+    } else {
+        progress.finish(result.is_ok());
+    }
+    let status = result?;
     println!(
         "Probe connected: {} records received, {} queued.",
         status.acknowledged_records, status.pending_records
@@ -250,8 +265,15 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &directory.join("runtime.json"),
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":true}),
     )?;
+    let mut capture_due = Instant::now();
     while !stop_requested(directory, startup_id) {
-        if cycle(directory, &config).is_err() {
+        let result = if Instant::now() >= capture_due {
+            capture_due = Instant::now() + Duration::from_secs(60);
+            cycle(directory, &config)
+        } else {
+            deliver_captured(directory, &config, false)
+        };
+        if result.is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");
         }
         for _ in 0..20 {
@@ -380,8 +402,7 @@ mod tests {
             )
             .unwrap();
         }
-        let baseline =
-            ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
+        let baseline = ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
         // The same identities carried inline would exceed the 64 KiB cap that
         // create_job enforces on a delivery configuration.
         assert!(serde_json::to_vec(&baseline).unwrap().len() > 65_536);
