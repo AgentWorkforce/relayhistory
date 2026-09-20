@@ -519,7 +519,8 @@ How each adapter works:
   Every read in this path answers in three states: **absent** (nothing to
   record), **malformed but present** (the file's existence is itself evidence,
   so the marker is written with no detail rather than deleted), and
-  **unreadable** (an error). A file the read consumes and cannot read is never
+  **unreadable** (an error). `summary.json` is the one exception to the middle
+  state, because it carries **identity** rather than detail — see below. A file the read consumes and cannot read is never
   an absent one: an unreadable `updates.jsonl` taken as "no stream" would replace exact
   event times with fallbacks and drop the token snapshots, and an unreadable
   sidecar directory taken as "no entries" would delete the checkpoints already
@@ -583,6 +584,25 @@ How each adapter works:
   permanently when `history.db` was rebuilt. The catalog row is deliberately
   *not* the check for a session that did write evidence — discovery writes
   catalog rows too, so it would stand over missing rows.
+
+  **A malformed `summary.json` fails the read; only an absent one falls back
+  to the directory name.** `info.id` becomes the session id, which keys every
+  evidence row and scopes every delete a replacing read performs, so it is the
+  one sidecar where "malformed but present is evidence" does not hold. A
+  summary caught mid-write used to fall back to the encoded-cwd folder name:
+  the transcript was stored under `local-folder`, and once the file was
+  repaired the next read stored the same session under `grok-123`, leaving the
+  first set of rows keyed to an id no read would ever name again — and so
+  never deletable, because deletes are scoped by the id that produced them.
+  Absence keeps the fallback: a session directory with no summary at all is a
+  real shape, and its folder name is the only identity there is.
+
+  **The shallow read strips the `<user_query>` envelope, because the full read
+  does.** Discovery writes `sessions.first_prompt` and hydration writes
+  `history.prompt` from the same typed prompt, so a wrapper stripped in one
+  and kept in the other shows the XML envelope in the catalog and the typed
+  text in the transcript, for one session, with nothing to say which is the
+  prompt. Both go through `unwrap_user_query`.
 
   **Replacing one session never deletes another session's prompt.** Because
   `history` is keyed `(source, timestamp_ms, prompt)` with no `session_id`, a
