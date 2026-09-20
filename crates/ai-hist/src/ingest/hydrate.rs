@@ -108,7 +108,8 @@ pub fn hydrate_session_at_with_connectors(
     options: &HydrateSessionOptions,
     connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_home_and_connectors(db_path, options, &home_dir(), connectors)
+    let roots = crate::ProviderRoots::from_env(home_dir());
+    hydrate_session_at_with_roots_and_connectors(db_path, options, &roots, connectors)
 }
 
 #[cfg(test)]
@@ -117,20 +118,25 @@ fn hydrate_session_at_with_home(
     options: &HydrateSessionOptions,
     home: &Path,
 ) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_home_and_connectors(
+    let roots = crate::ProviderRoots::from_home(
+        home.to_path_buf(),
+        home.join(".local/share/opencode/opencode.db"),
+    );
+    hydrate_session_at_with_roots_and_connectors(
         db_path,
         options,
-        home,
+        &roots,
         &crate::remote::SourceConnectorSelection::default(),
     )
 }
 
-fn hydrate_session_at_with_home_and_connectors(
+fn hydrate_session_at_with_roots_and_connectors(
     db_path: &Path,
     options: &HydrateSessionOptions,
-    home: &Path,
+    roots: &crate::ProviderRoots,
     connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<HydrateSessionResult> {
+    let home = &roots.home;
     validate_options(options)?;
     // One hydration is one acquisition pass; see `begin_acquisition_pass`.
     crate::project_identity::begin_acquisition_pass();
@@ -182,7 +188,7 @@ fn hydrate_session_at_with_home_and_connectors(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
-    let snapshot = source_snapshot(options, &target, home)?;
+    let snapshot = source_snapshot(options, &target, roots)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -1025,7 +1031,7 @@ fn catalog_target(conn: &Connection, options: &HydrateSessionOptions) -> Result<
 fn source_snapshot(
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
-    home: &Path,
+    roots: &crate::ProviderRoots,
 ) -> Result<SourceSnapshot> {
     if options.source == "relay" {
         return Err(hydration_error(
@@ -1034,9 +1040,7 @@ fn source_snapshot(
         ));
     }
     if options.source == "opencode" {
-        let configured_path = std::env::var_os("OPENCODE_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+        let configured_path = &roots.opencode_db;
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
@@ -1044,7 +1048,7 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
-        if fs::canonicalize(&path).ok() != fs::canonicalize(&configured_path).ok() {
+        if fs::canonicalize(&path).ok() != fs::canonicalize(configured_path).ok() {
             return Err(hydration_error(
                 "SESSION_SOURCE_MISMATCH",
                 format!(
@@ -1121,7 +1125,7 @@ fn source_snapshot(
             ),
         ));
     }
-    validate_provider_path(&options.source, &path, home)?;
+    validate_provider_path(&options.source, &path, roots)?;
     let mut bytes = path.metadata()?.len() as i64;
     let mut records = complete_jsonl_records(&path)?;
     let mut stamp = if options.source == "grok" {
@@ -1165,15 +1169,19 @@ fn source_snapshot(
     })
 }
 
-fn validate_provider_path(source: &str, path: &Path, home: &Path) -> Result<()> {
+fn validate_provider_path(
+    source: &str,
+    path: &Path,
+    provider_roots: &crate::ProviderRoots,
+) -> Result<()> {
     let roots = match source {
-        "claude" => vec![home.join(".claude/projects")],
+        "claude" => vec![provider_roots.claude.join("projects")],
         "codex" => vec![
-            home.join(".codex/sessions"),
-            home.join(".codex/archived_sessions"),
+            provider_roots.codex.join("sessions"),
+            provider_roots.codex.join("archived_sessions"),
         ],
-        "cursor" => vec![home.join(".cursor/projects")],
-        "grok" => vec![home.join(".grok/sessions")],
+        "cursor" => vec![provider_roots.home.join(".cursor/projects")],
+        "grok" => vec![provider_roots.grok.join("sessions")],
         _ => Vec::new(),
     };
     let canonical = fs::canonicalize(path)?;
@@ -1762,6 +1770,7 @@ pub(crate) fn hydrate_with_provider(
     provider: &dyn ShallowSessionProvider,
 ) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    let roots = crate::ProviderRoots::from_env(home_dir());
     // Keep transport response acquisition and replacement in the same critical section.
     let _lock = acquire_remote_hydration_lock(db_path, options)?;
     let started = Instant::now();
@@ -1773,7 +1782,7 @@ pub(crate) fn hydrate_with_provider(
     );
     let revision =
         observations::revision(&conn, &observation.key)?.context("missing observation revision")?;
-    let evidence = match provider.acquire(&home_dir(), &observation) {
+    let evidence = match provider.acquire(&roots.home, &observation) {
         Ok(evidence) => evidence,
         Err(error) => {
             observations::set_access(&conn, &observation.key, "unavailable")?;
@@ -1788,10 +1797,10 @@ pub(crate) fn hydrate_with_provider(
                     && observation.key.connector_instance == "default",
                 "CONNECTOR_FAILURE: local parser requires its built-in observation identity"
             );
-            hydrate_session_at_with_home_and_connectors(
+            hydrate_session_at_with_roots_and_connectors(
                 db_path,
                 options,
-                &home_dir(),
+                &roots,
                 &crate::remote::SourceConnectorSelection::new(Vec::new())?,
             )
         }
@@ -2254,7 +2263,14 @@ mod tests {
         drop(src);
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        let env = DiscoveryEnv::with_roots(&conn, dir.path().into(), source.clone());
+        let env = DiscoveryEnv::with_all_roots(
+            &conn,
+            dir.path().into(),
+            dir.path().join(".claude"),
+            dir.path().join(".codex"),
+            dir.path().join(".grok"),
+            source.clone(),
+        );
         crate::discover::discover_sessions_with_env(
             &env,
             &DiscoverOptions {

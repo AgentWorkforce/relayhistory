@@ -37,6 +37,17 @@
     "absoluteFloors": {
       "elapsedMs": 40,
       "peakRssBytes": 67108864
+    },
+    "absoluteFloorsByPhaseComment": [
+      "Some tiny elapsed-time phases need a higher final ceiling than the metric-wide",
+      "floor because observed runner jitter on github-hosted ubuntu-latest is already",
+      "above 2x their stored baseline. Keep these phase-scoped so other elapsed checks",
+      "do not silently become weaker."
+    ],
+    "absoluteFloorsByPhase": {
+      "unchanged_sync": {
+        "elapsedMs": 120
+      }
     }
   },
   "profiles": {
