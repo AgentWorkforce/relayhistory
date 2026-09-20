@@ -15,13 +15,38 @@ pub enum EvidenceKind {
     FileEdit,
     Relationship,
     CommitLink,
+    SessionMarker,
 }
+/// What a remote connector must supply for its snapshot to count as complete.
+///
+/// Deliberately does NOT include [`EvidenceKind::SessionMarker`]. A marker is
+/// derived by this crate's parser, not something a source plugin can produce,
+/// so requiring one here would silently demote every third-party connector
+/// from `full` to partial. The round trip through our own parser uses
+/// [`PARSED_SESSION_KINDS`] instead.
 pub const FULL_SESSION_KINDS: &[EvidenceKind] = &[
     EvidenceKind::History,
     EvidenceKind::SessionEvent,
     EvidenceKind::ToolCall,
     EvidenceKind::FileEdit,
     EvidenceKind::Relationship,
+];
+
+/// Everything this crate's own parser writes for one session.
+///
+/// A remote `ClaudeFull` snapshot is parsed into a temporary database and then
+/// projected back out through a kind list; whatever that list omits is written
+/// during normalization and thrown away before anything durable sees it. That
+/// is exactly how remote hydration came to drop every marker. The projection
+/// list is therefore kept separate from the connector-capability list above,
+/// and it is the one that has to name every table the parser touches.
+pub const PARSED_SESSION_KINDS: &[EvidenceKind] = &[
+    EvidenceKind::History,
+    EvidenceKind::SessionEvent,
+    EvidenceKind::ToolCall,
+    EvidenceKind::FileEdit,
+    EvidenceKind::Relationship,
+    EvidenceKind::SessionMarker,
 ];
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceRecord {
@@ -52,6 +77,10 @@ impl EvidenceKind {
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},
         Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method"},
+        // The `kind` column here is the marker's own classification, not the
+        // evidence kind. It is required because a marker without one is the
+        // unclassified row this table exists to keep.
+        Self::SessionMarker=>Spec{table:"session_markers",columns:"source,session_id,marker_uid,ts_ms,message_id,parent_id,turn_id,kind,subkind,payload_json",required:"source,session_id,marker_uid,kind",key:"source,session_id,marker_uid"},
     }
     }
 }
@@ -380,6 +409,7 @@ mod tests {
             EvidenceKind::FileEdit,
             EvidenceKind::Relationship,
             EvidenceKind::CommitLink,
+            EvidenceKind::SessionMarker,
         ] {
             let spec = kind.spec();
             let declared: HashSet<&str> = spec.columns.split(',').collect();

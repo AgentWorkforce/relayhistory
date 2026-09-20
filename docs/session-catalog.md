@@ -404,6 +404,16 @@ Markers are evidence, so they are removed with the rest when a complete remote
 snapshot replaces a session: a marker left behind would tell a caller that
 something is still there which the provider has stopped sending.
 
+They also have to *survive* that path. A remote Claude snapshot is parsed by
+the same local parser into a temporary database and then projected back out as
+evidence records, so whatever the projection list omits is written during
+normalization and discarded before anything durable sees it. Markers are in
+that list — `PARSED_SESSION_KINDS`, everything this crate's parser writes —
+which is deliberately separate from `FULL_SESSION_KINDS`, the set a remote
+connector must supply for its snapshot to count as complete. A source plugin
+cannot derive markers, so requiring them there would silently demote every
+third-party connector to partial.
+
 A compaction boundary states no size of its own, so a Claude
 `compaction_boundary` payload carries `tokens_before_compact` taken from the
 `cache_read_input_tokens` of the assistant message immediately before it.

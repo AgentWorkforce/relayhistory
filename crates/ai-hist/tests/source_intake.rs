@@ -211,6 +211,92 @@ fn malformed_complete_batch_never_creates_database() -> Result<()> {
     assert!(!path.exists());
     Ok(())
 }
+/// A remote `ClaudeFull` snapshot is parsed by the same local parser, into a
+/// temporary database, and then projected back out as evidence records. The
+/// projection is what decides which tables survive that round trip, so a table
+/// missing from it is written during normalization and silently thrown away
+/// before anything durable sees it.
+///
+/// Markers were missing, so remote Claude hydration produced none at all --
+/// the same class of gap #194 hit with its new columns.
+#[test]
+fn claude_remote_hydration_carries_session_markers() -> Result<()> {
+    use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let records = vec![
+        json!({"sessionId":"s","uuid":"u-asst","type":"assistant","timestamp":"2026-01-01T00:00:00Z",
+               "message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],
+                          "usage":{"cache_read_input_tokens":9000}}}),
+        json!({"sessionId":"s","uuid":"s-compact","type":"system","subtype":"compact_boundary",
+               "timestamp":"2026-01-01T00:00:01Z"}),
+    ];
+    let evidence = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records,
+            source_stamp: "raw1".into(),
+            source_bytes: 100,
+        },
+    )?;
+    assert!(
+        evidence
+            .records
+            .iter()
+            .any(|r| r.kind == EvidenceKind::SessionMarker),
+        "the projection must carry what the parser wrote"
+    );
+
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        evidence,
+    })?;
+
+    let conn = ai_hist::open_db(&path)?;
+    let (kind, payload): (String, Option<String>) = conn.query_row(
+        "SELECT kind, payload_json FROM session_markers WHERE source='claude' AND session_id='s'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(kind, "compaction_boundary");
+    assert!(
+        payload
+            .as_deref()
+            .is_some_and(|payload| payload.contains("9000")),
+        "the marker keeps the context it recorded: {payload:?}"
+    );
+
+    // A later complete snapshot without that record must take the marker back
+    // out again, exactly as it does for every other evidence table.
+    let empty = normalize_source_evidence(
+        "claude",
+        "s",
+        AcquiredEvidence::ClaudeFull {
+            records: vec![],
+            source_stamp: "raw2".into(),
+            source_bytes: 0,
+        },
+    )?;
+    apply_source_evidence(ApplyEvidenceRequest {
+        db_path: Some(path.clone()),
+        key: key("a"),
+        expected_revision: state(&path, "a")?.revision.unwrap(),
+        evidence: empty,
+    })?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM session_markers", [], |r| r
+            .get::<_, i64>(0))?,
+        0,
+        "a marker the snapshot no longer carries must not survive it"
+    );
+    Ok(())
+}
+
 #[test]
 fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()> {
     use ai_hist::sources::{normalize_source_evidence, AcquiredEvidence};

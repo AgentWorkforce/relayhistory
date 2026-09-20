@@ -66,7 +66,7 @@ pub(crate) use store::*;
 pub use session_store::{
     Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
-pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS, PARSED_SESSION_KINDS};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{

@@ -1872,7 +1872,7 @@ pub fn normalize_source_evidence(
     session_id: &str,
     evidence: crate::sources::AcquiredEvidence,
 ) -> Result<crate::source_intake::NormalizedSourceEvidence> {
-    use crate::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+    use crate::source_evidence::{self, EvidenceKind, EvidenceRecord, PARSED_SESSION_KINDS};
     use crate::sources::AcquiredEvidence;
     let (source_stamp, source_bytes, covered_kinds, records) = match evidence {
         AcquiredEvidence::Events(evidence) => {
@@ -1925,12 +1925,16 @@ pub fn normalize_source_evidence(
             let conn = Connection::open_in_memory()?;
             crate::init_db(&conn)?;
             ingest_claude_transcript(&conn, transcript.path())?;
+            // Projected through PARSED_SESSION_KINDS, not the connector
+            // capability list: this is our own parser's output coming back out
+            // of a temporary database, so the projection has to name every
+            // table it just wrote or the rows are dropped here.
             let records =
-                source_evidence::read_session(&conn, source, session_id, FULL_SESSION_KINDS)?;
+                source_evidence::read_session(&conn, source, session_id, PARSED_SESSION_KINDS)?;
             (
                 source_stamp,
                 source_bytes,
-                FULL_SESSION_KINDS.to_vec(),
+                PARSED_SESSION_KINDS.to_vec(),
                 records,
             )
         }
