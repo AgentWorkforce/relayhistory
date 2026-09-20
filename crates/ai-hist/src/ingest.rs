@@ -478,7 +478,7 @@ fn sweep_generation() -> String {
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
-const DESTINATION_MARKER_VERSION: &str = "v3";
+const DESTINATION_MARKER_VERSION: &str = "v4";
 
 /// The sources whose evidence a *sweep* can put back.
 ///
@@ -493,52 +493,108 @@ const DESTINATION_MARKER_VERSION: &str = "v3";
 /// means adding its repair path in the same change.
 const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex"];
 
-/// What the destination holds, per session the sweep has evidence for.
+/// What one session is expected to hold.
+///
+/// Every row here is re-created by re-reading the session's own transcript or
+/// rollout, which is what makes the whole tuple repairable and therefore
+/// guardable. `catalog` is the `sessions` row itself: losing it is not an
+/// evidence loss but a *catalog* loss, and discovery would otherwise skip the
+/// source whose stamp still matched and leave the row missing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionHoldings {
+    events: i64,
+    tool_calls: i64,
+    file_edits: i64,
+    catalog: i64,
+}
+
+impl SessionHoldings {
+    fn covers(&self, stored: &Self) -> bool {
+        self.events >= stored.events
+            && self.tool_calls >= stored.tool_calls
+            && self.file_edits >= stored.file_edits
+            && self.catalog >= stored.catalog
+    }
+}
+
+/// What the destination holds, per session the sweep is answerable for.
 ///
 /// The fast path's job is to skip a sweep, and a sweep owes more than
 /// ingestion: it reconciles sessions whose per-file stamp matches but whose
-/// evidence is gone (see the [`codex_session_events_exist`] arm). Evidence can
-/// be lost under a stamp that still matches — a half-restored backup, a
-/// truncated write, a maintenance query — and the source bytes of a finished
-/// session never move again to reopen it.
+/// rows are gone (see the [`codex_session_events_exist`] arm). Evidence can be
+/// lost under a stamp that still matches — a half-restored backup, a truncated
+/// write, a maintenance query — and the source bytes of a finished session
+/// never move again to reopen it.
 ///
 /// Per session, not in total. Global counts cannot tell a loss from a
-/// coincidence: delete one event from a finished Codex rollout, let the hook
-/// path insert one for an unrelated Claude session in the same second, and
-/// every total is unchanged or larger while the rollout is permanently short.
-/// One row per session is what makes the two distinguishable at all.
+/// coincidence: delete one row here, let an unrelated write land there, and
+/// every total is unchanged or larger while one session is permanently short.
+/// One row per session is what makes the two distinguishable at all — and the
+/// same argument applies table by table, which is why the entry is a tuple
+/// rather than one number. Structured evidence (`tool_calls`, `file_edits`)
+/// and the catalog row are re-created by the same re-read that restores the
+/// events, so they are guarded by the same marker.
 ///
-/// Deliberately not a counter our own delete paths bump: a counter can only
-/// see losses this code caused, and every loss worth defending against is one
-/// it did not. The grouped read is an index-only scan of
-/// `idx_session_events_session (source, session_id)`, already ordered, so it
-/// costs one pass over an index against a sweep's full walk of every source.
+/// Four grouped reads, each an index-ordered scan over a `(source,
+/// session_id)` key, merged in memory — not four correlated subqueries per
+/// session.
 fn destination_generation(conn: &Connection) -> Result<String> {
-    let sessions = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
-    let mut marker = format!("{DESTINATION_MARKER_VERSION} s{sessions}");
-    let mut statement = conn.prepare(
-        "SELECT source, session_id, COUNT(*) FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?)) \
-         GROUP BY source, session_id",
-    )?;
-    let mut rows = statement.query([repairable_event_sources()])?;
-    while let Some(row) = rows.next()? {
-        let source: String = row.get(0)?;
-        let session_id: String = row.get(1)?;
-        let events: i64 = row.get(2)?;
-        // Hashed rather than spelled out: the marker is rewritten with every
-        // sweep and read on every tick, and a session's identity only has to
-        // be *distinguishable*, not recoverable. 64 bits keeps two sessions
-        // from sharing an entry, which is the one way a hash here could
-        // reintroduce the masking this marker exists to catch.
+    let holdings = session_holdings(conn)?;
+    let mut marker = String::from(DESTINATION_MARKER_VERSION);
+    for (session, held) in holdings {
         marker.push_str(&format!(
-            " {:016x}={events}",
-            discover::fingerprint_hash("session-events", &source, &session_id)
+            " {session:016x}={}.{}.{}.{}",
+            held.events, held.tool_calls, held.file_edits, held.catalog
         ));
     }
     Ok(marker)
+}
+
+/// Which count in [`SessionHoldings`] one grouped read fills in.
+type HoldingField = fn(&mut SessionHoldings) -> &mut i64;
+
+/// Every session the marker is answerable for, keyed by the hash the marker
+/// stores.
+fn session_holdings(conn: &Connection) -> Result<BTreeMap<u64, SessionHoldings>> {
+    let mut holdings: BTreeMap<u64, SessionHoldings> = BTreeMap::new();
+    let counted: [(&str, HoldingField); 4] = [
+        (
+            "SELECT source, session_id, COUNT(*) FROM session_events",
+            |held| &mut held.events,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM tool_calls",
+            |held| &mut held.tool_calls,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM file_edits",
+            |held| &mut held.file_edits,
+        ),
+        (
+            "SELECT source, session_id, COUNT(*) FROM sessions",
+            |held| &mut held.catalog,
+        ),
+    ];
+    for (select, field) in counted {
+        let mut statement = conn.prepare(&format!(
+            "{select} WHERE source IN (SELECT value FROM json_each(?)) \
+             GROUP BY source, session_id"
+        ))?;
+        let mut rows = statement.query([repairable_event_sources()])?;
+        while let Some(row) = rows.next()? {
+            let source: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            // Hashed rather than spelled out: the marker is rewritten with
+            // every sweep and read on every tick, and a session's identity
+            // only has to be *distinguishable*, not recoverable. 64 bits keeps
+            // two sessions from sharing an entry, which is the one way a hash
+            // here could reintroduce the masking this marker exists to catch.
+            let key = discover::fingerprint_hash("session-events", &source, &session_id);
+            *field(holdings.entry(key).or_default()) = count;
+        }
+    }
+    Ok(holdings)
 }
 
 /// A destination marker, or `None` for anything this build did not write.
@@ -554,24 +610,32 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
     if parts.next()? != DESTINATION_MARKER_VERSION {
         return None;
     }
-    let sessions = parts.next()?.strip_prefix('s')?.parse::<i64>().ok()?;
-    let mut events = BTreeMap::new();
+    let mut sessions = BTreeMap::new();
     for part in parts {
-        let (session, count) = part.split_once('=')?;
+        let (session, held) = part.split_once('=')?;
         let session = u64::from_str_radix(session, 16).ok()?;
-        let count = count.parse::<i64>().ok()?;
+        let mut counts = held.split('.');
+        let mut next = || counts.next()?.parse::<i64>().ok();
+        let held = SessionHoldings {
+            events: next()?,
+            tool_calls: next()?,
+            file_edits: next()?,
+            catalog: next()?,
+        };
+        if counts.next().is_some() {
+            return None;
+        }
         // A repeated session is not a marker this build produced: the grouped
-        // read yields each one once.
-        if events.insert(session, count).is_some() {
+        // reads yield each one once.
+        if sessions.insert(session, held).is_some() {
             return None;
         }
     }
-    Some(DestinationMarker { sessions, events })
+    Some(DestinationMarker { sessions })
 }
 
 struct DestinationMarker {
-    sessions: i64,
-    events: BTreeMap<u64, i64>,
+    sessions: BTreeMap<u64, SessionHoldings>,
 }
 
 /// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
@@ -580,6 +644,32 @@ fn repairable_event_sources() -> rusqlite::types::Value {
     rusqlite::types::Value::Text(
         serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
     )
+}
+
+/// Whether the destination still holds everything the stamp was written over.
+///
+/// Growth is fine and must be: the hook fast path and hydration both add rows
+/// between sweeps, and treating that as a reason to re-walk every source would
+/// cost a full sweep per tool call. A session holding *less* than it did is
+/// the signal, and it is asked per session and per table so that growth
+/// somewhere else cannot answer for it.
+fn destination_covers(stored: &str, current: &str) -> bool {
+    let (Some(stored), Some(current)) = (
+        parse_destination_marker(stored),
+        parse_destination_marker(current),
+    ) else {
+        // An unreadable marker is one this build did not write, or one a
+        // failed generation query left empty. Re-sweep rather than guess: the
+        // cost is one walk, and the alternative is a skip that cannot be
+        // justified.
+        return false;
+    };
+    stored.sessions.iter().all(|(session, stored)| {
+        current
+            .sessions
+            .get(session)
+            .is_some_and(|current| current.covers(stored))
+    })
 }
 
 /// Sessions the destination lost evidence for since the marker was written.
@@ -638,55 +728,36 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         return Ok(SweepRepairs::default());
     };
     let mut repairs = SweepRepairs::default();
+    let current = session_holdings(conn)?;
+    // Named from the *session* side rather than from the evidence, because a
+    // session whose catalog row and events are both gone has no row left to be
+    // found by. The union of the two tables the sweep reaches it through is
+    // what keeps it nameable.
     let mut statement = conn.prepare(
-        "SELECT source, session_id, COUNT(*) FROM session_events \
-         WHERE source IN (SELECT value FROM json_each(?)) \
-         GROUP BY source, session_id",
+        "SELECT source, session_id FROM sessions \
+         WHERE source IN (SELECT value FROM json_each(?1)) \
+         UNION \
+         SELECT source, session_id FROM session_events \
+         WHERE source IN (SELECT value FROM json_each(?1))",
     )?;
     let mut rows = statement.query([repairable_event_sources()])?;
     while let Some(row) = rows.next()? {
         let source: String = row.get(0)?;
         let session_id: String = row.get(1)?;
-        let events: i64 = row.get(2)?;
         let key = discover::fingerprint_hash("session-events", &source, &session_id);
-        if stored
-            .events
+        let Some(before) = stored.sessions.get(&key) else {
+            continue;
+        };
+        if !current
             .get(&key)
-            .is_some_and(|before| events < *before)
+            .copied()
+            .unwrap_or_default()
+            .covers(before)
         {
             repairs.sessions.insert((source, session_id));
         }
     }
     Ok(repairs)
-}
-
-/// Whether the destination still holds everything the stamp was written over.
-///
-/// Growth is fine and must be: the hook fast path and hydration both add rows
-/// between sweeps, and treating that as a reason to re-walk every source would
-/// cost a full sweep per tool call. A session holding *less* than it did is
-/// the signal, and it is asked per session so that growth somewhere else
-/// cannot answer for it.
-fn destination_covers(stored: &str, current: &str) -> bool {
-    let (Some(stored), Some(current)) = (
-        parse_destination_marker(stored),
-        parse_destination_marker(current),
-    ) else {
-        // An unreadable marker is one this build did not write, or one a
-        // failed generation query left empty. Re-sweep rather than guess: the
-        // cost is one walk, and the alternative is a skip that cannot be
-        // justified.
-        return false;
-    };
-    if current.sessions < stored.sessions {
-        return false;
-    }
-    stored.events.iter().all(|(session, stored)| {
-        current
-            .events
-            .get(session)
-            .is_some_and(|current| current >= stored)
-    })
 }
 
 /// The sources a sweep reads that discovery never enumerates.

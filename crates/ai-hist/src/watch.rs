@@ -34,6 +34,7 @@
 //! runtime and this does not need one: a tick is a blocking sweep, and the
 //! watcher backend already runs on its own thread.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -528,11 +529,31 @@ impl WatchLoop {
             // against and runs fully anyway, so it does not need forcing.
             self.inner.run_skip_if_busy(TickTrigger::Startup);
         }
+        // When the loop last swept on its own cadence, so that waking early
+        // to reconcile does not also sweep early.
+        let mut last_poll_sweep = std::time::Instant::now();
         while !self.inner.stopped() {
-            let idle = Duration::from_millis(match self.current_driver() {
+            let sweep_every = match self.current_driver() {
                 WatchDriver::FsEvents => self.slow_poll_ms,
                 WatchDriver::Polling => self.poll_interval_ms,
-            });
+            };
+            // Coverage is not the user's sweep cadence. A loop with a root it
+            // has not attached yet — a provider installed after `watch`
+            // started — is *polling*, so without this it would retry that root
+            // on `--interval`, which the user may have set to an hour. The
+            // status output and the docs promise the backstop, so the wait is
+            // shortened to it while anything is uncovered; the sweep itself
+            // still happens on the interval that was asked for.
+            let reconcile_every = match watcher.as_ref() {
+                Some(watch)
+                    if !watch.pending().is_empty() || self.roots_refresh.is_some() =>
+                {
+                    self.slow_poll_ms.min(self.poll_interval_ms)
+                }
+                _ => sweep_every,
+            };
+            let woke_early = reconcile_every < sweep_every;
+            let idle = Duration::from_millis(sweep_every.min(reconcile_every));
             let Some(trigger) = self.inner.wait_for_wake(idle, debounce) else {
                 break;
             };
@@ -558,6 +579,13 @@ impl WatchLoop {
                         self.publish_status(Some(&*watch));
                     }
                 }
+                // Reconciled, but not yet due to sweep. Only reached when the
+                // wait was deliberately shortened above, so a loop that was
+                // not woken early behaves exactly as before.
+                if woke_early && last_poll_sweep.elapsed() < Duration::from_millis(sweep_every) {
+                    continue;
+                }
+                last_poll_sweep = std::time::Instant::now();
             }
             self.inner.run_skip_if_busy(trigger);
         }
@@ -621,11 +649,20 @@ mod fs_events {
     /// itself as event-driven.
     pub(super) struct FsWatch {
         watcher: notify::RecommendedWatcher,
-        /// The roots currently registered, kept whole rather than as paths:
-        /// a registration that dies with its directory has to be *re*-made,
-        /// which needs the depth it asked for.
-        watched: Vec<WatchRoot>,
+        /// The roots currently registered, each with the directory object it
+        /// was registered against. Kept whole rather than as paths: a
+        /// registration that died with its directory has to be *re*-made,
+        /// which needs the depth it asked for, and telling a live
+        /// registration from a dead one needs the identity.
+        watched: Vec<Registered>,
         pending: Vec<WatchRoot>,
+        /// Registered paths the backend reported as removed, shared with the
+        /// event callback. A watch dies with the directory it names, and the
+        /// name can come back over a *different* object — or over one the
+        /// filesystem gave the same inode number, which is routine when a
+        /// directory is deleted and immediately recreated. The event is the
+        /// only reliable statement that the registration is gone.
+        stale: Arc<Mutex<HashSet<PathBuf>>>,
         /// Every root and the depth it asked for, shared with the event
         /// callback so it can drop what the backend over-delivered.
         depth: Arc<Mutex<Vec<WatchRoot>>>,
@@ -633,7 +670,10 @@ mod fs_events {
 
     impl FsWatch {
         pub(super) fn watched(&self) -> Vec<PathBuf> {
-            self.watched.iter().map(|root| root.path.clone()).collect()
+            self.watched
+                .iter()
+                .map(|entry| entry.root.path.clone())
+                .collect()
         }
 
         pub(super) fn pending(&self) -> Vec<PathBuf> {
@@ -657,8 +697,9 @@ mod fs_events {
             added
         }
 
-        /// Re-make every registration, and return the roots that no longer
-        /// hold one to `pending`.
+        /// Re-register the roots whose directory is no longer the one they
+        /// were registered against, and return the ones that have no directory
+        /// at all to `pending`.
         ///
         /// A watch is bound to the directory *object*, not to its name. Delete
         /// a watched `~/.codex/sessions` and the kernel drops the watch with
@@ -667,28 +708,43 @@ mod fs_events {
         /// next transcript written there wakes nothing. Nothing in `pending`
         /// covers that: those are roots whose *initial* registration failed.
         ///
-        /// Re-registering an unchanged path is how the two cases are told
-        /// apart without asking the backend a question it cannot answer: the
-        /// backend replaces the existing watch, which is a no-op for a live
-        /// one and a repair for a stale one. It runs on backstop ticks only —
-        /// one call per root per slow poll, not per event.
+        /// The identity is what makes this cheap and safe. Re-registering
+        /// blindly would be neither: `notify` 8.2 does not replace a live
+        /// registration — its FSEvents backend appends the path to the array
+        /// it rebuilds the stream from, so a long run accumulates duplicates,
+        /// and its inotify backend re-walks the entire tree of a recursive
+        /// root with `WalkDir` on every call. Comparing the directory object
+        /// against the one registered is a `stat` per root per backstop tick,
+        /// and the backend is only touched when the answer changed.
         ///
         /// Returns how many roots changed side, so the caller knows whether to
         /// republish its status.
         pub(super) fn reconcile(&mut self) -> usize {
             let mut changed = 0usize;
             let mut lost = Vec::new();
-            self.watched.retain(|root| {
-                if register(&mut self.watcher, root) {
+            let watcher = &mut self.watcher;
+            let mut stale = self.stale.lock().expect("stale roots");
+            self.watched.retain_mut(|entry| {
+                let reported_gone = stale.remove(entry.root.registered_path());
+                let current = root_identity(entry.root.registered_path());
+                if !reported_gone && current.is_some() && current == entry.identity {
                     return true;
                 }
-                // Best effort: the watch may already be gone with its
+                // Best effort: the old watch may already be gone with its
                 // directory, and failing to drop it is not a reason to keep
                 // claiming it.
-                let _ = self.watcher.unwatch(root.registered_path());
-                lost.push(root.clone());
+                let _ = watcher.unwatch(entry.root.registered_path());
+                if current.is_some() && register(watcher, &entry.root) {
+                    // Same name, new directory object: re-registered against
+                    // the one that is there now.
+                    entry.identity = current;
+                    changed += 1;
+                    return true;
+                }
+                lost.push(entry.root.clone());
                 false
             });
+            drop(stale);
             for root in lost {
                 self.pending.push(root);
                 changed += 1;
@@ -703,11 +759,16 @@ mod fs_events {
                 return 0;
             }
             let mut attached = 0usize;
+            let watcher = &mut self.watcher;
+            let watched = &mut self.watched;
             self.pending.retain(|root| {
-                if !register(&mut self.watcher, root) {
+                if !register(watcher, root) {
                     return true;
                 }
-                self.watched.push(root.clone());
+                watched.push(Registered {
+                    identity: root_identity(root.registered_path()),
+                    root: root.clone(),
+                });
                 attached += 1;
                 false
             });
@@ -733,6 +794,8 @@ mod fs_events {
         // than captured by value.
         let depth: Arc<Mutex<Vec<WatchRoot>>> = Arc::new(Mutex::new(roots.to_vec()));
         let depth_for_events = depth.clone();
+        let stale: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let stale_for_events = stale.clone();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else {
                 return;
@@ -746,13 +809,38 @@ mod fs_events {
             ) {
                 return;
             }
-            let roots = depth_for_events.lock().expect("watch roots");
-            if event
-                .paths
-                .iter()
-                .any(|path| event_matches_roots(path, &roots))
-            {
-                drop(roots);
+            let (matched, removed) = {
+                let roots = depth_for_events.lock().expect("watch roots");
+                let matched = event
+                    .paths
+                    .iter()
+                    .any(|path| event_matches_roots(path, &roots));
+                // A registered path that was removed takes its watch with it,
+                // whatever the name does afterwards. Recorded here because the
+                // backend will not say so again, and a `stat` later cannot
+                // tell a recreated directory from the original one when the
+                // filesystem reuses the inode number.
+                let removed = matches!(event.kind, EventKind::Remove(_))
+                    .then(|| {
+                        event
+                            .paths
+                            .iter()
+                            .filter(|path| {
+                                roots
+                                    .iter()
+                                    .any(|root| root.registered_path() == path.as_path())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (matched, removed)
+            };
+            if !removed.is_empty() {
+                let mut stale = stale_for_events.lock().expect("stale roots");
+                stale.extend(removed);
+            }
+            if matched {
                 on_change();
             }
         })?;
@@ -760,7 +848,10 @@ mod fs_events {
         let mut pending = Vec::new();
         for root in roots {
             if register(&mut watcher, root) {
-                watched.push(root.clone());
+                watched.push(Registered {
+                    identity: root_identity(root.registered_path()),
+                    root: root.clone(),
+                });
             } else {
                 pending.push(root.clone());
             }
@@ -769,9 +860,64 @@ mod fs_events {
             watcher,
             watched,
             pending,
+            stale,
             depth,
         })
     }
+
+    /// One registration: the root, and the directory object it was made
+    /// against.
+    pub(super) struct Registered {
+        pub(super) root: WatchRoot,
+        identity: Option<RootIdentity>,
+    }
+
+    /// Which directory object a name currently refers to.
+    ///
+    /// On Unix that is exactly `(device, inode)` — the pair a watch is bound
+    /// to. Elsewhere it is the creation time, which changes when a directory
+    /// is replaced but is a weaker statement; the cost of the difference is a
+    /// missed re-registration in a case the platform cannot distinguish, not a
+    /// wrong one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RootIdentity {
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(not(unix))]
+        created: Option<std::time::SystemTime>,
+    }
+
+    fn root_identity(path: &Path) -> Option<RootIdentity> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(RootIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(RootIdentity {
+                created: metadata.created().ok(),
+            })
+        }
+    }
+
+    /// Successful backend registrations since the process started.
+    ///
+    /// The count is the only way to state the property that matters here from
+    /// outside: a live root must not be registered again on every backstop
+    /// tick.
+    #[cfg(test)]
+    pub(super) fn registrations() -> usize {
+        REGISTRATIONS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    static REGISTRATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn register(watcher: &mut notify::RecommendedWatcher, root: &WatchRoot) -> bool {
         // A file root registers its parent, so it is the parent's existence
@@ -786,7 +932,11 @@ mod fs_events {
             WatchDepth::Tree => RecursiveMode::Recursive,
             WatchDepth::Directory | WatchDepth::File => RecursiveMode::NonRecursive,
         };
-        watcher.watch(target, mode).is_ok()
+        let registered = watcher.watch(target, mode).is_ok();
+        if registered {
+            REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        registered
     }
 }
 
@@ -832,6 +982,96 @@ mod fs_events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reconciliation must not re-register a root that is still live.
+    ///
+    /// `notify` 8.2 does not replace a registration: its FSEvents backend
+    /// appends the path to the array it rebuilds the stream from — duplicates
+    /// accumulate for as long as the process runs — and its inotify backend
+    /// re-walks the whole tree of a recursive root with `WalkDir` on every
+    /// call. A backstop that re-registered blindly would therefore grow the
+    /// watcher without bound on macOS and re-walk `~/.claude/projects` every
+    /// 30 seconds on Linux, in the loop whose whole purpose is to be cheap
+    /// when nothing changed.
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn a_live_root_is_registered_once_however_many_backstop_ticks_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counted = ticks.clone();
+        let before = fs_events::registrations();
+        let watch = Arc::new(
+            WatchLoop::new(Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(TickOutcome::default())
+            }))
+            .with_immediate(false)
+            .with_fs_events(true)
+            .with_roots(vec![WatchRoot::tree(root.clone())])
+            .with_debounce_ms(20)
+            // Short, because backstop ticks are what this test counts against.
+            .with_slow_poll_ms(20)
+            .with_poll_interval_ms(20),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || {
+            runner.run().expect("watch loop run");
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while watch.driver() != Some(WatchDriver::FsEvents) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never attached"
+            );
+            std::thread::yield_now();
+        }
+        let attached = fs_events::registrations();
+        assert_eq!(
+            attached - before,
+            1,
+            "attaching one root is one registration"
+        );
+
+        // Synchronised on the loop's own ticks rather than on a sleep: ten
+        // backstop ticks have passed by the time this returns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while ticks.load(Ordering::SeqCst) < 10 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the backstop never ticked"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fs_events::registrations(),
+            attached,
+            "a live root must not be registered again on every backstop tick"
+        );
+
+        // Positive control: the reconciliation that declined to re-register a
+        // live root still repairs a dead one, so the assertion above is not
+        // passing because reconciliation does nothing at all.
+        std::fs::remove_dir_all(&root).expect("delete the root");
+        std::fs::create_dir_all(&root).expect("recreate the root");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fs_events::registrations() == attached {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a recreated root was never registered again"
+            );
+            std::thread::yield_now();
+        }
+
+        watch.stop();
+        let _ = thread.join();
+    }
+
 
     /// The depth filter is what makes `WatchRoot::directory` mean the same
     /// thing on every platform. It is unit-tested rather than only exercised

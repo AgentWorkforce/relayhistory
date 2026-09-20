@@ -90,11 +90,14 @@ Startup reports which driver it took **and which roots are not covered yet**. A
 root that does not exist cannot be watched, so a provider installed after
 `watch` started would otherwise be silently missed; those roots are retried on
 every backstop tick, and a loop that started with nothing to watch promotes
-itself to filesystem events as soon as one appears. That tick also re-makes
-every existing registration: a watch is bound to the directory object, not to
-its name, so a root that was deleted and recreated — `rm -rf ~/.codex/sessions`
-and the next session — has a live name and a dead watch until it is registered
-again. The backstop also
+itself to filesystem events as soon as one appears. Those retries are on the
+*backstop*, not on `--interval`: a `watch --interval 3600` started before a
+provider exists picks it up in seconds rather than in an hour, while its
+sweeps stay on the hour it was given. That tick also re-checks each
+registration against the directory it was made against — a watch is bound to
+the directory object, not to its name, so a root deleted and recreated
+(`rm -rf ~/.codex/sessions`, then the next session) has a live name and a dead
+watch — and re-registers only the ones that changed. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.
@@ -142,7 +145,9 @@ Two things make this cheap enough to leave running:
   leaves every total intact. Rows arriving between sweeps — the hook fast
   path, hydration — are growth rather than loss and still skip. The marker
   covers only what a sweep can put back: Claude transcripts and Codex
-  rollouts, both re-read when their session is short. `history` rows are
+  rollouts, both re-read when their session is short. Each entry covers that
+  session's events, tool calls, file edits and catalog row, since the same
+  re-read restores all four. `history` rows are
   deliberately outside it — they come from cursor-backed flat logs sitting at
   EOF, which nothing replays, so counting them would disarm the fast path
   forever over a loss no sweep could undo. And a loss the sweep could *not*

@@ -652,6 +652,74 @@ fn a_root_discovered_after_startup_is_adopted() {
     }
 }
 
+/// Coverage is not the user's sweep cadence. A root that does not exist yet is
+/// retried on the *backstop*, which the status output and the docs promise —
+/// not on `--interval`, which may be an hour. `watch --interval 3600` started
+/// before Claude is installed must pick `~/.claude/projects` up in seconds,
+/// or a session inside that hour is never captured.
+#[cfg(feature = "fs-events")]
+#[test]
+fn an_uncovered_root_is_retried_on_the_backstop_not_the_user_interval() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let late = home.path().join(".claude/projects");
+
+    let running = RunningLoop::reporting({
+        let late = late.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(late)])
+                .with_debounce_ms(50)
+                .with_slow_poll_ms(300)
+                // The user's interval, an hour in miniature: long enough that
+                // a retry on this cadence could not happen inside the test.
+                .with_poll_interval_ms(600_000)
+        }
+    });
+    let status = running.watch.status().expect("status");
+    assert_eq!(status.driver, WatchDriver::Polling);
+    assert_eq!(status.pending, vec![late.clone()]);
+
+    // The other half of the promise, asserted first because it is only true
+    // while the loop is polling: waking early to *reconcile* must not sweep
+    // early. Several backstop windows pass here, and the interval the user
+    // asked for has not.
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(1_000)),
+        Err(RecvTimeoutError::Timeout),
+        "reconciling on the backstop must not sweep on the user's interval"
+    );
+
+    std::fs::create_dir_all(&late).expect("install the provider");
+
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while running.watch.driver() != Some(WatchDriver::FsEvents) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an uncovered root was retried on the user interval, not the backstop: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+
+    // Positive control: the root that was picked up carries real events, so
+    // the transition above is coverage and not just a status change.
+    write_claude_transcript(home.path(), "late", "late-1", 1);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            // Once attached the loop is event-driven, and its backstop is the
+            // slow poll, so unforced ticks are expected here.
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a write under the newly attached root drove no forced sweep"
+            ),
+        }
+    }
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session
@@ -1427,6 +1495,107 @@ fn a_claude_transcript_short_of_its_events_is_re_read() {
     );
 }
 
+/// A session is more than its events. `tool_calls` and `file_edits` are put
+/// back by the same re-read that restores the events, so a marker that counted
+/// only events would let structured evidence disappear under a stamp that
+/// still matched — the sweep the loss is owed would be skipped forever.
+#[test]
+fn structured_evidence_lost_is_restored() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_codex_rollout(home.path(), "sess-tools");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the loss is testable"
+    );
+
+    let before = tool_call_count(&db, "codex", "sess-tools");
+    assert!(
+        before > 0,
+        "the rollout recorded no tool calls, so nothing structured could be lost"
+    );
+    let events_before = event_count(&db);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM tool_calls WHERE source = 'codex' AND session_id = 'sess-tools'",
+        [],
+    )
+    .expect("delete the tool calls");
+    drop(conn);
+    // Positive control on the premise: the *events* are untouched, so nothing
+    // but the structured evidence can explain the sweep below.
+    assert_eq!(event_count(&db), events_before);
+    assert_eq!(tool_call_count(&db, "codex", "sess-tools"), 0);
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a session short of its tool calls must reopen the sweep"
+    );
+    assert_eq!(
+        tool_call_count(&db, "codex", "sess-tools"),
+        before,
+        "the sweep must restore the structured evidence it owes the rollout"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired destination must arm the fast path again"
+    );
+}
+
+/// The catalog row is evidence too. A lost `sessions` row hidden behind an
+/// unrelated new session leaves every total covered, and discovery would skip
+/// the source whose stamp still matched — so the session stays missing from
+/// the catalog while its events sit in the database.
+#[test]
+fn a_lost_catalog_row_is_restored_even_when_sessions_grew() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_codex_rollout(home.path(), "sess-catalog");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+    assert_eq!(catalog_session_count(&db, "codex", "sess-catalog"), 1);
+    let sessions_before = session_count(&db);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM sessions WHERE source = 'codex' AND session_id = 'sess-catalog'",
+        [],
+    )
+    .expect("delete the catalog row");
+    // The masking write: another session arriving between ticks, so the total
+    // is exactly what it was.
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, cwd, first_activity_ms, last_activity_ms) \
+         VALUES ('grown-elsewhere', 'claude', '/tmp/grown', 1, 2)",
+        [],
+    )
+    .expect("insert a session");
+    drop(conn);
+    assert_eq!(
+        session_count(&db),
+        sessions_before,
+        "the compensating insert must leave the total unchanged, or nothing is concealed"
+    );
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a lost catalog row must reopen the sweep even when the total did not move"
+    );
+    assert_eq!(
+        catalog_session_count(&db, "codex", "sess-catalog"),
+        1,
+        "the sweep must put the catalog row back"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired catalog must arm the fast path again"
+    );
+}
+
 /// Detection without repair is only safe if the marker refuses to move. A loss
 /// the sweep could not put back — the transcript itself is gone — must leave
 /// the marker where it was, or the short count becomes the new baseline and
@@ -1743,6 +1912,16 @@ fn append_history_log(home: &Path, source: &str, prompt: &str) {
     file.flush().expect("flush");
 }
 
+fn tool_call_count(db: &Path, source: &str, session_id: &str) -> i64 {
+    let conn = ai_hist::open_db(db).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM tool_calls WHERE source = ? AND session_id = ?",
+        [source, session_id],
+        |row| row.get(0),
+    )
+    .expect("count tool calls")
+}
+
 fn event_count(db: &Path) -> i64 {
     let conn = ai_hist::open_db(db).expect("open db");
     conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
@@ -1783,6 +1962,16 @@ fn write_codex_rollout(home: &Path, session_id: &str) -> PathBuf {
          \"content\":[{\"type\":\"input_text\",\"text\":\"repair me\"}]}}",
         "{\"timestamp\":\"2026-09-19T10:00:02.000Z\",\"type\":\"event_msg\",\
          \"payload\":{\"type\":\"agent_message\",\"message\":\"Done.\"}}",
+    );
+    // One tool call, so the rollout carries structured evidence as well as
+    // events: `tool_calls` is restored by the same re-read, and is guarded by
+    // the same marker.
+    let body = format!(
+        "{body}{}\n",
+        "{\"timestamp\":\"2026-09-19T10:00:03.000Z\",\"type\":\"response_item\",\
+         \"payload\":{\"type\":\"function_call\",\"id\":\"fc_1\",\
+         \"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"git status\\\"}\",\
+         \"call_id\":\"call_1\"}}",
     );
     std::fs::write(&path, body).expect("write rollout");
     path
