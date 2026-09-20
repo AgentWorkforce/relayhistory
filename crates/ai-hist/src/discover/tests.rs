@@ -809,6 +809,48 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     assert!(row.models.is_empty());
 }
 
+/// The catalog's activity window comes from human turns, not from an
+/// assistant that quotes a `<timestamp>` tag back.
+///
+/// `cursor_record_time` ran the same unrestricted block scan the event parser
+/// did, so a model explaining the transcript format moved `first_activity_ms`
+/// and `last_activity_ms` and re-sorted the session in the catalog. Both paths
+/// now share `cursor::injected_turn_time`, which reads the tag only out of a
+/// human turn's own text blocks.
+///
+/// Positive control: with the scan unrestricted this failed at
+/// `assistant prose must not move the catalog window: left: Some(1789587660000),
+/// right: Some(1789587420000)` — the quoted instant became the session's last
+/// activity.
+#[test]
+fn cursor_activity_ignores_a_timestamp_quoted_by_the_assistant() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-quoted",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>when was this?</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Cursor writes <timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp> into the turn."}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-quoted");
+    // Both endpoints are the human turn's own time. The mtime is not reached
+    // either: a readable turn time outranks it.
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "assistant prose must not move the catalog window"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
 /// Discovery's session summary and the one full ingestion writes have to be
 /// the same string, or hydrating a session silently rewrites its summary.
 ///

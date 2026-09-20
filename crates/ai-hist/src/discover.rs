@@ -1265,10 +1265,10 @@ fn cursor_record_time(line: &[u8]) -> Option<i64> {
     }) {
         return Some(ts);
     }
-    crate::ingest::cursor::record_blocks(obj)
-        .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .find_map(crate::ingest::cursor::timestamp_from_text)
+    crate::ingest::cursor::injected_turn_time(
+        crate::ingest::cursor::record_role(obj),
+        &crate::ingest::cursor::record_blocks(obj),
+    )
 }
 
 /// `message.model` for the Cursor builds that record one.

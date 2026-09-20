@@ -515,6 +515,38 @@ pub(crate) fn record_role(obj: &serde_json::Map<String, Value>) -> Option<&str> 
         .or_else(|| obj.get("message")?.get("role")?.as_str())
 }
 
+/// The injected turn time a record carries, if it is the kind of record that
+/// can carry one.
+///
+/// The `<timestamp>` tag is not a field. Cursor's **client** injects it into
+/// the text a person submits, so it is a clock only there. The same characters
+/// in an assistant reply are prose — a model explaining the transcript format,
+/// quoting the turn it is answering, or reading a log back to you — and
+/// reading a clock out of them re-dates that record and every record after it
+/// until the next turn, silently. `cursor_record_time` repeats the scan during
+/// discovery, so the same prose also moves `first_activity_ms` and
+/// `last_activity_ms` and re-sorts the catalog.
+///
+/// So the scan is confined to a human turn's own `text` blocks: `role` must be
+/// `user`, and a block must be a `text` block. A user record carrying only a
+/// `tool_result` is an answer to a turn already open, not a new one, and has
+/// no text block to scan.
+///
+/// What this cannot separate, because nothing in the record does, is a person
+/// who pastes a transcript containing the tag. That is the same ambiguity
+/// `docs/session-catalog.md` records for Cursor's hooks and rules, which
+/// inject turns structurally identical to human prompts.
+pub(crate) fn injected_turn_time(role: Option<&str>, blocks: &[Value]) -> Option<i64> {
+    if role != Some("user") {
+        return None;
+    }
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .find_map(timestamp_from_text)
+}
+
 /// The blocks a record carries, normalizing the bare-string content older
 /// rows use into a single synthetic text block.
 pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> {

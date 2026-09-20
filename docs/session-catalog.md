@@ -618,7 +618,7 @@ How each adapter works:
   | `{"type":"text","text"}` | **Corroborated** | `session_events.kind = 'text'` |
   | `{"type":"tool_use","name","input"}`, **no `id`** | **Corroborated**; one report of `"id": null` in the CLI | `session_events.kind = 'tool_use'` plus a `tool_calls` row, keyed on the record's byte offset because there is no provider id |
   | `{"type":"turn_ended","status"}` | **Corroborated** | Skipped: it is a marker, and no `session_events.kind` honestly fits it |
-  | `<timestamp>…</timestamp>` in the human turn's text | **Corroborated**; a localized human string, e.g. `Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)` | Parsed explicitly (English month, 12- or 24-hour clock, required `(UTC±H[:MM])`). The records answering that turn inherit it |
+  | `<timestamp>…</timestamp>` in the human turn's text | **Corroborated**; a localized human string, e.g. `Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)` | Parsed explicitly (English month, 12- or 24-hour clock, required `(UTC±H[:MM])`), **only out of a human turn's own `text` blocks**. The records answering that turn inherit it |
   | `<user_query>…</user_query>` in the human turn's text | **Corroborated** | Stripped, so the stored prompt is what the person typed |
   | `message.model` | **Not written** by any reported build | Recorded if a build ever writes it; otherwise `models` is empty and the matrix says unavailable |
   | `message.usage` | **Not written** by any reported build | Same: recorded when present, never synthesized |
@@ -740,6 +740,24 @@ How each adapter works:
   carry a recorded time of their own. Treating every user record as a new turn
   sent tool results to the mtime, dating a result hours after the call it
   answers and putting the two halves of one exchange in disagreement.
+
+  The tag is a clock only where Cursor's client puts it: in the text a person
+  submitted. It is not a field, so the same characters can appear in an
+  assistant reply — a model explaining this format, quoting the turn it is
+  answering, or reading a log back — and that is prose. Scanning every role's
+  blocks for it let such a reply supply a turn time, which re-dated that record
+  and every record after it until the next turn, and suppressed the mtime
+  fallback that should have fired. Shallow discovery ran the same scan, so the
+  same prose also moved `first_activity_ms` and `last_activity_ms` and re-sorted
+  the session in the catalog. Both paths now share one rule
+  (`cursor::injected_turn_time`): the tag is read only from a `text` block of a
+  **`user`** record. A record `timestamp` field, when a build writes one, is a
+  real provider field and is believed whatever the role.
+
+  What no rule can separate, because nothing in the record does, is a person
+  who pastes a transcript containing the tag — the same ambiguity recorded
+  below for Cursor's hooks and rules, which inject turns structurally identical
+  to human prompts.
 
   The session's activity window covers every record a pass stamps **and stores
   evidence for**, not only the ones that carried a recorded time. An undated

@@ -5586,12 +5586,10 @@ pub(crate) fn ingest_cursor_transcript(
         let record_ts = obj
             .get("timestamp")
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-            .or_else(|| {
-                blocks
-                    .iter()
-                    .filter_map(|block| block.get("text").and_then(Value::as_str))
-                    .find_map(cursor::timestamp_from_text)
-            });
+            // A record `timestamp` is a provider field and is believed
+            // whatever the role; the injected tag is a clock only in a human
+            // turn's own text. See `cursor::injected_turn_time`.
+            .or_else(|| cursor::injected_turn_time(Some(role), &blocks));
         // A *human* turn opens a new one, so it replaces the inherited time —
         // including with `None`. Letting an untimed human turn keep the
         // previous turn's time would date a prompt to a conversation that had
@@ -13856,6 +13854,67 @@ mod tests {
                 ("well formed".to_string(), 1_789_587_660_000),
             ]
         );
+    }
+
+    /// Assistant prose that *quotes* a `<timestamp>` tag is prose, not a clock.
+    ///
+    /// The tag is injected by Cursor's client into what a person submits, so
+    /// only a human turn's own text carries one. Scanning every role's blocks
+    /// let a model explaining the transcript format, or reading a log back,
+    /// supply a `record_ts` — which re-dated that record and every record
+    /// after it until the next turn, and suppressed the mtime fallback that
+    /// should have fired.
+    ///
+    /// Positive control: with the scan unrestricted this fails at
+    /// `assistant prose must not re-date the turn: left: [("the reply",
+    /// 1789587660000)], right: [("the reply", 1789587420000)]` — the reply
+    /// jumped four minutes to the instant it was merely quoting.
+    #[test]
+    fn a_quoted_timestamp_in_assistant_prose_is_not_a_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-quoted.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>when was this?</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"the reply"},{"type":"text","text":"Cursor writes <timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp> into the turn."}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &path,
+            "s-quoted",
+            Some("/tmp/proj"),
+            4_242,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+
+        let replies: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT text, ts_ms FROM session_events WHERE source = 'cursor' \
+                 AND session_id = 's-quoted' AND role = 'assistant' \
+                 AND text = 'the reply' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec![("the reply".to_string(), 1_789_587_420_000)],
+            "assistant prose must not re-date the turn"
+        );
+        // The window closes at the human turn's time, not at the one the
+        // assistant quoted.
+        assert_eq!(outcome.last_ts_ms, Some(1_789_587_420_000));
     }
 
     /// A human turn is one `history` row, however many text blocks Cursor
