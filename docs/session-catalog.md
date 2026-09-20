@@ -515,20 +515,37 @@ How each adapter works:
   turn time and leaves it `null` when the build wrote none, and
   `last_activity_ms` falls back to the mtime.
 
-  A **user** record opens a new turn, so it replaces the inherited time even
-  when it has none of its own; only assistant and tool records inherit. An
+  A **human turn** opens a new turn, so it replaces the inherited time even
+  when it has none of its own; everything answering that turn inherits. An
   undated human turn that kept the previous turn's time would be dated to a
   conversation that had already ended, and — worse — would look dated, so the
   mtime fallback would never fire and the diagnostic would never be reported
   for a transcript that plainly needed it.
 
-  The session's activity window covers every event a pass **stamps**, not only
-  the ones that carried a recorded time. An undated turn still produces events,
-  at the mtime, so leaving it out of the window made `sessions.last_activity_ms`
-  claim a recency older than the session's own newest event — and the session
-  then sorted behind siblings that were genuinely older. Where a time was
-  recorded it is still the one used, so a fully dated session reports its
-  recorded times rather than the file mtime.
+  The `role` alone does not identify a human turn. Cursor writes tool results
+  back as **user-role** records, and a user record carrying only a
+  `tool_result` — or only a marker such as `turn_ended` — answers the turn that
+  is already open rather than starting a new one. A user record is treated as a
+  human turn only when it carries a `text` block; the rest inherit, unless they
+  carry a recorded time of their own. Treating every user record as a new turn
+  sent tool results to the mtime, dating a result hours after the call it
+  answers and putting the two halves of one exchange in disagreement.
+
+  The session's activity window covers every record a pass stamps **and stores
+  evidence for**, not only the ones that carried a recorded time. An undated
+  turn still produces events, at the mtime, so leaving it out of the window made
+  `sessions.last_activity_ms` claim a recency older than the session's own
+  newest event — and the session then sorted behind siblings that were
+  genuinely older. Where a time was recorded it is still the one used, so a
+  fully dated session reports its recorded times rather than the file mtime.
+
+  Two kinds of record stay out of the window. One that stores nothing — a
+  `turn_ended` marker is the whole record — has no event to be the recency
+  *of*, and on a re-read it also has no stored event to recover its original
+  time from, so it fell back to the *current* mtime and dragged the window to
+  "now" on every single sync. And a record before the resumed offset whose
+  original stamp cannot be recovered at all is stamped with a guess; a guess is
+  not evidence of when anything happened, so it does not set the window either.
 
   ### Delegation
 

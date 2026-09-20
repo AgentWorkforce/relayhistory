@@ -775,6 +775,7 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
     ("codex_rollouts_v3", "codex_rollouts_v5"),
     ("codex_rollouts_v4", "codex_rollouts_v5"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
+    ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
 ];
 
 /// Where plain `sync` remembers how far it has read each Cursor transcript.
@@ -785,7 +786,7 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
 /// `session_events`, `tool_calls` and `file_edits`. Bumping
 /// `HYDRATION_PARSER_VERSION` alone only repairs sessions somebody hydrates by
 /// name; plain `sync` would keep skipping the rest forever.
-const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v1";
+const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v2";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
@@ -3839,11 +3840,24 @@ fn sync_cursor_with_scan_hook(
     root: &Path,
     before_transcript: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
+    sync_cursor_with_hooks(conn, state, root, before_transcript, &mut |_| {})
+}
+
+/// `after_read` runs between a transcript's byte scan and the cursor that scan
+/// commits — the one window in which Cursor can replace a file the scan has
+/// already read but not yet identified. Production passes a no-op.
+fn sync_cursor_with_hooks(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    before_transcript: &mut dyn FnMut(&Path),
+    after_read: &mut dyn FnMut(&Path),
+) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
     // Finish provider I/O and parsing before taking the destination writer lock.
-    let prepared = prepare_cursor_sync(state, root, before_transcript)
+    let prepared = prepare_cursor_sync(state, root, before_transcript, after_read)
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
@@ -3982,6 +3996,18 @@ struct ScannedCursorTranscript {
 }
 
 fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
+    scan_cursor_transcript_with(jsonl, saved, &mut |_| {})
+}
+
+/// `after_read` runs after the byte scan has read what it is going to read and
+/// before the cursor it commits is validated. That is the window in which a
+/// replacement is invisible to both ends of the scan, so it is the only place
+/// a test can put one; production passes a no-op.
+fn scan_cursor_transcript_with(
+    jsonl: &Path,
+    saved: Option<&Value>,
+    after_read: &mut dyn FnMut(&Path),
+) -> Result<ScannedCursorTranscript> {
     let mut source = CompleteJsonlReader::open(jsonl, saved)
         .with_context(|| format!("open Cursor transcript {}", jsonl.display()))?;
     let offset = source.position;
@@ -4015,6 +4041,7 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
             }
         }
     }
+    after_read(jsonl);
     let opened_cursor = source.cursor.to_value();
     // The generation comes from the cursor this scan commits, whose prefix
     // hash is the digest of the bytes the reader *actually read* — not a
@@ -4033,26 +4060,48 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
     } else {
         None
     };
-    let generation = match &committed {
-        Some(cursor) => cursor
-            .prefix_hash
-            .as_ref()
-            .map(|prefix_hash| CursorGeneration {
-                device: cursor.generation.device,
-                inode: cursor.generation.inode,
-                prefix_hash: prefix_hash.clone(),
-                prefix_len: cursor.offset,
-            }),
-        // Nothing advanced and the saved cursor still describes the file, so
-        // there is nothing to index and no offsets to protect.
-        None => cursor_generation(jsonl, consumed)?,
+    // A cursor the reader *reset* is not this scan's generation. It describes
+    // the file that replaced the one being read — offset zero, the
+    // replacement's identity, the empty-prefix hash — while `restarted`,
+    // `resumed_from` and `consumed_through` below still describe the file that
+    // is gone. Stamping the scan with it would hand the write phase an
+    // identity that matches the new file exactly, so the check would find
+    // "no replacement" and index the new file from the old one's resume point
+    // with none of the old evidence cleared. The generation and the offsets
+    // have to move together, so a reset makes the generation *unidentifiable*
+    // and the write phase re-scans: `restarted`, `history_from_offset` and
+    // `scanned_through` then all come from the one read that saw the
+    // replacement whole.
+    let replaced_mid_scan = source.reset_cursor.is_some();
+    let generation = if replaced_mid_scan {
+        None
+    } else {
+        match &committed {
+            Some(cursor) => cursor
+                .prefix_hash
+                .as_ref()
+                .map(|prefix_hash| CursorGeneration {
+                    device: cursor.generation.device,
+                    inode: cursor.generation.inode,
+                    prefix_hash: prefix_hash.clone(),
+                    prefix_len: cursor.offset,
+                }),
+            // Nothing advanced and the saved cursor still describes the file,
+            // so there is nothing to index and no offsets to protect.
+            None => cursor_generation(jsonl, consumed)?,
+        }
     };
     Ok(ScannedCursorTranscript {
         timestamp_ms,
         parse_errors,
         checkpoint: committed.map(|cursor| cursor.to_value()),
         restarted: offset == 0,
-        advanced: consumed != offset,
+        // A replacement is work even when the read that found it consumed
+        // nothing: the session's stored evidence belongs to a file that no
+        // longer exists, and only a queued transcript gets re-scanned and
+        // rebuilt. Leaving it unqueued would keep that evidence until some
+        // later sync happened to find new bytes.
+        advanced: consumed != offset || replaced_mid_scan,
         resumed_from: offset,
         consumed_through: consumed,
         // Re-checked by the index phase, because a replacement can still land
@@ -4177,6 +4226,7 @@ fn prepare_cursor_sync(
     state: &Map<String, Value>,
     root: &Path,
     before_transcript: &mut dyn FnMut(&Path),
+    after_read: &mut dyn FnMut(&Path),
 ) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
         .get(CURSOR_SYNC_STATE_KEY)
@@ -4215,7 +4265,8 @@ fn prepare_cursor_sync(
             // per-file, not per-source: record it, leave this file's checkpoint
             // untouched so the next sync retries it from the same offset, and keep
             // preparing the remaining transcripts.
-            let scan = match scan_cursor_transcript(&jsonl, cursor_state.get(&key)) {
+            let scan = match scan_cursor_transcript_with(&jsonl, cursor_state.get(&key), after_read)
+            {
                 Ok(scan) => scan,
                 Err(error) => {
                     sync_note!("  [cursor] skipping {}: {error:#}", jsonl.display());
@@ -4427,16 +4478,31 @@ pub(crate) fn ingest_cursor_transcript(
                     .filter_map(|block| block.get("text").and_then(Value::as_str))
                     .find_map(cursor::timestamp_from_text)
             });
-        // A user record opens a new turn, so it *replaces* the inherited time
-        // — including with `None`. Letting an untimed human turn keep the
+        // A *human* turn opens a new one, so it replaces the inherited time —
+        // including with `None`. Letting an untimed human turn keep the
         // previous turn's time would date a prompt to a conversation that had
         // already ended, and would hide the fact that it was undated: the
         // mtime fallback would never fire and `CURSOR_TIMESTAMP_FROM_MTIME`
-        // would never be reported. Assistant and tool records answer the open
-        // turn, so they only move it when they carry a time of their own.
-        if role == "user" || record_ts.is_some() {
+        // would never be reported.
+        //
+        // The role alone does not say that. Cursor writes tool results back as
+        // user-role records, and a record carrying only a `tool_result` — or
+        // only a marker like `turn_ended` — is an answer to the turn that is
+        // already open, not a new one. Clearing the turn time for those sent
+        // them to the mtime, dating a tool result hours after the call it
+        // answers and putting the two halves of one exchange in disagreement.
+        // Assistant records, and user records that are not human turns, move
+        // the time only when they carry one of their own.
+        let opens_human_turn = role == "user"
+            && blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("text"));
+        if opens_human_turn || record_ts.is_some() {
             turn_ts = record_ts;
         }
+        // True when this record's stamp is the *current* mtime standing in for
+        // a time that could not be recovered — see the window update below.
+        let mut ts_is_guessed = false;
         let ts_ms = match turn_ts {
             Some(ts) => ts,
             None => {
@@ -4449,7 +4515,13 @@ pub(crate) fn ingest_cursor_transcript(
                 // re-reading keeps the stamp it already has; only records at or
                 // past the resumed offset take the current mtime.
                 if record_offset < history_from_offset {
-                    stored_cursor_record_ts(conn, session_id, record_offset)?.unwrap_or(mtime_ms)
+                    match stored_cursor_record_ts(conn, session_id, record_offset)? {
+                        Some(stored) => stored,
+                        None => {
+                            ts_is_guessed = true;
+                            mtime_ms
+                        }
+                    }
                 } else {
                     mtime_ms
                 }
@@ -4461,16 +4533,24 @@ pub(crate) fn ingest_cursor_transcript(
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("cursor:{record_offset}"));
-        // The window covers every record this pass *stamps*, not only the ones
-        // that carried a recorded time. An undated turn is still stamped —
-        // with the file mtime — and still produces events at that time, so
-        // leaving it out made the catalog claim a recency older than the
-        // session's own newest event, and the session then sorted behind
-        // siblings that were genuinely older. Where a time was recorded it is
-        // the one used, so a fully dated session still reports its recorded
-        // times rather than the mtime.
-        outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
-        outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
+        // The window covers every record this pass *stamps with evidence*, not
+        // only the ones that carried a recorded time. An undated turn is still
+        // stamped — with the file mtime — and still produces events at that
+        // time, so leaving it out made the catalog claim a recency older than
+        // the session's own newest event. Where a time was recorded it is the
+        // one used, so a fully dated session still reports its recorded times
+        // rather than the mtime.
+        //
+        // Two records must stay out of it. One that emits nothing has no event
+        // to be the recency *of*: a `turn_ended` marker is the whole record,
+        // and on a re-read it also has no stored event to recover a time from,
+        // so it fell back to the current mtime — which moves on every append —
+        // and dragged the window to "now" on every sync. And a pre-resume
+        // record whose original time cannot be recovered is stamped with a
+        // guess, which is not evidence of when anything happened. So the
+        // window is taken after the blocks, from records that actually stored
+        // something, and never from a guessed stamp.
+        let mut emitted_evidence = false;
         for (block_index, block) in blocks.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{record_offset}:{block_index}");
@@ -4506,6 +4586,7 @@ pub(crate) fn ingest_cursor_transcript(
                     } else {
                         outcome.last_assistant_text = Some(text.clone());
                     }
+                    emitted_evidence = true;
                     insert_session_event(
                         conn,
                         "cursor",
@@ -4532,6 +4613,7 @@ pub(crate) fn ingest_cursor_transcript(
                         .map(str::trim)
                         .filter(|text| !text.is_empty());
                     if let Some(thinking) = thinking {
+                        emitted_evidence = true;
                         insert_session_event(
                             conn,
                             "cursor",
@@ -4579,6 +4661,7 @@ pub(crate) fn ingest_cursor_transcript(
                     if cursor::is_subagent_tool(&name) {
                         outcome.subagent_calls += 1;
                     }
+                    emitted_evidence = true;
                     insert_session_event(
                         conn,
                         "cursor",
@@ -4678,6 +4761,7 @@ pub(crate) fn ingest_cursor_transcript(
                         .unwrap_or_default()
                         .to_string();
                     let content = block.get("content").unwrap_or(&Value::Null);
+                    emitted_evidence = true;
                     insert_session_event(
                         conn,
                         "cursor",
@@ -4724,6 +4808,10 @@ pub(crate) fn ingest_cursor_transcript(
                 // there is no `session_events.kind` that it honestly is.
                 _ => {}
             }
+        }
+        if emitted_evidence && !ts_is_guessed {
+            outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+            outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
         }
     }
     Ok(outcome)
@@ -10658,6 +10746,431 @@ mod tests {
         assert_eq!(
             rows,
             vec![("assistant".into(), "Here is the report.".into())]
+        );
+    }
+
+    /// Group N. A replacement that lands *while the scan is reading* must not
+    /// be stamped with the old scan's offsets.
+    ///
+    /// `committed_cursor` answers a mid-scan change with a *reset* cursor —
+    /// offset zero, the replacement's identity, the empty-prefix hash. The
+    /// scan's own `restarted`, `resumed_from` and `consumed_through` still
+    /// describe the file that is gone. Taking the generation from that reset
+    /// cursor and leaving the offsets alone lets the write phase compare the
+    /// replacement against its own empty-prefix identity, find it unchanged,
+    /// and index the new file from the old file's resume point with none of
+    /// the old evidence cleared. The two pieces of state have to move
+    /// together.
+    ///
+    /// Positive control: before the fix this failed at `the replaced
+    /// generation's evidence must be cleared: ["original.rs"]` — the old
+    /// file's edit survived, and the replacement's first prompt was missing
+    /// because it sits before the old resume offset.
+    #[test]
+    fn a_replacement_during_the_byte_scan_forces_a_full_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        // Long enough that the resume offset lands well inside the
+        // replacement, so a skipped prefix is observable.
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>original first</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"original.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:39 PM (UTC-4)</timestamp><user_query>original second</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-midscan", original);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-midscan"), 1);
+
+        // Grow it so the next sync has something to resume for, then replace
+        // it from inside that scan — after the reader has read, before it
+        // validates what it read.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"more original"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        let replacement = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:01 PM (UTC-4)</timestamp><user_query>replacement first turn</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"replacement.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:04 PM (UTC-4)</timestamp><user_query>replacement second turn</user_query>"}]}}"#,
+            "\n"
+        );
+        let mut replaced_once = false;
+        super::sync_cursor_with_hooks(&conn, &mut state, &root, &mut |_| {}, &mut |path| {
+            if path == transcript && !replaced_once {
+                replaced_once = true;
+                fs::write(&transcript, replacement).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(replaced_once, "the replacement hook must have run");
+
+        let edits: Vec<String> = crate::session_file_edits(&conn, "s-midscan", Some("cursor"))
+            .unwrap()
+            .into_iter()
+            .map(|edit| edit.file_path)
+            .collect();
+        assert!(
+            !edits.iter().any(|path| path == "original.rs"),
+            "the replaced generation's evidence must be cleared: {edits:?}"
+        );
+        assert!(
+            edits.iter().any(|path| path == "replacement.rs"),
+            "the replacement's own evidence must be indexed: {edits:?}"
+        );
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-midscan' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec![
+                "replacement first turn".to_string(),
+                "replacement second turn".to_string()
+            ],
+            "history_from_offset must come from the re-scan, so the \
+             replacement's prefix is indexed and the old file's prompts go"
+        );
+    }
+
+    /// Group N's control: an *append* landing in the same window is not a
+    /// replacement. Its scanned prefix is untouched, so the scan keeps its
+    /// resume point and the session is not rebuilt — the fix must not turn
+    /// every concurrent write into a full re-scan.
+    #[test]
+    fn an_append_during_the_byte_scan_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"kept.rs"}}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-append-race", original);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let first_edit_id: i64 = conn
+            .query_row(
+                "SELECT MIN(id) FROM file_edits WHERE source = 'cursor' \
+                 AND session_id = 's-append-race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:40 PM (UTC-4)</timestamp><user_query>second</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        super::sync_cursor_with_hooks(&conn, &mut state, &root, &mut |_| {}, &mut |path| {
+            if path == transcript {
+                let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(
+                    concat!(
+                        r#"{"role":"assistant","message":{"content":[{"type":"text","text":"appended mid-scan"}]}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-append-race' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
+        let still_first: i64 = conn
+            .query_row(
+                "SELECT MIN(id) FROM file_edits WHERE source = 'cursor' \
+                 AND session_id = 's-append-race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_first, first_edit_id,
+            "an append must not clear and re-insert the session's evidence"
+        );
+    }
+
+    /// Group O. A user-role record carrying only a `tool_result` is a tool
+    /// response, not a human turn, so it must not close the open turn's time.
+    ///
+    /// Cursor writes tool results back as user-role records. Treating every
+    /// user record as a new turn cleared the inherited timestamp, and the
+    /// result then fell through to the file mtime — so a tool result was
+    /// dated minutes or hours after the call it answers, with the two halves
+    /// of one exchange disagreeing.
+    ///
+    /// Positive control: before the fix this failed at `a tool result must
+    /// carry its call's time: left: 1789600000000, right: 1789587420000` —
+    /// the result took the file mtime.
+    #[test]
+    fn a_user_role_tool_result_keeps_its_calls_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-tool-result-ts",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>run it</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.rs"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"undated follow-up"}]}}"#,
+                "\n"
+            ),
+        );
+        // A much later mtime: the fallback any untimed turn takes.
+        set_file_mtime_ms(&transcript, 1_789_600_000_000);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let ts_of = |kind: &str| -> i64 {
+            conn.query_row(
+                "SELECT ts_ms FROM session_events WHERE source = 'cursor' \
+                 AND session_id = 's-tool-result-ts' AND kind = ? ORDER BY id LIMIT 1",
+                [kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            ts_of("tool_result"),
+            ts_of("tool_use"),
+            "a tool result must carry its call's time"
+        );
+
+        // Control: a real human turn with no time of its own still opens a
+        // new turn, and still falls through to the mtime.
+        let follow_up: i64 = conn
+            .query_row(
+                "SELECT timestamp_ms FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-tool-result-ts' AND prompt = 'undated follow-up'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            follow_up, 1_789_600_000_000,
+            "an undated human turn must still open a new turn and take the mtime"
+        );
+    }
+
+    /// Group P. A record this pass emits no evidence for must not move the
+    /// session's activity window.
+    ///
+    /// On an incremental read, a pre-resume record whose original timestamp
+    /// cannot be recovered falls back to the *current* mtime — and the mtime
+    /// moves on every append. A `turn_ended` marker is exactly that record:
+    /// it stores no event, so there is nothing to recover its time from, and
+    /// the window then advanced to "now" on every single sync, burying the
+    /// times the session actually recorded.
+    ///
+    /// Positive control: before the fix this failed at `the window must come
+    /// from the session's own evidence, not the current mtime: left:
+    /// 1789602000000, right: 1789600260000`.
+    #[test]
+    fn a_record_with_no_evidence_does_not_move_the_activity_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-marker-window",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"undated opening turn"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"turn_ended","status":"success"}]}}"#,
+                "\n"
+            ),
+        );
+        set_file_mtime_ms(&transcript, 1_789_587_420_000);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let last_activity = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT last_activity_ms FROM sessions WHERE source = 'cursor' \
+                 AND session_id = 's-marker-window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(last_activity(&conn), 1_789_587_420_000);
+
+        // Append a dated turn, and move the mtime well past it.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:51 PM (UTC-4)</timestamp><user_query>dated turn</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        set_file_mtime_ms(&transcript, 1_789_600_000_000);
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let dated: i64 = conn
+            .query_row(
+                "SELECT timestamp_ms FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-marker-window' AND prompt = 'dated turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_activity(&conn),
+            dated,
+            "the window must come from the session's own evidence, not the \
+             current mtime"
+        );
+
+        // Control: an undated turn that *does* emit evidence is stamped with
+        // the mtime and must still carry the window forward.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"undated closing turn"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        set_file_mtime_ms(&transcript, 1_789_602_000_000);
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            last_activity(&conn),
+            1_789_602_000_000,
+            "an undated record that does emit evidence still sets the window"
+        );
+    }
+
+    /// Group P's other half. Dropping the markers is not enough: a pre-resume
+    /// record that *does* emit evidence but whose original stamp can no
+    /// longer be recovered is stamped with the current mtime, and that stamp
+    /// is a guess, not a record of when anything happened. Letting it set the
+    /// window redates the session to "now" for a record the scan is only
+    /// re-reading.
+    ///
+    /// Positive control: with the window gated on evidence alone this failed
+    /// at `a guessed stamp must not become the session's recency: left:
+    /// 1789600000000, right: 1789588260000`.
+    #[test]
+    fn a_guessed_stamp_for_a_pre_resume_record_does_not_move_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-guessed-window",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"undated opening turn"}]}}"#,
+                "\n"
+            ),
+        );
+        set_file_mtime_ms(&transcript, 1_789_587_420_000);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        // Append a dated turn and move the mtime well past it.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:51 PM (UTC-4)</timestamp><user_query>dated turn</user_query>"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        set_file_mtime_ms(&transcript, 1_789_600_000_000);
+
+        // Lose the opening turn's stored events, the only place its stamp
+        // survives. The next pass re-reads that record from before its resume
+        // point with nothing left to recover its time from.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'cursor' \
+             AND session_id = 's-guessed-window' AND substr(event_uid, 1, 2) = '0:'",
+            [],
+        )
+        .unwrap();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let last_activity: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions WHERE source = 'cursor' \
+                 AND session_id = 's-guessed-window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_activity, 1_789_588_260_000,
+            "a guessed stamp must not become the session's recency"
         );
     }
 }

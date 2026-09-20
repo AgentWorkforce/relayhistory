@@ -18,7 +18,15 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// same push, which is why `CURSOR_SYNC_STATE_KEY` was retired in the same
 /// change — a parser version alone only reaches sessions somebody hydrates by
 /// name.
-const HYDRATION_PARSER_VERSION: i64 = 3;
+///
+/// Bumped to 4 when a user-role record carrying only a `tool_result` stopped
+/// closing the open turn. Those records were dated with the file mtime, so an
+/// already indexed Cursor session holds tool results timed hours after the
+/// calls they answer, and session windows that were dragged to the mtime by
+/// records that store no evidence at all. Neither heals in place — the window
+/// only ever widens — so the transcript has to be read again, which is why
+/// `CURSOR_SYNC_STATE_KEY` was retired alongside it.
+const HYDRATION_PARSER_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
