@@ -44,11 +44,14 @@ and `crates/ai-hist-napi/src/lib.rs`).
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
 4. `publish-crate` publishes the `ai-hist` crate to crates.io at that same
-   version (OIDC trusted publishing, or `CARGO_REGISTRY_TOKEN`). If the version
-   already exists, the job skips rather than failing. `dry_run` runs
-   `cargo publish --dry-run -p ai-hist` and publishes nothing. A crates.io-only
-   retry uses `skip_core` with the already-published `custom_version`; the job
-   checks out `sdk-ts-v<version>` and publishes the crate from that tag.
+   version via GitHub OIDC trusted publishing. `rust-lang/crates-io-auth-action`
+   exchanges the workflow's OIDC identity for a short-lived crates.io token and
+   passes it as `CARGO_REGISTRY_TOKEN` to `cargo publish`. There is no
+   long-lived crates.io secret. If the version already exists, the job skips
+   rather than failing. `dry_run` runs `cargo publish --dry-run -p ai-hist` and
+   publishes nothing. A crates.io-only retry uses `skip_core` with the
+   already-published `custom_version`; the job checks out `sdk-ts-v<version>`
+   and publishes the crate from that tag.
 5. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
    and creates the `sdk-ts-v<version>` tag and GitHub Release.

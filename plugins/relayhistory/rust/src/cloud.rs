@@ -359,6 +359,51 @@ pub fn access_token(base_url: Option<&str>) -> Result<String> {
     Ok(auth.access_token)
 }
 
+/// Best-effort renewal for idle progress reporting. Never wait for another
+/// transport's refresh lock, and bound the refresh request including its body.
+/// The rotated credential pair is persisted through the same atomic store.
+pub fn try_progress_access_token(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>> {
+    let Some(mut auth) = load_selected_auth(Some(base_url))? else {
+        return Ok(None);
+    };
+    if !token_has_valid_lifetime(&auth) {
+        let path = refresh_lock_path(base_url)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let _lock = AuthRefreshLock { _file: file };
+        auth = load_selected_auth(Some(base_url))?.context("progress credentials disappeared")?;
+        if !token_has_valid_lifetime(&auth) {
+            let agent = ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout(timeout)
+                .build();
+            auth = refresh_auth_with_agent(&auth, &agent)
+                .map_err(|_| anyhow::anyhow!("progress credential renewal unavailable"))?;
+            save_auth(&auth)?;
+        }
+    }
+    Ok((token_has_valid_lifetime(&auth)
+        && auth.access_token.starts_with("rth_at_")
+        && auth
+            .access_token
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic()))
+    .then_some(auth.access_token))
+}
+
 fn token_has_valid_lifetime(auth: &StoredAuth) -> bool {
     let expiry = auth
         .access_token_expires_at
@@ -445,10 +490,7 @@ pub fn machine_id() -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let id = format!(
-        "m_{}",
-        ai_hist::prompt_hash(&format!("{host}:{nanos}"))
-    );
+    let id = format!("m_{}", ai_hist::prompt_hash(&format!("{host}:{nanos}")));
     write_private(&path, &id)?;
     Ok(id)
 }
@@ -985,6 +1027,10 @@ fn refresh_and_save_auth(auth: &StoredAuth) -> Result<StoredAuth> {
 }
 
 fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
+    refresh_auth_with_agent(auth, &ureq::AgentBuilder::new().build())
+}
+
+fn refresh_auth_with_agent(auth: &StoredAuth, agent: &ureq::Agent) -> Result<StoredAuth> {
     require_secure_transport(&auth.base_url)?;
     let refresh_token = auth
         .refresh_token
@@ -994,7 +1040,8 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
         "{}/v1/auth/token/refresh",
         auth.base_url.trim_end_matches('/')
     );
-    let response = ureq::post(&url)
+    let response = agent
+        .post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({ "refreshToken": refresh_token }))
         .map_err(map_http_err)?;
@@ -1684,10 +1731,7 @@ pub fn resolve_recall_auth(
         auth.access_token.starts_with("rth_at_"),
         "stored relayhistory session has no rth_at_ access token (run `ai-hist login`)"
     );
-    let needs_tenancy = auth
-        .org_id
-        .as_deref()
-        .is_none_or(|id| id.trim().is_empty());
+    let needs_tenancy = auth.org_id.as_deref().is_none_or(|id| id.trim().is_empty());
     // A session created before the service began returning tenancy can still
     // recover it on refresh. Do this before the provenance check, under the
     // same lock as every other token rotation, so a concurrent writer cannot
@@ -3282,6 +3326,83 @@ pub(crate) mod tests {
             let stored = load_auth(Some(&auth.base_url)).unwrap().unwrap();
             assert_eq!(stored.access_token, "rth_at_fresh");
             assert_eq!(stored.refresh_token.as_deref(), Some("rth_rt_fresh"));
+        });
+    }
+
+    #[test]
+    fn idle_progress_refresh_is_bounded_and_respects_the_rotation_lock() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            save_auth(&StoredAuth {
+                base_url: base_url.clone(),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let lock = acquire_refresh_lock(&base_url).unwrap();
+            let start = std::time::Instant::now();
+            assert!(
+                try_progress_access_token(&base_url, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(start.elapsed() < std::time::Duration::from_millis(100));
+            drop(lock);
+            // The listening socket never responds: the refresh has a hard deadline.
+            let start = std::time::Instant::now();
+            assert!(
+                try_progress_access_token(&base_url, std::time::Duration::from_millis(100))
+                    .is_err()
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn idle_progress_refresh_persists_and_reuses_the_rotated_pair() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            save_auth(&StoredAuth {
+                base_url: base_url.clone(),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (line, _, _) = read_http_request(&mut stream);
+                assert!(line.starts_with("POST /v1/auth/token/refresh "));
+                write_http_response(&mut stream, "200 OK", &serde_json::json!({
+                    "accessToken": "rth_at_fresh", "refreshToken": "rth_rt_fresh",
+                    "accessTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+                }).to_string());
+            });
+            assert_eq!(
+                try_progress_access_token(&base_url, std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .as_deref(),
+                Some("rth_at_fresh")
+            );
+            server.join().unwrap();
+            // The listener is gone; a valid cached credential needs no network call.
+            assert_eq!(
+                try_progress_access_token(&base_url, std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .as_deref(),
+                Some("rth_at_fresh")
+            );
+            assert_eq!(
+                load_selected_auth(Some(&base_url))
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rth_rt_fresh")
+            );
         });
     }
 

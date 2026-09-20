@@ -1,0 +1,153 @@
+{
+  "corpus_files": [
+    "claude/files-touched.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/files-touched",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "read some files",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "two Read tool uses and a Grep in one assistant message — three calls, no file mutated",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "read some files",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "Read /src/a.ts",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":100,\"output_tokens\":50}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "Read /src/b.ts",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":100,\"output_tokens\":50}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:2",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "Grep foo.*bar",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":100,\"output_tokens\":50}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "read some files",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643201000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/files-touched.jsonl",
+      "repo_url": null,
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "source_stamp": "<n>:935",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"pattern\":\"foo.*bar\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Grep",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "target": "foo.*bar",
+      "tool_use_id": "tu_g1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"file_path\":\"/src/a.ts\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Read",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "target": "/src/a.ts",
+      "tool_use_id": "tu_r1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"file_path\":\"/src/b.ts\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Read",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "target": "/src/b.ts",
+      "tool_use_id": "tu_r2",
+      "ts_ms": 1776643201000
+    }
+  ]
+}

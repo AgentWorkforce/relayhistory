@@ -1,0 +1,19 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-with-compaction"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/legacy-json-with-compaction",
+  "history": [],
+  "hydration": [],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy layout with a summarized/compacted message",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [],
+  "source": "opencode",
+  "tool_calls": []
+}
