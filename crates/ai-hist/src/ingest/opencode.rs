@@ -1328,6 +1328,7 @@ fn normalize_session(
                     None,
                     None,
                     &event_uid,
+                    None,
                     RawMessageFacts::default(),
                 )?;
                 keys.events.insert(event_uid);
@@ -1388,6 +1389,7 @@ fn normalize_session(
                     message.provider_id.as_deref(),
                     stop_reason.as_deref(),
                     &event_uid,
+                    None,
                     RawMessageFacts::default(),
                 )?;
                 keys.events.insert(event_uid);
@@ -1438,6 +1440,7 @@ fn normalize_session(
                 message.provider_id.as_deref(),
                 stop_reason.as_deref(),
                 &format!("tool_use:{}", tool.call_id),
+                None,
                 RawMessageFacts::default(),
             )?;
             keys.events.insert(format!("tool_use:{}", tool.call_id));
@@ -1498,6 +1501,7 @@ fn normalize_session(
                         message.provider_id.as_deref(),
                         stop_reason.as_deref(),
                         &format!("tool_result:{}", tool.call_id),
+                        None,
                         RawMessageFacts::default(),
                     )?;
                     keys.events.insert(format!("tool_result:{}", tool.call_id));
@@ -1545,6 +1549,7 @@ fn normalize_session(
                 evidence_ref: Some(session_id),
                 child_has_events: counts.events > 0,
                 spawned_at_ms: loaded.session.created_ms.or(Some(first_ts)),
+                ..ObservedRelationship::default()
             },
         )?;
     }

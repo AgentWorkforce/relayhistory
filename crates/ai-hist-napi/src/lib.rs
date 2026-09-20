@@ -18,15 +18,18 @@ use ai_hist::{
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
     session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
+    session_user_turns_page as core_session_user_turns_page,
     stats_scoped_by as core_stats_scoped_by, HistoryEntry, QueryFilter,
     RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
-    RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
+    RelationshipDiagnostic as CoreRelationshipDiagnostic,
+    RelationshipKinds as CoreRelationshipKinds, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
     SessionFileEdit as CoreSessionFileEdit, SessionRelationship as CoreSessionRelationship,
     SessionRelationships as CoreSessionRelationships, SessionScope,
     SessionToolCall as CoreSessionToolCall, SessionTree as CoreSessionTree,
     SessionTreeNode as CoreSessionTreeNode, SessionTreeOptions as CoreSessionTreeOptions,
+    SessionUserTurn as CoreSessionUserTurn, SessionUserTurnBlock as CoreSessionUserTurnBlock,
     DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
@@ -34,13 +37,18 @@ use ai_hist::{
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-/// 17 adds `provider` to session events.
 /// 16 added `project_key` to catalog rows and session events, plus
 /// `project_key_method` on the catalog row and the `project_key` listing
-/// filter, and the per-message raw provider facts on session events
-/// (`requestId`, `stopReason`, `agentVersion`, `isSidechain`, `isMeta`,
-/// `turnId`).
-pub const NATIVE_CONTRACT_VERSION: u32 = 17;
+/// filter.
+/// 17 adds the per-tool-result fidelity fields to session events and the
+/// `getSessionUserTurnsPage` operation. It is 17 rather than 16 because that
+/// work and the project-identity work were developed in parallel and both
+/// claimed 16; a merged addon carries both, so it cannot answer with a
+/// number either side already published.
+/// 18 adds the upstream `provider` field to session events; the per-message
+/// raw facts landed alongside contract 16 without changing its published
+/// value, so this is the first combined contract that advertises them all.
+pub const NATIVE_CONTRACT_VERSION: u32 = 18;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -273,6 +281,27 @@ pub struct NativeSessionEvent {
     /// (OpenCode's `providerID`). Null elsewhere rather than inferred.
     pub provider: Option<String>,
     pub event_uid: String,
+    /// Per-tool-result fidelity. Null on every row that is not a tool result,
+    /// and on a tool-result row whose provider does not record the fact.
+    pub tool_use_id: Option<String>,
+    /// Raw UTF-8 byte length of the provider's result payload.
+    pub payload_bytes: Option<i64>,
+    /// True when the harness had already truncated the payload.
+    pub payload_truncated: Option<bool>,
+    /// First 16 hex characters of the payload's sha256.
+    pub payload_hash: Option<String>,
+    /// n-th result recorded for this `toolUseId`, from zero.
+    pub call_index: Option<i64>,
+    /// Position of this result in the transcript's tool-result order.
+    pub event_index: Option<i64>,
+    /// `running` / `completed` / `errored` / `cancelled` / `unknown`.
+    pub result_status: Option<String>,
+    /// `tool_result` / `subagent_notification` / `function_call_output`.
+    pub event_source: Option<String>,
+    /// Which provider signal set the error.
+    pub error_signal: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub agent_id: Option<String>,
     pub request_id: Option<String>,
     /// Why the turn ended, as the harness reported it.
     pub stop_reason: Option<String>,
@@ -302,6 +331,17 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             token_json: event.token_json,
             provider: event.provider,
             event_uid: event.event_uid,
+            tool_use_id: event.tool_use_id,
+            payload_bytes: event.payload_bytes,
+            payload_truncated: event.payload_truncated.map(|value| value != 0),
+            payload_hash: event.payload_hash,
+            call_index: event.call_index,
+            event_index: event.event_index,
+            result_status: event.result_status,
+            event_source: event.event_source,
+            error_signal: event.error_signal,
+            subagent_session_id: event.subagent_session_id,
+            agent_id: event.agent_id,
             request_id: event.request_id,
             stop_reason: event.stop_reason,
             agent_version: event.agent_version,
@@ -422,6 +462,81 @@ pub struct EvidencePageOptions {
     pub db_path: Option<String>,
     pub limit: Option<i64>,
     pub after: Option<EvidenceCursor>,
+}
+
+#[napi(object)]
+pub struct NativeSessionUserTurnBlock {
+    /// `text` or `tool_result`.
+    pub kind: String,
+    pub tool_use_id: Option<String>,
+    /// Measured payload bytes when the parser recorded them, otherwise the
+    /// UTF-8 length of the stored text.
+    pub byte_len: i64,
+    /// True when the result is known to have failed, false when it is known
+    /// to have succeeded, null when the provider has not said.
+    pub is_error: Option<bool>,
+}
+
+impl From<CoreSessionUserTurnBlock> for NativeSessionUserTurnBlock {
+    fn from(block: CoreSessionUserTurnBlock) -> Self {
+        Self {
+            kind: block.kind,
+            tool_use_id: block.tool_use_id,
+            byte_len: block.byte_len,
+            is_error: block.is_error.map(|value| value != 0),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionUserTurn {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    /// The nearest messages recorded either side of this turn, from either
+    /// side of the conversation. Null only when the session recorded no named
+    /// message on that side; an event the provider left unnamed is passed
+    /// over rather than nulling the field.
+    pub preceding_message_id: Option<String>,
+    pub following_message_id: Option<String>,
+    pub ts_ms: i64,
+    pub blocks: Vec<NativeSessionUserTurnBlock>,
+}
+
+impl From<CoreSessionUserTurn> for NativeSessionUserTurn {
+    fn from(turn: CoreSessionUserTurn) -> Self {
+        Self {
+            id: turn.id,
+            source: turn.source,
+            session_id: turn.session_id,
+            message_id: turn.message_id,
+            preceding_message_id: turn.preceding_message_id,
+            following_message_id: turn.following_message_id,
+            ts_ms: turn.ts_ms,
+            blocks: turn
+                .blocks
+                .into_iter()
+                .map(NativeSessionUserTurnBlock::from)
+                .collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct UserTurnsPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUserTurnsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub user_turns: Vec<NativeSessionUserTurn>,
+    pub next_cursor: Option<EventCursor>,
 }
 
 #[napi(object)]
@@ -691,6 +806,58 @@ pub async fn get_session_tool_calls_page(
             .map(NativeSessionToolCall::from)
             .collect(),
         next_cursor: page.next_cursor.map(evidence_cursor),
+    })
+}
+
+/// One bounded page of user turns for one session, oldest first.
+///
+/// Each turn carries the ordered blocks the provider attached to one user
+/// message: the human's own text and the tool results that came back with it,
+/// with the measured payload size of each. Computed from `session_events`
+/// rather than a table of its own, so it cannot disagree with the transcript.
+#[napi]
+pub async fn get_session_user_turns_page(
+    source: String,
+    session_id: String,
+    options: Option<UserTurnsPageOptions>,
+) -> napi::Result<SessionUserTurnsPage> {
+    let options = options.unwrap_or(UserTurnsPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreEventCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionUserTurnPage {
+            user_turns: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_event_read_current,
+        move |conn| core_session_user_turns_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionUserTurnsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        user_turns: page
+            .user_turns
+            .into_iter()
+            .map(NativeSessionUserTurn::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| EventCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
     })
 }
 
@@ -1244,6 +1411,7 @@ pub struct NativeSessionRelationship {
     pub spawned_at_ms: Option<i64>,
     pub created_ms: i64,
     pub relationship_uid: String,
+    pub origin_session_id: Option<String>,
 }
 
 impl From<CoreSessionRelationship> for NativeSessionRelationship {
@@ -1265,6 +1433,7 @@ impl From<CoreSessionRelationship> for NativeSessionRelationship {
             spawned_at_ms: relationship.spawned_at_ms,
             created_ms: relationship.created_ms,
             relationship_uid: relationship.relationship_uid,
+            origin_session_id: relationship.origin_session_id,
         }
     }
 }
@@ -1314,6 +1483,7 @@ pub struct NativeSessionRelationships {
     pub session_id: String,
     pub as_parent: Vec<NativeSessionRelationship>,
     pub as_child: Vec<NativeSessionRelationship>,
+    pub continuity: Vec<NativeSessionRelationship>,
     pub capabilities: NativeRelationshipCapabilities,
     pub diagnostics: Vec<NativeRelationshipDiagnostic>,
 }
@@ -1331,6 +1501,11 @@ impl From<CoreSessionRelationships> for NativeSessionRelationships {
                 .collect(),
             as_child: relationships
                 .as_child
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            continuity: relationships
+                .continuity
                 .into_iter()
                 .map(NativeSessionRelationship::from)
                 .collect(),
@@ -1438,6 +1613,9 @@ pub struct SessionTreeOptions {
     pub db_path: Option<String>,
     pub max_depth: Option<i64>,
     pub max_nodes: Option<i64>,
+    /// Which edges the walk follows. Omitted means delegation only, which is
+    /// what every caller got before continuity existed.
+    pub relationship_kinds: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -1447,6 +1625,35 @@ pub struct SessionChildrenPageOptions {
     pub db_path: Option<String>,
     pub limit: Option<i64>,
     pub after: Option<RelationshipCursor>,
+    pub relationship_kinds: Option<Vec<String>>,
+}
+
+/// Every relationship kind a caller may name, so a typo is refused at the
+/// boundary rather than answered with a silently empty page.
+const RELATIONSHIP_KIND_CHOICES: &[&str] = &[
+    "delegated",
+    "materialized_local",
+    "continuation",
+    "fork",
+    "resume",
+];
+
+fn validate_relationship_kinds(kinds: Option<Vec<String>>) -> napi::Result<CoreRelationshipKinds> {
+    let Some(kinds) = kinds else {
+        return Ok(CoreRelationshipKinds::delegation());
+    };
+    for kind in &kinds {
+        if !RELATIONSHIP_KIND_CHOICES.contains(&kind.as_str()) {
+            return Err(native_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "relationshipKinds must name only {}, got '{kind}'",
+                    RELATIONSHIP_KIND_CHOICES.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(CoreRelationshipKinds::only(kinds))
 }
 
 /// Direct delegation relationships for one session, in both directions.
@@ -1467,6 +1674,7 @@ pub async fn get_session_relationships(
         session_id: session_id.clone(),
         as_parent: Vec::new(),
         as_child: Vec::new(),
+        continuity: Vec::new(),
         capabilities: relationship_capabilities(&source).into(),
         diagnostics: Vec::new(),
     };
@@ -1496,6 +1704,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
         DEFAULT_TREE_MAX_NODES,
         MAX_TREE_MAX_NODES,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1533,6 +1742,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
                 &CoreSessionTreeOptions {
                     max_depth,
                     max_nodes,
+                    relationship_kinds,
                 },
             )?;
             Ok(tree.into())
@@ -1553,6 +1763,7 @@ pub async fn get_session_children_page(
         DEFAULT_CHILDREN_PAGE_LIMIT,
         MAX_CHILDREN_PAGE_LIMIT,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1568,8 +1779,14 @@ pub async fn get_session_children_page(
         },
         schema_is_relationship_read_current,
         move |conn| {
-            let page =
-                core_session_children_page(conn, &source, &session_id, limit, after.as_ref())?;
+            let page = core_session_children_page(
+                conn,
+                &source,
+                &session_id,
+                limit,
+                after.as_ref(),
+                &relationship_kinds,
+            )?;
             Ok(NativeSessionChildrenPage {
                 children: page
                     .children

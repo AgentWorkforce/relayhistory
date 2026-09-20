@@ -34,6 +34,22 @@
       "text": "Agent {\"description\":\"inspect the tree\",\"subagent_type\":\"Explore\"}",
       "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":8,\"output_tokens\":4}",
       "ts_ms": 1776992400000
+    },
+    {
+      "cwd": null,
+      "event_uid": "system-subagent-notification:sha256:8eb39d2ed8732bdf:subagent_notification",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "system-subagent-notification:sha256:8eb39d2ed8732bdf",
+      "model": null,
+      "parent_id": null,
+      "project": null,
+      "role": "tool_result",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "subagent completed",
+      "token_json": null,
+      "ts_ms": 1776992401000
     }
   ],
   "session_relationships": [],

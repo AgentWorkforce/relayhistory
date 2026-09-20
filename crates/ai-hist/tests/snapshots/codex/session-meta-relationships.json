@@ -19,7 +19,42 @@
   "origin": "burn",
   "quirk": "`sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta`",
   "session_events": [],
-  "session_relationships": [],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": null,
+      "child_session_id": "sess_meta_child",
+      "evidence_kind": "codex_session_meta_continuity",
+      "evidence_locator": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-session-meta-relationships.jsonl",
+      "evidence_ref": "forkSessionId",
+      "identity_status": "observed",
+      "parent_session_id": "sess_fork_base",
+      "relationship": "fork",
+      "relationship_uid": "fork:sess_meta_child",
+      "source": "codex",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776988800000
+    },
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": null,
+      "child_session_id": "sess_meta_child",
+      "evidence_kind": "codex_session_meta_continuity",
+      "evidence_locator": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-session-meta-relationships.jsonl",
+      "evidence_ref": "continuedFromSessionId",
+      "identity_status": "observed",
+      "parent_session_id": "sess_previous",
+      "relationship": "continuation",
+      "relationship_uid": "continuation:sess_meta_child",
+      "source": "codex",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776988800000
+    }
+  ],
   "sessions": [
     {
       "agent_version": "0.130.0",

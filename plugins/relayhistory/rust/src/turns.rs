@@ -243,6 +243,21 @@ mod tests {
                 text TEXT, model TEXT, token_json TEXT,
                 provider TEXT,
                 event_uid TEXT NOT NULL,
+                -- Per-tool-result fidelity columns. `ai_hist::session_events`
+                -- selects every column the crate defines, so a hand-built
+                -- fixture table that stops at `event_uid` fails the read with
+                -- `no such column` the moment the crate grows one.
+                tool_use_id TEXT,
+                payload_bytes INTEGER,
+                payload_truncated INTEGER,
+                payload_hash TEXT,
+                call_index INTEGER,
+                event_index INTEGER,
+                result_status TEXT,
+                event_source TEXT,
+                error_signal TEXT,
+                subagent_session_id TEXT,
+                agent_id TEXT,
                 request_id TEXT, stop_reason TEXT, agent_version TEXT,
                 is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
             );",

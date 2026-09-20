@@ -2327,9 +2327,7 @@ fn make_unwalkable_scope(session_dir: &Path) -> PathBuf {
     fs::remove_dir_all(&staging).ok();
     fs::create_dir_all(&staging).unwrap();
     let path_max = libc::PATH_MAX as usize;
-    let levels = path_max
-        .saturating_sub(staging.as_os_str().len() + WIDTH / 2)
-        / (WIDTH + 1);
+    let levels = path_max.saturating_sub(staging.as_os_str().len() + WIDTH / 2) / (WIDTH + 1);
     assert!(levels > 0, "the staging path leaves no room for one level");
     let mut deep = staging.clone();
     for level in 0..levels {

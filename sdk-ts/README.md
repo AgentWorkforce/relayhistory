@@ -127,7 +127,7 @@ becomes `null` while the raw string stays available as `argsJson` and
 stored string of their own: it returns the parsed value, or `null` for anything
 that is not a parseable string.
 
-## Delegation topology
+## Session topology
 
 Sessions that delegate to subagents form a tree, and it is queryable:
 
@@ -138,7 +138,7 @@ import {
   sessionEventsIncludingDescendants,
 } from 'ai-hist';
 
-const { asParent, asChild, capabilities } = await getSessionRelationships({
+const { asParent, asChild, continuity, capabilities } = await getSessionRelationships({
   source: 'codex',
   sessionId: rootId,
 });
@@ -194,6 +194,39 @@ The order differs: the walker is breadth-first, the tree is pre-order, so a
 consumer that depends on either the root node or `getSessionTree`'s ordering
 has to account for that. `sessionEventsIncludingDescendants` applies its
 `limit` to each session it reads, not to the iteration as a whole.
+
+### Continuity
+
+Resumed, forked and continued sessions are a second kind of relationship:
+`continuation`, `fork` and `resume`, reported on `getSessionRelationships`'s
+own `continuity` array rather than mixed into `asParent` / `asChild`. Each row
+carries `originSessionId` — the conversation it branched from, when the
+provider named one distinct from the parent — and an `evidenceRef` naming the
+signal that produced it: the provider field (`continuedFromSessionId`,
+`forkSessionId`), `resume-marker` for a `/resume` the human typed,
+`sharedSessionId` for two transcripts carrying one provider session id, or the
+record uuid that linked two files.
+
+`getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`.
+Omitting it follows delegation edges only, so existing calls answer exactly as
+before; naming the continuity kinds expands from an origin to its resumed,
+continued, or forked descendants:
+
+```ts
+const lineage = await getSessionTree({
+  source: 'claude',
+  sessionId: originId,
+  relationshipKinds: ['continuation', 'fork', 'resume'],
+});
+```
+
+Two transcripts carrying the same provider session id are branches with no
+identity of their own, so each is an `unlinked` row keyed on its transcript: a
+branch's identity is never taken from its file name. Evidence that cannot
+resolve yet — a parent record no session has indexed, a lone branch with no
+sibling — is reported as a `RELATIONSHIP_CONTINUITY_UNRESOLVED` diagnostic on
+both `hydrateSession` and `getSessionRelationships`, and resolves on its own
+once the session holding the missing record is hydrated.
 
 Native loading failures distinguish unsupported platforms, missing optional
 platform packages, addon load failures, SDK/native contract mismatches, and

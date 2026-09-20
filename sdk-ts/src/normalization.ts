@@ -42,6 +42,8 @@ import type {
   HydrationDiagnostic,
   HydrateSessionResult,
   SessionEvent,
+  SessionUserTurn,
+  SessionUserTurnBlock,
   ProjectKeyMethod,
   EventCursor,
   EventsPageOptions,
@@ -77,7 +79,14 @@ import type {
 } from './contracts.js';
 export type UnknownRecord = Record<string, unknown>;
 
-export const RELATIONSHIP_TYPES: readonly string[] = ['delegated'];
+/** Delegation kinds: one session started another thread of work. */
+export const DELEGATION_RELATIONSHIP_TYPES: readonly string[] = ['delegated', 'materialized_local'];
+/** Continuity kinds: one conversation carrying on as another. */
+export const CONTINUITY_RELATIONSHIP_TYPES: readonly string[] = ['continuation', 'fork', 'resume'];
+export const RELATIONSHIP_TYPES: readonly string[] = [
+  ...DELEGATION_RELATIONSHIP_TYPES,
+  ...CONTINUITY_RELATIONSHIP_TYPES,
+];
 export const DEFAULT_TREE_MAX_DEPTH = 32;
 export const MAX_TREE_MAX_DEPTH = 64;
 export const DEFAULT_TREE_MAX_NODES = 1_000;
@@ -211,12 +220,47 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     tokenUsage: tokenUsage(value.tokenJson),
     provider: nullableString(value.provider),
     eventUid: String(value.eventUid),
+    toolUseId: nullableString(value.toolUseId),
+    payloadBytes: nullableNumber(value.payloadBytes),
+    payloadTruncated: nullableBoolean(value.payloadTruncated),
+    payloadHash: nullableString(value.payloadHash),
+    callIndex: nullableNumber(value.callIndex),
+    eventIndex: nullableNumber(value.eventIndex),
+    resultStatus: nullableString(value.resultStatus) as SessionEvent['resultStatus'],
+    eventSource: nullableString(value.eventSource) as SessionEvent['eventSource'],
+    errorSignal: nullableString(value.errorSignal) as SessionEvent['errorSignal'],
+    subagentSessionId: nullableString(value.subagentSessionId),
+    agentId: nullableString(value.agentId),
     requestId: nullableString(value.requestId),
     stopReason: nullableString(value.stopReason),
     agentVersion: nullableString(value.agentVersion),
     isSidechain: nullableBoolean(value.isSidechain),
     isMeta: nullableBoolean(value.isMeta),
     turnId: nullableString(value.turnId),
+  };
+}
+
+export function sessionUserTurnBlock(value: UnknownRecord): SessionUserTurnBlock {
+  return {
+    kind: value.kind === 'tool_result' ? 'tool_result' : 'text',
+    toolUseId: nullableString(value.toolUseId),
+    byteLen: Number(value.byteLen),
+    isError: nullableBoolean(value.isError),
+  };
+}
+
+export function sessionUserTurn(value: UnknownRecord): SessionUserTurn {
+  return {
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    messageId: nullableString(value.messageId),
+    precedingMessageId: nullableString(value.precedingMessageId),
+    followingMessageId: nullableString(value.followingMessageId),
+    tsMs: Number(value.tsMs),
+    blocks: Array.isArray(value.blocks)
+      ? (value.blocks as UnknownRecord[]).map(sessionUserTurnBlock)
+      : [],
   };
 }
 
@@ -363,6 +407,7 @@ export function relationship(value: UnknownRecord): SessionRelationship {
     spawnedAtMs: typeof value.spawnedAtMs === 'number' ? value.spawnedAtMs : null,
     createdMs: Number(value.createdMs),
     relationshipUid: String(value.relationshipUid),
+    originSessionId: nullableString(value.originSessionId),
   };
 }
 
