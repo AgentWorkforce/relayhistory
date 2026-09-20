@@ -3622,10 +3622,11 @@ fn heal_legacy_positional_record(
 }
 
 /// Remove pre-upgrade positional leftovers that match one id-less record
-/// unambiguously: a legacy row is healed only when it is the single legacy
-/// row with its (text, timestamp), or carries one of the record's tool use
-/// ids (unique per session by schema). Anything ambiguous stays preserved
-/// under the retention contract.
+/// unambiguously: a legacy message heals only on an exact full-record match
+/// of its event (text, timestamp) multiset — and only when it is the single
+/// legacy message carrying that record — or when it carries one of the
+/// record's tool use ids (unique per session by schema). Anything ambiguous
+/// stays preserved under the retention contract.
 fn heal_legacy_positional_rows(
     conn: &Connection,
     session_id: &str,
@@ -3647,23 +3648,39 @@ fn heal_legacy_positional_rows(
             .into_iter()
             .chain(legacy_ids.iter().cloned()),
     ))?;
-    let mut by_key: HashMap<(String, i64), Vec<String>> = HashMap::new();
+    // Group legacy events by message: a legacy message heals only on an
+    // exact full-record match. Matching one shared block would erase the
+    // message's changed siblings, which the content-hash model treats as a
+    // distinct retained predecessor.
+    type MessageContentKey = Vec<(Option<String>, Option<i64>)>;
+    let mut by_message: HashMap<String, MessageContentKey> = HashMap::new();
     while let Some(row) = rows.next()? {
         let message_id: String = row.get(0)?;
         let text: Option<String> = row.get(1)?;
         let ts: Option<i64> = row.get(2)?;
-        if let (Some(text), Some(ts)) = (text, ts) {
-            by_key.entry((text, ts)).or_default().push(message_id);
-        }
+        by_message.entry(message_id).or_default().push((text, ts));
     }
     drop(rows);
     drop(statement);
+    let mut record_key: MessageContentKey = facts
+        .texts
+        .iter()
+        .map(|text| (Some(text.clone()), Some(ts_ms)))
+        .collect();
+    record_key.sort();
     let mut heal_messages: HashSet<String> = HashSet::new();
-    for text in &facts.texts {
-        if let Some(ids) = by_key.get(&(text.clone(), ts_ms)) {
-            if ids.len() == 1 {
-                heal_messages.insert(ids[0].clone());
+    if !record_key.is_empty() {
+        let mut full_matches = Vec::new();
+        for (message_id, mut key) in by_message {
+            key.sort();
+            if key == record_key {
+                full_matches.push(message_id);
             }
+        }
+        // Unique or preserved: two legacy messages carrying the same record
+        // stay put rather than risk healing the wrong one.
+        if full_matches.len() == 1 {
+            heal_messages.insert(full_matches.pop().unwrap());
         }
     }
     for message_id in &heal_messages {
@@ -7424,6 +7441,7 @@ mod tests {
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"delegated work\"},\"timestamp\":\"2026-09-18T10:00:00Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"Read\",\"input\":{\"file_path\":\"/work/app/notes.txt\"}}]},\"timestamp\":\"2026-09-18T10:00:01Z\"}\n",
                 "{\"sessionId\":\"parent\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"same words\"},\"timestamp\":\"2026-09-18T10:00:02Z\"}\n",
+                "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"analysis\"},{\"type\":\"text\",\"text\":\"new answer\"}]},\"timestamp\":\"2026-09-18T10:00:03Z\"}\n",
             ),
         )
         .unwrap();
@@ -7437,9 +7455,10 @@ mod tests {
             "side:0",
             "delegated work",
             ts("2026-09-18T10:00:00Z"),
+            0,
         );
         // Same text, different timestamp: not the same record, preserved.
-        legacy_event(&conn, "parent", "side:7", "delegated work", 1);
+        legacy_event(&conn, "parent", "side:7", "delegated work", 1, 0);
         // Twice-stored duplicate: ambiguous, both preserved.
         legacy_event(
             &conn,
@@ -7447,6 +7466,7 @@ mod tests {
             "side:5",
             "same words",
             ts("2026-09-18T10:00:02Z"),
+            0,
         );
         legacy_event(
             &conn,
@@ -7454,7 +7474,13 @@ mod tests {
             "side:6",
             "same words",
             ts("2026-09-18T10:00:02Z"),
+            0,
         );
+        // One shared block with a changed sibling: the record is a new
+        // identity whose predecessor stays retained, so both stay.
+        let partial_ts = ts("2026-09-18T10:00:03Z");
+        legacy_event(&conn, "parent", "side:8", "analysis", partial_ts, 0);
+        legacy_event(&conn, "parent", "side:8", "old answer", partial_ts, 1);
         // Referenced tool call: healed by tool use id (unique per session).
         conn.execute(
             "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
@@ -7475,7 +7501,7 @@ mod tests {
         let remaining: Vec<(String, String)> = conn
             .prepare(
                 "SELECT message_id, text FROM session_events \
-                 WHERE source = 'claude' AND session_id = 'parent' ORDER BY message_id",
+                 WHERE source = 'claude' AND session_id = 'parent' ORDER BY message_id, text",
             )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -7488,6 +7514,8 @@ mod tests {
                 ("side:5".to_string(), "same words".to_string()),
                 ("side:6".to_string(), "same words".to_string()),
                 ("side:7".to_string(), "delegated work".to_string()),
+                ("side:8".to_string(), "analysis".to_string()),
+                ("side:8".to_string(), "old answer".to_string()),
             ],
             "only the uniquely matched legacy event is healed"
         );
@@ -7509,11 +7537,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(healed, 3);
+        assert_eq!(healed, 5);
         let positional_under_child: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = 'child' \
-                 AND (event_uid = 'side:0:0' OR event_uid LIKE 'side:1:%' OR event_uid LIKE 'side:2:%')",
+                 AND (event_uid = 'side:0:0' OR event_uid LIKE 'side:1:%' \
+                      OR event_uid LIKE 'side:2:%' OR event_uid LIKE 'side:3:%')",
                 [],
                 |row| row.get(0),
             )
@@ -7521,12 +7550,19 @@ mod tests {
         assert_eq!(positional_under_child, 0);
     }
 
-    fn legacy_event(conn: &Connection, session_id: &str, message_id: &str, text: &str, ts_ms: i64) {
+    fn legacy_event(
+        conn: &Connection,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+        ts_ms: i64,
+        block: i64,
+    ) {
         conn.execute(
             "INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
-             VALUES ('claude', ?1, ?2, ?3, 'assistant', 'text', ?4, ?2 || ':0')",
-            rusqlite::params![session_id, message_id, ts_ms, text],
+             VALUES ('claude', ?1, ?2, ?3, 'assistant', 'text', ?4, ?2 || ':' || ?5)",
+            rusqlite::params![session_id, message_id, ts_ms, text, block],
         )
         .unwrap();
     }
