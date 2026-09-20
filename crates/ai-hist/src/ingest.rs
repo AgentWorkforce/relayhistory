@@ -3989,7 +3989,12 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     let mut errors = 0;
     for chat in collect_matching_files(root, "chat_history", "jsonl")? {
         let key = chat.to_string_lossy().to_string();
-        let stamp = grok_session_stamp(&chat)?;
+        // One unreadable session directory does not stop the rest, and it does
+        // not update its saved stamp either: the next run tries again.
+        let Ok(stamp) = grok_session_stamp(&chat) else {
+            errors += 1;
+            continue;
+        };
         if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
             continue;
         }
@@ -4244,6 +4249,12 @@ fn ingest_grok_session(
                 };
                 let group = session.updates.agent_thoughts.get(thought_ordinal);
                 thought_ordinal += 1;
+                // The matched group knows which turn this is, and the
+                // transcript side may not: a model-initiated turn has no user
+                // record to advance it.
+                if let Some(group) = group {
+                    turn = Some(group.turn);
+                }
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     group.and_then(|group| group.ts_ms),
@@ -4316,10 +4327,14 @@ fn ingest_grok_session(
                 for (nth, call) in calls.iter().enumerate() {
                     let tool_use_id = call.id.clone().unwrap_or_else(|| format!("r{idx}:t{nth}"));
                     let timing = session.updates.tools.get(&tool_use_id);
+                    // A tool call joins by id, so its turn is known exactly.
+                    // The transcript-side cursor is only the fallback, and it
+                    // must not displace a matched call's own turn.
+                    let call_turn = timing.and_then(|timing| timing.turn).or(turn);
                     let ts = resolve_grok_ts(
                         line.ts_ms,
                         timing.and_then(|timing| timing.started_ms),
-                        turn_start(turn),
+                        turn_start(call_turn),
                         inherited,
                         session.created_ms,
                         &mut outcome,
@@ -4352,7 +4367,7 @@ fn ingest_grok_session(
                     // `updates.jsonl` knows which turn the call belongs to even
                     // when the transcript side does not, because the call is
                     // joined by id.
-                    if let Some(call_turn) = timing.and_then(|timing| timing.turn).or(turn) {
+                    if let Some(call_turn) = call_turn {
                         turn_tool_tail.insert(call_turn, uid.clone());
                     }
                     insert_tool_call(
@@ -4397,10 +4412,13 @@ fn ingest_grok_session(
             } => {
                 let tool_use_id = call_id.clone().unwrap_or_else(|| format!("r{idx}:result"));
                 let timing = session.updates.tools.get(&tool_use_id);
+                // Paired by id with its call, so the result belongs to the
+                // call's turn whatever the transcript cursor says.
+                let result_turn = timing.and_then(|timing| timing.turn).or(turn);
                 let ts = resolve_grok_ts(
                     line.ts_ms,
                     timing.and_then(|timing| timing.finished_ms),
-                    turn_start(turn),
+                    turn_start(result_turn),
                     inherited,
                     session.created_ms,
                     &mut outcome,
@@ -4812,12 +4830,12 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
     for directory in GROK_DIGESTED_DIRECTORIES {
         // Sorted, so the digest describes the directory's contents rather than
         // the order the filesystem happened to hand them back.
-        let mut entries = read_dir_files(&chat.with_file_name(directory));
+        let mut entries = read_dir_files(&chat.with_file_name(directory))?;
         entries.sort();
         for entry in entries {
-            let Ok(found) = entry.metadata() else {
-                continue;
-            };
+            let found = entry
+                .metadata()
+                .with_context(|| format!("stat Grok entry {}", entry.display()))?;
             let name = entry
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -4863,7 +4881,7 @@ pub(crate) fn grok_source_records(chat: &Path) -> Result<i64> {
         }
     }
     for directory in GROK_DIGESTED_DIRECTORIES {
-        let mut entries = read_dir_files(&chat.with_file_name(directory));
+        let mut entries = read_dir_files(&chat.with_file_name(directory))?;
         entries.sort();
         for entry in entries {
             records += grok_record_count(&entry)?;
@@ -5012,22 +5030,22 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }
 
     let directory = chat.parent().map(Path::to_path_buf);
-    let signals = directory
-        .as_deref()
-        .and_then(|dir| read_json_file(&dir.join("signals.json")))
-        .as_ref()
-        .map(grok::parse_signals);
+    let signals = match directory.as_deref() {
+        Some(dir) => read_json_file(&dir.join("signals.json"))?
+            .as_ref()
+            .map(grok::parse_signals),
+        None => None,
+    };
     let prompt_context = directory
         .as_deref()
         .and_then(|dir| read_grok_prompt_context(&dir.join("prompt_context.json")));
-    let compactions = directory
-        .as_deref()
-        .map(|dir| read_grok_compactions(&dir.join("compaction_checkpoints")))
-        .unwrap_or_default();
-    let subagents = directory
-        .as_deref()
-        .map(|dir| read_grok_subagents(&dir.join("subagents")))
-        .unwrap_or_default();
+    let (compactions, subagents) = match directory.as_deref() {
+        Some(dir) => (
+            read_grok_compactions(&dir.join("compaction_checkpoints"))?,
+            read_grok_subagents(&dir.join("subagents"))?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
 
     // Real recorded times first, in this order: the update stream, then any
     // timestamp the transcript's own records carried, then `summary.json`.
@@ -5062,8 +5080,21 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }))
 }
 
-fn read_json_file(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+/// One JSON sidecar, if it is there and parses.
+///
+/// Absent is `None` and so is malformed — a sidecar this parser cannot read is
+/// still evidence that the file exists, and the caller records the entry
+/// without detail. An I/O failure is neither: it is an error, so a directory
+/// that cannot be read does not masquerade as a directory of empty files.
+fn read_json_file(path: &Path) -> Result<Option<Value>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok sidecar {}", path.display()))
+        }
+    };
+    Ok(serde_json::from_str(&contents).ok())
 }
 
 /// Identify `prompt_context.json` without copying it: the path, its SHA-256
@@ -5084,55 +5115,82 @@ fn read_grok_prompt_context(path: &Path) -> Option<GrokPromptContext> {
 /// An entry that parses as nothing is still a compaction: the directory entry
 /// itself is the evidence, so the marker is written with no detail rather than
 /// dropped.
-fn read_grok_compactions(dir: &Path) -> Vec<GrokCompaction> {
-    let mut checkpoints: Vec<GrokCompaction> = read_dir_files(dir)
-        .into_iter()
-        .map(|path| {
-            let parsed = read_json_file(&path);
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default();
-            GrokCompaction {
-                ts_ms: parsed
-                    .as_ref()
-                    .and_then(grok::compaction_timestamp_ms)
-                    .or_else(|| timestamp_from_name(&name)),
-                detail_json: parsed.as_ref().map(ToString::to_string),
-                locator: path.to_string_lossy().to_string(),
-                name,
-            }
-        })
-        .collect();
+fn read_grok_compactions(dir: &Path) -> Result<Vec<GrokCompaction>> {
+    let mut checkpoints = Vec::new();
+    for path in read_dir_files(dir)? {
+        let parsed = read_json_file(&path)?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        checkpoints.push(GrokCompaction {
+            ts_ms: parsed
+                .as_ref()
+                .and_then(grok::compaction_timestamp_ms)
+                .or_else(|| timestamp_from_name(&name)),
+            detail_json: parsed.as_ref().map(ToString::to_string),
+            locator: path.to_string_lossy().to_string(),
+            name,
+        });
+    }
     checkpoints.sort_by(|left, right| left.name.cmp(&right.name));
-    checkpoints
+    Ok(checkpoints)
 }
 
 /// Every readable entry in `subagents/`.
-fn read_grok_subagents(dir: &Path) -> Vec<GrokSubagentEvidence> {
-    let mut found: Vec<GrokSubagentEvidence> = read_dir_files(dir)
-        .into_iter()
-        .map(|path| GrokSubagentEvidence {
-            metadata: read_json_file(&path)
+fn read_grok_subagents(dir: &Path) -> Result<Vec<GrokSubagentEvidence>> {
+    let mut found = Vec::new();
+    for path in read_dir_files(dir)? {
+        found.push(GrokSubagentEvidence {
+            metadata: read_json_file(&path)?
                 .as_ref()
                 .map(grok::parse_subagent)
                 .unwrap_or_default(),
             locator: path.to_string_lossy().to_string(),
-        })
-        .collect();
+        });
+    }
     found.sort_by(|left, right| left.locator.cmp(&right.locator));
-    found
+    Ok(found)
 }
 
-fn read_dir_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+/// The regular files in one of a Grok session's sidecar directories.
+///
+/// A directory that is not there is empty — Grok writes `subagents/` only for
+/// a session that spawned one. **Anything else is an error**, and has to be,
+/// because this list is what the change stamp covers and what the replacement
+/// snapshot is built from: a permission or I/O failure read as "empty" would
+/// stamp the session as having no checkpoints and then delete the ones already
+/// stored, reporting success. The read has to fail so the surrounding
+/// transaction rolls back and the prior evidence survives.
+///
+/// A single entry that has vanished between the listing and the stat is
+/// skipped rather than fatal: the next run will not see it either.
+fn read_dir_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read Grok directory {}", dir.display()))
+        }
     };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect()
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("read Grok directory entry under {}", dir.display()))?
+            .path();
+        // `metadata` follows the link, so an entry that cannot be resolved --
+        // a symlink loop, an unreadable mount -- is an error here rather than
+        // a silently absent file.
+        match path.metadata() {
+            Ok(metadata) if metadata.is_file() => files.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat Grok entry {}", path.display()))
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// A checkpoint file named after the moment it was taken, e.g.
@@ -6082,6 +6140,148 @@ mod tests {
             2000,
             "the nearest preceding record is the marker, not the prompt before it"
         );
+    }
+
+    /// Reasoning and tools join their update the same way prose does, so they
+    /// have to adopt the turn that match establishes. A model-initiated turn
+    /// has no user record to advance the transcript-side cursor, so without
+    /// that the fallback dates them from before the turn began.
+    #[test]
+    fn untimed_reasoning_and_tools_fall_back_to_their_own_turns_start() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = ingest_grok_lines(
+            home.path(),
+            &[
+                r#"{"type":"user","content":"first"}"#,
+                r#"{"type":"reasoning","summary":"thinking in turn zero"}"#,
+                r#"{"type":"assistant","content":"answer one"}"#,
+                // The model continues on its own: no user record opens turn 1.
+                r#"{"type":"reasoning","summary":"thinking in turn one"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_late","name":"Shell","arguments":{"command":"ls"}}]}"#,
+                r#"{"type":"tool_result","tool_call_id":"call_late","content":"done"}"#,
+                "",
+            ]
+            .join("\n"),
+            &[
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"agentTimestampMs":2000,"turnStartMs":1000}}}"#,
+                r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":2500,"turnStartMs":1000}}}"#,
+                // Turn 1 opens on the model's own thinking, and none of its
+                // rows records a time of its own.
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk"},"_meta":{"eventId":"ev_think","turnStartMs":5000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"call_late"},"_meta":{"turnStartMs":5000}}}"#,
+                r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call_late","status":"completed"},"_meta":{"turnStartMs":5000}}}"#,
+                "",
+            ]
+            .join("\n"),
+        );
+        // The positive control: turn 0 is exact, so only the fallbacks below
+        // are under test.
+        assert_eq!(grok_event_time(&conn, "first"), 1000);
+        assert_eq!(grok_event_time(&conn, "thinking in turn zero"), 1100);
+        assert_eq!(grok_event_time(&conn, "answer one"), 2000);
+
+        assert_eq!(
+            grok_event_time(&conn, "thinking in turn one"),
+            5000,
+            "a thought belongs to the turn its group names, not the previous one"
+        );
+        let tool_times: Vec<i64> = conn
+            .prepare(
+                "SELECT ts_ms FROM session_events WHERE source = 'grok' \
+                   AND event_uid IN ('tool:call_late', 'result:call_late') ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            tool_times,
+            vec![5000, 5000],
+            "a call and its result join by id, so their turn is known exactly"
+        );
+    }
+
+    /// A directory that cannot be read is not an empty directory.
+    ///
+    /// The read is a replacement: an unreadable `compaction_checkpoints/`
+    /// taken as empty would stamp the session as having no checkpoints and
+    /// then delete the ones already stored, reporting success. It has to fail
+    /// so the transaction rolls back.
+    #[test]
+    fn an_unreadable_sidecar_directory_fails_instead_of_erasing_the_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".grok/sessions/%2Ftmp%2Fbroken/grok-brk-0001");
+        fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            b"{\"type\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            br#"{"info":{"id":"grok-brk-0001","cwd":"/tmp/broken"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("compaction_checkpoints/1700000000000.json"),
+            br#"{"created_at":"2026-01-01T00:10:00.000Z"}"#,
+        )
+        .unwrap();
+        let chat = dir.join("chat_history.jsonl");
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        let markers = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE source = 'grok' AND kind = 'compaction_boundary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let prompts = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(markers(), 1);
+        assert_eq!(prompts(), 1);
+
+        // An entry that `read_dir` lists and `stat` cannot resolve: a symlink
+        // to itself is ELOOP on every platform that has symlinks.
+        let loop_entry = dir.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        // The stamp fails rather than describing a directory it could not read.
+        assert!(super::grok_session_stamp(&chat).is_err());
+
+        // And so does the read, so nothing is replaced.
+        let scanned = super::scan_grok_session_file(&chat);
+        assert!(scanned.is_err(), "an unreadable entry must not scan clean");
+        assert_eq!(markers(), 1, "the stored checkpoint marker must survive");
+        assert_eq!(prompts(), 1);
+
+        // Positive control: with the entry readable the same paths succeed and
+        // the second checkpoint is indexed, so the failure above is the
+        // unreadable entry and not the extra file.
+        fs::remove_file(&loop_entry).unwrap();
+        fs::write(&loop_entry, br#"{"created_at":"2026-01-01T00:20:00.000Z"}"#).unwrap();
+        assert!(super::grok_session_stamp(&chat).is_ok());
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert_eq!(markers(), 2);
     }
 
     #[test]
