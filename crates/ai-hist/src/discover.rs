@@ -131,15 +131,19 @@ pub struct ShallowSession {
     /// Git branch the provider reported, last observed value. Observed.
     pub git_branch: Option<String>,
     /// Earliest activity timestamp the provider records. Observed. `None`
-    /// when the provider records no timestamps at all (cursor).
+    /// when the provider recorded none — for cursor that means the build
+    /// wrote no `<timestamp>` tag into any turn it read, not that cursor
+    /// never records a time.
     pub first_activity_ms: Option<i64>,
     /// Latest activity timestamp. Observed where the provider records one;
-    /// filesystem-derived (file mtime) for cursor, which records none.
+    /// for cursor that is the last readable injected `<timestamp>`, falling
+    /// back to the file mtime when the read found none.
     pub last_activity_ms: Option<i64>,
     /// Bounded excerpt of the first substantive human prompt. **Derived.**
     pub first_prompt: Option<String>,
-    /// Bounded excerpt of the last assistant text. Observed; only populated by
-    /// the full-ingest path, so a purely shallow row leaves it `None`.
+    /// Bounded excerpt of the last assistant text. Observed. Most providers
+    /// populate it only on the full-ingest path, so their shallow rows leave
+    /// it `None`; cursor fills it from the bounded tail read.
     pub last_assistant_text: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not

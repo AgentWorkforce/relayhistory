@@ -183,6 +183,9 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
     });
     let mut files: Vec<PatchFile> = Vec::new();
     let mut current: Option<(String, Vec<&str>)> = None;
+    // Inside a hunk, every line is content until the next file header or the
+    // envelope terminator, so header detection has to stand down.
+    let mut in_hunk = false;
     let mut index = 0;
     while index < lines.len() {
         let raw = lines[index];
@@ -197,11 +200,23 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
                 break;
             }
         }
-        // A `--- ` line only opens a file when a `+++ ` line follows it;
-        // otherwise it is a removed line of content that happens to start
-        // with three dashes.
+        // A `--- ` line opens a file only when a `+++ ` line follows it. That
+        // alone is not enough inside a hunk, where it is content: a deleted
+        // `-- old` renders as `--- old` and an added `++ new` as `+++ new`, so
+        // reading those as headers opens a phantom file and splits the real
+        // file's patch in half. The next file's header also arrives while the
+        // previous hunk is still open, though, so "not in a hunk" cannot be
+        // the whole rule either. What separates them is what comes next: a
+        // header pair is followed by `@@`, hunk content is not.
         if !envelope && header.is_none() && line.starts_with("--- ") {
-            if let Some(next) = lines.get(index + 1).map(|next| next.trim()) {
+            let opens_a_hunk = lines
+                .get(index + 2)
+                .is_some_and(|after| after.trim_start().starts_with("@@"));
+            if let Some(next) = lines
+                .get(index + 1)
+                .map(|next| next.trim())
+                .filter(|_| !in_hunk || opens_a_hunk)
+            {
                 if let Some(rest) = next.strip_prefix("+++ ") {
                     header = Some(unified_diff_path(rest).unwrap_or_else(|| {
                         unified_diff_path(line.strip_prefix("--- ").unwrap_or_default())
@@ -217,6 +232,7 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
                     patch: body.join("\n"),
                 });
             }
+            in_hunk = false;
             if !path.is_empty() {
                 current = Some((path, vec![raw]));
                 index += 1;
@@ -230,8 +246,14 @@ pub(crate) fn split_patch_files(patch: &str) -> Vec<PatchFile> {
                     patch: body.join("\n"),
                 });
             }
+            in_hunk = false;
             index += 1;
             continue;
+        }
+        // `@@` opens a hunk; everything after it is content until the next
+        // file header.
+        if line.starts_with("@@") {
+            in_hunk = true;
         }
         if let Some((_, body)) = current.as_mut() {
             body.push(raw);
@@ -375,7 +397,19 @@ fn parse_clock(clock: &str) -> Option<(u32, u32, u32)> {
     let mut fields = digits.split(':');
     let mut hour: u32 = fields.next()?.parse().ok()?;
     let minute: u32 = fields.next()?.parse().ok()?;
-    let second: u32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Absent seconds mean zero; seconds that are present but unparseable, or
+    // a fourth field, mean this is not a clock. Defaulting them to zero would
+    // turn a malformed string into a plausible instant, and a plausible
+    // instant suppresses the mtime fallback and the
+    // `CURSOR_TIMESTAMP_FROM_MTIME` diagnostic that exists to make an undated
+    // turn visible.
+    let second: u32 = match fields.next() {
+        Some(seconds) => seconds.parse().ok()?,
+        None => 0,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
     match meridiem.as_deref() {
         Some("PM") => {
             if hour < 12 {
@@ -462,6 +496,38 @@ mod tests {
         assert_eq!(
             parse_cursor_timestamp("Monday, Jan 5, 2026, 15:04 (UTC)"),
             Some(1_767_625_440_000)
+        );
+    }
+
+    /// A malformed seconds field must reject the timestamp, not silently
+    /// become second 0. Accepting it produces a plausible time, which then
+    /// suppresses the mtime fallback and the `CURSOR_TIMESTAMP_FROM_MTIME`
+    /// diagnostic that exists to make an undated turn visible.
+    ///
+    /// Reported by CodeRabbit. Positive control: with
+    /// `fields.next().and_then(parse).unwrap_or(0)` this failed at
+    /// `a malformed seconds field must not parse as second 0` — the string
+    /// parsed to a real instant.
+    #[test]
+    fn a_malformed_seconds_field_rejects_the_timestamp() {
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37:invalid PM (UTC-4)"),
+            None,
+            "a malformed seconds field must not parse as second 0"
+        );
+        // A trailing field is malformed too.
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37:05:99 PM (UTC-4)"),
+            None
+        );
+        // Controls: the shapes that really occur still parse.
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)"),
+            Some(1_789_587_420_000)
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Wednesday, Sep 16, 2026, 3:37:05 PM (UTC-4)"),
+            Some(1_789_587_425_000)
         );
     }
 
@@ -554,6 +620,35 @@ mod tests {
         );
         assert!(files[1].patch.contains("+z"));
         assert!(!files[1].patch.contains("-x"));
+    }
+
+    /// A hunk body can contain lines that look exactly like file headers: a
+    /// deleted `-- old` renders as `--- old`, and an added `++ new` as
+    /// `+++ new`. Only a header *outside* a hunk opens a file.
+    ///
+    /// Reported by CodeRabbit. Positive control: without the in-hunk guard
+    /// this failed with `left: ["one.rs", "old"], right: ["one.rs"]` — the
+    /// deleted line opened a phantom file and split the patch, so the real
+    /// file's edit lost everything after it.
+    #[test]
+    fn hunk_content_that_looks_like_a_file_header_does_not_open_a_file() {
+        let patch = "--- a/one.rs\n\
+                     +++ b/one.rs\n\
+                     @@\n\
+                     --- old\n\
+                     +++ new\n\
+                     -kept\n\
+                     +added\n";
+        let files = split_patch_files(patch);
+        assert_eq!(
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["one.rs"]
+        );
+        // The whole hunk stays with its file, including the lines that look
+        // like headers.
+        assert!(files[0].patch.contains("--- old"));
+        assert!(files[0].patch.contains("+++ new"));
+        assert!(files[0].patch.contains("+added"));
     }
 
     #[test]

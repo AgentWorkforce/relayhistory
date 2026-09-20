@@ -3868,10 +3868,7 @@ fn sync_cursor_with_scan_hook(
         // byte alone, and `cursor_generation` is deliberately blind to that so
         // the common case stays on the resume path. Only a file whose scanned
         // prefix or identity has changed is a rewrite.
-        let replaced = transcript.generation.as_ref().is_some_and(|generation| {
-            transcript.path.exists() && !cursor_generation_intact(&transcript.path, generation)
-        });
-        if replaced {
+        if cursor_transcript_was_replaced(&transcript.path, transcript.generation.as_ref()) {
             let rescan = scan_cursor_transcript(&transcript.path, None).with_context(|| {
                 format!(
                     "re-scan replaced Cursor transcript {}",
@@ -3913,13 +3910,17 @@ fn sync_cursor_with_scan_hook(
         // generations: the transaction and the checkpoint roll back together,
         // and the next sync sees the new file from zero. An append again does
         // not trip this, because the generation is identified by content.
-        if let Some(generation) = &transcript.generation {
-            anyhow::ensure!(
-                cursor_generation_intact(&transcript.path, generation),
-                "Cursor transcript {} was replaced while it was being indexed",
-                transcript.path.display()
-            );
-        }
+        // A missing generation fails here for the same reason it forces a
+        // rebuild above: the run could not identify what it read, which is not
+        // a reason to trust it.
+        anyhow::ensure!(
+            transcript
+                .generation
+                .as_ref()
+                .is_some_and(|generation| cursor_generation_intact(&transcript.path, generation)),
+            "Cursor transcript {} was replaced while it was being indexed",
+            transcript.path.display()
+        );
         inserted += outcome.prompts_inserted;
         // A restarted read saw the whole file, so it owns both endpoints; an
         // incremental one saw only the tail and may only widen the window.
@@ -4086,6 +4087,33 @@ pub(crate) fn cursor_generation(path: &Path, through: u64) -> Option<CursorGener
 /// append is not.
 pub(crate) fn cursor_generation_intact(path: &Path, generation: &CursorGeneration) -> bool {
     cursor_generation(path, generation.prefix_len).is_some_and(|current| &current == generation)
+}
+
+/// Must this transcript be rebuilt rather than resumed?
+///
+/// The `None` case is the subtle one. `cursor_generation` yields `None` when
+/// the file is shorter than the prefix the scan read — the truncate half of a
+/// rewrite — so a scan that ended while Cursor was rewriting queues the
+/// transcript with no generation at all. Reading that as "nothing to compare,
+/// carry on" would use the old `restarted` and `history_from_offset` against
+/// the new file, keeping stale evidence and skipping the replacement's
+/// prefix. An unidentifiable generation is by definition not the one the scan
+/// saw, so it is a replacement.
+///
+/// A file that is simply *gone* is still not a replacement: there is nothing
+/// to re-scan, and the read reports it with the message the rollback path is
+/// written against.
+pub(crate) fn cursor_transcript_was_replaced(
+    path: &Path,
+    generation: Option<&CursorGeneration>,
+) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match generation {
+        Some(generation) => !cursor_generation_intact(path, generation),
+        None => true,
+    }
 }
 
 fn prepare_cursor_sync(
@@ -4376,10 +4404,16 @@ pub(crate) fn ingest_cursor_transcript(
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("cursor:{record_offset}"));
-        if record_ts.is_some() {
-            outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
-            outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
-        }
+        // The window covers every record this pass *stamps*, not only the ones
+        // that carried a recorded time. An undated turn is still stamped —
+        // with the file mtime — and still produces events at that time, so
+        // leaving it out made the catalog claim a recency older than the
+        // session's own newest event, and the session then sorted behind
+        // siblings that were genuinely older. Where a time was recorded it is
+        // the one used, so a fully dated session still reports its recorded
+        // times rather than the mtime.
+        outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+        outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
         for (block_index, block) in blocks.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{record_offset}:{block_index}");
@@ -7054,8 +7088,11 @@ mod tests {
             by_text.contains(&(1_789_587_420_000, "answering the timed turn")),
             "a reply still inherits a turn that does have a time: {by_text:?}"
         );
-        // The window reports only what was actually recorded.
-        assert_eq!(outcome.first_ts_ms, Some(1_789_587_420_000));
+        // The window covers every event this pass stamped, including the
+        // undated turn at the mtime — the catalog row must not claim a
+        // recency its own events contradict. Here the fixture's mtime is
+        // deliberately tiny, so it widens the *start* of the window.
+        assert_eq!(outcome.first_ts_ms, Some(7_777));
         assert_eq!(outcome.last_ts_ms, Some(1_789_587_420_000));
     }
 
@@ -7253,6 +7290,274 @@ mod tests {
         assert!(
             !prompts.iter().any(|p| p.starts_with("original")),
             "prompts from the replaced generation must not survive: {prompts:?}"
+        );
+    }
+
+    /// Group M, at the level the defect actually lives. The window Bugbot
+    /// described — a rewrite in flight as the *scan itself* ends, so the scan
+    /// cannot identify what it read — is not reachable through `sync_cursor`,
+    /// because the scan hook fires before a transcript is opened, not between
+    /// its read loop and its identification. So the decision is tested
+    /// directly.
+    ///
+    /// Positive control: with the guard written as
+    /// `generation.is_some_and(|g| … )` this failed at `an unidentifiable
+    /// generation must be treated as a replacement` — `None` read as
+    /// "unchanged" and the transcript indexed with the old file's offsets.
+    #[test]
+    fn an_unidentifiable_cursor_generation_counts_as_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"one"}]}}"#,
+            "\n"
+        );
+        let path = dir.path().join("t.jsonl");
+        fs::write(&path, body).unwrap();
+        let generation = super::cursor_generation(&path, body.len() as u64).unwrap();
+
+        // The scan identified what it read and nothing moved: resume.
+        assert!(!super::cursor_transcript_was_replaced(
+            &path,
+            Some(&generation)
+        ));
+        // The scan could not identify what it read: rebuild.
+        assert!(
+            super::cursor_transcript_was_replaced(&path, None),
+            "an unidentifiable generation must be treated as a replacement"
+        );
+        // Truncated below the scanned prefix: rebuild.
+        fs::write(&path, "{}\n").unwrap();
+        assert!(super::cursor_transcript_was_replaced(
+            &path,
+            Some(&generation)
+        ));
+        // Gone is not a replacement — there is nothing to re-scan, and the
+        // read path owns that failure.
+        fs::remove_file(&path).unwrap();
+        assert!(!super::cursor_transcript_was_replaced(
+            &path,
+            Some(&generation)
+        ));
+        assert!(!super::cursor_transcript_was_replaced(&path, None));
+    }
+
+    /// Group M. A generation that cannot be identified is not "unchanged".
+    ///
+    /// `cursor_generation` yields `None` when the file is shorter than the
+    /// prefix the scan read — the truncate half of the rewrite Cursor does.
+    /// If that happens as the scan ends, the transcript is queued with no
+    /// generation at all, and a check written as "compare when we have
+    /// something to compare" skips it entirely: the old `restarted` and
+    /// `history_from_offset` are used against the new file, keeping stale
+    /// evidence and skipping the replacement's prefix. The previous
+    /// length/mtime stamp always produced *a* value, so this gap arrived with
+    /// the content-identity change.
+    ///
+    /// Positive control: with the checks written as `is_some_and` / `if let
+    /// Some` this failed at `a truncation below the scanned prefix must force
+    /// a rebuild: left: false, right: true` — the session kept the replaced
+    /// generation's tool call.
+    #[test]
+    fn a_transcript_with_no_identifiable_generation_is_treated_as_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>original</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"path":"original.rs"}}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-truncated", original);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        assert_eq!(cursor_row_count(&conn, "tool_calls", "s-truncated"), 1);
+
+        // Grow it so the next sync resumes, then truncate it below what that
+        // scan read, from the hook of a later transcript.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"more"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        let shorter = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 4:01 PM (UTC-4)</timestamp><user_query>rewritten</user_query>"}]}}"#,
+            "\n"
+        );
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-zlast",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"unrelated"}]}}"#,
+                "\n"
+            ),
+        );
+        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
+            if path == later {
+                fs::write(&transcript, shorter).unwrap();
+            }
+        })
+        .unwrap();
+
+        let edits = crate::session_file_edits(&conn, "s-truncated", Some("cursor")).unwrap();
+        assert!(
+            !edits.iter().any(|edit| edit.file_path == "original.rs"),
+            "a truncation below the scanned prefix must force a rebuild: {:?}",
+            edits
+                .iter()
+                .map(|e| e.file_path.as_str())
+                .collect::<Vec<_>>()
+        );
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' \
+                 AND session_id = 's-truncated' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["rewritten".to_string()],
+            "history_from_offset must be reset, so the replacement's prefix is indexed"
+        );
+    }
+
+    /// Group L. A session's recency must cover the events it actually has.
+    ///
+    /// An untimed turn is still *stamped* — with the file mtime — and still
+    /// produces events at that time. But the activity window was only widened
+    /// for records that carried a recorded time, so a transcript whose last
+    /// turn is undated left `sessions.last_activity_ms` at the earlier timed
+    /// turn. The catalog row then claims a recency older than its own newest
+    /// event, and the session sorts behind siblings that are genuinely older.
+    ///
+    /// Positive control: with the window guarded by `record_ts.is_some()` this
+    /// failed at `the session's recency must cover its newest event:
+    /// left: 1789587420000, right: 1789600000000`, and the ordering assertion
+    /// below put the stale session behind its older sibling.
+    #[test]
+    fn an_untimed_final_turn_still_advances_the_session_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        // A dated turn, then an undated one — the undated turn is stamped with
+        // the file mtime, which is later.
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-untimed-end",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>dated turn</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"undated final turn"}]}}"#,
+                "\n"
+            ),
+        );
+        set_file_mtime_ms(&transcript, 1_789_600_000_000);
+        // A sibling whose last activity falls between the two.
+        let sibling = write_cursor_transcript(
+            dir.path(),
+            "s-sibling",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 7:00 PM (UTC-4)</timestamp><user_query>sibling turn</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        set_file_mtime_ms(&sibling, 1_789_599_000_000);
+
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let newest_event: i64 = conn
+            .query_row(
+                "SELECT MAX(ts_ms) FROM session_events WHERE source = 'cursor' \
+                 AND session_id = 's-untimed-end'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(newest_event, 1_789_600_000_000);
+        let last_activity: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions WHERE source = 'cursor' \
+                 AND session_id = 's-untimed-end'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_activity, newest_event,
+            "the session's recency must cover its newest event"
+        );
+
+        // And it therefore sorts ahead of the genuinely older sibling.
+        let order: Vec<String> = conn
+            .prepare(
+                "SELECT session_id FROM sessions WHERE source = 'cursor' \
+                 ORDER BY last_activity_ms DESC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            order,
+            vec!["s-untimed-end".to_string(), "s-sibling".to_string()],
+            "a session must not sort behind one whose newest event is older"
+        );
+    }
+
+    /// Group L's control: a session whose last turn *is* dated keeps reporting
+    /// that recorded time, not the file mtime, so the fix must widen the
+    /// window to cover stamped events without letting mtime win outright.
+    #[test]
+    fn a_session_ending_in_a_dated_turn_keeps_its_recorded_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = write_cursor_transcript(
+            dir.path(),
+            "s-dated-end",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>first</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>last</user_query>"}]}}"#,
+                "\n"
+            ),
+        );
+        // A much later mtime that must NOT become the session's recency,
+        // because every turn here carries a recorded time.
+        set_file_mtime_ms(&transcript, 1_999_999_999_000);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let (first, last): (i64, i64) = conn
+            .query_row(
+                "SELECT first_activity_ms, last_activity_ms FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 's-dated-end'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, 1_789_587_420_000);
+        assert_eq!(
+            last, 1_789_587_660_000,
+            "a fully dated session must report its recorded times, not the mtime"
         );
     }
 
@@ -7995,7 +8300,11 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.used_mtime_fallback);
-        assert_eq!(outcome.first_ts_ms, None);
+        // No turn here carries a recorded time, so the whole window is the
+        // mtime the records were stamped with — the session still has events,
+        // and its activity window has to cover them.
+        assert_eq!(outcome.first_ts_ms, Some(4_242));
+        assert_eq!(outcome.last_ts_ms, Some(4_242));
         let events = crate::session_events(&conn, "s-legacy", Some("cursor")).unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.ts_ms == 4_242));

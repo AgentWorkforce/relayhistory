@@ -522,6 +522,14 @@ How each adapter works:
   mtime fallback would never fire and the diagnostic would never be reported
   for a transcript that plainly needed it.
 
+  The session's activity window covers every event a pass **stamps**, not only
+  the ones that carried a recorded time. An undated turn still produces events,
+  at the mtime, so leaving it out of the window made `sessions.last_activity_ms`
+  claim a recency older than the session's own newest event — and the session
+  then sorted behind siblings that were genuinely older. Where a time was
+  recorded it is still the one used, so a fully dated session reports its
+  recorded times rather than the file mtime.
+
   ### Delegation
 
   Cursor's `Task` / `functions.Subagent` calls are recorded as ordinary
