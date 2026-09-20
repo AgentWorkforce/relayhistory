@@ -155,6 +155,66 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Added
 
+- Add canonical project identity on every session and event, for every source.
+  `sessions.project_key` / `sessions.project_key_method` and
+  `session_events.project_key` carry the `origin` remote canonicalized to
+  `host/owner/repo`, or the working directory when no remote resolves, with the
+  method recorded as `remote`, `path`, or `inherited`. Two checkouts,
+  worktrees, or subdirectories of one repository now share one key, so a
+  rollup no longer splits `/Users/a/proj` from `/home/b/proj`. The rules live
+  in the new public `ai_hist::project_identity` module and match burn's
+  `crates/relayburn-sdk/src/reader/git.rs` vector for vector, so
+  `burn --group-by project` and a RelayHistory rollup agree on the same
+  checkout; `.git/config` is read directly (including a linked worktree's
+  `gitdir:` pointer) and no `git` subprocess runs. Codex's recorded
+  `session_meta.payload.git.repository_url` is preferred over resolving the
+  working directory. A delegated child whose own directory resolves to nothing
+  canonical inherits its parent's key as a post-pass over
+  `session_relationships`, so it does not depend on the order transcripts are
+  parsed in. Exposed as `projectKey` / `projectKeyMethod` on `CatalogSession`
+  and `projectKey` on `SessionEvent` (catalog contract version 4, native
+  contract version 16); filter with `ai-hist sessions list --project <key>` or
+  `listSessionCatalogPage({ projectKey })`. `ai-hist stats` now groups
+  `top_projects` by the canonical key and reports `grouped_by`; `--by-cwd`
+  restores the previous per-directory grouping. The cloud outbox's `projectId`
+  derivation reads the remote through the same helper instead of shelling out
+  to `git remote get-url`. Git's configuration is read in the scopes and
+  precedence git uses — system, then global (`$GIT_CONFIG_GLOBAL`,
+  `$XDG_CONFIG_HOME/git/config`, `~/.gitconfig`), then the repository's own —
+  with `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`, `onbranch:`)
+  expanded at the position of their own line, so `url.<base>.insteadOf`
+  rewrites apply wherever they are configured, as that command does. A linked
+  worktree reads `config` from the directory `commondir` names and `HEAD` from
+  its own, and its `includeIf` conditions are evaluated against its own git
+  directory — a worktree is on a different branch from the checkout it shares a
+  repository with, which is the point of it. A rewrite is overwhelmingly a global
+  setting, and a reader that stopped at `.git/config` saw `gh:Org/Repo.git` as
+  an unresolvable remote and fell back to a path key. A remote's URL is read as the
+  list git treats it as, so a repository with a mirror configured after its
+  origin keys to the origin (matching `git remote get-url`, not
+  `git config --get`), and an IPv6 authority keeps its brackets instead of
+  being cut at the first colon of its own address. Events of a delegated thread
+  the catalog does not hold take the key of their nearest cataloged *ancestor*,
+  so a subagent that delegates again still rolls up to the repository the work
+  was done for. Existing databases migrate additively and deliberately
+  backfill no keys: a column stays `null` until the next sync or hydration
+  resolves it for real, rather than being stamped with a path key for a
+  checkout that does have a remote. A `path` key is likewise never final —
+  every pass reconsiders it, so a session whose checkout has been deleted
+  picks up the canonical key as soon as a recorded remote makes one available,
+  and a `remote` key is never downgraded. `ai-hist sessions list --project`
+  and `ai-hist stats --by-cwd` are available on the Node CLI as well as the
+  native one.
+
+- Fix three defects in the delivery worker's lease keepalive that let a live
+  claim lapse under load, allowing a second worker to dispatch the same batch:
+  the renewal cadence was measured in requested sleep rather than elapsed time
+  (so it stretched by exactly the factor the machine was overloaded by), each
+  wait was scheduled from the previous renewal instead of the lease's own
+  deadline (so a slow renewal compounded rather than corrected), and a
+  contended `SQLITE_BUSY` write was treated as a lost lease rather than
+  retried while the claim still had time to run.
+
 - Add first-class delegation topology. `session_relationships` gains an
   identity status (`observed` or `unlinked`), child agent type, name, model and
   spawn depth, the provider evidence that established the link (kind, file
