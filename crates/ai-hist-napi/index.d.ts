@@ -75,9 +75,14 @@ export interface NativeSessionEvent {
    * (OpenCode's `providerID`). Null elsewhere rather than inferred.
    */
   provider?: string
+  eventUid: string
+  requestId?: string
   /** Why the turn ended, as the harness reported it. */
   stopReason?: string
-  eventUid: string
+  agentVersion?: string
+  isSidechain?: boolean
+  isMeta?: boolean
+  turnId?: string
 }
 export interface EventCursor {
   tsMs: number
@@ -346,6 +351,12 @@ export interface HydrateSessionResult {
   presence: string
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
+  /**
+   * Evidence kinds this hydration can have indexed, as wire names
+   * (`history`, `session_event`, `tool_call`, `file_edit`,
+   * `relationship`, `commit_link`).
+   */
+  coverage: Array<string>
   relatedSessionIds: Array<string>
   diagnostics: Array<HydrationDiagnostic>
 }

@@ -23,7 +23,7 @@
 
 use super::{
     insert_session_event_with_provenance, insert_tool_call, upsert_file_edit_from_call,
-    upsert_session, OPENCODE_MARKER_COMPACTION_BOUNDARY,
+    upsert_session, RawMessageFacts, OPENCODE_MARKER_COMPACTION_BOUNDARY,
 };
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
 use crate::{insert_history, prompt_hash, HistoryEntry};
@@ -1328,6 +1328,7 @@ fn normalize_session(
                     None,
                     None,
                     &event_uid,
+                    RawMessageFacts::default(),
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1387,6 +1388,7 @@ fn normalize_session(
                     message.provider_id.as_deref(),
                     stop_reason.as_deref(),
                     &event_uid,
+                    RawMessageFacts::default(),
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1436,6 +1438,7 @@ fn normalize_session(
                 message.provider_id.as_deref(),
                 stop_reason.as_deref(),
                 &format!("tool_use:{}", tool.call_id),
+                RawMessageFacts::default(),
             )?;
             keys.events.insert(format!("tool_use:{}", tool.call_id));
             keys.tool_calls.insert(tool.call_id.to_string());
@@ -1495,6 +1498,7 @@ fn normalize_session(
                         message.provider_id.as_deref(),
                         stop_reason.as_deref(),
                         &format!("tool_result:{}", tool.call_id),
+                        RawMessageFacts::default(),
                     )?;
                     keys.events.insert(format!("tool_result:{}", tool.call_id));
                     counts.events += 1;

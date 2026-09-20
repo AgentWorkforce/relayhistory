@@ -258,19 +258,12 @@ END;
         };
         let insert_shadow = shadow("NEW", "NULL");
         let before_shadow = shadow("OLD", &old_payload);
-        // A capture trigger embeds the table's column list in its own SQL at
-        // the moment it is created. `CREATE TRIGGER IF NOT EXISTS` leaves that
-        // in place, so a table that later gains a column keeps being captured
-        // in the old shape: delivery goes on reporting success while the new
-        // field never reaches the destination, and an upgraded database's
-        // incremental exports quietly differ from a fresh one's. Rebuild any
-        // trigger whose payload no longer matches the table it captures.
-        //
-        // Deliberately the same mechanism and the same wording as #190, which
-        // hit this with the columns it adds, so the two branches merge as one
-        // identical hunk rather than two designs. It needs no migration
-        // version of its own -- the trigger's own SQL is the version -- so
-        // there is no version number for the two to disagree about either.
+        // A capture trigger embeds the column list the table had when it was
+        // created. `CREATE TRIGGER IF NOT EXISTS` leaves that in place, so a
+        // table that later gains a column keeps being captured in the old
+        // shape: delivery goes on reporting success while the new field never
+        // reaches the destination. Rebuild any trigger whose payload no longer
+        // matches the table it captures.
         let stale: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
              WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",

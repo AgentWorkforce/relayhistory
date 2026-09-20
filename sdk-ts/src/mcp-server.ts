@@ -75,7 +75,11 @@ server.tool('discover_sessions', 'Explicit shallow provider discovery. Updates o
   acquisition_timeout_ms: z.number().int().min(1).max(3600000).optional(),
 }, ACQUIRE, ({ sources, scope, limit, source_connectors, acquisition_timeout_ms }) => call(() => discoverSessions({ sources, scope, limit, sourceConnectors: source_connectors, acquisitionTimeoutMs: acquisition_timeout_ms, plugins: configuredSources })));
 
-server.tool('hydrate_session', 'Fully index one cataloged session without global sync.', {
+server.tool('hydrate_session',
+  'Index one cataloged session as fully as its provider allows, without global sync. '
+  + '`capability` is computed from `coverage`, the evidence kinds that provider\'s parser produces: '
+  + 'prompt-only providers return `partial` with a HYDRATION_PARTIAL_COVERAGE diagnostic naming what is absent, '
+  + 'never `full`.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   scope: SESSION_SCOPE.optional().default('local'),

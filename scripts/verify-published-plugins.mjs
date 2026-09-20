@@ -25,20 +25,15 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
-import { installWithRegistryRetry } from "./npm-install-with-registry-retry.mjs";
-
-const version = process.argv[2];
-assert.match(
-  version ?? "",
-  /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/,
-  "Usage: verify-published-plugins.mjs <version>",
-);
+import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
 
 /** This machine's platform key, to check the helper that should have installed. */
 function currentPlatform() {
@@ -66,27 +61,81 @@ function expectedNames() {
   return names;
 }
 
-/**
- * Registry metadata for one name at one version.
- *
- * `--prefer-online` because npm's cache will happily serve a 404 it saw
- * seconds earlier, which is precisely the window a fresh publish sits in.
- */
-function viewed(name, field) {
-  const result = spawnSync(
-    "npm",
-    ["view", "--prefer-online", `${name}@${version}`, field],
-    { encoding: "utf8" },
-  );
-  return result.status === 0 ? (result.stdout ?? "").trim() : "";
+/** Read one exact manifest using a fresh cache on every attempt. */
+function viewed(name, version) {
+  const cache = mkdtempSync(join(tmpdir(), "relayhistory-view-cache-"));
+  try {
+    return spawnSync(
+      "npm",
+      ["view", "--prefer-online", "--json", `${name}@${version}`],
+      { encoding: "utf8", env: { ...process.env, npm_config_cache: cache } },
+    );
+  } finally {
+    rmSync(cache, { recursive: true, force: true });
+  }
 }
 
-async function main() {
+/** Wait for every platform, not just the packages installable on this runner. */
+export async function waitForPublishedPackages(version, {
+  attempts = 60,
+  delayMs = 5_000,
+  runView = viewed,
+  sleep = (ms) => new Promise((resolveDelay) => setTimeout(resolveDelay, ms)),
+  log = (message) => console.error(message),
+} = {}) {
+  const pending = new Set(expectedNames());
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const missing = [];
+    for (const name of pending) {
+      const result = runView(name, version);
+      const context = `npm view ${name}@${version}`;
+      if (result.error) throw new Error(`${context}: ${result.error.message}`, { cause: result.error });
+      if (result.status !== 0) {
+        const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+        const diagnostic = `${context} failed (exit ${result.status}, signal ${result.signal ?? "none"}):\n${output}`;
+        if (!isRegistryVisibilityFailure(output)) throw new Error(diagnostic);
+        missing.push(diagnostic);
+        continue;
+      }
+      let metadata;
+      try {
+        metadata = JSON.parse(result.stdout);
+      } catch (error) {
+        throw new Error(`${context}: invalid JSON: ${error.message}`, { cause: error });
+      }
+      // npm versions differ: an exact-version view can return an object or a
+      // singleton array. Never accept multiple versions from an exact lookup.
+      const manifests = Array.isArray(metadata) ? metadata : [metadata];
+      assert.equal(manifests.length, 1, `${context}: expected exactly one manifest`);
+      const [manifest] = manifests;
+      assert.ok(manifest && typeof manifest === "object", `${context}: invalid manifest`);
+      assert.equal(manifest.version, version, `${name}: registry returned the wrong version`);
+      assert.ok(manifest.repository?.url, `${name}@${version}: published without repository.url`);
+      pending.delete(name);
+    }
+    if (pending.size === 0) return;
+    if (attempt === attempts) {
+      throw new Error(`npm registry did not expose all plugin packages after ${attempts} attempts:\n${missing.join("\n")}`);
+    }
+    log(`Waiting for ${[...pending].join(", ")} at ${version} (attempt ${attempt}/${attempts}); retrying in ${delayMs}ms`);
+    await sleep(delayMs);
+  }
+}
+
+async function main(version) {
+  assert.match(
+    version ?? "",
+    /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/,
+    "Usage: verify-published-plugins.mjs <version>",
+  );
   const names = expectedNames();
   console.log(`Verifying ${names.length} published plugin packages at ${version}\n`);
 
-  // A new name can 404 for a couple of minutes after a successful publish, so
-  // absence is only meaningful once the retrying install below has settled.
+  // Registry visibility is independent for each package. A successful install
+  // of the JS packages says nothing about helpers for other operating systems,
+  // and npm can silently omit this runner's helper as an optional dependency.
+  await waitForPublishedPackages(version);
+
   const project = await mkdtemp(join(tmpdir(), "relayhistory-verify-"));
   try {
     await writeFile(
@@ -114,21 +163,6 @@ async function main() {
       ["--prefix", project, "--no-save", ...jsPackages],
       { attempts: 60, delayMs: 5_000 },
     );
-
-    // Present at the right version, and pointing at this repository: an absent
-    // repository field is what --provenance rejects, and it is invisible until
-    // the publish is attempted.
-    const missing = [];
-    for (const name of names) {
-      const published = viewed(name, "version");
-      if (published !== version) {
-        missing.push(`${name}: expected ${version}, registry has ${published || "nothing"}`);
-        continue;
-      }
-      const repository = viewed(name, "repository.url");
-      if (!repository) missing.push(`${name}: published without repository.url`);
-    }
-    assert.equal(missing.length, 0, `\n  ${missing.join("\n  ")}`);
 
     // npm skips an optionalDependency it cannot resolve and still exits 0, so a
     // helper missing from the registry produces a silent half-install rather
@@ -171,4 +205,6 @@ async function main() {
   }
 }
 
-await main();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main(process.argv[2]);
+}

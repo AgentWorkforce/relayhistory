@@ -424,6 +424,7 @@ export function evaluateGate(report, thresholds, profileName) {
   }
   const policy = thresholds.policy ?? {};
   const floors = policy.absoluteFloors ?? {};
+  const phaseFloors = policy.absoluteFloorsByPhase ?? {};
   const factors = {
     // `scale` turns a measurement into what it would have been on the baseline
     // machine: a busy box reports less throughput and more elapsed time.
@@ -517,8 +518,9 @@ export function evaluateGate(report, thresholds, profileName) {
       // than by the code under test, so an absolute floor can raise it. The
       // floor only ever loosens a ceiling; it never tightens one, and it never
       // applies to a throughput floor.
+      const floor = phaseFloors[phaseName]?.[metric] ?? floors[metric] ?? 0;
       const bound = rule.direction === "max"
-        ? Math.max(baseline * rule.factor, floors[metric] ?? 0)
+        ? Math.max(baseline * rule.factor, floor)
         : baseline * rule.factor;
       const normalized = rule.scale && applied ? rule.scale(Number(value), load) : Number(value);
       const ok = rule.direction === "min" ? normalized >= bound : normalized <= bound;

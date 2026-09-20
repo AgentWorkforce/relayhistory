@@ -241,8 +241,10 @@ mod tests {
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
-                provider TEXT, stop_reason TEXT,
-                event_uid TEXT NOT NULL
+                provider TEXT,
+                event_uid TEXT NOT NULL,
+                request_id TEXT, stop_reason TEXT, agent_version TEXT,
+                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
             );",
         )
         .unwrap();

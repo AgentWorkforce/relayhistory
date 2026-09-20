@@ -32,6 +32,31 @@ pub struct EvidenceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_id: Option<String>,
 }
+impl EvidenceKind {
+    /// The wire name, identical to this enum's serde representation. Callers
+    /// that name a kind in a diagnostic or a JSON contract use this rather
+    /// than `Debug`, which prints the Rust variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::SessionEvent => "session_event",
+            Self::ToolCall => "tool_call",
+            Self::FileEdit => "file_edit",
+            Self::Relationship => "relationship",
+            Self::CommitLink => "commit_link",
+        }
+    }
+}
+
+/// Render a kind list the way diagnostics and docs name it.
+pub fn join_kinds(kinds: &[EvidenceKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct Spec {
     table: &'static str,
     columns: &'static str,
@@ -61,7 +86,14 @@ impl EvidenceKind {
         // if the emitter had vouched for them. Neither is trusted as final:
         // `refresh_project_identity`'s denormalization pass brings every event
         // back in line with its own session's key.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,stop_reason,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        //
+        // The per-message raw facts travel too, and are the adapter's to vouch
+        // for: they are what the provider wrote on the envelope, so a
+        // connector that read the transcript can report them. `raw_facts_version`
+        // is deliberately absent -- it records which local parser generation
+        // wrote a row, which is this database's bookkeeping and not something a
+        // remote emitter can speak to.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,request_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
@@ -85,7 +117,10 @@ fn numeric(field: &str) -> bool {
     )
 }
 fn boolean(field: &str) -> bool {
-    matches!(field, "is_error" | "user_modified" | "child_has_events")
+    matches!(
+        field,
+        "is_error" | "user_modified" | "child_has_events" | "is_sidechain" | "is_meta"
+    )
 }
 
 /// Validate the complete response before opening a database or mutating history.
@@ -378,4 +413,29 @@ pub fn read_session(
         records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A diagnostic that names a kind and a JSON contract that serializes one
+    /// must agree, or a consumer matching on the wire name silently misses it.
+    #[test]
+    fn kind_names_match_their_serde_representation() {
+        for kind in [
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+            EvidenceKind::CommitLink,
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+        }
+        assert_eq!(
+            join_kinds(FULL_SESSION_KINDS),
+            "history, session_event, tool_call, file_edit, relationship"
+        );
+    }
 }

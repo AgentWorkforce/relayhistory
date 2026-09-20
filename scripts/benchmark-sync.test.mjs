@@ -313,6 +313,34 @@ test("an absolute floor loosens a ceiling and never tightens one", () => {
   assert.equal(evaluateGate(starved, floored, "demo").ok, false);
 });
 
+test("a phase-specific floor only loosens the named phase", () => {
+  const targeted = {
+    policy: {
+      ...gateThresholds.policy,
+      absoluteFloors: { elapsedMs: 40 },
+      absoluteFloorsByPhase: { unchanged_sync: { elapsedMs: 120 } },
+    },
+    profiles: {
+      demo: {
+        calibrationMs: 100,
+        phases: {
+          unchanged_sync: { elapsedMs: 10 },
+          hydrate_unchanged: { elapsedMs: 15 },
+        },
+      },
+    },
+  };
+  const run = report([
+    { phase: "unchanged_sync", elapsedMs: 100 },
+    { phase: "hydrate_unchanged", elapsedMs: 41 },
+  ]);
+  const verdict = evaluateGate(run, targeted, "demo");
+  assert.equal(verdict.ok, false);
+  const failures = verdict.failures.join("\n");
+  assert.match(failures, /hydrate_unchanged\.elapsedMs/);
+  assert.doesNotMatch(failures, /unchanged_sync\.elapsedMs/);
+});
+
 test("a phase that produced nothing is a failure, not a silent pass", () => {
   const missing = report([{ phase: "cold_sync", recordsPerSecond: 610, peakRssBytes: 10_100_000 }]);
   const verdict = evaluateGate(missing, gateThresholds, "demo");
@@ -384,6 +412,21 @@ test("the committed gate accepts both observed CI runners and still catches 3x",
     assert.equal(evaluateGate(tripled(run), thresholds, "ci-debug").ok, false,
       `${cpu} must go red on a 3x regression`);
   }
+});
+
+test("the committed thresholds tolerate the observed healthy unchanged_sync jitter", () => {
+  const verdict = evaluateGate({
+    calibrationMs: 166.8,
+    machine: { cpu: "INTEL(R) XEON(R) PLATINUM 8573C" },
+    phases: [
+      { phase: "cold_sync", recordsPerSecond: 631.0, peakRssBytes: 12476416 },
+      { phase: "incremental_sync", elapsedMs: 272.9, peakRssBytes: 11726848 },
+      { phase: "unchanged_sync", elapsedMs: 113.0, peakRssBytes: 9646080 },
+      { phase: "hydrate_cold", recordsPerSecond: 296.7, peakRssBytes: 10936320 },
+      { phase: "hydrate_unchanged", elapsedMs: 14.1, peakRssBytes: 8634368 },
+    ],
+  }, thresholds, "ci-debug");
+  assert.equal(verdict.ok, true, verdict.failures.join("; "));
 });
 
 test("re-measuring keeps the machine metadata the bounds depend on", () => {

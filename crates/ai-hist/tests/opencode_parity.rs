@@ -2319,15 +2319,20 @@ fn tool_call_ids(db_path: &Path, session_id: &str) -> Vec<String> {
 /// length of anything inside it.
 ///
 /// Returns the deepest directory that now exists and cannot be listed.
+#[cfg(unix)]
 fn make_unwalkable_scope(session_dir: &Path) -> PathBuf {
-    const LEVELS: usize = 15;
     const WIDTH: usize = 250;
 
     let staging = std::env::temp_dir().join(format!("ocw{}", std::process::id()));
     fs::remove_dir_all(&staging).ok();
     fs::create_dir_all(&staging).unwrap();
+    let path_max = libc::PATH_MAX as usize;
+    let levels = path_max
+        .saturating_sub(staging.as_os_str().len() + WIDTH / 2)
+        / (WIDTH + 1);
+    assert!(levels > 0, "the staging path leaves no room for one level");
     let mut deep = staging.clone();
-    for level in 0..LEVELS {
+    for level in 0..levels {
         deep = deep.join(
             std::char::from_u32('a' as u32 + level as u32)
                 .unwrap()
@@ -2354,13 +2359,17 @@ fn make_unwalkable_scope(session_dir: &Path) -> PathBuf {
         .map(|rest| moved.join(rest))
         .unwrap();
     assert!(
-        unwalkable.as_os_str().len() > 4096,
+        unwalkable.as_os_str().len() > path_max,
         "the path must exceed PATH_MAX, got {}",
         unwalkable.as_os_str().len()
     );
     let error = fs::read_dir(&unwalkable)
         .expect_err("the fixture must actually fail to list or this test proves nothing");
-    assert_eq!(error.raw_os_error(), Some(36), "expected ENAMETOOLONG");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(libc::ENAMETOOLONG),
+        "expected ENAMETOOLONG"
+    );
     unwalkable
 }
 

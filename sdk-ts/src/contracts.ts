@@ -1,5 +1,7 @@
 import type { HistoryPluginRegistry } from './delivery-plugins.js';
-import type { Source, CatalogSource, SessionScope, SessionLocation } from './sdk-common.js';
+import type {
+  Source, CatalogSource, EvidenceKind, SessionScope, SessionLocation,
+} from './sdk-common.js';
 export interface HistoryEntry {
   id: number;
   source: Source;
@@ -184,6 +186,11 @@ export interface HydrateSessionResult {
   source: CatalogSource;
   sessionId: string;
   status: 'hydrated' | 'updated' | 'unchanged' | 'capability_limited';
+  /**
+   * `full` only when every kind in `FULL_SESSION_KINDS` appears in
+   * {@link HydrateSessionResult.coverage}. Derived from the provider's
+   * declared coverage, never asserted by the local path.
+   */
   capability: 'full' | 'partial' | 'shallow_only';
   discoveryState: 'shallow' | 'full';
   presence: SessionLocation;
@@ -198,6 +205,13 @@ export interface HydrateSessionResult {
     fileEdits: number;
     relatedSessions: number;
   };
+  /**
+   * The evidence kinds this hydration could have indexed, in canonical order.
+   * A zero count for a covered kind means the session has none of it; a kind
+   * absent from this list means no parser on this path ever looked, and a
+   * `HYDRATION_PARTIAL_COVERAGE` diagnostic names the ones that are missing.
+   */
+  coverage: EvidenceKind[];
   relatedSessionIds: string[];
   diagnostics: HydrationDiagnostic[];
 }
@@ -223,11 +237,22 @@ export interface SessionEvent {
    * The upstream inference provider, when the harness records one of its own
    * (OpenCode's `providerID`). Null for harnesses that do not name one — it is
    * never inferred from `model`.
-   */
+  */
   provider: string | null;
-  /** Why the turn ended, as the harness itself reported it. */
-  stopReason: string | null;
   eventUid: string;
+  /**
+   * Per-message facts the provider recorded on the envelope, stored as it
+   * wrote them. `stopReason` is the verbatim wire string, never a normalized
+   * enum, and stays null while a turn is still in flight. `isSidechain` and
+   * `isMeta` are null when the provider did not say either way, which is not
+   * the same as false.
+   */
+  requestId: string | null;
+  stopReason: string | null;
+  agentVersion: string | null;
+  isSidechain: boolean | null;
+  isMeta: boolean | null;
+  turnId: string | null;
 }
 
 export interface EventCursor {

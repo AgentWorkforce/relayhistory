@@ -186,3 +186,46 @@ Claude session, reads that exact stored session, checks Cloud's `receiving` stat
 verifies private storage and stops the collector. It keeps credentials and the
 captured approval URL out of the test output, then removes its fixture directory.
 It refuses remote origins and must never run against production.
+
+## Desktop bridge v1
+
+The macOS companion uses `agent-relay-probe` for authentication, local credential
+storage, capture and delivery. All bridge commands accept `--json`; every JSON
+object has `bridge_version: 1`. Status output contains no credentials. Existing
+human-readable install/status/stop commands remain available.
+
+- `installs --json`: discover configured probe directories.
+- `cloud install --json --include-existing|--new-sessions-only|--selected-sessions-only`:
+  emit NDJSON `approval`, `connected`, and `ready` events. The browser approves
+  the device; the probe stores Cloud and workspace RelayHistory credentials.
+  JSON setup requires one explicit sharing choice and runs in the background.
+- `start`, `status`, `pause`, `resume`, `disconnect`: pass `--account ID`,
+  `--workspace ID`, and optionally `--site-url URL`, plus `--json`.
+- `sessions list <target> --json --limit 500`: newest sessions with title,
+  source, project path, activity and upload status. `uploading` means a record
+  from the session is in the currently leased batch; `queued` means a pending
+  batch. `shared` is used while a session's acknowledgement is not established.
+- `sessions include|exclude <target> --json --session SOURCE:ID …`: explicitly
+  share one session or a batch, or stop sharing them. This does not erase
+  already uploaded history.
+- `sharing set <target> --json --mode all|new|selected`: share everything,
+  establish a new-only baseline, or share only explicitly selected sessions.
+  Previously selected sessions are retained across mode changes.
+
+Selected mode excludes each unselected discovery after capture and before
+any delivery. Paused jobs continue local capture without delivery or progress
+heartbeats. Session lists and status use read-only database connections.
+
+Sharing mutations serialize on `desktop.lock`, stop the collector, and take
+its lock before replacing a generation. Includes, excludes and mode changes
+all use the same recovery path: persist `sharing-change.json`, cancel the old
+job, apply the exclusion set, create a replacement, preserve pause state, and
+atomically save `selected.json` and `config.json` before clearing the intent.
+If interrupted, startup replays the intent before it can deliver. This also
+means selection changes can temporarily restart record-level progress as
+acknowledged revisions are rechecked; remote delivery is idempotent.
+
+Disconnect stops the collector, cancels jobs, best-effort revokes the workspace
+RelayHistory token, and removes this install's stage credentials/configuration.
+The local history database is retained. It does not remove shared Cloud login
+credentials belonging to other Cloud clients.

@@ -1,0 +1,197 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-user-turn-blocks"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/legacy-json-user-turn-blocks",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "fix the build",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "timestamp_ms": 1776990000000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now run tests",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "timestamp_ms": 1776990002000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy layout with several tool parts of different sizes, one errored",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_u1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_utb_u1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "fix the build",
+      "token_json": null,
+      "ts_ms": 1776990000000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:call_b1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_utb_a1",
+      "model": "anthropic/claude-sonnet-4-6",
+      "parent_id": "msg_utb_u1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "ok\n",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
+      "ts_ms": 1776990001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:call_fail",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_utb_a1",
+      "model": "anthropic/claude-sonnet-4-6",
+      "parent_id": "msg_utb_u1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "ERROR: tests failed",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
+      "ts_ms": 1776990001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:call_b1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_utb_a1",
+      "model": "anthropic/claude-sonnet-4-6",
+      "parent_id": "msg_utb_u1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "ls",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
+      "ts_ms": 1776990001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:call_fail",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_utb_a1",
+      "model": "anthropic/claude-sonnet-4-6",
+      "parent_id": "msg_utb_u1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "test",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":5},\"input\":10,\"output\":20,\"reasoning\":0}",
+      "ts_ms": 1776990001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_u2_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_utb_u2",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "now run tests",
+      "token_json": null,
+      "ts_ms": 1776990002000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_a2_1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_utb_a2",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_utb_u2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "text": "done.",
+      "token_json": "{\"cache\":{\"read\":12,\"write\":21},\"input\":8,\"output\":10,\"reasoning\":0}",
+      "ts_ms": 1776990003000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776990000000,
+      "first_prompt": "fix the build",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776990003000,
+      "last_assistant_text": "done.",
+      "models_json": "[\"anthropic/claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_utb.json",
+      "repo_url": null,
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "source_stamp": "2784:13:<n>:9c55e12c88e72f08",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "opencode",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"ls\"}",
+      "is_error": 0,
+      "message_id": "msg_utb_a1",
+      "name": "bash",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "target": "ls",
+      "tool_use_id": "call_b1",
+      "ts_ms": 1776990001000
+    },
+    {
+      "args_json": "{\"command\":\"test\"}",
+      "is_error": 1,
+      "message_id": "msg_utb_a1",
+      "name": "bash",
+      "session_id": "ses_utb",
+      "source": "opencode",
+      "target": "test",
+      "tool_use_id": "call_fail",
+      "ts_ms": 1776990001000
+    }
+  ]
+}
