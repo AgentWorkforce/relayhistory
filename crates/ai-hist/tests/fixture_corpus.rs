@@ -428,7 +428,15 @@ const CORPUS: &[Fixture] = &[
         layout: Layout::HomeTree,
         origin: Origin::RelayHistory,
         files: &["grok/full-session"],
-        quirk: "a complete grok session directory: `summary.json`, `chat_history.jsonl` (including a `synthetic_reason` turn), plus the `updates.jsonl`, `prompt_context.json`, `signals.json` and `subagents/` files no relayhistory parser reads yet",
+        quirk: "older Claude-shaped grok directory: per-record timestamps, `tool_use` blocks in `content`, `updates.jsonl` as `file_changed` rows, plus `prompt_context.json`, `signals.json` and `subagents/`",
+    },
+    Fixture {
+        source: "grok",
+        name: "events-session",
+        layout: Layout::HomeTree,
+        origin: Origin::RelayHistory,
+        files: &["grok/events-session"],
+        quirk: "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
     },
     // -- opencode ----------------------------------------------------------
     Fixture {
