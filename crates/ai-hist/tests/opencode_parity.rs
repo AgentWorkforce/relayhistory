@@ -1248,8 +1248,7 @@ fn a_catalog_locator_from_the_other_layout_is_refused_not_read() {
     clear_opencode_evidence(&db_path);
 
     let message = hydrate_result(&db_path, "ses_simple")
-        .err()
-        .expect("hydration must not read the tree once SQLite is the current layout");
+        .expect_err("hydration must not read the tree once SQLite is the current layout");
     assert!(
         message.contains("SESSION_SOURCE_MISMATCH"),
         "the stale locator must be refused as a source mismatch, got: {message}"
