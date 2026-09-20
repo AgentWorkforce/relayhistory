@@ -235,14 +235,31 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
-                project TEXT, cwd TEXT, git_branch TEXT,
+                project TEXT, project_key TEXT, cwd TEXT, git_branch TEXT,
                 message_id TEXT, parent_id TEXT,
                 ts_ms INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
+                event_uid TEXT NOT NULL,
+                -- Per-tool-result fidelity columns. `ai_hist::session_events`
+                -- selects every column the crate defines, so a hand-built
+                -- fixture table that stops at `event_uid` fails the read with
+                -- `no such column` the moment the crate grows one.
+                tool_use_id TEXT,
+                payload_bytes INTEGER,
+                payload_truncated INTEGER,
+                payload_hash TEXT,
+                call_index INTEGER,
+                event_index INTEGER,
+                result_status TEXT,
+                event_source TEXT,
+                error_signal TEXT,
+                subagent_session_id TEXT,
+                agent_id TEXT,
                 request_id TEXT, provider_message_id TEXT,
-                event_uid TEXT NOT NULL
+                stop_reason TEXT, agent_version TEXT,
+                is_sidechain INTEGER, is_meta INTEGER, turn_id TEXT
             );",
         )
         .unwrap();

@@ -58,6 +58,8 @@ export interface NativeSessionEvent {
   source: string
   sessionId: string
   project?: string
+  /** Canonical project identity, denormalized from the owning session. */
+  projectKey?: string
   cwd?: string
   gitBranch?: string
   messageId?: string
@@ -69,6 +71,35 @@ export interface NativeSessionEvent {
   model?: string
   tokenJson?: string
   eventUid: string
+  /**
+   * Per-tool-result fidelity. Null on every row that is not a tool result,
+   * and on a tool-result row whose provider does not record the fact.
+   */
+  toolUseId?: string
+  /** Raw UTF-8 byte length of the provider's result payload. */
+  payloadBytes?: number
+  /** True when the harness had already truncated the payload. */
+  payloadTruncated?: boolean
+  /** First 16 hex characters of the payload's sha256. */
+  payloadHash?: string
+  /** n-th result recorded for this `toolUseId`, from zero. */
+  callIndex?: number
+  /** Position of this result in the transcript's tool-result order. */
+  eventIndex?: number
+  /** `running` / `completed` / `errored` / `cancelled` / `unknown`. */
+  resultStatus?: string
+  /** `tool_result` / `subagent_notification` / `function_call_output`. */
+  eventSource?: string
+  /** Which provider signal set the error. */
+  errorSignal?: string
+  subagentSessionId?: string
+  agentId?: string
+  requestId?: string
+  stopReason?: string
+  agentVersion?: string
+  isSidechain?: boolean
+  isMeta?: boolean
+  turnId?: string
 }
 export interface EventCursor {
   tsMs: number
@@ -133,6 +164,49 @@ export interface EvidencePageOptions {
   dbPath?: string
   limit?: number
   after?: EvidenceCursor
+}
+export interface NativeSessionUserTurnBlock {
+  /** `text` or `tool_result`. */
+  kind: string
+  toolUseId?: string
+  /**
+   * Measured payload bytes when the parser recorded them, otherwise the
+   * UTF-8 length of the stored text.
+   */
+  byteLen: number
+  /**
+   * True when the result is known to have failed, false when it is known
+   * to have succeeded, null when the provider has not said.
+   */
+  isError?: boolean
+}
+export interface NativeSessionUserTurn {
+  id: number
+  source: string
+  sessionId: string
+  messageId?: string
+  /**
+   * The nearest messages recorded either side of this turn, from either
+   * side of the conversation. Null only when the session recorded no named
+   * message on that side; an event the provider left unnamed is passed
+   * over rather than nulling the field.
+   */
+  precedingMessageId?: string
+  followingMessageId?: string
+  tsMs: number
+  blocks: Array<NativeSessionUserTurnBlock>
+}
+export interface UserTurnsPageOptions {
+  dbPath?: string
+  limit?: number
+  after?: EventCursor
+}
+export interface SessionUserTurnsPage {
+  contractVersion: number
+  source: string
+  sessionId: string
+  userTurns: Array<NativeSessionUserTurn>
+  nextCursor?: EventCursor
 }
 export interface SessionToolCallsPage {
   contractVersion: number
@@ -256,6 +330,12 @@ export interface NativeStats {
   total: number
   bySource: Array<SourceCount>
   byProject: Array<ProjectCount>
+  /**
+   * Which key `by_project` is bucketed by: `project_key` or `cwd`. Read it
+   * rather than assuming -- the two produce different counts for the same
+   * database.
+   */
+  groupedBy: string
   firstTimestampMs?: number
   lastTimestampMs?: number
 }
@@ -263,6 +343,11 @@ export interface StatsOptions {
   scope?: string
   dbPath?: string
   tag?: string
+  /**
+   * Bucket `by_project` by the raw working directory instead of the
+   * canonical project key. Defaults to false.
+   */
+  byCwd?: boolean
 }
 /** Full-text search of indexed history. Never discovers or syncs implicitly. */
 export declare function search(query: string, options?: SearchOptions | undefined | null): Promise<Array<NativeHistoryEntry>>
@@ -279,6 +364,15 @@ export declare function getSessionEventsPage(sessionId: string, options?: Events
  * globally unique, so an id-only lookup could interleave two sessions.
  */
 export declare function getSessionToolCallsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionToolCallsPage>
+/**
+ * One bounded page of user turns for one session, oldest first.
+ *
+ * Each turn carries the ordered blocks the provider attached to one user
+ * message: the human's own text and the tool results that came back with it,
+ * with the measured payload size of each. Computed from `session_events`
+ * rather than a table of its own, so it cannot disagree with the transcript.
+ */
+export declare function getSessionUserTurnsPage(source: string, sessionId: string, options?: UserTurnsPageOptions | undefined | null): Promise<SessionUserTurnsPage>
 /** One bounded page of recorded file edits for one session. */
 export declare function getSessionFileEditsPage(source: string, sessionId: string, options?: EvidencePageOptions | undefined | null): Promise<SessionFileEditsPage>
 /**
@@ -310,6 +404,13 @@ export interface CatalogSession {
   rawPath?: string
   sourceStamp?: string
   discoveryState: string
+  /**
+   * Canonical project identity: `host/owner/repo`, or the working
+   * directory when no git remote resolves.
+   */
+  projectKey?: string
+  /** `remote`, `path`, or `inherited`. */
+  projectKeyMethod?: string
   locations: Array<string>
   fromCache: boolean
 }
@@ -325,6 +426,11 @@ export interface ListCatalogOptions {
   limit?: number
   beforeMs?: number
   after?: CatalogCursor
+  /**
+   * Exact canonical project key (`host/owner/repo`, or the working
+   * directory when the checkout has no remote).
+   */
+  projectKey?: string
 }
 export interface SessionCatalogPage {
   contractVersion: number
@@ -418,6 +524,12 @@ export interface HydrateSessionResult {
   presence: string
   indexedThrough: HydrationIndexedThrough
   evidence: HydrationEvidence
+  /**
+   * Evidence kinds this hydration can have indexed, as wire names
+   * (`history`, `session_event`, `tool_call`, `file_edit`,
+   * `relationship`, `commit_link`).
+   */
+  coverage: Array<string>
   relatedSessionIds: Array<string>
   diagnostics: Array<HydrationDiagnostic>
 }
@@ -440,6 +552,7 @@ export interface NativeSessionRelationship {
   spawnedAtMs?: number
   createdMs: number
   relationshipUid: string
+  originSessionId?: string
 }
 export interface NativeRelationshipCapabilities {
   source: string
@@ -459,6 +572,7 @@ export interface NativeSessionRelationships {
   sessionId: string
   asParent: Array<NativeSessionRelationship>
   asChild: Array<NativeSessionRelationship>
+  continuity: Array<NativeSessionRelationship>
   capabilities: NativeRelationshipCapabilities
   diagnostics: Array<NativeRelationshipDiagnostic>
 }
@@ -502,6 +616,11 @@ export interface SessionTreeOptions {
   dbPath?: string
   maxDepth?: number
   maxNodes?: number
+  /**
+   * Which edges the walk follows. Omitted means delegation only, which is
+   * what every caller got before continuity existed.
+   */
+  relationshipKinds?: Array<string>
 }
 export interface SessionChildrenPageOptions {
   source: string
@@ -509,6 +628,7 @@ export interface SessionChildrenPageOptions {
   dbPath?: string
   limit?: number
   after?: RelationshipCursor
+  relationshipKinds?: Array<string>
 }
 /**
  * Direct delegation relationships for one session, in both directions.

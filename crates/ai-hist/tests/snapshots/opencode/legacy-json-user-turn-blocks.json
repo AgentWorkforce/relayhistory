@@ -1,0 +1,19 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-user-turn-blocks"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/legacy-json-user-turn-blocks",
+  "history": [],
+  "hydration": [],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy layout with several tool parts of different sizes, one errored",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [],
+  "source": "opencode",
+  "tool_calls": []
+}

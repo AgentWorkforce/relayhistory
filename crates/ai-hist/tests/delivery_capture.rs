@@ -203,6 +203,9 @@ fn local_sync_and_hydration_do_not_checkpoint_uncaptured_history() {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("XDG_DATA_HOME", home.join("xdg"));
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("GROK_HOME");
     std::env::set_var("TRAJECTORY_ROOT", home.join("missing-trajectories"));
     std::env::remove_var("AI_HIST_DB");
     sync_failure(home);

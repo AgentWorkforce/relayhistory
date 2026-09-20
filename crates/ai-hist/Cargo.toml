@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist"
-version = "0.18.8"
+version = "0.20.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -38,6 +38,15 @@ fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: `progress_handler` is the only way to commit a write from a
+# second connection *between* the two reads `session_user_turns_page` makes,
+# which is the race the single-snapshot transaction exists to close. The
+# feature adds no dependencies and is not enabled for the published library.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
+
+[[test]]
+name = "fixture_corpus"
+required-features = ["unstable-internal"]
 
 [[test]]
 name = "delivery_worker"
@@ -60,12 +69,32 @@ name = "hydration_preflight"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "session_continuity"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "env_roots"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "session_relationships"
 required-features = ["unstable-internal"]
 
 [[test]]
 name = "session_usage_plan"
 required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity_discovery"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_key_delivery"
+required-features = ["delivery", "unstable-internal"]
 
 [[test]]
 name = "source_intake"
@@ -77,4 +106,8 @@ required-features = ["unstable-internal"]
 
 [[test]]
 name = "sync_silence"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "claude_rewrite_retention"
 required-features = ["unstable-internal"]
