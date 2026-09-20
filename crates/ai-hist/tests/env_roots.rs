@@ -116,9 +116,19 @@ fn configured_provider_roots_child() {
 }
 
 #[test]
-fn explicit_store_home_still_honors_opencode_db() {
+fn explicit_store_home_honors_provider_env_roots() {
     let dir = tempfile::tempdir().unwrap();
     let provider_db = dir.path().join("relocated-opencode.db");
+    let codex = dir.path().join("relocated-codex");
+    write(
+        &codex.join("sessions/2026/09/20/rollout-codex-explicit-home.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-09-20T02:00:00Z","type":"session_meta","payload":{"id":"codex-explicit-home","cwd":"/work/app","originator":"codex_cli_rs"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-20T02:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"relocated codex explicit home"}}"#,
+            "\n",
+        ),
+    );
     let provider = Connection::open(&provider_db).unwrap();
     provider
         .execute_batch(
@@ -135,11 +145,12 @@ fn explicit_store_home_still_honors_opencode_db() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "explicit_store_home_still_honors_opencode_db_child",
+            "explicit_store_home_honors_provider_env_roots_child",
             "--nocapture",
         ])
         .env("RH_EXPLICIT_HOME_DB", dir.path().join("history.db"))
         .env("RH_EXPLICIT_HOME", dir.path().join("empty-home"))
+        .env("CODEX_HOME", codex)
         .env("OPENCODE_DB", provider_db)
         .output()
         .unwrap();
@@ -152,7 +163,7 @@ fn explicit_store_home_still_honors_opencode_db() {
 }
 
 #[test]
-fn explicit_store_home_still_honors_opencode_db_child() {
+fn explicit_store_home_honors_provider_env_roots_child() {
     let (Some(db), Some(home)) = (
         std::env::var_os("RH_EXPLICIT_HOME_DB"),
         std::env::var_os("RH_EXPLICIT_HOME"),
@@ -168,14 +179,19 @@ fn explicit_store_home_still_honors_opencode_db_child() {
         .unwrap();
 
     let conn = open_db(Path::new(&db)).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE source='opencode' AND session_id='opencode-env'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1, "SessionStore ignored OPENCODE_DB");
+    for (source, session_id, variable) in [
+        ("opencode", "opencode-env", "OPENCODE_DB"),
+        ("codex", "codex-explicit-home", "CODEX_HOME"),
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source=? AND session_id=?",
+                [source, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "SessionStore ignored {variable}");
+    }
 }
 
 #[test]
