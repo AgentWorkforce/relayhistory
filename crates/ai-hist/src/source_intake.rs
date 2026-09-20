@@ -163,6 +163,26 @@ pub(crate) fn apply_normalized(
     started: Instant,
 ) -> Result<HydrateSessionResult> {
     validate(key, &mut evidence)?;
+    // Enforced here rather than asked of each connector.
+    //
+    // `ShallowSessionProvider::acquire` takes no `include_related`, and for
+    // Claude's full export the engine derives the edges from a transcript the
+    // connector merely handed over -- so a connector cannot honour the option
+    // even when it wants to, and a third-party one has never been told about
+    // it. The option is a property of the request, so the boundary that owns
+    // the request enforces it: every path into intake, in-process provider and
+    // napi plugin alike, passes through here. Validation runs first, so a
+    // malformed relationship record is still rejected rather than quietly
+    // dropped. The plugin-side handling stays as an optimization -- do not
+    // fetch or ship what was not asked for -- not as what correctness rests on.
+    if !include_related {
+        evidence
+            .covered_kinds
+            .retain(|kind| *kind != EvidenceKind::Relationship);
+        evidence
+            .records
+            .retain(|record| record.kind != EvidenceKind::Relationship);
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure!(
         observations::revision(&tx, key)?.as_deref() == Some(expected),
