@@ -320,6 +320,33 @@ END;
     Ok(())
 }
 
+/// Whether a retained capture trigger still emits the column list its table
+/// has now.
+///
+/// Trigger *names* are what [`schema_is_current`] can check cheaply, but a
+/// name says nothing about the payload: a trigger embeds the column list its
+/// table had when it was created. Delivery is an optional feature, and that is
+/// what opens the hole -- a database can carry delivery tables and triggers
+/// from a delivery-enabled build, be opened by a `--no-default-features` build
+/// that adds a column without compiling the rebuild in, and then come back to
+/// a delivery-enabled build whose fast path the names alone satisfy. The
+/// rebuild is never reached and delivery goes on reporting success while the
+/// new field never leaves the machine.
+///
+/// Asked the same way the rebuild in `init_schema` asks it, so the two cannot
+/// disagree about what "current" means.
+fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> {
+    let name = table.name;
+    let payload = table.payload(conn, "NEW")?;
+    let stale: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",
+        rusqlite::params![format!("delivery_{name}_insert"), payload.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(!stale)
+}
+
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     let mut names = Vec::new();
     for table in TABLES {
@@ -351,5 +378,15 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         [],
         |r| r.get(0),
     )?;
-    Ok(count as usize == names.len())
+    if count as usize != names.len() {
+        return Ok(false);
+    }
+    // A trigger can carry the right name and a payload that predates a column
+    // its table has since gained; see `capture_payload_is_current`.
+    for table in TABLES {
+        if !capture_payload_is_current(conn, table)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

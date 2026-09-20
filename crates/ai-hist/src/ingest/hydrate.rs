@@ -1264,7 +1264,8 @@ fn opencode_json_tree_snapshot(
             format!("OpenCode source {} is unavailable", session_file.display()),
         ));
     }
-    let stamp = crate::ingest::opencode::stamp_json_tree_session(session_file, &options.session_id);
+    let stamp =
+        crate::ingest::opencode::stamp_json_tree_session(session_file, &options.session_id)?;
     Ok(SourceSnapshot {
         stamp: stamp.token(),
         bytes: i64::try_from(stamp.bytes).unwrap_or(i64::MAX),

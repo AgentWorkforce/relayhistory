@@ -1676,7 +1676,7 @@ fn enumerate_opencode_json_tree(
         if !path.is_file() {
             continue;
         }
-        let stamp = crate::ingest::opencode::stamp_json_tree_session(&path, &session_id);
+        let stamp = crate::ingest::opencode::stamp_json_tree_session(&path, &session_id)?;
         rows.push((session_id, path, stamp));
     }
     // Newest first, then by id, so a limit takes the same bounded head every

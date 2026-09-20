@@ -27,11 +27,12 @@ use super::{
 };
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
 use crate::{insert_history, prompt_hash, HistoryEntry};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// The session record itself: identity, delegation, working directory.
@@ -523,8 +524,27 @@ fn collect_session_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Read one session out of the JSON tree, given its session file.
 pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<OpencodeSession>> {
-    let Ok(raw) = fs::read_to_string(session_file) else {
-        return Ok(None);
+    // A read that fails is not a verdict. `Ok(None)` means "this candidate is
+    // not a session", and discovery records that against the current source
+    // stamp; hydration commits its checkpoint over whatever came back. An
+    // unreadable file changes neither its size nor its mtime, so a skip or a
+    // checkpoint written while it was unreadable stays valid after access
+    // recovers -- the omission outlives the outage that caused it.
+    //
+    // So the two are separated: a *malformed* provider record is skippable and
+    // still returns `Ok(None)`, while an I/O failure propagates with the path
+    // that failed. `NotFound` counts as malformed-not-present: discovery has
+    // already filtered to files that exist, so a file that vanished between
+    // the stat and the read is a race, not an outage, and the next run sees
+    // the tree as it now is.
+    let raw = match fs::read_to_string(session_file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading OpenCode session file {}", session_file.display())
+            })
+        }
     };
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&raw) else {
         return Ok(None);
@@ -556,7 +576,7 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
     let storage_root = derive_storage_root(session_file);
 
     let mut messages = Vec::new();
-    for (message_id, object) in read_json_dir(&storage_root.join("message").join(&info.id)) {
+    for (message_id, object) in read_json_dir(&storage_root.join("message").join(&info.id))? {
         if let Some(message) = parse_message(&message_id, &object, None) {
             messages.push(message);
         }
@@ -564,7 +584,7 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
 
     let mut parts_by_message: BTreeMap<String, Vec<OpencodePart>> = BTreeMap::new();
     for message in &messages {
-        for (part_id, object) in read_json_dir(&storage_root.join("part").join(&message.id)) {
+        for (part_id, object) in read_json_dir(&storage_root.join("part").join(&message.id))? {
             let kind = object
                 .get("type")
                 .and_then(Value::as_str)
@@ -618,18 +638,34 @@ pub(crate) fn derive_storage_root(session_file: &Path) -> PathBuf {
 /// within the same tick of a previous read can share its mtime — but adding a
 /// turn always adds a file, so the count moves whether or not the clock does.
 /// `bytes` catches an in-place edit of an existing part.
+///
+/// Those three are *aggregates*, though, and aggregates collide. A part
+/// rewritten to a different payload of the same length leaves `bytes` and
+/// `files` exactly where they were, and if the rewrite lands in the same
+/// filesystem timestamp tick as the read before it, `newest_ns` too — so the
+/// session reports `unchanged` and keeps the superseded event. `digest`
+/// closes that: it is a per-file fold rather than a sum, so a file that
+/// changes length while another changes the opposite way no longer cancels
+/// out, and for the files where metadata *cannot* settle the question it folds
+/// in the content itself. See [`stamp_json_tree_session`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct OpencodeTreeStamp {
     pub bytes: u64,
     pub files: u64,
     /// Newest modification time across those files, in nanoseconds.
     pub newest_ns: u128,
+    /// Per-file fold of name, length and mtime, plus the contents of any file
+    /// recent enough that its next write could share this mtime.
+    pub digest: u64,
 }
 
 impl OpencodeTreeStamp {
     /// The opaque token stored as a source stamp.
     pub fn token(&self) -> String {
-        format!("{}:{}:{}", self.bytes, self.files, self.newest_ns)
+        format!(
+            "{}:{}:{}:{:016x}",
+            self.bytes, self.files, self.newest_ns, self.digest
+        )
     }
 
     /// Newest activity as epoch milliseconds, for a recency hint.
@@ -638,14 +674,50 @@ impl OpencodeTreeStamp {
     }
 }
 
+/// How close to the moment of stamping a file's mtime has to be before
+/// metadata stops being able to prove it unchanged.
+///
+/// A same-length rewrite is invisible to `bytes` and `files`, so the only
+/// metadata left is mtime — and mtime can only distinguish two writes that
+/// land in different ticks. Suppose a file is written at T, stamped at S, and
+/// rewritten at U. If the rewrite is invisible then `mtime(T) == mtime(U)`,
+/// which means T and U share a tick; S lies between them, so S is in that tick
+/// too. In other words the collision is only possible for a file whose mtime
+/// is *within one tick of the stamp*, and hashing those is enough. Two seconds
+/// covers the coarsest granularity still in the field (FAT's two-second mtime).
+///
+/// This is what keeps the content hash off the hot path: in a tree that is not
+/// being written to right now, no file qualifies and the stamp is still pure
+/// metadata. A file that settles from ambiguous to old changes the digest once
+/// and costs one extra read of one session — the safe direction, since the
+/// error it cannot make is reporting `unchanged` over a change.
+const STAMP_AMBIGUITY_NS: u128 = 2_000_000_000;
+
 /// Stamp every file that composes one legacy-tree session: the session JSON,
-/// its messages, and those messages' parts. Metadata only — nothing is read
-/// or parsed, so this stays cheap enough for discovery to run over a tree.
-pub(crate) fn stamp_json_tree_session(session_file: &Path, session_id: &str) -> OpencodeTreeStamp {
+/// its messages, and those messages' parts.
+///
+/// Metadata for everything, plus the contents of any file recent enough that
+/// metadata cannot settle it (see [`STAMP_AMBIGUITY_NS`]), so discovery can
+/// still run this over a whole tree.
+pub(crate) fn stamp_json_tree_session(
+    session_file: &Path,
+    session_id: &str,
+) -> Result<OpencodeTreeStamp> {
     let root = derive_storage_root(session_file);
-    let mut stamp = OpencodeTreeStamp::default();
-    let mut add = |path: &Path| {
-        let Ok(meta) = fs::metadata(path) else { return };
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut stamp = OpencodeTreeStamp {
+        digest: FNV_OFFSET,
+        ..OpencodeTreeStamp::default()
+    };
+    let mut add = |path: &Path, stamp: &mut OpencodeTreeStamp| -> Result<()> {
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+        };
         stamp.bytes += meta.len();
         stamp.files += 1;
         let changed = meta
@@ -656,55 +728,88 @@ pub(crate) fn stamp_json_tree_session(session_file: &Path, session_id: &str) -> 
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default();
         stamp.newest_ns = stamp.newest_ns.max(changed);
+
+        // Fold this file in by name, length and mtime rather than adding it to
+        // a total, so two changes cannot cancel each other out.
+        stamp.digest = fnv(
+            stamp.digest,
+            path.file_name().unwrap_or_default().as_encoded_bytes(),
+        );
+        stamp.digest = fnv(stamp.digest, &meta.len().to_le_bytes());
+        stamp.digest = fnv(stamp.digest, &changed.to_le_bytes());
+        if now_ns.saturating_sub(changed) <= STAMP_AMBIGUITY_NS {
+            let body = match fs::read(path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading OpenCode record {}", path.display()))
+                }
+            };
+            stamp.digest = fnv(stamp.digest, b"\x01");
+            stamp.digest = fnv(stamp.digest, &body);
+        }
+        Ok(())
     };
-    add(session_file);
-    let mut message_ids = json_file_stems(&root.join("message").join(session_id), &mut add);
+    add(session_file, &mut stamp)?;
+    let mut message_ids =
+        json_file_stems(&root.join("message").join(session_id), &mut stamp, &mut add)?;
     message_ids.sort();
     for message_id in &message_ids {
-        json_file_stems(&root.join("part").join(message_id), &mut add);
+        json_file_stems(&root.join("part").join(message_id), &mut stamp, &mut add)?;
     }
-    stamp
+    Ok(stamp)
 }
 
-/// Visit every `*.json` in one directory, returning their stems. Sorted by the
-/// caller where order matters; a missing directory is simply empty.
-fn json_file_stems(dir: &Path, visit: &mut impl FnMut(&Path)) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .collect();
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a. Not a security primitive and not asked to be one: this only has to
+/// change when the bytes change, over files one process wrote and this process
+/// reads back.
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Visit every `*.json` in one directory, returning their stems. Sorted, so
+/// the fold is order-independent of the filesystem's own listing order; a
+/// missing directory is simply empty, an unlistable one is an error.
+fn json_file_stems(
+    dir: &Path,
+    stamp: &mut OpencodeTreeStamp,
+    visit: &mut impl FnMut(&Path, &mut OpencodeTreeStamp) -> Result<()>,
+) -> Result<Vec<String>> {
+    let mut paths = json_paths_in(dir)?;
     paths.sort();
     let mut stems = Vec::new();
     for path in &paths {
-        visit(path);
+        visit(path, stamp)?;
         if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
             stems.push(stem.to_string());
         }
     }
-    stems
+    Ok(stems)
 }
 
 /// `*.json` in one directory, keyed by the payload's own `id` when it has one
-/// and by the file stem otherwise. Unreadable or non-object files are skipped,
-/// exactly as the reference reader skips them.
-fn read_json_dir(dir: &Path) -> Vec<(String, Map<String, Value>)> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .collect();
+/// and by the file stem otherwise. A file that is not a JSON object is
+/// skipped, exactly as the reference reader skips it; a file that cannot be
+/// *read* is an error, for the reason given on `load_from_json_tree`.
+fn read_json_dir(dir: &Path) -> Result<Vec<(String, Map<String, Value>)>> {
+    let mut paths = json_paths_in(dir)?;
     paths.sort();
     let mut out = Vec::new();
     for path in paths {
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading OpenCode record {}", path.display()))
+            }
         };
         let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&raw) else {
             continue;
@@ -721,7 +826,29 @@ fn read_json_dir(dir: &Path) -> Vec<(String, Map<String, Value>)> {
         let Some(id) = id else { continue };
         out.push((id, object));
     }
-    out
+    Ok(out)
+}
+
+/// Every `*.json` directly in `dir`, unsorted. A directory that is not there
+/// is empty -- a session with no messages is ordinary. A directory that is
+/// there and cannot be listed is an error, because "it enumerated as nothing"
+/// and "it holds nothing" are the two readings this whole change is about
+/// keeping apart.
+fn json_paths_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("listing {}", dir.display())),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1520,251 @@ mod tests {
             .unwrap();
         assert!(!has_leading_index(&conn, "part", "session_id").unwrap());
         assert_eq!(sync_plan(&conn).unwrap(), OpencodeSyncPlan::SinglePass);
+    }
+
+    /// A minimal legacy tree: one session, one assistant message, one text
+    /// part. Returns the tree root and the part's path.
+    fn tree(dir: &Path) -> (PathBuf, PathBuf) {
+        let root = dir.join("storage");
+        let write = |path: PathBuf, body: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            path
+        };
+        write(
+            root.join("session/global/ses_io.json"),
+            r#"{"id":"ses_io","directory":"/tmp/p","time":{"created":1,"updated":2}}"#,
+        );
+        write(
+            root.join("message/ses_io/msg_io.json"),
+            r#"{"id":"msg_io","sessionID":"ses_io","role":"assistant","time":{"created":2}}"#,
+        );
+        let part = write(
+            root.join("part/msg_io/prt_io.json"),
+            r#"{"id":"prt_io","sessionID":"ses_io","messageID":"msg_io","type":"text","text":"aaa"}"#,
+        );
+        (root, part)
+    }
+
+    /// Replace `path` with something that still enumerates and still stats but
+    /// cannot be read.
+    ///
+    /// A unix socket, and not the obvious alternatives: `chmod 000` does
+    /// nothing when the suite runs as root, which it does here, and a
+    /// directory in place of the file is not a `.json` file to the scan at
+    /// all. `open(2)` on a socket fails with `ENXIO` whatever the uid while
+    /// `metadata()` still succeeds — which is exactly the hazard's shape, a
+    /// path that looks present and unchanged to every check made before the
+    /// read. (The technique is #190's; its rationale is quoted because it is
+    /// the reason the obvious fixtures are false greens.)
+    #[cfg(unix)]
+    fn make_unreadable(path: &Path) {
+        fs::remove_file(path).unwrap();
+        // Leaked deliberately: dropping the listener would not remove the
+        // socket file, and the file is what the test needs.
+        std::mem::forget(std::os::unix::net::UnixListener::bind(path).unwrap());
+        assert!(
+            fs::read_to_string(path).is_err(),
+            "the fixture must actually be unreadable or this test proves nothing"
+        );
+        assert!(
+            fs::metadata(path).is_ok(),
+            "the fixture must still stat, or the loader would never reach the read"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_part_is_an_error_not_a_session_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, part) = tree(dir.path());
+        let session_file = root.join("session/global/ses_io.json");
+
+        // Control: while everything is readable the part is there.
+        let loaded = load_from_json_tree(&session_file).unwrap().unwrap();
+        assert_eq!(loaded.parts_by_message["msg_io"].len(), 1);
+
+        make_unreadable(&part);
+        let error = format!(
+            "{:#}",
+            load_from_json_tree(&session_file).expect_err(
+                "an unreadable part must be an error, not a session recorded without it"
+            )
+        );
+        assert!(
+            error.contains("prt_io.json"),
+            "the error must name the file that failed, got {error}"
+        );
+
+        // And it recovers: nothing about the failure is remembered.
+        fs::remove_file(&part).unwrap();
+        fs::write(
+            &part,
+            r#"{"id":"prt_io","sessionID":"ses_io","messageID":"msg_io","type":"text","text":"aaa"}"#,
+        )
+        .unwrap();
+        let loaded = load_from_json_tree(&session_file).unwrap().unwrap();
+        assert_eq!(loaded.parts_by_message["msg_io"].len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_session_file_is_an_error_not_a_missing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _) = tree(dir.path());
+        let session_file = root.join("session/global/ses_io.json");
+        make_unreadable(&session_file);
+        let error = format!(
+            "{:#}",
+            load_from_json_tree(&session_file)
+                .expect_err("an unreadable session file must not read as 'not a session'")
+        );
+        assert!(
+            error.contains("ses_io.json"),
+            "the error must name the file that failed, got {error}"
+        );
+    }
+
+    /// The other half of the same rule: what is *skippable* still skips. A
+    /// malformed record and an absent directory are ordinary, and turning
+    /// those into errors would trade a silent omission for a loud one.
+    #[test]
+    fn malformed_and_absent_records_are_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, part) = tree(dir.path());
+        let session_file = root.join("session/global/ses_io.json");
+
+        fs::write(&part, "{ not json").unwrap();
+        let loaded = load_from_json_tree(&session_file).unwrap().unwrap();
+        assert!(
+            loaded.parts_by_message.is_empty(),
+            "a malformed part is skipped, not fatal"
+        );
+
+        fs::remove_dir_all(root.join("part/msg_io")).unwrap();
+        fs::remove_dir_all(root.join("message/ses_io")).unwrap();
+        let loaded = load_from_json_tree(&session_file).unwrap().unwrap();
+        assert!(loaded.messages.is_empty(), "a session may have no messages");
+
+        fs::write(&session_file, "{ not json").unwrap();
+        assert!(
+            load_from_json_tree(&session_file).unwrap().is_none(),
+            "a malformed session file is not a session"
+        );
+
+        fs::remove_file(&session_file).unwrap();
+        assert!(
+            load_from_json_tree(&session_file).unwrap().is_none(),
+            "a file that vanished between the stat and the read is a race, not an outage"
+        );
+    }
+
+    /// Pin `path`'s modification time, leaving its contents alone.
+    fn pin_mtime(path: &Path, when: std::time::SystemTime) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), when);
+    }
+
+    #[test]
+    fn a_same_length_rewrite_in_one_mtime_tick_still_moves_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, part) = tree(dir.path());
+        let session_file = root.join("session/global/ses_io.json");
+
+        let before = stamp_json_tree_session(&session_file, "ses_io").unwrap();
+        let pinned = fs::metadata(&part).unwrap().modified().unwrap();
+        // Premise: this file is recent enough that its next write could share
+        // this mtime. That is the only case the content fold exists for, and a
+        // slow machine must fail here rather than pass for another reason.
+        assert!(
+            std::time::SystemTime::now()
+                .duration_since(pinned)
+                .unwrap_or_default()
+                < std::time::Duration::from_secs(1),
+            "the fixture must still be inside the ambiguity window"
+        );
+
+        // Control: stamping again without touching anything is stable, or an
+        // assertion that the stamp *moved* would mean nothing.
+        assert_eq!(
+            before.token(),
+            stamp_json_tree_session(&session_file, "ses_io")
+                .unwrap()
+                .token(),
+            "an untouched tree must stamp the same twice"
+        );
+
+        let original = fs::read_to_string(&part).unwrap();
+        let rewritten = original.replace("\"aaa\"", "\"bbb\"");
+        assert_eq!(rewritten.len(), original.len());
+        assert_ne!(rewritten, original);
+        fs::write(&part, &rewritten).unwrap();
+        pin_mtime(&part, pinned);
+
+        let after = stamp_json_tree_session(&session_file, "ses_io").unwrap();
+        assert_eq!(
+            (before.bytes, before.files, before.newest_ns),
+            (after.bytes, after.files, after.newest_ns),
+            "precondition: every aggregate must be unchanged, or the content \
+             fold is not what caught this"
+        );
+        assert_ne!(
+            before.token(),
+            after.token(),
+            "a same-length rewrite inside one mtime tick must still move the stamp"
+        );
+    }
+
+    /// The content fold has to stay off the hot path: discovery stamps every
+    /// session in the tree, and reading all of them on every run would be a
+    /// different bug. A settled file is stat-only; a recent one is read.
+    /// Measured, because "it should be cheap" is not a bound.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_settled_tree_is_stamped_without_reading_it() {
+        fn bytes_read() -> u64 {
+            fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, part) = tree(dir.path());
+        let session_file = root.join("session/global/ses_io.json");
+        let body = format!(
+            "{{\"id\":\"prt_io\",\"sessionID\":\"ses_io\",\"messageID\":\"msg_io\",\
+             \"type\":\"text\",\"text\":\"{}\"}}",
+            "x".repeat(256 * 1024)
+        );
+        fs::write(&part, &body).unwrap();
+        let size = body.len() as u64;
+
+        let recent = std::time::SystemTime::now();
+        pin_mtime(&part, recent);
+        let before = bytes_read();
+        stamp_json_tree_session(&session_file, "ses_io").unwrap();
+        let while_recent = bytes_read() - before;
+
+        pin_mtime(&part, recent - std::time::Duration::from_secs(600));
+        let before = bytes_read();
+        stamp_json_tree_session(&session_file, "ses_io").unwrap();
+        let once_settled = bytes_read() - before;
+
+        assert!(
+            while_recent >= size,
+            "a file that could still be rewritten in this tick must be read: \
+             {while_recent} bytes for a {size}-byte part"
+        );
+        assert!(
+            once_settled < size / 4,
+            "a settled file must be stat-only: {once_settled} bytes for a \
+             {size}-byte part"
+        );
     }
 
     fn part(raw: &str) -> OpencodePart {

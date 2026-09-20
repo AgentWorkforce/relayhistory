@@ -15,7 +15,7 @@ use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, open_db, session_events,
     session_relationships, sync_local_at, DiscoverOptions, HydrateSessionOptions, SessionScope,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -292,6 +292,9 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     an_unindexed_store_is_not_read_once_per_session();
     a_sqlite_store_inside_the_storage_dir_still_hydrates();
     an_upgraded_database_delivers_the_new_event_columns();
+    an_unreadable_part_does_not_checkpoint_a_session_without_it();
+    an_unreadable_part_does_not_catalog_a_session_without_it();
+    a_same_length_rewrite_in_one_tick_re_hydrates();
 }
 
 /// Acceptance: "Snapshots for the 5 JSON fixtures and the new SQLite fixture
@@ -1692,4 +1695,262 @@ fn an_unindexed_store_is_not_read_once_per_session() {
     }
 
     fs::remove_dir_all(&root).ok();
+}
+
+/// Replace `path` with something the scan still enumerates and still stats,
+/// but cannot read, and wait until it is old enough that the stamp treats it
+/// as settled.
+///
+/// The socket is #190's technique and its rationale holds here: `chmod 000`
+/// does nothing as root, which is how the suite runs, and a directory in place
+/// of the file is not a `.json` file to the scan at all. `open(2)` on a socket
+/// fails with `ENXIO` for any uid while `metadata()` still succeeds.
+///
+/// The settling matters for *this* suite specifically: a recent file is one
+/// the stamp reads, so an unsettled socket would fail in the stamp and the
+/// test would pass whether or not the loader propagates anything. Settling it
+/// leaves the loader as the only thing that can catch it.
+#[cfg(unix)]
+fn make_unreadable_and_settled(path: &Path) {
+    fs::remove_file(path).unwrap();
+    // Bound at a short path and moved into place: `sun_path` is 108 bytes and
+    // these fixture roots are longer than that, but a socket file renames like
+    // any other directory entry. Leaked deliberately -- dropping the listener
+    // would not remove the socket file, and the file is what the test needs.
+    let staging = std::env::temp_dir().join(format!(
+        "aihs{}{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::mem::forget(std::os::unix::net::UnixListener::bind(&staging).unwrap());
+    fs::rename(&staging, path).unwrap();
+    assert!(
+        fs::read_to_string(path).is_err(),
+        "the fixture must actually be unreadable or this test proves nothing"
+    );
+    assert!(
+        fs::metadata(path).is_ok(),
+        "the fixture must still stat, or nothing would enumerate it"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let age = std::time::SystemTime::now()
+            .duration_since(fs::metadata(path).unwrap().modified().unwrap())
+            .unwrap_or_default();
+        if age > std::time::Duration::from_millis(2_500) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture never settled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A read that fails is not a reading. The legacy loader turned an unreadable
+/// message or part into an omission and hydration committed its checkpoint
+/// over the result — and because an unreadable file keeps its size and its
+/// mtime, the stamp the checkpoint was written against is still current after
+/// access recovers, so the missing events never come back.
+#[cfg(unix)]
+fn an_unreadable_part_does_not_checkpoint_a_session_without_it() {
+    let root = temp_root("unreadable-part");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    clear_opencode_evidence(&db_path);
+
+    let part = tree.join("part/msg_simple_asst/prt_simple_2.json");
+    make_unreadable_and_settled(&part);
+
+    let error = hydrate_result(&db_path, "ses_simple")
+        .expect_err("an unreadable part must fail the hydration, not shorten it");
+    assert!(
+        error.contains("prt_simple_2.json"),
+        "the error must name the file that failed, got {error}"
+    );
+    assert_eq!(
+        checkpoint_stamp(&db_path, "ses_simple"),
+        None,
+        "a hydration that could not read the session must not leave a checkpoint"
+    );
+    assert!(
+        session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+            .unwrap()
+            .is_empty(),
+        "and it must not leave partial evidence behind either"
+    );
+
+    // Access recovers, and so does the session — the outage left nothing
+    // behind that outlives it.
+    fs::remove_file(&part).unwrap();
+    copy_tree(
+        &fixtures().join("legacy-json-simple/storage/part/msg_simple_asst"),
+        &tree.join("part/msg_simple_asst"),
+    );
+    let hydrated = hydrate(&db_path, "ses_simple");
+    assert!(
+        hydrated.evidence.events > 0,
+        "the session must hydrate once the file is readable again, got {:?}",
+        hydrated.evidence
+    );
+    assert!(checkpoint_stamp(&db_path, "ses_simple").is_some());
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The discovery half of the same rule. A catalog row written while a part was
+/// unreadable describes a session it could not read, and it is stamped with
+/// the source stamp of that moment — which an unreadable file does not move,
+/// so the next run finds the stamp current and skips the session for good.
+#[cfg(unix)]
+fn an_unreadable_part_does_not_catalog_a_session_without_it() {
+    let root = temp_root("unreadable-discovery");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    let part = tree.join("part/msg_simple_asst/prt_simple_2.json");
+    make_unreadable_and_settled(&part);
+
+    let (_, summary) = discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        summary
+            .diagnostics
+            .iter()
+            .any(|entry| entry.error.contains("prt_simple_2.json")),
+        "the failure must be reported, not swallowed: {:?}",
+        summary.diagnostics
+    );
+    assert_eq!(
+        catalog_stamp(&db_path, "ses_simple"),
+        None,
+        "no catalog row may be stamped as current from a read that failed"
+    );
+
+    fs::remove_file(&part).unwrap();
+    copy_tree(
+        &fixtures().join("legacy-json-simple/storage/part/msg_simple_asst"),
+        &tree.join("part/msg_simple_asst"),
+    );
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert!(
+        catalog_stamp(&db_path, "ses_simple").is_some(),
+        "and the session must appear once the file is readable again"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `bytes`, `files` and `newest_ns` are aggregates, and aggregates collide. A
+/// part rewritten to a different payload of the same length moves none of
+/// them, and if the rewrite lands inside the same filesystem timestamp tick as
+/// the read before it, the mtime does not move either — so the session read as
+/// `unchanged` and kept the superseded text forever. Pinning the mtime is how
+/// a coarse tick is reproduced without waiting for one.
+fn a_same_length_rewrite_in_one_tick_re_hydrates() {
+    let root = temp_root("same-tick-rewrite");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+    let part = tree.join("part/msg_simple_asst/prt_simple_2.json");
+
+    // Fix the tick both reads see, rather than inheriting whatever the fixture
+    // copy left behind.
+    let tick = std::time::SystemTime::now();
+    pin_mtime(&part, tick);
+
+    sync_local_at(&db_path).unwrap();
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    hydrate(&db_path, "ses_simple");
+
+    // Control: nothing changed, so nothing is re-read.
+    assert_eq!(
+        hydrate(&db_path, "ses_simple").status,
+        "unchanged",
+        "an untouched session must still short-circuit, or the fix is just a \
+         cache that never hits"
+    );
+
+    let original = fs::read_to_string(&part).unwrap();
+    let rewritten = original.replace("Hello.", "Adieu.");
+    assert_eq!(rewritten.len(), original.len());
+    assert_ne!(rewritten, original);
+    fs::write(&part, &rewritten).unwrap();
+    pin_mtime(&part, tick);
+    assert!(
+        std::time::SystemTime::now()
+            .duration_since(tick)
+            .unwrap_or_default()
+            < std::time::Duration::from_secs(2),
+        "premise: the rewrite must still be inside the ambiguity window"
+    );
+
+    let again = hydrate(&db_path, "ses_simple");
+    assert_ne!(
+        again.status, "unchanged",
+        "a same-length rewrite inside one mtime tick must still be re-read"
+    );
+    let texts: Vec<String> =
+        session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("Adieu.")),
+        "and the new text must be what is indexed, got {texts:?}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Pin `path`'s modification time, leaving its contents alone.
+fn pin_mtime(path: &Path, when: std::time::SystemTime) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(when))
+        .unwrap();
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), when);
+}
+
+/// The stamp the hydration checkpoint was written against, if there is one.
+fn checkpoint_stamp(db_path: &Path, session_id: &str) -> Option<String> {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT source_stamp FROM session_hydration_checkpoints \
+             WHERE source='opencode' AND session_id=?",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
+}
+
+/// The stamp the catalog row was written against, if there is one.
+fn catalog_stamp(db_path: &Path, session_id: &str) -> Option<String> {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source='opencode' AND session_id=?",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
 }
