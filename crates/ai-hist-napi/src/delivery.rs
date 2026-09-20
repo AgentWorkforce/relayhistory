@@ -123,6 +123,7 @@ pub async fn history_delivery(
     let request: Request = serde_json::from_str(&request_json)
         .map_err(|_| crate::native_error("INVALID_ARGUMENT", "invalid typed delivery request"))?;
     let path = crate::db_path(db_path);
+    let received = Instant::now();
     napi::tokio::task::spawn_blocking(move || {
         if !path.exists() {
             match request {
@@ -156,13 +157,22 @@ pub async fn history_delivery(
                     lease_ms,
                     now_ms,
                 } => serde_json::to_value(core::claim_batch(
-                    &conn, &job_id, &worker_id, lease_ms, now_ms,
+                    &conn,
+                    &job_id,
+                    &worker_id,
+                    lease_ms,
+                    &request_clock(now_ms, received)?,
                 )?)?,
                 Request::RenewLease {
                     lease,
                     lease_ms,
                     now_ms,
-                } => serde_json::to_value(core::renew_lease(&conn, &lease, lease_ms, now_ms)?)?,
+                } => serde_json::to_value(core::renew_lease(
+                    &conn,
+                    &lease,
+                    lease_ms,
+                    &request_clock(now_ms, received)?,
+                )?)?,
                 Request::StorePreparedPayload {
                     lease,
                     mapping_version,
@@ -175,11 +185,11 @@ pub async fn history_delivery(
                     &mapping_version,
                     &content_type,
                     &body,
-                    now_ms,
+                    &request_clock(now_ms, received)?,
                 )?)?,
-                Request::ValidateDispatch { lease, now_ms } => {
-                    serde_json::to_value(core::validate_dispatch(&conn, &lease, now_ms)?)?
-                }
+                Request::ValidateDispatch { lease, now_ms } => serde_json::to_value(
+                    core::validate_dispatch(&conn, &lease, &request_clock(now_ms, received)?)?,
+                )?,
                 Request::Acknowledge {
                     lease,
                     acknowledgment,
@@ -188,7 +198,7 @@ pub async fn history_delivery(
                     &conn,
                     &lease,
                     &acknowledgment,
-                    now_ms,
+                    &request_clock(now_ms, received)?,
                 )?)?,
                 Request::RecordFailure {
                     lease,
@@ -200,7 +210,7 @@ pub async fn history_delivery(
                     &lease,
                     failure,
                     retry_after_ms,
-                    now_ms,
+                    &request_clock(now_ms, received)?,
                 )?)?,
                 Request::PauseJob { job_id } => {
                     serde_json::to_value(core::pause_job(&conn, &job_id)?)?
@@ -558,4 +568,65 @@ pub async fn history_delivery_drain(
     })
     .await
     .map_err(crate::worker_error)?
+}
+
+/// The clock a native lease write that must be dated from inside the lock
+/// is given: renewal, and the two pre-transport gates.
+///
+/// The JavaScript caller supplies `now_ms` when it builds the request, but
+/// `renew_lease`, `store_prepared_payload` and `validate_dispatch` read their
+/// clock only once they hold the write lock, and a contended lock can take
+/// longer than the lease itself. Handing the request's timestamp through
+/// unchanged would date a renewal, or a liveness check, from before the wait —
+/// the stale clock those functions taking a callback exists to stop — so the
+/// caller's timestamp is advanced by the monotonic time that has elapsed
+/// since the request was received. The caller's clock stays the base, which
+/// keeps a deterministic test clock deterministic when nothing waits.
+///
+/// The caller's timestamp is validated *before* the wait is added to it. The
+/// core refuses a negative clock, but a slightly negative request that waited
+/// a few milliseconds would arrive there already advanced past zero and be
+/// accepted — an invalid input turned valid by queueing delay, with a lease
+/// dated near the epoch that no normally clocked worker could use.
+fn request_clock(now_ms: i64, received: Instant) -> anyhow::Result<impl Fn() -> i64> {
+    anyhow::ensure!(now_ms >= 0, "invalid delivery clock");
+    Ok(move || {
+        let waited = i64::try_from(received.elapsed().as_millis()).unwrap_or(i64::MAX);
+        now_ms.saturating_add(waited)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_clock;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_renewal_dated_after_a_wait_is_not_dated_from_before_it() {
+        let received = Instant::now();
+        let clock = request_clock(1_000, received).unwrap();
+        // Read immediately: the caller's timestamp is the base, not replaced.
+        assert!((1_000..1_000 + 5_000).contains(&clock()));
+        sleep(Duration::from_millis(120));
+        // Read after waiting: the time waited is on the clock. Passing the
+        // request's `now_ms` straight through returned exactly 1_000 here.
+        assert!(clock() >= 1_120, "clock did not advance past the wait");
+    }
+
+    #[test]
+    fn a_negative_request_clock_is_refused_before_the_wait_can_advance_it() {
+        // Read after a wait: had the check run on the advanced value, a small
+        // negative timestamp would have crossed zero and been accepted.
+        let received = Instant::now();
+        sleep(Duration::from_millis(5));
+        assert!(request_clock(-1, received).is_err());
+        assert!(request_clock(0, received).is_ok());
+    }
+
+    #[test]
+    fn a_renewal_clock_cannot_overflow() {
+        let clock = request_clock(i64::MAX, Instant::now()).unwrap();
+        assert_eq!(clock(), i64::MAX);
+    }
 }
