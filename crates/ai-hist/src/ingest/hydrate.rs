@@ -11,7 +11,14 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 when `session_events` gained the per-message raw provider facts
+/// (`request_id`, `stop_reason`, `agent_version`, `is_sidechain`, `is_meta`,
+/// `turn_id`). The columns are added by migration, but the values only exist in
+/// the transcripts: without a re-parse every row already indexed would keep
+/// them null forever, which reads exactly like a provider that never recorded
+/// them.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -3692,5 +3699,83 @@ mod tests {
                 "materialized_local".into()
             )]
         );
+    }
+
+    /// The raw-fact columns are added by migration, but their values live only
+    /// in the transcript. A database indexed by an older parser must re-read
+    /// the file once so the rows already stored gain them; without the parser
+    /// version bump those rows would stay null forever, which reads exactly
+    /// like a provider that never recorded the facts.
+    #[test]
+    fn a_stale_parser_version_backfills_the_per_message_raw_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join(".claude/projects/app/session-facts.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"sessionId":"session-facts","uuid":"u1","cwd":"/work/app","type":"user","message":{"role":"user","content":"first prompt"},"timestamp":"2026-08-31T10:00:00Z","version":"2.1.96"}"#, "\n",
+                r#"{"sessionId":"session-facts","uuid":"a1","cwd":"/work/app","type":"assistant","requestId":"req_1","version":"2.1.96","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]},"timestamp":"2026-08-31T10:00:01Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-facts", Some(&transcript));
+        drop(conn);
+
+        let first =
+            hydrate_session_at_with_home(&db, &options("claude", "session-facts"), dir.path())
+                .unwrap();
+        assert_eq!(first.status, "hydrated");
+        assert_eq!(first.evidence.events, 2);
+
+        // Exactly what an upgraded database looks like: the columns exist,
+        // because the migration added them, and every row is null, because
+        // nothing has re-read the transcript yet.
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "UPDATE session_events SET request_id=NULL, stop_reason=NULL, agent_version=NULL, \
+             is_sidechain=NULL, is_meta=NULL, turn_id=NULL",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE observation_hydration_checkpoints SET parser_version = 0 \
+             WHERE source='claude' AND session_id='session-facts'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reparsed =
+            hydrate_session_at_with_home(&db, &options("claude", "session-facts"), dir.path())
+                .unwrap();
+        assert_eq!(reparsed.status, "updated");
+
+        let conn = open_db(&db).unwrap();
+        let row: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT request_id, stop_reason, agent_version FROM session_events \
+                 WHERE role = 'assistant'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("req_1".into()),
+                Some("end_turn".into()),
+                Some("2.1.96".into())
+            )
+        );
+        drop(conn);
+
+        // And the backfill happens once: the next hydration has nothing to do.
+        let settled =
+            hydrate_session_at_with_home(&db, &options("claude", "session-facts"), dir.path())
+                .unwrap();
+        assert_eq!(settled.status, "unchanged");
     }
 }

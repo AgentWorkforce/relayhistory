@@ -19,10 +19,10 @@ test('missing database reads are explicit empty cache operations', async () => {
       contractVersion: 4, scope: 'local', sessions: [], nextCursor: null,
     });
     assert.deepEqual(await getSessionToolCallsPage('claude', 'missing', { dbPath }), {
-      contractVersion: 1, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
+      contractVersion: 2, source: 'claude', sessionId: 'missing', toolCalls: [], nextCursor: null,
     });
     assert.deepEqual(await getSessionFileEditsPage('claude', 'missing', { dbPath }), {
-      contractVersion: 1, source: 'claude', sessionId: 'missing', fileEdits: [], nextCursor: null,
+      contractVersion: 2, source: 'claude', sessionId: 'missing', fileEdits: [], nextCursor: null,
     });
     assert.deepEqual(await recent({ dbPath, limit: 20 }), []);
     assert.deepEqual(await stats({ dbPath }), {
