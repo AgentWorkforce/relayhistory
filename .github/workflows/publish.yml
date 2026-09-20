@@ -846,17 +846,32 @@ jobs:
           PY
       - name: cargo publish dry-run
         run: cargo publish --dry-run -p ai-hist --allow-dirty --locked
-      - name: Publish to crates.io
+      - name: Check whether this version is already on crates.io
+        id: crate-gate
         if: ${{ !inputs.dry_run }}
         run: |
           set -euo pipefail
-          if curl -sf "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
+          # crates.io 403s requests without a User-Agent, which would look like
+          # a miss and try to republish an existing version.
+          if curl -sf -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
+            "https://crates.io/api/v1/crates/ai-hist/${VERSION}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "ai-hist ${VERSION} already exists on crates.io; skip"
-            exit 0
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-          # Trusted publishing (GitHub OIDC). Do not set CARGO_REGISTRY_TOKEN:
-          # an empty token makes Cargo skip OIDC and fail with
-          # "please provide a non-empty token".
+      - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run && steps.crate-gate.outputs.exists != 'true' }}
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run && steps.crate-gate.outputs.exists != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Dry-run already compiled the package. The token is the short-lived
+          # crates.io credential minted from GitHub OIDC above, not a repo secret.
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
   plugins:
