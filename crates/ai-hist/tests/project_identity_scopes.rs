@@ -116,6 +116,82 @@ fn global_and_conditional_git_config_resolve_a_rewritten_remote() {
         "the replaced file's conditional include must be gone with it"
     );
 
+    // --- both default global files are read, not one of them --------------
+    //
+    // Checked against git 2.43 in this environment, not taken from the
+    // documentation, because the obvious reading is the wrong one:
+    // `git config --global --list` shows only `~/.gitconfig`, which makes it
+    // look as though the XDG file is ignored once that exists. It is not —
+    // that is the *write* target. Both files are read, in XDG-then-home
+    // order:
+    //
+    //   ~/.config/git/config  [url "https://xdg.example/"] insteadOf = gh:
+    //   ~/.gitconfig          [user] name = Someone
+    //   $ git remote get-url origin   → https://xdg.example/Org/Repo.git
+    //
+    // Reading only `~/.gitconfig` when it exists would drop a rewrite git
+    // applies, which is the same class of defect as not reading the global
+    // scopes at all — and it would hit hardest on machines that keep their
+    // git configuration in XDG and have a `~/.gitconfig` holding nothing but
+    // a name and an email.
+    // The section above left an explicit global file in place, and these
+    // assertions are about the *defaults*.
+    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    let xdg_config = home.join(".config/git/config");
+    fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
+    fs::write(
+        &xdg_config,
+        "[url \"https://xdg.example/\"]\n\tinsteadOf = xdg:\n",
+    )
+    .unwrap();
+    fs::write(home.join(".gitconfig"), "[user]\n\tname = Someone\n").unwrap();
+    let xdg_only = repo_with_origin(&home.join("xdg-only"), "thing", "xdg:acme/thing.git");
+    assert_eq!(
+        project_identity(&xdg_only).project_key,
+        "xdg.example/acme/thing",
+        "the XDG global file must still be read when ~/.gitconfig exists"
+    );
+
+    // Both files contribute, and where they rewrite the same prefix the one
+    // git reads first wins — again as git answers it, not as it reads.
+    fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Someone\n[url \"https://home.example/\"]\n\tinsteadOf = hm:\n",
+    )
+    .unwrap();
+    let home_scoped = repo_with_origin(&home.join("home-scoped"), "thing", "hm:acme/thing.git");
+    assert_eq!(
+        project_identity(&home_scoped).project_key,
+        "home.example/acme/thing",
+        "~/.gitconfig must be read beside the XDG file, not instead of it"
+    );
+    assert_eq!(
+        project_identity(&xdg_only).project_key,
+        "xdg.example/acme/thing",
+        "and reading one must not stop the other from applying"
+    );
+
+    // `GIT_CONFIG_GLOBAL` replaces *both* of them, which is the one case where
+    // a default global file is genuinely ignored.
+    fs::write(
+        home.join("explicit.gitconfig"),
+        "[url \"https://explicit.example/\"]\n\tinsteadOf = xdg:\n",
+    )
+    .unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", home.join("explicit.gitconfig"));
+    assert_eq!(
+        project_identity(&xdg_only).project_key,
+        "explicit.example/acme/thing",
+        "an explicit global file must replace the XDG one as well as the home one"
+    );
+    assert_eq!(
+        project_identity(&home_scoped).method,
+        ProjectKeyMethod::PathFallback,
+        "and the home file's rewrites must go with it"
+    );
+    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    fs::remove_file(&xdg_config).unwrap();
+
     // --- a remote's URLs accumulate across scopes, head first -------------
     //
     // This is what git does, checked rather than assumed: with

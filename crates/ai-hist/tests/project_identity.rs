@@ -715,3 +715,207 @@ fn events_of_a_nested_delegated_thread_reach_the_nearest_cataloged_ancestor() {
         "the loan displaced a repository the thread had resolved for itself"
     );
 }
+
+/// A path key is not an answer, so the walk must climb past one and keep
+/// looking — including past it to the *next* parent.
+///
+/// `path` is the absence of a canonical key, which is why
+/// [`inheritable_parent_key_sql`] lends `remote` and `inherited` and nothing
+/// else. A walk that stopped at the first non-null ancestor key would hand a
+/// machine-local directory down to every descendant *labelled* `inherited`,
+/// which reads as a resolved answer and is not one — and it would do so in
+/// preference to a real repository sitting one parent along, so the two passes
+/// would key the same tree differently.
+#[test]
+fn a_path_keyed_ancestor_does_not_stop_the_walk() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("path-ancestor.db")).unwrap();
+
+    // The earlier-recorded parent resolved to nothing but its own directory,
+    // and has no ancestor to improve on it. The later one carries the
+    // repository.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'alt', '/tmp/scratch', '/tmp/scratch', 'path', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'root', '/work/app', 'github.com/acme/app', 'remote', 2, 'full')",
+        [],
+    )
+    .unwrap();
+    let edge = |parent: &str, child: &str, created: i64| {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    };
+    edge("alt", "leaf", 1);
+    edge("root", "leaf", 2);
+    // The leaf is evidence only: events, no catalog row.
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+         VALUES ('codex', 'leaf', 'leaf-1', 1, 'assistant', 'text', 'deep work')",
+        [],
+    )
+    .unwrap();
+
+    refresh_project_identity(&conn).unwrap();
+
+    let keyed: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT project_key, project_key_method FROM session_events \
+             WHERE source = 'codex' AND session_id = 'leaf'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        keyed,
+        (
+            Some("github.com/acme/app".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "a path key was passed down as if it were a project"
+    );
+    // The path-keyed parent is left as it is: it has nothing better available.
+    assert_eq!(
+        session_key(&conn, "codex", "alt"),
+        (
+            Some("/tmp/scratch".to_string()),
+            Some(ProjectKeyMethod::PathFallback.as_str().to_string())
+        ),
+    );
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// A generation the catalog does not hold must not strand the one below it.
+///
+/// `root -> middle -> leaf` with `middle` evidence-only leaves `leaf` joined
+/// to nothing by pass 2's single statement, so its *row* keeps a path key or
+/// none while the root carries the repository. Its events then cannot be keyed
+/// either without the two disagreeing.
+#[test]
+fn a_cataloged_session_inherits_across_an_uncataloged_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("across.db")).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'root', '/work/app', 'github.com/acme/app', 'remote', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    // The leaf is cataloged; the generation between them is not.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'leaf', 2, 'shallow')",
+        [],
+    )
+    .unwrap();
+    for (parent, child, created) in [("root", "middle", 1), ("middle", "leaf", 2)] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', ?4, ?4)",
+            rusqlite::params![parent, format!("{parent}->{child}"), child, created],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+         VALUES ('codex', 'leaf', 'leaf-1', 1, 'assistant', 'text', 'work')",
+        [],
+    )
+    .unwrap();
+
+    refresh_project_identity(&conn).unwrap();
+    assert_eq!(
+        session_key(&conn, "codex", "leaf"),
+        (
+            Some("github.com/acme/app".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "a cataloged session was stranded by an uncataloged generation above it"
+    );
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// A session the catalog holds and its events must name one project.
+///
+/// "This session's key reads NULL" and "the catalog does not hold this
+/// session" are different questions, and only the second belongs to the event
+/// pass. Answering the first with an ancestor's key keys the events while the
+/// row stays empty — two rows of the same database naming different projects,
+/// which pass 3 cannot reconcile afterwards because it may not lower a key's
+/// rank.
+///
+/// Here nothing in the tree has a canonical key at all: the root resolved only
+/// to its own directory. The right answer is that the leaf says nothing,
+/// because a path key is not a project — and, whatever the answer, the row and
+/// its events must give the same one.
+#[test]
+fn a_cataloged_session_and_its_events_never_name_different_projects() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("cataloged-null.db")).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'root', '/tmp/scratch', '/tmp/scratch', 'path', 1, 'full')",
+        [],
+    )
+    .unwrap();
+    // Cataloged, with no key yet and nothing of its own to resolve one from.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'leaf', 2, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'root', 'rel', 'leaf', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_events (source, session_id, event_uid, ts_ms, role, kind, text) \
+         VALUES ('codex', 'leaf', 'leaf-1', 1, 'assistant', 'text', 'work')",
+        [],
+    )
+    .unwrap();
+
+    refresh_project_identity(&conn).unwrap();
+
+    let row = session_key(&conn, "codex", "leaf");
+    let event: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT project_key, project_key_method FROM session_events \
+             WHERE source = 'codex' AND session_id = 'leaf'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row, event,
+        "a cataloged session and its events disagreed about the project"
+    );
+    assert_eq!(
+        row,
+        (None, None),
+        "a machine-local path was reported as this session's project"
+    );
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}

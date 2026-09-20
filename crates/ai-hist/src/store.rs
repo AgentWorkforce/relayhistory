@@ -2292,19 +2292,64 @@ fn inherit_project_keys(conn: &Connection) -> Result<usize> {
         // state read-only: a sync with nothing to inherit must not take the
         // write lock, both because it is pure cost and because a database held
         // by another writer would otherwise turn a no-op into a failure.
-        if !conn
+        let mut changed = 0;
+        if conn
             .prepare(&format!(
                 "SELECT 1 FROM sessions WHERE {inheritable} LIMIT 1"
             ))?
             .exists([])?
         {
-            break;
+            changed += conn.execute(&sql, [])?;
         }
-        let changed = conn.execute(&sql, [])?;
+        // The statement above joins a child straight to its parent's catalog
+        // row, so it cannot see past a generation the catalog does not hold —
+        // and a delegated thread that delegates again is routine. The walk
+        // covers exactly that gap, and has to run whether or not the statement
+        // found anything: its probe asks a strictly narrower question than
+        // this one does, so breaking on it would skip the walk entirely.
+        changed += inherit_across_uncataloged_generations(conn)?;
         written += changed;
         if changed == 0 {
             break;
         }
+    }
+    Ok(written)
+}
+
+/// The part of pass 2 that cannot be one statement: a cataloged session whose
+/// delegating ancestor is cataloged but whose *intermediate* generations are
+/// not.
+///
+/// `r -> c -> g` with `c` evidence-only leaves `g` joined to nothing, so `g`
+/// keeps a path key or none while the root it was delegated from carries the
+/// repository. The events of such a session must not be keyed where the
+/// session row itself is not, so this fills the row and lets the ordinary
+/// denormalizing pass carry it down.
+fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
+    let pending: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT source, session_id FROM sessions \
+             WHERE (project_key IS NULL OR project_key_method = 'path') \
+               AND EXISTS (SELECT 1 FROM session_relationships r \
+                     WHERE r.source = sessions.source \
+                       AND r.child_session_id = sessions.session_id)",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut update = conn.prepare(
+        "UPDATE sessions SET project_key = ?3, project_key_method = 'inherited' \
+         WHERE source = ?1 AND session_id = ?2 \
+           AND (project_key IS NULL OR project_key_method = 'path')",
+    )?;
+    let mut written = 0;
+    for (source, session_id) in pending {
+        let Some(key) = lendable_ancestor_key_for(conn, &source, &session_id)? else {
+            continue;
+        };
+        written += update.execute(params![source, session_id, key])?;
     }
     Ok(written)
 }
@@ -2536,8 +2581,8 @@ fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
 /// pass lends them an ancestor's key.
 const EVENT_INHERITED_RANK: i64 = 2;
 
-/// Pass 4: a delegated thread with no catalog row of its own takes the key of
-/// its nearest cataloged ancestor.
+/// Pass 4: a delegated thread the catalog does not hold at all takes the key
+/// of its nearest lendable ancestor.
 ///
 /// This is where a rollup is won or lost. A delegated thread is evidence, not
 /// a session — a Codex subagent rollout and a Claude sidechain produce
@@ -2551,7 +2596,10 @@ const EVENT_INHERITED_RANK: i64 = 2;
 /// that delegates again is routine: for `root -> child -> grandchild` with
 /// neither middle generation cataloged, the grandchild's events found no row
 /// to join and kept a path key or none at all — the deeper the delegation, the
-/// more certainly its work vanished from the project it belongs to.
+/// more certainly its work vanished from the project it belongs to. The walk
+/// climbs past an ancestor stuck on its own `path` too, for the same reason
+/// pass 2 does not lend one: a machine-local directory is the absence of an
+/// answer, not an answer to pass down.
 ///
 /// The loan is ranked like everything else here: it fills an event with no key
 /// or a merely path-derived one, and replaces a borrowed key that has gone
@@ -2559,10 +2607,17 @@ const EVENT_INHERITED_RANK: i64 = 2;
 /// subagent that genuinely ran in another checkout stays filed where it ran.
 fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
     let stored_rank = event_key_rank_sql("project_key", "project_key_method");
-    // A session is a candidate when it has no key of its own to take and its
-    // events are not already holding something at least as good.
+    // "No catalog row" is asked as exactly that, and not as "its key reads
+    // NULL". The two are different sessions with different answers: a session
+    // the catalog *does* hold is pass 2's business, and keying its events from
+    // an ancestor while its own row stays null would put the row and its
+    // events in two different projects — with pass 3 unable to reconcile them,
+    // since it may not lower a key's rank. A cataloged session's events follow
+    // its row, whatever that row ends up saying.
     let candidate = format!(
-        "{EVENT_SESSION_KEY_SQL} IS NULL \
+        "NOT EXISTS (SELECT 1 FROM sessions s \
+             WHERE s.source = session_events.source \
+               AND s.session_id = session_events.session_id) \
            AND ({stored_rank}) <= {EVENT_INHERITED_RANK} \
            AND EXISTS (SELECT 1 FROM session_relationships r \
                  WHERE r.source = session_events.source \
@@ -2588,11 +2643,7 @@ fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
     ))?;
     let mut written = 0;
     for (source, session_id) in pending {
-        let mut visited: HashSet<String> = HashSet::new();
-        visited.insert(session_id.clone());
-        let Some(key) =
-            nearest_cataloged_ancestor_key(conn, &source, &session_id, &mut visited, 0)?
-        else {
+        let Some(key) = lendable_ancestor_key_for(conn, &source, &session_id)? else {
             continue;
         };
         written += update.execute(params![source, session_id, key])?;
@@ -2600,11 +2651,32 @@ fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
-/// The key of the nearest ancestor the catalog actually holds, following the
-/// same parent order, cycle protection and depth bound the session inheritance
-/// pass uses — generations the catalog does not hold are stepped over rather
-/// than stopping the search.
-fn nearest_cataloged_ancestor_key(
+/// [`lendable_ancestor_key`] for one session, with the visited set opened.
+fn lendable_ancestor_key_for(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(session_id.to_string());
+    lendable_ancestor_key(conn, source, session_id, &mut visited, 0)
+}
+
+/// The key of the nearest ancestor that has one worth lending, following the
+/// same parent order, cycle protection and depth bound the rest of this module
+/// uses.
+///
+/// Two kinds of ancestor are climbed *past* rather than stopping the search,
+/// and both are ordinary:
+///
+///   - one the catalog does not hold at all, because a delegated thread is
+///     evidence rather than a session;
+///   - one whose own key is only its `path`, which is the absence of an answer
+///     rather than one — [`inheritable_parent_key_sql`] lends `remote` and
+///     `inherited` and nothing else, and a walk that stopped at a path key
+///     would label a machine-local directory `inherited` and call it a
+///     project.
+fn lendable_ancestor_key(
     conn: &Connection,
     source: &str,
     session_id: &str,
@@ -2614,29 +2686,29 @@ fn nearest_cataloged_ancestor_key(
     if depth >= PROJECT_KEY_INHERITANCE_PASSES {
         return Ok(None);
     }
-    let parents: Vec<(String, Option<String>)> = conn
+    let parents: Vec<(String, Option<String>, Option<String>)> = conn
         .prepare(
             "SELECT r.parent_session_id, \
                     (SELECT p.project_key FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.project_key_method FROM sessions p \
                      WHERE p.source = r.source AND p.session_id = r.parent_session_id) \
              FROM session_relationships r \
              WHERE r.source = ?1 AND r.child_session_id = ?2 \
              ORDER BY r.created_ms, r.parent_session_id",
         )?
         .query_map(params![source, session_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (parent_id, key) in parents {
+    for (parent_id, key, method) in parents {
         if !visited.insert(parent_id.clone()) {
             continue;
         }
-        if key.is_some() {
+        if key.is_some() && matches!(method.as_deref(), Some("remote") | Some("inherited")) {
             return Ok(key);
         }
-        if let Some(found) =
-            nearest_cataloged_ancestor_key(conn, source, &parent_id, visited, depth + 1)?
-        {
+        if let Some(found) = lendable_ancestor_key(conn, source, &parent_id, visited, depth + 1)? {
             return Ok(Some(found));
         }
     }

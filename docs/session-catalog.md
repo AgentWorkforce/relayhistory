@@ -165,8 +165,10 @@ vector, so `burn --group-by project` and a RelayHistory rollup agree on the
 same checkout. No `git` subprocess is involved: git's configuration is read
 directly, in the scopes and precedence git itself uses — system
 (`$GIT_CONFIG_SYSTEM` or `/etc/gitconfig`, unless `$GIT_CONFIG_NOSYSTEM`), then
-global (`$GIT_CONFIG_GLOBAL`, else `$XDG_CONFIG_HOME/git/config` and
-`~/.gitconfig`), then the repository's own, following a linked worktree's
+global (`$GIT_CONFIG_GLOBAL`, else **both** `$XDG_CONFIG_HOME/git/config` and
+`~/.gitconfig`, in that order — git reads both, and `git config --global
+--list` showing only the latter is about where git *writes*), then the
+repository's own, following a linked worktree's
 `gitdir:` pointer. `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`,
 `onbranch:`) are expanded at the position of their own line, so a value written
 before an include is overridden by it and one written after it wins — as git
