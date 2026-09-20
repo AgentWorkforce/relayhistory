@@ -14,10 +14,10 @@ use std::time::Instant;
 /// selected provider's parser actually produces, and can see which kinds
 /// those are.
 pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
-/// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
-/// started being indexed under that child id: existing databases re-parse once
-/// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+/// Bumped to 3 when Codex child acquisition became bounded. Existing
+/// checkpoints must re-run so a formerly unbounded relationship claim cannot
+/// survive an unchanged short-circuit.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -89,6 +89,9 @@ struct SourceSnapshot {
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
+    /// A bounded Codex child search cannot assert complete relationship coverage
+    /// when newer date directories exist beyond its search window.
+    codex_relationship_complete: bool,
 }
 
 fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
@@ -203,7 +206,9 @@ fn hydrate_session_at_with_home_and_connectors(
         && previous
             .as_ref()
             .is_some_and(|(_, parser_version, _)| *parser_version == HYDRATION_PARSER_VERSION)
-        && (!options.include_related || previous.as_ref().is_some_and(|(_, _, included)| *included))
+        && previous
+            .as_ref()
+            .is_some_and(|(_, _, included)| *included == options.include_related)
         && target.discovery_state.as_deref() == Some("full")
     {
         return build_result(
@@ -986,7 +991,7 @@ pub(crate) fn build_remote_result(
         })
         // A remote or plugin snapshot that covers less than a full session
         // names what it left out, exactly as the local path does.
-        .chain(partial_coverage_diagnostic(options, &coverage))
+        .chain(partial_coverage_diagnostic(options, &coverage, false))
         .collect(),
         coverage,
     })
@@ -1120,6 +1125,7 @@ fn source_snapshot(
             records: 0,
             path: Some(path),
             claude_subagents: Vec::new(),
+            codex_relationship_complete: true,
         });
     }
 
@@ -1166,7 +1172,15 @@ fn source_snapshot(
             }
         }
     }
+    let mut codex_relationship_complete = true;
     if options.source == "codex" && options.include_related {
+        codex_relationship_complete = match path.parent() {
+            Some(directory) => codex_child_scan_complete(directory)?,
+            None => false,
+        };
+        if !codex_relationship_complete {
+            stamp.push_str("|codex-relationships-limited");
+        }
         for child in codex_children(&path, &options.session_id)? {
             stamp.push('|');
             stamp.push_str(&file_stamp(&child)?);
@@ -1180,6 +1194,7 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_subagents: subagents,
+        codex_relationship_complete,
     })
 }
 
@@ -1510,12 +1525,10 @@ fn ingest_codex(conn: &Connection, options: &HydrateSessionOptions, path: &Path)
 /// relationship coverage, which is a complete claim over a child nobody looked
 /// for.
 ///
-/// A child cannot start before its parent, so the eligible set is the parent's
-/// date directory and every later one. Bounding the walk that way keeps it
-/// proportional to what was recorded after this session rather than to the
-/// whole store, and keeps the coverage claim earned: everything eligible is
-/// inspected. Directory names are zero-padded, so ordering them as text orders
-/// them by date.
+/// Inspect the parent's date and the next date. A targeted request must have
+/// a fixed cost with respect to the age of the parent session. If later date
+/// directories exist, `codex_child_scan_complete` prevents this bounded search
+/// from claiming complete relationship coverage.
 fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
     let Some(root) = directory
         .parent()
@@ -1524,27 +1537,46 @@ fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
     else {
         return collect_matching_files(directory, "rollout-", "jsonl");
     };
-    let Some(from) = date_key(directory) else {
+    let Some((_, through)) = codex_child_scan_dates(directory) else {
         return collect_matching_files(directory, "rollout-", "jsonl");
     };
-    let mut days = Vec::new();
-    for year in sorted_dirs(root)? {
-        for month in sorted_dirs(&year)? {
-            for day in sorted_dirs(&month)? {
-                if date_key(&day).is_some_and(|key| key >= from) {
-                    days.push(day);
-                }
-            }
-        }
-    }
-    if days.is_empty() {
-        days.push(directory.to_path_buf());
-    }
-    let mut candidates = Vec::new();
-    for day in days {
-        candidates.extend(collect_matching_files(&day, "rollout-", "jsonl")?);
-    }
+    let mut candidates = collect_matching_files(directory, "rollout-", "jsonl")?;
+    candidates.extend(collect_matching_files(
+        &root.join(through),
+        "rollout-",
+        "jsonl",
+    )?);
     Ok(candidates)
+}
+
+fn codex_child_scan_dates(directory: &Path) -> Option<(String, String)> {
+    let from = date_key(directory)?;
+    let day = chrono::NaiveDate::parse_from_str(&from, "%Y/%m/%d").ok()?;
+    let through = day.succ_opt()?.format("%Y/%m/%d").to_string();
+    Some((from, through))
+}
+
+fn codex_child_scan_complete(directory: &Path) -> Result<bool> {
+    let Some((_, through)) = codex_child_scan_dates(directory) else {
+        return Ok(false);
+    };
+    let Some(root) = directory
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return Ok(false);
+    };
+    let Some(year) = sorted_dirs(root)?.pop() else {
+        return Ok(true);
+    };
+    let Some(month) = sorted_dirs(&year)?.pop() else {
+        return Ok(true);
+    };
+    let Some(day) = sorted_dirs(&month)?.pop() else {
+        return Ok(true);
+    };
+    Ok(date_key(&day).is_some_and(|key| key <= through))
 }
 
 /// `YYYY/MM/DD` for a rollout date directory, as a sortable string.
@@ -1723,13 +1755,27 @@ fn build_result(
             &options.session_id,
         )?);
     }
+    if options.source == "codex" && options.include_related && !snapshot.codex_relationship_complete
+    {
+        diagnostics.push(HydrationDiagnostic {
+            code: "HYDRATION_BOUNDED_RELATIONSHIPS".to_string(),
+            message: "Codex child search examined the session's date and the next date; newer rollout dates exist, so relationship coverage is incomplete".to_string(),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
     // Declared coverage narrowed by what this request actually asked for, not a
     // literal: a provider whose local parser only reads prompts has not
     // produced the other four kinds no matter how cleanly the pass completed,
     // and reporting `full` for it is a well-formed answer computed over
     // nothing.
-    let coverage = effective_coverage(options);
-    diagnostics.extend(partial_coverage_diagnostic(options, &coverage));
+    let coverage = effective_coverage(options, snapshot.codex_relationship_complete);
+    diagnostics.extend(partial_coverage_diagnostic(
+        options,
+        &coverage,
+        options.source == "codex" && !snapshot.codex_relationship_complete,
+    ));
     Ok(HydrateSessionResult {
         contract_version: SESSION_HYDRATION_CONTRACT_VERSION,
         source: options.source.clone(),
@@ -1760,11 +1806,18 @@ fn build_result(
 /// `relationship` as covered there would tell a merger that unexamined
 /// delegation was fully indexed, which is the same overstatement as the
 /// hard-coded `full` this contract replaced.
-fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
+fn effective_coverage(
+    options: &HydrateSessionOptions,
+    codex_relationship_complete: bool,
+) -> Vec<EvidenceKind> {
     crate::discover::declared_evidence_kinds(&options.source)
         .iter()
         .copied()
-        .filter(|kind| options.include_related || *kind != EvidenceKind::Relationship)
+        .filter(|kind| {
+            *kind != EvidenceKind::Relationship
+                || (options.include_related
+                    && (options.source != "codex" || codex_relationship_complete))
+        })
         .collect()
 }
 
@@ -1782,6 +1835,7 @@ fn effective_coverage(options: &HydrateSessionOptions) -> Vec<EvidenceKind> {
 fn partial_coverage_diagnostic(
     options: &HydrateSessionOptions,
     coverage: &[EvidenceKind],
+    incomplete_relationships: bool,
 ) -> Option<HydrationDiagnostic> {
     let missing = missing_from(coverage);
     if coverage.is_empty() || missing.is_empty() {
@@ -1799,9 +1853,14 @@ fn partial_coverage_diagnostic(
     Some(HydrationDiagnostic {
         code: "HYDRATION_PARTIAL_COVERAGE".to_string(),
         message: format!(
-            "{} evidence covers {}; this hydration produces no {}{}",
+            "{} evidence covers {}; this hydration {} {}{}",
             options.source,
             crate::source_evidence::join_kinds(coverage),
+            if incomplete_relationships {
+                "does not fully cover"
+            } else {
+                "produces no"
+            },
             crate::source_evidence::join_kinds(&missing),
             if declined {
                 " (include_related is off, so delegation evidence is not read)"
@@ -2825,6 +2884,74 @@ mod tests {
         // able to reach every eligible child for `full` to be earned.
         assert!(result.coverage.contains(&EvidenceKind::Relationship));
         assert_eq!(result.capability, "full");
+    }
+
+    #[test]
+    fn old_codex_hydration_bounds_child_search_and_reports_partial_relationship_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join(".codex/sessions");
+        let root = sessions.join("2025/01/01/rollout-root.jsonl");
+        codex_rollout(&root, "root", None, "2025-01-01T23:59:00Z");
+        codex_rollout(
+            &sessions.join("2025/01/02/rollout-next-day.jsonl"),
+            "next-day",
+            Some("root"),
+            "2025-01-02T00:00:30Z",
+        );
+        let later = sessions.join("2026/09/20/rollout-later.jsonl");
+        codex_rollout(&later, "later", Some("root"), "2026-09-20T12:00:00Z");
+        assert!(!codex_child_candidates(root.parent().unwrap())
+            .unwrap()
+            .contains(&later));
+
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "root", Some(&root));
+        drop(conn);
+        let result =
+            hydrate_session_at_with_home(&db, &options("codex", "root"), dir.path()).unwrap();
+        assert!(result.related_session_ids.contains(&"next-day".to_string()));
+        assert!(!result.related_session_ids.contains(&"later".to_string()));
+        assert!(!result.coverage.contains(&EvidenceKind::Relationship));
+        assert_eq!(result.capability, "partial");
+    }
+
+    #[test]
+    fn local_hydration_reports_coverage_option_changes_as_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join(".claude/projects/app/root.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "{\"sessionId\":\"root\",\"uuid\":\"u1\",\"cwd\":\"/work/app\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"},\"timestamp\":\"2026-08-31T10:00:00Z\"}\n").unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "root", Some(&transcript));
+        drop(conn);
+
+        let mut request = options("claude", "root");
+        let full = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert_eq!(full.capability, "full");
+        assert_eq!(
+            hydrate_session_at_with_home(&db, &request, dir.path())
+                .unwrap()
+                .status,
+            "unchanged"
+        );
+
+        request.include_related = false;
+        let narrowed = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert_ne!(narrowed.status, "unchanged");
+        assert_eq!(narrowed.capability, "partial");
+        assert_eq!(
+            hydrate_session_at_with_home(&db, &request, dir.path())
+                .unwrap()
+                .status,
+            "unchanged"
+        );
+
+        request.include_related = true;
+        let widened = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
+        assert_ne!(widened.status, "unchanged");
+        assert_eq!(widened.capability, "full");
     }
 
     /// The opt-out explains an absent `relationship` and nothing else. A

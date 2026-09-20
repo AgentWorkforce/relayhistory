@@ -73,6 +73,14 @@ Claude or Codex session hydrated that way reports `partial`. That is the
 difference between "this session has no delegation" and "nothing looked"; the
 diagnostic says which by naming `include_related`.
 
+Codex child acquisition reads the selected session's date directory and the
+following date, which finds children spawned across midnight without making an
+old session scan years of newer rollouts. If later date directories exist, the
+bounded search may miss delayed descendants; the result omits `relationship`
+from `coverage`, reports `partial`, and includes
+`HYDRATION_BOUNDED_RELATIONSHIPS`. A full sync can index relationships across
+the archive.
+
 A source plugin declares its own `coverage` the same way, and the same
 distinction applies to it: `covered_kinds` names what the acquisition
 *examined*, so a complete export of a session that has no file edits still
