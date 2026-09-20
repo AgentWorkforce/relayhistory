@@ -21,13 +21,34 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 15, catalog contract version 3, hydration contract version 2,
+version 16, catalog contract version 4, hydration contract version 2,
 session-relationship contract version 1, and session evidence contract version
 1, normalizes nullable fields, maps native errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
+
+## Session sourcing ownership
+
+RelayHistory is the single owner of acquiring, parsing and storing session
+evidence for every harness. Downstream consumers — including
+[`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
+pricing, cost and analytics — read that evidence through the `ai-hist` crate's
+`SessionStore` facade rather than parsing harness logs themselves. New harnesses
+are added here and nowhere else.
+
+`ai-hist` is an in-process crate, so that buys one writer *implementation*, not
+one writer process: a consumer that calls `sync`, `hydrate` or `watch` holds a
+read-write connection in its own process, while every mutation still goes
+through this crate's schema, migrations, sync lock, hydration locks and WAL busy
+handler.
+
+See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
+decision, the rejected alternatives and the per-source capture matrix, and
+[`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
+must expose.
 
 ## Optional services and package boundaries
 

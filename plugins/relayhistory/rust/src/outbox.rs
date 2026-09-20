@@ -630,19 +630,19 @@ fn session_cwd(conn: &Connection, source: &str, session_id: &str) -> Option<Stri
         .filter(|s| !s.is_empty())
 }
 
+/// The session's `origin` remote, through the one shared implementation.
+///
+/// Previously `git -C <cwd> remote get-url origin`. A subprocess is the wrong
+/// tool here on three counts: `git` is not guaranteed to be on `PATH` where a
+/// push runs, a non-zero exit is indistinguishable from "this checkout has no
+/// remote" (and so silently downgraded a real repository to the cwd basename,
+/// which is how the project store fragmented), and the outbox would be a
+/// second implementation of remote discovery that can drift from the one
+/// stamping `sessions.project_key`. `ai_hist::project_identity` reads
+/// `.git/config` directly and understands linked worktrees, which the old
+/// `is_dir` guard plus subprocess did not.
 fn git_origin_url(cwd: &str) -> Option<String> {
-    if !Path::new(cwd).is_dir() {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .args(["-C", cwd, "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!url.is_empty()).then_some(url)
+    ai_hist::project_identity::origin_remote_url(Path::new(cwd))
 }
 
 fn session_project_id(
