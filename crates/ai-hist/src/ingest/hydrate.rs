@@ -1588,6 +1588,9 @@ fn ingest_cursor(
         project.as_deref(),
         mtime_ms,
         0,
+        // Hydration takes no byte checkpoint of its own: it re-reads the whole
+        // file every time, so there is no scanned boundary to stay behind.
+        u64::MAX,
     )?;
     // Authoritative about both ends of the window, having just read the whole
     // file: an expanding merge would keep a mtime endpoint an earlier parser

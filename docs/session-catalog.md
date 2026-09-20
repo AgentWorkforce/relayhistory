@@ -471,6 +471,23 @@ How each adapter works:
   terminated is left alone: publishing it would put evidence at a byte offset
   the checkpoint does not consider consumed.
 
+  For the same reason, indexing stops at the byte position the scan consumed
+  through. Cursor writes continuously, so it can append between the scan and
+  the whole-file read; those bytes are past the checkpoint this run commits, so
+  indexing them would publish evidence the next sync reads again from the
+  checkpoint — and an untimed prompt re-read after the mtime moved is a
+  duplicate, not an upsert. The append is picked up by the next sync instead,
+  from the offset that still points at it.
+
+  An incremental read also leaves the timestamps of records it is merely
+  re-reading alone. The mtime moves on every append, and it is the fallback
+  stamp for a record with no recorded time, so re-deriving it for an older
+  record would silently redate evidence stored under a different one — and
+  since `history` rows before the resumed offset are deliberately not
+  rewritten, the event would end up disagreeing with the prompt of its own
+  turn. Only records at or past the resumed offset take the current mtime;
+  earlier untimed records keep the stamp they already have.
+
   A transcript that cannot be read — it vanished between the scan and the
   index, or it is not valid UTF-8 — **fails** the sync. It is not indexed as an
   empty session. That matters because the rebuild has already deleted the rows
@@ -480,11 +497,14 @@ How each adapter works:
   retries the same offset.
 
   A rebuild also **replaces** both ends of `sessions.first_activity_ms` /
-  `last_activity_ms` rather than merging into them. The usual merge widens the
-  window, which is right for an incremental read that saw only the tail — but a
-  `MAX()` can never retract an endpoint an earlier, prompt-only parser derived
-  from the file mtime, because a real recorded timestamp is almost always
-  smaller than it.
+  `last_activity_ms`, and `sessions.last_assistant_text`, rather than merging
+  into them. The usual merge widens the window and keeps whatever prose it
+  already had, which is right for an incremental read that saw only the tail —
+  but a `MAX()` can never retract an endpoint an earlier, prompt-only parser
+  derived from the file mtime, because a real recorded timestamp is almost
+  always smaller than it; and a rebuild that has just re-read the whole source
+  and found no assistant prose would otherwise leave the catalog quoting a
+  reply the transcript no longer contains.
 
   ### Timestamps
 

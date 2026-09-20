@@ -3668,14 +3668,21 @@ fn upsert_session_inner(
     raw_path: Option<&str>,
     window: ActivityWindow,
 ) -> Result<()> {
-    let (first_activity, last_activity) = match window {
+    // `last_assistant_text` follows the same rule as the window. A pass that
+    // saw only part of the session must not erase prose it did not read, but a
+    // rebuild has just re-read the whole source: if there is no assistant
+    // prose in it any more, keeping the old value would leave the catalog
+    // quoting a reply the transcript no longer contains.
+    let (first_activity, last_activity, assistant_text) = match window {
         ActivityWindow::Expand => (
             "first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms)",
             "last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms)",
+            "last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text)",
         ),
         ActivityWindow::Replace => (
             "first_activity_ms = excluded.first_activity_ms",
             "last_activity_ms = excluded.last_activity_ms",
+            "last_assistant_text = excluded.last_assistant_text",
         ),
     };
     conn.execute(
@@ -3688,7 +3695,7 @@ fn upsert_session_inner(
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          {first_activity}, \
          {last_activity}, \
-         last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
+         {assistant_text}, \
          raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
@@ -3812,6 +3819,9 @@ struct PreparedCursorTranscript {
     /// The byte offset this sync resumed from. Records before it are already
     /// in `history`; see [`ingest_cursor_transcript`].
     history_from_offset: u64,
+    /// How far the byte scan actually got, and therefore how far the
+    /// checkpoint this run will commit reaches. Indexing must not go past it.
+    scanned_through: u64,
 }
 
 struct PreparedCursorSync {
@@ -3853,6 +3863,7 @@ fn sync_cursor_with_scan_hook(
             Some(&transcript.project),
             transcript.timestamp_ms,
             transcript.history_from_offset,
+            transcript.scanned_through,
         )
         .with_context(|| format!("index Cursor transcript {}", transcript.path.display()))?;
         inserted += outcome.prompts_inserted;
@@ -3907,6 +3918,9 @@ struct ScannedCursorTranscript {
     advanced: bool,
     /// Where the byte cursor resumed from.
     resumed_from: u64,
+    /// The byte position the scan consumed through, which is what this run's
+    /// checkpoint will record.
+    consumed_through: u64,
 }
 
 fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<ScannedCursorTranscript> {
@@ -3961,6 +3975,7 @@ fn scan_cursor_transcript(jsonl: &Path, saved: Option<&Value>) -> Result<Scanned
         restarted: offset == 0,
         advanced: consumed != offset,
         resumed_from: offset,
+        consumed_through: consumed,
     })
 }
 
@@ -4032,6 +4047,7 @@ fn prepare_cursor_sync(
                     timestamp_ms: scan.timestamp_ms,
                     restarted: scan.restarted,
                     history_from_offset: scan.resumed_from,
+                    scanned_through: scan.consumed_through,
                 });
             }
         }
@@ -4042,6 +4058,31 @@ fn prepare_cursor_sync(
         errors,
         files_seen,
     })
+}
+
+/// The timestamp a previous pass stored for the record at `record_offset`.
+///
+/// Every event derived from one record shares that record's byte offset as the
+/// prefix of its `event_uid`, so any one of them answers the question. The
+/// prefix is compared with `substr` rather than `LIKE` because an offset is
+/// digits but the separator is not, and `LIKE` would treat `_` as a wildcard.
+fn stored_cursor_record_ts(
+    conn: &Connection,
+    session_id: &str,
+    record_offset: u64,
+) -> Result<Option<i64>> {
+    let prefix = record_offset.to_string();
+    use rusqlite::OptionalExtension as _;
+    Ok(conn
+        .query_row(
+            "SELECT ts_ms FROM session_events \
+             WHERE source = 'cursor' AND session_id = ? \
+               AND substr(event_uid, 1, length(?) + 1) = ? || ':' \
+             ORDER BY id LIMIT 1",
+            params![session_id, prefix, prefix],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Drop every row a previous read of this Cursor transcript produced.
@@ -4120,6 +4161,7 @@ pub(crate) fn ingest_cursor_transcript(
     project: Option<&str>,
     mtime_ms: i64,
     history_from_offset: u64,
+    index_through: u64,
 ) -> Result<CursorTranscriptOutcome> {
     // An unreadable transcript is a failure, not an empty one. Swallowing the
     // error here would index the session as having no records at all — after
@@ -4144,6 +4186,15 @@ pub(crate) fn ingest_cursor_transcript(
     {
         let record_offset = offset;
         offset += line.len() as u64;
+        // Cursor can append between the byte scan and this read. Those bytes
+        // are past the checkpoint the scan committed, so indexing them would
+        // publish evidence the next sync reads again from the checkpoint —
+        // and an untimed prompt re-read after the mtime moved is a duplicate,
+        // not an upsert. Stop at what was actually scanned; the append is
+        // picked up by the next sync, from the offset that still points at it.
+        if offset > index_through {
+            break;
+        }
         let line = line.trim_end_matches(['\n', '\r']);
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -4195,7 +4246,18 @@ pub(crate) fn ingest_cursor_transcript(
             Some(ts) => ts,
             None => {
                 outcome.used_mtime_fallback = true;
-                mtime_ms
+                // The mtime moves on every append, so re-deriving it for an
+                // *old* record would silently redate evidence that was stored
+                // under a different one. Worse, the `history` row for that same
+                // turn is not rewritten on an incremental read, so the prompt
+                // and its event would drift apart. A record this pass is only
+                // re-reading keeps the stamp it already has; only records at or
+                // past the resumed offset take the current mtime.
+                if record_offset < history_from_offset {
+                    stored_cursor_record_ts(conn, session_id, record_offset)?.unwrap_or(mtime_ms)
+                } else {
+                    mtime_ms
+                }
             }
         };
         let message_id = message
@@ -6618,9 +6680,10 @@ mod tests {
 
         // A transcript that vanished between the scan and the read.
         let missing = dir.path().join("gone/gone.jsonl");
-        let error = super::ingest_cursor_transcript(&conn, &missing, "s-gone", None, 1, 0)
-            .err()
-            .unwrap_or_else(|| panic!("expected an error for a vanished transcript"));
+        let error =
+            super::ingest_cursor_transcript(&conn, &missing, "s-gone", None, 1, 0, u64::MAX)
+                .err()
+                .unwrap_or_else(|| panic!("expected an error for a vanished transcript"));
         assert!(
             format!("{error:#}").contains("read Cursor transcript"),
             "the failure must name the transcript it could not read: {error:#}"
@@ -6631,7 +6694,7 @@ mod tests {
         let binary = dir.path().join("bin/bin.jsonl");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(&binary, [0x7b, 0xff, 0xfe, 0x0a]).unwrap();
-        let error = super::ingest_cursor_transcript(&conn, &binary, "s-bin", None, 1, 0)
+        let error = super::ingest_cursor_transcript(&conn, &binary, "s-bin", None, 1, 0, u64::MAX)
             .err()
             .unwrap_or_else(|| panic!("expected an error for a non-UTF-8 transcript"));
         assert!(
@@ -6791,7 +6854,8 @@ mod tests {
         );
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0, u64::MAX)
+            .unwrap();
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rehydrate"), 2);
 
         fs::write(
@@ -6806,7 +6870,8 @@ mod tests {
         .unwrap();
         // What targeted hydration does around the parser.
         super::clear_cursor_session_evidence(&conn, "s-rehydrate").unwrap();
-        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-rehydrate", None, 1, 0, u64::MAX)
+            .unwrap();
 
         assert_eq!(cursor_row_count(&conn, "tool_calls", "s-rehydrate"), 1);
         assert_eq!(cursor_row_count(&conn, "file_edits", "s-rehydrate"), 1);
@@ -6840,9 +6905,16 @@ mod tests {
         );
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let outcome =
-            super::ingest_cursor_transcript(&conn, &transcript, "s-untimed", None, 7_777, 0)
-                .unwrap();
+        let outcome = super::ingest_cursor_transcript(
+            &conn,
+            &transcript,
+            "s-untimed",
+            None,
+            7_777,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
 
         assert!(
             outcome.used_mtime_fallback,
@@ -6868,6 +6940,226 @@ mod tests {
         // The window reports only what was actually recorded.
         assert_eq!(outcome.first_ts_ms, Some(1_789_587_420_000));
         assert_eq!(outcome.last_ts_ms, Some(1_789_587_420_000));
+    }
+
+    /// Group G. An append moves the file mtime, and the mtime is the fallback
+    /// stamp for records with no recorded time. Re-deriving it for records an
+    /// earlier pass already stored silently redates them.
+    ///
+    /// The divergence is the tell: `history` rows before the resumed offset
+    /// are deliberately not rewritten, so a redated event ends up disagreeing
+    /// with the prompt of its own turn.
+    ///
+    /// Positive control: re-deriving the mtime for every untimed record, this
+    /// failed with `an already-stored untimed event must keep its timestamp:
+    /// left: 9999, right: 4242` — the first turn's event had been dragged
+    /// forward to the new mtime while its history row stayed at the old one.
+    #[test]
+    fn appending_to_a_cursor_transcript_does_not_redate_events_already_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"first untimed"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-redate", first);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-redate", None, 4_242, 0, u64::MAX)
+            .unwrap();
+        let stored: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM session_events WHERE source = 'cursor' AND session_id = 's-redate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 4_242);
+
+        // Cursor appends a second untimed turn; the file mtime moves with it.
+        let resumed = first.len() as u64;
+        fs::write(
+            &transcript,
+            format!(
+                "{first}{}",
+                concat!(
+                    r#"{"role":"user","message":{"content":[{"type":"text","text":"second untimed"}]}}"#,
+                    "\n"
+                )
+            ),
+        )
+        .unwrap();
+        super::ingest_cursor_transcript(
+            &conn,
+            &transcript,
+            "s-redate",
+            None,
+            9_999,
+            resumed,
+            u64::MAX,
+        )
+        .unwrap();
+
+        let by_text: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT text, ts_ms FROM session_events \
+                 WHERE source = 'cursor' AND session_id = 's-redate' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            by_text[0],
+            ("first untimed".to_string(), 4_242),
+            "an already-stored untimed event must keep its timestamp"
+        );
+        assert_eq!(
+            by_text[1],
+            ("second untimed".to_string(), 9_999),
+            "a newly read untimed record takes the current mtime"
+        );
+        // And the event agrees with the prompt of its own turn, which the
+        // incremental read deliberately leaves alone.
+        let prompt_ts: i64 = conn
+            .query_row(
+                "SELECT timestamp_ms FROM history WHERE source = 'cursor' AND prompt = 'first untimed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt_ts, by_text[0].1);
+    }
+
+    /// Group H. Cursor can append between the byte scan and the read. Those
+    /// bytes are past the checkpoint this run commits, so indexing them
+    /// publishes evidence the next sync reads again — and an untimed prompt
+    /// re-read after the mtime moved duplicates rather than upserting.
+    ///
+    /// Positive control: without the `index_through` bound this failed with
+    /// `the post-scan append must not be indexed twice: left: 3, right: 2` —
+    /// the appended prompt was indexed once past the checkpoint and once more
+    /// on the next sync, under a new mtime.
+    #[test]
+    fn a_cursor_append_after_the_scan_is_not_indexed_past_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"seed turn"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-append", seed);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+
+        let appended = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"raced turn"}]}}"#,
+            "\n"
+        );
+        // The hook fires per transcript *before* that transcript is scanned,
+        // so appending to the first one while the second is being prepared
+        // lands exactly in the window this guards: after the first file's scan
+        // took its checkpoint, before the write phase reads the whole file.
+        let later = write_cursor_transcript(
+            dir.path(),
+            "s-later",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"unrelated"}]}}"#,
+                "\n"
+            ),
+        );
+        super::sync_cursor_with_scan_hook(&conn, &mut state, &root, &mut |path| {
+            if path == later {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap();
+                file.write_all(appended.as_bytes()).unwrap();
+            }
+        })
+        .unwrap();
+
+        // Whatever the first pass indexed, the second must not double it. The
+        // raced turn is untimed, so re-reading it after the mtime moved
+        // inserts a second row rather than upserting the first.
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 's-append' \
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "the post-scan append must not be indexed twice: {prompts:?}"
+        );
+        assert_eq!(
+            prompts,
+            vec!["seed turn".to_string(), "raced turn".to_string()]
+        );
+    }
+
+    /// Group I. A rebuild has re-read the whole source, so it owns
+    /// `last_assistant_text` too: if the reply is gone from the transcript,
+    /// the catalog must stop quoting it.
+    ///
+    /// Positive control: with the `COALESCE(excluded, sessions)` merge this
+    /// failed with `a rebuild must clear a reply the transcript no longer has:
+    /// left: Some("the old reply"), right: None`.
+    #[test]
+    fn a_rebuild_clears_an_assistant_reply_the_transcript_no_longer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_reply = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp><user_query>ask</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"the old reply"}]}}"#,
+            "\n"
+        );
+        let transcript = write_cursor_transcript(dir.path(), "s-reply", with_reply);
+        let root = dir.path().join(".cursor/projects");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+        let quoted: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 's-reply'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quoted.as_deref(), Some("the old reply"));
+
+        // Cursor rewrites the transcript without the reply.
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp><user_query>ask again</user_query>"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        super::sync_cursor(&conn, &mut state, &root).unwrap();
+
+        let quoted: Option<String> = conn
+            .query_row(
+                "SELECT last_assistant_text FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 's-reply'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            quoted, None,
+            "a rebuild must clear a reply the transcript no longer has"
+        );
     }
 
     /// Group D. Only newline-terminated records may be indexed, matching
@@ -6902,7 +7194,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let outcome =
-            super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0).unwrap();
+            super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0, u64::MAX)
+                .unwrap();
         assert_eq!(
             cursor_row_count(&conn, "history", "s-partial"),
             1,
@@ -6914,7 +7207,8 @@ mod tests {
         // Cursor terminates the line. Now it is indexed, exactly once, at the
         // byte offset the checkpoint covers.
         fs::write(&transcript, format!("{complete}{unterminated}\n")).unwrap();
-        super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-partial", None, 1, 0, u64::MAX)
+            .unwrap();
         let prompts: Vec<String> = conn
             .prepare("SELECT prompt FROM history WHERE source = 'cursor' ORDER BY timestamp_ms")
             .unwrap()
@@ -7054,7 +7348,8 @@ mod tests {
         );
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        super::ingest_cursor_transcript(&conn, &transcript, "s-multi", None, 1, 0).unwrap();
+        super::ingest_cursor_transcript(&conn, &transcript, "s-multi", None, 1, 0, u64::MAX)
+            .unwrap();
 
         // One call, three edits.
         let calls = crate::session_tool_calls(&conn, "s-multi", Some("cursor")).unwrap();
@@ -7096,6 +7391,7 @@ mod tests {
             Some("/home/dev/demo"),
             7_000_000_000_000,
             0,
+            u64::MAX,
         )
         .unwrap();
 
@@ -7193,6 +7489,7 @@ mod tests {
             Some("/home/dev/demo"),
             1,
             0,
+            u64::MAX,
         )
         .unwrap();
         assert_eq!(outcome.models, vec!["claude-4.5-sonnet".to_string()]);
@@ -7247,6 +7544,7 @@ mod tests {
             Some("/home/dev/demo"),
             4_242,
             0,
+            u64::MAX,
         )
         .unwrap();
         assert!(outcome.used_mtime_fallback);
@@ -7263,8 +7561,16 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         for _ in 0..2 {
-            super::ingest_cursor_transcript(&conn, &path, "s-repeat", Some("/home/dev/demo"), 1, 0)
-                .unwrap();
+            super::ingest_cursor_transcript(
+                &conn,
+                &path,
+                "s-repeat",
+                Some("/home/dev/demo"),
+                1,
+                0,
+                u64::MAX,
+            )
+            .unwrap();
         }
         let counts = |table: &str| {
             conn.query_row(
