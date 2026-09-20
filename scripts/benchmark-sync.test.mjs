@@ -238,11 +238,14 @@ function report(phases, calibrationMs = 100) {
   return { phases, calibrationMs };
 }
 
+// The tests below that exercise scaling set `calibration: "applied"`
+// explicitly, because the committed policy no longer applies it by default.
 const gateThresholds = {
   policy: {
     minRecordsPerSecondFactor: 0.5,
     maxElapsedMsFactor: 2,
     maxPeakRssFactor: 1.5,
+    calibration: "applied",
     absoluteFloors: { elapsedMs: 40 },
   },
   profiles: {
@@ -328,6 +331,96 @@ test("a phase that produced nothing is a failure, not a silent pass", () => {
   );
 });
 
+test("the committed gate accepts both observed CI runners and still catches 3x", () => {
+  // The two real `verify` runs on this branch, replayed against the committed
+  // thresholds. One of them used to fail on a completely healthy runner.
+  const runs = {
+    "6973P-C": {
+      calibrationMs: 129.0,
+      machine: { cpu: "Intel(R) Xeon(R) 6973P-C" },
+      phases: [
+        { phase: "cold_sync", recordsPerSecond: 478.6, peakRssBytes: 12644352 },
+        { phase: "incremental_sync", elapsedMs: 423.3, peakRssBytes: 10297344 },
+        { phase: "unchanged_sync", elapsedMs: 47.1, peakRssBytes: 9687040 },
+        { phase: "hydrate_cold", recordsPerSecond: 406.3, peakRssBytes: 10895360 },
+        { phase: "hydrate_unchanged", elapsedMs: 10.5, peakRssBytes: 8708096 },
+      ],
+    },
+    "8573C": {
+      calibrationMs: 166.8,
+      machine: { cpu: "INTEL(R) XEON(R) PLATINUM 8573C" },
+      phases: [
+        { phase: "cold_sync", recordsPerSecond: 631.0, peakRssBytes: 12476416 },
+        { phase: "incremental_sync", elapsedMs: 272.9, peakRssBytes: 10395648 },
+        { phase: "unchanged_sync", elapsedMs: 50.8, peakRssBytes: 9646080 },
+        { phase: "hydrate_cold", recordsPerSecond: 296.7, peakRssBytes: 10936320 },
+        { phase: "hydrate_unchanged", elapsedMs: 14.1, peakRssBytes: 8634368 },
+      ],
+    },
+  };
+  const tripled = (run) => ({
+    ...run,
+    phases: run.phases.map((phase) => ({
+      ...phase,
+      ...(phase.recordsPerSecond === undefined
+        ? {} : { recordsPerSecond: phase.recordsPerSecond / 3 }),
+      ...(phase.elapsedMs === undefined ? {} : { elapsedMs: phase.elapsedMs * 3 }),
+    })),
+  });
+  for (const [cpu, run] of Object.entries(runs)) {
+    const healthy = evaluateGate(run, thresholds, "ci-debug");
+    assert.equal(healthy.ok, true, `${cpu} healthy: ${healthy.failures.join("; ")}`);
+    assert.deepEqual(healthy.warnings, [], `${cpu} is a known baseline CPU, so nothing to warn`);
+    // Every margin at or above the 2x the policy asks for, on both CPUs.
+    for (const check of healthy.checks.filter((c) => c.metric !== "peakRssBytes")) {
+      const margin = check.metric === "recordsPerSecond"
+        ? check.value / check.bound : check.bound / check.value;
+      assert.ok(margin >= 2, `${cpu} ${check.phase}.${check.metric} margin ${margin.toFixed(2)}x`);
+    }
+    assert.equal(evaluateGate(tripled(run), thresholds, "ci-debug").ok, false,
+      `${cpu} must go red on a 3x regression`);
+  }
+});
+
+test("unfamiliar hardware is called out without failing the gate", () => {
+  const onKnownCpu = {
+    calibrationMs: 147.9,
+    machine: { cpu: "Intel(R) Xeon(R) 6973P-C" },
+    phases: [{ phase: "cold_sync", recordsPerSecond: 479, peakRssBytes: 1 }],
+  };
+  // Same numbers, different CPU: a warning, and only a warning.
+  const elsewhere = { ...onKnownCpu, machine: { cpu: "Apple M2 Max" } };
+  const verdict = evaluateGate(elsewhere, thresholds, "ci-debug");
+  assert.match(verdict.warnings.join("\n"), /this is Apple M2 Max/);
+  assert.ok(
+    !verdict.failures.some((failure) => /Apple M2 Max/.test(failure)),
+    "an unfamiliar CPU is never itself a failure",
+  );
+  assert.deepEqual(evaluateGate(onKnownCpu, thresholds, "ci-debug").warnings, []);
+});
+
+test("a calibration far from the baseline runs is reported, not applied", () => {
+  const diagnostic = {
+    policy: { minRecordsPerSecondFactor: 0.5, calibration: "diagnostic",
+      calibrationWarnBand: { min: 0.7, max: 1.4 } },
+    profiles: { demo: { calibrationMs: 100, phases: { cold_sync: { recordsPerSecond: 600 } } } },
+  };
+  // Twice as long on the reference, but the measurement itself is healthy:
+  // green, with the discrepancy said out loud.
+  const report = { calibrationMs: 200, phases: [{ phase: "cold_sync", recordsPerSecond: 610 }] };
+  const verdict = evaluateGate(report, diagnostic, "demo");
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.calibrationApplied, false);
+  assert.equal(verdict.checks[0].normalized, 610, "the reading is not scaled");
+  assert.match(verdict.warnings.join("\n"), /2\.00x as long/);
+
+  // The same thresholds with the factor switched back on scale it instead.
+  const applied = { ...diagnostic, policy: { ...diagnostic.policy, calibration: "applied" } };
+  const scaled = evaluateGate(report, applied, "demo");
+  assert.equal(scaled.calibrationApplied, true);
+  assert.equal(scaled.checks[0].normalized, 1220);
+});
+
 test("a slower machine is normalized away, but a slower code path is not", () => {
   // Everything three times slower, including the reference workload: a busy or
   // smaller runner, not a regression.
@@ -371,7 +464,16 @@ test("the committed thresholds file is usable by the gate", () => {
   assert.ok(thresholds.policy.maxPeakRssFactor >= 1);
   const gateProfile = thresholds.profiles["ci-debug"];
   assert.ok(gateProfile, "the PR gate profile exists");
-  assert.ok(gateProfile.measuredOn?.commit, "the gate baseline records where it came from");
+  // The baselines must say which machines produced them: bounds are absolute
+  // numbers, so where they came from is part of what they mean.
+  const measuredOn = gateProfile.measuredOn;
+  assert.ok(measuredOn?.machineClass, "the gate baseline names the machine class");
+  assert.ok(measuredOn.cpusSeen?.length >= 1, "and the CPUs it was measured on");
+  assert.ok(measuredOn.runs?.length >= 1, "and the runs it came from");
+  for (const run of measuredOn.runs) {
+    assert.ok(run.commit && run.run, "each baseline run is identified by commit and run id");
+    assert.ok(measuredOn.cpusSeen.includes(run.cpu), "and names a CPU the profile lists");
+  }
   assert.ok(gateProfile.calibrationMs > 0, "the gate baseline carries its reference workload");
   assert.deepEqual(Object.keys(gateProfile.phases).sort(), [...PHASE_ORDER].sort());
   assert.ok(!PHASE_ORDER.includes(CALIBRATION_PHASE), "calibration is not a gated phase");

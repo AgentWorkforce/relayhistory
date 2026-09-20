@@ -11,6 +11,22 @@
     "minRecordsPerSecondFactor": 0.5,
     "maxElapsedMsFactor": 2,
     "maxPeakRssFactor": 1.5,
+    "calibrationComment": [
+      "\"applied\" scales throughput and elapsed checks by the reference workload;",
+      "\"diagnostic\" measures and reports it but does not let it decide. It is",
+      "diagnostic because two ubuntu-latest runners disagreed about which of them was",
+      "faster depending on the phase -- the reference said the 6973P-C was 1.29x",
+      "quicker while cold_sync said the 8573C was 1.32x quicker -- so no single scalar",
+      "can normalize all five phases. Scaling by it failed an entirely healthy run",
+      "(PR #202, job 106023782674). The 2x and 1.5x margins are the contention",
+      "allowance; a second, sometimes anti-correlated corrector on top made the gate",
+      "worse. Flip this to \"applied\" to restore the previous behaviour."
+    ],
+    "calibration": "diagnostic",
+    "calibrationWarnBand": {
+      "min": 0.7,
+      "max": 1.4
+    },
     "absoluteFloorsComment": [
       "A ceiling derived from a very small baseline measures the runner, not the",
       "code. These floors raise such a ceiling and never lower one. On the tiny PR",
@@ -25,7 +41,7 @@
   },
   "profiles": {
     "ci-debug": {
-      "description": "Fast PR gate: an unoptimized build against a small synthetic store, sized to keep the whole gate inside 60 s on a 4-core runner.",
+      "description": "Fast PR gate: an unoptimized build against a small synthetic store, sized to keep the whole gate inside 60 s on a 4-core runner. Baselines are the worst value each metric took across the observed ubuntu-latest CPUs, so both pass with the issue's 2x/1.5x factors and neither CPU sets a bar the other cannot clear.",
       "cargoProfile": "debug",
       "store": {
         "seed": 176,
@@ -42,36 +58,57 @@
         "toolResultBytes": 1024
       },
       "measuredOn": {
-        "commit": "c8fbc648a98f80d795fab0ce23ce9b0262fa3551",
-        "machine": "Intel(R) Xeon(R) Processor @ 2.80GHz (4 cores), linux/x64",
+        "machineClass": "github-hosted ubuntu-latest, 4 cores, 15.6 GiB, Node 20, debug build",
+        "cpusSeen": [
+          "Intel(R) Xeon(R) 6973P-C",
+          "INTEL(R) XEON(R) PLATINUM 8573C"
+        ],
+        "runs": [
+          {
+            "cpu": "Intel(R) Xeon(R) 6973P-C",
+            "run": "35490225839",
+            "job": "106023782674",
+            "commit": "a898c7a",
+            "calibrationMs": 129
+          },
+          {
+            "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+            "run": "35489681478",
+            "job": "106022358292",
+            "commit": "7fa7690",
+            "calibrationMs": 166.8
+          }
+        ],
+        "rule": "each baseline is the worse of the two runs -- lowest throughput, longest time, largest RSS -- rounded away from the bound (floors down, ceilings up) so that rounding cannot make a limit stricter than the run it came from, and a bound set by one CPU cannot fail the other",
         "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
         "cargoProfile": "debug",
-        "at": "2026-09-19T19:27:46.922Z"
+        "at": "2026-09-20",
+        "supersedes": "baselines measured on an Intel Xeon 2.80GHz development box at 2a1e81a. They failed the gate on a healthy runner because that machine is not in the pool the gate runs on, and the calibration factor that was supposed to bridge the difference is anti-correlated with cold_sync across these CPUs."
       },
       "phases": {
         "cold_sync": {
-          "recordsPerSecond": 642,
-          "peakRssBytes": 12591104
+          "recordsPerSecond": 478,
+          "peakRssBytes": 12644352
         },
         "incremental_sync": {
-          "elapsedMs": 268,
-          "peakRssBytes": 10510336
+          "elapsedMs": 424,
+          "peakRssBytes": 10395648
         },
         "unchanged_sync": {
-          "elapsedMs": 62,
-          "peakRssBytes": 9629696
+          "elapsedMs": 51,
+          "peakRssBytes": 9687040
         },
         "hydrate_cold": {
-          "recordsPerSecond": 261,
-          "peakRssBytes": 10985472
+          "recordsPerSecond": 296,
+          "peakRssBytes": 10936320
         },
         "hydrate_unchanged": {
-          "elapsedMs": 17,
-          "peakRssBytes": 8830976
+          "elapsedMs": 15,
+          "peakRssBytes": 8708096
         }
       },
       "repeat": 2,
-      "calibrationMs": 192.9
+      "calibrationMs": 147.9
     },
     "full": {
       "description": "Release-build matrix run by .github/workflows/benchmark-sync.yml on workflow_dispatch. Not a PR gate: it has no stored baselines, it publishes numbers.",

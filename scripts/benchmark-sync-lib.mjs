@@ -344,17 +344,38 @@ export function formatNumber(value) {
 }
 
 /**
- * How much slower this machine is, right now, than the one the baselines were
- * recorded on — measured by the reference workload in the harness.
+ * How long this machine took on the reference workload, relative to the runs
+ * the baselines were recorded on. Above 1 is slower, below 1 is faster.
  *
- * A throughput floor recorded on one machine says nothing on another, and a
- * shared CI runner under load is several times slower than the same runner
- * idle. Dividing that out is what keeps the gate about the code. The factor is
- * clamped: a calibration that lands outside this range is evidence something is
- * wrong with the measurement, not a licence to normalize an arbitrary amount of
- * regression away.
+ * This started out as a *corrector*: scale each measurement by it, and a
+ * throughput floor recorded on one machine would mean something on another.
+ * Two GitHub runners disproved that. On `ubuntu-latest` the pool contains at
+ * least two CPUs, and they do not agree about which of them is faster:
+ *
+ *     measurement            6973P-C   8573C    faster   spread
+ *     calibration (time)       129.0   166.8      A       1.29x
+ *     cold_sync (rec/s)        478.6   631.0      B       1.32x
+ *     incremental (time)       423.3   272.9      B       1.55x
+ *     unchanged (time)          47.1    50.8      A       1.08x
+ *     hydrate_cold (rec/s)     406.3   296.7      A       1.37x
+ *     hydrate_unchanged (time)  10.5    14.1      A       1.34x
+ *
+ * The calibration agrees with three phases and contradicts two — and the two
+ * it contradicts, `cold_sync` and `incremental_sync`, are exactly the ones a
+ * scaled comparison failed on a healthy runner. No single scalar can fix that,
+ * because the phases themselves disagree about which machine is faster; it is
+ * a property of the hardware, not of the reference's composition.
+ *
+ * So the factor is now a **diagnostic**, not a decision, unless
+ * `policy.calibration` is set to `"applied"`. Contention, which is the case it
+ * does track, is absorbed instead by the plain 2x throughput and time margins
+ * — those margins *are* the contention allowance, and stacking a second,
+ * sometimes anti-correlated corrector on top made the gate worse.
  */
 export const CALIBRATION_CLAMP = { min: 0.2, max: 8 };
+
+/** Outside this band, the baselines probably came from different hardware. */
+export const CALIBRATION_WARN_BAND = { min: 0.7, max: 1.4 };
 
 export function calibrationFactor(measuredMs, baselineMs) {
   if (!Number.isFinite(measuredMs) || !Number.isFinite(baselineMs)) return null;
@@ -409,14 +430,38 @@ export function evaluateGate(report, thresholds, profileName) {
   const measured = new Map((report.phases ?? []).map((phase) => [phase.phase, phase]));
   const checks = [];
   const failures = [];
+  const warnings = [];
   const calibration = calibrationFactor(report.calibrationMs, profile.calibrationMs);
+  // Applying the factor is opt-in; see CALIBRATION_CLAMP for why. Measuring it
+  // is not, because it is how a baseline taken on other hardware is spotted.
+  const applied = policy.calibration === "applied";
   if (profile.calibrationMs && !calibration) {
-    failures.push(
-      "the profile stores a calibration baseline but this run measured none; "
-      + "throughput cannot be compared across machines without it",
+    const complaint = "the profile stores a calibration baseline but this run measured none";
+    if (applied) failures.push(`${complaint}; measurements cannot be scaled without it`);
+    else warnings.push(`${complaint}, so there is no reading on the machine this ran on`);
+  }
+  // A timing ratio is a weak proxy for "is this the hardware the baselines came
+  // from". The profile records the CPUs it was measured on, so ask directly.
+  const cpu = report.machine?.cpu;
+  const cpusSeen = profile.measuredOn?.cpusSeen;
+  if (cpu && Array.isArray(cpusSeen) && cpusSeen.length > 0 && !cpusSeen.includes(cpu)) {
+    warnings.push(
+      `these baselines were measured on ${cpusSeen.join(" and ")}, and this is `
+      + `${cpu}. Bounds are absolute numbers from those machines, so a failure here may `
+      + "be the hardware rather than the code; compare against a run on the baseline class "
+      + "before treating it as a regression.",
     );
   }
-  const load = calibration?.factor ?? 1;
+  const band = policy.calibrationWarnBand ?? CALIBRATION_WARN_BAND;
+  if (calibration && (calibration.raw < band.min || calibration.raw > band.max)) {
+    warnings.push(
+      `the reference workload took ${calibration.raw.toFixed(2)}x as long here as in the `
+      + `baseline runs, outside the expected ${band.min}x-${band.max}x. The baselines were `
+      + "probably recorded on different hardware; re-measure them on this machine class "
+      + "before reading a failure below as a regression.",
+    );
+  }
+  const load = applied ? (calibration?.factor ?? 1) : 1;
   for (const [phaseName, baselines] of Object.entries(profile.phases ?? {})) {
     const phase = measured.get(phaseName);
     if (!phase) {
@@ -441,7 +486,7 @@ export function evaluateGate(report, thresholds, profileName) {
       const bound = rule.direction === "max"
         ? Math.max(baseline * rule.factor, floors[metric] ?? 0)
         : baseline * rule.factor;
-      const normalized = rule.scale ? rule.scale(Number(value), load) : Number(value);
+      const normalized = rule.scale && applied ? rule.scale(Number(value), load) : Number(value);
       const ok = rule.direction === "min" ? normalized >= bound : normalized <= bound;
       checks.push({
         phase: phaseName, metric, value: Number(value), normalized, baseline, bound, ok,
@@ -449,7 +494,7 @@ export function evaluateGate(report, thresholds, profileName) {
       if (!ok) {
         failures.push(
           `${phaseName}.${metric} = ${formatNumber(value)}` +
-          (rule.scale ? ` (${formatNumber(normalized)} machine-normalized)` : "") +
+          (rule.scale && applied ? ` (${formatNumber(normalized)} machine-normalized)` : "") +
           `, baseline ${formatNumber(baseline)}, ` +
           `${rule.direction === "min" ? "floor" : "ceiling"} ${formatNumber(bound)}`,
         );
@@ -462,11 +507,13 @@ export function evaluateGate(report, thresholds, profileName) {
   return {
     ok: failures.length === 0,
     profile: profileName,
+    calibrationApplied: applied,
     calibration: calibration
       ? { measuredMs: report.calibrationMs, baselineMs: profile.calibrationMs, ...calibration }
       : null,
     checks,
     failures,
+    warnings,
   };
 }
 
@@ -505,6 +552,16 @@ export function renderMarkdownTable(report) {
   return [header, rule, ...rows].join("\n");
 }
 
+/**
+ * Round a baseline away from the bound it produces: a throughput floor down, a
+ * time or memory ceiling up. Rounding the other way makes the limit fractionally
+ * stricter than the run it was measured from, which is how a baseline taken from
+ * a healthy run can fail that very run.
+ */
+export function roundBaseline(metric, value) {
+  return metric === "recordsPerSecond" ? Math.floor(value) : Math.ceil(value);
+}
+
 /** Baselines shaped for `scripts/benchmark-thresholds.json` from a measured run. */
 export function baselinesFromReport(report, metrics) {
   const phases = {};
@@ -515,7 +572,7 @@ export function baselinesFromReport(report, metrics) {
     for (const metric of wanted) {
       const value = phase[metric];
       if (value === null || value === undefined) continue;
-      entry[metric] = Math.round(Number(value));
+      entry[metric] = roundBaseline(metric, Number(value));
     }
     if (Object.keys(entry).length > 0) phases[phase.phase] = entry;
   }

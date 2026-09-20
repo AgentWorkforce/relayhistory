@@ -289,34 +289,69 @@ rounds per phase, the faster round reported. It takes roughly 15 s on a 4-core
 machine — well inside the 60 s budget — and the `full` matrix runs separately on
 `workflow_dispatch` through `.github/workflows/benchmark-sync.yml`.
 
-#### Why the gate is not machine-dependent
+#### Baselines belong to the machines that produced them
 
-A throughput floor recorded on one machine says nothing on another, and a shared
-runner under load can be several times slower than the same runner idle — which
-is exactly the shape of the regression the gate is looking for. Measured
-directly, the first version of this gate went red on a developer box simply
-because a neighbouring build was running.
+A throughput floor recorded on one machine says nothing on another. The gate's
+first design tried to bridge that with a **calibration phase** — a fixed
+reference workload beside the real ones (walk and read a small file tree, parse
+JSON, insert into a WAL+FTS5 database, commit periodically, checkpoint) — and
+scaled every throughput and elapsed check by
+`stored_calibration / measured_calibration`.
 
-So every run measures a **calibration phase** beside the real ones: a fixed
-reference workload built from the same materials as the code under test — walk
-and read a small file tree, parse JSON, insert into a WAL-mode SQLite database
-with an FTS5 index, commit periodically, checkpoint. Throughput and elapsed
-checks are then scaled by `stored_calibration / measured_calibration` before
-being compared, so what the gate compares is "what this phase would have cost on
-the machine the baseline came from". Peak RSS is not scaled: memory does not
-grow because the box is busy.
+**That did not work, and the numbers say why.** Two `ubuntu-latest` runners
+measured on this branch have different CPUs, and they do not agree about which
+of them is faster:
 
-The calibration deliberately touches neither the synthetic store nor the
-benchmark database and shares no code with the ingestion path, so a real
-slowdown in `sync` or `hydrate_session` cannot normalize itself away. A 3×
-slowdown patched into `ingest_claude_transcript_as` leaves the calibration at
-1.00× and turns three checks red; the same 3× applied to the whole machine
-leaves every check green. Both cases are covered by
-`scripts/benchmark-sync.test.mjs`.
+| measurement | Xeon 6973P-C | Xeon Platinum 8573C | faster | spread |
+|---|---:|---:|:--:|---:|
+| calibration (time) | 129.0 ms | 166.8 ms | 6973P-C | 1.29× |
+| `cold_sync` (rec/s) | 478.6 | 631.0 | 8573C | 1.32× |
+| `incremental_sync` (time) | 423.3 ms | 272.9 ms | 8573C | 1.55× |
+| `unchanged_sync` (time) | 47.1 ms | 50.8 ms | 6973P-C | 1.08× |
+| `hydrate_cold` (rec/s) | 406.3 | 296.7 | 6973P-C | 1.37× |
+| `hydrate_unchanged` (time) | 10.5 ms | 14.1 ms | 6973P-C | 1.34× |
 
-The factor is clamped to 0.2×–8×. A calibration outside that range is evidence
-that the measurement is wrong, not a licence to normalize an arbitrary amount of
-regression away, and the gate says when it clamped.
+The reference agrees with three phases and contradicts two — and the two it
+contradicts are `cold_sync` and `incremental_sync`, precisely the checks that a
+scaled comparison failed on a completely healthy runner (PR #202, job
+106023782674: 479 rec/s scaled down to 320 against a floor of 321). No single
+scalar can correct this, because the phases themselves disagree about which
+machine is faster. It is a property of the hardware, not of the reference's
+composition, and no amount of re-weighting the reference fixes it.
+
+So the gate now works the other way round:
+
+* **Baselines are measured on the machine class the gate runs on** — GitHub's
+  `ubuntu-latest` — and each one is the worse of the observed runs: the lowest
+  throughput, the longest time, the largest RSS, rounded away from the bound it
+  produces. A limit set by one CPU therefore cannot fail the other, and rounding
+  cannot make a limit stricter than the run it came from.
+* **The 2× and 1.5× margins are the contention allowance.** They already absorb
+  a busy runner; stacking a second, sometimes anti-correlated corrector on top
+  made the gate worse rather than better.
+* **The calibration is still measured, and still reported** — as a diagnostic.
+  Set `policy.calibration` to `"applied"` in the thresholds file to restore the
+  scaling; it defaults to `"diagnostic"`.
+
+Two warnings, neither of which fails the run, exist so that a failure is not
+silently read as a regression when it is really the hardware:
+
+* the running CPU is not one of `measuredOn.cpusSeen`;
+* the reference took more than `calibrationWarnBand` times as long as it did in
+  the baseline runs (0.7×–1.4×, which comfortably contains the observed pool at
+  0.87× and 1.13×).
+
+Both observed runners clear every bound by at least 2.00×, and a 3× regression
+turns the gate red on both — asserted against their recorded measurements in
+`scripts/benchmark-sync.test.mjs`, not argued. The calibration still touches
+neither the synthetic store nor the benchmark database and shares no code with
+the ingestion path, so switching it back to `"applied"` cannot let a real
+slowdown normalize itself away.
+
+One wording note, because it cost a real investigation: the factor is a ratio of
+*durations*, so a value below 1 means the machine was **faster**. The gate used
+to print it as "0.67x its speed", which reads as slower; it now spells out both
+halves.
 
 Bounds come from `scripts/benchmark-thresholds.json`:
 
@@ -344,6 +379,13 @@ node scripts/benchmark-sync.mjs --profile ci-debug --update-baselines
 
 Re-measuring records the commit, machine and toolchain it came from in the
 thresholds file, and the pull request has to say why the number moved.
+
+Re-measure **on the machine class the gate runs on**, not on a developer box.
+`--update-baselines` rounds each baseline away from the bound it produces, so
+the run it was taken from cannot fail on it; the rest — `measuredOn.cpusSeen`,
+the run ids, and taking the worse value when more than one machine has been
+observed — is currently done by hand, because harvesting a runner's numbers
+means reading them out of a CI log.
 
 ### 2026-09-19 baseline
 

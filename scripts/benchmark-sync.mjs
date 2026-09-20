@@ -386,12 +386,23 @@ async function main(argv) {
   const seconds = (report.totalWallMs / 1000).toFixed(1);
   if (verdict.calibration) {
     const { measuredMs, baselineMs, raw, factor, clamped } = verdict.calibration;
+    // `raw` is a ratio of durations, so below 1 means this machine was
+    // FASTER. The previous wording called it "0.67x its speed", which reads
+    // as slower and misled a real investigation; say both halves explicitly.
+    const pace = raw >= 1
+      ? `${raw.toFixed(2)}x as long, so ${raw.toFixed(2)}x slower`
+      : `${raw.toFixed(2)}x as long, so ${(1 / raw).toFixed(2)}x faster`;
     process.stdout.write(
-      `calibration: ${measuredMs.toFixed(1)} ms here vs ${baselineMs.toFixed(1)} ms ` +
-      `on the baseline machine — this run is ${raw.toFixed(2)}x its speed` +
-      `${clamped ? `, clamped to ${factor.toFixed(2)}x` : ""}. ` +
-      "Throughput and elapsed checks below are normalized by that.\n\n",
+      `calibration: ${measuredMs.toFixed(1)} ms here vs ${baselineMs.toFixed(1)} ms `
+      + `in the baseline runs — this machine took ${pace} on the reference workload`
+      + `${clamped ? `, clamped to ${factor.toFixed(2)}x` : ""}.\n`
+      + (verdict.calibrationApplied
+        ? "Throughput and elapsed checks below are scaled by that.\n\n"
+        : "Reported as a diagnostic; the checks below are not scaled by it.\n\n"),
     );
+  }
+  for (const warning of verdict.warnings ?? []) {
+    process.stdout.write(`warning: ${warning}\n\n`);
   }
   for (const check of verdict.checks) {
     const shown = check.normalized === check.value
@@ -409,10 +420,22 @@ async function main(argv) {
   if (!verdict.ok) {
     process.stderr.write(`\nsync/hydration throughput gate FAILED:\n`);
     for (const failure of verdict.failures) process.stderr.write(`  - ${failure}\n`);
+    if ((verdict.warnings ?? []).length > 0) {
+      // Do not soften the verdict — a new CI runner CPU must fail loudly rather
+      // than go quietly advisory — but say plainly that the bounds may not
+      // belong to this machine, so a developer does not read hardware as a bug.
+      process.stderr.write(
+        "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
+        + `${(verdict.calibration && thresholds.profiles[profileName].measuredOn?.machineClass)
+          || "another machine class"}, and this run was not on one of them. Off that class a\n`
+        + "failure here is as likely to be the hardware as the code. Compare against a run\n"
+        + "on the baseline class before treating it as a regression.\n",
+      );
+    }
     process.stderr.write(
       "\nIf this is an intended cost, re-measure with " +
       `\`node scripts/benchmark-sync.mjs --profile ${profileName} --update-baselines\` ` +
-      "and say why in the pull request.\n",
+      "on the baseline machine class and say why in the pull request.\n",
     );
     process.exitCode = 1;
     return;
