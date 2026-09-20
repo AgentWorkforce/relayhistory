@@ -29,7 +29,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `getSessionRelationships` reports continuity on its own `continuity` array.
   Plain `sync` re-reads a transcript once when it has no continuity evidence
   row, so an upgraded install backfills instead of skipping every unchanged
-  file on the stamp fast path. `HYDRATION_PARSER_VERSION` 2 -> 3;
+  file on the stamp fast path. `HYDRATION_PARSER_VERSION` 4 -> 5;
   `SESSION_RELATIONSHIP_CONTRACT_VERSION` 1 -> 2; native contract 15 -> 16.
 
 - Rebuild a delivery capture trigger that predates one of its table's columns.

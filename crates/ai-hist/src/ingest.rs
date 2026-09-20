@@ -10770,7 +10770,7 @@ mod tests {
             [],
         )
         .unwrap();
-        sync_codex(&conn, &mut state, dir.path()).unwrap();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
         let survived: String = conn
             .query_row(
                 "SELECT text FROM session_events WHERE session_id = 'forked' AND role = 'user'",

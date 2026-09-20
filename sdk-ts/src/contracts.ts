@@ -365,7 +365,7 @@ export interface GetSessionTreeOptions extends GetSessionRelationshipsOptions {
   /**
    * Which edges the walk follows. Omitted means delegation only, which is
    * what every caller got before continuity existed; naming continuity kinds
-   * rolls a resumed or forked conversation up to its origin.
+   * expands from an origin to its resumed, continued, or forked descendants.
    */
   relationshipKinds?: RelationshipType[];
 }

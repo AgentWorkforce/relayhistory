@@ -209,8 +209,8 @@ record uuid that linked two files.
 
 `getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`.
 Omitting it follows delegation edges only, so existing calls answer exactly as
-before; naming the continuity kinds rolls a resumed or forked conversation up
-to its origin instead:
+before; naming the continuity kinds expands from an origin to its resumed,
+continued, or forked descendants:
 
 ```ts
 const lineage = await getSessionTree({

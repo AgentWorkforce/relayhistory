@@ -491,7 +491,7 @@ test('continuity topology reaches the SDK and stays out of the delegation view',
     const delegation = await getSessionTree({ source: 'claude', sessionId: 'origin', dbPath });
     assert.deepEqual(delegation.nodes.map((node: SessionTreeNode) => node.sessionId), ['origin']);
 
-    // Naming the continuity kinds rolls the continuation up to its origin.
+    // Naming the continuity kinds expands from the origin to the continuation.
     const rolledUp = await getSessionTree({
       source: 'claude', sessionId: 'origin', dbPath,
       relationshipKinds: ['continuation', 'fork', 'resume'],

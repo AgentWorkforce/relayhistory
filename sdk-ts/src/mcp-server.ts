@@ -108,7 +108,7 @@ server.tool('get_session_relationships',
 }, READ, ({ source, session_id }) => call(() => getSessionRelationships({ source, sessionId: session_id })));
 
 server.tool('get_session_tree',
-  'Complete descendant tree for one session, with cycle protection and deterministic ordering. Follows delegation edges by default; pass relationship_kinds to roll a resumed or forked conversation up to its origin instead. Child events are not flattened into the parent.', {
+  'Complete descendant tree for one session, with cycle protection and deterministic ordering. Follows delegation edges by default; pass relationship_kinds to also include resumed, continued, or forked descendants of the root. Child events are not flattened into the parent.', {
   source: CATALOG_SOURCE,
   session_id: z.string().min(1),
   max_depth: z.number().int().min(1).max(64).optional(),

@@ -257,8 +257,8 @@ rules to the nodes it yields.
 means delegation only — defined as *every kind that is not a continuity kind*,
 not as a whitelist of `delegated`, so `materialized_local` keeps traversing as
 it always has and a delegation-only database answers byte-identically to before
-continuity existed. Naming the continuity kinds instead rolls a resumed or
-forked conversation up to its origin over the same bounded walk.
+continuity existed. Naming the continuity kinds instead expands from an origin
+to its resumed, continued, or forked descendants over the same bounded walk.
 `getSessionRelationships` reports continuity on its own `continuity` array, in
 both directions, leaving `asParent` and `asChild` delegation-only.
 
