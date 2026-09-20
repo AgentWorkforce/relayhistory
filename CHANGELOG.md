@@ -36,7 +36,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   rather than counted as done: the lock holder may already have walked past
   the provider that just wrote, so the forced sweep is retried 250 ms later,
   backing off to the backstop while the lock stays held, and the change is
-  swept as soon as a sync can take it.
+  swept as soon as a sync can take it. A forced sweep that *failed* is kept the
+  same way: a transient database error covered nothing either, and logging it
+  and waiting for the backstop loses the change it was woken for.
   A registration is re-made only when the directory it was made against is
   gone or has been replaced, so a deleted-and-recreated root is watched again
   instead of being silently reported as covered, and a live one is not

@@ -1861,6 +1861,124 @@ fn a_sweep_turned_away_by_another_sync_is_retried_not_dropped() {
     );
 }
 
+/// A sweep that *failed* has covered nothing either, and the change it was
+/// for is recorded nowhere else.
+///
+/// The sibling of the contended case, one door further along: the wake state
+/// was cleared when the debounce window opened, so an `Err` out of the tick —
+/// SQLite returning a transient I/O error, a provider that could not be read,
+/// a sync-state write that failed — takes the only record of the change with
+/// it. The loop logs the error and goes back to waiting, and the next chance
+/// is the backstop, by which time a ten-second session's transcript has been
+/// written and cleaned up again.
+///
+/// End to end against a real failure rather than a synthetic `Err`: the
+/// database path is a *directory* for the first ticks, which is what a real
+/// `open_db` refuses, and becomes writable again partway through.
+#[cfg(all(feature = "fs-events", unix))]
+#[test]
+fn a_sweep_that_failed_is_retried_not_dropped() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = home.path().join("history.db");
+    let root = home.path().join(".claude/projects");
+    std::fs::create_dir_all(&root).expect("the provider root");
+    // Nothing can open this as a database.
+    std::fs::create_dir(&db).expect("the unusable database path");
+
+    let (ticks, ticks_rx) = mpsc::channel();
+    let (errors, errors_rx) = mpsc::channel();
+    let tick: TickFn = {
+        let db = db.clone();
+        let home = home.path().to_path_buf();
+        Arc::new(move |force| {
+            let outcome = ai_hist::sync_tick_at_with_home(&db, &home, SyncOutput::Silent, force)
+                .map(ai_hist::watch::TickOutcome::from);
+            let _ = ticks.send(outcome.is_ok());
+            outcome
+        })
+    };
+    let running = RunningLoop::start(
+        {
+            let root = root.clone();
+            move |watch| {
+                watch
+                    .with_immediate(false)
+                    .with_fs_events(true)
+                    .with_roots(vec![ai_hist::discover::WatchRoot::tree(root)])
+                    .with_debounce_ms(100)
+                    // Ten minutes each: any sweep below can only have come
+                    // from the retry.
+                    .with_poll_interval_ms(600_000)
+                    .with_slow_poll_ms(600_000)
+                    .on_error(Arc::new(move |_| {
+                        let _ = errors.send(());
+                    }))
+            }
+        },
+        tick,
+    );
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // A session writes while the store cannot be opened.
+    let written = std::time::Instant::now();
+    write_claude_transcript(home.path(), "proj", "failed-session", 2);
+    errors_rx
+        .recv_timeout(ARRIVES_WITHIN)
+        .expect("the write drove no sweep at all");
+
+    // Control on the cadence, before the recovery: the retries back off the
+    // way the contended ones do. A fixed 250 ms would put a dozen failures in
+    // this window; doubling puts a handful.
+    let window = Duration::from_secs(3);
+    let mut failures = 1;
+    while written.elapsed() < window {
+        let left = window.saturating_sub(written.elapsed());
+        if errors_rx
+            .recv_timeout(left.min(Duration::from_millis(200)))
+            .is_ok()
+        {
+            failures += 1;
+        }
+    }
+    assert!(
+        (2..=8).contains(&failures),
+        "a failing forced sweep must be retried, and must back off doing it: \
+         {failures} failures in {window:?}"
+    );
+
+    // The store becomes usable. Nothing else can wake the loop now: both
+    // intervals are ten minutes away.
+    std::fs::remove_dir(&db).expect("free the database path");
+
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while catalog_session_count(&db, "claude", "failed-session") != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the change was consumed by the sweep that failed: nothing was \
+             retried once the store was usable"
+        );
+        std::thread::yield_now();
+    }
+
+    // Control: a sweep that succeeded is not retried.
+    while ticks_rx.recv_timeout(Duration::from_millis(600)).is_ok() {}
+    write_claude_transcript(home.path(), "proj", "healthy-session", 2);
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while catalog_session_count(&db, "claude", "healthy-session") != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a write with the store healthy must be swept as it always was"
+        );
+        std::thread::yield_now();
+    }
+    while ticks_rx.recv_timeout(Duration::from_millis(600)).is_ok() {}
+    assert_eq!(
+        ticks_rx.recv_timeout(Duration::from_millis(1_500)),
+        Err(RecvTimeoutError::Timeout),
+        "a sweep that ran must not be retried"
+    );
+}
+
 /// A watch is bound to the directory *object*, not to its name. Delete a
 /// watched root and the kernel drops the watch with the inode; recreate it —
 /// which is what a `rm -rf ~/.codex/sessions` followed by the next session

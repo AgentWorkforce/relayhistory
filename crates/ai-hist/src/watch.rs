@@ -450,9 +450,10 @@ impl WatchInner {
     /// instead, and [`InFlight::drop`] re-posts it the moment the run in
     /// flight finishes. Repeats coalesce into the one bit, so a busy tree
     /// during a long manual sweep costs one sweep afterwards.
-    /// Returns whether a *forced* sweep is still owed: the tick ran, and came
-    /// back saying it never took the store's lock, so nothing looked at the
-    /// change it was for. A tick that could not have the slot returns `false`
+    /// Returns whether a *forced* sweep is still owed — whether it came back
+    /// saying it never took the store's lock, or failed outright. Either way
+    /// nothing looked at the change it was for, and the change is recorded
+    /// nowhere else. A tick that could not have the slot returns `false`
     /// — that change is remembered as `deferred_force` and re-posted by
     /// [`InFlight::drop`], which is the same promise by another route.
     fn run_skip_if_busy(&self, trigger: TickTrigger) -> bool {
@@ -501,14 +502,11 @@ impl WatchInner {
 
     fn run_claimed(&self, trigger: TickTrigger, guard: InFlight<'_>) -> bool {
         let forced = trigger.forces_scan();
-        let mut owed = false;
-        match (self.tick)(forced) {
+        // Only a forced tick is ever owed anything: a backstop tick that found
+        // the store busy, or failed, is covered by the next backstop, while a
+        // forced one is standing in for a change nothing else knows about.
+        let owed = match (self.tick)(forced) {
             Ok(outcome) => {
-                // Only a forced tick is owed anything: a backstop tick that
-                // found the store busy is covered by the next backstop, while
-                // a forced one is standing in for a change nothing else knows
-                // about.
-                owed = forced && outcome.contended;
                 if let Some(sink) = &self.on_report {
                     sink(&TickReport {
                         trigger,
@@ -516,6 +514,7 @@ impl WatchInner {
                         outcome,
                     });
                 }
+                forced && outcome.contended
             }
             Err(error) => {
                 if let Some(sink) = &self.on_error {
@@ -523,8 +522,15 @@ impl WatchInner {
                 } else {
                     eprintln!("ai-hist: watch tick failed: {error:#}");
                 }
+                // A sweep that failed covered nothing, exactly as a contended
+                // one covered nothing, and the change it was for is recorded
+                // nowhere else: the wake state was cleared when the debounce
+                // window opened. An error is not an answer about the change,
+                // so it is owed and retried on the same bounded cadence rather
+                // than logged and forgotten until the backstop.
+                forced
             }
-        }
+        };
         drop(guard);
         owed
     }

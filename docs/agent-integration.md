@@ -129,7 +129,10 @@ guarantee of cover, because its own source walk may already be past the
 provider that just wrote — and a transcript written and cleaned up inside that
 window would never be read. Such a sweep is retried 250 ms later and backs off
 towards the backstop while the lock stays held; repeated events coalesce into
-the one retry, and a sweep that gets through clears it.
+the one retry, and a sweep that gets through clears it. A forced sweep that
+returned an error goes down the same path, for the same reason: a transient
+SQLite error or a provider that could not be read is not an answer about the
+change, and the wake that carried it has already been consumed.
 
 A root given relatively — `TRAJECTORY_ROOT=trajectory.json` — is resolved
 against the working directory when it is built, and every event path is put
