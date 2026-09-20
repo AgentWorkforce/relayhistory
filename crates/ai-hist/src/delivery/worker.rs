@@ -531,7 +531,7 @@ impl Worker<'_> {
             // Never acknowledge work whose lease was lost or whose host asked
             // to stop: the outcome is uncertain and stays retryable.
             Ok(_) if stopping() => Err(DeliveryFailure::Transient.into()),
-            Ok(ack) => acknowledge(&self.conn, &claim.lease, &ack, (self.clock)())
+            Ok(ack) => acknowledge(&self.conn, &claim.lease, &ack, self.clock)
                 .map(|_| ())
                 .map_err(|_| ReceiverFailure::from(DeliveryFailure::Transient)),
             Err(failure) => Err(failure),
@@ -544,7 +544,7 @@ impl Worker<'_> {
                 &claim.lease,
                 failure.failure,
                 failure.retry_after_ms,
-                (self.clock)(),
+                self.clock,
             )?;
         }
         Ok(())
