@@ -1,0 +1,87 @@
+{
+  "corpus_files": [
+    "claude/sidechain-leading-then-main.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/sidechain-leading-then-main",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "continue from elsewhere",
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "source": "claude",
+      "timestamp_ms": 1776816001000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "sidechain records precede the first main-chain record in the same file",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-main-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-main-1",
+      "model": null,
+      "parent_id": "u-original-asst",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "source": "claude",
+      "text": "continue from elsewhere",
+      "token_json": null,
+      "ts_ms": 1776816001000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-x:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-x",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-main-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "source": "claude",
+      "text": "ok",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":3,\"output_tokens\":1}",
+      "ts_ms": 1776816002000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.97",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776816000000,
+      "first_prompt": "continue from elsewhere",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776816002000,
+      "last_assistant_text": "ok",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/sidechain-leading-then-main.jsonl",
+      "repo_url": null,
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "source": "claude",
+      "source_stamp": "<n>:1030",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

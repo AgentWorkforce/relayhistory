@@ -1,0 +1,8 @@
+{
+  "id": "ses_tool",
+  "version": "1.0.0",
+  "projectID": "global",
+  "directory": "/tmp/project",
+  "title": "tool call turn",
+  "time": { "created": 1776988810000, "updated": 1776988813000 }
+}

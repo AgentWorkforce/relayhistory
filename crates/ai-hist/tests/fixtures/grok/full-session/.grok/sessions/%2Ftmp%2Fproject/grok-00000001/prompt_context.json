@@ -1,0 +1,5 @@
+{
+  "system_prompt_tokens": 1820,
+  "files": ["/tmp/project/src/client.ts", "/tmp/project/test/client.test.ts"],
+  "rules": ["/tmp/project/.grok/rules.md"]
+}

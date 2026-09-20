@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "claude/interleaved-turns.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/interleaved-turns",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "first question",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "second question",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "timestamp_ms": 1776643202000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "two assistant messages interleave their blocks instead of arriving contiguously",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "text": "first question",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "text": "first answer",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "text": "second question",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "text": "second answer",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}",
+      "ts_ms": 1776643203000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "first question",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643203000,
+      "last_assistant_text": "second answer",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/interleaved-turns.jsonl",
+      "repo_url": null,
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "source_stamp": "<n>:1714",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}
