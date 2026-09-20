@@ -152,7 +152,8 @@ archive relocation.
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
-| `SessionStore::session_user_turns_page`, `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
+| `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
+| `SessionStore::session_user_turns_page` | none | bounded keyset page plus ordered block reads on one snapshot | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |

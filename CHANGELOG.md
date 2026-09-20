@@ -76,7 +76,7 @@ Notable changes to the native `ai-hist` CLI are documented here.
   because local and remote observations share `(source, session_id)` and an
   adapter may contribute a tool result with no fidelity that re-reading the
   local transcript can never repair.
-  `HYDRATION_PARSER_VERSION` 2 -> 3.
+  `HYDRATION_PARSER_VERSION` 4 -> 5.
 
 - Validate submitted `session_events` fidelity on the source-adapter boundary:
   `payload_bytes`, `call_index` and `event_index` must be non-negative,
@@ -90,7 +90,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   one keyset page of user turns, each with the ordered
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
   derived from `session_events` rather than a second table. A turn is what
-  arrived on one user message. A block's `is_error` is `true` for a
+  arrived on one user message, and carries the `preceding_message_id` /
+  `following_message_id` the sourcing contract asks for: the messages recorded
+  either side of it, from either side of the conversation, null at the ends of
+  a session and wherever the adjacent record carried no provider message id. A block's `is_error` is `true` for a
   `result_status` of `errored` or `cancelled`, `false` for `completed`, and
   `null` only while the outcome is genuinely undecided — a terminal status the
   provider stated is never reported as unknown. Membership is asserted through `event_source`
@@ -105,7 +108,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   deliberately not computed — every estimate available here is a
   bytes-per-token heuristic, and one served beside measured values is
   indistinguishable from a measurement at the call site.
-  `SESSION_EVIDENCE_CONTRACT_VERSION` 1 -> 2.
+  Carried by `SESSION_EVIDENCE_CONTRACT_VERSION` 2, which the per-message raw
+  provider facts already claimed: both landed unreleased, so 2 means the
+  fidelity columns and the user-turn page as well.
 
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and
   `ai-hist-engine` packages). Default features expose `SessionStore`, evidence
@@ -147,15 +152,16 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `getSessionUserTurnsPage(source, sessionId, options?)` —
   with `getSessionUserTurns()` and the `sessionUserTurns()` iterator in the
   TypeScript SDK — returns one keyset page of user turns and their ordered
-  blocks. Native contract 16 -> 17 (the project-identity work landed 16 in
-  parallel, so a build carrying both answers with 17); session-evidence
-  contract 1 -> 2.
+  blocks, each naming the messages either side of it. Native contract
+  16 -> 17 (the project-identity work landed 16 in parallel, so a build
+  carrying both answers with 17); session-evidence contract stays 2 and now
+  covers these fields too.
 
 ### Breaking
 
-- The native-addon contract is now 16 and the session evidence contract is now
-  2: `session_events` rows carry the per-message raw provider facts (see
-  Added). Hydration parser version 3 re-parses existing databases once on the
+- The native-addon contract is now 17 and the session evidence contract is now
+  2: `session_events` rows carry the per-message raw provider facts and the
+  per-tool-result fidelity columns (see Added). Hydration parser version 3 re-parses existing databases once on the
   next `sessions hydrate` so rows already indexed gain the facts instead of
   staying null forever, and the `session_events_raw_facts_v1` schema marker is
   required, so the first read of an existing database is routed through a
