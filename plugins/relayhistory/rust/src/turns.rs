@@ -241,7 +241,8 @@ mod tests {
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 text TEXT, model TEXT, token_json TEXT,
-                event_uid TEXT NOT NULL
+                event_uid TEXT NOT NULL,
+                raw_kind TEXT
             );",
         )
         .unwrap();

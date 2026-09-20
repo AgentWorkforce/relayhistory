@@ -6,6 +6,26 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Stop dropping the record types neither parser could normalize. A new
+  `session_markers` table records compaction and summary boundaries, provider
+  `system` rows, non-text content blocks (`image`, `document`,
+  `redacted_thinking`, thinking `signature`s), tool-replacement metadata, and
+  Codex lifecycle events (`compacted`, `turn_diff`, `stream_error`,
+  `*_begin`, `task_started`/`task_complete`, review mode, `subagent_*`,
+  encrypted `reasoning`). A provider type no classifier knows is stored as
+  `kind = "unknown"` carrying its verbatim type in `subkind` — the table has
+  no CHECK constraint, because a constraint would turn tomorrow's unknown
+  record back into today's silent drop. `payload_json` is an allowlisted,
+  per-field-bounded projection: an image or document block contributes its
+  size, never its bytes. Read one bounded page with
+  `session_markers_page(conn, source, session_id, limit, after)`, which uses
+  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits.
+  `session_events.raw_kind` records the provider-native record or block type
+  an event came from, so a `tool_result` synthesized from a `system` subagent
+  notification stays distinguishable from a `tool_result` content block.
+  `HYDRATION_PARSER_VERSION` is 3, so existing databases re-parse once.
+  napi/TS/MCP exposure is not included.
+
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and
   `ai-hist-engine` packages). Default features expose `SessionStore`, evidence
   structs, `Source`, and `Error`. Optional features: `delivery`,

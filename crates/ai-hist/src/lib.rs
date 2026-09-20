@@ -70,7 +70,8 @@ pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
-    HistoryEntry, SessionEvent, SessionFileEdit, SessionLocation, SessionScope, SessionToolCall,
+    HistoryEntry, SessionEvent, SessionFileEdit, SessionLocation, SessionMarker, SessionScope,
+    SessionToolCall,
 };
 
 #[cfg(feature = "unstable-internal")]

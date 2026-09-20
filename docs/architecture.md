@@ -104,6 +104,7 @@ dependencies back into the local engine. See [source plugins](remote-connectors.
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
+| `session_markers_page` (Rust only; no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |

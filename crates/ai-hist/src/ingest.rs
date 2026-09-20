@@ -1,7 +1,7 @@
 use crate::{
-    default_db_path, insert_history, now_ms, open_db, open_db_readonly, parse_cursor_text,
-    prompt_hash, schema_is_catalog_read_current, sync_opencode_db, sync_opencode_session,
-    HistoryEntry, SessionLocation, SessionScope,
+    default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
+    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
+    sync_opencode_session, HistoryEntry, NewSessionMarker, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -2151,6 +2151,27 @@ fn ingest_codex_rollout(
         }
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
+        // Lifecycle, compaction, streaming-failure and begin-side tool lines
+        // are not messages, so none of the arms below can hold them. Classify
+        // every line once, here, and keep whatever the event model drops.
+        if let Some(draft) = codex_marker_for_event(line_type, payload_type, payload) {
+            let marker_uid = format!("{index}:marker");
+            insert_session_marker(
+                conn,
+                "codex",
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &marker_uid,
+                    ts_ms: (ts_ms != 0).then_some(ts_ms),
+                    message_id: payload_str("id"),
+                    parent_id: draft.parent_id.as_deref(),
+                    turn_id: draft.turn_id.as_deref(),
+                    kind: draft.kind,
+                    subkind: draft.subkind.as_deref(),
+                    payload_json: draft.payload_json.as_deref(),
+                },
+            )?;
+        }
         if let Some(message) = human_messages.observe(&value) {
             let suffix = match message.format {
                 codex::HumanMessageFormat::EventMessage => "user_message",
@@ -2990,6 +3011,13 @@ fn delete_claude_record_rows(
         "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
     )?;
+    // Markers are derived from the same record and keyed on the same prefix,
+    // so they move with it rather than outliving it under the old identity.
+    conn.execute(
+        "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ? \
+         AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
+        params![session_id, message_uuid, message_uuid],
+    )?;
     Ok(())
 }
 
@@ -3003,6 +3031,11 @@ fn ingest_claude_transcript_as(
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
+    // A compaction boundary reports no size of its own. The context it
+    // replaced is the cache read of the assistant message immediately before
+    // it, which is the only place the provider states how much was in flight
+    // when compaction fired.
+    let mut last_assistant_cache_read: Option<i64> = None;
     for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -3071,7 +3104,67 @@ fn ingest_claude_transcript_as(
         let token_json = message
             .and_then(|m| m.get("usage"))
             .and_then(|v| serde_json::to_string(v).ok());
+        if message_role == "assistant" {
+            if let Some(cache_read) = message
+                .and_then(|m| m.get("usage"))
+                .and_then(|usage| usage.get("cache_read_input_tokens"))
+                .and_then(Value::as_i64)
+            {
+                last_assistant_cache_read = Some(cache_read);
+            }
+        }
         let Some(content) = message.and_then(|m| m.get("content")) else {
+            // A record with no message content is not nothing: summaries,
+            // compaction boundaries and subagent notifications all arrive
+            // this way. Record what it was before moving on.
+            if let Some(draft) = claude_marker_for_record(obj, last_assistant_cache_read) {
+                let marker_uid = format!("{message_uuid}:marker");
+                insert_session_marker(
+                    conn,
+                    "claude",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &marker_uid,
+                        ts_ms: (ts_ms != 0).then_some(ts_ms),
+                        message_id: Some(message_uuid),
+                        parent_id: draft.parent_id.as_deref().or(parent_id),
+                        turn_id: draft.turn_id.as_deref(),
+                        kind: draft.kind,
+                        subkind: draft.subkind.as_deref(),
+                        payload_json: draft.payload_json.as_deref(),
+                    },
+                )?;
+                // A subagent notification is the provider reporting a
+                // delegated call finishing. It is a tool result in everything
+                // but shape, so it is stored as one — `raw_kind` keeps it
+                // distinguishable from a real `tool_result` block.
+                if draft.kind == "subagent_notification" {
+                    if let Some(notice) = obj
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        insert_session_event_with_raw_kind(
+                            conn,
+                            "claude",
+                            session_id,
+                            project,
+                            cwd,
+                            git_branch,
+                            message_uuid,
+                            draft.parent_id.as_deref().or(parent_id),
+                            ts_ms,
+                            "tool_result",
+                            "tool_result",
+                            Some(notice),
+                            model,
+                            token_json.as_deref(),
+                            &format!("{message_uuid}:system"),
+                            Some("system_subagent_notification"),
+                        )?;
+                    }
+                }
+            }
             continue;
         };
         if !sidechain
@@ -3140,6 +3233,28 @@ fn ingest_claude_transcript_as(
         for (block_index, block) in blocks.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{message_uuid}:{block_index}");
+            // Everything the normalized event model cannot carry off this
+            // block — an unsupported block type, a thinking signature, tool
+            // replacement metadata, a delegated result's agent id — is
+            // recorded here, before the arms that handle what it can.
+            for (suffix, draft) in claude_markers_for_block(block_type, block) {
+                let marker_uid = format!("{event_uid}:{suffix}");
+                insert_session_marker(
+                    conn,
+                    "claude",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &marker_uid,
+                        ts_ms: (ts_ms != 0).then_some(ts_ms),
+                        message_id: Some(message_uuid),
+                        parent_id: draft.parent_id.as_deref().or(parent_id),
+                        turn_id: draft.turn_id.as_deref(),
+                        kind: draft.kind,
+                        subkind: draft.subkind.as_deref(),
+                        payload_json: draft.payload_json.as_deref(),
+                    },
+                )?;
+            }
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -3258,7 +3373,7 @@ fn ingest_claude_transcript_as(
                         .unwrap_or("");
                     let content = block.get("content").unwrap_or(&Value::Null);
                     let text = materialize_tool_result_text(content);
-                    insert_session_event(
+                    insert_session_event_with_raw_kind(
                         conn,
                         "claude",
                         session_id,
@@ -3274,6 +3389,7 @@ fn ingest_claude_transcript_as(
                         model,
                         token_json.as_deref(),
                         &event_uid,
+                        Some("tool_result_block"),
                     )?;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
@@ -3302,6 +3418,414 @@ fn ingest_claude_transcript_as(
     Ok(())
 }
 
+/// Longest string any marker payload field keeps.
+///
+/// A marker records that a provider record existed and what shape it had, not
+/// its contents. Bounding every field here is what makes the "never store
+/// image or document bytes" rule structural rather than a promise: a payload
+/// cannot grow with the record it describes.
+const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
+
+/// One marker a parser decided to record, before it is keyed and written.
+///
+/// Both parsers build these in helpers rather than inline so the record and
+/// content-block loops keep their existing shape; the loops gain one call
+/// each.
+#[derive(Debug, Clone, PartialEq)]
+struct MarkerDraft {
+    kind: &'static str,
+    subkind: Option<String>,
+    payload_json: Option<String>,
+    parent_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl MarkerDraft {
+    fn new(kind: &'static str, subkind: Option<&str>) -> Self {
+        Self {
+            kind,
+            subkind: subkind.map(str::to_string),
+            payload_json: None,
+            parent_id: None,
+            turn_id: None,
+        }
+    }
+
+    fn with_payload(mut self, fields: Vec<(&str, Value)>) -> Self {
+        self.payload_json = marker_payload(fields);
+        self
+    }
+}
+
+/// Serialize an allowlisted marker payload, bounding every string field.
+///
+/// Null fields are dropped so a payload says only what the provider actually
+/// recorded. Returns `None` for an empty object rather than storing `{}`.
+fn marker_payload(fields: Vec<(&str, Value)>) -> Option<String> {
+    let mut map = Map::new();
+    for (name, value) in fields {
+        let value = match value {
+            Value::Null => continue,
+            Value::String(text) => Value::String(
+                text.chars()
+                    .take(MARKER_PAYLOAD_FIELD_LIMIT)
+                    .collect::<String>(),
+            ),
+            other => other,
+        };
+        map.insert(name.to_string(), value);
+    }
+    if map.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(map)).ok()
+}
+
+fn marker_string(value: Option<&Value>) -> Value {
+    value
+        .and_then(Value::as_str)
+        .map(|text| Value::String(text.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+/// Classify a Claude transcript record that carries no `message.content`.
+///
+/// These are exactly the records the parser used to drop on the floor:
+/// `type: "summary"` rollups, `type: "system"` compaction boundaries and
+/// subagent notifications, and anything else a future provider version emits.
+/// An unclassified record is still recorded, as `kind = "unknown"` carrying
+/// its provider-native type — a stored row nobody understands is recoverable,
+/// a dropped one is not.
+fn claude_marker_for_record(
+    obj: &Map<String, Value>,
+    tokens_before_compact: Option<i64>,
+) -> Option<MarkerDraft> {
+    let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    let subtype = obj.get("subtype").and_then(Value::as_str);
+    match record_type {
+        "summary" => Some(
+            MarkerDraft::new("summary", subtype.or(Some("summary"))).with_payload(vec![
+                ("summary", marker_string(obj.get("summary"))),
+                ("leaf_uuid", marker_string(obj.get("leafUuid"))),
+            ]),
+        ),
+        "system" => {
+            let compact_metadata = obj.get("compactMetadata");
+            let parent_tool_use_id = obj.get("parent_tool_use_id").and_then(Value::as_str);
+            let agent_id = obj.get("agent_id").and_then(Value::as_str);
+            let subagent_session_id = obj.get("subagent_session_id").and_then(Value::as_str);
+            if subtype == Some("compact_boundary") || compact_metadata.is_some() {
+                Some(
+                    MarkerDraft::new("compaction_boundary", subtype.or(Some("compact_boundary")))
+                        .with_payload(vec![
+                            (
+                                "tokens_before_compact",
+                                tokens_before_compact
+                                    .map(Value::from)
+                                    .unwrap_or(Value::Null),
+                            ),
+                            (
+                                "trigger",
+                                marker_string(compact_metadata.and_then(|m| m.get("trigger"))),
+                            ),
+                            (
+                                "pre_tokens",
+                                compact_metadata
+                                    .and_then(|m| m.get("preTokens"))
+                                    .and_then(Value::as_i64)
+                                    .map(Value::from)
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ]),
+                )
+            } else if parent_tool_use_id.is_some()
+                && (agent_id.is_some() || subagent_session_id.is_some())
+            {
+                let mut draft =
+                    MarkerDraft::new("subagent_notification", subtype.or(Some("system")))
+                        .with_payload(vec![
+                            (
+                                "parent_tool_use_id",
+                                marker_string(obj.get("parent_tool_use_id")),
+                            ),
+                            ("agent_id", marker_string(obj.get("agent_id"))),
+                            (
+                                "subagent_session_id",
+                                marker_string(obj.get("subagent_session_id")),
+                            ),
+                            ("status", marker_string(obj.get("status"))),
+                        ]);
+                // The spawning `tool_use` is the parent of a notification
+                // about it; the record's own `parentUuid` is only the previous
+                // line. Linking on the tool use id is what makes the marker
+                // reachable from the call it reports on.
+                draft.parent_id = parent_tool_use_id.map(str::to_string);
+                Some(draft)
+            } else {
+                Some(MarkerDraft::new("unknown", subtype.or(Some("system"))))
+            }
+        }
+        "" => None,
+        other => Some(MarkerDraft::new("unknown", Some(other))),
+    }
+}
+
+/// Classify what a Claude content block leaves behind after normalization.
+///
+/// `text` and `tool_use` are fully modeled as events and produce nothing. The
+/// rest are the drops: any block type the event model has no `kind` for, the
+/// `signature` on a thinking block, `_meta.replaces` / `_meta.collapsedCalls`
+/// tool-replacement metadata, and the `agentId` a delegated tool result
+/// carries. Several can apply to one block, so each marker brings the suffix
+/// that keys it.
+fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static str, MarkerDraft)> {
+    let mut markers = Vec::new();
+    match block_type {
+        "text" | "tool_use" => {}
+        "thinking" => {
+            if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                markers.push((
+                    "signature",
+                    MarkerDraft::new("unsupported_block", Some("thinking_signature")).with_payload(
+                        vec![
+                            ("bytes", Value::from(signature.len())),
+                            ("has_signature", Value::Bool(true)),
+                        ],
+                    ),
+                ));
+            }
+        }
+        "tool_result" => {
+            let meta = block.get("_meta");
+            let replaces = meta
+                .and_then(|m| m.get("replaces"))
+                .and_then(Value::as_array);
+            let collapsed = meta
+                .and_then(|m| m.get("collapsedCalls"))
+                .and_then(Value::as_i64);
+            if replaces.is_some() || collapsed.is_some() {
+                let replaced = replaces
+                    .map(|names| {
+                        Value::Array(
+                            names
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .take(32)
+                                .map(|name| Value::String(name.to_string()))
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or(Value::Null);
+                markers.push((
+                    "replacement",
+                    MarkerDraft::new("tool_replacement", Some("tool_result")).with_payload(vec![
+                        ("replaces", replaced),
+                        (
+                            "collapsedCalls",
+                            collapsed.map(Value::from).unwrap_or(Value::Null),
+                        ),
+                    ]),
+                ));
+            }
+            let tool_use_id = block
+                .get("tool_use_id")
+                .or_else(|| block.get("toolUseId"))
+                .and_then(Value::as_str);
+            if let Some(agent_id) = find_tool_use_result(block)
+                .and_then(|result| result.get("agentId"))
+                .and_then(Value::as_str)
+            {
+                let mut draft =
+                    MarkerDraft::new("subagent_notification", Some("tool_use_result_agent_id"))
+                        .with_payload(vec![
+                            ("agent_id", Value::String(agent_id.to_string())),
+                            (
+                                "tool_use_id",
+                                tool_use_id
+                                    .map(|id| Value::String(id.to_string()))
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ]);
+                draft.parent_id = tool_use_id.map(str::to_string);
+                markers.push(("agent", draft));
+            }
+        }
+        other => {
+            // `bytes` is the serialized size of the block, never its content:
+            // an `image` or `document` block is exactly what must not be
+            // copied into the ledger.
+            let bytes = serde_json::to_string(block)
+                .map(|text| text.len())
+                .unwrap_or(0);
+            let has_signature = block.get("signature").is_some();
+            markers.push((
+                "block",
+                MarkerDraft::new("unsupported_block", Some(other)).with_payload(vec![
+                    ("bytes", Value::from(bytes)),
+                    ("has_signature", Value::Bool(has_signature)),
+                ]),
+            ));
+        }
+    }
+    markers
+}
+
+/// Codex payload types the normalized event model already carries in full.
+///
+/// Listing them is what lets everything else fall through to a marker: the
+/// default is "record it", and a type is silent only when something else in
+/// the parser is known to have stored it.
+fn codex_payload_is_modeled(line_type: &str, payload_type: &str) -> bool {
+    match line_type {
+        "event_msg" => matches!(
+            payload_type,
+            "user_message"
+                | "agent_message"
+                | "agent_reasoning"
+                | "agent_reasoning_raw_content"
+                | "agent_reasoning_section_break"
+                | "token_count"
+                | "thread_settings_applied"
+                | "mcp_tool_call_end"
+                | "web_search_end"
+                | "patch_apply_end"
+                | "exec_command_end"
+        ),
+        "response_item" => matches!(
+            payload_type,
+            "function_call"
+                | "custom_tool_call"
+                | "function_call_output"
+                | "custom_tool_call_output"
+                | "message"
+        ),
+        _ => false,
+    }
+}
+
+/// Classify a Codex rollout line the event model does not turn into an event.
+///
+/// Called once per line, before the existing `match`, so the arms below keep
+/// their shape. A streaming `*_delta` fragment is silent because the final
+/// event it builds toward is already recorded; everything else that is not
+/// modeled becomes a marker, and an unrecognized type becomes
+/// `kind = "unknown"` carrying its verbatim provider type in `subkind`.
+fn codex_marker_for_event(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> Option<MarkerDraft> {
+    let mut draft = match line_type {
+        "session_meta" | "turn_context" => return None,
+        "compacted" => {
+            MarkerDraft::new("compaction_boundary", Some("compacted")).with_payload(vec![(
+                "replacement_items",
+                payload
+                    .get("replacement_history")
+                    .and_then(Value::as_array)
+                    .map(|items| Value::from(items.len()))
+                    .unwrap_or(Value::Null),
+            )])
+        }
+        "event_msg" | "response_item" => {
+            if payload_type.is_empty() || codex_payload_is_modeled(line_type, payload_type) {
+                return None;
+            }
+            // Deltas are fragments of an event that is recorded whole.
+            if payload_type.ends_with("_delta") {
+                return None;
+            }
+            codex_marker_for_payload(line_type, payload_type, payload)
+        }
+        other => MarkerDraft::new("unknown", Some(other)),
+    };
+    if draft.turn_id.is_none() {
+        draft.turn_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    Some(draft)
+}
+
+fn codex_marker_for_payload(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> MarkerDraft {
+    if line_type == "response_item" {
+        return match payload_type {
+            "reasoning" => {
+                MarkerDraft::new("encrypted_reasoning", Some("reasoning")).with_payload(vec![(
+                    "bytes",
+                    Value::from(
+                        payload
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .map(str::len)
+                            .unwrap_or(0),
+                    ),
+                )])
+            }
+            other => MarkerDraft::new("unknown", Some(other)),
+        };
+    }
+    match payload_type {
+        "task_started" => MarkerDraft::new("task_started", Some("task_started")),
+        "task_complete" => {
+            MarkerDraft::new("task_complete", Some("task_complete")).with_payload(vec![(
+                "duration_ms",
+                payload
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            )])
+        }
+        "turn_diff" => MarkerDraft::new("turn_diff", Some("turn_diff")).with_payload(vec![(
+            "bytes",
+            Value::from(
+                payload
+                    .get("unified_diff")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0),
+            ),
+        )]),
+        "stream_error" => MarkerDraft::new("stream_error", Some("stream_error"))
+            .with_payload(vec![("message", marker_string(payload.get("message")))]),
+        "context_compacted" | "compacted" => {
+            MarkerDraft::new("compaction_boundary", Some(payload_type))
+        }
+        "entered_review_mode" | "exited_review_mode" => {
+            MarkerDraft::new("review_mode", Some(payload_type))
+        }
+        other if other.ends_with("_begin") => MarkerDraft::new("tool_begin", Some(other))
+            .with_payload(vec![("call_id", marker_string(payload.get("call_id")))]),
+        other if other.starts_with("subagent_") => {
+            let mut draft =
+                MarkerDraft::new("subagent_notification", Some(other)).with_payload(vec![
+                    ("call_id", marker_string(payload.get("call_id"))),
+                    ("agent_id", marker_string(payload.get("agent_id"))),
+                    (
+                        "success",
+                        payload
+                            .get("success")
+                            .and_then(Value::as_bool)
+                            .map(Value::Bool)
+                            .unwrap_or(Value::Null),
+                    ),
+                ]);
+            draft.parent_id = payload
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            draft
+        }
+        other => MarkerDraft::new("unknown", Some(other)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
@@ -3320,15 +3844,48 @@ fn insert_session_event(
     token_json: Option<&str>,
     event_uid: &str,
 ) -> Result<()> {
+    insert_session_event_with_raw_kind(
+        conn, source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role,
+        kind, text, model, token_json, event_uid, None,
+    )
+}
+
+/// As [`insert_session_event`], additionally recording the provider-native
+/// record or block type the event came from.
+///
+/// Two very different provider records normalize to `kind = "tool_result"`: a
+/// `tool_result` content block, and a `type: "system"` subagent notification
+/// that reports a delegated call finishing. `raw_kind` is what keeps them
+/// apart without widening the normalized `kind` vocabulary, which downstream
+/// readers switch on exhaustively.
+#[allow(clippy::too_many_arguments)]
+fn insert_session_event_with_raw_kind(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    message_id: &str,
+    parent_id: Option<&str>,
+    ts_ms: i64,
+    role: &str,
+    kind: &str,
+    text: Option<&str>,
+    model: Option<&str>,
+    token_json: Option<&str>,
+    event_uid: &str,
+    raw_kind: Option<&str>,
+) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (source, session_id, project, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, raw_kind) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json",
+         model=excluded.model, token_json=excluded.token_json, raw_kind=excluded.raw_kind",
         params![
             source,
             session_id,
@@ -3344,6 +3901,7 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
+            raw_kind,
         ],
     )?;
     Ok(())
@@ -6903,6 +7461,380 @@ mod tests {
 
     fn codex_meta(path: &std::path::Path) -> super::CodexSessionMeta {
         super::read_codex_session_meta(path).unwrap().unwrap()
+    }
+
+    /// Every marker recorded for one session, oldest first, as
+    /// `(kind, subkind, payload_json)`.
+    fn markers_of(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+    ) -> Vec<(String, String, String)> {
+        crate::session_markers_page(conn, source, session_id, 1_000, None)
+            .unwrap()
+            .markers
+            .into_iter()
+            .map(|marker| {
+                (
+                    marker.kind,
+                    marker.subkind.unwrap_or_default(),
+                    marker.payload_json.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn marker_kinds(conn: &Connection, source: &str, session_id: &str) -> Vec<String> {
+        markers_of(conn, source, session_id)
+            .into_iter()
+            .map(|(kind, _, _)| kind)
+            .collect()
+    }
+
+    /// A compaction boundary carries no size of its own, so the only honest
+    /// answer for "how much context did this replace?" is the cache read of
+    /// the assistant message immediately before it.
+    #[test]
+    fn claude_compact_boundary_is_recorded_with_the_context_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hello"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_c_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":9000,"cache_creation_input_tokens":200}},"type":"assistant","uuid":"u-asst-1","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","sessionId":"compact-session","timestamp":"2026-04-20T00:00:02.000Z","uuid":"s-compact-1","compactMetadata":{"trigger":"auto","preTokens":9200}}"#, "\n",
+                r#"{"parentUuid":"u-asst-1","isSidechain":false,"type":"user","message":{"role":"user","content":"continue"},"uuid":"u-user-2","timestamp":"2026-04-20T00:00:03.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "compact-session");
+        assert_eq!(markers.len(), 1, "one boundary, one marker: {markers:?}");
+        let (kind, subkind, payload) = &markers[0];
+        assert_eq!(
+            (kind.as_str(), subkind.as_str()),
+            ("compaction_boundary", "compact_boundary")
+        );
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["tokens_before_compact"], json!(9000));
+        assert_eq!(payload["trigger"], json!("auto"));
+        assert_eq!(payload["pre_tokens"], json!(9200));
+
+        // Re-reading the same transcript heals rather than duplicates.
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(markers_of(&conn, "claude", "compact-session").len(), 1);
+    }
+
+    /// A `type: "system"` subagent notification reports a delegated call
+    /// finishing. It must reach the `tool_use` that spawned it, and the event
+    /// it normalizes to must stay distinguishable from a real `tool_result`
+    /// content block.
+    #[test]
+    fn claude_system_subagent_notification_links_to_the_spawning_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_system_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_system","name":"Agent","input":{"subagent_type":"Explore","description":"inspect the tree"}}],"usage":{"input_tokens":8,"output_tokens":4}},"type":"assistant","uuid":"u-system-asst","timestamp":"2026-04-24T01:00:00.000Z","cwd":"/tmp/project","sessionId":"sub-session"}"#, "\n",
+                r#"{"type":"system","subtype":"subagent_completed","sessionId":"sub-session","timestamp":"2026-04-24T01:00:01.000Z","parent_tool_use_id":"toolu_system","agent_id":"agent-system-1","subagent_session_id":"session-system-child","status":"completed","content":"subagent completed"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_markers_page(&conn, "claude", "sub-session", 10, None).unwrap();
+        assert_eq!(page.markers.len(), 1);
+        let marker = &page.markers[0];
+        assert_eq!(marker.kind, "subagent_notification");
+        assert_eq!(marker.subkind.as_deref(), Some("subagent_completed"));
+        assert_eq!(
+            marker.parent_id.as_deref(),
+            Some("toolu_system"),
+            "the notification must point at the call it reports on"
+        );
+        assert!(marker.message_id.is_some());
+        let payload: Value = serde_json::from_str(marker.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["agent_id"], json!("agent-system-1"));
+        assert_eq!(
+            payload["subagent_session_id"],
+            json!("session-system-child")
+        );
+        assert_eq!(payload["status"], json!("completed"));
+
+        let spawned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND tool_use_id='toolu_system'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(spawned, 1, "the spawning tool_use is still recorded");
+
+        let raw_kinds: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT kind, raw_kind FROM session_events WHERE source='claude' AND session_id='sub-session' AND kind='tool_result'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            raw_kinds,
+            vec![(
+                "tool_result".to_string(),
+                Some("system_subagent_notification".to_string())
+            )],
+            "the notification lands as a tool_result that says where it came from"
+        );
+    }
+
+    /// Tool-replacement metadata and a delegated result's `agentId` are two
+    /// separate facts about the same block, so each keeps its own marker.
+    #[test]
+    fn claude_tool_result_metadata_is_recorded_beside_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replacement.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"search the repo"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_rm_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_search_1","name":"relaywash__Search","input":{"query":"foo"}},{"type":"tool_use","id":"tu_task_1","name":"Task","input":{"description":"explore"}}]},"type":"assistant","uuid":"u-asst-1","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_search_1","content":"results...","_meta":{"replaces":["Glob","Grep","Read"],"collapsedCalls":9}},{"type":"tool_result","tool_use_id":"tu_task_1","content":"done","toolUseResult":{"agentId":"agent-77"}}]},"uuid":"u-user-2","timestamp":"2026-04-20T00:00:02.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "replacement-session");
+        let replacement = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "tool_replacement")
+            .unwrap_or_else(|| panic!("no tool_replacement marker in {markers:?}"));
+        let payload: Value = serde_json::from_str(&replacement.2).unwrap();
+        assert_eq!(payload["replaces"], json!(["Glob", "Grep", "Read"]));
+        assert_eq!(payload["collapsedCalls"], json!(9));
+
+        let delegated = markers
+            .iter()
+            .find(|(_, subkind, _)| subkind == "tool_use_result_agent_id")
+            .unwrap_or_else(|| panic!("no delegated-result marker in {markers:?}"));
+        assert_eq!(delegated.0, "subagent_notification");
+        let payload: Value = serde_json::from_str(&delegated.2).unwrap();
+        assert_eq!(payload["agent_id"], json!("agent-77"));
+        assert_eq!(payload["tool_use_id"], json!("tu_task_1"));
+
+        let raw_kinds: Vec<Option<String>> = conn
+            .prepare("SELECT raw_kind FROM session_events WHERE source='claude' AND kind='tool_result' ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            raw_kinds,
+            vec![
+                Some("tool_result_block".to_string()),
+                Some("tool_result_block".to_string())
+            ]
+        );
+    }
+
+    /// Summaries, non-text blocks and thinking signatures are all recorded,
+    /// and none of them brings its bytes along. The `image` block below is
+    /// deliberately far larger than any marker payload is allowed to be.
+    #[test]
+    fn claude_summary_and_non_text_blocks_are_recorded_without_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markers.jsonl");
+        let image_data = "A".repeat(4096);
+        let signature = "S".repeat(600);
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"summary","summary":"Refactored the transcript parser","leafUuid":"u-asst-1","sessionId":"marker-session","timestamp":"2026-09-10T00:00:00.000Z","uuid":"sum-1"}}"#, "\n",
+                    r#"{{"type":"user","uuid":"u1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:01.000Z","message":{{"role":"user","content":"look at this screenshot"}}}}"#, "\n",
+                    r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:02.000Z","message":{{"role":"assistant","model":"claude-test","content":[{{"type":"thinking","thinking":"weighing the options","signature":"{signature}"}},{{"type":"redacted_thinking","data":"encrypted-reasoning-blob"}},{{"type":"text","text":"I can see it"}}]}}}}"#, "\n",
+                    r#"{{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:03.000Z","message":{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{image_data}"}}}}]}}}}"#, "\n",
+                ),
+                signature = signature,
+                image_data = image_data,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "marker-session");
+        let by_subkind = |name: &str| {
+            markers
+                .iter()
+                .find(|(_, subkind, _)| subkind == name)
+                .unwrap_or_else(|| panic!("no {name} marker in {markers:?}"))
+        };
+
+        let summary = by_subkind("summary");
+        assert_eq!(summary.0, "summary");
+        let payload: Value = serde_json::from_str(&summary.2).unwrap();
+        assert_eq!(
+            payload["summary"],
+            json!("Refactored the transcript parser")
+        );
+        assert_eq!(payload["leaf_uuid"], json!("u-asst-1"));
+
+        assert_eq!(by_subkind("redacted_thinking").0, "unsupported_block");
+        let thinking_signature = by_subkind("thinking_signature");
+        assert_eq!(thinking_signature.0, "unsupported_block");
+        let payload: Value = serde_json::from_str(&thinking_signature.2).unwrap();
+        assert_eq!(payload["has_signature"], json!(true));
+        assert_eq!(payload["bytes"], json!(signature.len()));
+
+        let image = by_subkind("image");
+        assert_eq!(image.0, "unsupported_block");
+        let payload: Value = serde_json::from_str(&image.2).unwrap();
+        assert!(
+            payload["bytes"].as_i64().unwrap() > 4096,
+            "the block's size is recorded"
+        );
+
+        // The point of the whole payload contract: a marker never grows with
+        // the record it describes.
+        for (kind, subkind, payload) in &markers {
+            if kind == "unsupported_block" {
+                assert!(
+                    payload.len() < 256,
+                    "{subkind} payload must stay bounded: {payload}"
+                );
+            }
+            assert!(
+                !payload.contains(&image_data[..64]),
+                "{subkind} payload must never carry block bytes"
+            );
+        }
+        assert!(
+            !markers.iter().any(|(_, subkind, _)| subkind == "text"),
+            "fully modeled blocks produce no marker: {markers:?}"
+        );
+
+        // The readable half of the thinking block is still an event.
+        let thinking: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND kind='thinking'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thinking, 1);
+    }
+
+    /// Every Codex line the event model drops becomes a marker, and a type no
+    /// classifier knows is stored as `unknown` rather than discarded.
+    #[test]
+    fn codex_lifecycle_and_unknown_events_are_recorded_as_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-markers.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-09-10T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-markers","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.300Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call_1","turn_id":"t1","command":["ls"]}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.400Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"par"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.500Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-blob"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.600Z","type":"event_msg","payload":{"type":"turn_diff","turn_id":"t1","unified_diff":"@@\n+a\n-b"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.700Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.800Z","type":"event_msg","payload":{"type":"zzz_future","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.900Z","type":"event_msg","payload":{"type":"entered_review_mode","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.000Z","type":"event_msg","payload":{"type":"subagent_message_complete","call_id":"call_1","agent_id":"agent_42","success":true}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.100Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message"},{"type":"compaction"}]}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.200Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-markers");
+        let kinds = marker_kinds(&conn, "codex", "sess-markers");
+        for expected in [
+            "task_started",
+            "tool_begin",
+            "encrypted_reasoning",
+            "turn_diff",
+            "stream_error",
+            "unknown",
+            "review_mode",
+            "subagent_notification",
+            "compaction_boundary",
+            "task_complete",
+        ] {
+            assert!(
+                kinds.iter().any(|kind| kind == expected),
+                "missing {expected} in {markers:?}"
+            );
+        }
+        assert_eq!(
+            kinds.len(),
+            10,
+            "a streaming delta is a fragment of an event that is already \
+             recorded whole, and turn_context is modeled: {markers:?}"
+        );
+
+        let unknown = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "unknown")
+            .unwrap();
+        assert_eq!(
+            unknown.1, "zzz_future",
+            "an unclassified type keeps its provider-native name"
+        );
+
+        let reasoning = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "encrypted_reasoning")
+            .unwrap();
+        let payload: Value = serde_json::from_str(&reasoning.2).unwrap();
+        assert_eq!(payload["bytes"], json!("opaque-blob".len()));
+        assert!(
+            !reasoning.2.contains("opaque-blob"),
+            "only the size of an encrypted block is kept"
+        );
+
+        let turn_ids: Vec<Option<String>> =
+            crate::session_markers_page(&conn, "codex", "sess-markers", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .map(|marker| marker.turn_id)
+                .collect();
+        assert!(
+            turn_ids
+                .iter()
+                .filter(|id| id.as_deref() == Some("t1"))
+                .count()
+                >= 5,
+            "a marker keeps the turn it belongs to: {turn_ids:?}"
+        );
+
+        // Idempotent under a re-parse: uids are derived from file position.
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 10);
     }
 
     #[test]

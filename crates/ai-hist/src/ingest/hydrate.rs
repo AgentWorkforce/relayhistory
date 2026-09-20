@@ -11,7 +11,13 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 2;
 /// Bumped to 2 when Claude subagent transcripts that carry an `agentId`
 /// started being indexed under that child id: existing databases re-parse once
 /// and the earlier parent-attributed rows are healed in place.
-const HYDRATION_PARSER_VERSION: i64 = 2;
+///
+/// Bumped to 3 when both parsers started recording `session_markers` for the
+/// record types they used to drop — compaction and summary boundaries, system
+/// rows, non-text content blocks and Codex lifecycle events. A database
+/// indexed by version 2 has those rows nowhere, and nothing short of
+/// re-reading the transcript can recover them, so every session re-parses once.
+const HYDRATION_PARSER_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

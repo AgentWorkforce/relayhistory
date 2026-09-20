@@ -147,6 +147,20 @@ CREATE TABLE IF NOT EXISTS session_events (
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
     text, role, project, content='session_events', content_rowid='id'
 );
+CREATE TABLE IF NOT EXISTS session_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    marker_uid TEXT NOT NULL,
+    ts_ms INTEGER,
+    message_id TEXT,
+    parent_id TEXT,
+    turn_id TEXT,
+    kind TEXT NOT NULL,
+    subkind TEXT,
+    payload_json TEXT,
+    UNIQUE(source, session_id, marker_uid)
+);
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
@@ -410,6 +424,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "history_fts",
     "session_events",
     "session_events_fts",
+    "session_markers",
     "tool_calls",
     "file_edits",
     "session_commit_links",
@@ -440,6 +455,15 @@ const REQUIRED_DELIVERY_TABLES: &[&str] = &[
 #[cfg(not(feature = "delivery"))]
 const REQUIRED_DELIVERY_TABLES: &[&str] = &[];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
+/// Columns [`init_db`] adds to `session_events` after the original DDL.
+///
+/// `raw_kind` records the provider-native record or block type an event was
+/// derived from, so a `tool_result` that came from a Claude `tool_result`
+/// content block stays distinguishable from one synthesized out of a
+/// `type: "system"` subagent notification. Both land in the same `kind`, and
+/// the normalized `kind` vocabulary is deliberately not widened to carry the
+/// distinction.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["raw_kind"];
 /// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
 /// session catalog (`ai-hist sessions list` / `discover`) reads every one of
 /// them, so a read-only handle over a database that predates them would fail
@@ -495,6 +519,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_events_page",
     "idx_tool_calls_page_v2",
     "idx_file_edits_page_v2",
+    "idx_session_markers_page",
     "idx_session_presences_location",
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
@@ -532,11 +557,14 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 ];
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
-/// Indexes the session-scoped tool call and file edit pages depend on. Both
-/// pages always name one source and one session, so a single composite index
-/// per table carries the whole lookup and its ordering.
-const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] =
-    &["idx_tool_calls_page_v2", "idx_file_edits_page_v2"];
+/// Indexes the session-scoped tool call, file edit and marker pages depend
+/// on. All three always name one source and one session, so a single
+/// composite index per table carries the whole lookup and its ordering.
+const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &[
+    "idx_tool_calls_page_v2",
+    "idx_file_edits_page_v2",
+    "idx_session_markers_page",
+];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
@@ -550,6 +578,7 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    "session_markers_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -600,7 +629,8 @@ pub fn schema_is_relationship_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_RELATIONSHIP_READ_INDEXES)
 }
 
-/// Whether bounded tool call and file edit pagination has its page indexes.
+/// Whether bounded tool call, file edit and marker pagination has its page
+/// indexes.
 pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
@@ -646,6 +676,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSIONS_COLUMNS
         .iter()
         .all(|needed| session_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let session_event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|needed| session_event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -876,6 +916,7 @@ END;
     // TEXT, so the guard list is the migration list.
     migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
+    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     // Before the presence model every identity in the local evidence ledger
@@ -1014,6 +1055,10 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_markers_page ON session_markers(source, session_id, (ts_ms IS NULL), ts_ms, id)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
         [],
     )?;
@@ -1028,6 +1073,13 @@ VALUES ('session_presences_local_backfill_v1');
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
+    )?;
+    // The marker table and `session_events.raw_kind` both arrive above; the
+    // marker is what makes a database that predates them fail
+    // [`schema_is_current`] exactly once, so a read-only handle is never
+    // served a query against a column it does not have.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
     )?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
@@ -1629,6 +1681,37 @@ pub struct SessionFileEditPage {
     pub next_cursor: Option<SessionEvidenceCursor>,
 }
 
+/// One provider record that the normalized `session_events` model cannot
+/// carry, kept rather than dropped.
+///
+/// Compaction and summary boundaries, provider system rows, non-text content
+/// blocks and agent lifecycle events all describe a session without being a
+/// message in it. `kind` is the classified vocabulary; `subkind` is the
+/// provider-native type verbatim, so a record type that no classifier knows
+/// yet still lands as `kind = "unknown"` with its real name intact.
+/// `payload_json` carries an allowlisted, bounded projection only — never the
+/// bytes of an image or a document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMarker {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub marker_uid: String,
+    pub ts_ms: Option<i64>,
+    pub message_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub kind: String,
+    pub subkind: Option<String>,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMarkerPage {
+    pub markers: Vec<SessionMarker>,
+    pub next_cursor: Option<SessionEvidenceCursor>,
+}
+
 /// All normalized events for one session, oldest first. Rows sharing a
 /// timestamp keep insertion order via the rowid tiebreaker.
 pub fn session_events(
@@ -1773,6 +1856,126 @@ const TOOL_CALL_COLUMNS: &str = "id, source, session_id, message_id, tool_use_id
 const FILE_EDIT_COLUMNS: &str =
     "id, source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, \
      lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd";
+const SESSION_MARKER_COLUMNS: &str = "id, source, session_id, marker_uid, ts_ms, message_id, \
+                                      parent_id, turn_id, kind, subkind, payload_json";
+
+fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
+    Ok(SessionMarker {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        marker_uid: row.get(3)?,
+        ts_ms: row.get(4)?,
+        message_id: row.get(5)?,
+        parent_id: row.get(6)?,
+        turn_id: row.get(7)?,
+        kind: row.get(8)?,
+        subkind: row.get(9)?,
+        payload_json: row.get(10)?,
+    })
+}
+
+/// One bounded page of session markers for one session, oldest first.
+///
+/// Markers carry the same `(ts_ms IS NULL, ts_ms, id)` order as tool calls and
+/// file edits, and for the same reason: a provider record type that carries no
+/// timestamp at all must still be reachable, and it must sort after everything
+/// dated rather than in front of it. Scoped to one `source` because native
+/// session ids collide across providers.
+pub fn session_markers_page(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> Result<SessionMarkerPage> {
+    let limit = limit.clamp(1, 1_000);
+    let (sql, params_vec) = evidence_page_query(
+        SESSION_MARKER_COLUMNS,
+        "session_markers",
+        source,
+        session_id,
+        limit,
+        after,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(params_vec),
+        row_to_session_marker,
+    )?;
+    let mut markers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
+    let has_more = markers.len() > limit as usize;
+    if has_more {
+        markers.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = markers.last().expect("non-empty page");
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    Ok(SessionMarkerPage {
+        markers,
+        next_cursor,
+    })
+}
+
+/// A marker about to be written, keyed by `(source, session_id, marker_uid)`.
+///
+/// `marker_uid` is derived the same deterministic way `event_uid` is, so a
+/// re-parse of the same transcript updates the row in place instead of
+/// accumulating duplicates.
+#[derive(Debug, Clone, Default)]
+pub struct NewSessionMarker<'a> {
+    pub marker_uid: &'a str,
+    pub ts_ms: Option<i64>,
+    pub message_id: Option<&'a str>,
+    pub parent_id: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub subkind: Option<&'a str>,
+    pub payload_json: Option<&'a str>,
+}
+
+/// Record one provider record the normalized event model cannot carry.
+///
+/// `kind` deliberately has no CHECK constraint. The table exists because both
+/// parsers used to drop what they could not classify, and a constraint would
+/// reintroduce exactly that: a provider shipping a new record type would turn
+/// an unclassified row into a failed insert. An unrecognized type is stored as
+/// `kind = "unknown"` with the provider-native type in `subkind` instead.
+pub fn insert_session_marker(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    marker: &NewSessionMarker<'_>,
+) -> Result<()> {
+    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    conn.execute(
+        "INSERT INTO session_markers \
+         (source, session_id, marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, payload_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
+         ts_ms=excluded.ts_ms, message_id=excluded.message_id, parent_id=excluded.parent_id, \
+         turn_id=excluded.turn_id, kind=excluded.kind, subkind=excluded.subkind, \
+         payload_json=excluded.payload_json",
+        params![
+            source,
+            session_id,
+            marker.marker_uid,
+            marker.ts_ms,
+            marker.message_id,
+            marker.parent_id,
+            marker.turn_id,
+            marker.kind,
+            marker.subkind,
+            marker.payload_json,
+        ],
+    )?;
+    Ok(())
+}
 
 fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
     Ok(SessionToolCall {
@@ -3134,6 +3337,15 @@ mod tests {
                    ('claude', 's1', 'm3', 'fe-f', '/tmp/p/f.rs', 'Edit', 0, 1, NULL, NULL, NULL, NULL, NULL),
                    ('codex', 's1', 'm9', 'fe-x', '/tmp/p/z.rs', 'apply_patch', 1, 1, NULL, NULL, 150, NULL, NULL),
                    ('claude', 's2', 'm8', 'fe-y', '/tmp/q/a.rs', 'Edit', 1, 0, NULL, NULL, 150, NULL, NULL);
+            INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, payload_json)
+            VALUES ('claude', 's1', 'mk-a', 200, 'm1', NULL, NULL, 'compaction_boundary', 'compact_boundary', '{"tokens_before_compact":9000}'),
+                   ('claude', 's1', 'mk-b', 100, 'm1', NULL, NULL, 'summary', 'summary', NULL),
+                   ('claude', 's1', 'mk-c', 200, 'm2', 'tu-a', NULL, 'subagent_notification', 'subagent_completed', NULL),
+                   ('claude', 's1', 'mk-d', NULL, 'm2', NULL, NULL, 'unknown', 'zzz_future', NULL),
+                   ('claude', 's1', 'mk-e', 100, 'm3', NULL, NULL, 'unsupported_block', 'image', '{"bytes":42,"has_signature":false}'),
+                   ('claude', 's1', 'mk-f', NULL, 'm3', NULL, NULL, 'unsupported_block', 'document', NULL),
+                   ('codex', 's1', 'mk-x', 150, NULL, NULL, 't1', 'turn_diff', 'turn_diff', NULL),
+                   ('claude', 's2', 'mk-y', 150, 'm8', NULL, NULL, 'stream_error', 'stream_error', NULL);
             "#,
         )
         .unwrap();
@@ -3172,6 +3384,103 @@ mod tests {
             }
         }
         panic!("file edit pagination did not terminate");
+    }
+
+    fn walk_markers(conn: &Connection, source: &str, session_id: &str, limit: i64) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        for _ in 0..100 {
+            let page =
+                session_markers_page(conn, source, session_id, limit, cursor.as_ref()).unwrap();
+            assert!(page.markers.len() as i64 <= limit.clamp(1, 1_000));
+            ids.extend(page.markers.iter().map(|marker| marker.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return ids,
+            }
+        }
+        panic!("marker pagination did not terminate");
+    }
+
+    /// Markers share the evidence keyset, so they inherit the two properties
+    /// that keyset exists for: the undated tail sorts last rather than first,
+    /// and a walk at any page size yields exactly the same rows, once each, in
+    /// the same order as the unpaged read.
+    #[test]
+    fn session_marker_pages_scope_and_page_like_the_other_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        let page = session_markers_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert!(page
+            .markers
+            .iter()
+            .all(|marker| marker.source == "claude" && marker.session_id == "s1"));
+        assert_eq!(
+            page.markers
+                .iter()
+                .map(|marker| marker.marker_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mk-b", "mk-e", "mk-a", "mk-c", "mk-d", "mk-f"],
+            "dated markers come first in timestamp order; the undated tail follows"
+        );
+        assert!(page.next_cursor.is_none());
+        assert_eq!(
+            page.markers[0].kind, "summary",
+            "kind is stored verbatim, with no CHECK constraint to reject it"
+        );
+        assert_eq!(
+            session_markers_page(&conn, "codex", "s1", 100, None)
+                .unwrap()
+                .markers
+                .iter()
+                .map(|marker| marker.marker_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mk-x"],
+            "a native session id shared across providers must not interleave"
+        );
+
+        let whole = walk_markers(&conn, "claude", "s1", 100);
+        for limit in [1, 2, 3, 5, 6, 7] {
+            assert_eq!(
+                walk_markers(&conn, "claude", "s1", limit),
+                whole,
+                "a walk at page size {limit} must neither drop nor repeat a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_session_marker_upserts_on_its_deterministic_uid() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for kind in ["unknown", "compaction_boundary"] {
+            insert_session_marker(
+                &conn,
+                "claude",
+                "s1",
+                &NewSessionMarker {
+                    marker_uid: "u-1:marker",
+                    ts_ms: Some(7),
+                    message_id: Some("u-1"),
+                    parent_id: None,
+                    turn_id: None,
+                    kind,
+                    subkind: Some("compact_boundary"),
+                    payload_json: Some(r#"{"tokens_before_compact":9000}"#),
+                },
+            )
+            .unwrap();
+        }
+
+        let page = session_markers_page(&conn, "claude", "s1", 10, None).unwrap();
+        assert_eq!(page.markers.len(), 1, "a re-parse must not duplicate");
+        assert_eq!(
+            page.markers[0].kind, "compaction_boundary",
+            "a re-parse that classifies better must overwrite in place"
+        );
     }
 
     #[test]
@@ -3454,6 +3763,11 @@ mod tests {
             for (table, columns, index) in [
                 ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
                 ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
+                (
+                    "session_markers",
+                    SESSION_MARKER_COLUMNS,
+                    "idx_session_markers_page",
+                ),
             ] {
                 for (shape, after) in [
                     ("the first page", None),

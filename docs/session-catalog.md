@@ -329,6 +329,49 @@ read.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+### Session markers
+
+Not every provider record is a message. Compaction and summary boundaries,
+system rows, non-text content blocks and agent lifecycle events all describe a
+session without being a turn in it, and the normalized `session_events` model
+has no `kind` for any of them. They are recorded in `session_markers` instead
+of being dropped, and read with `session_markers_page` — the same
+`(ts_ms IS NULL, ts_ms, id)` keyset the tool call and file edit pages use.
+
+`kind` is the classified vocabulary below; `subkind` is the provider-native
+type verbatim. A record type no classifier knows yet is stored as
+`kind = "unknown"` with its real name in `subkind`, so it is recoverable
+later. `payload_json` carries an allowlisted projection with every string
+field bounded — an `image` or `document` block contributes its size, never its
+bytes.
+
+| `kind` | claude | codex | `subkind` examples |
+|---|---|---|---|
+| `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | `compact_boundary`, `compacted` |
+| `summary` | ✓ `type:"summary"` | – | `summary` |
+| `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
+| `task_started` | – | ✓ | `task_started` |
+| `task_complete` | – | ✓ | `task_complete` |
+| `turn_diff` | – | ✓ | `turn_diff` |
+| `stream_error` | – | ✓ | `stream_error` |
+| `tool_begin` | – | ✓ any `*_begin` | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
+| `review_mode` | – | ✓ | `entered_review_mode`, `exited_review_mode` |
+| `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature` |
+| `encrypted_reasoning` | – | ✓ `response_item/reasoning` | `reasoning` |
+| `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | `tool_result` |
+| `unknown` | ✓ any unclassified record type | ✓ any unclassified payload type | the provider type, verbatim |
+
+A compaction boundary states no size of its own, so a Claude
+`compaction_boundary` payload carries `tokens_before_compact` taken from the
+`cache_read_input_tokens` of the assistant message immediately before it.
+
+`session_events.raw_kind` names the provider-native record or block an event
+came from. Two very different records normalize to `kind = "tool_result"` — a
+`tool_result` content block (`raw_kind = "tool_result_block"`) and a Claude
+`type: "system"` subagent notification
+(`raw_kind = "system_subagent_notification"`) — and `raw_kind` is what keeps
+them apart without widening the `kind` vocabulary readers switch on.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
