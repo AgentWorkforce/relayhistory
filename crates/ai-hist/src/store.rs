@@ -2223,8 +2223,16 @@ pub fn session_user_turns_page(
                     .to_string(),
                     tool_use_id: is_tool_result.then_some(tool_use_id).flatten(),
                     byte_len,
+                    // `is_error` has three states and the statuses have
+                    // five, so the collapse has to keep "known" separate
+                    // from "not yet known". `cancelled` is terminal and
+                    // stated by the provider: it did not succeed, and
+                    // reporting null would make it read exactly like a
+                    // result still in flight. The status itself stays on the
+                    // event for a consumer that needs to tell a cancellation
+                    // from a failure.
                     is_error: match result_status.as_deref() {
-                        Some("errored") => Some(1),
+                        Some("errored" | "cancelled") => Some(1),
                         Some("completed") => Some(0),
                         _ => None,
                     },
@@ -2703,6 +2711,75 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn a_terminal_result_status_is_never_reported_as_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // One user message carrying four results, one per status a provider
+        // can record. They share a message_id so they are one turn.
+        for (index, status) in ["errored", "cancelled", "completed", "running"]
+            .iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                  tool_use_id, payload_bytes, event_index, result_status, event_source) \
+                 VALUES ('claude', 's1', 'm1', ?, 'tool_result', 'tool_result', 'out', ?, \
+                  ?, 3, ?, ?, 'tool_result')",
+                rusqlite::params![
+                    (index as i64) + 1,
+                    format!("uid-{status}"),
+                    format!("tu-{status}"),
+                    index as i64,
+                    status,
+                ],
+            )
+            .unwrap();
+        }
+
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert_eq!(page.user_turns.len(), 1);
+        let seen: Vec<(Option<&str>, Option<i64>)> = page.user_turns[0]
+            .blocks
+            .iter()
+            .map(|block| (block.tool_use_id.as_deref(), block.is_error))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // Known to have failed.
+                (Some("tu-errored"), Some(1)),
+                // Terminal and known not to have succeeded. Reporting null
+                // here would say "we do not know" about an outcome the
+                // provider stated, and would read identically to a result
+                // still in flight.
+                (Some("tu-cancelled"), Some(1)),
+                // Known to have succeeded.
+                (Some("tu-completed"), Some(0)),
+                // Genuinely undecided: still running.
+                (Some("tu-running"), None),
+            ],
+        );
+
+        // The status itself is not flattened away -- a consumer that needs to
+        // tell a cancellation from a failure reads it from the event.
+        let statuses: Vec<Option<String>> = session_events(&conn, "s1", Some("claude"))
+            .unwrap()
+            .into_iter()
+            .map(|event| event.result_status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                Some("errored".into()),
+                Some("cancelled".into()),
+                Some("completed".into()),
+                Some("running".into()),
+            ],
+        );
     }
 
     #[test]

@@ -56,7 +56,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   one keyset page of user turns, each with the ordered
   `[{kind, tool_use_id, byte_len, is_error}]` blocks its message carried,
   derived from `session_events` rather than a second table. A turn is what
-  arrived on one user message. Membership is asserted through `event_source`
+  arrived on one user message. A block's `is_error` is `true` for a
+  `result_status` of `errored` or `cancelled`, `false` for `completed`, and
+  `null` only while the outcome is genuinely undecided — a terminal status the
+  provider stated is never reported as unknown. Membership is asserted through `event_source`
   rather than inferred from `role`: only `tool_result` means "a block inside a
   message", so a Claude subagent notification and a Codex
   `function_call_output` — both stored with `role = 'tool_result'`, both

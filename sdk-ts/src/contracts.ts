@@ -477,6 +477,17 @@ export interface SessionUserTurnBlock {
   toolUseId: string | null;
   /** Measured payload bytes when recorded, else the stored text's UTF-8 length. */
   byteLen: number;
+  /**
+   * Whether the result is known not to have succeeded. `true` for a
+   * `resultStatus` of `errored` or `cancelled` — both terminal, both stated
+   * by the provider — and `false` for `completed`.
+   *
+   * `null` means the outcome is not known *yet* (`running`, `unknown`, or a
+   * row indexed before the status existed). It does not mean "not an error",
+   * so a consumer that treats it as a success is reading a missing fact as a
+   * measured one. Read `resultStatus` from the event to tell a cancellation
+   * from a failure.
+   */
   isError: boolean | null;
 }
 

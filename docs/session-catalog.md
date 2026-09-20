@@ -682,6 +682,13 @@ discoverable".
   the columns above on every event; `getSessionUserTurnsPage(source,
   sessionId, options?)` returns one keyset page of user turns, each with the
   ordered `[{kind, toolUseId, byteLen, isError}]` blocks its message carried.
+  A block's `isError` collapses five statuses into three states, and keeps
+  "known" apart from "not yet known": `true` for `errored` and `cancelled`
+  (both terminal, both stated by the provider), `false` for `completed`, and
+  `null` only for `running`, `unknown` and rows indexed before the column
+  existed. `null` is not "no error" — it is "no answer", and the full
+  `result_status` stays on the event for a consumer that needs to tell a
+  cancellation from a failure.
   Both are cache-only and derived from `session_events`, so they cannot
   disagree with the transcript. Both reads a page makes — the turn headers and
   each turn's blocks — run inside one deferred read transaction, so a sync
