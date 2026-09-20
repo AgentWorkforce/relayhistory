@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::discover::WatchRoot;
+use crate::discover::{WatchDepth, WatchRoot};
 
 /// Default coalescing window for filesystem-event bursts. Short enough that an
 /// interactive pause feels live, long enough to collapse the event burst from
@@ -159,14 +159,7 @@ pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 /// fingerprint. Filtering by the depth the root asked for makes the two
 /// backends agree, and on inotify it is simply a no-op the kernel already did.
 fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
-    roots.iter().any(|root| {
-        if root.recursive {
-            path.starts_with(&root.path)
-        } else {
-            // The root's own entries, and the root itself — nothing below.
-            path == root.path || path.parent() == Some(root.path.as_path())
-        }
-    })
+    roots.iter().any(|root| root.covers(path))
 }
 
 #[derive(Default)]
@@ -516,7 +509,13 @@ impl WatchLoop {
     /// in should not be stuck polling until restart.
     pub fn run(&self) -> Result<WatchDriver> {
         let debounce = Duration::from_millis(self.debounce_ms);
-        let mut watcher = if self.use_fs_events && !self.roots.is_empty() {
+        // A loop given no roots up front but a refresher that will produce
+        // them still has to start the backend: `adopt` is only reachable
+        // through an attached watcher, so skipping it here would leave that
+        // caller polling forever.
+        let mut watcher = if self.use_fs_events
+            && (!self.roots.is_empty() || self.roots_refresh.is_some())
+        {
             let inner = self.inner.clone();
             fs_events::attach(&self.roots, move || inner.signal_change()).ok()
         } else {
@@ -730,15 +729,19 @@ mod fs_events {
     }
 
     fn register(watcher: &mut notify::RecommendedWatcher, root: &WatchRoot) -> bool {
-        if !root.path.exists() {
+        // A file root registers its parent, so it is the parent's existence
+        // that decides whether the root is coverable yet — and a file that
+        // does not exist inside a directory that does is covered from the
+        // start, which is the point of watching the parent.
+        let target = root.registered_path();
+        if !target.exists() {
             return false;
         }
-        let mode = if root.recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
+        let mode = match root.depth {
+            WatchDepth::Tree => RecursiveMode::Recursive,
+            WatchDepth::Directory | WatchDepth::File => RecursiveMode::NonRecursive,
         };
-        watcher.watch(&root.path, mode).is_ok()
+        watcher.watch(target, mode).is_ok()
     }
 }
 

@@ -24,6 +24,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   recorded in `.sync-state.json`. A tick over unchanged sources opens no files.
   Filesystem-event ticks force past it, because an event can arrive before the
   write flushes.
+- The fingerprint is qualified by the sweep's parser and scanner generations,
+  and paired with a `destination_generation` marker in `.sync-state.json`
+  recorded after each sweep. An upgrade that bumps a generation cannot honour
+  the previous one's stamp, and a destination that has *lost* evidence — a
+  half-restored backup, a truncated write — reopens the sweep that owes it the
+  repair, rather than being skipped forever behind sources that will never
+  change again. Rows arriving between sweeps (the hook fast path, hydration)
+  are growth, not loss, and still skip.
 - New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
   lifecycle-hook payload from stdin and hydrates exactly the transcript it
   names. It always exits 0, and `--quiet` outranks `--json` so a hook wired

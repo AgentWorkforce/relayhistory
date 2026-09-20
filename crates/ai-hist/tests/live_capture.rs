@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ai_hist::discover::{DiscoveryEnv, ProviderRoots};
+use ai_hist::discover::{DiscoveryEnv, ProviderRoots, WatchDepth};
 use ai_hist::watch::{TickFn, TickOutcome, WatchDriver, WatchLoop};
 use ai_hist::{shallow_providers, SyncOutput};
 
@@ -420,8 +420,9 @@ fn trajectory_roots_are_watched_before_they_hold_anything() {
         .iter()
         .find(|root| root.path == empty)
         .unwrap_or_else(|| panic!("empty trajectory root missing from {roots:?}"));
-    assert!(
-        root.recursive,
+    assert_eq!(
+        root.depth,
+        WatchDepth::Tree,
         "a trajectory root must be watched as a tree, or a new completed/<month>/ goes unseen"
     );
     assert!(
@@ -466,17 +467,17 @@ fn the_sweep_only_sources_are_watched_too() {
 
     // The flat logs are reached through their parent: a watch on the file
     // itself follows an inode the harness may replace.
-    for (expected, recursive) in [
-        (home.join(".claude"), false),
-        (home.join(".codex"), false),
-        (home.join(".claude/projects"), true),
+    for (expected, depth) in [
+        (home.join(".claude"), WatchDepth::Directory),
+        (home.join(".codex"), WatchDepth::Directory),
+        (home.join(".claude/projects"), WatchDepth::Tree),
     ] {
         let root = roots
             .iter()
             .find(|root| root.path == expected)
             .unwrap_or_else(|| panic!("{expected:?} missing from {roots:?}"));
         assert_eq!(
-            root.recursive, recursive,
+            root.depth, depth,
             "{expected:?} is watched at the wrong depth"
         );
     }
@@ -646,6 +647,121 @@ fn a_root_discovered_after_startup_is_adopted() {
             Ok(false) | Err(_) => assert!(
                 std::time::Instant::now() < deadline,
                 "a write in the adopted root drove no forced sweep"
+            ),
+        }
+    }
+}
+
+/// A `TRAJECTORY_ROOT` entry may name one JSON file, and that file's parent is
+/// routinely `$HOME` — or `/`. The parent is what has to be registered, since
+/// a watch on the file itself stops firing the moment the harness rewrites it
+/// atomically, but only the named file may wake a sweep: watching that parent
+/// as a tree turns every unrelated write on the machine into a forced
+/// fingerprint walk.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_file_root_wakes_on_its_own_name_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let named = dir.path().join("trajectory.json");
+    std::fs::write(&named, "{\"id\":\"t1\"}\n").expect("seed the named file");
+    let buried = dir.path().join("nested");
+    std::fs::create_dir_all(&buried).expect("sibling directory");
+
+    let running = RunningLoop::reporting({
+        let named = named.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::file(named)])
+                .with_debounce_ms(100)
+                .with_poll_interval_ms(600_000)
+                .with_slow_poll_ms(600_000)
+        }
+    });
+    let status = running.watch.status().expect("status");
+    assert_eq!(
+        status.driver,
+        WatchDriver::FsEvents,
+        "a file root attaches through its parent, which exists: {status:?}"
+    );
+    assert_eq!(
+        status.watched,
+        vec![named.clone()],
+        "the root is reported as the file it names, not as its parent"
+    );
+
+    std::fs::write(dir.path().join("unrelated.log"), "noise\n").expect("write a sibling");
+    std::fs::write(buried.join("deeper.json"), "{}\n").expect("write below the parent");
+    assert_eq!(
+        running.ticks.recv_timeout(Duration::from_millis(800)),
+        Err(RecvTimeoutError::Timeout),
+        "a write beside the named file must not drive a sweep"
+    );
+
+    // Positive control: the filter that rejected the siblings must still pass
+    // the one path the root exists for.
+    std::fs::write(&named, "{\"id\":\"t1\",\"n\":2}\n").expect("rewrite the named file");
+    assert_eq!(
+        running.next_tick(),
+        Ok(true),
+        "a write to the named file must drive a forced sweep"
+    );
+}
+
+/// A caller may have no roots at all up front — `sync_watch_roots` returns
+/// nothing on a machine with no provider installed yet — and supply them only
+/// through the refresher. Attaching the backend anyway is what makes that
+/// work: `adopt` is reachable only through an attached watcher, so a loop that
+/// skipped it because its initial root list was empty would poll forever.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_loop_given_its_roots_only_by_the_refresher_still_attaches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let late = dir.path().join("projects");
+    let refreshed = {
+        let late = late.clone();
+        Arc::new(move || vec![ai_hist::discover::WatchRoot::tree(late.clone())])
+    };
+
+    let running = RunningLoop::reporting(move |watch| {
+        watch
+            .with_immediate(false)
+            .with_fs_events(true)
+            .with_roots(Vec::new())
+            .with_roots_refresh(refreshed)
+            .with_debounce_ms(100)
+            // The backstop tick is what re-derives and adopts the roots.
+            .with_slow_poll_ms(200)
+            .with_poll_interval_ms(200)
+    });
+
+    // Nothing is attached yet, so the loop is honestly polling — which is what
+    // makes the transition below evidence that `adopt` ran, rather than the
+    // initial attach having covered it.
+    assert_eq!(running.watch.driver(), Some(WatchDriver::Polling));
+
+    std::fs::create_dir_all(&late).expect("the root the refresher names");
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while running.watch.driver() != Some(WatchDriver::FsEvents) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a root supplied only by the refresher was never attached: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+
+    // And it is a real watch, not just a status: a write under it forces a
+    // tick, which the backstop cadence never does.
+    std::fs::write(late.join("run-1.json"), "{}\n").expect("write under the adopted root");
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a write under the refresher's root drove no forced sweep"
             ),
         }
     }
@@ -1031,6 +1147,163 @@ fn a_hook_ingest_of_an_unchanged_transcript_reports_unchanged() {
     );
 }
 
+/// A sweep owes more than ingestion. It also reconciles a session whose
+/// per-file stamp matches but whose evidence is gone — a half-restored backup,
+/// a truncated write, a maintenance query — and a finished rollout's bytes
+/// never move again to reopen it. A stamp describing only the sources would
+/// therefore make that loss permanent: every later tick matches and skips the
+/// sweep that owns the repair.
+#[test]
+fn evidence_lost_under_a_matching_stamp_is_repaired_on_the_next_tick() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_codex_rollout(home.path(), "sess-repair");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the loss is testable"
+    );
+
+    // Positive control: there is something to lose, and the assertion below
+    // is not comparing zero against zero.
+    let before = codex_event_count(&db, "sess-repair");
+    assert!(
+        before > 0,
+        "the sweep recorded no events for the rollout, so nothing could be lost"
+    );
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-repair'",
+        [],
+    )
+    .expect("delete the session's events");
+    drop(conn);
+    assert_eq!(codex_event_count(&db, "sess-repair"), 0);
+
+    let tick = sync_tick(&db, home.path(), false);
+    assert!(
+        tick.swept,
+        "a destination that lost evidence must not be skipped, whatever the sources say"
+    );
+    assert_eq!(
+        codex_event_count(&db, "sess-repair"),
+        before,
+        "the sweep must restore the events it owes the rollout"
+    );
+
+    // And it settles rather than re-sweeping forever: the repaired
+    // destination re-arms the fast path.
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired destination must arm the fast path again"
+    );
+}
+
+/// Rows arriving between sweeps — the hook fast path, hydration — are not a
+/// loss, and must not cost a full walk of every source. Only shrinkage is the
+/// signal.
+#[test]
+fn evidence_added_between_sweeps_does_not_reopen_the_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let transcript = write_claude_transcript(home.path(), "proj", "grow-2", 2);
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+
+    // A session the sweep never saw, arriving the way the hook path's writes
+    // do: between two ticks, under a stamp that still matches.
+    let before = session_count(&db);
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, cwd, first_activity_ms, last_activity_ms) \
+         VALUES ('grown-elsewhere', 'claude', '/tmp/grown', 1, 2)",
+        [],
+    )
+    .expect("insert a session");
+    drop(conn);
+    assert_eq!(
+        session_count(&db),
+        before + 1,
+        "positive control: the row the skip below has to tolerate must exist"
+    );
+
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a destination that only grew must still skip the sweep"
+    );
+
+    // Positive control on the other side: the fast path is still capable of
+    // reopening, so the skip above is a decision and not a dead end.
+    append_claude_record(&transcript, "grow-2", 3);
+    assert!(sync_tick(&db, home.path(), false).swept);
+}
+
+/// An upgrade that bumps a parser or state generation exists to re-read
+/// sources whose bytes never changed. A stamp describing only those bytes
+/// survives the upgrade and skips exactly that sweep, so the generation is
+/// part of the stamp.
+#[test]
+fn a_stamp_from_another_parser_generation_does_not_skip_the_sweep() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_claude_transcript(home.path(), "proj", "gen-1", 1);
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the generation matters"
+    );
+
+    // Rewrite *only* the generation half of the stored stamp. The half
+    // describing the sources stays byte-identical, and the destination marker
+    // is untouched, so nothing else can explain the sweep below.
+    let state_path = home.path().join(".sync-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read sync state"))
+            .expect("parse sync state");
+    let stamp = state["source_fingerprint"]
+        .as_str()
+        .expect("a stored fingerprint")
+        .to_string();
+    let (generation, sources) = stamp
+        .split_once('/')
+        .expect("the stamp carries a generation and a source half");
+    assert_ne!(generation, "g0000000000000000");
+    state["source_fingerprint"] = serde_json::Value::from(format!("g0000000000000000/{sources}"));
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize sync state"),
+    )
+    .expect("write sync state");
+
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a stamp from another parser generation must not skip the sweep"
+    );
+
+    // Positive control: restoring this build's generation over the same source
+    // half re-arms the fast path, which proves the segment replaced above is
+    // the generation and not the source fingerprint.
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the current generation's stamp must still arm the fast path"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read sync state"))
+            .expect("parse sync state");
+    assert_eq!(
+        state["source_fingerprint"]
+            .as_str()
+            .and_then(|stamp| stamp.split_once('/'))
+            .map(|(_, sources)| sources.to_string()),
+        Some(sources.to_string()),
+        "the source half must be unchanged across the re-sweep"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1109,6 +1382,45 @@ fn append_history_log(home: &Path, source: &str, prompt: &str) {
         .expect("open history log");
     file.write_all(line.as_bytes()).expect("append record");
     file.flush().expect("flush");
+}
+
+fn session_count(db: &Path) -> i64 {
+    let conn = ai_hist::open_db(db).expect("open db");
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions")
+}
+
+fn codex_event_count(db: &Path, session_id: &str) -> i64 {
+    let conn = ai_hist::open_db(db).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND session_id = ?",
+        [session_id],
+        |row| row.get(0),
+    )
+    .expect("count session events")
+}
+
+/// One finished Codex rollout: the shape whose bytes never change again, which
+/// is why a lost row under a matching stamp is unrecoverable without a
+/// destination check.
+fn write_codex_rollout(home: &Path, session_id: &str) -> PathBuf {
+    let day = home.join(".codex/sessions/2026/09/19");
+    std::fs::create_dir_all(&day).expect("codex session dir");
+    let path = day.join(format!("rollout-2026-09-19T10-00-00-{session_id}.jsonl"));
+    let body = format!(
+        "{}\n{}\n{}\n",
+        format_args!(
+            "{{\"timestamp\":\"2026-09-19T10:00:00.000Z\",\"type\":\"session_meta\",\
+             \"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/tmp/{session_id}\"}}}}"
+        ),
+        "{\"timestamp\":\"2026-09-19T10:00:01.000Z\",\"type\":\"response_item\",\
+         \"payload\":{\"type\":\"message\",\"role\":\"user\",\
+         \"content\":[{\"type\":\"input_text\",\"text\":\"repair me\"}]}}",
+        "{\"timestamp\":\"2026-09-19T10:00:02.000Z\",\"type\":\"event_msg\",\
+         \"payload\":{\"type\":\"agent_message\",\"message\":\"Done.\"}}",
+    );
+    std::fs::write(&path, body).expect("write rollout");
+    path
 }
 
 fn history_prompt_count(db: &Path, prompt: &str) -> i64 {

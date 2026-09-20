@@ -98,9 +98,13 @@ up too.
 A root is watched at the depth it asks for: transcript trees recursively,
 because a new session is a new file somewhere inside; the directories holding
 the flat logs shallowly, so the todo files and shell snapshots an active
-session rewrites constantly do not each wake a sweep. That depth is enforced
-on the events themselves rather than left to the OS, because the macOS backend
-has no shallow mode and delivers the whole subtree regardless.
+session rewrites constantly do not each wake a sweep; and a `TRAJECTORY_ROOT`
+naming a single JSON file as that one file — registered through its parent,
+because an atomic rewrite takes a watch on the file itself with it, but
+filtered back down to the one name, since that parent is routinely `$HOME`.
+That depth is enforced on the events themselves rather than left to the OS,
+because the macOS backend has no shallow mode and delivers the whole subtree
+regardless.
 
 `watch --remote` installs no local roots at all. Local provider writes are not
 what a remote-only run collects, and letting them drive the loop would fire the
@@ -120,7 +124,16 @@ Two things make this cheap enough to leave running:
   including the per-file failures a provider absorbs on its way to a
   successful partial run. A file that could not be read this tick keeps the
   fingerprint stale so the next tick retries it, rather than caching the
-  failure in place.
+  failure in place. The value is qualified by the sweep's own parser and
+  scanner generations, so a stamp written before an upgrade that bumps one
+  cannot skip the re-read that bump exists to force.
+- A sweep owes more than ingestion — it also repairs a session whose per-file
+  stamp matches but whose evidence is gone. So the stamp is paired with a
+  **destination generation** recorded after the sweep: if the database has
+  *lost* rows since, the next tick sweeps instead of skipping, however
+  unchanged the sources look. A finished rollout's bytes never move again, so
+  without this the loss would be permanent. Rows arriving between sweeps — the
+  hook fast path, hydration — are growth rather than loss and still skip.
 - A tick woken by a filesystem event **forces** the sweep past that
   fingerprint. An event can arrive before the write is flushed, so the size and
   mtime it would be compared against are not yet trustworthy. The polling

@@ -380,9 +380,28 @@ pub struct ProviderRoots<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WatchRoot {
     pub path: PathBuf,
-    /// Whether the whole subtree is watched, or only this directory's own
-    /// entries.
-    pub recursive: bool,
+    /// How much of `path` is watched.
+    pub depth: WatchDepth,
+}
+
+/// How much of a [`WatchRoot`]'s path is watched.
+///
+/// Ordered narrowest-first, so merging two claims on the same path is a `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchDepth {
+    /// Only the one file the root names.
+    ///
+    /// Registered through the file's *parent*, because a watch on the file
+    /// itself stops firing the moment an atomic rewrite replaces it — but
+    /// every other entry in that parent is filtered back out. That distinction
+    /// matters for a `TRAJECTORY_ROOT` naming a single JSON file: its parent
+    /// can be `$HOME`, or `/`, and watching that as a tree would turn every
+    /// unrelated write on the machine into a forced sweep.
+    File,
+    /// This directory's own entries, and nothing below them.
+    Directory,
+    /// This path and its whole subtree.
+    Tree,
 }
 
 impl WatchRoot {
@@ -390,7 +409,7 @@ impl WatchRoot {
     pub fn tree(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            recursive: true,
+            depth: WatchDepth::Tree,
         }
     }
 
@@ -398,7 +417,37 @@ impl WatchRoot {
     pub fn directory(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            recursive: false,
+            depth: WatchDepth::Directory,
+        }
+    }
+
+    /// Watch only this one file, through its parent directory.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            depth: WatchDepth::File,
+        }
+    }
+
+    /// The path actually handed to the filesystem backend.
+    ///
+    /// Only a [`WatchDepth::File`] root differs from the path it names; a file
+    /// with no parent at all (a bare relative name) registers itself.
+    pub fn registered_path(&self) -> &Path {
+        match self.depth {
+            WatchDepth::File => self.path.parent().unwrap_or(self.path.as_path()),
+            _ => self.path.as_path(),
+        }
+    }
+
+    /// Whether an event on `path` is one this root asked for.
+    pub fn covers(&self, path: &Path) -> bool {
+        match self.depth {
+            WatchDepth::Tree => path.starts_with(&self.path),
+            WatchDepth::Directory => {
+                path == self.path || path.parent() == Some(self.path.as_path())
+            }
+            WatchDepth::File => path == self.path,
         }
     }
 }
@@ -415,14 +464,14 @@ pub fn watch_roots(
     providers: &[Box<dyn ShallowSessionProvider>],
     roots: &ProviderRoots<'_>,
 ) -> Vec<WatchRoot> {
-    let mut widest: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut widest: BTreeMap<PathBuf, WatchDepth> = BTreeMap::new();
     let mut order = Vec::new();
     for provider in providers {
         for root in provider.watch_roots(roots) {
             match widest.get_mut(&root.path) {
-                Some(recursive) => *recursive |= root.recursive,
+                Some(depth) => *depth = (*depth).max(root.depth),
                 None => {
-                    widest.insert(root.path.clone(), root.recursive);
+                    widest.insert(root.path.clone(), root.depth);
                     order.push(root.path);
                 }
             }
@@ -431,8 +480,8 @@ pub fn watch_roots(
     order
         .into_iter()
         .map(|path| {
-            let recursive = widest[&path];
-            WatchRoot { path, recursive }
+            let depth = widest[&path];
+            WatchRoot { path, depth }
         })
         .collect()
 }
@@ -520,7 +569,7 @@ fn stamp_reported_bytes(stamp: &str) -> u64 {
 
 /// FNV-1a over one candidate's identity and change stamp. Summed rather than
 /// chained across candidates so the fold does not depend on enumeration order.
-fn fingerprint_hash(source: &str, locator: &str, stamp: &str) -> u64 {
+pub(crate) fn fingerprint_hash(source: &str, locator: &str, stamp: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x1000_0000_01b3;
     let mut hash = OFFSET;

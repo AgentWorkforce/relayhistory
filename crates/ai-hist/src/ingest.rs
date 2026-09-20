@@ -442,6 +442,96 @@ impl SyncSourceReport {
 /// the sync state file that already holds every per-source cursor.
 const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 
+/// Where the destination's own generation is remembered, beside the source
+/// fingerprint it qualifies.
+const DESTINATION_GENERATION_KEY: &str = "destination_generation";
+
+/// The parser and state generations a stored fingerprint is valid for.
+///
+/// These are the sync-state keys whose *names* carry a generation: bumping one
+/// is how an upgrade says "re-read sources whose bytes never changed". The
+/// fingerprint has to carry them, because it is a statement about the sources
+/// on disk and those do not move across an upgrade. A stamp written by the
+/// previous generation would otherwise match on the first tick after the
+/// upgrade and skip the very sweep the bump exists to force — the repair would
+/// then wait for an unrelated transcript to change, which on a finished
+/// session's rollout is never.
+///
+/// Add the new key here in the same change that introduces it; the old one
+/// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
+/// generations belong in the stamp.
+const SWEEP_PARSER_GENERATIONS: &[&str] = &["claude_sessions_v3", "codex_rollouts_v5"];
+
+/// The generation half of a stored fingerprint: what this build of the sweep
+/// would produce from a given tree, independent of the tree itself.
+fn sweep_generation() -> String {
+    let parts = SWEEP_PARSER_GENERATIONS.join("|");
+    format!(
+        "g{:016x}",
+        discover::fingerprint_hash(
+            "sweep-generation",
+            &discover::SHALLOW_SCANNER_VERSION.to_string(),
+            &parts,
+        )
+    )
+}
+
+/// A cheap, durable statement about what the destination holds.
+///
+/// Counted, not merely probed for existence. The fast path's job is to skip a
+/// sweep, and a sweep owes more than ingestion: it reconciles sessions whose
+/// stamp matches but whose evidence is gone (see the
+/// [`codex_session_events_exist`] arm). Evidence can be lost under a stamp
+/// that still matches — a half-restored backup, a truncated write, a
+/// maintenance query — and the source bytes will never move again to reopen
+/// it.
+///
+/// Deliberately not a counter our own delete paths bump: a counter can only
+/// see losses this code caused, and every loss worth defending against is one
+/// it did not. Counting is O(rows) over an index, single-digit milliseconds
+/// against a sweep's full walk.
+fn destination_generation(conn: &Connection) -> Result<String> {
+    let (sessions, events, max_event, history) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM sessions),          (SELECT COUNT(*) FROM session_events),          (SELECT COALESCE(MAX(rowid), 0) FROM session_events),          (SELECT COUNT(*) FROM history)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    Ok(format!("s{sessions}:e{events}:r{max_event}:h{history}"))
+}
+
+/// Whether the destination still holds everything the stamp was written over.
+///
+/// Growth is fine and must be: the hook fast path and hydration both add rows
+/// between sweeps, and treating that as a reason to re-walk every source would
+/// cost a full sweep per tool call. Shrinkage is the signal — evidence the
+/// sweep put there is gone, so the sweep is owed again.
+fn destination_covers(stored: &str, current: &str) -> bool {
+    fn parse(value: &str) -> Option<Vec<i64>> {
+        let parts = value
+            .split(':')
+            .map(|part| part[1..].parse::<i64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        (parts.len() == 4).then_some(parts)
+    }
+    // An unparsable marker is one this build did not write. Re-sweep rather
+    // than guess: the cost is one walk, and the alternative is a skip that
+    // cannot be justified.
+    let (Some(stored), Some(current)) = (parse(stored), parse(current)) else {
+        return false;
+    };
+    stored
+        .iter()
+        .zip(current.iter())
+        .all(|(stored, current)| current >= stored)
+}
+
 /// The sources a sweep reads that discovery never enumerates.
 ///
 /// Discovery is about *sessions*, so its adapters walk the transcript trees.
@@ -511,25 +601,32 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
     roots.push(discover::WatchRoot::directory(home.join(".claude")));
     roots.push(discover::WatchRoot::directory(home.join(".codex")));
     for root in trajectory_roots(home).unwrap_or_default() {
-        // A `TRAJECTORY_ROOT` entry may name a single JSON file rather than a
-        // directory; watch what contains it.
-        if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            if let Some(parent) = root.parent() {
-                roots.push(discover::WatchRoot::tree(parent));
-            }
-            continue;
-        }
-        roots.push(discover::WatchRoot::tree(root));
+        roots.push(trajectory_watch_root(root));
     }
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
             return false;
         }
-        first.recursive |= later.recursive;
+        first.depth = first.depth.max(later.depth);
         true
     });
     roots
+}
+
+/// How one `TRAJECTORY_ROOT` entry is watched.
+///
+/// An entry naming a single JSON file is watched as a *file*: the parent is
+/// what gets registered, because an atomic rewrite would take a watch on the
+/// file itself with it, but only events on that one name count. The parent of
+/// such an entry is routinely `$HOME` — or `/` — so treating it as a tree
+/// would make every unrelated write on the machine a forced sweep. Anything
+/// else is a directory the roll-ups grow inside, and is watched as a tree.
+fn trajectory_watch_root(root: PathBuf) -> discover::WatchRoot {
+    if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
+        return discover::WatchRoot::file(root);
+    }
+    discover::WatchRoot::tree(root)
 }
 
 /// Whether a sweep read everything the fingerprint counted.
@@ -581,11 +678,22 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
     if stored.is_empty() || stored != current {
         return false;
     }
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| {
-        row.get::<_, i64>(0)
-    })
-    .unwrap_or(0)
-        == 1
+    // The sources are where the last sweep left them. That alone does not
+    // license a skip: the stamp also has to vouch for the destination those
+    // sources were read into.
+    let Some(stored_destination) = state
+        .get(DESTINATION_GENERATION_KEY)
+        .and_then(Value::as_str)
+    else {
+        // A stamp from a build that recorded no destination marker cannot say
+        // anything about one. The sweep below writes it.
+        return false;
+    };
+    match destination_generation(conn) {
+        Ok(current_destination) => destination_covers(stored_destination, &current_destination),
+        // Prefer a loud extra sweep to a confident skip.
+        Err(_) => false,
+    }
 }
 
 /// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
@@ -642,7 +750,12 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
         if let Err(error) = &taken {
             sync_note!("  [sync] source fingerprint unavailable: {error:#}");
         }
-        taken.ok()
+        // Qualified by the generation that produced it, so an upgrade that
+        // bumps a parser or scanner generation cannot honour the stamp the
+        // previous one wrote.
+        taken
+            .ok()
+            .map(|sources| format!("{}/{sources}", sweep_generation()))
     };
     if !force {
         if let Some(current) = fingerprint.as_deref() {
@@ -754,7 +867,25 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // never a missed append. The reverse order would lose one.
     if all_sources_read {
         if let Some(fingerprint) = fingerprint {
+            // The destination marker is taken *after* the sweep, from what the
+            // sweep just wrote — the opposite of the source fingerprint, which
+            // describes what it was about to read. A marker taken before the
+            // work would never match again afterwards and the fast path would
+            // never arm at all.
+            //
+            // An empty value on failure rather than a removal: the sync-state
+            // merge only ever folds keys forward, so an in-memory `remove` is
+            // invisible on disk and would leave a stale marker vouching for a
+            // destination nobody measured.
+            let destination = destination_generation(conn).unwrap_or_else(|error| {
+                sync_note!("  [sync] destination generation unavailable: {error:#}");
+                String::new()
+            });
             state.insert(SOURCE_FINGERPRINT_KEY.to_string(), Value::from(fingerprint));
+            state.insert(
+                DESTINATION_GENERATION_KEY.to_string(),
+                Value::from(destination),
+            );
             checkpoint_sync_state(&state_path, &state);
         }
     }
@@ -4966,6 +5097,33 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+    /// A `TRAJECTORY_ROOT` naming one JSON file must not promote its parent —
+    /// often `$HOME`, sometimes `/` — into a watched tree.
+    #[test]
+    fn a_json_trajectory_entry_is_watched_as_a_file() {
+        let named = PathBuf::from("/home/someone/trajectory.json");
+        let root = super::trajectory_watch_root(named.clone());
+        assert_eq!(root.path, named, "the root names the file, not its parent");
+        assert_eq!(root.depth, crate::discover::WatchDepth::File);
+        assert_eq!(
+            root.registered_path(),
+            Path::new("/home/someone"),
+            "a file root is registered through its parent"
+        );
+        assert!(root.covers(&named));
+        assert!(
+            !root.covers(Path::new("/home/someone/unrelated.log")),
+            "a sibling in the parent must not wake a sweep"
+        );
+
+        // Positive control: a directory entry is still the recursive tree the
+        // roll-ups grow inside, so the narrowing above is specific to files.
+        let dir = PathBuf::from("/home/someone/.trajectories");
+        let root = super::trajectory_watch_root(dir.clone());
+        assert_eq!(root.depth, crate::discover::WatchDepth::Tree);
+        assert!(root.covers(&dir.join("completed/2026-09/run.json")));
+    }
+
     fn saved_cursor_offset(value: &Value) -> u64 {
         match super::FileCursor::decode(value).expect("valid file cursor") {
             super::DecodedFileCursor::Legacy(offset) => offset,
