@@ -203,6 +203,15 @@ node scripts/benchmark-sync.mjs --profile full --output sync-bench.md
 node scripts/gen-synthetic-history.mjs --out /tmp/bench-home --target-bytes 104857600
 ```
 
+`--target-bytes` is the size of the **whole** store. When `opencode` is one of
+the sources its SQLite database takes a share of that budget rather than being
+added on top, so two plans with the same target measure the same amount of work;
+an empty OpenCode schema is already tens of kilobytes, so a very small target
+overshoots and the manifest reports what actually landed. A source may not be
+listed twice — each is written once per round, so a duplicate would overwrite
+its own files while still being counted, leaving the store smaller than the byte
+target it reports.
+
 Nothing real is read and nothing generated is committed. The record shapes are
 modelled on what the parsers in `crates/ai-hist/src/ingest.rs` accept — a Claude
 turn is a user prompt, an assistant record carrying `thinking`/`text`/`tool_use`

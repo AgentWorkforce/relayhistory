@@ -64,8 +64,20 @@ export function planStore(options = {}) {
     largeSessionBytes: options.largeSessionBytes ?? 0,
     project: options.project ?? "relayhistory-bench",
   };
+  const seen = new Set();
   for (const source of plan.sources) {
     if (!SOURCES.includes(source)) throw new Error(`unknown source ${source}`);
+    // A repeated source generates the same session ids twice per ordinal: the
+    // second write replaces the first file while both are counted, so the store
+    // silently falls short of `targetBytes` and the manifest overstates it.
+    if (seen.has(source)) {
+      throw new Error(
+        `source \`${source}\` is listed more than once. Each source is written once per `
+        + "round, so a duplicate would overwrite its own files while still being counted, "
+        + "leaving the store smaller than the byte target it reports.",
+      );
+    }
+    seen.add(source);
   }
   if (plan.sources.length === 0) throw new Error("at least one source is required");
   if (plan.targetBytes <= 0) throw new Error("targetBytes must be positive");
@@ -438,28 +450,50 @@ export function evaluateGate(report, thresholds, profileName) {
   if (profile.calibrationMs && !calibration) {
     const complaint = "the profile stores a calibration baseline but this run measured none";
     if (applied) failures.push(`${complaint}; measurements cannot be scaled without it`);
-    else warnings.push(`${complaint}, so there is no reading on the machine this ran on`);
+    else {
+      warnings.push({
+        kind: "no-calibration",
+        message: `${complaint}, so there is no reading on the machine this ran on`,
+      });
+    }
   }
-  // A timing ratio is a weak proxy for "is this the hardware the baselines came
-  // from". The profile records the CPUs it was measured on, so ask directly.
+  // Warnings carry a `kind` because they mean different things and a reader
+  // acts on them differently: an unfamiliar CPU says the bounds may not belong
+  // to this machine at all, while a reference that merely ran slow on a CPU the
+  // baselines came from is usually load. Collapsing the two into "something is
+  // off with the hardware" is how a real regression gets excused.
+  //
+  // A timing ratio is also a weak proxy for "is this the hardware the baselines
+  // came from". The profile records the CPUs it was measured on, so ask that
+  // directly rather than inferring it.
   const cpu = report.machine?.cpu;
   const cpusSeen = profile.measuredOn?.cpusSeen;
   if (cpu && Array.isArray(cpusSeen) && cpusSeen.length > 0 && !cpusSeen.includes(cpu)) {
-    warnings.push(
-      `these baselines were measured on ${cpusSeen.join(" and ")}, and this is `
-      + `${cpu}. Bounds are absolute numbers from those machines, so a failure here may `
-      + "be the hardware rather than the code; compare against a run on the baseline class "
-      + "before treating it as a regression.",
-    );
+    warnings.push({
+      kind: "unknown-cpu",
+      cpu,
+      message: `these baselines were measured on ${cpusSeen.join(" and ")}, and this is `
+        + `${cpu}. Bounds are absolute numbers from those machines, so a failure here may `
+        + "be the hardware rather than the code; compare against a run on the baseline class "
+        + "before treating it as a regression.",
+    });
   }
   const band = policy.calibrationWarnBand ?? CALIBRATION_WARN_BAND;
   if (calibration && (calibration.raw < band.min || calibration.raw > band.max)) {
-    warnings.push(
-      `the reference workload took ${calibration.raw.toFixed(2)}x as long here as in the `
-      + `baseline runs, outside the expected ${band.min}x-${band.max}x. The baselines were `
-      + "probably recorded on different hardware; re-measure them on this machine class "
-      + "before reading a failure below as a regression.",
-    );
+    const knownCpu = cpu && Array.isArray(cpusSeen) && cpusSeen.includes(cpu);
+    warnings.push({
+      kind: "calibration-band",
+      raw: calibration.raw,
+      knownCpu: Boolean(knownCpu),
+      message: `the reference workload took ${calibration.raw.toFixed(2)}x as long here as in `
+        + `the baseline runs, outside the expected ${band.min}x-${band.max}x. `
+        + (knownCpu
+          // Same CPU, different pace: the machine is busy, not different.
+          ? "This is a CPU the baselines were measured on, so that is load rather than "
+            + "different hardware."
+          : "The baselines may have been recorded on different hardware; re-measure them "
+            + "on this machine class before reading a failure below as a regression."),
+    });
   }
   const load = applied ? (calibration?.factor ?? 1) : 1;
   for (const [phaseName, baselines] of Object.entries(profile.phases ?? {})) {

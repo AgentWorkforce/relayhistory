@@ -87,7 +87,21 @@ export async function opencodeAvailable() {
   }
 }
 
-async function writeOpencodeStore(root, sessions, rng) {
+/** Smallest OpenCode store worth generating, in sessions. */
+const OPENCODE_MIN_SESSIONS = 10;
+/** Rows added between size checks while growing toward the byte budget. */
+const OPENCODE_BATCH = 25;
+
+/**
+ * Write the OpenCode store, growing it toward `budgetBytes`.
+ *
+ * It counts against the same `targetBytes` as the file-backed sources rather
+ * than being added on top: otherwise two plans with equal targets measure
+ * different amounts of work, which is the one thing a size target is for. An
+ * empty schema is already tens of kilobytes, so a budget below that overshoots;
+ * the manifest reports what actually landed either way.
+ */
+async function writeOpencodeStore(root, budgetBytes, rng) {
   const { DatabaseSync } = await import("node:sqlite");
   const path = join(root, ".local/share/opencode/opencode.db");
   await mkdir(dirname(path), { recursive: true });
@@ -104,8 +118,8 @@ async function writeOpencodeStore(root, sessions, rng) {
   const insertSession = db.prepare("INSERT INTO session VALUES (?, ?, ?, ?)");
   const insertMessage = db.prepare("INSERT INTO message VALUES (?, ?, ?, ?)");
   const insertPart = db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)");
-  db.exec("BEGIN");
-  for (let index = 0; index < sessions; index += 1) {
+  let written = 0;
+  const addSession = (index) => {
     const id = `oc-${index.toString().padStart(6, "0")}`;
     const created = BASE_MS + index;
     insertSession.run(id, "/work/relayhistory-bench", created, created + 1000);
@@ -115,10 +129,27 @@ async function writeOpencodeStore(root, sessions, rng) {
       `prt-${index}`, message, id, created,
       JSON.stringify({ type: "text", text: `opencode prompt ${index} ${Math.floor(rng() * 1e6)}` }),
     );
-  }
+  };
+  const sizeOnDisk = async () => {
+    try {
+      return (await stat(path)).size;
+    } catch {
+      return 0;
+    }
+  };
+  // The floor first, then batches until the file reaches its share. Each batch
+  // is committed so the pages land on disk and the size check sees them.
+  db.exec("BEGIN");
+  for (; written < OPENCODE_MIN_SESSIONS; written += 1) addSession(written);
   db.exec("COMMIT");
+  while (await sizeOnDisk() < budgetBytes) {
+    db.exec("BEGIN");
+    const until = written + OPENCODE_BATCH;
+    for (; written < until; written += 1) addSession(written);
+    db.exec("COMMIT");
+  }
   db.close();
-  return sessions;
+  return written;
 }
 
 /**
@@ -210,8 +241,16 @@ export async function generateStore(plan, root) {
     written += bytes;
   }
 
+  // `targetBytes` is the size of the whole store, so when an OpenCode database
+  // is coming it takes a share of the same budget rather than being added on
+  // top. A plan without OpenCode gets the whole budget and is byte-identical to
+  // before this split existed.
+  const fileBudget = plan.sources.includes("opencode")
+    ? Math.round((plan.targetBytes * fileSources.length) / plan.sources.length)
+    : plan.targetBytes;
+
   let index = 0;
-  while (written < plan.targetBytes) {
+  while (written < fileBudget) {
     const source = fileSources[index % fileSources.length];
     const ordinal = Math.floor(index / fileSources.length);
     const id = `bench-${source}-${ordinal.toString().padStart(6, "0")}`;
@@ -231,7 +270,12 @@ export async function generateStore(plan, root) {
   let opencodeSessions = 0;
   if (plan.sources.includes("opencode")) {
     if (await opencodeAvailable()) {
-      opencodeSessions = await writeOpencodeStore(root, Math.max(10, sessions.length), rng);
+      // It gets its share of the same budget, written last so the file sources
+      // have already spent theirs: whatever is left of `targetBytes`.
+      const spent = (await storeBytes(root)).bytes;
+      opencodeSessions = await writeOpencodeStore(
+        root, Math.max(0, plan.targetBytes - spent), rng,
+      );
     } else {
       throw new Error(
         "opencode was requested but node:sqlite is unavailable (needs Node 22.13+); " +

@@ -17,7 +17,11 @@ import {
   unsupportedPhases,
 } from "./benchmark-sync-lib.mjs";
 import { generateStore, opencodeAvailable } from "./gen-synthetic-history.mjs";
-import { CALIBRATION_PHASE, PHASE_ORDER, findHarnessExecutable } from "./benchmark-sync.mjs";
+import {
+  CALIBRATION_PHASE, PHASE_ORDER, failureFooter, findHarnessExecutable, updatedProfile,
+} from "./benchmark-sync.mjs";
+
+const warningText = (verdict) => (verdict.warnings ?? []).map((w) => w.message).join("\n");
 
 const thresholds = JSON.parse(
   await readFile(new URL("./benchmark-thresholds.json", import.meta.url), "utf8"),
@@ -382,6 +386,133 @@ test("the committed gate accepts both observed CI runners and still catches 3x",
   }
 });
 
+test("re-measuring keeps the machine metadata the bounds depend on", () => {
+  const before = structuredClone(thresholds);
+  const report = {
+    commit: "abc1234",
+    generatedAt: "2026-09-21T00:00:00.000Z",
+    cargoProfile: "debug",
+    calibrationMs: 151.2,
+    machine: { cpu: "AMD EPYC 7763", cores: 4, platform: "linux", arch: "x64", rustc: "rustc 1.98.1" },
+    phases: [
+      { phase: "cold_sync", recordsPerSecond: 500.7, peakRssBytes: 12_000_000 },
+      { phase: "incremental_sync", elapsedMs: 400.2, peakRssBytes: 10_000_000 },
+      { phase: "unchanged_sync", elapsedMs: 49.4, peakRssBytes: 9_000_000 },
+      { phase: "hydrate_cold", recordsPerSecond: 310.9, peakRssBytes: 10_000_000 },
+      { phase: "hydrate_unchanged", elapsedMs: 13.6, peakRssBytes: 8_000_000 },
+    ],
+  };
+  const next = updatedProfile(before.profiles["ci-debug"], report);
+
+  // The schema the contract test and the unknown-CPU warning both rely on.
+  assert.ok(next.measuredOn.machineClass, "machineClass survives a re-measure");
+  assert.ok(Array.isArray(next.measuredOn.cpusSeen));
+  assert.ok(next.measuredOn.cpusSeen.includes("AMD EPYC 7763"), "the new CPU is recorded");
+  for (const cpu of before.profiles["ci-debug"].measuredOn.cpusSeen) {
+    assert.ok(next.measuredOn.cpusSeen.includes(cpu), `${cpu} is not forgotten`);
+  }
+  assert.equal(next.measuredOn.runs.length, before.profiles["ci-debug"].measuredOn.runs.length + 1);
+  const appended = next.measuredOn.runs.at(-1);
+  assert.equal(appended.commit, "abc1234");
+  assert.equal(appended.cpu, "AMD EPYC 7763");
+  assert.equal(appended.calibrationMs, 151.2);
+
+  // Baselines are rounded away from the bound, so the run they came from passes.
+  assert.equal(next.phases.cold_sync.recordsPerSecond, 500);
+  assert.equal(next.phases.incremental_sync.elapsedMs, 401);
+  assert.equal(next.calibrationMs, 151.2);
+
+  // And the warning still works against the rewritten profile.
+  const rewritten = { ...before, profiles: { ...before.profiles, "ci-debug": next } };
+  const elsewhere = {
+    calibrationMs: 151.2,
+    machine: { cpu: "Apple M2 Max" },
+    phases: report.phases,
+  };
+  assert.match(warningText(evaluateGate(elsewhere, rewritten, "ci-debug")), /Apple M2 Max/);
+  assert.deepEqual(evaluateGate(report, rewritten, "ci-debug").warnings, []);
+});
+
+test("a source listed twice is refused instead of quietly shrinking the store", () => {
+  assert.throws(
+    () => planStore({ sources: ["claude", "claude"] }),
+    /listed more than once|duplicate/i,
+  );
+  assert.throws(() => planStore({ sources: ["codex", "claude", "codex"] }), /codex/);
+  // Positive control: a distinct pair is still fine.
+  assert.deepEqual(planStore({ sources: ["claude", "codex"] }).sources, ["claude", "codex"]);
+});
+
+test("an OpenCode store counts against the byte target, not on top of it", async (t) => {
+  if (!(await opencodeAvailable())) {
+    t.skip("node:sqlite is unavailable on this Node; the OpenCode fixture cannot be written");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "sync-bench-oc-budget-"));
+  try {
+    const targetBytes = 512 * 1024;
+    const withOpencode = planStore({
+      seed: 12, targetBytes, turns: 2, sources: ["claude", "opencode"], largeSessionBytes: 0,
+    });
+    const manifest = await generateStore(withOpencode, join(root, "home"));
+    assert.ok(manifest.opencodeSessions > 0, "the OpenCode store was written");
+    // The requested corpus size is the whole store, SQLite included. Otherwise
+    // two runs with equal targets measure different amounts of work.
+    assert.ok(
+      manifest.storeBytes <= targetBytes * 1.25,
+      `store is ${manifest.storeBytes} B against a ${targetBytes} B target`,
+    );
+    assert.ok(manifest.storeBytes >= targetBytes * 0.75, "and is not far short either");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the failure footer names the warning that fired, and claims no more", () => {
+  const profile = thresholds.profiles["ci-debug"];
+  const known = profile.measuredOn.cpusSeen[0];
+  const calibration = { measuredMs: 300, baselineMs: 147.9, raw: 2.03, factor: 2.03 };
+
+  // A known CPU that merely ran the reference slowly. That is load, not new
+  // hardware, so the footer must not say the run was off the baseline class —
+  // a red here is more likely contention or a genuine regression.
+  const bandOnly = failureFooter(
+    { warnings: [{ kind: "calibration-band", message: "…", raw: 2.03, knownCpu: true }], calibration },
+    profile,
+  );
+  assert.match(bandOnly, /took 2\.03x as long/);
+  assert.match(bandOnly, new RegExp(known.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(bandOnly, /not (on )?one of them|different machine class/i);
+  assert.match(bandOnly, /load|contention/i);
+
+  // An unfamiliar CPU: here the machine-class claim is the right one.
+  const unknownCpu = failureFooter(
+    { warnings: [{ kind: "unknown-cpu", message: "…", cpu: "Apple M2 Max" }], calibration: null },
+    profile,
+  );
+  assert.match(unknownCpu, /Apple M2 Max/);
+  assert.match(unknownCpu, /not one of them/i);
+  assert.match(unknownCpu, /as likely to be the hardware as the code/);
+
+  // Both: the hardware claim wins, because it is the stronger explanation.
+  const both = failureFooter(
+    {
+      warnings: [
+        { kind: "unknown-cpu", message: "…", cpu: "Apple M2 Max" },
+        { kind: "calibration-band", message: "…", raw: 2.03, knownCpu: false },
+      ],
+      calibration,
+    },
+    profile,
+  );
+  assert.match(both, /Apple M2 Max/);
+  assert.match(both, /not one of them/i);
+
+  // No warnings at all: no hardware talk of any kind.
+  const clean = failureFooter({ warnings: [], calibration: null }, profile);
+  assert.doesNotMatch(clean, /hardware|machine class/i);
+});
+
 test("unfamiliar hardware is called out without failing the gate", () => {
   const onKnownCpu = {
     calibrationMs: 147.9,
@@ -391,7 +522,7 @@ test("unfamiliar hardware is called out without failing the gate", () => {
   // Same numbers, different CPU: a warning, and only a warning.
   const elsewhere = { ...onKnownCpu, machine: { cpu: "Apple M2 Max" } };
   const verdict = evaluateGate(elsewhere, thresholds, "ci-debug");
-  assert.match(verdict.warnings.join("\n"), /this is Apple M2 Max/);
+  assert.match(warningText(verdict), /this is Apple M2 Max/);
   assert.ok(
     !verdict.failures.some((failure) => /Apple M2 Max/.test(failure)),
     "an unfamiliar CPU is never itself a failure",
@@ -412,7 +543,7 @@ test("a calibration far from the baseline runs is reported, not applied", () => 
   assert.equal(verdict.ok, true);
   assert.equal(verdict.calibrationApplied, false);
   assert.equal(verdict.checks[0].normalized, 610, "the reading is not scaled");
-  assert.match(verdict.warnings.join("\n"), /2\.00x as long/);
+  assert.match(warningText(verdict), /2\.00x as long/);
 
   // The same thresholds with the factor switched back on scale it instead.
   const applied = { ...diagnostic, policy: { ...diagnostic.policy, calibration: "applied" } };

@@ -195,6 +195,80 @@ function runPhase(phase, context) {
   return { ...JSON.parse(readFileSync(reportPath, "utf8")), harnessWallMs: wallMs };
 }
 
+/**
+ * A profile with this run's baselines written into it.
+ *
+ * `measuredOn` is merged, not replaced. Its shape is load-bearing: the contract
+ * test asserts it, and `evaluateGate` stops warning about unfamiliar CPUs the
+ * moment `cpusSeen` goes missing — so an overwrite would quietly disable the
+ * check that tells you the bounds are not yours. The run is appended to
+ * `runs`, its CPU is added to `cpusSeen` if new, and everything else is kept.
+ */
+export function updatedProfile(profile, report) {
+  const previous = profile.measuredOn ?? {};
+  const cpu = report.machine?.cpu;
+  const run = {
+    ...(cpu ? { cpu } : {}),
+    ...(process.env.GITHUB_RUN_ID ? { run: process.env.GITHUB_RUN_ID } : {}),
+    ...(process.env.GITHUB_JOB ? { job: process.env.GITHUB_JOB } : {}),
+    commit: report.commit,
+    calibrationMs: Number(report.calibrationMs.toFixed(1)),
+    machine: `${report.machine?.cpu} (${report.machine?.cores} cores), `
+      + `${report.machine?.platform}/${report.machine?.arch}`,
+    rustc: report.machine?.rustc,
+    cargoProfile: report.cargoProfile,
+    at: report.generatedAt,
+  };
+  const cpusSeen = [...(previous.cpusSeen ?? [])];
+  if (cpu && !cpusSeen.includes(cpu)) cpusSeen.push(cpu);
+  return {
+    ...profile,
+    calibrationMs: Number(report.calibrationMs.toFixed(1)),
+    phases: baselinesFromReport(report, BASELINE_METRICS),
+    measuredOn: {
+      ...previous,
+      ...(cpusSeen.length > 0 ? { cpusSeen } : {}),
+      runs: [...(previous.runs ?? []), run],
+    },
+  };
+}
+
+/**
+ * The paragraph printed under a failing gate, explaining what the warnings do
+ * and do not imply.
+ *
+ * It matters which warning fired. An unfamiliar CPU means the bounds may not
+ * belong to this machine at all. A reference that merely ran slow on a CPU the
+ * baselines *were* measured on means load — and saying "this run was not on the
+ * baseline machine class" in that case hands a real regression a ready-made
+ * excuse. Neither ever softens the verdict: a new CPU in the runner pool must
+ * fail loudly rather than go quietly advisory.
+ */
+export function failureFooter(verdict, profile) {
+  const warnings = verdict.warnings ?? [];
+  const unknown = warnings.find((warning) => warning.kind === "unknown-cpu");
+  const band = warnings.find((warning) => warning.kind === "calibration-band");
+  const machineClass = profile?.measuredOn?.machineClass ?? "another machine class";
+  if (unknown) {
+    return "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
+      + `${machineClass}, and this run was on ${unknown.cpu}, not one of them. Off that\n`
+      + "class a failure here is as likely to be the hardware as the code. Compare against\n"
+      + "a run on the baseline class before treating it as a regression.\n";
+  }
+  if (band) {
+    const pace = band.raw >= 1
+      ? `${band.raw.toFixed(2)}x as long as`
+      : `${band.raw.toFixed(2)}x as long as (that is ${(1 / band.raw).toFixed(2)}x faster than)`;
+    return "\nThe warning above applies, but note what it does not say: this ran on\n"
+      + `${(profile?.measuredOn?.cpusSeen ?? []).join(" or ") || machineClass}, a machine the\n`
+      + `baselines were measured on. The reference took ${pace} it did there, which is load\n`
+      + "on a known machine rather than unfamiliar hardware — so a failure above is more\n"
+      + "likely contention or a real regression. Re-run on an idle machine to tell them\n"
+      + "apart.\n";
+  }
+  return "";
+}
+
 /** Turn `unsupportedPhases` findings into one actionable failure. */
 function refuseUnmeasurable(problems) {
   if (problems.length === 0) return;
@@ -352,17 +426,23 @@ async function main(argv) {
 
   if (flag(argv, "update-baselines")) {
     const next = structuredClone(thresholds);
-    next.profiles[profileName].calibrationMs = Number(report.calibrationMs.toFixed(1));
-    next.profiles[profileName].phases = baselinesFromReport(report, BASELINE_METRICS);
-    next.profiles[profileName].measuredOn = {
-      commit: report.commit,
-      machine: `${report.machine.cpu} (${report.machine.cores} cores), ${report.machine.platform}/${report.machine.arch}`,
-      rustc: report.machine.rustc,
-      cargoProfile: report.cargoProfile,
-      at: report.generatedAt,
-    };
+    const previous = next.profiles[profileName];
+    next.profiles[profileName] = updatedProfile(previous, report);
     writeFileSync(THRESHOLDS, `${JSON.stringify(next, null, 2)}\n`, "utf8");
     process.stdout.write(`baselines for profile "${profileName}" written to ${THRESHOLDS}\n`);
+    // The stored bounds are supposed to be the worse of every machine in the
+    // class. A re-measure on one of them replaces that with a single machine's
+    // numbers, which is rarely what someone wants and never obvious afterwards.
+    const others = (previous.measuredOn?.cpusSeen ?? [])
+      .filter((cpu) => cpu !== report.machine?.cpu);
+    if (others.length > 0) {
+      process.stdout.write(
+        `note: these baselines previously covered ${others.join(" and ")} as well, and now `
+        + `describe ${report.machine?.cpu ?? "this machine"} alone. Fold the other machines' `
+        + "numbers back in by hand — take the worse of each metric — or the bounds will be "
+        + "tighter than that hardware can meet.\n",
+      );
+    }
   }
 
   const output = option(argv, "output", undefined);
@@ -402,7 +482,7 @@ async function main(argv) {
     );
   }
   for (const warning of verdict.warnings ?? []) {
-    process.stdout.write(`warning: ${warning}\n\n`);
+    process.stdout.write(`warning [${warning.kind}]: ${warning.message}\n\n`);
   }
   for (const check of verdict.checks) {
     const shown = check.normalized === check.value
@@ -420,18 +500,7 @@ async function main(argv) {
   if (!verdict.ok) {
     process.stderr.write(`\nsync/hydration throughput gate FAILED:\n`);
     for (const failure of verdict.failures) process.stderr.write(`  - ${failure}\n`);
-    if ((verdict.warnings ?? []).length > 0) {
-      // Do not soften the verdict — a new CI runner CPU must fail loudly rather
-      // than go quietly advisory — but say plainly that the bounds may not
-      // belong to this machine, so a developer does not read hardware as a bug.
-      process.stderr.write(
-        "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
-        + `${(verdict.calibration && thresholds.profiles[profileName].measuredOn?.machineClass)
-          || "another machine class"}, and this run was not on one of them. Off that class a\n`
-        + "failure here is as likely to be the hardware as the code. Compare against a run\n"
-        + "on the baseline class before treating it as a regression.\n",
-      );
-    }
+    process.stderr.write(failureFooter(verdict, thresholds.profiles[profileName]));
     process.stderr.write(
       "\nIf this is an intended cost, re-measure with " +
       `\`node scripts/benchmark-sync.mjs --profile ${profileName} --update-baselines\` ` +
