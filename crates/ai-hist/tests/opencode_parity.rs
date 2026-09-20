@@ -2349,8 +2349,7 @@ fn make_unwalkable_scope(session_dir: &Path) -> PathBuf {
         unwalkable.as_os_str().len()
     );
     let error = fs::read_dir(&unwalkable)
-        .err()
-        .expect("the fixture must actually fail to list or this test proves nothing");
+        .expect_err("the fixture must actually fail to list or this test proves nothing");
     assert_eq!(error.raw_os_error(), Some(36), "expected ENAMETOOLONG");
     unwalkable
 }
