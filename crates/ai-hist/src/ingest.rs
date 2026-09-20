@@ -608,10 +608,8 @@ fn sync_exclusive(db_path: &Path) -> Result<bool> {
 }
 
 fn sync_exclusive_with_home(db_path: &Path, home: &Path) -> Result<bool> {
-    let roots = crate::ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    );
+    let roots =
+        crate::ProviderRoots::from_home(home.to_path_buf(), crate::paths::opencode_db_path(home));
     sync_exclusive_with_roots(db_path, &roots)
 }
 

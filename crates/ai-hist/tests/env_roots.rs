@@ -1,8 +1,9 @@
 use ai_hist::{
     hydrate_session_at, open_db,
     sources::{ConnectorIdentity, SourceRegistry},
-    sync_scoped_at, HydrateSessionOptions, SessionScope,
+    sync_scoped_at, HydrateSessionOptions, SessionScope, SessionStore, StoreOptions, SyncOptions,
 };
+use rusqlite::Connection;
 use std::{fs, path::Path, process::Command};
 
 fn write(path: &Path, body: &str) {
@@ -112,6 +113,69 @@ fn configured_provider_roots_child() {
             "{source} registry hydration did not use the configured root"
         );
     }
+}
+
+#[test]
+fn explicit_store_home_still_honors_opencode_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_db = dir.path().join("relocated-opencode.db");
+    let provider = Connection::open(&provider_db).unwrap();
+    provider
+        .execute_batch(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER, time_updated INTEGER);
+               CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+               CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+               INSERT INTO session VALUES ('opencode-env', '/work/app', 1, 2);
+               INSERT INTO message VALUES ('m1', 'opencode-env', 1, '{"role":"user","modelID":"test-model"}');
+               INSERT INTO part VALUES ('p1', 'm1', 'opencode-env', 1, '{"type":"text","text":"relocated opencode session"}');"#,
+        )
+        .unwrap();
+    drop(provider);
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "explicit_store_home_still_honors_opencode_db_child",
+            "--nocapture",
+        ])
+        .env("RH_EXPLICIT_HOME_DB", dir.path().join("history.db"))
+        .env("RH_EXPLICIT_HOME", dir.path().join("empty-home"))
+        .env("OPENCODE_DB", provider_db)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn explicit_store_home_still_honors_opencode_db_child() {
+    let (Some(db), Some(home)) = (
+        std::env::var_os("RH_EXPLICIT_HOME_DB"),
+        std::env::var_os("RH_EXPLICIT_HOME"),
+    ) else {
+        return;
+    };
+    let mut options = StoreOptions::default();
+    options.db_path = Some(db.clone().into());
+    options.home = Some(home.into());
+    SessionStore::open(options)
+        .unwrap()
+        .sync(SyncOptions::default())
+        .unwrap();
+
+    let conn = open_db(Path::new(&db)).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='opencode' AND session_id='opencode-env'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "SessionStore ignored OPENCODE_DB");
 }
 
 #[test]

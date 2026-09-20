@@ -23,6 +23,11 @@ pub fn grok_home(home: &Path) -> PathBuf {
     env_dir("GROK_HOME").unwrap_or_else(|| home.join(".grok"))
 }
 
+pub fn opencode_db_path(home: &Path) -> PathBuf {
+    env_dir("OPENCODE_DB")
+        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderRoots {
     pub home: PathBuf,
@@ -39,10 +44,7 @@ impl ProviderRoots {
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
-            opencode_db: std::env::var_os("OPENCODE_DB")
-                .filter(|value| !value.to_string_lossy().trim().is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db")),
+            opencode_db: opencode_db_path(&home),
             use_env_roots: true,
             home,
         }
@@ -61,16 +63,7 @@ impl ProviderRoots {
 }
 
 pub fn default_opencode_db_path() -> PathBuf {
-    std::env::var_os("OPENCODE_DB")
-        .filter(|value| !value.to_string_lossy().trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            home.join(".local/share/opencode/opencode.db")
-        })
+    opencode_db_path(&home_dir())
 }
 
 pub fn home_dir() -> PathBuf {
