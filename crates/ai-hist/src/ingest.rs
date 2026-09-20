@@ -3508,7 +3508,7 @@ fn ingest_claude_transcript_as(
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
-    for line in text.lines() {
+    for (line_index, line) in text.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -3544,20 +3544,26 @@ fn ingest_claude_transcript_as(
         // identity whose predecessor stays retained. Byte-identical id-less
         // rows share one identity.
         let digest = Sha256::digest(line.as_bytes());
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
         let fallback_uid = format!(
-            "{}:{}",
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session"),
+            "{stem}:{}",
             digest
                 .iter()
                 .take(8)
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let message_uuid = uuid
-            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
-            .unwrap_or(&fallback_uid);
+        // The identity a pre-upgrade parse stored for this same record. Heals
+        // below remove both identities, but only for records that are id-less
+        // now: a record with provider identity never owned a positional one,
+        // and its line index may since have shifted onto another record's.
+        let legacy_uid = format!("{stem}:{line_index}");
+        let message_id = message.and_then(|m| m.get("id")).and_then(Value::as_str);
+        let id_less = uuid.is_none() && message_id.is_none();
+        let message_uuid = uuid.or(message_id).unwrap_or(&fallback_uid);
         // Heal what an earlier parser version wrote for this record: it
         // attributed every sidechain row to the parent, and stored the rows
         // this guard now skips. Re-reading the file removes the stale rows
@@ -3565,9 +3571,15 @@ fn ingest_claude_transcript_as(
         // onto the child instead of duplicating them across both.
         if session_id != record_session_id {
             delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+            if id_less {
+                delete_claude_record_rows(conn, record_session_id, &legacy_uid)?;
+            }
         }
         if skipped_sidechain {
             delete_claude_record_rows(conn, session_id, message_uuid)?;
+            if id_less {
+                delete_claude_record_rows(conn, session_id, &legacy_uid)?;
+            }
             continue;
         }
         let cwd = obj.get("cwd").and_then(Value::as_str);
@@ -7184,6 +7196,75 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reattribution_heals_both_fallback_identities_of_an_id_less_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("side.jsonl");
+        // No uuid and no message.id: the record's identity is the content
+        // hash, so this is the row a prefix-dropping rewrite keeps.
+        fs::write(
+            &transcript,
+            "{\"sessionId\":\"parent\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"delegated work\"},\"timestamp\":\"2026-09-18T10:00:00Z\"}\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What a pre-upgrade parse stored for this same record: the
+        // positional fallback identity, attributed to the parent.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'parent', 'side:0', 1, 'assistant', 'text', 'delegated work', 'side:0:0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name) \
+             VALUES ('claude', 'parent', 'side:0', 'toolu_9', 'Read')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_edits (source, session_id, message_id, tool_use_id, file_path, tool_name) \
+             VALUES ('claude', 'parent', 'side:0', 'toolu_9', '/work/app/notes.txt', 'Edit')",
+            [],
+        )
+        .unwrap();
+
+        // Re-attribution onto the child heals the positional rows too: the
+        // hash-identity rows land under the child and nothing stays behind on
+        // the parent.
+        ingest_claude_transcript_as(&conn, &transcript, Some("child")).unwrap();
+
+        for table in ["session_events", "tool_calls", "file_edits"] {
+            let orphaned: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE source = 'claude' AND session_id = 'parent'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphaned, 0, "no positional row stays on {table}");
+        }
+        let healed: Vec<String> = conn
+            .prepare(
+                "SELECT event_uid FROM session_events WHERE source = 'claude' AND session_id = 'child'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(healed.len(), 1);
+        assert!(
+            healed[0].starts_with("side:") && healed[0] != "side:0:0",
+            "the healed row carries the hash identity, not the positional one: {}",
+            healed[0]
+        );
     }
 
     #[test]
