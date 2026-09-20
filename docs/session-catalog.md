@@ -569,13 +569,33 @@ How each adapter works:
   "already done" for a session with no rows at all — for a finished session,
   forever. Plain `sync` records the session id beside each stamp and re-reads
   the directory when the evidence is gone, the same guard the Codex and Claude
-  walks apply. "The evidence" means what Grok actually writes: not every
-  session produces `session_events` — one made only of `system` lines,
-  synthetic turns or encrypted reasoning is stored entirely as markers — so
-  the check covers `session_markers` too, and the state entry records whether
-  the indexing run wrote any evidence at all. Asking only about events would
-  re-read a marker-only session on every run for ever, which is the thing the
-  guard exists to prevent.
+  walks apply. "The evidence" means what Grok actually writes, and that is
+  every table this ingestion drives: not every session produces
+  `session_events` — one made only of `system` lines, synthetic turns or
+  encrypted reasoning is stored entirely as markers, and one whose transcript
+  is empty but whose `subagents/` directory names a child has only a
+  relationship. Asking about a subset re-reads such a session on every run for
+  ever, which is the thing the guard exists to prevent. The state entry
+  records whether the indexing run wrote any evidence at all; a session that
+  wrote none is checked against its **catalog row**, which every ingestion
+  writes and which for such a session is the whole of what indexing produced.
+  Skipping it without asking anything is what let an empty session disappear
+  permanently when `history.db` was rebuilt. The catalog row is deliberately
+  *not* the check for a session that did write evidence — discovery writes
+  catalog rows too, so it would stand over missing rows.
+
+  **Replacing one session never deletes another session's prompt.** Because
+  `history` is keyed `(source, timestamp_ms, prompt)` with no `session_id`, a
+  prompt two sessions both contain is one row, attributed to whichever was
+  indexed first. Deleting the replaced session's rows outright took that
+  shared row with it, so an unchanged session's prompt vanished from search —
+  permanently, since its own files never change again. A row the replaced
+  session no longer owns is therefore **re-attributed** to a session whose
+  stored `session_events` still carry that prompt at that millisecond, and
+  only what is left is deleted. Re-attribution rather than skipping: skipping
+  would leave the row filed under a session that no longer contains the
+  prompt, which is untrue and also undeletable, since the only session that
+  could clean it up is the one that no longer evidences it.
 
   **Markers are delivered like any other evidence.** `session_markers` is in
   `delivery::schema::TABLES`, so durable delivery bootstraps and journals it
