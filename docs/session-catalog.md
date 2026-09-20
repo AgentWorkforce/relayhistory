@@ -536,6 +536,53 @@ How each adapter works:
   checkpoint written before those were persisted has none stored, and the usage
   caveat is rebuilt from the stored `token_json` instead.
 
+  Grok hydration reports `capability: "partial"`, and the reason travels with
+  it as `GROK_USAGE_CONTEXT_PROXY_ONLY`. The evidence *kinds* are all there --
+  prompts, events, tool calls, file edits and relationships -- but Grok writes
+  no per-turn billing tokens at all, and the SDK ranks sources by capability
+  (`full: 2, partial: 1, shallow_only: 0`). Reporting `full` would tell a
+  consumer that a Grok session carries what a Claude session carries, and a
+  cost figure built on that ranking would be a well-formed number computed
+  over a context proxy. #169 computes capability from declared evidence kinds,
+  a set Grok satisfies; usage is not one of those kinds, so the two rules meet
+  in `local_capability` and have to be reconciled there rather than one
+  quietly replacing the other.
+
+  **A finished JSONL row that does not parse fails the read.** Grok ingestion
+  *replaces* a session's evidence rather than appending to it, so a row that is
+  silently skipped is a turn deleted from the stored transcript — and the
+  change stamp saved after it would checkpoint that deletion as the session's
+  settled state, so no later run would look again. Both `chat_history.jsonl`
+  and `updates.jsonl` therefore treat a newline-terminated row that is not JSON
+  as a scan error: the session is named and counted, its previous transaction
+  stands untouched, and its stamp is left behind for the next run. The single
+  exception is the last line of a file when it has no newline — a record still
+  being written. That one is parsed if it parses (not every writer terminates
+  its final line, and discarding a whole record over a missing newline loses
+  evidence just as surely) and ignored if it does not. Discovery's bounded
+  head/tail scans stay lenient by design: a bounded tail read can legitimately
+  begin mid-record, and discovery never deletes evidence.
+
+  **An unchanged stamp is not on its own proof a session is indexed.**
+  `.sync-state.json` sits beside `history.db`, so deleting or rebuilding the
+  database leaves the state file behind, and a stamp read alone would answer
+  "already done" for a session with no rows at all — for a finished session,
+  forever. Plain `sync` records the session id beside each stamp and re-reads
+  the directory when `session_events` holds nothing for it, the same guard the
+  Codex and Claude walks apply.
+
+  **Repeated prompts at one timestamp are one `history` row.** `history` is
+  keyed `UNIQUE(source, timestamp_ms, prompt)`, without `session_id`, so two
+  turns with the same text at the same millisecond collapse. Grok makes this
+  visible rather than causing it: a session with no `updates.jsonl` and no
+  per-record times has exactly one real timestamp, `created_at`, so two
+  `continue` turns collide where another provider's per-record clock would
+  separate them. Spacing them out by a millisecond each is the synthesized
+  `first_ts + index` ladder this work deleted, and is not an option — a
+  fabricated time is worse than a collapsed rollup. The transcript, keyed per
+  record, keeps both turns; the prompt rollup keeps one. Widening that key is a
+  change to a table every provider shares and is tracked separately.
+
   A hydration's `source_bytes` and `records_parsed` describe the whole
   directory, not the transcript: an `updates.jsonl` is routinely the largest
   file in a busy session, and reporting the transcript alone understates the
