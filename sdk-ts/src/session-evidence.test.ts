@@ -629,6 +629,23 @@ test('user turn pages group each message with its blocks and page by keyset', as
       ],
     );
 
+    // Each turn names the messages recorded either side of it, so a consumer
+    // can stitch a turn back into the conversation without re-reading the
+    // event stream. The last turn's neighbour is the harness notification
+    // that follows it — what was actually recorded next, not a guess at what
+    // a reader would prefer.
+    const events = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'claude' });
+    const notificationId = events[events.length - 1].messageId;
+    assert.deepEqual(
+      turns.map((turn) => [turn.messageId, turn.precedingMessageId, turn.followingMessageId]),
+      [
+        ['u1', null, 'a1'],
+        ['r1', 'a1', 'a2'],
+        ['r2', 'a2', 'a3'],
+        ['r3', 'a3', notificationId],
+      ],
+    );
+
     const first = await getSessionUserTurnsPage('claude', SHARED_SESSION, { dbPath, limit: 1 });
     assert.equal(first.contractVersion, SESSION_EVIDENCE_CONTRACT_VERSION);
     assert.equal(first.userTurns.length, 1);

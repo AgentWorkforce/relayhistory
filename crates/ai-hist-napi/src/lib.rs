@@ -486,6 +486,11 @@ pub struct NativeSessionUserTurn {
     pub source: String,
     pub session_id: String,
     pub message_id: Option<String>,
+    /// The messages recorded either side of this turn, from either side of
+    /// the conversation. Null at the ends of a session, and when the
+    /// neighbouring record carried no provider message id.
+    pub preceding_message_id: Option<String>,
+    pub following_message_id: Option<String>,
     pub ts_ms: i64,
     pub blocks: Vec<NativeSessionUserTurnBlock>,
 }
@@ -497,6 +502,8 @@ impl From<CoreSessionUserTurn> for NativeSessionUserTurn {
             source: turn.source,
             session_id: turn.session_id,
             message_id: turn.message_id,
+            preceding_message_id: turn.preceding_message_id,
+            following_message_id: turn.following_message_id,
             ts_ms: turn.ts_ms,
             blocks: turn
                 .blocks

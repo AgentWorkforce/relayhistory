@@ -938,7 +938,13 @@ provider's logs contain that relayhistory does not capture yet are written as
   each turn's blocks — run inside one deferred read transaction, so a sync
   writing concurrently cannot hand back a header whose blocks have moved or
   vanished behind a cursor that already advanced past it.
-  A turn is what arrived on one user message.
+  A turn is what arrived on one user message. Each one also names its
+  `precedingMessageId` and `followingMessageId` — the messages recorded either
+  side of it, from either side of the conversation — so a consumer can stitch
+  a turn back into the message stream without re-reading the events. Both are
+  `null` at the ends of a session and when the adjacent record carried no
+  provider message id, and a later block of the same turn is never reported as
+  the message that follows it.
   Membership is asserted through `event_source`, never inferred from `role`:
   only `tool_result` means "a block inside a message". A Claude subagent
   notification and a Codex `function_call_output` are both stored with

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 #[cfg(feature = "opencode-backup")]
 use rusqlite::DatabaseName;
-use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -2383,6 +2385,13 @@ pub struct SessionUserTurn {
     pub session_id: String,
     /// Provider message id the blocks share, when there is one.
     pub message_id: Option<String>,
+    /// The message recorded immediately before this turn began, and the one
+    /// recorded immediately after it, whichever side of the conversation each
+    /// came from. `None` at the ends of a session, and on a row whose
+    /// neighbour carried no provider message id. Blocks of this same turn are
+    /// never reported as its neighbours.
+    pub preceding_message_id: Option<String>,
+    pub following_message_id: Option<String>,
     pub ts_ms: i64,
     pub blocks: Vec<SessionUserTurnBlock>,
 }
@@ -2426,6 +2435,18 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// `event_source` for every transcript it can still read.
 const USER_TURN_ROW_FILTER: &str =
     "(role = 'user' OR (role = 'tool_result' AND event_source = 'tool_result'))";
+
+/// The message recorded next to a turn, on either side of it.
+///
+/// The neighbour is looked for from the turn's *first* block in `(ts_ms, id)`
+/// order, and every row sharing that turn's key is excluded, so the turn's own
+/// later blocks can never be reported as the message that follows it. The
+/// search is over every event of the session, not only user-side ones: what
+/// precedes a human turn is normally the assistant message it answers, which
+/// is the whole point of asking. A row carrying no provider message id is
+/// skipped rather than reported as an empty id.
+const USER_TURN_NEIGHBOUR_SELECT: &str = "SELECT NULLIF(message_id, '') FROM session_events \
+     WHERE source = ? AND session_id = ? AND NULLIF(message_id, '') IS NOT NULL";
 
 /// One bounded page of user turns for one session, oldest first.
 ///
@@ -2502,14 +2523,24 @@ pub fn session_user_turns_page(
     }
 
     let mut user_turns = Vec::with_capacity(turns.len());
+    let mut block_stmt = conn.prepare(&format!(
+        "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
+         FROM session_events \
+         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
+           AND {USER_TURN_KEY} = ? \
+         ORDER BY ts_ms ASC, id ASC"
+    ))?;
+    let mut preceding_stmt = conn.prepare(&format!(
+        "{USER_TURN_NEIGHBOUR_SELECT} AND {USER_TURN_KEY} <> ? \
+           AND (ts_ms < ? OR (ts_ms = ? AND id < ?)) \
+         ORDER BY ts_ms DESC, id DESC LIMIT 1"
+    ))?;
+    let mut following_stmt = conn.prepare(&format!(
+        "{USER_TURN_NEIGHBOUR_SELECT} AND {USER_TURN_KEY} <> ? \
+           AND (ts_ms > ? OR (ts_ms = ? AND id > ?)) \
+         ORDER BY ts_ms ASC, id ASC LIMIT 1"
+    ))?;
     for (turn_key, ts_ms, id, message_id) in turns {
-        let mut block_stmt = conn.prepare(&format!(
-            "SELECT role, kind, tool_use_id, {USER_TURN_BYTE_LEN}, result_status \
-             FROM session_events \
-             WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-               AND {USER_TURN_KEY} = ? \
-             ORDER BY ts_ms ASC, id ASC"
-        ))?;
         let blocks = block_stmt
             .query_map(params![source, session_id, turn_key], |row| {
                 let role: String = row.get(0)?;
@@ -2543,11 +2574,24 @@ pub fn session_user_turns_page(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let neighbour = |stmt: &mut rusqlite::Statement<'_>| -> Result<Option<String>> {
+            Ok(stmt
+                .query_row(
+                    params![source, session_id, &turn_key, ts_ms, ts_ms, id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        };
+        let preceding_message_id = neighbour(&mut preceding_stmt)?;
+        let following_message_id = neighbour(&mut following_stmt)?;
         user_turns.push(SessionUserTurn {
             id,
             source: source.to_string(),
             session_id: session_id.to_string(),
             message_id,
+            preceding_message_id,
+            following_message_id,
             ts_ms,
             blocks,
         });
@@ -3748,6 +3792,79 @@ mod tests {
                 Some("completed".into()),
                 Some("running".into()),
             ],
+        );
+    }
+
+    #[test]
+    fn a_user_turn_names_the_messages_either_side_of_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // One session, in recorded order: an assistant message, a user turn
+        // whose text and tool result share a message id, an assistant
+        // message with no id of its own, another assistant message, and a
+        // second user turn at the end of the transcript.
+        let insert = |message_id: &str, ts: i64, role: &str, uid: &str| {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, message_id, ts_ms, role, kind, text, event_uid, event_source) \
+                 VALUES ('claude', 's1', ?, ?, ?, ?, 'body', ?, ?)",
+                rusqlite::params![
+                    message_id,
+                    ts,
+                    role,
+                    if role == "tool_result" { "tool_result" } else { "text" },
+                    uid,
+                    if role == "tool_result" { Some("tool_result") } else { None },
+                ],
+            )
+            .unwrap();
+        };
+        insert("a1", 1, "assistant", "e1");
+        insert("m1", 2, "user", "e2");
+        insert("m1", 3, "tool_result", "e3");
+        // A row carrying no message id cannot be named as a neighbour, so the
+        // search passes over it rather than reporting an empty id.
+        insert("", 4, "assistant", "e4");
+        insert("a2", 5, "assistant", "e5");
+        insert("m2", 6, "user", "e6");
+
+        let page = session_user_turns_page(&conn, "claude", "s1", 100, None).unwrap();
+        let seen: Vec<(Option<&str>, Option<&str>, Option<&str>)> = page
+            .user_turns
+            .iter()
+            .map(|turn| {
+                (
+                    turn.message_id.as_deref(),
+                    turn.preceding_message_id.as_deref(),
+                    turn.following_message_id.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // The turn's own second block shares its message id, so it is
+                // never reported as the message that follows the turn.
+                (Some("m1"), Some("a1"), Some("a2")),
+                // Nothing was recorded after the last turn.
+                (Some("m2"), Some("a2"), None),
+            ],
+        );
+        // A session that opens on the human's prompt has nothing before it.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's2', 'm9', 1, 'user', 'text', 'body', 'f1'), \
+                    ('claude', 's2', 'a9', 2, 'assistant', 'text', 'body', 'f2')",
+            [],
+        )
+        .unwrap();
+        let opening = session_user_turns_page(&conn, "claude", "s2", 100, None).unwrap();
+        assert_eq!(opening.user_turns.len(), 1);
+        assert_eq!(opening.user_turns[0].preceding_message_id, None);
+        assert_eq!(
+            opening.user_turns[0].following_message_id.as_deref(),
+            Some("a9")
         );
     }
 

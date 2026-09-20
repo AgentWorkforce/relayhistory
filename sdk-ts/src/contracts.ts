@@ -571,6 +571,15 @@ export interface SessionUserTurn {
   source: Source;
   sessionId: string;
   messageId: string | null;
+  /**
+   * The messages recorded either side of this turn, whichever side of the
+   * conversation each came from — normally the assistant message the human
+   * answered, and the one their prompt drew. `null` at the ends of a session,
+   * and when the neighbouring record carried no provider message id. A later
+   * block of this same turn is never its own neighbour.
+   */
+  precedingMessageId: string | null;
+  followingMessageId: string | null;
   tsMs: number;
   blocks: SessionUserTurnBlock[];
 }

@@ -254,6 +254,8 @@ export function sessionUserTurn(value: UnknownRecord): SessionUserTurn {
     source: String(value.source) as Source,
     sessionId: String(value.sessionId),
     messageId: nullableString(value.messageId),
+    precedingMessageId: nullableString(value.precedingMessageId),
+    followingMessageId: nullableString(value.followingMessageId),
     tsMs: Number(value.tsMs),
     blocks: Array.isArray(value.blocks)
       ? (value.blocks as UnknownRecord[]).map(sessionUserTurnBlock)

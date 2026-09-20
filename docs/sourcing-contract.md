@@ -143,8 +143,11 @@ accounting.
 
 Shipped for Claude and Codex as `SessionStore::session_user_turns_page` and
 the corresponding Node/TypeScript page and pagination helpers. Blocks carry
-`byte_len`, `tool_use_id`, and three-state `is_error`; `approx_tokens` remains
-consumer-derived rather than presenting a heuristic as measured evidence.
+`byte_len`, `tool_use_id`, and three-state `is_error`, and each turn carries
+`preceding_message_id` / `following_message_id` — the messages recorded either
+side of it, null at the ends of a session and wherever the adjacent record
+carried no provider message id. `approx_tokens` remains consumer-derived
+rather than presenting a heuristic as measured evidence.
 
 ## 7. Request identity — `RequestIdLookup`
 
