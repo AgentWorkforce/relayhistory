@@ -103,11 +103,56 @@ impl SessionLocation {
     }
 }
 
+/// How [`stats_scoped_by`] buckets `by_project`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectGrouping {
+    /// The canonical `project_key`, falling back to the raw `history.project`
+    /// string for a row whose session has not been resolved yet. This is the
+    /// default because it is the grouping that merges `/Users/a/proj` and
+    /// `/home/b/proj` when they are the same repository.
+    #[default]
+    ProjectKey,
+    /// The historical grouping: `history.project`, which is the raw cwd.
+    Cwd,
+}
+
+impl ProjectGrouping {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectKey => "project_key",
+            Self::Cwd => "cwd",
+        }
+    }
+
+    /// The grouping expression, against `history` aliased as `h`.
+    ///
+    /// A correlated subquery rather than a join: it is answered by the
+    /// `sessions` primary key, and a join would change the row count if the
+    /// catalog ever held a duplicate. The `COALESCE` matters -- a history row
+    /// whose session has no resolved key still has to appear somewhere, and
+    /// dropping it would leave a total that does not match the sum of the
+    /// buckets.
+    pub fn expression(self) -> &'static str {
+        match self {
+            Self::ProjectKey => {
+                "COALESCE((SELECT s.project_key FROM sessions s \
+                  WHERE s.source = h.source AND s.session_id = h.session_id), h.project)"
+            }
+            Self::Cwd => "h.project",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stats {
     pub total: i64,
     pub by_source: Vec<(String, i64)>,
+    /// Top projects, bucketed by [`Stats::grouping`].
     pub by_project: Vec<(String, i64)>,
+    /// Which key `by_project` is bucketed by.
+    #[serde(default)]
+    pub grouping: ProjectGrouping,
     pub first_timestamp_ms: Option<i64>,
     pub last_timestamp_ms: Option<i64>,
 }
@@ -131,6 +176,8 @@ CREATE TABLE IF NOT EXISTS session_events (
     source TEXT NOT NULL,
     session_id TEXT NOT NULL,
     project TEXT,
+    project_key TEXT,
+    project_key_method TEXT,
     cwd TEXT,
     git_branch TEXT,
     message_id TEXT,
@@ -466,6 +513,11 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "workspace_roots_json",
     "source_stamp",
     "discovery_state",
+    // Canonical project identity (issue #175). Every catalog read selects
+    // both, so a database that predates them must migrate before a read-only
+    // handle can serve one.
+    "project_key",
+    "project_key_method",
 ];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
@@ -473,6 +525,15 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
 /// fact about the stored evidence, not about the run that happened to parse
 /// it.
 const REQUIRED_HYDRATION_CHECKPOINT_COLUMNS: &[&str] = &["source_diagnostics_json"];
+/// Columns [`init_db`] adds to `session_events` after the original DDL.
+/// `project_key` is denormalized onto the event so a grouping query does not
+/// have to join `sessions` for every row, and `project_key_method` says what
+/// kind of key it is. The method is storage, not surface: nothing selects it
+/// into [`crate::SessionEvent`]. It exists so the denormalizing pass can rank
+/// what it is about to write against what the row already holds, which is the
+/// only way to tell a key a delegated child resolved for itself from one it
+/// was lent. Without it that pass overwrote the former with the latter.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["project_key", "project_key_method"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
@@ -517,6 +578,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
     "idx_session_relationships_child",
+    "idx_sessions_project_key",
 ];
 
 /// Indexes no longer created: nothing queries them, or a replacement covers
@@ -570,6 +632,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
     "session_markers_v1",
+    "session_project_key_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -676,6 +739,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_HYDRATION_CHECKPOINT_COLUMNS
         .iter()
         .all(|needed| checkpoint_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|needed| event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -840,6 +913,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     workspace_roots_json TEXT,
     source_stamp TEXT,
     discovery_state TEXT,
+    project_key TEXT,
+    project_key_method TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -915,11 +990,25 @@ INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');
     migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     ensure_text_columns(
         conn,
         "session_hydration_checkpoints",
         REQUIRED_HYDRATION_CHECKPOINT_COLUMNS,
+    )?;
+    // Canonical project identity (issue #175). The columns above are additive
+    // and the index below is created unconditionally, so the marker records
+    // only that this database has the shape -- it deliberately backfills no
+    // data. Resolving a key means walking the filesystem from each distinct
+    // `cwd`, which is not something a schema migration inside the open path
+    // should do, and writing a path-fallback key for a checkout that does have
+    // a remote would be a well-formed answer computed over nothing: it would
+    // read as "resolved to a path" forever, and every consumer grouping by the
+    // key would split that repository. NULL means "not resolved yet" honestly,
+    // and [`refresh_project_identity`] fills it on the next sync or hydration.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_project_key_v1');",
     )?;
     // Before the presence model every identity in the local evidence ledger
     // was local. Check the marker before attempting a write so an
@@ -1003,6 +1092,14 @@ VALUES ('session_presences_local_backfill_v1');
     // path, because a transcript's session id is not known until it is read.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_raw_path ON sessions(source, raw_path)",
+        [],
+    )?;
+    // Grouping and filtering by canonical project is the point of the column:
+    // `(source, project_key, last_activity_ms)` answers "this project's
+    // sessions, newest first" without a sort, and its `project_key IS NULL`
+    // prefix is what [`refresh_project_identity`] scans for unresolved rows.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_project_key ON sessions(source, project_key, last_activity_ms DESC)",
         [],
     )?;
     conn.execute(
@@ -1653,7 +1750,12 @@ pub struct SessionEvent {
     pub id: i64,
     pub source: String,
     pub session_id: String,
+    /// Raw working directory as the provider recorded it. Machine-local.
     pub project: Option<String>,
+    /// Canonical project identity, denormalized from the owning session so a
+    /// consumer can group events without joining. `None` until the session's
+    /// identity has been resolved (see [`refresh_project_identity`]).
+    pub project_key: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub message_id: Option<String>,
@@ -1744,6 +1846,37 @@ pub struct SessionFileEditPage {
     pub next_cursor: Option<SessionEvidenceCursor>,
 }
 
+/// Column list and row mapper for [`SessionEvent`], declared once.
+///
+/// The full listing and the paged listing must return identical rows; when
+/// each spelled its own `SELECT` the two drifted the moment a column was
+/// added, and the mismatch only surfaces as a positional `row.get` reading the
+/// wrong field.
+const SESSION_EVENT_COLUMNS: &str =
+    "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
+     ts_ms, role, kind, text, model, token_json, event_uid";
+
+fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        project: row.get(3)?,
+        project_key: row.get(4)?,
+        cwd: row.get(5)?,
+        git_branch: row.get(6)?,
+        message_id: row.get(7)?,
+        parent_id: row.get(8)?,
+        ts_ms: row.get(9)?,
+        role: row.get(10)?,
+        kind: row.get(11)?,
+        text: row.get(12)?,
+        model: row.get(13)?,
+        token_json: row.get(14)?,
+        event_uid: row.get(15)?,
+    })
+}
+
 /// All normalized events for one session, oldest first. Rows sharing a
 /// timestamp keep insertion order via the rowid tiebreaker.
 pub fn session_events(
@@ -1751,8 +1884,8 @@ pub fn session_events(
     session_id: &str,
     source: Option<&str>,
 ) -> Result<Vec<SessionEvent>> {
-    let mut sql = "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id,                    ts_ms, role, kind, text, model, token_json, event_uid                    FROM session_events WHERE session_id = ?"
-        .to_string();
+    let mut sql =
+        format!("SELECT {SESSION_EVENT_COLUMNS} FROM session_events WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1760,25 +1893,7 @@ pub fn session_events(
     }
     sql.push_str(" ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionEvent {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            project: row.get(3)?,
-            cwd: row.get(4)?,
-            git_branch: row.get(5)?,
-            message_id: row.get(6)?,
-            parent_id: row.get(7)?,
-            ts_ms: row.get(8)?,
-            role: row.get(9)?,
-            kind: row.get(10)?,
-            text: row.get(11)?,
-            model: row.get(12)?,
-            token_json: row.get(13)?,
-            event_uid: row.get(14)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1792,10 +1907,7 @@ pub fn session_events_page(
 ) -> Result<SessionEventPage> {
     let limit = limit.clamp(1, 1_000);
     let mut sql =
-        "SELECT id, source, session_id, project, cwd, git_branch, message_id, parent_id, \
-                          ts_ms, role, kind, text, model, token_json, event_uid \
-                   FROM session_events WHERE session_id = ?"
-            .to_string();
+        format!("SELECT {SESSION_EVENT_COLUMNS} FROM session_events WHERE session_id = ?");
     let mut params_vec = vec![session_id.to_string()];
     if let Some(source) = source {
         sql.push_str(" AND source = ?");
@@ -1811,25 +1923,7 @@ pub fn session_events_page(
     params_vec.push((limit + 1).to_string());
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(SessionEvent {
-            id: row.get(0)?,
-            source: row.get(1)?,
-            session_id: row.get(2)?,
-            project: row.get(3)?,
-            cwd: row.get(4)?,
-            git_branch: row.get(5)?,
-            message_id: row.get(6)?,
-            parent_id: row.get(7)?,
-            ts_ms: row.get(8)?,
-            role: row.get(9)?,
-            kind: row.get(10)?,
-            text: row.get(11)?,
-            model: row.get(12)?,
-            token_json: row.get(13)?,
-            event_uid: row.get(14)?,
-        })
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), row_to_session_event)?;
     let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let has_more = events.len() > limit as usize;
     if has_more {
@@ -2062,6 +2156,16 @@ pub fn stats(conn: &Connection, tag: Option<&str>) -> Result<Stats> {
 }
 
 pub fn stats_scoped(conn: &Connection, tag: Option<&str>, scope: SessionScope) -> Result<Stats> {
+    stats_scoped_by(conn, tag, scope, ProjectGrouping::default())
+}
+
+/// Statistics with an explicit `by_project` bucketing.
+pub fn stats_scoped_by(
+    conn: &Connection,
+    tag: Option<&str>,
+    scope: SessionScope,
+    grouping: ProjectGrouping,
+) -> Result<Stats> {
     let mut where_sql = " WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
     append_scope_filter(&mut where_sql, scope, "h");
@@ -2086,8 +2190,12 @@ pub fn stats_scoped(conn: &Connection, tag: Option<&str>, scope: SessionScope) -
         rows
     };
     let by_project = {
-        let extra = format!("{where_sql} AND project IS NOT NULL");
-        let mut stmt = conn.prepare(&format!("SELECT project, COUNT(*) FROM history h {extra} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"))?;
+        let key = grouping.expression();
+        let extra = format!("{where_sql} AND {key} IS NOT NULL");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key}, COUNT(*) FROM history h {extra} \
+             GROUP BY {key} ORDER BY COUNT(*) DESC LIMIT 10"
+        ))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.clone()), |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -2104,9 +2212,660 @@ pub fn stats_scoped(conn: &Connection, tag: Option<&str>, scope: SessionScope) -
         total,
         by_source,
         by_project,
+        grouping,
         first_timestamp_ms,
         last_timestamp_ms,
     })
+}
+
+// ---------------------------------------------------------------------------
+// canonical project identity
+// ---------------------------------------------------------------------------
+
+/// Strength of a stored project identity, as a SQL expression over `alias`.
+///
+/// Upserts merge on this ranking so a later, weaker observation can never
+/// overwrite a stronger one: a shallow rescan that cannot see the repository
+/// any more must not replace a resolved remote key with the directory it was
+/// run from. `0` is "nothing stored", which every real value outranks.
+fn project_key_rank_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.project_key IS NULL THEN 0 \
+              WHEN {alias}.project_key_method = 'remote' THEN 3 \
+              WHEN {alias}.project_key_method = 'inherited' THEN 2 \
+              ELSE 1 END"
+    )
+}
+
+/// The `ON CONFLICT ... DO UPDATE SET` fragment that merges project identity
+/// into the `sessions` table. Shared by shallow discovery and full ingest so
+/// the two cannot disagree about precedence.
+pub(crate) fn project_key_merge_sql() -> String {
+    let incoming = project_key_rank_sql("excluded");
+    let stored = project_key_rank_sql("sessions");
+    format!(
+        "project_key = CASE WHEN ({incoming}) >= ({stored}) \
+            THEN excluded.project_key ELSE sessions.project_key END, \
+         project_key_method = CASE WHEN ({incoming}) >= ({stored}) \
+            THEN excluded.project_key_method ELSE sessions.project_key_method END"
+    )
+}
+
+/// How many times the inheritance pass is repeated.
+///
+/// One statement propagates one level, so a chain of delegations needs one
+/// pass per level, and a bound below the deepest chain the ledger can hold
+/// would silently leave the tail of that chain on a path key. It is therefore
+/// tied to [`crate::relationships::MAX_TREE_MAX_DEPTH`], the depth the
+/// relationship reader itself will traverse: anything the tree can show, this
+/// can key.
+///
+/// The loop stops as soon as no inheritable row remains, so the bound is not
+/// the normal exit. It is a termination guarantee for a pathological topology
+/// — the ledger does not forbid a relationship cycle — and it is safe as a
+/// bound because each pass converts rows to `inherited`, which the predicate
+/// excludes, so the candidate set strictly shrinks.
+const PROJECT_KEY_INHERITANCE_PASSES: usize = crate::relationships::MAX_TREE_MAX_DEPTH as usize;
+
+/// Resolve, inherit and denormalize canonical project identity.
+///
+/// Three passes, in order, because each depends on the previous one:
+///
+/// 1. **Resolve.** Every distinct `cwd` belonging to a session with no key is
+///    resolved once through the cached resolver, and its sessions are stamped.
+///    This is the only pass that touches the filesystem, and it is bounded by
+///    the number of *unresolved* sessions, so a steady-state run does nothing.
+/// 2. **Inherit.** A delegated child whose own directory resolved to nothing
+///    canonical adopts its parent's key with `method = 'inherited'`, which is
+///    what makes a subagent's work roll up to the repository the parent was
+///    working in (burn's #506 rollup requirement). Deliberately a post-pass
+///    over `session_relationships` rather than something the parsers do: the
+///    child is frequently ingested before its parent, so anything that ran
+///    during parsing would depend on file ordering.
+/// 3. **Denormalize.** `session_events.project_key` is brought in line with
+///    its session, so grouping events by project needs no join.
+/// 4. **Lend.** Events of a delegated thread the catalog does not hold at all
+///    take the key of their nearest cataloged ancestor, stepping over any
+///    uncataloged generations between.
+///
+/// Returns the number of rows written across the three passes. Idempotent: a
+/// second call on an unchanged database returns 0.
+pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
+    let mut written = resolve_missing_project_keys(conn)?;
+    written += inherit_project_keys(conn)?;
+    written += denormalize_event_project_keys(conn)?;
+    written += inherit_event_project_keys(conn)?;
+    Ok(written)
+}
+
+/// Pass 1: stamp sessions with no key, and upgrade ones stuck on a borrowed
+/// or provisional key.
+///
+/// A path key is not a settled answer, it is the absence of one. Only filling
+/// NULLs would freeze it: `upsert_session` resolves from the working directory
+/// alone, so a session whose checkout has since been deleted or moved gets a
+/// path key, and nothing would ever revisit it — not this pass, which would
+/// see a non-NULL key, and not shallow discovery, which skips a source whose
+/// bytes have not changed. The repository's own `repo_url`, which the Codex
+/// reader records, then sits in the same row unused while every worktree of
+/// that repository files under a different key.
+///
+/// So a `path` row is reconsidered on every pass and replaced only by
+/// something strictly better. An `inherited` row is reconsidered too, for the
+/// mirror-image reason: the parent's repository is a stand-in, and a child
+/// that later gains its own `origin` would otherwise wear the parent's key for
+/// as long as its transcript stayed unchanged — which is forever.
+///
+/// Nothing here can downgrade a key. `remote` replaces `path` or `inherited`;
+/// `path` replaces only `path` or NULL, never an inherited key, because a
+/// borrowed repository says more about a session than the directory it
+/// happened to run in.
+fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
+    let pending: Vec<(Option<String>, Option<String>)> = conn
+        .prepare(
+            "SELECT DISTINCT cwd, repo_url FROM sessions \
+             WHERE (project_key IS NULL \
+                    OR project_key_method IN ('path', 'inherited')) \
+               AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    // The predicate the update would apply, asked as a question first.
+    //
+    // In the steady state every one of these rows resolves to the key it
+    // already has: a `path` key is reconsidered on every pass precisely
+    // because it might be upgradable, and almost always is not. Issuing the
+    // UPDATE anyway takes the write lock to change nothing, on every sync, for
+    // every path-keyed session -- and a `SQLITE_BUSY` on that no-op would fail
+    // the whole refresh, taking inheritance and denormalization down with it.
+    // The other two passes probe for the same reason.
+    //
+    // An `inherited` key is reconsidered too, but displaced only by a
+    // `remote`: it is a borrowed key, so it outranks a path and loses to the
+    // child's own repository. A child that later gains its own `origin` would
+    // otherwise keep the parent's repository for as long as its transcript
+    // stayed unchanged, which is forever.
+    const UPGRADABLE: &str = "(project_key IS NULL \
+             OR (project_key_method = 'path' \
+                 AND (?2 = 'remote' OR project_key <> ?1)) \
+             OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
+           AND cwd IS ?3 AND repo_url IS ?4";
+    let mut needed = conn.prepare(&format!(
+        "SELECT 1 FROM sessions WHERE {UPGRADABLE} LIMIT 1"
+    ))?;
+    let mut update = conn.prepare(&format!(
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 WHERE {UPGRADABLE}"
+    ))?;
+    let mut written = 0;
+    for (cwd, repo_url) in pending {
+        let Some((key, method)) =
+            crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
+        else {
+            continue;
+        };
+        let arguments = params![key, method.as_str(), cwd, repo_url];
+        if !needed.exists(arguments)? {
+            continue;
+        }
+        written += update.execute(arguments)?;
+    }
+    Ok(written)
+}
+
+/// Pass 2: a delegated child adopts its parent's canonical key.
+///
+/// Applies to a child with no key at all and to one that only resolved to its
+/// own path: a path key is machine-local and says nothing about the project,
+/// so the parent's repository is strictly better information. A child that
+/// resolved its *own* remote keeps it — that is a stronger statement than the
+/// parent's, and a subagent genuinely running in another checkout should not
+/// be filed under the delegator's repository.
+fn inherit_project_keys(conn: &Connection) -> Result<usize> {
+    let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    let inheritable = inheritable_session_sql();
+    let sql = format!(
+        "UPDATE sessions SET project_key = ({parent}), project_key_method = 'inherited' \
+         WHERE {inheritable}"
+    );
+    let mut written = 0;
+    for _ in 0..PROJECT_KEY_INHERITANCE_PASSES {
+        // Each iteration settles one level of delegation: a row whose
+        // parent already holds its final key reaches that key and matches the
+        // predicate no more. For a tree the loop therefore exits on the first
+        // iteration that writes nothing, one past the deepest chain.
+        //
+        // Since the predicate now also admits a row whose borrowed key has
+        // gone stale, the candidate set no longer *strictly* shrinks, so for a
+        // cycle — which the ledger does not forbid — the bound rather than the
+        // predicate is what terminates the loop. That is what the bound has
+        // always been for.
+        //
+        // Probing with a SELECT before issuing the UPDATE keeps the steady
+        // state read-only: a sync with nothing to inherit must not take the
+        // write lock, both because it is pure cost and because a database held
+        // by another writer would otherwise turn a no-op into a failure.
+        let mut changed = 0;
+        if conn
+            .prepare(&format!(
+                "SELECT 1 FROM sessions WHERE {inheritable} LIMIT 1"
+            ))?
+            .exists([])?
+        {
+            changed += conn.execute(&sql, [])?;
+        }
+        // The statement above joins a child straight to its parent's catalog
+        // row, so it cannot see past a generation the catalog does not hold —
+        // and a delegated thread that delegates again is routine. The walk
+        // covers exactly that gap, and has to run whether or not the statement
+        // found anything: its probe asks a strictly narrower question than
+        // this one does, so breaking on it would skip the walk entirely.
+        changed += inherit_across_uncataloged_generations(conn)?;
+        written += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    Ok(written)
+}
+
+/// The part of pass 2 that cannot be one statement: a cataloged session whose
+/// delegating ancestor is cataloged but whose *intermediate* generations are
+/// not.
+///
+/// `r -> c -> g` with `c` evidence-only leaves `g` joined to nothing, so `g`
+/// keeps a path key or none while the root it was delegated from carries the
+/// repository. The events of such a session must not be keyed where the
+/// session row itself is not, so this fills the row and lets the ordinary
+/// denormalizing pass carry it down — and keeps it in step afterwards, when
+/// the ancestor it borrowed from moves.
+fn inherit_across_uncataloged_generations(conn: &Connection) -> Result<usize> {
+    // Two kinds of row reach the walk, and everything else is the statement's:
+    //
+    //   - one already wearing a borrowed key, because re-lending has to be
+    //     decided one row at a time against a visited set — a statement that
+    //     re-lends rotates the keys of a delegation cycle forever;
+    //   - one with no key, or only a path, whose direct parent has nothing to
+    //     lend, because then the answer is further up than a join can see.
+    //
+    // A row the statement can settle is left to it rather than walked twice.
+    let lendable_parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    let pending: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT source, session_id FROM sessions \
+             WHERE ((project_key_method = 'inherited' AND project_key IS NOT NULL) \
+                    OR ((project_key IS NULL OR project_key_method = 'path') \
+                        AND NOT EXISTS ({lendable_parent}))) \
+               AND EXISTS (SELECT 1 FROM session_relationships r \
+                     WHERE r.source = sessions.source \
+                       AND r.child_session_id = sessions.session_id)"
+        ))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    // The same ranking the rest of the module applies: a `remote` is never
+    // touched, and a borrowed key is rewritten only when the ancestor now
+    // holds a different one — so a settled database writes nothing and the
+    // loop around this terminates.
+    let mut update = conn.prepare(
+        "UPDATE sessions SET project_key = ?3, project_key_method = 'inherited' \
+         WHERE source = ?1 AND session_id = ?2 \
+           AND (project_key IS NULL OR project_key_method = 'path' \
+                OR (project_key_method = 'inherited' AND project_key IS NOT ?3))",
+    )?;
+    let mut written = 0;
+    for (source, session_id) in pending {
+        let Some(key) = lendable_ancestor_key_for(conn, &source, &session_id)? else {
+            continue;
+        };
+        written += update.execute(params![source, session_id, key])?;
+    }
+    Ok(written)
+}
+
+/// The key pass 2 would adopt for a child: that of its earliest-recorded
+/// delegating parent which has something better than a path of its own.
+///
+/// The child is named by two SQL expressions so that one statement serves both
+/// callers — correlated against the `sessions` row pass 2 is updating, and
+/// against bound parameters when discovery asks the same question about a
+/// single row before the pass runs. The two must not drift: discovery streams
+/// its answer to the caller while pass 2 writes the row, and a consumer
+/// reading both would otherwise be told two different projects for one
+/// session.
+fn inheritable_parent_key_sql(source: &str, session_id: &str) -> String {
+    format!(
+        "SELECT p.project_key FROM session_relationships r \
+         JOIN sessions p ON p.source = r.source AND p.session_id = r.parent_session_id \
+         WHERE r.source = {source} AND r.child_session_id = {session_id} \
+           AND p.project_key IS NOT NULL \
+           AND p.project_key_method IN ('remote', 'inherited') \
+         ORDER BY r.created_ms, r.parent_session_id LIMIT 1"
+    )
+}
+
+/// The rows this one statement lends to: a delegated child whose own key is
+/// absent or merely its own path, whose parent has something better.
+///
+/// Deliberately *not* rows that already wear a borrowed key. Re-lending one is
+/// necessary — an ancestor can be promoted onto a `remote` of its own and
+/// every stand-in beneath it has to move — but it cannot be done by a
+/// set-at-a-time statement: the relationship ledger permits a cycle, and in an
+/// inherited-only cycle `A -> B -> C -> A` a single UPDATE reads every parent
+/// from the same pre-statement snapshot and *rotates* the three keys. The
+/// iteration bound ends the call but not at a fixed point, so every later
+/// refresh rotates them again and denormalizes the new arrangement onto every
+/// event — permanent churn that each pass reports as work done.
+///
+/// Re-lending therefore belongs to the walk below, which carries a visited set
+/// and so can tell a chain from a circle. What is left here strictly shrinks
+/// its own candidate set each iteration — a row it rewrites becomes
+/// `inherited` and stops matching — which is the loop's termination argument.
+fn inheritable_session_sql() -> String {
+    let parent = inheritable_parent_key_sql("sessions.source", "sessions.session_id");
+    format!("(project_key IS NULL OR project_key_method = 'path') AND EXISTS ({parent})")
+}
+
+/// The key a session will hold once pass 1 and pass 2 have both run, computed
+/// one row at a time from the filesystem and the relationship ledger.
+///
+/// This is what makes a *streamed* key trustworthy. Discovery decides a cached
+/// row's key and hands it to its caller in the same breath, while the refresh
+/// pass runs at the end of the pass over every row at once. Asking only what
+/// the catalog holds right now is not enough to agree with it: the same pass
+/// may promote this row's parent from a path to its own `remote` (pass 1) and
+/// only then lend it down (pass 2) — after the child was already emitted.
+///
+/// So the answer is derived rather than read: the nearest ancestor, in the
+/// order pass 2 selects parents, that has or is about to have a `remote` key
+/// of its own. Bounded by [`PROJECT_KEY_INHERITANCE_PASSES`] and by a visited
+/// set, because the ledger does not forbid a relationship cycle.
+///
+/// Returns `None` when nothing would be inherited, which is the common case:
+/// most sessions have no parent at all, and the walk then costs one indexed
+/// lookup that returns no rows.
+pub(crate) fn inheritable_parent_project_key(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    lendable_ancestor_key_for(conn, source, session_id)
+}
+
+/// One candidate parent as the walk below reads it: its id, the key and
+/// method it currently holds, and the two inputs pass 1 would resolve it from.
+type ParentIdentityRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The `remote` key this row will hold once pass 1 has run, if it will hold
+/// one at all.
+///
+/// Two arms, both [`resolve_missing_project_keys`]'s `UPGRADABLE` predicate
+/// read back out: a stored `remote` is never rewritten, and anything weaker —
+/// `path`, `inherited`, or no key at all — is replaced by a `remote` the row
+/// resolves for itself. Nothing else settles a row, so nothing else belongs
+/// here; a key the row merely *borrowed* is the caller's business, because
+/// pass 2 may replace that one too.
+fn pass_one_remote_key(
+    key: &Option<String>,
+    method: Option<&str>,
+    cwd: Option<String>,
+    repo_url: Option<String>,
+) -> Option<String> {
+    if method == Some("remote") && key.is_some() {
+        return key.clone();
+    }
+    match crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref()) {
+        Some((own, crate::project_identity::ProjectKeyMethod::Remote)) => Some(own),
+        _ => None,
+    }
+}
+
+/// The key the event's *own* session carries, when it has a catalog row.
+const EVENT_SESSION_KEY_SQL: &str = "(SELECT s.project_key FROM sessions s \
+     WHERE s.source = session_events.source \
+       AND s.session_id = session_events.session_id)";
+
+/// The method that key was arrived at by.
+const EVENT_SESSION_METHOD_SQL: &str = "(SELECT s.project_key_method FROM sessions s \
+     WHERE s.source = session_events.source \
+       AND s.session_id = session_events.session_id)";
+
+/// Rank a `(project_key, project_key_method)` pair the way the catalog does.
+///
+/// A method the row does not state ranks below everything. An event whose key
+/// arrived through a plugin snapshot is exactly that case, and the evidence
+/// contract already says such a key is never final — so it is improved by the
+/// first pass that knows better, rather than being defended as if the emitter
+/// had vouched for it.
+fn event_key_rank_sql(key: &str, method: &str) -> String {
+    format!(
+        "CASE WHEN {key} IS NULL THEN 0 \
+              WHEN {method} = 'remote' THEN 3 \
+              WHEN {method} = 'inherited' THEN 2 \
+              WHEN {method} = 'path' THEN 1 \
+              ELSE 0 END"
+    )
+}
+
+/// Pass 3: bring every event in line with its own session's key.
+///
+/// Ranked exactly as the catalog's merge is: nothing may lower a key's rank,
+/// and an equal rank may only be rewritten when the key itself differs.
+fn denormalize_event_project_keys(conn: &Connection) -> Result<usize> {
+    let incoming = event_key_rank_sql(EVENT_SESSION_KEY_SQL, EVENT_SESSION_METHOD_SQL);
+    let stored = event_key_rank_sql("project_key", "project_key_method");
+    let stale = format!(
+        "{EVENT_SESSION_KEY_SQL} IS NOT NULL \
+           AND (({incoming}) > ({stored}) \
+                OR (({incoming}) = ({stored}) \
+                    AND (project_key IS NULL OR project_key <> {EVENT_SESSION_KEY_SQL})))"
+    );
+    // Probe first, for the same reason pass 2 does: the ingest path already
+    // stamps each event as it inserts it, so this pass normally has nothing to
+    // do and must not take the write lock to discover that.
+    if !conn
+        .prepare(&format!(
+            "SELECT 1 FROM session_events WHERE {stale} LIMIT 1"
+        ))?
+        .exists([])?
+    {
+        return Ok(0);
+    }
+    Ok(conn.execute(
+        &format!(
+            "UPDATE session_events SET project_key = {EVENT_SESSION_KEY_SQL}, \
+             project_key_method = {EVENT_SESSION_METHOD_SQL} WHERE {stale}"
+        ),
+        [],
+    )?)
+}
+
+/// Events of a session the catalog does not hold rank as `inherited` once this
+/// pass lends them an ancestor's key.
+const EVENT_INHERITED_RANK: i64 = 2;
+
+/// Pass 4: a delegated thread the catalog does not hold at all takes the key
+/// of its nearest lendable ancestor.
+///
+/// This is where a rollup is won or lost. A delegated thread is evidence, not
+/// a session — a Codex subagent rollout and a Claude sidechain produce
+/// `session_events` under the child's id while the catalog holds only the root
+/// a human actually ran — so without this those events are the one place in
+/// the database with no project at all, which is exactly what burn's #506
+/// rollup needs.
+///
+/// It has to *walk*. Joining the relationship parent straight to `sessions`
+/// stops at the first generation the catalog does not hold, and a subagent
+/// that delegates again is routine: for `root -> child -> grandchild` with
+/// neither middle generation cataloged, the grandchild's events found no row
+/// to join and kept a path key or none at all — the deeper the delegation, the
+/// more certainly its work vanished from the project it belongs to. The walk
+/// climbs past an ancestor stuck on its own `path` too, for the same reason
+/// pass 2 does not lend one: a machine-local directory is the absence of an
+/// answer, not an answer to pass down.
+///
+/// The loan is ranked like everything else here: it fills an event with no key
+/// or a merely path-derived one, and replaces a borrowed key that has gone
+/// stale, but never displaces a `remote` the thread resolved for itself. A
+/// subagent that genuinely ran in another checkout stays filed where it ran.
+fn inherit_event_project_keys(conn: &Connection) -> Result<usize> {
+    let stored_rank = event_key_rank_sql("project_key", "project_key_method");
+    // "No catalog row" is asked as exactly that, and not as "its key reads
+    // NULL". The two are different sessions with different answers: a session
+    // the catalog *does* hold is pass 2's business, and keying its events from
+    // an ancestor while its own row stays null would put the row and its
+    // events in two different projects — with pass 3 unable to reconcile them,
+    // since it may not lower a key's rank. A cataloged session's events follow
+    // its row, whatever that row ends up saying.
+    let candidate = format!(
+        "NOT EXISTS (SELECT 1 FROM sessions s \
+             WHERE s.source = session_events.source \
+               AND s.session_id = session_events.session_id) \
+           AND ({stored_rank}) <= {EVENT_INHERITED_RANK} \
+           AND EXISTS (SELECT 1 FROM session_relationships r \
+                 WHERE r.source = session_events.source \
+                   AND r.child_session_id = session_events.session_id)"
+    );
+    let pending: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT DISTINCT source, session_id FROM session_events WHERE {candidate}"
+        ))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    // The write repeats the candidate predicate — the rows were read without a
+    // lock — and adds the one thing the walk decides: an equal-ranked key is
+    // rewritten only when it actually differs, so a settled database writes
+    // nothing.
+    let mut update = conn.prepare(&format!(
+        "UPDATE session_events SET project_key = ?3, project_key_method = 'inherited' \
+         WHERE source = ?1 AND session_id = ?2 AND {candidate} \
+           AND (({stored_rank}) < {EVENT_INHERITED_RANK} OR project_key <> ?3)"
+    ))?;
+    let mut written = 0;
+    for (source, session_id) in pending {
+        let Some(key) = lendable_ancestor_key_for(conn, &source, &session_id)? else {
+            continue;
+        };
+        written += update.execute(params![source, session_id, key])?;
+    }
+    Ok(written)
+}
+
+/// [`lendable_ancestor_key`] for one session, with the visited set opened.
+fn lendable_ancestor_key_for(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let mut walk = AncestorWalk {
+        visited: HashSet::new(),
+        path: HashSet::new(),
+    };
+    walk.visited.insert(session_id.to_string());
+    walk.path.insert(session_id.to_string());
+    Ok(lendable_ancestor_key(conn, source, session_id, &mut walk, 0)?.0)
+}
+
+/// State carried through the ancestor walk.
+struct AncestorWalk {
+    /// Sessions already examined, so a shared ancestor is examined once and a
+    /// circle is walked once rather than forever.
+    visited: HashSet<String>,
+    /// Sessions on the *current* path from the starting row. An edge back into
+    /// this set closes a cycle; an edge into `visited` but not into this set is
+    /// only a second route to the same ancestor, which is a diamond and
+    /// perfectly ordinary. Conflating the two is what made a shared ancestor
+    /// look like a loop.
+    path: HashSet<String>,
+}
+
+/// The key of the nearest ancestor that has one worth lending, following the
+/// same parent order, cycle protection and depth bound the rest of this module
+/// uses.
+///
+/// **One walk, asked by two callers**, and that is the point of it: discovery
+/// asks it for the key to *stream* before the refresh runs, and the refresh
+/// asks it for the key to *store*. When they were two functions they drifted —
+/// one of them inner-joined `sessions` and so could not see an evidence-only
+/// parent, and a grandchild's row in the catalog and the same row in
+/// `sessions discover --json` named different projects, with nothing anywhere
+/// recording the disagreement.
+///
+/// Three kinds of ancestor are climbed *past* rather than stopping the search,
+/// and all three are ordinary:
+///
+///   - one the catalog does not hold at all, because a delegated thread is
+///     evidence rather than a session (hence the correlated subqueries: an
+///     inner join drops exactly this case);
+///   - one whose own key is only its `path`, which is the absence of an answer
+///     rather than one — [`inheritable_parent_key_sql`] lends `remote` and
+///     `inherited` and nothing else, and a walk that stopped at a path key
+///     would label a machine-local directory `inherited` and call it a
+///     project;
+///   - one wearing a *borrowed* key, until its own ancestors have been asked:
+///     promote an ancestor and every stand-in beneath it moves, so returning
+///     the stand-in first answers with the key the refresh is about to
+///     replace.
+///
+/// Returns the key, and whether a cycle was closed *below this point* — the
+/// second is what tells the caller whether an ancestor's borrowed key is
+/// grounded in anything or only in the row being keyed.
+fn lendable_ancestor_key(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    walk: &mut AncestorWalk,
+    depth: usize,
+) -> Result<(Option<String>, bool)> {
+    if depth >= PROJECT_KEY_INHERITANCE_PASSES {
+        return Ok((None, false));
+    }
+    let parents: Vec<ParentIdentityRow> = conn
+        .prepare(
+            "SELECT r.parent_session_id, \
+                    (SELECT p.project_key FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.project_key_method FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.cwd FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id), \
+                    (SELECT p.repo_url FROM sessions p \
+                     WHERE p.source = r.source AND p.session_id = r.parent_session_id) \
+             FROM session_relationships r \
+             WHERE r.source = ?1 AND r.child_session_id = ?2 \
+             ORDER BY r.created_ms, r.parent_session_id",
+        )?
+        .query_map(params![source, session_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut closed_a_cycle = false;
+    for (parent_id, key, method, cwd, repo_url) in parents {
+        if walk.path.contains(&parent_id) {
+            // Back into the path we are standing on: this edge closes a cycle.
+            closed_a_cycle = true;
+            continue;
+        }
+        if !walk.visited.insert(parent_id.clone()) {
+            // Seen on another branch and fully examined there. Nothing new is
+            // reachable through it, and it is not a cycle.
+            continue;
+        }
+        // What pass 1 will leave on this parent, by the rule pass 1 uses
+        // rather than by what resolution alone would say. Pass 1 never
+        // rewrites a `remote`, so a parent whose checkout now canonicalizes
+        // differently keeps the key it has; answering with the fresh one would
+        // stream a key the refresh then writes back over. Asked here rather
+        // than only by the discovery caller because a refresh reaching this
+        // walk has already run pass 1, so the two agree either way — and one
+        // rule that is right in both places beats two that must be kept so.
+        if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
+            return Ok((Some(settled), closed_a_cycle));
+        }
+        walk.path.insert(parent_id.clone());
+        let (found, cycle_below) =
+            lendable_ancestor_key(conn, source, &parent_id, walk, depth + 1)?;
+        walk.path.remove(&parent_id);
+        if let Some(found) = found {
+            return Ok((Some(found), closed_a_cycle || cycle_below));
+        }
+        closed_a_cycle |= cycle_below;
+        // The borrowed key this ancestor is already wearing — unless the
+        // search below *it* closed a cycle. A stand-in is only worth passing
+        // on when it came from somewhere: in a ring of sessions that all
+        // borrowed from each other, each one wears its key on the authority of
+        // the next, and lending it round again just moves the ring. Declining
+        // leaves those keys exactly as they are, which is the only stable
+        // answer available.
+        //
+        // Scoped to this ancestor's own subtree, not to the whole walk: a
+        // cycle somewhere else in the graph says nothing about whether *this*
+        // key is grounded, and a walk that gave up after touching one left
+        // every later parent's key on the floor.
+        if !cycle_below && key.is_some() && method.as_deref() == Some("inherited") {
+            return Ok((key, closed_a_cycle));
+        }
+    }
+    Ok((None, closed_a_cycle))
 }
 
 fn now_ms() -> i64 {
@@ -3754,6 +4513,135 @@ mod tests {
         conn.execute("DELETE FROM sessions WHERE session_id = 'kept-1'", [])
             .unwrap();
         assert!(session_markers(&conn, "grok", "kept-1").unwrap().is_empty());
+    }
+
+    /// The project-identity columns, marker and index reach a database that
+    /// predates them — and the migration deliberately invents no keys.
+    ///
+    /// A backfill that stamped every existing `cwd` as a path key would be the
+    /// worst outcome: the row would read as "resolved, and this repository has
+    /// no remote" forever, every consumer grouping by the key would split that
+    /// repository across its checkouts, and nothing downstream could tell that
+    /// answer from a real one. NULL says "not resolved yet" and the next sync
+    /// or hydration resolves it for real.
+    #[test]
+    fn project_identity_migrates_onto_an_older_database_without_inventing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-project-key.db");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy.execute_batch(SCHEMA).unwrap();
+            // The `sessions` shape as it stood before this change, plus a row
+            // whose working directory is a real repository.
+            legacy
+                .execute_batch(
+                    "DROP TABLE IF EXISTS sessions;
+                     CREATE TABLE sessions (
+                         session_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         cwd TEXT,
+                         git_branch TEXT,
+                         first_activity_ms INTEGER,
+                         last_activity_ms INTEGER,
+                         last_assistant_text TEXT,
+                         raw_path TEXT,
+                         parser_version INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (session_id, source)
+                     );
+                     INSERT INTO sessions (session_id, source, cwd, last_activity_ms)
+                     VALUES ('legacy-1', 'claude', '/work/app', 42);",
+                )
+                .unwrap();
+            // `session_events` predates the column too.
+            legacy
+                .execute_batch(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('claude', 'legacy-1', 42, 'user', 'text', 'hi', 'e1');",
+                )
+                .unwrap();
+            legacy
+                .execute("ALTER TABLE session_events DROP COLUMN project_key", [])
+                .unwrap();
+            assert!(
+                !schema_is_current(&legacy).unwrap(),
+                "a database without the project-identity columns must not be served read-only"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let has_column = |table: &str, column: &str| -> bool {
+            conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<HashSet<String>>>()
+                .unwrap()
+                .contains(column)
+        };
+        assert!(has_column("sessions", "project_key"));
+        assert!(has_column("sessions", "project_key_method"));
+        assert!(has_column("session_events", "project_key"));
+        assert!(conn
+            .prepare("SELECT 1 FROM schema_migrations WHERE name = 'session_project_key_v1'")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        assert!(conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_sessions_project_key'"
+            )
+            .unwrap()
+            .exists([])
+            .unwrap());
+
+        // The migration itself resolved nothing: the existing row keeps a
+        // null key rather than being told its project is a directory.
+        let stored: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT project_key, project_key_method FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None));
+        let event_key: Option<String> = conn
+            .query_row("SELECT project_key FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(event_key, None);
+
+        // `/work/app` does not exist, so the refresh resolves it to itself and
+        // says `path` — a fallback that announces itself, not a remote.
+        assert!(refresh_project_identity(&conn).unwrap() > 0);
+        let resolved: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT project_key, project_key_method FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved,
+            (
+                Some("/work/app".to_string()),
+                Some(
+                    crate::project_identity::ProjectKeyMethod::PathFallback
+                        .as_str()
+                        .to_string()
+                )
+            )
+        );
+        // And the denormalized copy followed.
+        let event_key: Option<String> = conn
+            .query_row("SELECT project_key FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(event_key.as_deref(), Some("/work/app"));
     }
 
     /// The catalog columns must reach a database that predates them, and a

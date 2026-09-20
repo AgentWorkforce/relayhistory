@@ -168,6 +168,8 @@ fn hydrate_session_at_with_home_and_connectors(
     connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<HydrateSessionResult> {
     validate_options(options)?;
+    // One hydration is one acquisition pass; see `begin_acquisition_pass`.
+    crate::project_identity::begin_acquisition_pass();
     if options.scope == SessionScope::Remote {
         crate::remote::ensure_selected_remote_connectors_configured_for_at(
             "hydration",
@@ -326,6 +328,12 @@ fn hydrate_session_at_with_home_and_connectors(
         options.include_related,
         true,
     )?;
+    // Inside the transaction and after every relationship this hydration
+    // recorded: a subagent transcript is routinely read before its parent, so
+    // the child's inheritance can only be settled once the whole selected
+    // session has landed. Leaving it to the next sync would serve a hydrated
+    // session with a null project key in between.
+    crate::store::refresh_project_identity(&tx)?;
     tx.commit()?;
 
     let status = if previous_stamp.is_some() {

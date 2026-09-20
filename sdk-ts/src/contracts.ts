@@ -36,6 +36,16 @@ export interface CatalogCursor {
   sessionId: string;
 }
 
+/**
+ * How a `projectKey` was resolved.
+ *
+ * - `remote` — canonicalized `origin` remote; comparable across machines.
+ * - `path` — no remote resolved, so the key is the working directory and is
+ *   only meaningful on the machine that produced it.
+ * - `inherited` — adopted from the delegating parent session.
+ */
+export type ProjectKeyMethod = 'remote' | 'path' | 'inherited';
+
 export interface CatalogSession {
   source: CatalogSource;
   sessionId: string;
@@ -54,6 +64,14 @@ export interface CatalogSession {
   rawPath: string | null;
   sourceStamp: string | null;
   discoveryState: 'shallow' | 'full';
+  /**
+   * Canonical project identity: the `origin` remote canonicalized to
+   * `host/owner/repo`, or the working directory when no remote resolves.
+   * Group by this, not by `cwd` — two checkouts of one repository share it.
+   */
+  projectKey: string | null;
+  /** How `projectKey` was arrived at. `path` keys are machine-local. */
+  projectKeyMethod: ProjectKeyMethod | null;
   fromCache: boolean;
   locations: SessionLocation[];
 }
@@ -65,6 +83,8 @@ export interface ListCatalogOptions {
   limit?: number;
   beforeMs?: number;
   after?: CatalogCursor;
+  /** Exact canonical project key; not a prefix and not a path search. */
+  projectKey?: string;
 }
 
 export interface SessionCatalogPage {
@@ -187,6 +207,8 @@ export interface SessionEvent {
   source: Source;
   sessionId: string;
   project: string | null;
+  /** Canonical project identity, denormalized from the owning session. */
+  projectKey: string | null;
   cwd: string | null;
   gitBranch: string | null;
   messageId: string | null;
@@ -438,14 +460,24 @@ export interface Stats {
   total: number;
   bySource: Partial<Record<Source, number>>;
   byProject: Array<{ project: string; count: number }>;
+  /**
+   * Which key `byProject` is bucketed by. `project_key` merges two checkouts
+   * of one repository; `cwd` is the historical per-directory grouping. Read
+   * it — the same database gives different counts under each.
+   */
+  groupedBy: ProjectGrouping;
   firstTimestampMs: number | null;
   lastTimestampMs: number | null;
 }
+
+export type ProjectGrouping = 'project_key' | 'cwd';
 
 export interface StatsOptions {
   dbPath?: string;
   scope?: SessionScope;
   tag?: string;
+  /** Bucket `byProject` by working directory instead of project key. */
+  byCwd?: boolean;
 }
 export interface SyncOptions extends SourceConnectorOptions {
   dbPath?: string;
