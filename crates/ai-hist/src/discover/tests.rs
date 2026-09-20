@@ -809,6 +809,71 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     assert!(row.models.is_empty());
 }
 
+/// The catalog's `first_prompt` and the indexed `history` row are the same
+/// string for a turn Cursor split into several text blocks.
+///
+/// Reported by Devin as "multi-block first prompts stay truncated".
+/// `parse_cursor_text` stopped at the first text block while the event parser
+/// joins them all, so a two-block opening turn was stored whole in `history`
+/// and truncated in the catalog — and hydration does not rewrite
+/// `sessions.first_prompt`, so the short version survived full indexing.
+/// Both now go through `cursor::human_turn_prompt`.
+///
+/// Positive control: with the `break` in `parse_cursor_text` this failed at
+/// `discovery and ingestion must agree on the first prompt:
+/// left: Some("now write the test"), right: Some("now write the
+/// test\n\ninclude the timeout case")`.
+#[test]
+fn cursor_first_prompt_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-split",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>now write the test</user_query>"},{"type":"text","text":"include the timeout case"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-split").first_prompt.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-split",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    let indexed: Option<String> = ingest_conn
+        .query_row(
+            "SELECT prompt FROM history WHERE source = 'cursor' \
+             AND session_id = 'cursor-split' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    assert_eq!(
+        discovered, indexed,
+        "discovery and ingestion must agree on the first prompt"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("now write the test\n\ninclude the timeout case"),
+    );
+}
+
 /// The catalog's activity window comes from human turns, not from an
 /// assistant that quotes a `<timestamp>` tag back.
 ///

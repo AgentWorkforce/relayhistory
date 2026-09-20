@@ -515,6 +515,31 @@ pub(crate) fn record_role(obj: &serde_json::Map<String, Value>) -> Option<&str> 
         .or_else(|| obj.get("message")?.get("role")?.as_str())
 }
 
+/// The prompt one human turn contributes, from its `text` blocks.
+///
+/// A person typed one message; Cursor may have split it into several blocks.
+/// `session_events` keeps the blocks apart because that is what the record
+/// says, but a prompt is the turn. Each block is unwrapped on its own — the
+/// `<timestamp>` and `<user_query>` framing is per block — empties are
+/// dropped, and what is left is joined with a blank line.
+///
+/// Both readers of a human turn use this: `ingest_cursor_transcript` for the
+/// `history` row and `parse_cursor_text` for the catalog's `first_prompt`.
+/// They used to disagree — the shallow reader stopped at the first block — so
+/// a multi-block opening turn was stored in full by `history` and truncated in
+/// the catalog, and hydration does not rewrite `sessions.first_prompt`, so the
+/// short version stuck.
+pub(crate) fn human_turn_prompt(blocks: &[Value]) -> Option<String> {
+    let parts: Vec<String> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(unwrap_user_text)
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// The injected turn time a record carries, if it is the kind of record that
 /// can carry one.
 ///

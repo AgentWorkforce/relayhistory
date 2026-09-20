@@ -5663,15 +5663,6 @@ pub(crate) fn ingest_cursor_transcript(
         // window is taken after the blocks, from records that actually stored
         // something, and never from a guessed stamp.
         let mut emitted_evidence = false;
-        // A human turn is one prompt, however many text blocks Cursor split it
-        // into. `session_events` keeps the blocks apart because that is what
-        // the record says; `history` does not, for two reasons. A person typed
-        // one message, and searching for it should find one row. And
-        // `history`'s identity is `(source, timestamp_ms, prompt)`, so two
-        // blocks that happen to carry the same text in one turn would collide
-        // on insert and silently store one row for two events -- the tables
-        // would then disagree about how many times the person said it.
-        let mut user_prompt_parts: Vec<String> = Vec::new();
         for (block_index, block) in blocks.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{record_offset}:{block_index}");
@@ -5689,9 +5680,7 @@ pub(crate) fn ingest_cursor_transcript(
                     if text.is_empty() {
                         continue;
                     }
-                    if is_user {
-                        user_prompt_parts.push(text.clone());
-                    } else {
+                    if !is_user {
                         outcome.last_assistant_text = Some(text.clone());
                     }
                     emitted_evidence = true;
@@ -5922,11 +5911,23 @@ pub(crate) fn ingest_cursor_transcript(
             }
         }
         // One row for the turn, after the blocks, so the prompt carries
-        // everything the person wrote in it. Records before the offset this
-        // read resumed from are already in `history` under a timestamp this
-        // pass must not restate; see the note on `history_from_offset`.
-        if !user_prompt_parts.is_empty() && record_offset >= history_from_offset {
-            let prompt = user_prompt_parts.join("\n\n");
+        // everything the person wrote in it. `session_events` keeps the blocks
+        // apart because that is what the record says; `history` does not, for
+        // two reasons. A person typed one message, and searching for it should
+        // find one row. And `history`'s identity is
+        // `(source, timestamp_ms, prompt)`, so two blocks that happen to carry
+        // the same text in one turn would collide on insert and silently store
+        // one row for two events -- the tables would then disagree about how
+        // many times the person said it.
+        //
+        // `cursor::human_turn_prompt` is the same function the catalog's
+        // `first_prompt` goes through, so the two cannot drift. Records before
+        // the offset this read resumed from are already in `history` under a
+        // timestamp this pass must not restate; see `history_from_offset`.
+        let turn_prompt = (role == "user")
+            .then(|| cursor::human_turn_prompt(&blocks))
+            .flatten();
+        if let Some(prompt) = turn_prompt.filter(|_| record_offset >= history_from_offset) {
             outcome.prompts_inserted += insert_history(
                 conn,
                 &HistoryEntry {
