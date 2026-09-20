@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -476,60 +476,186 @@ fn sweep_generation() -> String {
     )
 }
 
-/// A cheap, durable statement about what the destination holds.
+/// Version tag of the destination marker's encoding, so a marker written by a
+/// build with a different shape is rejected rather than misread.
+const DESTINATION_MARKER_VERSION: &str = "v2";
+
+/// What the destination holds, per session the sweep has evidence for.
 ///
-/// Counted, not merely probed for existence. The fast path's job is to skip a
-/// sweep, and a sweep owes more than ingestion: it reconciles sessions whose
-/// stamp matches but whose evidence is gone (see the
-/// [`codex_session_events_exist`] arm). Evidence can be lost under a stamp
-/// that still matches — a half-restored backup, a truncated write, a
-/// maintenance query — and the source bytes will never move again to reopen
-/// it.
+/// The fast path's job is to skip a sweep, and a sweep owes more than
+/// ingestion: it reconciles sessions whose per-file stamp matches but whose
+/// evidence is gone (see the [`codex_session_events_exist`] arm). Evidence can
+/// be lost under a stamp that still matches — a half-restored backup, a
+/// truncated write, a maintenance query — and the source bytes of a finished
+/// session never move again to reopen it.
+///
+/// Per session, not in total. Global counts cannot tell a loss from a
+/// coincidence: delete one event from a finished Codex rollout, let the hook
+/// path insert one for an unrelated Claude session in the same second, and
+/// every total is unchanged or larger while the rollout is permanently short.
+/// One row per session is what makes the two distinguishable at all.
 ///
 /// Deliberately not a counter our own delete paths bump: a counter can only
 /// see losses this code caused, and every loss worth defending against is one
-/// it did not. Counting is O(rows) over an index, single-digit milliseconds
-/// against a sweep's full walk.
+/// it did not. The grouped read is an index-only scan of
+/// `idx_session_events_session (source, session_id)`, already ordered, so it
+/// costs one pass over an index against a sweep's full walk of every source.
 fn destination_generation(conn: &Connection) -> Result<String> {
-    let (sessions, events, max_event, history) = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM sessions),          (SELECT COUNT(*) FROM session_events),          (SELECT COALESCE(MAX(rowid), 0) FROM session_events),          (SELECT COUNT(*) FROM history)",
+    let (sessions, history) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM history)",
         [],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        },
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
     )?;
-    Ok(format!("s{sessions}:e{events}:r{max_event}:h{history}"))
+    let mut marker = format!("{DESTINATION_MARKER_VERSION} s{sessions} h{history}");
+    let mut statement = conn.prepare(
+        "SELECT source, session_id, COUNT(*) FROM session_events GROUP BY source, session_id",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let source: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let events: i64 = row.get(2)?;
+        // Hashed rather than spelled out: the marker is rewritten with every
+        // sweep and read on every tick, and a session's identity only has to
+        // be *distinguishable*, not recoverable. 64 bits keeps two sessions
+        // from sharing an entry, which is the one way a hash here could
+        // reintroduce the masking this marker exists to catch.
+        marker.push_str(&format!(
+            " {:016x}={events}",
+            discover::fingerprint_hash("session-events", &source, &session_id)
+        ));
+    }
+    Ok(marker)
+}
+
+/// A destination marker, or `None` for anything this build did not write.
+///
+/// Total by construction: every step is a `strip_prefix`, a `split_once` or a
+/// `parse`, and each returns `None` rather than indexing into a string it has
+/// not checked. An empty marker — which the sweep itself stores when the
+/// generation query fails — has to reach `sources_unchanged` as "unknown, go
+/// and sweep", never as a panic that kills the tick and wedges every sync
+/// after it.
+fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
+    let mut parts = value.split(' ');
+    if parts.next()? != DESTINATION_MARKER_VERSION {
+        return None;
+    }
+    let sessions = parts.next()?.strip_prefix('s')?.parse::<i64>().ok()?;
+    let history = parts.next()?.strip_prefix('h')?.parse::<i64>().ok()?;
+    let mut events = BTreeMap::new();
+    for part in parts {
+        let (session, count) = part.split_once('=')?;
+        let session = u64::from_str_radix(session, 16).ok()?;
+        let count = count.parse::<i64>().ok()?;
+        // A repeated session is not a marker this build produced: the grouped
+        // read yields each one once.
+        if events.insert(session, count).is_some() {
+            return None;
+        }
+    }
+    Some(DestinationMarker {
+        sessions,
+        history,
+        events,
+    })
+}
+
+struct DestinationMarker {
+    sessions: i64,
+    history: i64,
+    events: BTreeMap<u64, i64>,
+}
+
+/// Sessions the destination lost evidence for since the marker was written.
+///
+/// Detecting a loss is not the same as repairing it. The sweep skips a source
+/// whose per-file stamp is unchanged, and a session that is *short* rather
+/// than empty still satisfies the existence check that guards that skip, so
+/// without naming the sessions the sweep would run and repair nothing.
+#[derive(Debug, Default)]
+pub(crate) struct SweepRepairs {
+    sessions: HashSet<(String, String)>,
+}
+
+impl SweepRepairs {
+    fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn contains(&self, source: &str, session_id: &str) -> bool {
+        // Cheap enough to build the key: this is asked once per rollout whose
+        // stamp matched, not per row.
+        self.sessions
+            .contains(&(source.to_string(), session_id.to_string()))
+    }
+}
+
+/// Which sessions hold less than the stored marker recorded.
+///
+/// The marker keys sessions by hash, which is enough to *detect* a loss but
+/// not to name one. The names come back from the destination itself: every
+/// session that still holds a row is hashed the same way, so matching the
+/// short hashes against the current groups recovers exactly the sessions to
+/// repair. A session with nothing left at all cannot be named this way, and
+/// does not need to be — an empty session already fails the existence check
+/// the skip is guarded by.
+fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs> {
+    let Some(stored) = parse_destination_marker(stored) else {
+        return Ok(SweepRepairs::default());
+    };
+    let mut repairs = SweepRepairs::default();
+    let mut statement = conn.prepare(
+        "SELECT source, session_id, COUNT(*) FROM session_events GROUP BY source, session_id",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let source: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let events: i64 = row.get(2)?;
+        let key = discover::fingerprint_hash("session-events", &source, &session_id);
+        if stored
+            .events
+            .get(&key)
+            .is_some_and(|before| events < *before)
+        {
+            repairs.sessions.insert((source, session_id));
+        }
+    }
+    Ok(repairs)
 }
 
 /// Whether the destination still holds everything the stamp was written over.
 ///
 /// Growth is fine and must be: the hook fast path and hydration both add rows
 /// between sweeps, and treating that as a reason to re-walk every source would
-/// cost a full sweep per tool call. Shrinkage is the signal — evidence the
-/// sweep put there is gone, so the sweep is owed again.
+/// cost a full sweep per tool call. A session holding *less* than it did is
+/// the signal, and it is asked per session so that growth somewhere else
+/// cannot answer for it.
 fn destination_covers(stored: &str, current: &str) -> bool {
-    fn parse(value: &str) -> Option<Vec<i64>> {
-        let parts = value
-            .split(':')
-            .map(|part| part[1..].parse::<i64>().ok())
-            .collect::<Option<Vec<_>>>()?;
-        (parts.len() == 4).then_some(parts)
-    }
-    // An unparsable marker is one this build did not write. Re-sweep rather
-    // than guess: the cost is one walk, and the alternative is a skip that
-    // cannot be justified.
-    let (Some(stored), Some(current)) = (parse(stored), parse(current)) else {
+    let (Some(stored), Some(current)) = (
+        parse_destination_marker(stored),
+        parse_destination_marker(current),
+    ) else {
+        // An unreadable marker is one this build did not write, or one a
+        // failed generation query left empty. Re-sweep rather than guess: the
+        // cost is one walk, and the alternative is a skip that cannot be
+        // justified.
         return false;
     };
-    stored
-        .iter()
-        .zip(current.iter())
-        .all(|(stored, current)| current >= stored)
+    if current.sessions < stored.sessions || current.history < stored.history {
+        return false;
+    }
+    stored.events.iter().all(|(session, stored)| {
+        current
+            .events
+            .get(session)
+            .is_some_and(|current| current >= stored)
+    })
 }
 
 /// The sources a sweep reads that discovery never enumerates.
@@ -765,6 +891,25 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
             }
         }
     }
+    // Named before anything is written, because the sweep below is what
+    // repairs them and it decides per session whether its unchanged stamp
+    // licenses a skip. A failure here costs the repair, not the sweep.
+    let repairs = state
+        .get(DESTINATION_GENERATION_KEY)
+        .and_then(Value::as_str)
+        .map(|stored| destination_shortfall(conn, stored))
+        .transpose()
+        .unwrap_or_else(|error| {
+            sync_note!("  [sync] could not name the sessions to repair: {error:#}");
+            None
+        })
+        .unwrap_or_default();
+    if !repairs.is_empty() {
+        sync_note!(
+            "  [sync] {} session(s) lost evidence since the last sweep; repairing",
+            repairs.len()
+        );
+    }
     // Checkpoint after every source that advances `state`, rather than once at
     // the end. A run can die partway through -- killed process, locked database,
     // full disk -- and state written only at the end discards every source that
@@ -795,7 +940,7 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     {
         checkpoint_sync_state(&state_path, &state);
     }
-    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, home)) {
+    if let Some(inserted) = report.capture("codex", sync_codex(conn, &mut state, home, &repairs)) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
     }
@@ -1809,8 +1954,13 @@ fn sync_jsonl_incremental(
     Ok(inserted)
 }
 
-fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, home: &Path) -> Result<usize> {
-    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, home)?;
+fn sync_codex(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    home: &Path,
+    repairs: &SweepRepairs,
+) -> Result<usize> {
+    let (cwds, branches, mut inserted) = sync_codex_rollouts(conn, state, home, repairs)?;
     let path = home.join(".codex/history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
@@ -1967,6 +2117,7 @@ fn sync_codex_rollouts(
     conn: &Connection,
     state: &mut Map<String, Value>,
     home: &Path,
+    repairs: &SweepRepairs,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -2042,6 +2193,10 @@ fn sync_codex_rollouts(
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
+                    // Present but short: the destination marker says this
+                    // session lost rows since the last sweep. Existence is not
+                    // enough to answer that — re-ingest, which is idempotent.
+                    Some(id) if repairs.contains("codex", id) => {}
                     Some(id) if codex_session_events_exist(conn, id)? => continue,
                     // Stamp matches but the events are gone (wiped or rebuilt
                     // database): fall through and re-ingest.
@@ -6624,14 +6779,20 @@ mod tests {
         let codex = dir.path().join(".codex/history.jsonl");
         fs::create_dir_all(codex.parent().unwrap()).unwrap();
         fs::write(&codex, r#"{"text":"codex"#).unwrap();
-        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 0);
+        assert_eq!(
+            super::sync_codex(&conn, &mut state, dir.path(), &Default::default()).unwrap(),
+            0
+        );
         assert_eq!(saved_cursor_offset(&state["codex"]), 0);
         let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
         file.write_all(br#" prompt","ts":1,"session_id":"c1"}"#)
             .unwrap();
         file.write_all(b"\n").unwrap();
         drop(file);
-        assert_eq!(super::sync_codex(&conn, &mut state, dir.path()).unwrap(), 1);
+        assert_eq!(
+            super::sync_codex(&conn, &mut state, dir.path(), &Default::default()).unwrap(),
+            1
+        );
 
         let cursor_root = dir.path().join(".cursor/projects");
         let cursor = cursor_root.join("P/agent-transcripts/s1/s1.jsonl");
@@ -7911,7 +8072,7 @@ mod tests {
                 "session": "sess-repair"
             }}),
         );
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         let counts: (i64, i64, i64, Option<String>) = conn
             .query_row(
                 "SELECT \
@@ -7935,7 +8096,7 @@ mod tests {
         assert!(state.get("codex_rollouts_v3").is_none());
         assert!(state.get("codex_rollouts_v5").is_some());
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT \
@@ -8110,7 +8271,7 @@ mod tests {
         );
 
         let (cwds, branches, inserted) =
-            super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+            super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         assert_eq!(inserted, 0);
         assert!(!cwds.contains_key("sess-unchanged-sub"));
         assert!(!branches.contains_key("sess-unchanged-sub"));
@@ -8175,7 +8336,7 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         let edge: (String, String, String, i64) = conn
             .query_row(
                 "SELECT parent_session_id, relationship_uid, evidence_kind, created_ms \
@@ -8191,7 +8352,7 @@ mod tests {
 
         // A second pass over the same unchanged state neither duplicates the
         // row nor re-reads the rollout to rewrite it.
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         let (count, created): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), MIN(created_ms) FROM session_relationships \
@@ -8241,7 +8402,7 @@ mod tests {
         .unwrap();
         let mut state = unchanged_subagent_state(&rollout, "sess-unchanged-sub");
 
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         let registrations: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions \
@@ -8355,7 +8516,8 @@ mod tests {
             }),
         );
 
-        let (_, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (_, _, inserted) =
+            super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         assert_eq!(inserted, 1, "standalone guardian prompt is newly indexed");
         let sessions: Vec<String> = conn
             .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
@@ -8445,7 +8607,7 @@ mod tests {
         )
         .unwrap();
 
-        super::sync_codex_rollouts(&conn, &mut Map::new(), home).unwrap();
+        super::sync_codex_rollouts(&conn, &mut Map::new(), home, &Default::default()).unwrap();
 
         let prompts: Vec<String> = conn
             .prepare(
@@ -8501,7 +8663,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), home)
+        let error = super::sync_codex_rollouts(&conn, &mut Map::new(), home, &Default::default())
             .expect_err("the trigger must fail ingestion");
         assert!(error.to_string().contains("forced subagent ingest failure"));
         let stale_rows: i64 = conn
@@ -8566,7 +8728,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let (cwds, _, inserted) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (cwds, _, inserted) =
+            super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         assert_eq!(inserted, 1);
         // Subagent threads never reach the maps, prompt history, or session
         // registration — including rows left behind by earlier syncs.
@@ -8614,7 +8777,8 @@ mod tests {
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
             .unwrap();
-        let (_, _, inserted_again) = super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let (_, _, inserted_again) =
+            super::sync_codex_rollouts(&conn, &mut state, home, &Default::default()).unwrap();
         assert_eq!(inserted_again, 0);
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))

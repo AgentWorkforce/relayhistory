@@ -1201,6 +1201,126 @@ fn evidence_lost_under_a_matching_stamp_is_repaired_on_the_next_tick() {
     );
 }
 
+/// Growth must not be able to answer for a loss. Totals cannot tell the two
+/// apart: delete one event from a finished Codex rollout, let a write for an
+/// unrelated session land in the same window, and every total is unchanged or
+/// larger while the rollout stays permanently short. The marker is therefore
+/// per session.
+#[test]
+fn growth_elsewhere_does_not_conceal_a_lost_session() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_codex_rollout(home.path(), "sess-masked");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the loss is testable"
+    );
+
+    let before = codex_event_count(&db, "sess-masked");
+    assert!(
+        before > 0,
+        "the sweep recorded no events for the rollout, so nothing could be lost"
+    );
+    let events_before = event_count(&db);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'codex' AND session_id = 'sess-masked' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'codex' AND session_id = 'sess-masked')",
+        [],
+    )
+    .expect("delete one event");
+    // Stands in for the hook path's write: a row for a different session,
+    // arriving between two ticks. Inserted directly so no *source* changes —
+    // a new transcript on disk would reopen the sweep for the wrong reason
+    // and the masking would never be exercised.
+    conn.execute(
+        "INSERT INTO session_events \
+         (source, session_id, cwd, project, ts_ms, role, text, kind, event_uid) \
+         VALUES ('claude', 'sess-hook', '/tmp/hook', 'hook', 1, 'user', 'hi', 'text', 'uid-hook')",
+        [],
+    )
+    .expect("insert an unrelated event");
+    drop(conn);
+
+    // Positive control on the premise: the totals really are masked. Without
+    // this the test could pass against a marker that never looked at them.
+    assert_eq!(
+        event_count(&db),
+        events_before,
+        "the compensating insert must leave the total unchanged, or nothing is concealed"
+    );
+    assert_eq!(codex_event_count(&db, "sess-masked"), before - 1);
+
+    let tick = sync_tick(&db, home.path(), false);
+    assert!(
+        tick.swept,
+        "a session that lost an event must reopen the sweep even when the totals did not move"
+    );
+    assert_eq!(
+        codex_event_count(&db, "sess-masked"),
+        before,
+        "the sweep must restore the event it owes the rollout"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired destination must arm the fast path again"
+    );
+}
+
+/// The sweep stores an empty marker when it could not measure the destination,
+/// and a database written by another build may store anything at all. Reading
+/// one has to mean "unknown, go and sweep" — a panic here kills the watch tick
+/// and wedges every sync after it.
+#[test]
+fn an_unreadable_destination_marker_sweeps_instead_of_panicking() {
+    for marker in [
+        serde_json::Value::from(""),
+        serde_json::Value::from("v2"),
+        serde_json::Value::from("v2 s1"),
+        serde_json::Value::from("v2 sx h1"),
+        serde_json::Value::from("v2 s1 h1 notanentry"),
+        serde_json::Value::from("v2 s1 h1 zzzz=1"),
+        serde_json::Value::from("v1 s1 h1"),
+        serde_json::Value::from(":::"),
+        serde_json::Value::from(7),
+    ] {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_claude_transcript(home.path(), "proj", "marker-1", 1);
+        let db = home.path().join("history.db");
+        assert!(sync_tick(&db, home.path(), false).swept);
+        assert!(
+            sync_tick(&db, home.path(), false).skipped_unchanged(),
+            "the fast path must be armed before the marker matters"
+        );
+
+        let state_path = home.path().join(".sync-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read sync state"))
+                .expect("parse sync state");
+        state["destination_generation"] = marker.clone();
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("serialize sync state"),
+        )
+        .expect("write sync state");
+
+        assert!(
+            sync_tick(&db, home.path(), false).swept,
+            "an unreadable destination marker ({marker}) must sweep, not skip and not panic"
+        );
+        // Positive control: the sweep rewrote a marker this build can read, so
+        // the tick recovers rather than sweeping forever.
+        assert!(
+            sync_tick(&db, home.path(), false).skipped_unchanged(),
+            "the sweep must restore a readable marker ({marker})"
+        );
+    }
+}
+
 /// Rows arriving between sweeps — the hook fast path, hydration — are not a
 /// loss, and must not cost a full walk of every source. Only shrinkage is the
 /// signal.
@@ -1382,6 +1502,12 @@ fn append_history_log(home: &Path, source: &str, prompt: &str) {
         .expect("open history log");
     file.write_all(line.as_bytes()).expect("append record");
     file.flush().expect("flush");
+}
+
+fn event_count(db: &Path) -> i64 {
+    let conn = ai_hist::open_db(db).expect("open db");
+    conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+        .expect("count session events")
 }
 
 fn session_count(db: &Path) -> i64 {

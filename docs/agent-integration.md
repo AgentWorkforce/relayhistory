@@ -129,11 +129,14 @@ Two things make this cheap enough to leave running:
   cannot skip the re-read that bump exists to force.
 - A sweep owes more than ingestion — it also repairs a session whose per-file
   stamp matches but whose evidence is gone. So the stamp is paired with a
-  **destination generation** recorded after the sweep: if the database has
-  *lost* rows since, the next tick sweeps instead of skipping, however
-  unchanged the sources look. A finished rollout's bytes never move again, so
-  without this the loss would be permanent. Rows arriving between sweeps — the
-  hook fast path, hydration — are growth rather than loss and still skip.
+  **destination generation** recorded after the sweep, one entry per session:
+  if a session holds less than it did, the next tick sweeps instead of
+  skipping and that session is re-ingested, however unchanged the sources
+  look. A finished rollout's bytes never move again, so without this the loss
+  would be permanent. Per session rather than in total, because totals cannot
+  tell a loss from a coincidence — one row deleted here and one inserted there
+  leaves every total intact. Rows arriving between sweeps — the hook fast
+  path, hydration — are growth rather than loss and still skip.
 - A tick woken by a filesystem event **forces** the sweep past that
   fingerprint. An event can arrive before the write is flushed, so the size and
   mtime it would be compared against are not yet trustworthy. The polling
