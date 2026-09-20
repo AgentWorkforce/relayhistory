@@ -2159,6 +2159,46 @@ fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
     command
 }
 
+const PROVIDER_ENV_VARS: [&str; 4] = [
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "OPENCODE_DB",
+];
+
+fn service_provider_environment(spec: &ServiceSpec) -> Vec<(&'static str, String)> {
+    if spec.subcommand != "sync" {
+        return Vec::new();
+    }
+    PROVIDER_ENV_VARS
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var_os(name).and_then(|value| {
+                let value = value.to_string_lossy();
+                (!value.trim().is_empty()).then(|| (name, value.into_owned()))
+            })
+        })
+        .collect()
+}
+
+fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
+    if environment.is_empty() {
+        return String::new();
+    }
+    let entries = environment
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>",
+                xml_escape(name),
+                xml_escape(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}\n    </dict>\n")
+}
+
 fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
@@ -2243,6 +2283,8 @@ fn install_launchd_service(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    let environment = service_provider_environment(spec);
+    let environment_xml = launchd_environment_xml(&environment);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2255,7 +2297,7 @@ fn install_launchd_service(
         <string>{bin}</string>
 {command_args}
     </array>
-    <key>StartInterval</key>
+{environment_xml}    <key>StartInterval</key>
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <true/>
@@ -2269,6 +2311,7 @@ fn install_launchd_service(
         label = spec.label,
         bin = xml_escape(bin),
         command_args = command_args,
+        environment_xml = environment_xml,
         interval = interval,
         log_stem = spec.log_stem,
     );
@@ -2340,7 +2383,11 @@ fn install_cron_service(
         );
     }
     let marker = cron_marker(spec);
-    let command = std::iter::once(shell_single_quote(bin))
+    let environment = service_provider_environment(spec);
+    let command = environment
+        .iter()
+        .map(|(name, value)| format!("{name}={}", shell_single_quote(value)))
+        .chain(std::iter::once(shell_single_quote(bin)))
         .chain(
             service_command_args(spec, args)
                 .iter()
@@ -3219,6 +3266,29 @@ mod tests {
         assert_eq!(
             xml_escape("/usr/local/bin/ai-hist"),
             "/usr/local/bin/ai-hist"
+        );
+    }
+
+    #[test]
+    fn service_environment_rendering_preserves_relocated_provider_roots() {
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR", "/srv/Claude & tools".to_string()),
+            ("CODEX_HOME", "/srv/codex's home".to_string()),
+        ];
+        let xml = launchd_environment_xml(&environment);
+        assert!(xml.contains("<key>EnvironmentVariables</key>"));
+        assert!(xml.contains("<key>CLAUDE_CONFIG_DIR</key>"));
+        assert!(xml.contains("<string>/srv/Claude &amp; tools</string>"));
+        assert!(xml.contains("<key>CODEX_HOME</key>"));
+
+        let cron = environment
+            .iter()
+            .map(|(name, value)| format!("{name}={}", shell_single_quote(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            cron,
+            "CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\\''s home'"
         );
     }
 
