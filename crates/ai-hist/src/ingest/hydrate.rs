@@ -3222,7 +3222,7 @@ mod tests {
                 }
                 continue;
             }
-            let claim = claim_batch(&conn, &job.job_id, "worker", 1000, now)
+            let claim = claim_batch(&conn, &job.job_id, "worker", 1000, &|| now)
                 .unwrap()
                 .expect("a prepared batch is claimable");
             store_prepared_payload(
