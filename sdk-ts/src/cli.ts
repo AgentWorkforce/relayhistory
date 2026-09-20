@@ -399,11 +399,25 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
 }
 
+/**
+ * One relationship row, rendered from the point of view of the session that
+ * was asked about.
+ *
+ * A continuity row is returned for whichever end of it the caller named, so
+ * naming its child end and printing `childSessionId` printed the session back
+ * at itself. `queried` is the session the row was read for, and the line shows
+ * the *other* end: the origin when this session is the branch, the branch when
+ * this session is the origin.
+ */
 function relationshipLine(
   direction: 'child' | 'parent' | 'continuity',
   row: SessionRelationship,
+  queried?: string,
 ): string {
-  const identity = direction === 'parent' ? row.parentSessionId : row.childSessionId ?? '(unlinked)';
+  const other = row.childSessionId === queried ? row.parentSessionId : row.childSessionId;
+  const identity = direction === 'parent'
+    ? row.parentSessionId
+    : (direction === 'continuity' ? other : row.childSessionId) ?? '(unlinked)';
   return [
     direction, identity, row.relationship, row.childAgentType ?? '-', row.spawnedAtMs ?? '-',
     `events=${row.childHasEvents ? 'yes' : 'no'}`, `identity=${row.identityStatus}`,
@@ -426,7 +440,9 @@ function outputRelationships(io: CliIo, value: Awaited<ReturnType<typeof getSess
   if (value.continuity.length > 0) {
     io.stdout(`${value.continuity.length} continuity relationship(s)\n`);
     for (const row of value.continuity) {
-      io.stdout(`${relationshipLine('continuity', row)}  origin=${row.originSessionId ?? '-'}\n`);
+      io.stdout(
+        `${relationshipLine('continuity', row, value.sessionId)}  origin=${row.originSessionId ?? '-'}\n`,
+      );
     }
   }
   io.stdout(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);

@@ -712,6 +712,16 @@ fn resolve_cross_file_parent(
     reasons: &mut Vec<String>,
     written: &mut Vec<(String, String)>,
 ) -> Result<()> {
+    // An explicit field has already said where this conversation came from,
+    // and this is inference over the same question. Running it anyway left the
+    // row pending on a uuid the answer did not depend on — and once that uuid
+    // was indexed under some other session, added a second parent beside the
+    // one the provider named. Callers reach this before `sourceSessionId` is
+    // considered, so source-only evidence still gets the lookup and a
+    // resolvable parent still outranks it.
+    if !written.is_empty() {
+        return Ok(());
+    }
     let Some(parent_uuid) = evidence
         .first_parent_uuid
         .as_deref()
@@ -727,14 +737,6 @@ fn resolve_cross_file_parent(
         return Ok(());
     };
     if parent_session_id == evidence.session_id {
-        return Ok(());
-    }
-    // An explicit field already said this, and said it better.
-    if evidence
-        .explicit_continuation_targets
-        .contains(&parent_session_id)
-        || evidence.resume_target.as_deref() == Some(parent_session_id.as_str())
-    {
         return Ok(());
     }
     written.push(write_edge(
@@ -2204,5 +2206,105 @@ mod tests {
             "nothing depended on the deleted session"
         );
         assert_eq!(edges(&conn, "origin").len(), 1);
+    }
+
+    #[test]
+    fn explicit_lineage_is_not_joined_by_a_parent_uuid_that_resolves_later() {
+        // A transcript with an explicit `continuedFromSessionId` *and* a
+        // `parentUuid` nothing has indexed yet used to stay pending on that
+        // uuid — and then gain a second parent the day some other session
+        // turned out to hold it. The explicit field had already answered the
+        // question the uuid was being asked.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let branch = dir.path().join("branch.jsonl");
+        std::fs::write(
+            &branch,
+            concat!(
+                "{\"sessionId\":\"branch\",\"uuid\":\"b-u\",\"parentUuid\":\"elsewhere-a\",",
+                "\"type\":\"user\",\"continuedFromSessionId\":\"prior\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"carry on\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &branch);
+
+        let parents = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT relationship, parent_session_id FROM session_relationships \
+                 WHERE child_session_id = 'branch' ORDER BY parent_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let one_parent = vec![(RELATIONSHIP_CONTINUATION.to_string(), "prior".to_string())];
+        assert_eq!(parents(&conn), one_parent);
+        assert!(
+            pending_reasons(&conn, "claude", "branch").unwrap().is_empty(),
+            "the uuid was never needed, so nothing is waiting on it"
+        );
+
+        // The uuid turns up later, held by an unrelated session.
+        let elsewhere = dir.path().join("elsewhere.jsonl");
+        std::fs::write(
+            &elsewhere,
+            concat!(
+                "{\"sessionId\":\"elsewhere\",\"uuid\":\"elsewhere-a\",\"parentUuid\":null,",
+                "\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},",
+                "\"timestamp\":\"2026-08-31T09:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &elsewhere);
+        assert_eq!(
+            parents(&conn),
+            one_parent,
+            "still one parent: the explicit field settled it"
+        );
+    }
+
+    #[test]
+    fn a_parent_uuid_that_resolves_later_still_answers_source_only_evidence() {
+        // The positive control for the skip above: evidence carrying only
+        // `sourceSessionId` has named an origin but not how the conversation
+        // carried on, so the uuid lookup still runs — and when it resolves,
+        // the continuation replaces the weaker source fork.
+        let (_dir, conn) = database();
+        let dir = tempfile::tempdir().unwrap();
+        let branch = dir.path().join("branch.jsonl");
+        std::fs::write(
+            &branch,
+            concat!(
+                "{\"sessionId\":\"branch\",\"uuid\":\"b-u\",\"parentUuid\":\"origin-a\",",
+                "\"type\":\"user\",\"sourceSessionId\":\"origin\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"carry on\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        ingest_file(&conn, &branch);
+        // Nothing holds `origin-a` yet, so the source fork stands in.
+        assert_eq!(
+            edges(&conn, "origin")
+                .into_iter()
+                .map(|edge| edge.0)
+                .collect::<Vec<_>>(),
+            vec![RELATIONSHIP_FORK.to_string()]
+        );
+
+        let (origin, _) = linked_pair(dir.path());
+        ingest_file(&conn, &origin);
+        assert_eq!(
+            edges(&conn, "origin")
+                .into_iter()
+                .map(|edge| (edge.0, edge.3))
+                .collect::<Vec<_>>(),
+            vec![(RELATIONSHIP_CONTINUATION.to_string(), "origin-a".to_string())],
+            "the resolved uuid replaced the source fork rather than joining it"
+        );
     }
 }
