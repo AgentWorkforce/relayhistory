@@ -2163,27 +2163,29 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
     let candidate = match resolved {
         // The session's own repository beats anything borrowed.
         Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
-        // Anything weaker has to be weighed against what this row already has
-        // and against what the end-of-pass refresh is about to give it.
+        // Anything weaker has to be weighed against what the end-of-pass
+        // refresh is about to do to this row. Deciding that here, and not only
+        // in the pass, is what keeps the row this function streams equal to
+        // the row the pass will store: a consumer reading
+        // `sessions discover --json` beside the catalog must not be told two
+        // different projects.
+        //
+        // `inheritable_parent_project_key` is asked even when this row already
+        // holds a borrowed key, because the key it borrowed can go stale — the
+        // same refresh may promote its parent to a `remote` of its own, and
+        // pass 2 then lends the new one down.
         weaker => {
-            if stored == Some(ProjectKeyMethod::Inherited.as_str()) {
-                // An inherited key is borrowed, so it outranks a path: a child
-                // whose directory still resolves to nothing canonical keeps
-                // the parent's repository, which is the point of inheriting it.
-                None
-            } else if let Some(parent) = crate::store::inheritable_parent_project_key(
+            match crate::store::inheritable_parent_project_key(
                 conn,
                 &row.source,
                 &row.session_id,
             )? {
-                // A delegated child about to inherit. Deciding that here, and
-                // not only in the refresh pass, is what keeps the row this
-                // function streams equal to the row the pass will store: a
-                // consumer reading `sessions discover --json` beside the
-                // catalog must not be told two different projects.
-                Some((parent, ProjectKeyMethod::Inherited))
-            } else {
-                weaker
+                Some(parent) => Some((parent, ProjectKeyMethod::Inherited)),
+                // An inherited key is borrowed, so it outranks a path: a child
+                // whose directory still resolves to nothing canonical keeps
+                // the parent's repository, which is the point of inheriting it.
+                None if stored == Some(ProjectKeyMethod::Inherited.as_str()) => None,
+                None => weaker,
             }
         }
     };
@@ -2201,7 +2203,8 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
          WHERE source = ?3 AND session_id = ?4 \
            AND (project_key IS NULL \
                 OR project_key_method = 'path' \
-                OR (project_key_method = 'inherited' AND ?2 = 'remote'))",
+                OR (project_key_method = 'inherited' \
+                    AND ?2 IN ('remote', 'inherited')))",
         params![key, method.as_str(), row.source, row.session_id],
     )?;
     if changed == 0 {

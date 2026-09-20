@@ -3378,16 +3378,33 @@ fn insert_session_event(
     // with a machine-local path on every re-ingest, and hand every one of
     // those events back to the sweep to fix, journalling a second delivery
     // upsert each time.
-    let resolved = cwd
-        .and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None))
-        .map(|(key, _)| key);
+    //
+    // The *method* is stamped beside the key, always from the same arm that
+    // produced it. It is what tells a later pass whether this row worked its
+    // key out from its own directory or was lent one, and a row that carries a
+    // key with no method is indistinguishable from one that was never
+    // resolved: the denormalizing pass would then replace a delegated
+    // thread's own repository with its delegator's, on every sync, forever.
+    let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
+    let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
+    let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
-         VALUES (?1, ?2, ?3, COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid) \
+         VALUES (?1, ?2, ?3, \
+           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), \
+           CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
+                THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
+                ELSE ?16 END, \
+           ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
+         project_key_method=CASE \
+           WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
+             THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
+           WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
+           ELSE ?16 END, \
          cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
          model=excluded.model, token_json=excluded.token_json",
@@ -3406,7 +3423,8 @@ fn insert_session_event(
             model,
             token_json,
             event_uid,
-            resolved,
+            resolved_key,
+            resolved_method,
         ],
     )?;
     Ok(())

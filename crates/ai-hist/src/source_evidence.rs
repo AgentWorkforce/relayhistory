@@ -43,10 +43,15 @@ impl EvidenceKind {
         match self {
         Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt"},
         // `project_key` travels with the event so a snapshot round-trips the
-        // canonical identity the emitting side resolved. It is never trusted
-        // as final: `refresh_project_identity`'s denormalization pass brings
-        // every event back in line with its own session's key.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
+        // canonical identity the emitting side resolved, and `project_key_method`
+        // with it so the receiving side can tell a key the emitter resolved for
+        // itself from one it was lent. A key that arrives without a method
+        // ranks below every stated one, so an older adapter's events are
+        // improved by the first pass that knows better rather than defended as
+        // if the emitter had vouched for them. Neither is trusted as final:
+        // `refresh_project_identity`'s denormalization pass brings every event
+        // back in line with its own session's key.
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id"},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},

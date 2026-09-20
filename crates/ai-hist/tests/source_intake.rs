@@ -732,3 +732,69 @@ fn a_plugin_snapshot_leaves_every_event_carrying_the_session_key() -> Result<()>
     );
     Ok(())
 }
+
+/// Plugin intake is an acquisition pass, so it must open one.
+///
+/// The project-identity cache is process-global and only sound for the length
+/// of a pass. The Node addon serves request after request from one long-lived
+/// host, so without a boundary here the answer it reconciles against is
+/// whatever the *first* request happened to see: a repository cloned, moved or
+/// given an `origin` an hour ago is still filed under the directory it used to
+/// be, and that stale key is shaped exactly like a correct one.
+#[test]
+fn plugin_intake_opens_a_new_acquisition_pass() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("history.db");
+    let work = directory.path().join("work/app");
+    std::fs::create_dir_all(&work)?;
+    observe(&path, "one")?;
+
+    let conn = ai_hist::open_db(&path)?;
+    conn.execute(
+        "UPDATE sessions SET cwd = ? WHERE source = 'claude' AND session_id = 's'",
+        rusqlite::params![work.to_string_lossy()],
+    )?;
+
+    // A pass earlier in the life of this process resolved the directory while
+    // it was not yet a repository, and that answer is in the cache.
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert_eq!(
+        ai_hist::project_identity::resolve_project_identity(&work.to_string_lossy()).method,
+        ai_hist::project_identity::ProjectKeyMethod::PathFallback
+    );
+
+    // Then the checkout gains an origin, as checkouts do.
+    let git_dir = work.join(".git");
+    std::fs::create_dir_all(&git_dir)?;
+    std::fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n",
+    )?;
+
+    let revision = state(&path, "one")?
+        .revision
+        .expect("an observed session has a revision");
+    apply(
+        &path,
+        "one",
+        revision,
+        vec![EvidenceKind::SessionEvent],
+        vec![event("fresh", "from the plugin")],
+    )?;
+
+    let key: (Option<String>, Option<String>) = conn.query_row(
+        "SELECT project_key, project_key_method FROM sessions \
+         WHERE source = 'claude' AND session_id = 's'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        key,
+        (
+            Some("github.com/acme/app".to_string()),
+            Some("remote".to_string())
+        ),
+        "intake reconciled against a directory state from an earlier request"
+    );
+    Ok(())
+}

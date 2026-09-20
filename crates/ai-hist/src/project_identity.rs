@@ -19,11 +19,22 @@
 //!
 //! No subprocess runs. `git` is not guaranteed to be on `PATH` in the contexts
 //! that ingest history (a hook, a daemon, a Node addon), spawning it per
-//! session is far more expensive than reading one small file, and a subprocess
-//! that fails is indistinguishable from a repository with no remote. `.git` is
-//! read directly, including the `gitdir:` pointer file a linked worktree uses
-//! and the `commondir` indirection that points back at the main checkout whose
-//! `config` actually holds the remote.
+//! session is far more expensive than reading a few small files, and a
+//! subprocess that fails is indistinguishable from a repository with no
+//! remote. `.git` is read directly, including the `gitdir:` pointer file a
+//! linked worktree uses and the `commondir` indirection that points back at
+//! the main checkout whose `config` actually holds the remote.
+//!
+//! Reading the repository's own `config` is not enough, because git does not
+//! resolve a remote from it alone. The system and global scopes are read and
+//! merged in git's precedence order, and `include` / `includeIf` directives
+//! are followed, because the rewrite that makes a remote recognizable is
+//! overwhelmingly configured *outside* the repository: one
+//! `url."git@github.com:".insteadOf = https://github.com/` in `~/.gitconfig`
+//! covers every repository on the machine. A reader that skipped it saw
+//! `gh:Org/Repo.git` as an unrecognizable remote and fell back to a path key —
+//! fragmenting exactly the sessions this key exists to merge, on precisely
+//! the machines whose owners had configured git most carefully.
 //!
 //! One deliberate difference from burn: burn returns `project_key: None` when
 //! nothing resolves, keeping the raw `cwd` in a separate `project` field.
@@ -101,13 +112,11 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
             method: ProjectKeyMethod::PathFallback,
         };
     };
-    let repo_url = fs::read_to_string(found.git_dir.join("config"))
-        .ok()
-        .and_then(|text| {
-            let config = parse_git_config(&text);
-            let url = single(config.get("remote \"origin\"")?, "url")?;
-            Some(apply_insteadof(&config, url))
-        });
+    let config = load_git_config(&found.git_dir);
+    let repo_url = config.get("remote \"origin\"").and_then(|origin| {
+        let url = single(origin, "url")?;
+        Some(apply_insteadof(&config, url))
+    });
     match repo_url
         .as_deref()
         .and_then(canonicalize_remote_url)
@@ -303,6 +312,315 @@ fn gitdir_pointer(text: &str) -> Option<&str> {
         let trimmed = rest.trim_matches(|c: char| c.is_whitespace());
         (!trimmed.is_empty()).then_some(trimmed)
     })
+}
+
+/// Git's configuration as it applies inside `git_dir`: the system scope,
+/// then the global scopes, then the repository's own, with `include` and
+/// `includeIf` expanded.
+///
+/// Precedence is expressed by append order — [`single`] takes the last value —
+/// so a repository's `remote.origin.url` overrides a global one, while
+/// multi-valued keys such as `insteadOf` accumulate across every scope, which
+/// is what git does with them.
+///
+/// One documented difference from git: a file's own values are applied *after*
+/// everything it includes, rather than at the point the `include` line
+/// appears. It matters only for a single-valued key set before an include that
+/// sets it again, which no configuration that resolves a remote does.
+fn load_git_config(git_dir: &Path) -> GitConfig {
+    let context = IncludeContext {
+        git_dir: git_dir
+            .canonicalize()
+            .unwrap_or_else(|_| git_dir.to_path_buf()),
+        branch: head_branch(git_dir),
+    };
+    let mut merged = GitConfig::new();
+    if let Some(system) = system_config_path() {
+        merge_config(&mut merged, load_config_file(&system, &context, 0));
+    }
+    for global in global_config_paths() {
+        merge_config(&mut merged, load_config_file(&global, &context, 0));
+    }
+    merge_config(
+        &mut merged,
+        load_config_file(&git_dir.join("config"), &context, 0),
+    );
+    merged
+}
+
+/// What an `includeIf` condition is asked about.
+struct IncludeContext {
+    git_dir: PathBuf,
+    branch: Option<String>,
+}
+
+/// Git's own cap on include nesting. A configuration that exceeds it is
+/// malformed for git too, so stopping is the same answer git gives.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Parse one config file and everything it includes.
+fn load_config_file(path: &Path, context: &IncludeContext, depth: usize) -> GitConfig {
+    let Ok(text) = fs::read_to_string(path) else {
+        return GitConfig::new();
+    };
+    let own = parse_git_config(&text);
+    if depth >= MAX_INCLUDE_DEPTH {
+        return own;
+    }
+    let mut merged = GitConfig::new();
+    for included in include_paths(&own, path, context) {
+        merge_config(&mut merged, load_config_file(&included, context, depth + 1));
+    }
+    merge_config(&mut merged, own);
+    merged
+}
+
+/// The files `config` pulls in: every `include.path`, and every
+/// `includeIf.<condition>.path` whose condition holds here.
+fn include_paths(config: &GitConfig, from: &Path, context: &IncludeContext) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (section, entries) in config {
+        let applies = if section == "include" {
+            true
+        } else if let Some(condition) = section
+            .strip_prefix("includeif \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            include_condition_holds(condition, from, context)
+        } else {
+            continue;
+        };
+        if !applies {
+            continue;
+        }
+        for (key, values) in entries {
+            if !key.eq_ignore_ascii_case("path") {
+                continue;
+            }
+            for value in values {
+                if let Some(resolved) = resolve_config_path(value, from) {
+                    out.push(resolved);
+                }
+            }
+        }
+    }
+    // A map iterates in no particular order, and two `includeIf` sections can
+    // both match. Order them so the result does not depend on hashing.
+    out.sort();
+    out
+}
+
+/// Evaluate one `includeIf` condition.
+///
+/// `gitdir:` / `gitdir/i:` match the repository's own `.git` directory, and
+/// `onbranch:` the branch `HEAD` points at. `hasconfig:remote.*.url:` is
+/// deliberately not evaluated: git resolves it against the configuration read
+/// so far, which is a different and order-dependent question, and treating an
+/// unevaluated condition as *false* only ever leaves a remote unrewritten —
+/// the same answer this module gave before it followed includes at all.
+fn include_condition_holds(condition: &str, from: &Path, context: &IncludeContext) -> bool {
+    let (keyword, pattern) = match condition.split_once(':') {
+        Some(split) => split,
+        None => return false,
+    };
+    match keyword {
+        "gitdir" => gitdir_condition(pattern, from, context, false),
+        "gitdir/i" => gitdir_condition(pattern, from, context, true),
+        "onbranch" => {
+            let Some(branch) = context.branch.as_deref() else {
+                return false;
+            };
+            let pattern = if pattern.ends_with('/') {
+                format!("{pattern}**")
+            } else {
+                pattern.to_string()
+            };
+            wildmatch(&pattern, branch, false)
+        }
+        _ => false,
+    }
+}
+
+fn gitdir_condition(pattern: &str, from: &Path, context: &IncludeContext, fold_case: bool) -> bool {
+    // git's documented expansions, in order: `~/` is the home directory, `./`
+    // is relative to the including file, a pattern that is not anchored at all
+    // matches at any depth, and a trailing `/` matches everything below.
+    let mut expanded = if let Some(rest) = pattern.strip_prefix("~/") {
+        match home_dir() {
+            Some(home) => format!("{}/{rest}", home.to_string_lossy()),
+            None => return false,
+        }
+    } else if let Some(rest) = pattern.strip_prefix("./") {
+        match from.parent() {
+            Some(dir) => format!("{}/{rest}", dir.to_string_lossy()),
+            None => return false,
+        }
+    } else if pattern.starts_with('/') {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
+    };
+    if expanded.ends_with('/') {
+        expanded.push_str("**");
+    }
+    let git_dir = context.git_dir.to_string_lossy().replace('\\', "/");
+    wildmatch(&expanded, &git_dir, fold_case)
+}
+
+/// The branch `HEAD` names, when it names one.
+fn head_branch(git_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let reference = text.trim().strip_prefix("ref:")?.trim();
+    Some(reference.strip_prefix("refs/heads/")?.to_string())
+}
+
+/// Resolve a `path` value: `~` for the home directory, and anything relative
+/// taken from the including file's directory, as git does.
+fn resolve_config_path(value: &str, from: &Path) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return Some(home_dir()?.join(rest));
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    Some(from.parent()?.join(path))
+}
+
+/// `$GIT_CONFIG_SYSTEM`, or `/etc/gitconfig`, unless `$GIT_CONFIG_NOSYSTEM`
+/// says to read neither — the same three rules git applies.
+fn system_config_path() -> Option<PathBuf> {
+    if std::env::var_os("GIT_CONFIG_NOSYSTEM").is_some_and(|value| {
+        let value = value.to_string_lossy().to_ascii_lowercase();
+        !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
+    }) {
+        return None;
+    }
+    if let Some(explicit) = std::env::var_os("GIT_CONFIG_SYSTEM") {
+        let path = PathBuf::from(explicit);
+        return (!path.as_os_str().is_empty()).then_some(path);
+    }
+    Some(PathBuf::from("/etc/gitconfig"))
+}
+
+/// The global scope: `$GIT_CONFIG_GLOBAL` when set, otherwise
+/// `$XDG_CONFIG_HOME/git/config` and then `~/.gitconfig`, which git reads in
+/// that order so the home file wins.
+fn global_config_paths() -> Vec<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        let path = PathBuf::from(explicit);
+        // git treats `/dev/null` as "no global config"; any unreadable path
+        // has the same effect here, since the read simply yields nothing.
+        return if path.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            vec![path]
+        };
+    }
+    let mut out = Vec::new();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| home_dir().map(|home| home.join(".config")));
+    if let Some(xdg) = xdg {
+        out.push(xdg.join("git/config"));
+    }
+    if let Some(home) = home_dir() {
+        out.push(home.join(".gitconfig"));
+    }
+    out
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// Append `incoming` over `base`, keeping every value.
+///
+/// Append rather than replace because git's scopes do not replace one another:
+/// a single-valued key resolves to the last one written, which [`single`]
+/// takes, while a multi-valued one — `insteadOf`, the reason this function
+/// exists — is the union of every scope that sets it.
+fn merge_config(base: &mut GitConfig, incoming: GitConfig) {
+    for (section, entries) in incoming {
+        let target = base.entry(section).or_default();
+        for (key, values) in entries {
+            target.entry(key).or_default().extend(values);
+        }
+    }
+}
+
+/// git's `wildmatch` with `WM_PATHNAME`, which is what config conditions are
+/// matched with: `*` and `?` stay inside one path component, `**` crosses
+/// them.
+fn wildmatch(pattern: &str, text: &str, fold_case: bool) -> bool {
+    let (pattern, text) = if fold_case {
+        (pattern.to_lowercase(), text.to_lowercase())
+    } else {
+        (pattern.to_string(), text.to_string())
+    };
+    wildmatch_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildmatch_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    while p < pattern.len() {
+        match pattern[p] {
+            b'*' => {
+                let double = pattern.get(p + 1) == Some(&b'*');
+                let rest = if double {
+                    &pattern[p + 2..]
+                } else {
+                    &pattern[p + 1..]
+                };
+                // `**/` consumes whole components, including none of them.
+                let rest = if double && rest.first() == Some(&b'/') {
+                    if wildmatch_bytes(&rest[1..], &text[t..]) {
+                        return true;
+                    }
+                    rest
+                } else {
+                    rest
+                };
+                let mut at = t;
+                loop {
+                    if wildmatch_bytes(rest, &text[at..]) {
+                        return true;
+                    }
+                    if at >= text.len() {
+                        return false;
+                    }
+                    if !double && text[at] == b'/' {
+                        return false;
+                    }
+                    at += 1;
+                }
+            }
+            b'?' => {
+                if t >= text.len() || text[t] == b'/' {
+                    return false;
+                }
+                p += 1;
+                t += 1;
+            }
+            literal => {
+                if t >= text.len() || text[t] != literal {
+                    return false;
+                }
+                p += 1;
+                t += 1;
+            }
+        }
+    }
+    t == text.len()
 }
 
 /// Parse `.git/config` text into `{section -> {key -> value}}`.
@@ -570,6 +888,180 @@ fn strip_port(host: &str) -> &str {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // ---- configuration git reads from outside the repository ------------
+
+    #[test]
+    fn wildmatch_keeps_a_single_star_inside_one_component() {
+        assert!(wildmatch("/work/*/.git", "/work/app/.git", false));
+        assert!(!wildmatch("/work/*/.git", "/work/team/app/.git", false));
+        assert!(wildmatch("**/work/**", "/home/me/work/app/.git", false));
+        assert!(wildmatch("/work/**", "/work/.git", false));
+        assert!(wildmatch("/work/a?c/.git", "/work/abc/.git", false));
+        assert!(!wildmatch("/Work/**", "/work/app/.git", false));
+        assert!(wildmatch("/Work/**", "/work/app/.git", true));
+    }
+
+    #[test]
+    fn a_later_scope_wins_a_single_value_and_adds_to_a_multi_valued_one() {
+        let mut merged = parse_git_config(
+            "[url \"a\"]\n\tinsteadOf = one:\n[remote \"origin\"]\n\turl = first\n",
+        );
+        merge_config(
+            &mut merged,
+            parse_git_config(
+                "[url \"a\"]\n\tinsteadOf = two:\n[remote \"origin\"]\n\turl = second\n",
+            ),
+        );
+        assert_eq!(
+            single(merged.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            Some("second"),
+            "the later scope must win a single-valued key"
+        );
+        let mut rewrites = merged.get("url \"a\"").unwrap()["insteadOf"].clone();
+        rewrites.sort();
+        assert_eq!(
+            rewrites,
+            vec!["one:".to_string(), "two:".to_string()],
+            "a rewrite configured in one scope must not delete another scope's"
+        );
+    }
+
+    /// `include.path` is followed, and the including file still wins.
+    #[test]
+    fn an_included_file_is_read_and_overridden_by_its_includer() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("identity"),
+            "[url \"https://github.com/\"]\n\tinsteadOf = gh:\n[remote \"origin\"]\n\turl = from-include\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("config"),
+            "[include]\n\tpath = identity\n[remote \"origin\"]\n\turl = from-includer\n",
+        )
+        .unwrap();
+        let context = IncludeContext {
+            git_dir: root.to_path_buf(),
+            branch: None,
+        };
+        let config = load_config_file(&root.join("config"), &context, 0);
+        assert_eq!(
+            single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            Some("from-includer")
+        );
+        assert_eq!(
+            apply_insteadof(&config, "gh:Org/Repo.git"),
+            "https://github.com/Org/Repo.git",
+            "a rewrite defined in an included file was not applied"
+        );
+    }
+
+    /// `includeIf "gitdir:"` is evaluated against the repository, not guessed.
+    #[test]
+    fn a_conditional_include_is_applied_only_where_its_condition_holds() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("work-identity"),
+            "[url \"git@github.com:acme/\"]\n\tinsteadOf = acme:\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("config"),
+            "[includeIf \"gitdir:/srv/work/\"]\n\tpath = work-identity\n",
+        )
+        .unwrap();
+
+        let inside = IncludeContext {
+            git_dir: PathBuf::from("/srv/work/app/.git"),
+            branch: None,
+        };
+        let applied = load_config_file(&root.join("config"), &inside, 0);
+        assert_eq!(
+            apply_insteadof(&applied, "acme:thing.git"),
+            "git@github.com:acme/thing.git"
+        );
+
+        let elsewhere = IncludeContext {
+            git_dir: PathBuf::from("/srv/other/app/.git"),
+            branch: None,
+        };
+        let skipped = load_config_file(&root.join("config"), &elsewhere, 0);
+        assert_eq!(
+            apply_insteadof(&skipped, "acme:thing.git"),
+            "acme:thing.git",
+            "a condition that does not hold must not pull the file in"
+        );
+    }
+
+    /// An include cycle must cost a bounded number of reads, not the process.
+    #[test]
+    fn an_include_cycle_terminates() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("a"), "[include]\n\tpath = b\n").unwrap();
+        fs::write(
+            root.join("b"),
+            "[include]\n\tpath = a\n[remote \"origin\"]\n\turl = looped\n",
+        )
+        .unwrap();
+        let context = IncludeContext {
+            git_dir: root.to_path_buf(),
+            branch: None,
+        };
+        let config = load_config_file(&root.join("a"), &context, 0);
+        assert_eq!(
+            single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            Some("looped")
+        );
+    }
+
+    #[test]
+    fn an_onbranch_condition_reads_head() {
+        let temp = tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/release/1.x\n").unwrap();
+        assert_eq!(head_branch(&git_dir).as_deref(), Some("release/1.x"));
+        let context = IncludeContext {
+            git_dir: git_dir.clone(),
+            branch: head_branch(&git_dir),
+        };
+        assert!(include_condition_holds(
+            "onbranch:release/",
+            &git_dir.join("config"),
+            &context
+        ));
+        assert!(!include_condition_holds(
+            "onbranch:main",
+            &git_dir.join("config"),
+            &context
+        ));
+        // A detached HEAD names no branch, and an unevaluated condition is
+        // false rather than assumed.
+        fs::write(
+            git_dir.join("HEAD"),
+            "9fceb02d0ae598e95dc970b74767f19372d61af8\n",
+        )
+        .unwrap();
+        assert_eq!(head_branch(&git_dir), None);
+    }
+
+    #[test]
+    fn a_condition_this_module_does_not_evaluate_is_false() {
+        let temp = tempdir().unwrap();
+        let context = IncludeContext {
+            git_dir: temp.path().to_path_buf(),
+            branch: Some("main".to_string()),
+        };
+        assert!(!include_condition_holds(
+            "hasconfig:remote.*.url:https://github.com/**",
+            &temp.path().join("config"),
+            &context
+        ));
+    }
 
     // ---- canonicalization: burn's own vectors, kept verbatim -------------
 

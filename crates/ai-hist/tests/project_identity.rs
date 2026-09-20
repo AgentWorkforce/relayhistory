@@ -80,6 +80,9 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
     // can only resolve to its own path, so it is the case inheritance covers.
     let no_repo = work.join("scratch");
     fs::create_dir_all(&no_repo).unwrap();
+    // And a delegated child that runs in a repository of its own, which is the
+    // case inheritance must keep its hands off.
+    let own_repo = checkout(&work, "subagent-repo", Some("git@github.com:Org/Other.git"));
 
     let day = home.join(".codex/sessions/2026/09/19");
     let rollout = |id: &str, cwd: &Path, parent: Option<&str>, at: &str| {
@@ -107,6 +110,14 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
     rollout("sess-a", &checkout_a, None, "2026-09-19T10:00:00Z");
     // The delegated child runs somewhere that resolves to nothing canonical.
     rollout("child", &no_repo, Some("sess-a"), "2026-09-19T10:00:30Z");
+    // Its sibling was delegated by the same session but ran in another
+    // repository entirely.
+    rollout(
+        "child-own",
+        &own_repo,
+        Some("sess-a"),
+        "2026-09-19T10:00:45Z",
+    );
 
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
@@ -174,6 +185,27 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
             "an inherited key must say so rather than pass as a resolved remote"
         );
     }
+
+    // --- a child with a repository of its own keeps it --------------------
+    //
+    // Inheritance is a loan for a child that resolved to nothing, not a
+    // correction applied to one that resolved to something. This child's
+    // events worked out `github.com/Org/Other` from the directory it ran in,
+    // which is a stronger statement about where the work happened than its
+    // delegator's repository. Overwriting it files a subagent under a project
+    // it never touched, and — because the denormalizing pass runs on every
+    // sync — does it again after every correction.
+    let own_events = event_keys(&conn, "codex", "child-own");
+    assert!(
+        !own_events.is_empty(),
+        "the sibling transcript produced no events, so the claim is untested"
+    );
+    assert!(
+        own_events
+            .iter()
+            .all(|key| key.as_deref() == Some("github.com/Org/Other")),
+        "a delegated child's own repository was replaced by its delegator's: {own_events:?}"
+    );
 
     // The parent's own key is not downgraded by the inheritance pass.
     assert_eq!(
@@ -504,4 +536,85 @@ fn an_inherited_key_yields_to_the_child_gaining_its_own_remote() {
     // Settled: the inheritance pass does not claw a `remote` key back, and a
     // further refresh writes nothing.
     assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+}
+
+/// A borrowed key follows the session it was borrowed from.
+///
+/// Pass 1 can promote a parent off a key it had itself borrowed and onto a
+/// `remote` of its own. Every child wearing the old stand-in is then filed
+/// under a repository no session in the database claims any more — and pass 2
+/// used to skip anything already marked `inherited`, so nothing would ever
+/// revisit them. The two sessions were one project a moment ago and there is
+/// nothing anywhere to say they still are.
+#[test]
+fn a_child_re_inherits_when_its_parent_moves_to_a_key_of_its_own() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = open_db(&temp.path().join("reinherit.db")).unwrap();
+
+    // The parent's directory is not a repository yet, so the key it wears was
+    // lent to it by something outside this database.
+    let parent_dir = temp.path().join("parent-checkout");
+    fs::create_dir_all(&parent_dir).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', ?, 'github.com/acme/grandparent', 'inherited', 1, 'full')",
+        rusqlite::params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The child borrowed that same stand-in.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'child', '/tmp/scratch', 'github.com/acme/grandparent', 'inherited', 2, 'full')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    // Settled: nothing to do while the borrowed key is the best available.
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert_eq!(refresh_project_identity(&conn).unwrap(), 0);
+
+    // The parent's checkout gains an origin of its own.
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/parent.git\n",
+    )
+    .unwrap();
+
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert!(refresh_project_identity(&conn).unwrap() > 0);
+    assert_eq!(
+        session_key(&conn, "codex", "parent"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "pass 1 did not promote the parent, so the claim below is untested"
+    );
+    assert_eq!(
+        session_key(&conn, "codex", "child"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Inherited.as_str().to_string())
+        ),
+        "the child kept a key its parent no longer wears"
+    );
+
+    // And it settles: the rewritten row is not rewritten again.
+    ai_hist::project_identity::begin_acquisition_pass();
+    assert_eq!(
+        refresh_project_identity(&conn).unwrap(),
+        0,
+        "re-inheritance must reach a fixed point, not churn on every sync"
+    );
 }

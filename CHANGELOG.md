@@ -97,8 +97,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `top_projects` by the canonical key and reports `grouped_by`; `--by-cwd`
   restores the previous per-directory grouping. The cloud outbox's `projectId`
   derivation reads the remote through the same helper instead of shelling out
-  to `git remote get-url`; `url.<base>.insteadOf` rewrites are expanded, as
-  that command does. Existing databases migrate additively and deliberately
+  to `git remote get-url`. Git's configuration is read in the scopes and
+  precedence git uses — system, then global (`$GIT_CONFIG_GLOBAL`,
+  `$XDG_CONFIG_HOME/git/config`, `~/.gitconfig`), then the repository's own —
+  with `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`, `onbranch:`)
+  expanded, so `url.<base>.insteadOf` rewrites apply wherever they are
+  configured, as that command does. A rewrite is overwhelmingly a global
+  setting, and a reader that stopped at `.git/config` saw `gh:Org/Repo.git` as
+  an unresolvable remote and fell back to a path key. Existing databases migrate additively and deliberately
   backfill no keys: a column stays `null` until the next sync or hydration
   resolves it for real, rather than being stamped with a path key for a
   checkout that does have a remote. A `path` key is likewise never final —

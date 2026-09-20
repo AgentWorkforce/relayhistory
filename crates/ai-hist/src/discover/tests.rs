@@ -2480,3 +2480,81 @@ fn a_cached_upgrade_the_catalog_refuses_streams_the_stored_key() {
         "a settled remote key must never be overwritten by a path"
     );
 }
+
+/// The streamed key must survive the *whole* refresh, not just its first pass.
+///
+/// A cached row is decided and handed to the caller before the end-of-pass
+/// refresh runs at all. Asking the catalog what the parent holds right now is
+/// not enough to agree with what that refresh will store: the same refresh can
+/// promote the parent off a path and onto a `remote` of its own (pass 1) and
+/// only then lend it down (pass 2) — by which time the child has been streamed
+/// with a path key, and the JSONL a consumer parses disagrees with the
+/// database it came from.
+#[test]
+fn a_cached_child_is_streamed_the_key_its_parent_is_about_to_resolve() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The delegating parent is a checkout that has an `origin` — but the
+    // catalog still has it on a path key, exactly as a session first seen
+    // before its checkout was cloned would be. Pass 1 is what fixes that, and
+    // pass 1 has not run since.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/parent.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) VALUES ('codex', 'parent', ?1, ?1, 'path', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let expected = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        expected,
+        "the streamed key did not account for the promotion its own pass was about to make"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        expected,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the parent was not promoted, so nothing above was actually tested"
+    );
+}
