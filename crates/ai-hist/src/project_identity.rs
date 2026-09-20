@@ -112,7 +112,7 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
             method: ProjectKeyMethod::PathFallback,
         };
     };
-    let config = load_git_config(&found.git_dir);
+    let config = load_git_config(&found.git_dir, &found.head_dir);
     let repo_url = config.get("remote \"origin\"").and_then(|origin| {
         let url = single(origin, "url")?;
         Some(apply_insteadof(&config, url))
@@ -240,6 +240,14 @@ pub fn begin_acquisition_pass() {
 struct FoundGitDir {
     /// Directory holding `config` — `.git`, or a worktree's common dir.
     git_dir: PathBuf,
+    /// Directory holding `HEAD`. The same one for an ordinary checkout, and
+    /// the *per-worktree* git dir for a linked worktree, which is the whole
+    /// point of keeping them apart: a worktree exists to be on a different
+    /// branch from the checkout whose `config` it shares, so asking the common
+    /// dir what branch we are on answers about the wrong tree — and an
+    /// `includeIf "onbranch:"` rewrite git would apply here would be skipped,
+    /// dropping the repository back to a path key.
+    head_dir: PathBuf,
     /// Directory whose `.git` entry was found.
     work_tree: PathBuf,
 }
@@ -253,14 +261,16 @@ fn find_git_dir(start: &Path) -> Option<FoundGitDir> {
         if let Ok(meta) = fs::metadata(&candidate) {
             if meta.is_dir() {
                 return Some(FoundGitDir {
-                    git_dir: candidate,
+                    git_dir: candidate.clone(),
+                    head_dir: candidate,
                     work_tree: dir,
                 });
             }
             if meta.is_file() {
-                if let Some(resolved) = resolve_worktree_git_dir(&candidate) {
+                if let Some((common, head)) = resolve_worktree_git_dir(&candidate) {
                     return Some(FoundGitDir {
-                        git_dir: resolved,
+                        git_dir: common,
+                        head_dir: head,
                         work_tree: dir,
                     });
                 }
@@ -274,14 +284,16 @@ fn find_git_dir(start: &Path) -> Option<FoundGitDir> {
     None
 }
 
-/// Follow a linked worktree's `.git` pointer file to the directory holding the
-/// shared `config`.
+/// Follow a linked worktree's `.git` pointer file, returning the directory
+/// holding the shared `config` and the one holding this worktree's `HEAD`.
 ///
 /// A worktree's own gitdir has no `config` of its own — the remote lives in
-/// the main checkout, which `commondir` names. Without the second hop every
-/// session run from a worktree would fall back to its path and split away from
-/// the repository it belongs to.
-fn resolve_worktree_git_dir(git_file: &Path) -> Option<PathBuf> {
+/// the main checkout, which `commondir` names. Without that hop every session
+/// run from a worktree would fall back to its path and split away from the
+/// repository it belongs to. `HEAD`, though, lives in the per-worktree dir and
+/// has to be read there: the branch is the one thing a worktree does *not*
+/// share.
+fn resolve_worktree_git_dir(git_file: &Path) -> Option<(PathBuf, PathBuf)> {
     let text = fs::read_to_string(git_file).ok()?;
     let raw = gitdir_pointer(&text)?;
     let raw_path = Path::new(raw);
@@ -294,14 +306,15 @@ fn resolve_worktree_git_dir(git_file: &Path) -> Option<PathBuf> {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
             let common = Path::new(trimmed);
-            return Some(if common.is_absolute() {
+            let common = if common.is_absolute() {
                 common.to_path_buf()
             } else {
                 gitdir.join(common)
-            });
+            };
+            return Some((common, gitdir));
         }
     }
-    Some(gitdir)
+    Some((gitdir.clone(), gitdir))
 }
 
 /// The payload of the first `gitdir:` line, trimmed. Equivalent to burn's
@@ -321,30 +334,29 @@ fn gitdir_pointer(text: &str) -> Option<&str> {
 /// Precedence is expressed by append order — [`single`] takes the last value —
 /// so a repository's `remote.origin.url` overrides a global one, while
 /// multi-valued keys such as `insteadOf` accumulate across every scope, which
-/// is what git does with them.
+/// is what git does with them. Includes are expanded at the position of their
+/// own line, for the same reason and with the same consequence if they are
+/// not.
 ///
-/// One documented difference from git: a file's own values are applied *after*
-/// everything it includes, rather than at the point the `include` line
-/// appears. It matters only for a single-valued key set before an include that
-/// sets it again, which no configuration that resolves a remote does.
-fn load_git_config(git_dir: &Path) -> GitConfig {
+/// `head_dir` is separate from `git_dir` because a linked worktree shares the
+/// repository's `config` and keeps its own `HEAD`: the branch an
+/// `includeIf "onbranch:"` asks about is the worktree's, not the main
+/// checkout's.
+fn load_git_config(git_dir: &Path, head_dir: &Path) -> GitConfig {
     let context = IncludeContext {
-        git_dir: git_dir
+        git_dir: head_dir
             .canonicalize()
-            .unwrap_or_else(|_| git_dir.to_path_buf()),
-        branch: head_branch(git_dir),
+            .unwrap_or_else(|_| head_dir.to_path_buf()),
+        branch: head_branch(head_dir),
     };
     let mut merged = GitConfig::new();
     if let Some(system) = system_config_path() {
-        merge_config(&mut merged, load_config_file(&system, &context, 0));
+        load_config_file(&system, &context, 0, &mut merged);
     }
     for global in global_config_paths() {
-        merge_config(&mut merged, load_config_file(&global, &context, 0));
+        load_config_file(&global, &context, 0, &mut merged);
     }
-    merge_config(
-        &mut merged,
-        load_config_file(&git_dir.join("config"), &context, 0),
-    );
+    load_config_file(&git_dir.join("config"), &context, 0, &mut merged);
     merged
 }
 
@@ -358,56 +370,57 @@ struct IncludeContext {
 /// malformed for git too, so stopping is the same answer git gives.
 const MAX_INCLUDE_DEPTH: usize = 10;
 
-/// Parse one config file and everything it includes.
-fn load_config_file(path: &Path, context: &IncludeContext, depth: usize) -> GitConfig {
+/// Read one config file into `out`, expanding each include **where its line
+/// appears**.
+///
+/// Appending in file order is what makes [`single`] — which takes the last
+/// value — agree with git: a variable set before an `include` is overridden by
+/// the included file, and one set after it overrides the include. Reading the
+/// whole file into a map first and merging it over its includes inverts that
+/// for every key, `remote.origin.url` included, so the reader would answer
+/// with a URL `git remote get-url origin` does not return.
+fn load_config_file(path: &Path, context: &IncludeContext, depth: usize, out: &mut GitConfig) {
     let Ok(text) = fs::read_to_string(path) else {
-        return GitConfig::new();
+        return;
     };
-    let own = parse_git_config(&text);
-    if depth >= MAX_INCLUDE_DEPTH {
-        return own;
-    }
-    let mut merged = GitConfig::new();
-    for included in include_paths(&own, path, context) {
-        merge_config(&mut merged, load_config_file(&included, context, depth + 1));
-    }
-    merge_config(&mut merged, own);
-    merged
-}
-
-/// The files `config` pulls in: every `include.path`, and every
-/// `includeIf.<condition>.path` whose condition holds here.
-fn include_paths(config: &GitConfig, from: &Path, context: &IncludeContext) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for (section, entries) in config {
-        let applies = if section == "include" {
-            true
-        } else if let Some(condition) = section
-            .strip_prefix("includeif \"")
-            .and_then(|rest| rest.strip_suffix('"'))
-        {
-            include_condition_holds(condition, from, context)
-        } else {
-            continue;
-        };
-        if !applies {
-            continue;
-        }
-        for (key, values) in entries {
-            if !key.eq_ignore_ascii_case("path") {
-                continue;
-            }
-            for value in values {
-                if let Some(resolved) = resolve_config_path(value, from) {
-                    out.push(resolved);
+    read_git_config(
+        &text,
+        &mut |section: &str, entry: Option<(&str, String)>| {
+            let Some((key, value)) = entry else {
+                out.entry(section.to_string()).or_default();
+                return;
+            };
+            if depth < MAX_INCLUDE_DEPTH && key.eq_ignore_ascii_case("path") {
+                if let Some(included) = included_path(section, &value, path, context) {
+                    load_config_file(&included, context, depth + 1, out);
                 }
             }
-        }
-    }
-    // A map iterates in no particular order, and two `includeIf` sections can
-    // both match. Order them so the result does not depend on hashing.
-    out.sort();
-    out
+            out.entry(section.to_string())
+                .or_default()
+                .entry(key.to_string())
+                .or_default()
+                .push(value);
+        },
+    );
+}
+
+/// The file an `include.path` / `includeIf.<condition>.path` line pulls in,
+/// when its section is an include at all and its condition holds here.
+fn included_path(
+    section: &str,
+    value: &str,
+    from: &Path,
+    context: &IncludeContext,
+) -> Option<PathBuf> {
+    let applies = if section == "include" {
+        true
+    } else {
+        let condition = section
+            .strip_prefix("includeif \"")
+            .and_then(|rest| rest.strip_suffix('"'))?;
+        include_condition_holds(condition, from, context)
+    };
+    applies.then(|| resolve_config_path(value, from))?
 }
 
 /// Evaluate one `includeIf` condition.
@@ -548,6 +561,7 @@ fn home_dir() -> Option<PathBuf> {
 /// a single-valued key resolves to the last one written, which [`single`]
 /// takes, while a multi-valued one — `insteadOf`, the reason this function
 /// exists — is the union of every scope that sets it.
+#[cfg(test)]
 fn merge_config(base: &mut GitConfig, incoming: GitConfig) {
     for (section, entries) in incoming {
         let target = base.entry(section).or_default();
@@ -632,6 +646,50 @@ fn wildmatch_bytes(pattern: &[u8], text: &[u8]) -> bool {
 /// reads so the two cannot disagree about a config they both parse.
 pub fn parse_git_config(text: &str) -> GitConfig {
     let mut out: GitConfig = HashMap::new();
+    read_git_config(
+        text,
+        &mut |section: &str, entry: Option<(&str, String)>| match entry {
+            // A header with no variables under it is still a section git saw.
+            None => {
+                out.entry(section.to_string()).or_default();
+            }
+            Some((key, value)) => out
+                .entry(section.to_string())
+                .or_default()
+                .entry(key.to_string())
+                .or_default()
+                .push(value),
+        },
+    );
+    out
+}
+
+/// What [`read_git_config`] reports as it walks a file: a section header, then
+/// each variable written under it.
+trait ConfigVisitor {
+    fn visit(&mut self, section: &str, entry: Option<(&str, String)>);
+}
+
+impl<F: FnMut(&str, Option<(&str, String)>)> ConfigVisitor for F {
+    fn visit(&mut self, section: &str, entry: Option<(&str, String)>) {
+        self(section, entry)
+    }
+}
+
+/// Walk a config file's variables **in the order they are written**.
+///
+/// The order is not a detail: an `include` takes effect where its line
+/// appears, so a variable written before it can be overridden by the included
+/// file and one written after it overrides the include. Collecting the file
+/// into a map first and merging afterwards loses exactly that, and for
+/// `remote.origin.url` it loses the identity of the repository — the reader
+/// would answer with a URL `git remote get-url origin` does not return.
+///
+/// `visit` is called with the current section and either `None` when a section
+/// header opens, or `Some((key, value))` for each variable. A trait rather than
+/// a closure type so the signature stays readable; every caller passes a
+/// closure.
+fn read_git_config(text: &str, visit: &mut dyn ConfigVisitor) {
     let mut current: Option<String> = None;
     for raw_line in text.split('\n') {
         let line = raw_line
@@ -644,7 +702,7 @@ pub fn parse_git_config(text: &str) -> GitConfig {
         if line.starts_with('[') && line.ends_with(']') {
             let raw = line[1..line.len() - 1].trim();
             let name = section_name(raw);
-            out.entry(name.clone()).or_default();
+            visit.visit(&name, None);
             current = Some(name);
             continue;
         }
@@ -652,18 +710,13 @@ pub fn parse_git_config(text: &str) -> GitConfig {
             continue;
         };
         let Some(eq) = line.find('=') else { continue };
-        let key = line[..eq].trim().to_string();
+        let key = line[..eq].trim();
         if key.is_empty() {
             continue;
         }
         let value = strip_inline_comment(line[eq + 1..].trim());
-        out.entry(section.clone())
-            .or_default()
-            .entry(key)
-            .or_default()
-            .push(value);
+        visit.visit(section, Some((key, value)));
     }
-    out
 }
 
 /// A parsed `.git/config`: `{section -> {key -> values}}`.
@@ -891,6 +944,13 @@ mod tests {
 
     // ---- configuration git reads from outside the repository ------------
 
+    /// One config file and everything it includes, in file order.
+    fn config_chain(path: &Path, context: &IncludeContext) -> GitConfig {
+        let mut out = GitConfig::new();
+        load_config_file(path, context, 0, &mut out);
+        out
+    }
+
     #[test]
     fn wildmatch_keeps_a_single_star_inside_one_component() {
         assert!(wildmatch("/work/*/.git", "/work/app/.git", false));
@@ -937,24 +997,65 @@ mod tests {
             "[url \"https://github.com/\"]\n\tinsteadOf = gh:\n[remote \"origin\"]\n\turl = from-include\n",
         )
         .unwrap();
+        // `origin` is set *before* the include, so the included file's value
+        // is the one git resolves. Reading the file into a map and merging it
+        // over its includes would invert that and answer with a URL
+        // `git remote get-url origin` does not return.
         fs::write(
             root.join("config"),
-            "[include]\n\tpath = identity\n[remote \"origin\"]\n\turl = from-includer\n",
+            "[remote \"origin\"]\n\turl = before-the-include\n\
+             [include]\n\tpath = identity\n",
         )
         .unwrap();
         let context = IncludeContext {
             git_dir: root.to_path_buf(),
             branch: None,
         };
-        let config = load_config_file(&root.join("config"), &context, 0);
+        let config = config_chain(&root.join("config"), &context);
         assert_eq!(
             single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
-            Some("from-includer")
+            Some("from-include"),
+            "an include must override a value written before its line"
         );
         assert_eq!(
             apply_insteadof(&config, "gh:Org/Repo.git"),
             "https://github.com/Org/Repo.git",
             "a rewrite defined in an included file was not applied"
+        );
+
+        // And the other way round: a value after the include wins, because
+        // that is where git would apply it.
+        fs::write(
+            root.join("config"),
+            "[include]\n\tpath = identity\n\
+             [remote \"origin\"]\n\turl = after-the-include\n",
+        )
+        .unwrap();
+        let config = config_chain(&root.join("config"), &context);
+        assert_eq!(
+            single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            Some("after-the-include"),
+            "a value written after an include must override it"
+        );
+
+        // Two includes, and the later one wins — which is only true if each is
+        // expanded where it is written rather than collected and sorted.
+        fs::write(
+            root.join("second"),
+            "[remote \"origin\"]\n\turl = from-the-second-include\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("config"),
+            "[include]\n\tpath = second\n\
+             [include]\n\tpath = identity\n",
+        )
+        .unwrap();
+        let config = config_chain(&root.join("config"), &context);
+        assert_eq!(
+            single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
+            Some("from-include"),
+            "the last include written must win, not whichever sorts last"
         );
     }
 
@@ -978,7 +1079,7 @@ mod tests {
             git_dir: PathBuf::from("/srv/work/app/.git"),
             branch: None,
         };
-        let applied = load_config_file(&root.join("config"), &inside, 0);
+        let applied = config_chain(&root.join("config"), &inside);
         assert_eq!(
             apply_insteadof(&applied, "acme:thing.git"),
             "git@github.com:acme/thing.git"
@@ -988,7 +1089,7 @@ mod tests {
             git_dir: PathBuf::from("/srv/other/app/.git"),
             branch: None,
         };
-        let skipped = load_config_file(&root.join("config"), &elsewhere, 0);
+        let skipped = config_chain(&root.join("config"), &elsewhere);
         assert_eq!(
             apply_insteadof(&skipped, "acme:thing.git"),
             "acme:thing.git",
@@ -1011,10 +1112,99 @@ mod tests {
             git_dir: root.to_path_buf(),
             branch: None,
         };
-        let config = load_config_file(&root.join("a"), &context, 0);
+        let config = config_chain(&root.join("a"), &context);
         assert_eq!(
             single(config.get("remote \"origin\"").unwrap(), "url").map(String::as_str),
             Some("looped")
+        );
+    }
+
+    /// A worktree is on its own branch, and `onbranch:` has to know that.
+    ///
+    /// A linked worktree shares the repository's `config` and keeps its own
+    /// `HEAD`. Reading the branch from the shared directory answers about the
+    /// main checkout — a different branch, which is the entire reason the
+    /// worktree exists — so a conditional include git applies here would be
+    /// skipped and the repository would drop back to a path key.
+    #[test]
+    fn a_linked_worktree_resolves_an_onbranch_include_against_its_own_branch() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        // The main checkout, on `main`, whose config carries the rewrite
+        // behind an `onbranch:feature` condition.
+        let main_tree = root.join("app");
+        let git = main_tree.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            root.join("feature-identity"),
+            "[url \"git@github.com:acme/\"]\n\tinsteadOf = acme:\n",
+        )
+        .unwrap();
+        fs::write(
+            git.join("config"),
+            format!(
+                "[remote \"origin\"]\n\turl = acme:app.git\n\
+                 [includeIf \"onbranch:feature\"]\n\tpath = {}\n",
+                root.join("feature-identity").display()
+            ),
+        )
+        .unwrap();
+
+        // The linked worktree, on `feature`, sharing that config through
+        // `commondir` and keeping its own `HEAD`.
+        let worktree_git = git.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        let worktree = root.join("app-feature");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        // On `main` the condition does not hold, so the shorthand stays
+        // unresolvable — which is also what makes the next assertion mean
+        // something.
+        assert_eq!(
+            project_identity(&main_tree).method,
+            ProjectKeyMethod::PathFallback
+        );
+        let resolved = project_identity(&worktree);
+        assert_eq!(
+            (resolved.project_key.as_str(), resolved.method),
+            ("github.com/acme/app", ProjectKeyMethod::Remote),
+            "the worktree was asked about the main checkout's branch"
+        );
+
+        // --- and `gitdir:` is the worktree's own git dir, not the shared one --
+        //
+        // The same mistake in the other direction: matched against `commondir`
+        // every worktree looks like the main checkout, so an include scoped to
+        // the main checkout applies to all of them and one scoped to a
+        // worktree applies to none.
+        fs::write(
+            git.join("config"),
+            format!(
+                "[remote \"origin\"]\n\turl = acme:app.git\n\
+                 [includeIf \"gitdir:{}/worktrees/\"]\n\tpath = {}\n",
+                git.display(),
+                root.join("feature-identity").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            project_identity(&worktree).project_key,
+            "github.com/acme/app",
+            "a condition scoped to the worktree's own git dir was not applied"
+        );
+        assert_eq!(
+            project_identity(&main_tree).method,
+            ProjectKeyMethod::PathFallback,
+            "a worktree-scoped condition must not apply to the main checkout"
         );
     }
 

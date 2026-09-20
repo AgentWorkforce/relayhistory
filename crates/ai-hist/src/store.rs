@@ -2415,29 +2415,57 @@ fn settled_key_of_parents(
         if !visited.insert(parent_id.clone()) {
             continue;
         }
-        // What pass 1 will leave on the parent. A `remote` it resolves for
-        // itself is the strongest thing available and displaces even a key it
-        // had borrowed, so it is asked for first.
-        if let Some((own, crate::project_identity::ProjectKeyMethod::Remote)) =
-            crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
-        {
-            return Ok(Some(own));
+        // What pass 1 will leave on this parent, decided by the same rule pass
+        // 1 uses — not by what resolution alone would say. Pass 1 never
+        // rewrites a `remote`, so a parent whose checkout now canonicalizes
+        // differently keeps the key it has; answering with the fresh one would
+        // stream a key the refresh then writes back over, which is the whole
+        // failure this walk exists to avoid.
+        if let Some(lendable) = pass_one_key(key, method.as_deref(), cwd, repo_url) {
+            return Ok(Some(lendable));
         }
-        // Then what pass 2 will leave on it: whatever *its* ancestors settle
-        // on, which is why this is a walk and not a lookup.
+        // Not lendable on its own, so what pass 2 will leave on it: whatever
+        // *its* ancestors settle on. That is why this is a walk and not a
+        // lookup — pass 2 propagates one level per iteration and the child
+        // ends up with whatever the chain settles on.
         if let Some(inherited) =
             settled_key_of_parents(conn, source, &parent_id, visited, depth + 1)?
         {
             return Ok(Some(inherited));
         }
-        // Failing both, a key it is already wearing. A borrowed one still
-        // counts: the session it was borrowed from may be outside this
-        // database entirely, and the child is no worse off holding it.
-        if key.is_some() && matches!(method.as_deref(), Some("remote") | Some("inherited")) {
-            return Ok(key);
-        }
     }
     Ok(None)
+}
+
+/// The key this row will hold after pass 1, if that key is one pass 2 would
+/// lend to a child — that is, `remote` or `inherited`. `None` means pass 1
+/// leaves it with nothing better than a path, so a child inherits from further
+/// up instead.
+///
+/// The four arms are [`resolve_missing_project_keys`]'s `UPGRADABLE` predicate
+/// read back out: `remote` is never rewritten, `inherited` yields only to a
+/// `remote` the row resolves for itself, `path` yields to anything, and a row
+/// with no key at all takes whatever resolution gives it.
+fn pass_one_key(
+    key: Option<String>,
+    method: Option<&str>,
+    cwd: Option<String>,
+    repo_url: Option<String>,
+) -> Option<String> {
+    if method == Some("remote") && key.is_some() {
+        return key;
+    }
+    let resolved = crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref());
+    if let Some((own, crate::project_identity::ProjectKeyMethod::Remote)) = resolved {
+        return Some(own);
+    }
+    // A borrowed key survives anything short of the row's own remote, and is
+    // still worth lending on: the session it was borrowed from may be outside
+    // this database entirely, and the child is no worse off holding it.
+    if method == Some("inherited") && key.is_some() {
+        return key;
+    }
+    None
 }
 
 /// The canonical key for the session an event belongs to: its own catalog

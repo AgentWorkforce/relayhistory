@@ -2558,3 +2558,78 @@ fn a_cached_child_is_streamed_the_key_its_parent_is_about_to_resolve() {
         "the parent was not promoted, so nothing above was actually tested"
     );
 }
+
+/// The streamed key must be the key the refresh will *leave*, which is not the
+/// same as the key the filesystem resolves.
+///
+/// Pass 1 never rewrites a `remote`: a session that resolved its repository
+/// once keeps that answer even if the checkout has since been re-pointed at a
+/// fork, because a settled canonical key is not something a later pass may
+/// quietly change underneath every consumer that has already grouped by it. A
+/// read-time walk that asks the filesystem instead would hand the caller the
+/// fork's key and then watch the refresh write the original back — the two
+/// disagreeing on every single pass, not just once.
+#[test]
+fn a_cached_child_is_streamed_the_settled_key_its_parent_keeps() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The parent settled on `acme/parent` at some earlier pass; its checkout
+    // now points somewhere else entirely.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/fork.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', ?, 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let settled = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        settled,
+        "the streamed key came from the checkout rather than from the row the pass will leave"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        settled,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent").0.as_deref(),
+        Some("github.com/acme/parent"),
+        "a settled remote key must not be rewritten by a later pass"
+    );
+}

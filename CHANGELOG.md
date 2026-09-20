@@ -101,8 +101,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   precedence git uses — system, then global (`$GIT_CONFIG_GLOBAL`,
   `$XDG_CONFIG_HOME/git/config`, `~/.gitconfig`), then the repository's own —
   with `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`, `onbranch:`)
-  expanded, so `url.<base>.insteadOf` rewrites apply wherever they are
-  configured, as that command does. A rewrite is overwhelmingly a global
+  expanded at the position of their own line, so `url.<base>.insteadOf`
+  rewrites apply wherever they are configured, as that command does. A linked
+  worktree reads `config` from the directory `commondir` names and `HEAD` from
+  its own, and its `includeIf` conditions are evaluated against its own git
+  directory — a worktree is on a different branch from the checkout it shares a
+  repository with, which is the point of it. A rewrite is overwhelmingly a global
   setting, and a reader that stopped at `.git/config` saw `gh:Org/Repo.git` as
   an unresolvable remote and fell back to a path key. Existing databases migrate additively and deliberately
   backfill no keys: a column stays `null` until the next sync or hydration

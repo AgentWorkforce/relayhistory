@@ -168,19 +168,25 @@ directly, in the scopes and precedence git itself uses — system
 global (`$GIT_CONFIG_GLOBAL`, else `$XDG_CONFIG_HOME/git/config` and
 `~/.gitconfig`), then the repository's own, following a linked worktree's
 `gitdir:` pointer. `include.path` and `includeIf` (`gitdir:`, `gitdir/i:`,
-`onbranch:`) are expanded, and `url.<base>.insteadOf` rewrites are applied
+`onbranch:`) are expanded at the position of their own line, so a value written
+before an include is overridden by it and one written after it wins — as git
+resolves them — and `url.<base>.insteadOf` rewrites are applied
 longest-prefix-first, as `git remote get-url` does. The outer scopes matter as
 much as the repository's own: the rewrite that makes `gh:Org/Repo.git`
 resolvable is almost always configured once in `~/.gitconfig` for the whole
 machine.
 
-Two things are deliberately left out. `includeIf "hasconfig:remote.*.url:"` is
+For a linked worktree, `config` is read from the shared directory `commondir`
+names while `HEAD` is read from the worktree's own git directory, and
+`includeIf` conditions are evaluated against that same per-worktree directory.
+A worktree exists to be on a different branch from the checkout it shares a
+repository with, so asking the shared directory would answer about the wrong
+tree.
+
+One thing is deliberately left out: `includeIf "hasconfig:remote.*.url:"` is
 not evaluated, because its answer depends on how much configuration has been
-read so far. And a file's own values are applied after everything it includes,
-rather than at the point the `include` line appears, which differs from git
-only for a single-valued key set on both sides of that line. Neither can turn a
-resolvable remote into a wrong one: both only ever leave a rewrite unapplied,
-which falls back to a path key.
+read so far. It cannot turn a resolvable remote into a wrong one — it only
+leaves a rewrite unapplied, which falls back to a path key.
 
 Both are `null` while a session's identity has not been resolved yet — a
 database that predates the columns migrates without inventing keys, and the
