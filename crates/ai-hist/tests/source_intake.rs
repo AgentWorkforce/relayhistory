@@ -48,10 +48,21 @@ fn apply(
     covered: Vec<EvidenceKind>,
     records: Vec<EvidenceRecord>,
 ) -> Result<ai_hist::HydrateSessionResult> {
+    apply_scoped(path, instance, revision, covered, records, None)
+}
+fn apply_scoped(
+    path: &std::path::Path,
+    instance: &str,
+    revision: String,
+    covered: Vec<EvidenceKind>,
+    records: Vec<EvidenceRecord>,
+    include_related: Option<bool>,
+) -> Result<ai_hist::HydrateSessionResult> {
     apply_source_evidence(ApplyEvidenceRequest {
         db_path: Some(path.into()),
         key: key(instance),
         expected_revision: revision,
+        include_related,
         evidence: NormalizedSourceEvidence {
             source_stamp: "full1".into(),
             source_bytes: 20,
@@ -60,6 +71,357 @@ fn apply(
         },
     })
 }
+fn record(kind: EvidenceKind, payload: serde_json::Value, id: &str) -> EvidenceRecord {
+    EvidenceRecord {
+        kind,
+        payload: payload.as_object().unwrap().clone(),
+        record_id: Some(format!("upstream:{id}")),
+        revision_id: Some("upstream:1".into()),
+    }
+}
+
+/// One record of every kind in `FULL_SESSION_KINDS`.
+fn full_session_records() -> Vec<EvidenceRecord> {
+    vec![
+        record(
+            EvidenceKind::History,
+            json!({"source":"claude","session_id":"s","prompt":"question","timestamp_ms":1}),
+            "prompt",
+        ),
+        event("answer", "answer"),
+        record(
+            EvidenceKind::ToolCall,
+            json!({"source":"claude","session_id":"s","tool_use_id":"tool-1","name":"Edit"}),
+            "tool",
+        ),
+        record(
+            EvidenceKind::FileEdit,
+            json!({"source":"claude","session_id":"s","tool_use_id":"tool-1","file_path":"/work/a.rs","tool_name":"Edit"}),
+            "edit",
+        ),
+        record(
+            EvidenceKind::Relationship,
+            json!({"source":"claude","parent_session_id":"s","relationship_uid":"child-1","child_session_id":"child","relationship":"delegated","identity_status":"observed","evidence_kind":"transcript","created_ms":1,"updated_ms":1}),
+            "delegation",
+        ),
+    ]
+}
+
+/// The retained snapshot accumulates every kind this connector has ever
+/// covered, which is what the stored `discovery_state` is about. The result's
+/// `coverage` answers a different question -- what *this* acquisition examined
+/// -- and reporting the accumulated set let a later `include_related: false`
+/// snapshot inherit `relationship` from an earlier one and read as `full`
+/// despite the opt-out.
+#[test]
+fn declining_related_evidence_does_not_inherit_coverage_from_an_earlier_acquisition() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    let related = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        full_session_records(),
+    )?;
+    assert_eq!(related.capability, "full");
+    assert!(related.coverage.contains(&EvidenceKind::Relationship));
+
+    // The same observation, acquired again without delegation evidence.
+    let thread_only = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ],
+        full_session_records()
+            .into_iter()
+            .filter(|record| record.kind != EvidenceKind::Relationship)
+            .collect(),
+        Some(false),
+    )?;
+    assert!(
+        !thread_only.coverage.contains(&EvidenceKind::Relationship),
+        "coverage is this acquisition's, not the accumulated snapshot's: {:?}",
+        thread_only.coverage
+    );
+    assert_eq!(
+        thread_only.coverage,
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ]
+    );
+    assert_eq!(thread_only.capability, "partial");
+    // The normalized plugin path names what it left out too, in the same words
+    // the local path uses. A `partial` capability with nothing naming the
+    // absent kinds is most of the way back to the defect this contract removes.
+    let partial = thread_only
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
+        .expect("a partial plugin snapshot names the kinds it does not cover");
+    assert_eq!(
+        partial.message,
+        "claude evidence covers history, session_event, tool_call, file_edit; \
+         this hydration produces no relationship \
+         (include_related is off, so delegation evidence is not read)"
+    );
+    // The acquisition's own diagnostic survives beside it.
+    assert!(thread_only
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SOURCE_EVIDENCE_INDEXED"));
+    // The earlier acquisition's delegation record is not withdrawn -- not
+    // covering a kind is not a claim that it is gone -- so the snapshot as a
+    // whole is still complete and the stored state stays `full`. That is the
+    // distinction the two fields carry, and it is why reporting the stored
+    // state as `coverage` was wrong rather than merely redundant.
+    assert_eq!(thread_only.discovery_state, "full");
+    // The opt-out reaches intake, not only the connector's snapshot: a request
+    // that declined related evidence must not come back listing related
+    // sessions, even though the rows an earlier acquisition contributed are
+    // still there.
+    assert!(
+        thread_only.related_session_ids.is_empty(),
+        "{:?}",
+        thread_only.related_session_ids
+    );
+    assert_eq!(thread_only.evidence.related_sessions, 0);
+
+    // Asking for it again restores the claim, so the assertions above are about
+    // the acquisition and not about evidence that stopped existing.
+    let again = apply(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        full_session_records(),
+    )?;
+    assert_eq!(again.capability, "full");
+    assert!(again.coverage.contains(&EvidenceKind::Relationship));
+    assert!(
+        !again
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"),
+        "complete coverage names nothing as absent"
+    );
+    // Positive control for the two assertions above: with related evidence
+    // requested the same store does report the child, so their emptiness is
+    // about the option rather than about a relationship that never landed.
+    assert_eq!(again.related_session_ids, vec!["child".to_string()]);
+    assert_eq!(again.evidence.related_sessions, 1);
+    Ok(())
+}
+
+/// Coverage is acquisition metadata, so a snapshot that covers more than the
+/// last one is a different result even when the rows and the stamp are
+/// identical -- the capability it reports has changed. Calling that `unchanged`
+/// invites a consumer to skip the upgrade.
+#[test]
+fn expanding_coverage_without_new_rows_is_not_an_unchanged_result() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    let thread_kinds = vec![
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::FileEdit,
+    ];
+    let rows = || {
+        full_session_records()
+            .into_iter()
+            .filter(|record| record.kind != EvidenceKind::Relationship)
+            .collect::<Vec<_>>()
+    };
+
+    let first = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        thread_kinds.clone(),
+        rows(),
+        Some(false),
+    )?;
+    assert_eq!(first.status, "hydrated");
+    assert_eq!(first.capability, "partial");
+
+    // Control: the identical acquisition, repeated. Same rows, same stamp, same
+    // coverage -- genuinely unchanged, and it must stay that way or the
+    // assertion below would pass for a result that simply never reports it.
+    let repeated = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        thread_kinds.clone(),
+        rows(),
+        Some(false),
+    )?;
+    assert_eq!(repeated.status, "unchanged");
+    assert_eq!(repeated.capability, "partial");
+
+    // The same rows and stamp again, but now covering delegation too. No row is
+    // added -- this session simply has no child -- yet the capability rises.
+    let upgraded = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        rows(),
+        Some(true),
+    )?;
+    assert_eq!(upgraded.capability, "full");
+    assert_ne!(
+        upgraded.status, "unchanged",
+        "coverage grew and the capability rose, so the result is not unchanged"
+    );
+    Ok(())
+}
+
+/// The mirror of the widening case. The accumulated snapshot kinds only ever
+/// grow, so comparing against them catches an acquisition that covers more and
+/// misses one that covers less: a later `include_related: false` pass reports
+/// `partial` while still calling itself `unchanged`, and a consumer that skips
+/// work on `unchanged` keeps the earlier `full` ranking.
+#[test]
+fn narrowing_coverage_is_not_an_unchanged_result_either() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+    let all_kinds = vec![
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::FileEdit,
+        EvidenceKind::Relationship,
+    ];
+
+    let full = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        all_kinds.clone(),
+        full_session_records(),
+        Some(true),
+    )?;
+    assert_eq!(full.capability, "full");
+
+    // Control: the identical pass again is genuinely unchanged.
+    let repeated = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        all_kinds,
+        full_session_records(),
+        Some(true),
+    )?;
+    assert_eq!(repeated.status, "unchanged");
+
+    // Same stamp, same rows, but this acquisition declined delegation. The
+    // accumulated set still contains it, so only comparing against that would
+    // call this unchanged while the capability drops.
+    let narrowed = apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ],
+        full_session_records()
+            .into_iter()
+            .filter(|record| record.kind != EvidenceKind::Relationship)
+            .collect(),
+        Some(false),
+    )?;
+    assert_eq!(narrowed.capability, "partial");
+    assert_ne!(
+        narrowed.status, "unchanged",
+        "coverage narrowed and the capability fell, so the result is not unchanged"
+    );
+    Ok(())
+}
+
+/// The checkpoint records what the acquisition did. Storing a literal `false`
+/// made it disagree with a hydration that did index delegation.
+#[test]
+fn the_checkpoint_records_whether_related_evidence_was_acquired() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("history.db");
+    observe(&path, "a")?;
+
+    apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+        ],
+        full_session_records(),
+        Some(true),
+    )?;
+    assert!(
+        state(&path, "a")?.checkpoint.unwrap().include_related,
+        "an acquisition that indexed delegation records that it did"
+    );
+
+    // Control: declining it stores false, so the field tracks the request
+    // rather than being pinned either way.
+    apply_scoped(
+        &path,
+        "a",
+        state(&path, "a")?.revision.unwrap(),
+        vec![EvidenceKind::History, EvidenceKind::SessionEvent],
+        full_session_records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.kind,
+                    EvidenceKind::History | EvidenceKind::SessionEvent
+                )
+            })
+            .collect(),
+        Some(false),
+    )?;
+    assert!(!state(&path, "a")?.checkpoint.unwrap().include_related);
+    Ok(())
+}
+
 #[test]
 fn revisions_fence_stale_results_and_instances_are_independent() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -240,6 +602,7 @@ fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()>
                 db_path: Some(path.clone()),
                 key: key(instance),
                 expected_revision: state(&path, instance)?.revision.unwrap(),
+                include_related: None,
                 evidence,
             })?;
         }
@@ -263,6 +626,7 @@ fn claude_snapshots_use_same_reconciliation_for_both_scan_orders() -> Result<()>
             db_path: Some(path.clone()),
             key: key("a"),
             expected_revision: state(&path, "a")?.revision.unwrap(),
+            include_related: None,
             evidence: empty,
         })?;
         assert_eq!(

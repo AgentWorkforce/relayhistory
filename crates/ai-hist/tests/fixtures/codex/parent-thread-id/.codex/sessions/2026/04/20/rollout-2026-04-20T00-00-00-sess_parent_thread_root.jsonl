@@ -1,0 +1,5 @@
+{"timestamp":"2026-04-20T00:00:00.000Z","type":"session_meta","payload":{"id":"sess_parent_thread_root","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:00.000Z","cli_version":"0.148.0","originator":"codex_cli_rs","git":{"branch":"main","repository_url":"git@github.com:acme/project.git","commit_hash":"1234567"}}}
+{"timestamp":"2026-04-20T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_root_1","cwd":"/tmp/project","model":"gpt-5.4"}}
+{"timestamp":"2026-04-20T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"split this across two agents"}}
+{"timestamp":"2026-04-20T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Delegating the first half."}}
+{"timestamp":"2026-04-20T00:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":100,"output_tokens":60,"reasoning_output_tokens":10,"total_tokens":960}}}}

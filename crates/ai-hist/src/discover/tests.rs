@@ -26,7 +26,14 @@ fn catalog() -> Connection {
 }
 
 fn env_at<'a>(conn: &'a Connection, home: &Path) -> DiscoveryEnv<'a> {
-    DiscoveryEnv::with_roots(conn, home.to_path_buf(), home.join("opencode.db"))
+    DiscoveryEnv::with_all_roots(
+        conn,
+        home.to_path_buf(),
+        home.join(".claude"),
+        home.join(".codex"),
+        home.join(".grok"),
+        home.join("opencode.db"),
+    )
 }
 
 fn write(path: &Path, contents: &str) {

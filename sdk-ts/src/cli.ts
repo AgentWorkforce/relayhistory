@@ -388,6 +388,9 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
   io.stdout(`${value.source}/${value.sessionId}: ${value.status}\n`);
   io.stdout(
+    `capability: ${value.capability} (coverage: ${value.coverage.join(', ') || 'none'})\n`,
+  );
+  io.stdout(
     `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
     `${value.evidence.toolCalls} tool call(s), ${value.evidence.fileEdits} file edit(s)\n`,
   );

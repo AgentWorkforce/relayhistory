@@ -56,6 +56,42 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
   }
 });
 
+// Bootstrap hydrates with includeRelated: false, so the absent `relationship`
+// coverage is its own choice. Only what the provider itself cannot produce is a
+// capability limitation -- otherwise every Claude bootstrap would report the
+// provider as limited and land in `partial`. Grok is the prompt-only exemplar
+// here; cursor stopped being one when its parser became event-level.
+test('bootstrap reports only the evidence the provider cannot produce, not what it declined', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
+  const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
+  const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',
+    `import { bootstrapLocal } from ${JSON.stringify(sdk)}; console.log(JSON.stringify(await bootstrapLocal()));`,
+  ], { env })).stdout) as {
+    status: string; diagnostics: Array<{ source: string; code: string; message: string }>;
+  };
+  try {
+    const grok = join(home, '.grok', 'sessions', '%2Fwork%2Fapp', 'grok-boot');
+    await mkdir(grok, { recursive: true });
+    await writeFile(join(grok, 'summary.json'), JSON.stringify({
+      info: { id: 'grok-boot', cwd: '/work/app' },
+      created_at: '2026-08-31T10:00:00.000Z',
+      updated_at: '2026-08-31T10:00:00.000Z',
+    }));
+    await writeFile(join(grok, 'chat_history.jsonl'),
+      JSON.stringify({ type: 'user', content: 'bootstrap grok prompt' }) + '\n');
+    const result = await call();
+    const limited = result.diagnostics.find((item) => item.code === 'CAPABILITY_LIMITED');
+    assert.ok(limited, 'a prompt-only provider is still reported as limited');
+    assert.equal(limited.source, 'grok');
+    assert.equal(limited.message, 'Provider exposes no session_event, tool_call, file_edit evidence');
+    // `relationship` is absent from the message: bootstrap declined it.
+    assert.doesNotMatch(limited.message, /relationship/);
+    assert.equal(result.status, 'partial');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test('bare CLI discovers and indexes on first invocation with an explicit database', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-first-cli-'));
   const env = { ...process.env, HOME: home, USERPROFILE: home };

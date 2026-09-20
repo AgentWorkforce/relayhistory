@@ -61,7 +61,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::project_identity::ProjectKeyMethod;
 use crate::{
-    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -279,6 +280,12 @@ impl CounterCell {
 pub struct DiscoveryEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: PathBuf,
+    /// Claude Code configuration root.
+    pub claude_config_dir: PathBuf,
+    /// Codex state root.
+    pub codex_home: PathBuf,
+    /// Grok state root.
+    pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
     conn: &'a Connection,
@@ -286,11 +293,22 @@ pub struct DiscoveryEnv<'a> {
 }
 
 impl<'a> DiscoveryEnv<'a> {
-    /// Build an environment from the process environment (`HOME`, `OPENCODE_DB`).
+    /// Build an environment from the process environment.
     pub fn new(conn: &'a Connection) -> Self {
+        let roots = crate::ProviderRoots::from_env(crate::home_dir());
+        Self::with_provider_roots(conn, roots)
+    }
+
+    pub(crate) fn with_provider_roots(
+        conn: &'a Connection,
+        roots: crate::ProviderRoots,
+    ) -> Self {
         Self {
-            home: crate::home_dir(),
-            opencode_db: crate::default_opencode_db_path(),
+            home: roots.home,
+            claude_config_dir: roots.claude,
+            codex_home: roots.codex,
+            grok_home: roots.grok,
+            opencode_db: roots.opencode_db,
             conn,
             counters: CounterCell::default(),
         }
@@ -300,12 +318,29 @@ impl<'a> DiscoveryEnv<'a> {
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
-        Self {
-            home,
-            opencode_db,
+        Self::with_provider_roots(conn, crate::ProviderRoots::from_home(home, opencode_db))
+    }
+
+    /// Build an environment with every provider root supplied explicitly.
+    pub fn with_all_roots(
+        conn: &'a Connection,
+        home: PathBuf,
+        claude_config_dir: PathBuf,
+        codex_home: PathBuf,
+        grok_home: PathBuf,
+        opencode_db: PathBuf,
+    ) -> Self {
+        Self::with_provider_roots(
             conn,
-            counters: CounterCell::default(),
-        }
+            crate::ProviderRoots {
+                home,
+                claude: claude_config_dir,
+                codex: codex_home,
+                grok: grok_home,
+                opencode_db,
+                use_env_roots: false,
+            },
+        )
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -320,6 +355,9 @@ impl<'a> DiscoveryEnv<'a> {
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
             home: &self.home,
+            claude_config_dir: &self.claude_config_dir,
+            codex_home: &self.codex_home,
+            grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
             counters: &self.counters,
         }
@@ -354,6 +392,12 @@ impl<'a> DiscoveryEnv<'a> {
 pub struct ScanEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: &'a Path,
+    /// Claude Code configuration root.
+    pub claude_config_dir: &'a Path,
+    /// Codex state root.
+    pub codex_home: &'a Path,
+    /// Grok state root.
+    pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
     counters: &'a CounterCell,
@@ -430,6 +474,21 @@ pub trait ShallowSessionProvider: Sync {
 
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
+    /// Which evidence kinds this source's local parser is *able* to produce.
+    ///
+    /// Declared, not measured: it is the ceiling on what a completed local
+    /// hydration can have indexed, and it is a property of the adapter rather
+    /// than of any one session or database — the same shape as
+    /// [`crate::relationship_capabilities`]. Hydration derives its reported
+    /// `capability` from it, so a prompt-only provider reports `partial`
+    /// instead of claiming `full` over evidence it never parses.
+    ///
+    /// The default is "nothing declared", which reports `partial`. A new
+    /// adapter therefore understates its coverage until someone writes the
+    /// list down, rather than silently overstating it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
     /// Where this adapter's evidence lives. Local file-backed adapters keep
     /// the default; remote connectors (see [`crate::remote`]) override it, and
     /// the engine records their presences and stamps under that location.
@@ -491,6 +550,30 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
         Box::new(OpencodeProvider::default()),
         Box::new(RelayProvider),
     ]
+}
+
+/// Declared local evidence coverage for one source, resolved from the shallow
+/// provider registry.
+///
+/// A pure table: it opens nothing, so it answers the same way for a source
+/// whose database is missing, and a source with no registered adapter (or one
+/// that has not declared its kinds) declares nothing.
+pub fn declared_evidence_kinds(source: &str) -> &'static [EvidenceKind] {
+    shallow_providers()
+        .iter()
+        .find(|provider| provider.source() == source)
+        .map_or(&[][..], |provider| provider.evidence_kinds())
+}
+
+/// The `FULL_SESSION_KINDS` a source's local parser does not produce, in the
+/// canonical order. Empty means the source's declared coverage is complete.
+pub fn missing_evidence_kinds(source: &str) -> Vec<EvidenceKind> {
+    let declared = declared_evidence_kinds(source);
+    FULL_SESSION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !declared.contains(kind))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +816,11 @@ impl ShallowSessionProvider for ClaudeProvider {
     fn source(&self) -> &'static str {
         "claude"
     }
+    /// The transcript parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -741,7 +829,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
+            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "jsonl")?,
             crate::file_stamp_and_modified,
         )
     }
@@ -903,6 +991,11 @@ impl ShallowSessionProvider for CodexProvider {
     fn source(&self) -> &'static str {
         "codex"
     }
+    /// The rollout parser writes prompts, events, tool calls, file edits and
+    /// child-thread relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
 
     fn enumerate(
         &self,
@@ -911,8 +1004,8 @@ impl ShallowSessionProvider for CodexProvider {
     ) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for root in [
-            env.home.join(".codex/sessions"),
-            env.home.join(".codex/archived_sessions"),
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
         ] {
             files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
         }
@@ -1053,6 +1146,17 @@ impl ShallowSessionProvider for CursorProvider {
     }
     fn source(&self) -> &'static str {
         "cursor"
+    }
+    /// The transcript parser writes prompts, events, tool calls and file edits.
+    /// Delegation is deliberately absent: a Cursor `Task` block names no child
+    /// transcript, so no relationship row is ever written.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ]
     }
 
     fn enumerate(
@@ -1212,6 +1316,11 @@ impl ShallowSessionProvider for GrokProvider {
     fn source(&self) -> &'static str {
         "grok"
     }
+    /// The local parser reads user prompts only; Grok's chat files expose no
+    /// tool calls, file edits or delegation to this reader.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
+    }
 
     fn enumerate(
         &self,
@@ -1221,7 +1330,7 @@ impl ShallowSessionProvider for GrokProvider {
         file_candidates(
             "grok",
             crate::collect_matching_files(
-                &env.home.join(".grok/sessions"),
+                &env.grok_home.join("sessions"),
                 "chat_history",
                 "jsonl",
             )?,
@@ -1477,6 +1586,11 @@ impl ShallowSessionProvider for OpencodeProvider {
     }
     fn source(&self) -> &'static str {
         "opencode"
+    }
+    /// The session-keyed query reads user text parts only; assistant turns,
+    /// tool calls and file edits in OpenCode's store are not read.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[EvidenceKind::History]
     }
 
     fn enumerate(
@@ -1738,6 +1852,11 @@ struct RelayProvider;
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
+    }
+    /// Relay rows are enumerated out of already-ingested `history`; there is no
+    /// relay parser, and targeted hydration is unsupported for it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
     }
 
     fn enumerate(

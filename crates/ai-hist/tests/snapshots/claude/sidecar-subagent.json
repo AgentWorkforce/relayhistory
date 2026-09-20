@@ -1,0 +1,151 @@
+{
+  "corpus_files": [
+    "claude/sidecar-subagent"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/sidecar-subagent",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "plan the migration",
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [
+        "plan01"
+      ],
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-side-user-1:0",
+      "git_branch": "main",
+      "kind": "text",
+      "message_id": "u-side-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "text": "plan the migration",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-side-asst-1:0",
+      "git_branch": "main",
+      "kind": "tool_use",
+      "message_id": "u-side-asst-1",
+      "model": "claude-opus-4-7",
+      "parent_id": "u-side-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "text": "Task {\"description\":\"plan the work\",\"prompt\":\"draft the migration plan\",\"subagent_type\":\"Plan\"}",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":12,\"output_tokens\":40}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-side-result-1:0",
+      "git_branch": "main",
+      "kind": "tool_result",
+      "message_id": "u-side-result-1",
+      "model": null,
+      "parent_id": "u-side-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "text": "plan ready",
+      "token_json": null,
+      "ts_ms": 1776643205000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-agent-asst-1:0",
+      "git_branch": "main",
+      "kind": "text",
+      "message_id": "u-agent-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-agent-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "plan01",
+      "source": "claude",
+      "text": "Step 1: inventory the tables.",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":30,\"output_tokens\":18}",
+      "ts_ms": 1776643203000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": "plan the work",
+      "child_agent_type": "Plan",
+      "child_has_events": 1,
+      "child_model": "claude-sonnet-4-6",
+      "child_session_id": "plan01",
+      "evidence_kind": "claude_subagent_meta",
+      "evidence_locator": "<home>/.claude/projects/corpus/claude-sidecar-parent/subagents/agent-plan01.jsonl",
+      "evidence_ref": "toolu_task_1",
+      "identity_status": "observed",
+      "parent_session_id": "claude-sidecar-parent",
+      "relationship": "delegated",
+      "relationship_uid": "child:plan01",
+      "source": "claude",
+      "spawn_depth": 1,
+      "spawned_at_ms": 1776643202000
+    }
+  ],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "plan the migration",
+      "git_branch": "main",
+      "initial_commit": null,
+      "last_activity_ms": 1776643205000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-opus-4-7\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/claude-sidecar-parent.jsonl",
+      "repo_url": null,
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "source_stamp": "<n>:1246|<n>:860|<n>:142",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"description\":\"plan the work\",\"prompt\":\"draft the migration plan\",\"subagent_type\":\"Plan\"}",
+      "is_error": null,
+      "message_id": "u-side-asst-1",
+      "name": "Task",
+      "session_id": "claude-sidecar-parent",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "toolu_task_1",
+      "ts_ms": 1776643201000
+    }
+  ]
+}

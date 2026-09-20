@@ -1,0 +1,46 @@
+{
+  "corpus_files": [
+    "codex/simple-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/simple-turn",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "one turn: `session_meta`, `turn_context`, `task_started`, a null `token_count`, a populated one, `task_complete`",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "0.121.0",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643205100,
+      "last_assistant_text": null,
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-simple-turn.jsonl",
+      "repo_url": null,
+      "session_id": "sess_simple_1",
+      "source": "codex",
+      "source_stamp": "<n>:1103",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

@@ -183,11 +183,16 @@ test('sessions hydrate uses the SDK contract and is idempotent', async () => {
       cli, 'sessions', 'hydrate', 'claude', 'claude-hydrate', '--db', db, '--json', '--no-warning',
     ], { env });
     const hydrated = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(hydrated.contract_version, 2);
+    assert.equal(hydrated.contract_version, 3);
     assert.ok(hydrated.status === 'hydrated' || hydrated.status === 'updated',
       `expected hydrated or updated, got ${String(hydrated.status)}`);
     assert.equal(hydrated.capability, 'full');
     assert.equal(hydrated.discovery_state, 'full');
+    // Claude's parser produces every kind, so `full` is a computed answer here
+    // rather than the literal every provider used to receive.
+    assert.deepEqual(hydrated.coverage, [
+      'history', 'session_event', 'tool_call', 'file_edit', 'relationship',
+    ]);
     assert.deepEqual(hydrated.evidence, {
       prompts: 1, events: 1, tool_calls: 0, file_edits: 0, related_sessions: 0,
     });
@@ -321,7 +326,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'tools', 'claude', 'claude-evidence', '--limit', '1', '--db', db, '--json', '--no-warning',
     ], { env });
     const page = JSON.parse(first.stdout) as Record<string, unknown>;
-    assert.equal(page.contract_version, 1);
+    assert.equal(page.contract_version, 2);
     assert.equal(page.source, 'claude');
     assert.equal(page.session_id, 'claude-evidence');
     const calls = page.tool_calls as Array<Record<string, unknown>>;
@@ -345,7 +350,7 @@ test('sessions tools and edits page versioned JSON and continue from a cursor', 
       cli, 'sessions', 'edits', 'claude', 'claude-evidence', '--db', db, '--json', '--no-warning',
     ], { env });
     const editPage = JSON.parse(edits.stdout) as Record<string, unknown>;
-    assert.equal(editPage.contract_version, 1);
+    assert.equal(editPage.contract_version, 2);
     assert.deepEqual((editPage.file_edits as Array<Record<string, unknown>>).map((edit) => edit.file_path), ['/work/app/a.ts', '/work/app/b.ts']);
 
     const human = await run(process.execPath, [

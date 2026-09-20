@@ -189,6 +189,13 @@ CREATE TABLE IF NOT EXISTS session_events (
     model TEXT,
     token_json TEXT,
     event_uid TEXT NOT NULL,
+    request_id TEXT,
+    stop_reason TEXT,
+    agent_version TEXT,
+    is_sidechain INTEGER,
+    is_meta INTEGER,
+    turn_id TEXT,
+    raw_facts_version INTEGER,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -507,17 +514,47 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "project_key",
     "project_key_method",
 ];
-/// Columns [`init_db`] adds to `session_events` after the original DDL.
-/// `project_key` is denormalized onto the event so a grouping query does not
-/// have to join `sessions` for every row, and `project_key_method` says what
-/// kind of key it is. The method is storage, not surface: nothing selects it
-/// into [`crate::SessionEvent`]. It exists so the denormalizing pass can rank
-/// what it is about to write against what the row already holds, which is the
-/// only way to tell a key a delegated child resolved for itself from one it
-/// was lent. Without it that pass overwrote the former with the latter.
-const REQUIRED_SESSION_EVENT_COLUMNS: &[&str] = &["project_key", "project_key_method"];
 const REQUIRED_SESSION_PRESENCE_COLUMNS: &[&str] =
     &["raw_locator", "source_stamp", "discovery_state"];
+/// Columns [`init_db`] adds to `session_events` after the original DDL, with
+/// the SQL type each one is added as.
+///
+/// Canonical project identity (issue #175): `project_key` is denormalized onto
+/// the event so a grouping query does not have to join `sessions` for every
+/// row, and `project_key_method` says what kind of key it is. The method is
+/// storage, not surface: nothing selects it into [`crate::SessionEvent`]. It
+/// exists so the denormalizing pass can rank what it is about to write against
+/// what the row already holds, which is the only way to tell a key a delegated
+/// child resolved for itself from one it was lent. Without it that pass
+/// overwrote the former with the latter.
+///
+/// Then the per-message raw provider facts: the envelope facts a harness
+/// records once per API request or per message and that normalization used to
+/// read past. burn groups turns into API requests by `request_id`, detects an
+/// in-progress turn by the *absence* of `stop_reason`, attributes sidechain
+/// output, and bounds a Codex turn by `turn_id`. Every one is nullable, and
+/// the wire value is stored verbatim -- relayhistory preserves, consumers map.
+///
+/// As with the catalog columns above, this list is both the migration list and
+/// the read-only guard list, so the two cannot drift.
+const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
+    ("project_key", "TEXT"),
+    ("project_key_method", "TEXT"),
+    ("request_id", "TEXT"),
+    ("stop_reason", "TEXT"),
+    ("agent_version", "TEXT"),
+    ("is_sidechain", "INTEGER"),
+    ("is_meta", "INTEGER"),
+    ("turn_id", "TEXT"),
+    // Not a provider fact: the generation of raw-fact parsing the local parser
+    // wrote the row with. It is the only field stamped on every event the
+    // parser writes, whatever the provider recorded, which is what lets a
+    // plain `sync` tell a row indexed before the facts existed from one whose
+    // facts the provider genuinely never recorded. Adapter-supplied rows do
+    // not carry it (it is absent from the session-event evidence spec), so the
+    // probes that read it exclude sessions with remote provenance.
+    ("raw_facts_version", "INTEGER"),
+];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
 /// so a database still carrying the v1 table is not current for any read.
@@ -612,6 +649,7 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
+    "session_events_raw_facts_v1",
     "session_project_key_v1",
 ];
 #[cfg(feature = "delivery")]
@@ -712,16 +750,6 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     {
         return Ok(false);
     }
-    let event_columns: HashSet<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('session_events')")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !REQUIRED_SESSION_EVENT_COLUMNS
-        .iter()
-        .all(|needed| event_columns.contains(*needed))
-    {
-        return Ok(false);
-    }
     let presence_columns: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info('session_presences')")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -729,6 +757,16 @@ fn schema_has_required_indexes(conn: &Connection, required_indexes: &[&str]) -> 
     if !REQUIRED_SESSION_PRESENCE_COLUMNS
         .iter()
         .all(|needed| presence_columns.contains(*needed))
+    {
+        return Ok(false);
+    }
+    let event_columns: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('session_events')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !REQUIRED_SESSION_EVENT_COLUMNS
+        .iter()
+        .all(|(needed, _)| event_columns.contains(*needed))
     {
         return Ok(false);
     }
@@ -952,8 +990,19 @@ END;
     migrate_session_relationships_v2(conn)?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
-    ensure_text_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
+    // One typed migration for every column `session_events` gained after its
+    // DDL: the project-identity pair and the per-message raw facts. An
+    // existing database gains them here, a fresh one already has them from the
+    // CREATE TABLE, and both paths converge.
+    ensure_columns(conn, "session_events", REQUIRED_SESSION_EVENT_COLUMNS)?;
+    // The raw-facts marker records that the columns exist; the rows are
+    // backfilled by re-parsing, which HYDRATION_PARSER_VERSION forces once and
+    // which a plain `sync` does once per provider.
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_events_raw_facts_v1')",
+        [],
+    )?;
     // Canonical project identity (issue #175). The columns above are additive
     // and the index below is created unconditionally, so the marker records
     // only that this database has the shape -- it deliberately backfills no
@@ -1215,23 +1264,31 @@ DROP TABLE session_relationships_v1;
 /// This avoids both guaranteed failing ALTERs and locale/version-sensitive
 /// matching on SQLite error strings.
 fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
-    let missing = |conn: &Connection| -> Result<Vec<&str>> {
-        let existing: HashSet<String> = conn
-            .prepare("SELECT name FROM pragma_table_info(?)")?
-            .query_map([table], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(required
-            .iter()
-            .copied()
-            .filter(|column| !existing.contains(*column))
-            .collect())
-    };
+    let typed: Vec<(&str, &str)> = required.iter().map(|column| (*column, "TEXT")).collect();
+    ensure_columns(conn, table, &typed)
+}
 
-    for column in missing(conn)? {
-        // `table` and `column` come exclusively from internal constant lists,
-        // never from user input.
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
-            .with_context(|| format!("adding column {table}.{column}"))?;
+/// Add only columns that are actually absent, each with its own SQL type.
+///
+/// Same contract as [`ensure_text_columns`]; `session_events` needs it because
+/// its raw-fact columns are a mix of TEXT and INTEGER.
+fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<()> {
+    let existing: HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info(?)")?
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    for (column, sql_type) in required
+        .iter()
+        .filter(|(column, _)| !existing.contains(*column))
+    {
+        // `table`, `column` and `sql_type` come exclusively from internal
+        // constant lists, never from user input.
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"),
+            [],
+        )
+        .with_context(|| format!("adding column {table}.{column}"))?;
     }
     Ok(())
 }
@@ -1652,6 +1709,13 @@ pub struct SessionEvent {
     pub model: Option<String>,
     pub token_json: Option<String>,
     pub event_uid: String,
+    /// Verbatim provider envelope facts; see [`REQUIRED_SESSION_EVENT_COLUMNS`].
+    pub request_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub agent_version: Option<String>,
+    pub is_sidechain: Option<i64>,
+    pub is_meta: Option<i64>,
+    pub turn_id: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -1703,9 +1767,11 @@ pub struct SessionFileEdit {
     pub cwd: Option<String>,
 }
 
-/// Bump whenever the tool call / file edit page row shapes, ordering, or
-/// cursor semantics require an SDK change.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 1;
+/// Bump whenever the session evidence row shapes, ordering, or cursor
+/// semantics require an SDK change.
+///
+/// 2: `session_events` rows carry the per-message raw provider facts.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 2;
 
 /// Stable continuation for tool calls and file edits.
 ///
@@ -1739,7 +1805,8 @@ pub struct SessionFileEditPage {
 /// wrong field.
 const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
-     ts_ms, role, kind, text, model, token_json, event_uid";
+     ts_ms, role, kind, text, model, token_json, event_uid, request_id, stop_reason, \
+     agent_version, is_sidechain, is_meta, turn_id";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -1759,6 +1826,12 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         model: row.get(13)?,
         token_json: row.get(14)?,
         event_uid: row.get(15)?,
+        request_id: row.get(16)?,
+        stop_reason: row.get(17)?,
+        agent_version: row.get(18)?,
+        is_sidechain: row.get(19)?,
+        is_meta: row.get(20)?,
+        turn_id: row.get(21)?,
     })
 }
 
@@ -4777,5 +4850,224 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids.len(), 5);
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// A database whose `session_events` predates the per-message raw facts
+    /// must not be served read-only against columns it does not have, and the
+    /// writable open must add them without disturbing the rows already there.
+    ///
+    /// The database is dropped back to the pre-facts shape from a current one,
+    /// so the only thing missing is these columns: a database that failed the
+    /// guard for some older reason would prove nothing about this one.
+    #[test]
+    fn session_event_raw_fact_columns_migrate_onto_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-events.db");
+        {
+            let legacy = open_db(&db_path).unwrap();
+            assert!(schema_is_current(&legacy).unwrap());
+            legacy
+                .execute(
+                    "INSERT INTO session_events \
+                     (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('claude', 'legacy-session', 7, 'assistant', 'text', 'kept', 'uid-1')",
+                    [],
+                )
+                .unwrap();
+            drop_session_event_capture_triggers(&legacy);
+            for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
+                legacy
+                    .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
+                    .unwrap();
+            }
+            assert!(
+                !schema_is_current(&legacy).unwrap(),
+                "a database without the raw fact columns must not be served read-only"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('session_events')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<String>>>()
+            .unwrap();
+        for (needed, _) in REQUIRED_SESSION_EVENT_COLUMNS {
+            assert!(columns.contains(*needed), "missing column {needed}");
+        }
+        assert!(conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'session_events_raw_facts_v1')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        // The pre-existing row survives, with the new facts null rather than
+        // invented: nothing knows them until the transcript is re-parsed.
+        let row: (String, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT text, request_id, stop_reason, is_sidechain FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("kept".to_string(), None, None, None));
+        // A capture trigger created before the migration would go on emitting
+        // the old column list, so delivery would keep succeeding while these
+        // facts never left the machine. Rebuilding it is part of the upgrade.
+        let capture_sql = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' AND name='delivery_session_events_insert'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(sql) = capture_sql {
+            for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
+                assert!(
+                    sql.contains(*column),
+                    "the rebuilt capture trigger still omits {column}"
+                );
+            }
+        }
+    }
+
+    /// Delivery is an optional feature, and that is what opens the hole. A
+    /// database can carry delivery tables and capture triggers from a
+    /// delivery-enabled build, then be opened by a `--no-default-features`
+    /// build: that build adds the new `session_events` columns, because the
+    /// migration is not delivery-gated, but it never rebuilds the triggers,
+    /// because `init_delivery_schema` is compiled out. On the next
+    /// delivery-enabled open the trigger names are all still present, so a
+    /// read-only fast path that checks names alone is satisfied, `init_db`
+    /// never reaches the rebuild, and delivery goes on reporting success while
+    /// the new fields never leave the machine.
+    ///
+    /// So a name is not enough: the payload has to be checked too.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_capture_trigger_with_an_outdated_payload_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale-trigger.db");
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+
+        let capture_sql = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' AND name='delivery_session_events_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Rewrite the trigger to the shape a build before the raw facts left
+        // behind: same name, payload one column short.
+        let omitted = "'turn_id',NEW.\"turn_id\"";
+        let sql = capture_sql(&conn);
+        assert!(
+            sql.contains(omitted),
+            "the payload must carry {omitted} before removing it, or this test proves nothing"
+        );
+        let stale_sql = sql.replace(&format!(",{omitted}"), "");
+        assert_ne!(stale_sql, sql);
+        conn.execute_batch("DROP TRIGGER delivery_session_events_insert;")
+            .unwrap();
+        conn.execute_batch(&stale_sql).unwrap();
+
+        assert!(
+            !schema_is_current(&conn).unwrap(),
+            "a trigger whose payload predates a column its table has is not current"
+        );
+
+        // And the writable open repairs it, which is the point of saying so.
+        drop(conn);
+        let conn = open_db(&db_path).unwrap();
+        assert!(capture_sql(&conn).contains(omitted));
+        assert!(schema_is_current(&conn).unwrap());
+    }
+
+    /// A legacy database predates the raw-fact columns, so its capture triggers
+    /// never referenced them either; SQLite refuses to drop a column a trigger
+    /// still names.
+    fn drop_session_event_capture_triggers(conn: &Connection) {
+        let names = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='trigger' AND tbl_name='session_events' AND name LIKE 'delivery_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        for name in names {
+            conn.execute_batch(&format!("DROP TRIGGER {name};"))
+                .unwrap();
+        }
+    }
+
+    /// A fresh database and a migrated one must end up with the same
+    /// `session_events` shape, or the CREATE TABLE and the ALTER TABLE list
+    /// have drifted apart.
+    #[test]
+    fn fresh_and_migrated_session_event_tables_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = open_db(&dir.path().join("fresh-events.db")).unwrap();
+        let legacy_path = dir.path().join("legacy-events.db");
+        {
+            let legacy = open_db(&legacy_path).unwrap();
+            drop_session_event_capture_triggers(&legacy);
+            for (column, _) in REQUIRED_SESSION_EVENT_COLUMNS {
+                legacy
+                    .execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
+                    .unwrap();
+            }
+        }
+        let migrated = open_db(&legacy_path).unwrap();
+        let columns = |conn: &Connection| {
+            conn.prepare("SELECT name, type FROM pragma_table_info('session_events') ORDER BY name")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<(String, String)>>>()
+                .unwrap()
+        };
+        assert_eq!(columns(&fresh), columns(&migrated));
+    }
+
+    /// Both event reads select the same column list, so a page and a whole
+    /// session read cannot disagree about what an event carries.
+    #[test]
+    fn event_reads_return_the_raw_message_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_db(&dir.path().join("facts.db")).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid, \
+              request_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id) \
+             VALUES ('claude', 's', 1, 'assistant', 'text', 'hi', 'uid-1', \
+                     'req_1', 'end_turn', '2.1.96', 0, 1, 'turn_1')",
+            [],
+        )
+        .unwrap();
+
+        let whole = session_events(&conn, "s", None).unwrap();
+        let page = session_events_page(&conn, "s", None, 10, None).unwrap();
+        assert_eq!(whole, page.events);
+        let event = &whole[0];
+        assert_eq!(event.request_id.as_deref(), Some("req_1"));
+        assert_eq!(event.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(event.agent_version.as_deref(), Some("2.1.96"));
+        assert_eq!(event.is_sidechain, Some(0));
+        assert_eq!(event.is_meta, Some(1));
+        assert_eq!(event.turn_id.as_deref(), Some("turn_1"));
     }
 }

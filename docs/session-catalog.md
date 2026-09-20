@@ -34,13 +34,67 @@ const sessions = await listSessionCatalog({ limit: 100 });
 await hydrateSession({ source: sessions[0].source, sessionId: sessions[0].sessionId });
 ```
 
-Hydration requires the catalog row, never invokes discovery or global sync,
-and upgrades `discoveryState` to `full` only when the connector returned all
-available evidence. Here `full` means indexed through the returned source
-stamp, not that a live coding session has ended. Partial remote connectors
-remain `shallow` and report their capability explicitly. File providers
-validate the saved locator against the expected provider root; OpenCode uses
-session-keyed queries against its live read-only database.
+Hydration requires the catalog row and never invokes discovery or global sync.
+It upgrades `discoveryState` to `full` when the acquisition it was asked for
+was indexed through its recorded source stamp. `full` is therefore a statement
+about discovery being complete for that request, not that a live coding
+session has ended, and not that every evidence kind exists: kinds the request
+never acquired -- including ones declined by an option such as
+`includeRelated: false` -- are described by `coverage` and `capability` below,
+which is where a consumer looks to find out what was left out. A remote
+connector that could not return its evidence at all stays `shallow` and reports
+its capability explicitly. File providers validate the saved locator against
+the expected provider root; OpenCode uses session-keyed queries against its
+live read-only database.
+
+`capability` and `coverage` answer a different question from `discoveryState`,
+and hydration contract 3 made the local path compute both rather than assert
+them. `coverage` lists the evidence kinds the selected provider's parser can
+produce; `capability` is `full` only when that list contains every kind in
+`FULL_SESSION_KINDS` (`history`, `session_event`, `tool_call`, `file_edit`,
+`relationship`), and `partial` otherwise, with a `HYDRATION_PARTIAL_COVERAGE`
+diagnostic naming the missing ones. A zero count for a *covered* kind means
+this session has none of it; a kind absent from `coverage` means nothing
+looked. So a completed Cursor hydration reports:
+
+```json
+{
+  "capability": "partial",
+  "coverage": ["history"],
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor evidence covers history; this hydration produces no session_event, tool_call, file_edit, relationship" }]
+}
+```
+
+Coverage is narrowed by the request as well as by the provider.
+`includeRelated: false` asks for the selected thread alone, and hydration
+honours that literally -- Claude subagent sidecars are not walked and Codex
+child rollouts are not read -- so `relationship` drops out of `coverage` and a
+Claude or Codex session hydrated that way reports `partial`. That is the
+difference between "this session has no delegation" and "nothing looked"; the
+diagnostic says which by naming `include_related`.
+
+Codex child acquisition reads the selected session's date directory and the
+following date in both the active and archived rollout stores, which finds
+children spawned across midnight or moved between stores without making an
+old session scan years of newer rollouts. If later date directories exist in
+either store, the
+bounded search may miss delayed descendants; the result omits `relationship`
+from `coverage`, reports `partial`, and includes
+`HYDRATION_BOUNDED_RELATIONSHIPS`. A full sync can index relationships across
+the archive.
+
+A source plugin declares its own `coverage` the same way, and the same
+distinction applies to it: `covered_kinds` names what the acquisition
+*examined*, so a complete export of a session that has no file edits still
+covers `file_edit` and reports `full`. A connector also receives
+`includeRelated` and must omit `relationship` from both its coverage and its
+records when it is `false` -- otherwise a `scope: 'all'` merge would union the
+kind back in and report `full` despite the opt-out.
+
+`discoveryState` stays `full` for that row: it records that the session was
+indexed through its recorded source stamp, which is what the unchanged
+short-circuit reads. A parser upgrade still forces a re-parse, because the
+stored `parser_version` is checked independently of `discoveryState`.
 
 Codex child rollouts, and Claude subagent transcripts whose records carry a
 per-child `agentId`, retain their provider-native IDs and are linked through
@@ -412,6 +466,77 @@ which this table must stay consistent with.
 | **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
+Evidence coverage is the hydration-side version of that matrix: what each
+local parser writes, and therefore the `coverage` a completed local hydration
+reports. It is declared per adapter (`ShallowSessionProvider::evidence_kinds`),
+so a provider that grows a parser flips one entry and the reported capability
+follows.
+
+| Source | `history` | `session_event` | `tool_call` | `file_edit` | `relationship` | `capability` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
+| **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
+| **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
+| **grok** | ✓ | – | – | – | – | `partial` |
+| **opencode** | ✓ | – | – | – | – | `partial` |
+| **relay** | – | – | – | – | – | targeted hydration unsupported |
+
+### Per-message raw facts on `session_events`
+
+The envelope facts a harness records per message or per API request, kept
+verbatim on every event so a consumer can group, price and time turns without
+re-reading the transcript. `stop_reason` is the provider's own wire string,
+never a normalized enum, and its *absence* is the signal that a turn is still
+in flight.
+
+| Source | `request_id` | `stop_reason` | `agent_version` | `is_sidechain` | `is_meta` | `turn_id` |
+|---|---|---|---|---|---|---|
+| **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
+| **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
+| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+
+A null is "the provider did not record it", which is not the same as `false`
+or as an empty string: a Claude record with no `isSidechain` key stores null,
+while `"isSidechain": false` stores `0`.
+
+Because of that, none of the six can answer "was this row indexed before the
+facts existed?" -- a real record legitimately has no `request_id`, no
+`stop_reason` and no `turn_id`, and Codex records none of the other three.
+`raw_facts_version` answers it instead: the local parser stamps it on every
+event it writes, so a full sync can pick out the transcripts whose rows predate
+the facts and re-read them. It is bookkeeping rather than a provider fact and is
+not part of the session-event evidence spec, so a row an installed source
+adapter contributed is permanently unstamped.
+
+That is why the column selects files but does not bound the work. Local and
+remote observations of one session share `(source, session_id)`, so a contributed
+row would otherwise hold an unchanged local transcript off the stamp fast path on
+every sync while never being stamped itself. What ends the work is a per-provider
+generation recorded in the sync state (`claude_raw_message_facts`,
+`codex_raw_message_facts`), written only after a walk completes **and only when
+every archive root the state already names was present on that run**, so the
+backfill runs exactly once, an interrupted sync retries it, and a walk that
+could not read the files it was meant to repair does not retire it. That check
+is per file, not per root: a mount point exists whether or not anything is
+mounted on it, and a partially mounted archive returns some of the paths the
+state names and not others. A path this run did not see withholds the
+generation **and** loses its stamp, so if it comes back it is read afresh rather
+than skipped on a stamp nothing watched. Dropping the stamp is also what bounds
+the deleted-file case: it costs one further sync, after which the path is no
+longer one the state knows about. Removing the entry from the in-memory map is
+not enough to achieve that — the checkpoint merge folds a run's keys over
+what is on disk and has no way to express a delete, so a dropped path would
+come back on every write. The run carries the removals as an instruction the
+merge applies and then discards. A transcript that is enumerated but cannot be
+read counts as unobserved too, not as an empty one — the parsers read with
+`unwrap_or_default()`, so without that check a file that became unreadable
+between the walk and the read would be stamped as seen. A root the state never knew about — an install
+with no `.codex/archived_sessions` — is not a missing archive and does not hold
+the pass open. Claude reaches a subagent
+sidecar's rows through `session_relationships.evidence_locator`, because a
+sidecar never gets a `sessions` row of its own.
+
 Delegation is a separate capability, reported on every relationship result as
 `capabilities.stableChildIdentity`:
 
@@ -435,7 +560,8 @@ unlinked evidence and the child id is left null — it is never taken from the
 
 How each adapter works:
 
-- **claude** — `~/.claude/projects/**/*.jsonl`. Head for identity, `cwd`,
+- **claude** — `$CLAUDE_CONFIG_DIR/projects/**/*.jsonl` (default
+  `~/.claude/projects/**/*.jsonl`). Head for identity, `cwd`,
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
@@ -445,8 +571,9 @@ How each adapter works:
   row keeps pointing at its own transcript. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet.
-- **codex** — `rollout-*.jsonl` under `~/.codex/sessions` and
-  `~/.codex/archived_sessions`. The first line is a `session_meta` record, which
+- **codex** — `rollout-*.jsonl` under `$CODEX_HOME/sessions` and
+  `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
+  is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Subagent threads are real
   rollouts but not user sessions, so they are excluded — exactly as the full
@@ -711,7 +838,8 @@ How each adapter works:
   Anything that comes back different should replace the matching row in the
   table above, move the fixture out of `extended-unverified.jsonl`, and update
   the capability matrix.
-- **grok** — `~/.grok/sessions/<encoded-path>/<id>/`. Identity, `cwd`, branch and
+- **grok** — `$GROK_HOME/sessions/<encoded-path>/<id>/` (default
+  `~/.grok/sessions/<encoded-path>/<id>/`). Identity, `cwd`, branch and
   both timestamps come from `summary.json`; the first prompt comes from the head
   of `chat_history.jsonl`, skipping synthetic reminder turns.
 - **opencode** — the SQLite store at `$OPENCODE_DB` (default
@@ -942,6 +1070,31 @@ never be presented as a session.
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
 discoverable".
+
+### Add a fixture and a snapshot
+
+A provider is not added until its log shape is in the checked-in corpus. Add at
+least one fixture under `crates/ai-hist/tests/fixtures/<source>/`, register it
+in the `CORPUS` manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the
+quirk it encodes, list it in `tests/fixtures/README.md`, and commit the
+generated snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
+
+```sh
+UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
+```
+
+`every_source_choice_has_a_fixture_or_an_exemption` enforces the same pairing
+the discovery registry does: every `SOURCE_CHOICES` entry has a fixture, or a
+documented fixture exemption for a source that has no provider log on disk
+(`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file` and
+`corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being added
+without being described, and `no_orphaned_snapshots` stops a snapshot from
+outliving its fixture.
+
+The snapshots are the *current* extraction, gaps included — they are the
+review artifact for a parser change, not a statement of intent. Facts a
+provider's logs contain that relayhistory does not capture yet are written as
+`#[ignore = "closed by #<issue>"]` tests in the same file.
 
 ---
 

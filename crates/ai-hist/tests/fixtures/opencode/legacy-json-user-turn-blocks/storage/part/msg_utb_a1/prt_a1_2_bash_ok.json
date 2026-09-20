@@ -1,0 +1,14 @@
+{
+  "id": "prt_a1_2_bash_ok",
+  "sessionID": "ses_utb",
+  "messageID": "msg_utb_a1",
+  "type": "tool",
+  "callID": "call_b1",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "ls" },
+    "output": "ok\n",
+    "metadata": { "exit": 0 }
+  }
+}

@@ -112,6 +112,9 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("GROK_HOME");
     std::env::remove_var("AI_HIST_DB");
     let db = home.join("history.db");
 
