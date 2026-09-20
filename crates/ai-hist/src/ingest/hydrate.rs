@@ -3534,13 +3534,13 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(again.status, "unchanged");
         // Not zero: skipping the file means validating that the bytes behind
-        // its cursor are still the bytes on disk, which reads the two bounded
-        // windows the cursor's hash covers. Recomputed from the window size
-        // rather than pasted from a run.
-        assert_eq!(
-            again.bytes_read,
-            2 * super::cursor::PREFIX_WINDOW_BYTES.min(records.len() as u64) as i64
-        );
+        // its cursors are still the bytes on disk. A Claude transcript has two
+        // positions in its document — the record walk's and the metadata
+        // fold's — and both are checked before a skip, so that is two digests
+        // of two windows each. Recomputed from the window size rather than
+        // pasted from a run.
+        let digest = 2 * super::cursor::PREFIX_WINDOW_BYTES.min(records.len() as u64) as i64;
+        assert_eq!(again.bytes_read, 2 * digest);
         assert_eq!(session_event_snapshot(&db, session_id).len(), 525);
 
         // When the newline and another record finally arrive, the pass rewinds
@@ -3682,12 +3682,12 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
                 .unwrap();
         assert_eq!(third.status, "unchanged");
-        // The cursor covers the whole file, so its validation window is the
-        // file, read twice: the first window and the last are the same bytes.
-        assert_eq!(
-            third.bytes_read,
-            2 * super::cursor::PREFIX_WINDOW_BYTES.min(bytes.len() as u64) as i64
-        );
+        // Each cursor covers the whole file, so a digest's window is the file
+        // read twice — the first window and the last are the same bytes — and
+        // there are two positions to check, the record walk's and the metadata
+        // fold's.
+        let digest = 2 * super::cursor::PREFIX_WINDOW_BYTES.min(bytes.len() as u64) as i64;
+        assert_eq!(third.bytes_read, 2 * digest);
     }
 
     /// A Codex rollout's identity comes from its first record, so a hydration
