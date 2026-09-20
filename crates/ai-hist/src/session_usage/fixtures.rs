@@ -394,6 +394,97 @@ fn a_bad_snapshot_followed_by_a_good_one_still_measures_the_waiting_turn() {
     assert!(summary.diagnostics.is_empty());
 }
 
+/// The refusal belongs to the turn that was waiting when the bad snapshot
+/// arrived, not to whichever turn happens to be waiting at end of file. Once a
+/// second assistant turn takes the waiting slot, the first can never receive a
+/// measurement, so flushing the held refusal onto the current slot marked the
+/// *new* turn unreadable and left the turn that owned the glitch silent — two
+/// wrong answers from one mistake.
+#[test]
+fn an_unreadable_snapshot_is_charged_to_the_turn_that_was_waiting_for_it() {
+    let conn = codex_store("codex/counter-unusable-then-new-turn.jsonl");
+    let mut stored: Vec<(String, Option<String>)> = conn
+        .prepare(
+            "SELECT text, token_json FROM session_events \
+             WHERE source='codex' AND role='assistant' AND kind='text' ORDER BY ts_ms",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    stored.sort();
+    assert_eq!(stored.len(), 2, "two turns");
+
+    let first = stored
+        .iter()
+        .find(|(text, _)| text == "First answer.")
+        .unwrap();
+    let second = stored
+        .iter()
+        .find(|(text, _)| text == "Second answer.")
+        .unwrap();
+    let first_usage = first.1.as_deref().expect("the first turn is not silent");
+    assert!(
+        first_usage.contains("-1"),
+        "the first turn keeps the provider's own unreadable object: {first_usage}"
+    );
+    let second_usage = second.1.as_deref().expect("the second turn was measured");
+    assert!(
+        !second_usage.contains("-1"),
+        "the second turn is untouched by the earlier glitch: {second_usage}"
+    );
+    assert_eq!(
+        crate::usage::normalize_usage_str("codex", second_usage)
+            .unwrap()
+            .unwrap()
+            .output_tokens,
+        140,
+        "and still carries its own delta"
+    );
+}
+
+/// A resumed rollout opens with the cumulative total it carried over. If that
+/// snapshot is unreadable there is no baseline, and differencing the next good
+/// one against zero charges the whole carried-over history to a single
+/// request. The baseline is unknown, so the next readable snapshot installs it
+/// without emitting a delta — the same treatment a first-ever snapshot gets.
+#[test]
+fn an_unreadable_resume_baseline_does_not_become_a_delta() {
+    let conn = codex_store("codex/resume-baseline-corrupt.jsonl");
+    let deltas: Vec<String> = conn
+        .prepare(
+            "SELECT token_json FROM session_events \
+             WHERE source='codex' AND token_json IS NOT NULL",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    for delta in &deltas {
+        let Some(usage) = crate::usage::normalize_usage_str("codex", delta).unwrap() else {
+            continue;
+        };
+        assert_ne!(
+            usage.input_tokens, 50_000,
+            "the resumed session's carried-over total is not one request's delta: {delta}"
+        );
+        assert_ne!(usage.output_tokens, 9_100, "likewise for output: {delta}");
+    }
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_resume_corrupt")
+        .unwrap()
+        .unwrap();
+    // The turn is reported, and reported as unmeasured, rather than given a
+    // number the evidence does not support.
+    assert_eq!(summary.total_request_count, 1, "the turn is still reported");
+    assert!(
+        summary.usage.is_none(),
+        "nothing establishes what this turn cost: {:?}",
+        summary.usage
+    );
+}
+
 /// A counter above `i64::MAX` is still a valid `u64`, so the parser keeps it
 /// rather than zeroing it — and the JavaScript boundary is where it is
 /// refused, because that is the layer that genuinely cannot carry it.
@@ -437,4 +528,67 @@ fn prompt_attribution_charges_an_intact_turn_to_its_prompt() {
     assert_eq!(usage.input_tokens, 10);
     assert_eq!(usage.output_tokens, 0);
     assert!(!usage.coverage.has_output_tokens);
+}
+
+/// Claude writes one API request as several records with distinct uuids that
+/// share a `requestId`, and copies the whole `message.usage` onto each of
+/// them. Attribution resolves ownership per record, because that is where the
+/// parent links are, but it must add the measurement **once per request** -
+/// folding the copies charged the prompt its own cost multiplied by the
+/// request's record count.
+#[test]
+fn a_request_split_across_records_is_charged_to_its_prompt_once() {
+    let conn = claude_store("claude/multi-record-request.jsonl");
+    let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
+    // Two stored records, one request, each carrying a full copy of its usage.
+    assert_eq!(assistant_rows_with_usage(&conn), 2);
+    let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+    assert_eq!(attributed.len(), 1);
+    let ((_, prompt), usage) = attributed.iter().next().unwrap();
+    assert_eq!(prompt, "count once");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (7, 40),
+        "one request's usage, not one copy per record"
+    );
+    // And the request view agrees, which is the point of sharing the rule.
+    let summary = session_usage_summary(&conn, "claude", CLAUDE_SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.request_count, 1);
+    let totals = summary.usage.as_ref().expect("one readable request");
+    assert_eq!((totals.input_tokens, totals.output_tokens), (7, 40));
+}
+
+/// The attribution key and the view's grouping key are the same rule written
+/// twice - once in Rust, once in SQL - so they are pinned against each other.
+/// A drift here is what let one API request be counted once by the session
+/// rollup and several times by prompt attribution.
+#[test]
+fn the_rust_request_key_agrees_with_the_view() {
+    for fixture in [
+        "claude/multi-record-request.jsonl",
+        "claude/multi-block-turn.jsonl",
+        "claude/multi-block-turn-no-request-id.jsonl",
+        "claude/padded-request-id.jsonl",
+    ] {
+        let conn = claude_store(fixture);
+        let events = crate::store::session_events(&conn, CLAUDE_SESSION, Some("claude")).unwrap();
+        let mut from_rust: Vec<String> = events
+            .iter()
+            .filter(|event| event.role == "assistant")
+            .map(crate::usage::request_key)
+            .collect();
+        from_rust.sort();
+        from_rust.dedup();
+        let mut from_view: Vec<String> =
+            session_requests_page(&conn, "claude", CLAUDE_SESSION, 100, None)
+                .unwrap()
+                .requests
+                .into_iter()
+                .map(|request| request.request_key)
+                .collect();
+        from_view.sort();
+        assert_eq!(from_rust, from_view, "{fixture}");
+    }
 }

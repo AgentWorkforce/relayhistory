@@ -264,8 +264,16 @@ evidence does not establish ownership, and the response contributes nothing
 rather than being charged to a plausible neighbour. A missing number is
 recoverable; a confident wrong one is not.
 
-It still groups on the store's `message_id` rather than on
-`session_requests`, so on rows whose request identity was never captured it
-inherits the same per-record over-count described above. Re-basing it onto the
-request grouping is a follow-up; the current number is pinned by a test so the
-change shows up as deliberate.
+Ownership is resolved per **record**, because that is where the parent links
+are, but the measurement is added once per **request**, under the same identity
+rule `session_requests` groups by. One Claude API response is written as several
+records with distinct uuids and a full copy of `message.usage` on each, so
+folding the records charged a prompt its own cost multiplied by the response's
+block count. When the records of one request disagree — on the measurement, or
+on the prompt they resolve to — the request contributes nothing, for the same
+reason a broken ancestry does.
+
+The identity rule exists twice, once in Rust (`usage::request_key`) and once in
+the view's SQL. They are pinned against each other by a test, because drift
+between them is exactly how one API request came to be counted once by the
+session rollup and once per record here.

@@ -2197,8 +2197,18 @@ pub(crate) fn ingest_codex_rollout(
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut pending_usage: Option<PendingCodexUsage> = None;
     // The last snapshot that could not be differenced, held in case no later
-    // one measures the span it belongs to.
-    let mut unusable_snapshot: Option<String> = None;
+    // one measures the span it belongs to, **together with the assistant
+    // event that was waiting for a measurement when it arrived**. The waiting
+    // slot moves on as new turns appear, so flushing at end of file onto
+    // whatever occupies it then marked the wrong turn unreadable and left the
+    // right one silent.
+    let mut unusable_snapshot: Option<(String, Option<String>)> = None;
+    // Set when a snapshot is unreadable while no baseline has been
+    // established. A resumed rollout opens with the cumulative total it
+    // carried over; if that opening snapshot cannot be read, there is no
+    // baseline, and differencing the next good one against zero would charge
+    // the session's entire carried-over history to one request.
+    let mut baseline_unknown = false;
     let mut untokened_assistant_uid: Option<String> = None;
     let mut saw_model_output = false;
     let mut human_messages = codex::HumanMessageDeduper::default();
@@ -2359,10 +2369,17 @@ pub(crate) fn ingest_codex_rollout(
                         // snapshot's delta already covers this whole span;
                         // the number is recoverable and the turn must get it.
                         //
-                        // It is only remembered, and only surfaces at the end
-                        // of the rollout if nothing ever superseded it — see
-                        // the flush after the loop.
-                        unusable_snapshot = Some(usage.to_string());
+                        // It is only remembered — with the turn it belongs
+                        // to — and only surfaces at the end of the rollout if
+                        // nothing ever superseded it; see the flush after the
+                        // loop.
+                        unusable_snapshot =
+                            Some((usage.to_string(), untokened_assistant_uid.clone()));
+                        // With no baseline yet, this was the resume snapshot,
+                        // and nothing now says where the session started.
+                        if prev_totals.is_none() && !saw_model_output {
+                            baseline_unknown = true;
+                        }
                         continue;
                     };
                     match prev_totals {
@@ -2370,6 +2387,16 @@ pub(crate) fn ingest_codex_rollout(
                         // carried-over baseline of a resumed session (a fresh
                         // session's opening snapshot has `info: null`).
                         None if !saw_model_output => prev_totals = Some(totals),
+                        // The carried-over baseline was unreadable, so this
+                        // snapshot establishes one and measures nothing. A
+                        // delta from zero here would be this session's whole
+                        // history reported as a single request's spend — a
+                        // well-formed number that is wrong by however much the
+                        // session had already used.
+                        None if baseline_unknown => {
+                            prev_totals = Some(totals);
+                            baseline_unknown = false;
+                        }
                         // A regressed snapshot is treated as a transient
                         // glitch: keeping the prior baseline means the next
                         // advancing snapshot's delta covers exactly the spend
@@ -2381,9 +2408,18 @@ pub(crate) fn ingest_codex_rollout(
                             let baseline = prev_totals.unwrap_or_default();
                             let measured = totals.minus(&baseline);
                             prev_totals = Some(totals);
-                            // This delta spans the unreadable snapshot too,
-                            // so there is no longer anything to report.
-                            unusable_snapshot = None;
+                            // This delta spans the unreadable snapshot, so it
+                            // supersedes the refusal — but only for the turn
+                            // it is about to land on. If a later turn has taken
+                            // the waiting slot, this measurement belongs to
+                            // that one and the earlier turn is still owed its
+                            // refusal.
+                            if unusable_snapshot
+                                .as_ref()
+                                .is_some_and(|(_, uid)| *uid == untokened_assistant_uid)
+                            {
+                                unusable_snapshot = None;
+                            }
                             let next = match measured {
                                 Some(delta) => match pending_usage.take() {
                                     Some(pending) => pending.merged(delta, usage),
@@ -2621,17 +2657,22 @@ pub(crate) fn ingest_codex_rollout(
             _ => {}
         }
     }
-    // Nothing superseded it: the turn still waiting for a measurement is the
-    // one the unreadable snapshot belonged to, so the refusal surfaces there
-    // rather than being dropped. With no turn waiting, every turn already has
-    // a real delta and the glitch measured nothing anyone is missing.
-    if let Some(raw) = unusable_snapshot {
-        attach_codex_usage(
-            conn,
-            session_id,
-            &mut pending_usage,
-            &mut untokened_assistant_uid,
-            PendingCodexUsage::Unusable(raw),
+    // Nothing superseded it, so the refusal surfaces on the turn that was
+    // waiting when the snapshot arrived — named at that moment, not looked up
+    // now, because the waiting slot has since moved on. `token_json IS NULL`
+    // keeps it from overwriting a real measurement that turn acquired by
+    // another route. With no turn waiting then, the glitch measured a span no
+    // turn is missing, and there is nothing to report.
+    if let Some((raw, Some(uid))) = unusable_snapshot {
+        conn.execute(
+            "UPDATE session_events SET token_json = ? \
+             WHERE source = 'codex' AND session_id = ? AND event_uid = ? \
+               AND token_json IS NULL",
+            params![
+                PendingCodexUsage::Unusable(raw).into_token_json(),
+                session_id,
+                uid
+            ],
         )?;
     }
     Ok(outcome)

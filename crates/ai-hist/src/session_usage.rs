@@ -314,6 +314,23 @@ struct RawRequest {
     event_count: i64,
 }
 
+/// Decode the group's `message_ids`, which the view builds with
+/// `json_group_array` over a TEXT column — so every element is a JSON string,
+/// including ids that happen to read as JSON themselves (`123`, `true`, `{}`).
+///
+/// A decode failure is **refused**, not defaulted away. An empty list here is
+/// indistinguishable from a request that genuinely has no ids, and it is the
+/// list the tool-call join is keyed on: defaulting would drop a request's
+/// whole tool history while the response still looked perfectly well formed.
+fn decode_message_ids(encoded: Option<&str>) -> rusqlite::Result<Vec<String>> {
+    let Some(encoded) = encoded else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
 fn row_to_raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
     Ok(RawRequest {
         id: row.get(0)?,
@@ -324,11 +341,7 @@ fn row_to_raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
         // A JSON array, decoded rather than split on a delimiter: a
         // provider id may contain a comma, and the join/split round trip
         // turned `part,1` into two ids that match nothing.
-        message_ids: row
-            .get::<_, Option<String>>(5)?
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str::<Vec<String>>(encoded).ok())
-            .unwrap_or_default(),
+        message_ids: decode_message_ids(row.get::<_, Option<String>>(5)?.as_deref())?,
         provider: row.get(6)?,
         model: row.get(7)?,
         model_variants: row.get(8)?,
@@ -791,6 +804,90 @@ mod tests {
             vec!["toolu_comma".to_string()],
             "the tool call still matches its request"
         );
+    }
+
+    /// And a message id that *looks* like JSON is still just text. If the
+    /// aggregate lets `123`, `true` or `{}` through as a JSON number, literal
+    /// or object, the reader's `Vec<String>` decode fails on the whole array
+    /// and the request silently loses every id it had — tool calls included.
+    #[test]
+    fn a_json_shaped_message_id_survives_the_group() {
+        let conn = db();
+        for (index, id) in ["123", "true", "{}", "[1,2]", "null"].iter().enumerate() {
+            event(
+                &conn,
+                "claude",
+                "s1",
+                id,
+                1_000 + index as i64,
+                "assistant",
+                "tool_use",
+                None,
+                Some(r#"{"input_tokens":5,"output_tokens":6}"#),
+                &format!("{id}:0"),
+            );
+            conn.execute(
+                "INSERT INTO tool_calls (source, session_id, message_id, tool_use_id, name, ts_ms) \
+                 VALUES ('claude', 's1', ?1, ?2, 'Bash', 1)",
+                rusqlite::params![id, format!("toolu_{index}")],
+            )
+            .unwrap();
+        }
+        let page = session_requests_page(&conn, "claude", "s1", 50, None).unwrap();
+        assert_eq!(page.requests.len(), 5);
+        let mut seen: Vec<String> = page
+            .requests
+            .iter()
+            .flat_map(|request| request.message_ids.clone())
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "123".to_string(),
+                "[1,2]".to_string(),
+                "null".to_string(),
+                "true".to_string(),
+                "{}".to_string(),
+            ],
+            "every id comes back as the text it was stored as"
+        );
+        let mut tools: Vec<String> = page
+            .requests
+            .iter()
+            .flat_map(|request| request.tool_use_ids.clone())
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            vec![
+                "toolu_0".to_string(),
+                "toolu_1".to_string(),
+                "toolu_2".to_string(),
+                "toolu_3".to_string(),
+                "toolu_4".to_string(),
+            ],
+            "and the tool calls keyed on those ids still match"
+        );
+    }
+
+    /// An id list that cannot be decoded is an error, not an empty list.
+    /// Defaulting it away would hand back a request with no `message_ids` and
+    /// no `tool_use_ids` — the exact shape of a request that legitimately has
+    /// neither — so nothing downstream could tell the loss from the truth.
+    #[test]
+    fn an_undecodable_id_list_is_refused_rather_than_emptied() {
+        assert_eq!(decode_message_ids(None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            decode_message_ids(Some(r#"["a","b"]"#)).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        for broken in [r#"[1,2]"#, r#"[null]"#, r#"{"a":1}"#, "not json", "["] {
+            assert!(
+                decode_message_ids(Some(broken)).is_err(),
+                "{broken} must fail loudly"
+            );
+        }
     }
 
     /// Two identity namespaces can carry the same text. Collapsing them into

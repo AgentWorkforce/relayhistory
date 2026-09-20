@@ -526,6 +526,36 @@ fn read_cost(object: &serde_json::Map<String, Value>) -> Result<Option<f64>, Usa
 /// `(timestamp_ms, prompt_text)` — the identity a `history` row is keyed by.
 pub type PromptKey = (i64, String);
 
+/// The request an event belongs to, under the same rule the `session_requests`
+/// view groups by: the provider's own `request_id` first, then its
+/// `provider_message_id`, and the stored record id only as a last resort.
+///
+/// Namespace-qualified, because those three namespaces are separate and can
+/// carry the same text — a bare value is not unique, and a key that is not
+/// unique is not a key.
+///
+/// This rule exists twice, once here and once in SQL, and the two are pinned
+/// against each other by `the_rust_request_key_agrees_with_the_view`. Drift
+/// between them is not cosmetic: it is how one API request came to be counted
+/// once by the session rollup and once per record by prompt attribution.
+pub(crate) fn request_key(event: &SessionEvent) -> String {
+    fn present(value: Option<&String>) -> Option<&str> {
+        // `NULLIF(x, '')` in the view: empty falls through, anything else is
+        // taken verbatim, padding included.
+        value.map(String::as_str).filter(|value| !value.is_empty())
+    }
+    if let Some(id) = present(event.request_id.as_ref()) {
+        format!("request-id:{id}")
+    } else if let Some(id) = present(event.provider_message_id.as_ref()) {
+        format!("provider-message-id:{id}")
+    } else {
+        format!(
+            "record-id:{}",
+            event.message_id.as_deref().unwrap_or_default()
+        )
+    }
+}
+
 /// One assistant or user message, rebuilt from the content-block rows that
 /// carry it.
 struct UsageMessage {
@@ -535,6 +565,9 @@ struct UsageMessage {
     role: String,
     text: String,
     usage: Option<NormalizedUsage>,
+    /// The API request this record belongs to. Several records can share one
+    /// — see [`request_key`].
+    request: String,
 }
 
 /// Attribute each message's usage to the prompt that caused it.
@@ -566,6 +599,13 @@ pub fn attribute_usage_to_prompts(
             if rows.iter().any(|r| {
                 r.ts_ms != first.ts_ms || r.role != first.role || r.parent_id != first.parent_id
             }) {
+                return None;
+            }
+            // Rows sharing a record id come from one provider record, so they
+            // report one request. Disagreement means the row layout is not
+            // what it claims, and a measurement built on it is not evidence.
+            let request = request_key(first);
+            if rows.iter().any(|r| request_key(r) != request) {
                 return None;
             }
             // Claude copies message.usage onto every content block. Counting
@@ -603,6 +643,7 @@ pub fn attribute_usage_to_prompts(
                     role: first.role.clone(),
                     text,
                     usage,
+                    request,
                 },
             ))
         })
@@ -620,7 +661,18 @@ pub fn attribute_usage_to_prompts(
             .entry((user.ts, user.text.clone()))
             .or_insert(0) += 1;
     }
-    let mut attributed: HashMap<PromptKey, Option<NormalizedUsage>> = HashMap::new();
+    // One API request is often written as several records: Claude gives each
+    // content block its own uuid, links them in a chain, and copies the whole
+    // of `message.usage` onto every one of them. Ownership is resolved per
+    // *record*, because that is where the parent links are, but the
+    // measurement belongs to the *request* and is added exactly once —
+    // grouping on the record id charged a prompt its own cost multiplied by
+    // the request's record count, which is the same defect the
+    // `session_requests` view exists to prevent, and it must not survive in
+    // the path that feeds prompt costs.
+    //
+    // `None` marks a request whose records contradict each other.
+    let mut requests: HashMap<&str, Option<(PromptKey, &NormalizedUsage)>> = HashMap::new();
     for message in messages.values().filter(|m| m.role == "assistant") {
         let Some(usage) = &message.usage else {
             continue;
@@ -657,6 +709,29 @@ pub fn attribute_usage_to_prompts(
         if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
             continue;
         }
+        match requests.entry(message.request.as_str()) {
+            Entry::Vacant(slot) => {
+                slot.insert(Some((key, usage)));
+            }
+            Entry::Occupied(mut slot) => {
+                // The copies of one request must agree on both the
+                // measurement and the prompt that caused it. If they do not,
+                // the evidence does not say which reading is real, so the
+                // request contributes nothing rather than one of them — the
+                // same refusal this function applies to a broken ancestry.
+                let agrees = slot
+                    .get()
+                    .as_ref()
+                    .is_some_and(|(owner, seen)| *owner == key && *seen == usage);
+                if !agrees {
+                    slot.insert(None);
+                }
+            }
+        }
+    }
+
+    let mut attributed: HashMap<PromptKey, Option<NormalizedUsage>> = HashMap::new();
+    for (key, usage) in requests.into_values().flatten() {
         // Seed from the first contribution rather than from an all-zero
         // record. `empty()` reports *nothing* optional, and an optional field
         // is only reported when every contributor reported it — so folding
