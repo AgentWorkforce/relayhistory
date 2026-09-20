@@ -478,7 +478,20 @@ fn sweep_generation() -> String {
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
-const DESTINATION_MARKER_VERSION: &str = "v2";
+const DESTINATION_MARKER_VERSION: &str = "v3";
+
+/// The sources whose evidence a *sweep* can put back.
+///
+/// The marker is a repair guard, so it may only promise what the sweep can
+/// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
+/// by this sweep, so a loss in one is repairable and belongs in the marker.
+/// Everything else does not: `history` rows come from cursor-backed flat logs
+/// that sit at EOF and cannot be safely rewound, and a provider with no sweep
+/// repair path would be a shortfall nothing could ever clear — a marker that
+/// counted them would disarm the fast path forever over a loss it could not
+/// undo, which is a worse failure than not guarding them. Adding a source here
+/// means adding its repair path in the same change.
+const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex"];
 
 /// What the destination holds, per session the sweep has evidence for.
 ///
@@ -501,16 +514,16 @@ const DESTINATION_MARKER_VERSION: &str = "v2";
 /// `idx_session_events_session (source, session_id)`, already ordered, so it
 /// costs one pass over an index against a sweep's full walk of every source.
 fn destination_generation(conn: &Connection) -> Result<String> {
-    let (sessions, history) = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM history)",
-        [],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    )?;
-    let mut marker = format!("{DESTINATION_MARKER_VERSION} s{sessions} h{history}");
+    let sessions = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let mut marker = format!("{DESTINATION_MARKER_VERSION} s{sessions}");
     let mut statement = conn.prepare(
-        "SELECT source, session_id, COUNT(*) FROM session_events GROUP BY source, session_id",
+        "SELECT source, session_id, COUNT(*) FROM session_events \
+         WHERE source IN (SELECT value FROM json_each(?)) \
+         GROUP BY source, session_id",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([repairable_event_sources()])?;
     while let Some(row) = rows.next()? {
         let source: String = row.get(0)?;
         let session_id: String = row.get(1)?;
@@ -542,7 +555,6 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
         return None;
     }
     let sessions = parts.next()?.strip_prefix('s')?.parse::<i64>().ok()?;
-    let history = parts.next()?.strip_prefix('h')?.parse::<i64>().ok()?;
     let mut events = BTreeMap::new();
     for part in parts {
         let (session, count) = part.split_once('=')?;
@@ -554,17 +566,20 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
             return None;
         }
     }
-    Some(DestinationMarker {
-        sessions,
-        history,
-        events,
-    })
+    Some(DestinationMarker { sessions, events })
 }
 
 struct DestinationMarker {
     sessions: i64,
-    history: i64,
     events: BTreeMap<u64, i64>,
+}
+
+/// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
+/// the shortfall scan cannot drift apart.
+fn repairable_event_sources() -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(
+        serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
+    )
 }
 
 /// Sessions the destination lost evidence for since the marker was written.
@@ -595,6 +610,20 @@ impl SweepRepairs {
     }
 }
 
+/// The shortfall against whatever marker the sync state currently holds.
+fn destination_shortfall_against(
+    conn: &Connection,
+    state: &Map<String, Value>,
+) -> Result<SweepRepairs> {
+    let Some(stored) = state
+        .get(DESTINATION_GENERATION_KEY)
+        .and_then(Value::as_str)
+    else {
+        return Ok(SweepRepairs::default());
+    };
+    destination_shortfall(conn, stored)
+}
+
 /// Which sessions hold less than the stored marker recorded.
 ///
 /// The marker keys sessions by hash, which is enough to *detect* a loss but
@@ -610,9 +639,11 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
     };
     let mut repairs = SweepRepairs::default();
     let mut statement = conn.prepare(
-        "SELECT source, session_id, COUNT(*) FROM session_events GROUP BY source, session_id",
+        "SELECT source, session_id, COUNT(*) FROM session_events \
+         WHERE source IN (SELECT value FROM json_each(?)) \
+         GROUP BY source, session_id",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([repairable_event_sources()])?;
     while let Some(row) = rows.next()? {
         let source: String = row.get(0)?;
         let session_id: String = row.get(1)?;
@@ -647,7 +678,7 @@ fn destination_covers(stored: &str, current: &str) -> bool {
         // justified.
         return false;
     };
-    if current.sessions < stored.sessions || current.history < stored.history {
+    if current.sessions < stored.sessions {
         return false;
     }
     stored.events.iter().all(|(session, stored)| {
@@ -894,16 +925,13 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // Named before anything is written, because the sweep below is what
     // repairs them and it decides per session whether its unchanged stamp
     // licenses a skip. A failure here costs the repair, not the sweep.
-    let repairs = state
-        .get(DESTINATION_GENERATION_KEY)
-        .and_then(Value::as_str)
-        .map(|stored| destination_shortfall(conn, stored))
-        .transpose()
-        .unwrap_or_else(|error| {
+    let repairs = match destination_shortfall_against(conn, &state) {
+        Ok(repairs) => repairs,
+        Err(error) => {
             sync_note!("  [sync] could not name the sessions to repair: {error:#}");
-            None
-        })
-        .unwrap_or_default();
+            SweepRepairs::default()
+        }
+    };
     if !repairs.is_empty() {
         sync_note!(
             "  [sync] {} session(s) lost evidence since the last sweep; repairing",
@@ -934,7 +962,12 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     if report
         .capture(
             "claude-metadata",
-            sync_claude_session_metadata(conn, &mut state, &home.join(".claude/projects")),
+            sync_claude_session_metadata(
+                conn,
+                &mut state,
+                &home.join(".claude/projects"),
+                &repairs,
+            ),
         )
         .is_some()
     {
@@ -1010,7 +1043,30 @@ fn sync_basic(conn: &Connection, db_path: &Path, home: &Path, force: bool) -> Re
     // checkpoint. A crash between them leaves cursors ahead of a stale
     // fingerprint, which costs one extra full walk that then finds nothing —
     // never a missed append. The reverse order would lose one.
-    if all_sources_read {
+    // A loss the sweep was told about and did not put back must stay visible.
+    // Writing the marker here would record the short counts as the new truth,
+    // and the next tick would compare against them and skip: detection
+    // followed by re-baselining is how a loss becomes permanent and silent,
+    // which is the failure this marker exists to prevent. Leaving both the
+    // marker and the fingerprint stale costs a full sweep per tick until the
+    // evidence is back — loud and expensive, which is the right side to fail
+    // on — and the note below names how many sessions are still owed.
+    let outstanding = match destination_shortfall_against(conn, &state) {
+        Ok(outstanding) => outstanding,
+        Err(error) => {
+            sync_note!("  [sync] could not re-check the destination: {error:#}");
+            SweepRepairs::default()
+        }
+    };
+    if !outstanding.is_empty() {
+        eprintln!(
+            "ai-hist: {} session(s) are still missing evidence after this sweep; \
+             the source may be gone. Sync will keep re-sweeping until they are \
+             restored or the catalog is rebuilt.",
+            outstanding.len()
+        );
+    }
+    if all_sources_read && outstanding.is_empty() {
         if let Some(fingerprint) = fingerprint {
             // The destination marker is taken *after* the sweep, from what the
             // sweep just wrote — the opposite of the source fingerprint, which
@@ -3219,6 +3275,7 @@ fn sync_claude_session_metadata(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
+    repairs: &SweepRepairs,
 ) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -3239,6 +3296,11 @@ fn sync_claude_session_metadata(
         let key = path.to_string_lossy().to_string();
         let stamp = claude_sync_stamp(&path)?;
         if session_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str())
+            // Present but short: the destination marker says this transcript's
+            // session lost rows. Existence cannot answer that, and the
+            // transcript's bytes will never move again to reopen it, so the
+            // stamp does not license a skip here. Re-reading is idempotent.
+            && !claude_transcript_needs_repair(conn, &path, repairs)?
             && (claude_transcript_events_exist(conn, &path)?
                 || claude_sidecar_evidence_exists(conn, &path)?)
         {
@@ -3333,6 +3395,32 @@ fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Whether this transcript owns a session the destination marker says is short.
+///
+/// Keyed through `sessions.raw_path`, the same join the existence check uses,
+/// because the sweep reaches a Claude session by its file and the marker names
+/// it by its id.
+fn claude_transcript_needs_repair(
+    conn: &Connection,
+    path: &Path,
+    repairs: &SweepRepairs,
+) -> Result<bool> {
+    if repairs.is_empty() {
+        return Ok(false);
+    }
+    let raw_path = path.to_string_lossy();
+    let mut statement =
+        conn.prepare("SELECT session_id FROM sessions WHERE source = 'claude' AND raw_path = ?")?;
+    let mut rows = statement.query([raw_path.as_ref()])?;
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        if repairs.contains("claude", &session_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
@@ -7123,7 +7211,7 @@ mod tests {
             Value::Object(claude_sessions),
         );
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         let event_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
@@ -7235,7 +7323,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
         let cached: (String, String) = conn
             .query_row(
                 "SELECT local_session_id, remote_session_id \
@@ -7301,7 +7389,7 @@ mod tests {
 
         // No hydration anywhere: a plain sync is the only thing that has ever
         // read these files.
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         let row = delegation_row(&conn, "claude_subagent_meta");
         assert_eq!(row.parent, "claude-root");
@@ -7348,7 +7436,7 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         let row = delegation_row(&conn, "claude_sidechain_records");
         assert_eq!(row.parent, "claude-root");
@@ -7385,14 +7473,14 @@ mod tests {
         init_db(&conn).unwrap();
         let mut state = Map::new();
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
         let first = (
             delegation_row(&conn, "claude_subagent_meta").created_ms,
             delegation_row(&conn, "claude_sidechain_records").created_ms,
         );
 
         // The second walk sees unchanged stamps for every file.
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
                 row.get(0)
@@ -7423,7 +7511,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         // Rewrite the sidecar and record the rewritten file as already seen: a
         // walk that re-reads every unchanged sidecar, because a sidecar never
@@ -7443,7 +7531,7 @@ mod tests {
             .unwrap()
             .insert(key, json!(claude_sync_stamp(&named).unwrap()));
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
         let rewritten = |conn: &Connection| -> i64 {
             conn.query_row(
                 "SELECT COUNT(*) FROM session_events \
@@ -7462,7 +7550,7 @@ mod tests {
             [],
         )
         .unwrap();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
         assert_eq!(rewritten(&conn), 1);
     }
 
@@ -7473,7 +7561,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let mut state = Map::new();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         // The transcript never moves; only what describes the child changes.
         fs::write(
@@ -7481,7 +7569,7 @@ mod tests {
             r#"{"agentType":"Explore","description":"explore the code","toolUseId":"toolu_1","spawnDepth":2,"model":"other-model"}"#,
         )
         .unwrap();
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         let row = delegation_row(&conn, "claude_subagent_meta");
         assert_eq!(row.agent_type.as_deref(), Some("Explore"));
@@ -7531,7 +7619,7 @@ mod tests {
             Value::Object(claude_sessions),
         );
 
-        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path(), &Default::default()).unwrap();
 
         assert_eq!(
             delegation_row(&conn, "claude_subagent_meta")

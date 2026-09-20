@@ -90,7 +90,11 @@ Startup reports which driver it took **and which roots are not covered yet**. A
 root that does not exist cannot be watched, so a provider installed after
 `watch` started would otherwise be silently missed; those roots are retried on
 every backstop tick, and a loop that started with nothing to watch promotes
-itself to filesystem events as soon as one appears. The backstop also
+itself to filesystem events as soon as one appears. That tick also re-makes
+every existing registration: a watch is bound to the directory object, not to
+its name, so a root that was deleted and recreated — `rm -rf ~/.codex/sessions`
+and the next session — has a live name and a dead watch until it is registered
+again. The backstop also
 re-derives the root set, so a project that grows a `.trajectories` directory
 mid-run — a root whose *name* could not have been known at startup — is picked
 up too.
@@ -136,7 +140,14 @@ Two things make this cheap enough to leave running:
   would be permanent. Per session rather than in total, because totals cannot
   tell a loss from a coincidence — one row deleted here and one inserted there
   leaves every total intact. Rows arriving between sweeps — the hook fast
-  path, hydration — are growth rather than loss and still skip.
+  path, hydration — are growth rather than loss and still skip. The marker
+  covers only what a sweep can put back: Claude transcripts and Codex
+  rollouts, both re-read when their session is short. `history` rows are
+  deliberately outside it — they come from cursor-backed flat logs sitting at
+  EOF, which nothing replays, so counting them would disarm the fast path
+  forever over a loss no sweep could undo. And a loss the sweep could *not*
+  restore leaves the marker and the fingerprint stale: every tick keeps
+  sweeping, loudly, rather than recording the shortfall as the new truth.
 - A tick woken by a filesystem event **forces** the sweep past that
   fingerprint. An event can arrive before the write is flushed, so the size and
   mtime it would be compared against are not yet trustworthy. The polling

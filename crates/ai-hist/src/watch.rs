@@ -551,7 +551,10 @@ impl WatchLoop {
                     if let Some(refresh) = &self.roots_refresh {
                         watch.adopt(refresh());
                     }
-                    if watch.retry_pending() > 0 {
+                    // Reconciles rather than only retrying: a root can be
+                    // lost after a successful registration, not just before
+                    // one.
+                    if watch.reconcile() > 0 {
                         self.publish_status(Some(&*watch));
                     }
                 }
@@ -618,7 +621,10 @@ mod fs_events {
     /// itself as event-driven.
     pub(super) struct FsWatch {
         watcher: notify::RecommendedWatcher,
-        watched: Vec<PathBuf>,
+        /// The roots currently registered, kept whole rather than as paths:
+        /// a registration that dies with its directory has to be *re*-made,
+        /// which needs the depth it asked for.
+        watched: Vec<WatchRoot>,
         pending: Vec<WatchRoot>,
         /// Every root and the depth it asked for, shared with the event
         /// callback so it can drop what the backend over-delivered.
@@ -627,7 +633,7 @@ mod fs_events {
 
     impl FsWatch {
         pub(super) fn watched(&self) -> Vec<PathBuf> {
-            self.watched.clone()
+            self.watched.iter().map(|root| root.path.clone()).collect()
         }
 
         pub(super) fn pending(&self) -> Vec<PathBuf> {
@@ -651,6 +657,45 @@ mod fs_events {
             added
         }
 
+        /// Re-make every registration, and return the roots that no longer
+        /// hold one to `pending`.
+        ///
+        /// A watch is bound to the directory *object*, not to its name. Delete
+        /// a watched `~/.codex/sessions` and the kernel drops the watch with
+        /// the inode; recreate it and the name is back while the watch is not,
+        /// so the loop goes on reporting coverage it does not have and the
+        /// next transcript written there wakes nothing. Nothing in `pending`
+        /// covers that: those are roots whose *initial* registration failed.
+        ///
+        /// Re-registering an unchanged path is how the two cases are told
+        /// apart without asking the backend a question it cannot answer: the
+        /// backend replaces the existing watch, which is a no-op for a live
+        /// one and a repair for a stale one. It runs on backstop ticks only —
+        /// one call per root per slow poll, not per event.
+        ///
+        /// Returns how many roots changed side, so the caller knows whether to
+        /// republish its status.
+        pub(super) fn reconcile(&mut self) -> usize {
+            let mut changed = 0usize;
+            let mut lost = Vec::new();
+            self.watched.retain(|root| {
+                if register(&mut self.watcher, root) {
+                    return true;
+                }
+                // Best effort: the watch may already be gone with its
+                // directory, and failing to drop it is not a reason to keep
+                // claiming it.
+                let _ = self.watcher.unwatch(root.registered_path());
+                lost.push(root.clone());
+                false
+            });
+            for root in lost {
+                self.pending.push(root);
+                changed += 1;
+            }
+            changed + self.retry_pending()
+        }
+
         /// Try the roots that were not there before. Returns how many were
         /// picked up, so the caller knows whether to republish its status.
         pub(super) fn retry_pending(&mut self) -> usize {
@@ -662,7 +707,7 @@ mod fs_events {
                 if !register(&mut self.watcher, root) {
                     return true;
                 }
-                self.watched.push(root.path.clone());
+                self.watched.push(root.clone());
                 attached += 1;
                 false
             });
@@ -715,7 +760,7 @@ mod fs_events {
         let mut pending = Vec::new();
         for root in roots {
             if register(&mut watcher, root) {
-                watched.push(root.path.clone());
+                watched.push(root.clone());
             } else {
                 pending.push(root.clone());
             }
@@ -758,6 +803,10 @@ mod fs_events {
 
         pub(super) fn pending(&self) -> Vec<PathBuf> {
             Vec::new()
+        }
+
+        pub(super) fn reconcile(&mut self) -> usize {
+            0
         }
 
         pub(super) fn adopt(&mut self, _roots: Vec<WatchRoot>) -> usize {

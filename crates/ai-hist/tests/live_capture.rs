@@ -652,6 +652,101 @@ fn a_root_discovered_after_startup_is_adopted() {
     }
 }
 
+/// A watch is bound to the directory *object*, not to its name. Delete a
+/// watched root and the kernel drops the watch with the inode; recreate it —
+/// which is what a `rm -rf ~/.codex/sessions` followed by the next session
+/// does — and the name is back while the watch is not. The loop would go on
+/// reporting coverage it does not have, and every transcript written there
+/// would wait for the backstop instead of waking a sweep.
+#[cfg(feature = "fs-events")]
+#[test]
+fn a_recreated_root_is_watched_again() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let root = home.path().join("sessions");
+    std::fs::create_dir_all(&root).expect("root");
+
+    let running = RunningLoop::reporting({
+        let root = root.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(vec![ai_hist::discover::WatchRoot::tree(root)])
+                .with_debounce_ms(100)
+                // The backstop is what reconciles the registrations.
+                .with_slow_poll_ms(200)
+                .with_poll_interval_ms(200)
+        }
+    });
+    assert_eq!(running.watch.driver(), Some(WatchDriver::FsEvents));
+
+    // Positive control first: the watch works before the directory is
+    // replaced, so a silent failure afterwards cannot be mistaken for a
+    // watcher that never worked.
+    std::fs::write(root.join("first.jsonl"), "{}\n").expect("write under the original root");
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a write under the original root drove no forced sweep"
+            ),
+        }
+    }
+
+    std::fs::remove_dir_all(&root).expect("delete the root");
+    std::fs::create_dir_all(&root).expect("recreate the root");
+
+    // Wait for the loop to re-register it. `watched` is the loop's own
+    // statement about coverage, so waiting on a *fresh* forced tick below is
+    // what proves the statement is true.
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    while !running
+        .watch
+        .status()
+        .expect("status")
+        .watched
+        .contains(&root)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a recreated root was dropped from the watch set: {:?}",
+            running.watch.status()
+        );
+        std::thread::yield_now();
+    }
+
+    // Drain whatever the delete and recreate themselves produced, so the
+    // assertion below is about the write and not about the churn. Bounded by
+    // a window rather than by "until quiet": the short backstop this test
+    // needs keeps producing ticks, so a drain that waited for silence would
+    // never return.
+    let drain_until = std::time::Instant::now() + Duration::from_millis(600);
+    while std::time::Instant::now() < drain_until {
+        let _ = running.ticks.recv_timeout(Duration::from_millis(100));
+    }
+
+    std::fs::write(root.join("second.jsonl"), "{}\n").expect("write under the recreated root");
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        match running.ticks.recv_timeout(Duration::from_millis(500)) {
+            Ok(true) => break,
+            Ok(false) | Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a write under the recreated root drove no forced sweep: {:?}",
+                running.watch.status()
+            ),
+        }
+    }
+    assert!(running
+        .watch
+        .status()
+        .expect("status")
+        .watched
+        .contains(&root));
+}
+
 /// A `TRAJECTORY_ROOT` entry may name one JSON file, and that file's parent is
 /// routinely `$HOME` — or `/`. The parent is what has to be registered, since
 /// a watch on the file itself stops firing the moment the harness rewrites it
@@ -1268,6 +1363,150 @@ fn growth_elsewhere_does_not_conceal_a_lost_session() {
     assert!(
         sync_tick(&db, home.path(), false).skipped_unchanged(),
         "a repaired destination must arm the fast path again"
+    );
+}
+
+/// The Claude half of the same property. The marker names every session that
+/// lost evidence, and the sweep has to *act* on the name: a transcript whose
+/// stamp still matches and still has one row left was skipped on an existence
+/// check, so the loss survived the sweep it triggered — and the marker written
+/// afterwards would have recorded the short count as the new truth.
+#[test]
+fn a_claude_transcript_short_of_its_events_is_re_read() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_claude_transcript(home.path(), "proj", "claude-short", 4);
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "the fast path must be armed before the loss is testable"
+    );
+
+    let before = session_event_count(&db, "claude-short");
+    assert!(
+        before > 1,
+        "the transcript must leave more than one event, or 'short' and 'empty' are the same test"
+    );
+    let events_before = event_count(&db);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'claude-short' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'claude' AND session_id = 'claude-short')",
+        [],
+    )
+    .expect("delete one event");
+    // The compensating write, as in the Codex case: a row for another session,
+    // inserted directly so no source moves.
+    conn.execute(
+        "INSERT INTO session_events \
+         (source, session_id, cwd, project, ts_ms, role, text, kind, event_uid) \
+         VALUES ('claude', 'sess-hook', '/tmp/hook', 'hook', 1, 'user', 'hi', 'text', 'uid-hook')",
+        [],
+    )
+    .expect("insert an unrelated event");
+    drop(conn);
+    assert_eq!(
+        event_count(&db),
+        events_before,
+        "the compensating insert must leave the total unchanged, or nothing is concealed"
+    );
+
+    let tick = sync_tick(&db, home.path(), false);
+    assert!(tick.swept, "a short Claude session must reopen the sweep");
+    assert_eq!(
+        session_event_count(&db, "claude-short"),
+        before,
+        "the sweep must re-read the transcript, not skip it on the events that survived"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a repaired destination must arm the fast path again"
+    );
+}
+
+/// Detection without repair is only safe if the marker refuses to move. A loss
+/// the sweep could not put back — the transcript itself is gone — must leave
+/// the marker where it was, or the short count becomes the new baseline and
+/// every later tick accepts the loss.
+#[test]
+fn a_loss_the_sweep_could_not_repair_is_not_re_baselined() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let transcript = write_claude_transcript(home.path(), "proj", "claude-gone", 3);
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'claude-gone' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'claude' AND session_id = 'claude-gone')",
+        [],
+    )
+    .expect("delete one event");
+    drop(conn);
+    // Nothing on disk can restore it now.
+    std::fs::remove_file(&transcript).expect("remove the transcript");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    // The point of the test: the sweep that could not repair must not record
+    // the short count as the truth. A tick that skipped here would mean the
+    // loss had been absorbed.
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a loss the sweep could not repair must keep the fast path disarmed"
+    );
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "and must go on doing so, rather than settling on the shortfall"
+    );
+}
+
+/// The marker guards what the sweep can put back, and says so. `history` rows
+/// come from cursor-backed flat logs sitting at EOF: nothing replays them, so
+/// counting them would disarm the fast path forever over a loss no sweep could
+/// undo. They are excluded deliberately — this test is the record of that
+/// boundary, and of the fact that evidence on the same session *is* guarded.
+#[test]
+fn history_rows_are_outside_the_repair_guard() {
+    let home = tempfile::tempdir().expect("tempdir");
+    write_claude_transcript(home.path(), "proj", "hist-1", 2);
+    append_history_log(home.path(), "claude", "flat one");
+    let db = home.path().join("history.db");
+
+    assert!(sync_tick(&db, home.path(), false).swept);
+    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
+    assert_eq!(history_prompt_count(&db, "flat one"), 1);
+
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute("DELETE FROM history WHERE prompt = 'flat one'", [])
+        .expect("delete the history row");
+    drop(conn);
+    assert_eq!(history_prompt_count(&db, "flat one"), 0);
+
+    assert!(
+        sync_tick(&db, home.path(), false).skipped_unchanged(),
+        "a history loss is not something the sweep can replay, so the marker must not claim it"
+    );
+
+    // Positive control on the same database: evidence the sweep *can* restore
+    // still reopens it, so the exclusion above is a boundary and not a hole.
+    let conn = ai_hist::open_db(&db).expect("open db");
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'hist-1' \
+         AND rowid = (SELECT MIN(rowid) FROM session_events \
+                      WHERE source = 'claude' AND session_id = 'hist-1')",
+        [],
+    )
+    .expect("delete one event");
+    drop(conn);
+    assert!(
+        sync_tick(&db, home.path(), false).swept,
+        "a lost event on a live transcript must still reopen the sweep"
     );
 }
 

@@ -2890,7 +2890,8 @@ mod tests {
         // pull the child's output back onto the parent, take over the
         // parent's catalog locator, or register itself.
         for _ in 0..2 {
-            sync_claude_session_metadata(&conn, &mut Map::new(), &projects).unwrap();
+            sync_claude_session_metadata(&conn, &mut Map::new(), &projects, &Default::default())
+                .unwrap();
             let placement: (i64, i64, i64, String) = conn
                 .query_row(
                     "SELECT \

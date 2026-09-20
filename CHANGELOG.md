@@ -15,8 +15,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   optional `fs-events` crate feature, which the CLI enables; a
   `--no-default-features` build polls.
 - Startup reports the driver **and any root not covered yet**. Roots that do
-  not exist are retried on every backstop tick, so a provider installed after
-  `watch` started becomes covered without a restart. `watch --remote` installs
+  not exist are retried on every backstop tick, and every registration is
+  re-made on that tick, so a provider installed after `watch` started becomes
+  covered without a restart and a watched directory that was deleted and
+  recreated is watched again rather than silently reported as covered. `watch --remote` installs
   no local roots, so local writes cannot drive remote connector traffic.
 - `sync` now short-circuits on a stat-only source fingerprint folded over
   everything the sweep reads — the enumerated transcripts, the Claude subagent
@@ -32,7 +34,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   re-ingested, rather than being skipped forever behind sources that will
   never change again. The marker holds one entry per session, so growth
   elsewhere cannot answer for a loss; rows arriving between sweeps (the hook
-  fast path, hydration) are growth, not loss, and still skip.
+  fast path, hydration) are growth, not loss, and still skip. It covers only
+  what a sweep can put back — Claude transcripts and Codex rollouts, both of
+  which are re-read when their session is short — and a loss the sweep could
+  not restore leaves the marker and the fingerprint stale rather than
+  recording the shortfall as the new truth.
 - New `ai-hist ingest --hook claude [--quiet] [--json]` reads a Claude Code
   lifecycle-hook payload from stdin and hydrates exactly the transcript it
   names. It always exits 0, and `--quiet` outranks `--json` so a hook wired
