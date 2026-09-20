@@ -118,7 +118,9 @@ so rows the rewritten file no longer contains are left untouched in
 `session_events`, `tool_calls`, `file_edits` and `history`. Records without
 provider identity derive a content-hash fallback instead of a line index, so
 a compaction that drops the prefix or inserts summary rows cannot shift
-survivors onto earlier rows' identities. Claude Code
+survivors onto earlier rows' identities. Pre-upgrade positional leftovers
+heal onto a re-attributed record only on a unique stored-content match,
+otherwise they stay preserved. Claude Code
 rewrites a transcript in place on resume/compact, and the compacted file is
 routinely missing assistant turns the pre-compaction file contained; those
 turns stay queryable. The only local deletion path is a targeted heal that
