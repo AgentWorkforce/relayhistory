@@ -856,26 +856,65 @@ fn unobserved_known_paths(
         .collect()
 }
 
-/// Forget the stamps of files this run could not see, and report that the walk
-/// did not cover them.
+/// Sync-state key carrying the nested stamp entries this run deliberately
+/// dropped.
 ///
-/// Two things have to happen, and each is insufficient alone. The generation
+/// It is an instruction for the checkpoint write rather than state:
+/// [`merged_sync_state`] applies it and then removes it, so it never reaches
+/// disk and no later run inherits it.
+///
+/// It has to exist because removing a key from the in-memory map does not
+/// remove it from the file. The merge folds this run's keys into what is
+/// already on disk, and `merge_object_values` starts from the on-disk object,
+/// so an entry this run dropped is simply absent from the overlay and survives
+/// untouched. Without this the stamp comes back on every write, the pass stays
+/// withheld for the life of the install, and every later sync re-runs the
+/// raw-fact probes over the whole archive.
+const FORGOTTEN_PATHS_KEY: &str = "forgotten_paths";
+
+/// Forget the stamps of files this run could not see, and report whether the
+/// walk covered everything the state knows about.
+///
+/// Three things have to happen, and each is insufficient alone. The generation
 /// is withheld, because a run that did not see a file has not backfilled it.
-/// And the file's stamp is dropped, because a stamp is a claim that the file
-/// is unchanged since we last read it, and a file that vanished and came back
-/// is not something this process watched -- skipping it on that stale stamp is
-/// exactly how its rows would keep null facts after the archive returns.
+/// The file's stamp is dropped, because a stamp is a claim that the file is
+/// unchanged since we last read it, and a file that vanished and came back is
+/// not something this process watched -- skipping it on that stale stamp is
+/// exactly how its rows would keep null facts after the archive returns. And
+/// the drop is recorded for the checkpoint merge, or it lives only in this
+/// run's copy of the map and the file on disk keeps the entry.
 ///
 /// Dropping the stamp is also what keeps a genuinely deleted file cheap. It
 /// holds the pass open for one more sync, then it is no longer a path the
 /// state knows about and the generation is recorded normally, instead of the
 /// pass staying pending for the life of the install.
-fn forget_unobserved_paths(known: &mut Map<String, Value>, missing: Vec<String>) -> bool {
+fn forget_unobserved_paths(
+    state: &mut Map<String, Value>,
+    stamps: &mut Map<String, Value>,
+    stamp_map_key: &str,
+    missing: Vec<String>,
+) -> bool {
     if missing.is_empty() {
         return true;
     }
+    let forgotten = state
+        .entry(FORGOTTEN_PATHS_KEY)
+        .or_insert_with(|| json!({}));
+    if let Some(per_map) = forgotten.as_object_mut() {
+        let list = per_map
+            .entry(stamp_map_key)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(list) = list.as_array_mut() {
+            for key in &missing {
+                let entry = json!(key);
+                if !list.contains(&entry) {
+                    list.push(entry);
+                }
+            }
+        }
+    }
     for key in missing {
-        known.remove(&key);
+        stamps.remove(&key);
     }
     false
 }
@@ -891,6 +930,10 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
     let mut merged = load_sync_state(path)?;
     let mut changed = false;
     for (key, value) in ours {
+        // Applied after the fold, and never persisted.
+        if key == FORGOTTEN_PATHS_KEY {
+            continue;
+        }
         let next = match merged.get(key) {
             Some(existing) if key == "cursor" => merge_file_cursor_map(existing, value),
             Some(existing) => merge_sync_value(existing, value),
@@ -911,6 +954,30 @@ fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Ma
         if merged.remove(*retired).is_some() {
             changed = true;
         }
+    }
+    // The same idea one level down: entries this run deliberately dropped from
+    // a stamp map. The fold above cannot express a removal -- it only overlays
+    // the keys this run carries -- so they are applied here instead. A run
+    // concurrent with this one may have just re-stamped one of these paths
+    // because it could see the file; dropping its stamp costs that file one
+    // re-read and never loses a row, which is the safe direction.
+    if let Some(forgotten) = ours.get(FORGOTTEN_PATHS_KEY).and_then(Value::as_object) {
+        for (stamp_map_key, paths) in forgotten {
+            let Some(stamps) = merged.get_mut(stamp_map_key).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for path in paths.as_array().into_iter().flatten() {
+                let Some(path) = path.as_str() else { continue };
+                if stamps.remove(path).is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    // An instruction, not state: it must not survive into the file, and an
+    // older build that wrote one is cleaned up here.
+    if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
+        changed = true;
     }
     Ok(if changed { Some(merged) } else { None })
 }
@@ -1713,7 +1780,7 @@ fn sync_codex_rollouts(
         // question is asked per path, not per root.
         if known_here {
             let missing = unobserved_known_paths(&seen, &root, &rollouts);
-            if !forget_unobserved_paths(&mut seen, missing) {
+            if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v5", missing) {
                 walked_every_known_root = false;
             }
         }
@@ -2832,7 +2899,8 @@ fn sync_claude_session_metadata(
     // loses the stamp this run can no longer vouch for.
     let transcripts = collect_matching_files(root, "", "jsonl")?;
     let missing = unobserved_known_paths(&session_state, root, &transcripts);
-    let walked_every_known_root = forget_unobserved_paths(&mut session_state, missing);
+    let walked_every_known_root =
+        forget_unobserved_paths(state, &mut session_state, "claude_sessions_v3", missing);
     let mut scanned = 0;
     let mut upserted = 0;
     for path in transcripts {
@@ -7424,10 +7492,20 @@ mod tests {
     /// of the install. Its stamp is dropped when the walk cannot see it, so it
     /// costs exactly one more sync and then stops being a path the state knows
     /// about.
+    ///
+    /// Every sync here goes through the real `.sync-state.json` write and is
+    /// reloaded from that file, because the in-memory map is not where this
+    /// claim can be tested. `merged_sync_state` folds a run's keys into what is
+    /// already on disk, and `merge_object_values` starts from the on-disk
+    /// object -- so a nested entry this run *removed* is simply absent from the
+    /// overlay and survives. An earlier version of this test held one `Map`
+    /// across all three syncs and passed while the stamp was being resurrected
+    /// on every write.
     #[test]
     fn a_deleted_rollout_holds_the_backfill_pass_open_for_one_sync_only() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
+        let state_path = home.join(".sync-state.json");
         let day = home.join(".codex/sessions/2026/04/20");
         fs::create_dir_all(&day).unwrap();
         let kept = day.join("rollout-2026-04-20T05-00-00-sess_kept.jsonl");
@@ -7448,26 +7526,121 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let mut state = Map::new();
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
 
+        // One sync, persisted and reloaded the way a real run does it.
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            super::sync_codex_rollouts(conn, &mut state, home).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
+            state
+                .get("codex_rollouts_v5")
+                .and_then(Value::as_object)
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        let state = sync(&conn);
+        assert_eq!(stamped_paths(&state).len(), 2);
+
+        // Clear the generation on disk, the way an upgraded install has it.
+        let mut state = state;
         blank_raw_message_facts_state(&mut state);
+        super::save_sync_state(&state_path, &state).unwrap();
+
         fs::remove_file(&gone).unwrap();
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let state = sync(&conn);
         assert!(
             state.get(super::CODEX_RAW_MESSAGE_FACTS_KEY).is_none(),
             "the first run after the file vanished cannot know it is gone"
         );
+        assert_eq!(
+            stamped_paths(&state),
+            vec![kept.to_string_lossy().to_string()],
+            "the vanished rollout's stamp must not survive the checkpoint merge"
+        );
+        assert!(
+            !state.contains_key(super::FORGOTTEN_PATHS_KEY),
+            "the removal instruction is not state and must not reach the file"
+        );
 
         // Nothing changed on disk, but the deleted rollout is no longer a path
         // the state knows about, so the pass finishes.
-        super::sync_codex_rollouts(&conn, &mut state, home).unwrap();
+        let state = sync(&conn);
         assert_eq!(
             state
                 .get(super::CODEX_RAW_MESSAGE_FACTS_KEY)
                 .and_then(Value::as_i64),
             Some(super::RAW_MESSAGE_FACTS_GENERATION),
             "a deleted file must not hold the pass open for the life of the install"
+        );
+    }
+
+    /// The same bound for Claude, through the same persisted path.
+    #[test]
+    fn a_deleted_transcript_holds_the_backfill_pass_open_for_one_sync_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let kept = root.join("sess-kept.jsonl");
+        let gone = root.join("sess-gone.jsonl");
+        for (path, id) in [(&kept, "sess-kept"), (&gone, "sess-gone")] {
+            fs::write(
+                path,
+                format!(
+                    r#"{{"type":"user","uuid":"u1","sessionId":"{0}","cwd":"/tmp/project","isSidechain":false,"version":"2.1.96","timestamp":"2026-04-20T00:00:00.000Z","message":{{"role":"user","content":"run it"}}}}"#,
+                    id
+                ) + "\n",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let sync = |conn: &Connection| {
+            let mut state = super::load_sync_state(&state_path).unwrap();
+            sync_claude_session_metadata(conn, &mut state, &root).unwrap();
+            super::checkpoint_sync_state(&state_path, &state);
+            super::load_sync_state(&state_path).unwrap()
+        };
+        let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
+            state
+                .get("claude_sessions_v3")
+                .and_then(Value::as_object)
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        let state = sync(&conn);
+        assert_eq!(stamped_paths(&state).len(), 2);
+
+        let mut state = state;
+        blank_raw_message_facts_state(&mut state);
+        super::save_sync_state(&state_path, &state).unwrap();
+
+        fs::remove_file(&gone).unwrap();
+        let state = sync(&conn);
+        assert!(
+            state.get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY).is_none(),
+            "the first run after the transcript vanished cannot know it is gone"
+        );
+        assert_eq!(
+            stamped_paths(&state),
+            vec![kept.to_string_lossy().to_string()],
+            "the vanished transcript's stamp must not survive the checkpoint merge"
+        );
+
+        let state = sync(&conn);
+        assert_eq!(
+            state
+                .get(super::CLAUDE_RAW_MESSAGE_FACTS_KEY)
+                .and_then(Value::as_i64),
+            Some(super::RAW_MESSAGE_FACTS_GENERATION),
+            "a deleted transcript must not hold the pass open for the life of the install"
         );
     }
 

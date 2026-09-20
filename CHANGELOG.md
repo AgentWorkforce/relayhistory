@@ -71,7 +71,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
   path this run did not see also loses its stamp, so a file that comes back is
   read afresh instead of skipped on a stamp nothing watched — which is also
   what keeps a genuinely deleted file cheap, costing one further sync rather
-  than leaving the pass pending forever.
+  than leaving the pass pending forever. The checkpoint merge honours that
+  removal: it folds a run's keys over the state already on disk and cannot
+  express a delete, so the dropped paths are carried as an instruction that the
+  merge applies and then discards, rather than living only in the run's own
+  copy of the map.
 
 - Add truthful OpenCode SQL work counters to discovery summaries. The catalog
   contract is now 3 and the native-addon contract is now 7; `bytes_read` no

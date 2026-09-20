@@ -372,7 +372,11 @@ state names and not others. A path this run did not see withholds the
 generation **and** loses its stamp, so if it comes back it is read afresh rather
 than skipped on a stamp nothing watched. Dropping the stamp is also what bounds
 the deleted-file case: it costs one further sync, after which the path is no
-longer one the state knows about. A root the state never knew about — an install
+longer one the state knows about. Removing the entry from the in-memory map is
+not enough to achieve that — the checkpoint merge folds a run's keys over
+what is on disk and has no way to express a delete, so a dropped path would
+come back on every write. The run carries the removals as an instruction the
+merge applies and then discards. A root the state never knew about — an install
 with no `.codex/archived_sessions` — is not a missing archive and does not hold
 the pass open. Claude reaches a subagent
 sidecar's rows through `session_relationships.evidence_locator`, because a
