@@ -4,6 +4,25 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Agent Relay Probe
+
+- Add the desktop bridge (contract v1) that Relay Desktop drives:
+  `installs`, `start`, `pause`, `resume`, `disconnect`, `sessions list`,
+  `sessions include`, `sessions exclude`, `sharing set`, plus `--json` on
+  `status` and NDJSON events (`approval`, `connected`, `ready`) on
+  `cloud install`. Every object carries `"bridge_version": 1`; failures keep the
+  existing one-safe-sentence rule. Existing commands, flags and human output are
+  unchanged.
+- Add a third sharing mode. `config.json` now stores `sharing_mode`
+  (`all`/`new`/`selected`, derived from `include_existing` when absent and kept
+  in step with it), `selected` withholds every newly discovered session that is
+  not listed in the new `selected.json`, and `sharing set`/`sessions include`
+  replace the delivery generation under the collector lock when a withdrawal or
+  a changed selection requires one.
+- Treat a paused delivery job as a healthy cycle: the collector keeps capturing
+  locally, skips delivery and the onboarding heartbeat, and logs no error. Each
+  cycle records its outcome in `cycle.json` for `status --json`.
+
 ### Rust API
 
 - Publish `ai-hist` as one crate (the former `ai-hist-core` and

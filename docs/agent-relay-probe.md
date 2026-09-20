@@ -43,8 +43,8 @@ Without a workspace argument, the probe uses Cloud's current workspace.
 
 Setup prints the existing Cloud device-approval URL, waits for browser approval,
 then asks whether to share existing and future sessions or only new sessions.
-`--include-existing` and `--new-sessions-only` make that choice explicit in a
-noninteractive terminal. `--force-login` bypasses eligible existing CLI sign-in.
+`--include-existing`, `--new-sessions-only` and `--selected-sessions-only` make
+that choice explicit in a noninteractive terminal. `--force-login` bypasses eligible existing CLI sign-in.
 The shared implementation reuses an unexpired official CLI credential only for
 the exact selected Cloud URL, and never writes or refreshes that CLI's auth
 file; `CLOUD_API_ACCESS_TOKEN` overrides both. Setup always prints the approval
@@ -62,7 +62,9 @@ behind; a later setup that chooses to share existing sessions withdraws it, so
 the choice that takes effect is always the one just made. Sessions
 discovered later are treated as new; this is a local capture baseline, not a
 guarantee about the actual creation time of files added later. The saved sharing
-choice is immutable on reconnect.
+choice is immutable on reconnect: changing it is a separate, explicit
+`sharing set` that replaces the delivery generation (see
+[Desktop bridge](#desktop-bridge)).
 
 Default setup starts a detached process. `--foreground` keeps it in the terminal;
 `--once` captures and delivers one bounded cycle. To inspect or stop it:
@@ -73,8 +75,130 @@ Default setup starts a detached process. `--foreground` keeps it in the terminal
 ```
 
 The executable must already be at that location to use these example paths.
-There is no launchd/systemd installation or automatic restart after reboot yet.
-Run setup again after restarting the machine. It preserves the existing queue.
+The probe installs no launchd/systemd unit of its own and does not restart
+itself after a reboot. Relay Desktop supervises it instead: the app starts at
+login and runs `agent-relay-probe start` whenever `status --json` reports that
+the collector is not running (see [Desktop bridge](#desktop-bridge)). Without
+that app, run setup again after restarting the machine. Either way the existing
+queue is preserved.
+
+## Desktop bridge
+
+Relay Desktop (the native menu-bar app) drives the probe through machine-readable
+commands rather than by scraping its terminal output. Every one of them prints a
+single JSON object on stdout — `cloud install --json` prints NDJSON, one object
+per line — and every object carries `"bridge_version": 1`. Failures keep the
+existing rule: exit code 1 and one safe sentence on stderr, never a response
+body, credential, URL from a response or session content. Human output is
+unchanged when `--json` is absent, and every existing command and flag still
+behaves as before.
+
+`<target>` below is the existing `--site-url URL --account ID --workspace ID`
+selection of one install.
+
+| Command | Purpose |
+| --- | --- |
+| `installs --json` | every connected workspace on this computer |
+| `cloud install --json [--include-existing\|--new-sessions-only\|--selected-sessions-only]` | connect, as NDJSON events |
+| `start <target> [--json]` | start the background collector, without signing in again |
+| `status <target> --json` | running/paused state, delivery progress, session counts |
+| `pause` / `resume <target> [--json]` | stop and resume uploading without disconnecting |
+| `sessions list <target> --json [--limit N]` | the captured sessions and whether they are shared |
+| `sessions include` / `sessions exclude <target> --json --session SOURCE:ID …` | change which sessions are shared |
+| `sharing set <target> --mode all\|new\|selected --json` | change what the install uploads |
+| `disconnect <target> [--json]` | disconnect this workspace, keeping local history |
+
+```jsonc
+// installs --json
+{"bridge_version":1,"installs":[{"directory":"/Users/x/.agentworkforce/probe/ab12…","site_url":"https://agentrelay.com","account_id":"usr_…","workspace_id":"ws_…","org_id":"org_…","sharing_mode":"new","running":true,"paused":false}]}
+
+// cloud install --json --selected-sessions-only …   (NDJSON)
+{"bridge_version":1,"event":"approval","verification_uri":"https://agentrelay.com/…","user_code":"ABCD-EFGH"}
+{"bridge_version":1,"event":"connected","account_id":"usr_…","workspace_id":"ws_…","org_id":"org_…","directory":"/Users/x/.agentworkforce/probe/ab12…"}
+{"bridge_version":1,"event":"ready","running":true}
+
+// start <target> --json
+{"bridge_version":1,"running":true,"started":false}
+
+// status <target> --json
+{"bridge_version":1,"probe_version":"0.18.8","running":true,"paused":false,
+ "sharing_mode":"new","site_url":"https://agentrelay.com","account_id":"usr_…",
+ "workspace_id":"ws_…","org_id":"org_…","directory":"…",
+ "delivery":{"state":"active","bootstrap_complete":true,"pending_records":12,
+   "pending_bytes":40960,"acknowledged_records":3401,"unqueued_changes":0,
+   "suppressed_records":0,"last_attempt_ms":1758300000000,
+   "last_acknowledged_ms":1758300000000,"next_attempt_ms":0,"failure":null},
+ "sessions":{"total":210,"shared":57,"excluded":153},
+ "last_cycle":{"at_ms":1758300000000,"ok":true,"message":null}}
+
+// pause / resume <target> --json
+{"bridge_version":1,"paused":true}
+
+// sessions list <target> --json
+{"bridge_version":1,"sharing_mode":"new","sessions":[
+ {"source":"claude","session_id":"29284179-…","title":"Fix auth rewrite…",
+  "cwd":"/Users/x/code/app","git_branch":"main","first_activity_ms":1758200000000,
+  "last_activity_ms":1758300000000,"included":false,"status":"not_shared"}]}
+
+// sessions include / exclude <target> --json --session claude:29284179-…
+{"bridge_version":1,"included":["claude:29284179-…"],"regenerated":true}
+{"bridge_version":1,"excluded":["claude:29284179-…"],"regenerated":false}
+
+// sharing set <target> --mode selected --json
+{"bridge_version":1,"sharing_mode":"selected","regenerated":true}
+
+// disconnect <target> --json
+{"bridge_version":1,"disconnected":true}
+```
+
+`user_code` is `null` when the approval URL already carries it. `--json` never
+reads stdin, so a first-time `cloud install --json` must pass one of the three
+sharing flags, and it always starts the detached collector even if `--foreground`
+was also given. `start` is idempotent: `started` is true only when that call
+launched a process. `last_cycle` is what the collector recorded in `cycle.json`
+after its last cycle, with `message` holding the same safe sentence the terminal
+would have shown. A session's `status` is `not_shared` when it is excluded,
+`queued` while the generation still has records in flight, and otherwise
+`shared`; per-session acknowledgement is not cheaply derivable from the delivery
+journal, so no row claims `uploaded`. `title` is the first prompt (whitespace
+collapsed, 120 characters), then the last assistant message, then the session id.
+
+### Sharing modes
+
+`sharing_mode` is stored in `config.json` beside the original `include_existing`
+boolean, which stays authoritative for the delivery selection and is kept in
+step (true only for `all`); a configuration written before the bridge has no
+mode and derives one from that boolean.
+
+- `all` — existing and future sessions. This is the only mode whose delivery
+  selection includes the prompt-only rows, some of which carry no session
+  identity.
+- `new` — everything known at the moment of the choice is excluded; sessions
+  discovered later are delivered.
+- `selected` — as `new`, and each cycle the collector also excludes every newly
+  discovered session unless it is listed in `selected.json`.
+
+`selected.json` is the durable list of sessions the user picked by hand. It
+survives mode changes, so a later baseline never withdraws a deliberate choice.
+`sessions exclude` adds exclusions, which delivery rechecks when a batch is
+prepared, claimed and dispatched, so it needs no new generation.
+
+`sessions include` and `sharing set` may need one: withdrawing an exclusion that
+a live job selects is refused, and only `all` changes the job's own selection.
+When that happens, the command — not the collector — owns the replacement: it
+stops a running collector, takes the collector lock, cancels every live
+generation for this destination, converges the exclusion table, creates the new
+generation, writes `config.json` and `selected.json`, releases the lock and
+starts the collector again. The command returns only once that is durable, and
+its JSON reports `regenerated`. A change that only adds exclusions skips all of
+that and reports `regenerated: false`. A replacement generation rescans local
+history; the service is idempotent per record revision, so re-sending already
+acknowledged rows is work rather than duplication.
+
+`disconnect` stops the collector, cancels the generation, best-effort revokes the
+stored RelayHistory session against `/v1/auth/token/revoke`, deletes the stored
+credentials and `config.json`, and keeps `history.db`: the local capture is the
+user's own data. Afterwards `installs` no longer lists the directory.
 
 ## State and delivery
 
@@ -169,6 +293,10 @@ cargo test -p ai-hist --features delivery identity_pages --locked
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,
 origin binding, official-CLI credential reuse, sharing choices, complete exclusion
 pagination, private atomic state, collector locking and stale stop requests. The
+desktop bridge adds parsing tests for every new command, the JSON shapes above,
+a paused generation reported as a healthy capture-only cycle, `selected` mode
+withholding sessions discovered after its baseline, and `sessions include`
+replacing the generation while keeping `selected.json`. The
 sign-in tests live with the shared implementation, in the library's `cloud` module.
 
 For a composed local test, start the companion marketing proxy on 3100, Cloud

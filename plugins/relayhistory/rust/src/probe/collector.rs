@@ -1,8 +1,9 @@
-use super::{lock, read_config, save_json, user_error, Config};
-use ai_hist::delivery::{self, worker, ExportSelection};
+use super::{lock, read_config, safe_message, save_json, user_error, Config, SharingMode};
+use ai_hist::delivery::{self, worker, ExportSelection, SessionIdentity};
 use anyhow::{ensure, Context, Result};
 use relayhistory_plugin::{cloud, destination};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs,
@@ -15,8 +16,8 @@ use std::{
 
 /// The destination and generation this probe delivers as. Both are part of the
 /// saved job configuration, so they cannot change for an existing install.
-const DESTINATION: &str = "relayhistory";
-const INSTANCE: &str = "teams-probe";
+pub const DESTINATION: &str = "relayhistory";
+pub const INSTANCE: &str = "teams-probe";
 static STOP: AtomicBool = AtomicBool::new(false);
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -41,6 +42,34 @@ pub fn selection(include_existing: bool) -> ExportSelection {
         excluded_sessions: vec![],
     }
 }
+/// The generation this install delivers as. Setup and every later regeneration
+/// build it here, so the only field that a sharing change can move is the
+/// selection — everything else stays byte-identical and adoptable.
+pub fn delivery_config(account: &str, mode: SharingMode) -> delivery::DeliveryJobConfig {
+    delivery::DeliveryJobConfig {
+        destination_id: DESTINATION.into(),
+        instance_id: INSTANCE.into(),
+        account_id: account.into(),
+        mapping_version: destination::MAPPING_VERSION.into(),
+        selection: selection(mode.include_existing()),
+        limits: Default::default(),
+    }
+}
+/// Cancel every live generation for this destination, not only the one named in
+/// `config.json`: a crash between `create_job` and saving that file leaves one
+/// behind, and a second live generation would deliver its own baseline.
+pub fn cancel_jobs(conn: &Connection, account: &str) -> Result<()> {
+    for job in delivery::list_jobs(conn)? {
+        if job.state != "cancelled"
+            && job.config.destination_id == DESTINATION
+            && job.config.instance_id == INSTANCE
+            && job.config.account_id == account
+        {
+            delivery::cancel_job(conn, &job.job_id)?;
+        }
+    }
+    Ok(())
+}
 /// Converge the durable exclusion baseline on the requested sharing choice and
 /// report how many sessions it now withholds. Delivery rechecks exclusions when
 /// a batch is prepared, claimed and dispatched, so a new-only baseline has to be
@@ -54,11 +83,25 @@ pub fn selection(include_existing: bool) -> ExportSelection {
 /// in to send. Withdrawal is refused while a live job still selects a session,
 /// which this path cannot reach: it runs only when no generation was adopted.
 pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usize> {
+    let mode = if include_existing {
+        SharingMode::All
+    } else {
+        SharingMode::New
+    };
+    record_baseline_for(conn, mode, &[])
+}
+/// The same convergence for the three sharing modes. `selected` is the durable
+/// list of sessions the user asked for by hand: it survives a mode change, so a
+/// later baseline never re-excludes what was explicitly included.
+pub fn record_baseline_for(
+    conn: &Connection,
+    mode: SharingMode,
+    selected: &[SessionIdentity],
+) -> Result<usize> {
     let snapshot = conn.unchecked_transaction()?;
     let mut identities = Vec::new();
     loop {
-        let page =
-            ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
+        let page = ai_hist::storage::session_identities_after(&snapshot, identities.last(), 1000)?;
         if page.is_empty() {
             break;
         }
@@ -67,14 +110,72 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
     // Exclusions take their own short write transactions, so the consistent
     // read has to end before any of them is recorded or withdrawn.
     snapshot.commit()?;
+    let mut excluded = 0;
     for identity in &identities {
-        delivery::set_session_excluded(conn, identity, !include_existing)?;
+        let withhold = !mode.include_existing() && !selected.contains(identity);
+        delivery::set_session_excluded(conn, identity, withhold)?;
+        excluded += usize::from(withhold);
     }
-    Ok(if include_existing {
-        0
-    } else {
-        identities.len()
-    })
+    Ok(excluded)
+}
+/// `selected` mode only: withhold sessions discovered after the baseline. Adding
+/// an exclusion is always allowed and is rechecked when a batch is prepared,
+/// claimed and dispatched, so this runs inside the normal cycle rather than
+/// requiring a new generation. Already excluded sessions are left alone: every
+/// write fences live claims.
+pub fn exclude_unselected(conn: &Connection, selected: &[SessionIdentity]) -> Result<usize> {
+    let mut cursor: Option<SessionIdentity> = None;
+    let mut added = 0;
+    loop {
+        let page = ai_hist::storage::session_identities_after(conn, cursor.as_ref(), 1000)?;
+        let Some(last) = page.last().cloned() else {
+            break;
+        };
+        cursor = Some(last);
+        for identity in page {
+            if selected.contains(&identity) || is_excluded(conn, &identity)? {
+                continue;
+            }
+            delivery::set_session_excluded(conn, &identity, true)?;
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+/// Exclusions have no typed reader in the core, and this binary ships with it.
+/// Read-only, parameter-bound, and never written outside `set_session_excluded`.
+pub fn is_excluded(conn: &Connection, identity: &SessionIdentity) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=?1 AND session_id=?2)",
+        [identity.source.as_str(), identity.session_id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+/// Sessions the user asked to share by hand. Kept beside `config.json` because a
+/// delivery configuration is capped at 64 KiB and must stay reproducible.
+#[derive(Default, Serialize, Deserialize)]
+struct Selected {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    sessions: Vec<SessionIdentity>,
+}
+pub fn load_selected(directory: &Path) -> Result<Vec<SessionIdentity>> {
+    let path = directory.join("selected.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file: Selected = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(file.sessions)
+}
+pub fn save_selected(directory: &Path, sessions: &[SessionIdentity]) -> Result<()> {
+    save_json(
+        &directory.join("selected.json"),
+        &Selected {
+            version: 1,
+            sessions: sessions.to_vec(),
+        },
+    )
 }
 /// One bounded delivery pass through the shared core delivery worker — the
 /// same loop the SDK drains with — carrying the RelayHistory receiver. The
@@ -123,27 +224,55 @@ fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> 
     }
     Ok(status)
 }
-pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
+/// Everything a cycle owes the local database before it delivers: the saved
+/// generation still has to match this destination, and a `selected` install
+/// withholds sessions discovered since its baseline. Reports whether delivery
+/// is paused, which is a healthy state rather than a failure.
+pub fn prepare_cycle(conn: &Connection, directory: &Path, config: &Config) -> Result<bool> {
+    let job = delivery::status(conn, &config.job_id)?;
+    ensure!(
+        job.config.account_id == config.delivery_account
+            && job.config.mapping_version == destination::MAPPING_VERSION,
+        "delivery config mismatch"
+    );
+    if config.sharing_mode() == SharingMode::Selected {
+        exclude_unselected(conn, &load_selected(directory)?)?;
+    }
+    Ok(job.state == "paused")
+}
+/// One cycle, recording its outcome in `cycle.json` for the desktop bridge.
+/// The record is best effort: a state directory that cannot be written must not
+/// turn a successful cycle into a failure, or a failed one into a crash.
+pub fn cycle_recorded(directory: &Path, config: &Config, announce: bool) -> Result<()> {
+    let result = cycle(directory, config, announce);
+    let _ = save_json(
+        &directory.join("cycle.json"),
+        &json!({
+            "at_ms": now(),
+            "ok": result.is_ok(),
+            "message": result.as_ref().err().map(safe_message),
+        }),
+    );
+    result
+}
+pub fn cycle(directory: &Path, config: &Config, announce: bool) -> Result<()> {
     ensure!(
         destination::selected_account(Some(&config.history_url))? == config.delivery_account,
         "wrong destination"
     );
     let db_path = directory.join("history.db");
-    ensure!(
-        ai_hist::sync_local_at(&db_path)?,
-        "capture not complete"
-    );
+    ensure!(ai_hist::sync_local_at(&db_path)?, "capture not complete");
     // The receiver rejects a batch whose account or mapping does not match, but
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
-    {
+    let paused = {
         let conn = ai_hist::open_db(&db_path)?;
-        let job = delivery::status(&conn, &config.job_id)?;
-        ensure!(
-            job.config.account_id == config.delivery_account
-                && job.config.mapping_version == destination::MAPPING_VERSION,
-            "delivery config mismatch"
-        );
+        prepare_cycle(&conn, directory, config)?
+    };
+    // A paused job is a healthy state the user chose, not a fault: keep
+    // capturing locally, deliver nothing, and claim nothing to Cloud.
+    if paused {
+        return Ok(());
     }
     // The receiver blocks the job when an older managed uploader appears, but
     // its verdict is a generic permission refusal. Name the cause here first so
@@ -160,13 +289,15 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .map_err(|_| user_error("Could not confirm the connection with Cloud."))?;
-    println!(
-        "Probe connected: {} records received, {} queued.",
-        status.acknowledged_records, status.pending_records
-    );
+    if announce {
+        println!(
+            "Probe connected: {} records received, {} queued.",
+            status.acknowledged_records, status.pending_records
+        );
+    }
     Ok(())
 }
-fn running(directory: &Path) -> Result<bool> {
+pub fn running(directory: &Path) -> Result<bool> {
     if !directory.join("collector.lock").exists() {
         return Ok(false);
     }
@@ -192,9 +323,21 @@ pub fn print_status(directory: &Path) -> Result<()> {
     Ok(())
 }
 pub fn stop(directory: &Path) -> Result<()> {
+    println!(
+        "{}",
+        if stop_quiet(directory)? {
+            "Probe stopped."
+        } else {
+            "Probe is stopped."
+        }
+    );
+    Ok(())
+}
+/// Stop a running collector and wait for its lock. Reports whether one was
+/// running, so a caller that stopped it to take the lock can put it back.
+pub fn stop_quiet(directory: &Path) -> Result<bool> {
     if !running(directory)? {
-        println!("Probe is stopped.");
-        return Ok(());
+        return Ok(false);
     }
     let runtime: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("runtime.json"))?)?;
@@ -207,8 +350,7 @@ pub fn stop(directory: &Path) -> Result<()> {
     )?;
     for _ in 0..45 {
         if !running(directory)? {
-            println!("Probe stopped.");
-            return Ok(());
+            return Ok(true);
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -251,7 +393,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":true}),
     )?;
     while !stop_requested(directory, startup_id) {
-        if cycle(directory, &config).is_err() {
+        if cycle_recorded(directory, &config, true).is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");
         }
         for _ in 0..20 {
@@ -267,7 +409,9 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     )?;
     Ok(())
 }
-pub fn start_background(directory: &Path) -> Result<()> {
+/// Launch the detached collector and wait for its readiness handshake.
+/// `announce` prints the terminal follow-up; a bridge caller owns its own output.
+pub fn start_background(directory: &Path, announce: bool) -> Result<()> {
     let executable = std::env::current_exe()?;
     let startup_id = format!("{}-{}", std::process::id(), now());
     let log_path = directory.join("collector.log");
@@ -317,13 +461,15 @@ pub fn start_background(directory: &Path) -> Result<()> {
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
             .is_some_and(|value| value["startup_id"] == startup_id && value["ready"] == true);
         if ready {
-            println!("Probe is running in the background. You can close this terminal.");
-            println!("Run setup again after restarting the computer.");
-            let config = read_config(directory)?;
-            println!(
-                "Stop: agent-relay-probe stop --site-url {} --workspace {} --account {}",
-                config.site_url, config.workspace_id, config.account_id
-            );
+            if announce {
+                println!("Probe is running in the background. You can close this terminal.");
+                println!("Run setup again after restarting the computer.");
+                let config = read_config(directory)?;
+                println!(
+                    "Stop: agent-relay-probe stop --site-url {} --workspace {} --account {}",
+                    config.site_url, config.workspace_id, config.account_id
+                );
+            }
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -380,8 +526,7 @@ mod tests {
             )
             .unwrap();
         }
-        let baseline =
-            ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
+        let baseline = ai_hist::storage::session_identities_after(&conn, None, 10_000).unwrap();
         // The same identities carried inline would exceed the 64 KiB cap that
         // create_job enforces on a delivery configuration.
         assert!(serde_json::to_vec(&baseline).unwrap().len() > 65_536);
@@ -441,6 +586,100 @@ mod tests {
             claim_sessions(&conn, &job.job_id),
             vec!["before".to_string()]
         );
+    }
+    fn config(job_id: &str, mode: SharingMode) -> Config {
+        let mut config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "usr_1".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: destination::account_id("org", Some("workspace")),
+            job_id: job_id.into(),
+            include_existing: false,
+            acknowledge_uninspected_schedules: false,
+            sharing_mode: None,
+        };
+        config.set_sharing_mode(mode);
+        config
+    }
+    #[test]
+    fn a_paused_generation_is_a_healthy_capture_only_cycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = ai_hist::open_db(&directory.path().join("history.db")).unwrap();
+        let job = delivery::create_job(&conn, &job_config(false), now()).unwrap();
+        let config = config(&job.job_id, SharingMode::New);
+        assert!(!prepare_cycle(&conn, directory.path(), &config).unwrap());
+        delivery::pause_job(&conn, &job.job_id).unwrap();
+        // No error, and the cycle is told to capture without delivering.
+        assert!(prepare_cycle(&conn, directory.path(), &config).unwrap());
+        delivery::resume_job(&conn, &job.job_id).unwrap();
+        assert!(!prepare_cycle(&conn, directory.path(), &config).unwrap());
+    }
+    #[test]
+    fn selected_mode_withholds_sessions_discovered_after_the_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = ai_hist::open_db(&directory.path().join("history.db")).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source, session_id) VALUES ('claude','chosen')",
+            [],
+        )
+        .unwrap();
+        let chosen = SessionIdentity {
+            source: "claude".into(),
+            session_id: "chosen".into(),
+        };
+        let selected = [chosen.clone()];
+        record_baseline_for(&conn, SharingMode::Selected, &selected).unwrap();
+        save_selected(directory.path(), &selected).unwrap();
+        let job = delivery::create_job(&conn, &job_config(false), now()).unwrap();
+        let config = config(&job.job_id, SharingMode::Selected);
+        conn.execute(
+            "INSERT INTO sessions(source, session_id) VALUES ('claude','later')",
+            [],
+        )
+        .unwrap();
+        let later = SessionIdentity {
+            source: "claude".into(),
+            session_id: "later".into(),
+        };
+        assert!(!is_excluded(&conn, &later).unwrap());
+        assert!(!prepare_cycle(&conn, directory.path(), &config).unwrap());
+        // The session discovered after setup is withheld; the chosen one is not.
+        assert!(is_excluded(&conn, &later).unwrap());
+        assert!(!is_excluded(&conn, &chosen).unwrap());
+        assert_eq!(
+            claim_sessions(&conn, &job.job_id),
+            vec!["chosen".to_string()]
+        );
+        // A `new` install leaves sessions discovered later alone.
+        conn.execute(
+            "INSERT INTO sessions(source, session_id) VALUES ('claude','newer')",
+            [],
+        )
+        .unwrap();
+        let new_config = self::config(&job.job_id, SharingMode::New);
+        assert!(!prepare_cycle(&conn, directory.path(), &new_config).unwrap());
+        let newer = SessionIdentity {
+            source: "claude".into(),
+            session_id: "newer".into(),
+        };
+        assert!(!is_excluded(&conn, &newer).unwrap());
+    }
+    #[test]
+    fn a_cycle_records_its_outcome_for_the_desktop_bridge() {
+        let directory = tempfile::tempdir().unwrap();
+        // No configuration and no database: the cycle fails, and the failure is
+        // one safe sentence rather than a provider error.
+        let config = config("missing", SharingMode::New);
+        assert!(cycle_recorded(directory.path(), &config, false).is_err());
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("cycle.json")).unwrap())
+                .unwrap();
+        assert_eq!(recorded["ok"], false);
+        assert!(recorded["at_ms"].as_i64().unwrap() > 0);
+        assert!(recorded["message"].as_str().unwrap().len() > 10);
     }
     #[test]
     fn os_lock_releases_after_owner_exit_without_pid_reuse() {
