@@ -1816,8 +1816,8 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
     if outcome.missing_updates {
         diagnostics.push(diagnostic(
             "GROK_UPDATES_STREAM_MISSING",
-            "grok chat_history.jsonl carries no timestamps and this session has no readable \
-             updates.jsonl; event times fall back to summary.json"
+            "grok chat_history.jsonl carries no timestamps and this session has no \
+             updates.jsonl at all; event times fall back to summary.json"
                 .to_string(),
         ));
     }
@@ -1863,6 +1863,14 @@ fn grok_diagnostics(outcome: &GrokIngestOutcome) -> Vec<HydrationDiagnostic> {
                  stored as unlinked evidence and the child is not independently addressable",
                 outcome.unlinked_subagents
             ),
+        ));
+    }
+    if outcome.updates_yielded_no_timing {
+        diagnostics.push(diagnostic(
+            "GROK_UPDATES_STREAM_UNUSABLE",
+            "grok wrote an updates.jsonl for this session but none of it established a turn, \
+             a message or a tool call; event times fall back to the transcript and the summary"
+                .to_string(),
         ));
     }
     if outcome.unread_update_rows > 0 {

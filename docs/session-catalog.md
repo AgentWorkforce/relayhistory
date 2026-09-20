@@ -516,6 +516,15 @@ How each adapter works:
   would have re-read — a new checkpoint written after the last update row is
   new evidence, and is read as such.
 
+  A file the read consumes and **cannot read** is an error, never an absent
+  one: an unreadable `updates.jsonl` taken as "no stream" would replace exact
+  event times with fallbacks and drop the token snapshots, and an unreadable
+  sidecar directory taken as "no entries" would delete the checkpoints already
+  stored — both while the metadata stamp, still perfectly readable,
+  checkpointed that loss as the session's settled state. Only `NotFound` is
+  absence. Plain `sync` isolates such a session, names it, counts it, and
+  fails the source outright when nothing in the store could be read.
+
   A hydration that parses nothing still reports what Grok does not record: the
   provider diagnostics are stored with the hydration checkpoint and replayed on
   an `unchanged` result. An `unchanged` reader is looking at exactly the rows a

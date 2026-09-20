@@ -3990,10 +3990,18 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     for chat in collect_matching_files(root, "chat_history", "jsonl")? {
         let key = chat.to_string_lossy().to_string();
         // One unreadable session directory does not stop the rest, and it does
-        // not update its saved stamp either: the next run tries again.
-        let Ok(stamp) = grok_session_stamp(&chat) else {
-            errors += 1;
-            continue;
+        // not update its saved stamp either: the next run tries again. It is
+        // counted as looked at, so the run says so — a stamp that fails
+        // closed and is then reported as nothing at all is the silence the
+        // strictness exists to prevent.
+        let stamp = match grok_session_stamp(&chat) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                scanned += 1;
+                errors += 1;
+                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+                continue;
+            }
         };
         if grok_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
             continue;
@@ -4014,7 +4022,10 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             Ok(None) => {
                 grok_state.insert(key, json!(stamp));
             }
-            Err(_) => errors += 1,
+            Err(error) => {
+                errors += 1;
+                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+            }
         }
     }
     state.insert(GROK_SYNC_STATE_KEY.to_string(), Value::Object(grok_state));
@@ -4025,6 +4036,17 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
             String::new()
         };
         sync_note!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
+    }
+    // A store where nothing could be read is a failed source, not an empty
+    // one: the caller records it and the run says so. A store where something
+    // failed and something else worked stays a success, so the sessions that
+    // did read keep their saved stamps -- otherwise one unreadable directory
+    // would send every future run back over the whole store.
+    if errors > 0 && sessions == 0 {
+        anyhow::bail!(
+            "{errors} Grok session(s) could not be read and none were indexed; \
+             the unreadable directories are named above"
+        );
     }
     Ok(inserted)
 }
@@ -4056,8 +4078,14 @@ pub(crate) struct GrokIngestOutcome {
     pub session_start_fallbacks: usize,
     pub encrypted_reasoning: usize,
     pub unread_update_rows: usize,
-    /// The session directory had no readable `updates.jsonl`.
+    /// The session directory had no `updates.jsonl` at all.
     pub missing_updates: bool,
+    /// The stream was there and established no timing at all — no turn, no
+    /// message group, no tool. Distinct from `missing_updates`, because the
+    /// two want different answers: a session Grok wrote no updates for is
+    /// normal, and a stream this parser could not use is a gap in coverage
+    /// worth knowing about.
+    pub updates_yielded_no_timing: bool,
     /// The newest `turn_completed` context snapshot, for the caller's report.
     pub context_total_tokens: Option<i64>,
 }
@@ -4075,7 +4103,8 @@ fn ingest_grok_session(
     let branch = session.git_branch.as_deref();
     replace_grok_session_evidence(conn, sid)?;
     let mut outcome = GrokIngestOutcome {
-        missing_updates: session.updates.is_empty(),
+        missing_updates: !session.updates_present,
+        updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
         unread_update_rows: session.updates.unread_rows,
         context_total_tokens: session
             .updates
@@ -4939,6 +4968,12 @@ struct GrokSession {
     /// the record enum stays about content.
     synthetic_reasons: HashMap<usize, String>,
     updates: grok::GrokUpdates,
+    /// Whether `updates.jsonl` was there at all. Distinct from
+    /// `updates.is_empty()`, which says only that nothing in the file parsed
+    /// as a timing structure this parser understands: a stream of rows it does
+    /// not interpret is a stream that exists, and reporting it as missing
+    /// would tell a caller the wrong thing about the session.
+    updates_present: bool,
     signals: Option<grok::GrokSignals>,
     prompt_context: Option<GrokPromptContext>,
     compactions: Vec<GrokCompaction>,
@@ -4987,9 +5022,23 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .and_then(parse_iso_ms)
         .unwrap_or(created_ms);
 
-    let updates = match fs::read_to_string(chat.with_file_name("updates.jsonl")) {
-        Ok(contents) => grok::parse_updates(&contents),
-        Err(_) => grok::GrokUpdates::default(),
+    // Three states, not two. A stream that is **not there** is a session Grok
+    // wrote no ACP updates for, and its events fall back to what the
+    // transcript says. A stream that is there but **cannot be read** is a
+    // failure: taking it as absent would replace exact event times with
+    // fallbacks, drop the token snapshots, and — because the change stamp was
+    // computed from metadata that is still perfectly readable — checkpoint
+    // that loss as the session's settled state until some file changes again.
+    let updates_path = chat.with_file_name("updates.jsonl");
+    let (updates, updates_present) = match fs::read_to_string(&updates_path) {
+        Ok(contents) => (grok::parse_updates(&contents), true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (grok::GrokUpdates::default(), false)
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read Grok updates {}", updates_path.display()))
+        }
     };
 
     let mut lines = Vec::new();
@@ -5073,6 +5122,7 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         lines,
         synthetic_reasons,
         updates,
+        updates_present,
         signals,
         prompt_context,
         compactions,
@@ -6282,6 +6332,141 @@ mod tests {
         let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
         super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
         assert_eq!(markers(), 2);
+    }
+
+    /// Write a Grok session directory with no `updates.jsonl`, and answer with
+    /// the transcript and the directory.
+    fn grok_stream_fixture(home: &Path, id: &str) -> (PathBuf, PathBuf) {
+        let dir = home.join(".grok/sessions/%2Ftmp%2Fstream").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            format!("{{\"type\":\"user\",\"content\":\"hello from {id}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            format!(
+                r#"{{"info":{{"id":"{id}","cwd":"/tmp/stream"}},"created_at":"2026-01-01T00:00:00.000Z"}}"#
+            ),
+        )
+        .unwrap();
+        (dir.join("chat_history.jsonl"), dir)
+    }
+
+    /// An `updates.jsonl` that exists and cannot be read is a failure, not an
+    /// absent stream.
+    ///
+    /// Taking it as absent would replace every exact event time with a
+    /// fallback and drop the token snapshots — and the change stamp, computed
+    /// from metadata that is still perfectly readable, would then checkpoint
+    /// that loss as the session's settled state until some file changes again.
+    #[test]
+    fn an_unreadable_update_stream_fails_instead_of_dating_events_from_fallbacks() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-str-0001");
+
+        // The positive control first: with no stream at all the session reads
+        // clean and simply reports that there is none.
+        let absent = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        assert!(!absent.updates_present);
+
+        let stream = dir.join("updates.jsonl");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&stream, &stream).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let scanned = super::scan_grok_session_file(&chat);
+        assert!(
+            scanned.is_err(),
+            "an unreadable update stream must not scan as an absent one"
+        );
+
+        // And once it is readable, the same path succeeds and the stream is
+        // present — so the failure was the unreadable file, not its existence.
+        fs::remove_file(&stream).unwrap();
+        fs::write(
+            &stream,
+            br#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1000,"turnStartMs":1000}}}
+"#,
+        )
+        .unwrap();
+        let read = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        assert!(read.updates_present);
+        assert_eq!(read.first_ts, 1000);
+    }
+
+    /// "Nothing in it parsed" is not "it is not there". A stream of rows this
+    /// parser does not interpret is a stream that exists, and a caller told it
+    /// is missing would look for a file that is sitting right there.
+    #[test]
+    fn a_stream_of_rows_the_parser_cannot_use_is_present_not_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-str-0002");
+        fs::write(
+            dir.join("updates.jsonl"),
+            b"{\"hello\":\"world\"}\n{\"another\":\"row\"}\n",
+        )
+        .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert!(
+            !outcome.missing_updates,
+            "the file exists; it just said nothing this parser understands"
+        );
+        assert!(outcome.updates_yielded_no_timing);
+        assert_eq!(outcome.unread_update_rows, 2);
+
+        // The positive control: with the file removed, it really is missing.
+        fs::remove_file(dir.join("updates.jsonl")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        let outcome = super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+        assert!(outcome.missing_updates);
+        assert!(!outcome.updates_yielded_no_timing);
+        assert_eq!(outcome.unread_update_rows, 0);
+    }
+
+    /// A stamp that fails closed has to be *reported*. Round four stopped one
+    /// unreadable directory from failing the whole Grok pass; on its own that
+    /// turned a store whose only session is unreadable into a silent success —
+    /// the strictness produced an error and then swallowed it.
+    #[test]
+    fn a_store_whose_only_session_is_unreadable_reports_the_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let (_chat, dir) = grok_stream_fixture(home.path(), "grok-sil-0001");
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+
+        // The positive control: a healthy store syncs and reports nothing.
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        assert!(state.contains_key(super::GROK_SYNC_STATE_KEY));
+
+        fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        let loop_entry = dir.join("compaction_checkpoints/loop.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loop_entry, &loop_entry).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let mut state = Map::new();
+        let error = super::sync_grok(&conn, &mut state, &root)
+            .expect_err("a store that could read nothing is a failed source");
+        assert!(
+            format!("{error:#}").contains("could not be read"),
+            "unexpected error: {error:#}"
+        );
+
+        // …and a store where something still worked keeps its progress rather
+        // than failing wholesale, so one broken directory cannot send every
+        // later run back over the whole store.
+        let (_second, _) = grok_stream_fixture(home.path(), "grok-sil-0002");
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        let saved = state[super::GROK_SYNC_STATE_KEY].as_object().unwrap();
+        assert_eq!(saved.len(), 1, "only the readable session is checkpointed");
     }
 
     #[test]

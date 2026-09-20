@@ -608,7 +608,12 @@ pub(crate) fn parse_updates(contents: &str) -> GrokUpdates {
             }
         }
         let event_id = string_field(meta, &["eventId", "event_id"]);
-        let continues = previous_kind == Some(kind);
+        // A turn boundary ends the message, even when the next row is the same
+        // kind: two `agent_message_chunk`s either side of a new `turnStartMs`
+        // are two messages, and merging them leaves the ordinal join with
+        // fewer groups than the transcript has records — so every record after
+        // the merge takes the previous turn's time.
+        let continues = !boundary && previous_kind == Some(kind);
         match kind {
             UpdateKind::UserMessage | UpdateKind::AgentMessage | UpdateKind::AgentThought => {
                 let bucket = match kind {
@@ -939,6 +944,42 @@ mod tests {
         assert_eq!(updates.agent_messages.len(), 1);
         assert_eq!(updates.agent_messages[0].ts_ms, Some(1_789_560_000_000));
         assert_eq!(updates.agent_messages[0].event_id.as_deref(), Some("a"));
+    }
+
+    /// A turn boundary ends a message. Two `agent_message_chunk` rows either
+    /// side of a new `turnStartMs` are two messages, and merging them leaves
+    /// the ordinal join with fewer groups than the transcript has records —
+    /// after which every later record takes the previous turn's time.
+    #[test]
+    fn a_turn_boundary_ends_a_message_even_between_two_rows_of_one_kind() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a","agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"b","agentTimestampMs":5000,"turnStartMs":5000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates(&stream);
+        assert_eq!(updates.agent_messages.len(), 2, "two turns, two messages");
+        assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
+        assert_eq!(updates.agent_messages[0].turn, 0);
+        assert_eq!(updates.agent_messages[1].ts_ms, Some(5000));
+        assert_eq!(updates.agent_messages[1].turn, 1);
+        assert_eq!(updates.turns.len(), 2);
+    }
+
+    /// The positive control for the rule above: inside one turn, a streamed
+    /// message is still one message however many chunks it arrives in.
+    #[test]
+    fn chunks_inside_one_turn_still_coalesce() {
+        let stream = [
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"a","agentTimestampMs":1000,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"b","agentTimestampMs":1100,"turnStartMs":1000}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"eventId":"c","agentTimestampMs":1200,"turnStartMs":1000}}}"#,
+        ]
+        .join("\n");
+        let updates = parse_updates(&stream);
+        assert_eq!(updates.agent_messages.len(), 1);
+        assert_eq!(updates.agent_messages[0].ts_ms, Some(1000));
+        assert_eq!(updates.turns.len(), 1);
     }
 
     #[test]
