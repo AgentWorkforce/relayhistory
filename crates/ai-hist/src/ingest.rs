@@ -5136,7 +5136,19 @@ fn marker_payload(fields: Vec<(&str, Value)>) -> Option<String> {
 /// names, and a top-level-only truncation copied each element verbatim — 32
 /// names the provider chose the length of. A marker must never grow with the
 /// record it describes, and "only at the top level" is not that guarantee.
-fn bound_marker_value(value: Value) -> Value {
+/// Bound a payload that arrives as a provider's own JSON text.
+///
+/// The field-list builders above know their keys; a provider sidecar and a
+/// legacy `detail_json` do not, so they come through here instead. Text that
+/// does not parse is dropped rather than stored raw: this column's whole
+/// contract is that it is bounded, and an unparsed blob is exactly what the
+/// bound exists to keep out.
+pub(crate) fn bound_marker_json(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    serde_json::to_string(&bound_marker_value(value)).ok()
+}
+
+pub(crate) fn bound_marker_value(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(bound_marker_string(&text)),
         Value::Array(items) => Value::Array(
@@ -6664,10 +6676,9 @@ fn ingest_grok_session(
                     );
                     let marker_uid = format!("r{idx}");
                     let marker_text = truncate_marker_text(text);
-                    let payload_json = session
-                        .synthetic_reasons
-                        .get(&idx)
-                        .map(|reason| json!({ "synthetic_reason": reason }).to_string());
+                    let payload_json = session.synthetic_reasons.get(&idx).and_then(|reason| {
+                        marker_payload(vec![("synthetic_reason", json!(reason))])
+                    });
                     outcome.markers += insert_session_marker(
                         conn,
                         SOURCE,
@@ -7135,7 +7146,15 @@ fn ingest_grok_session_extras(
     let sid = session.session_id.as_str();
     if let Some(signals) = &session.signals {
         let summary = grok_signals_summary(signals);
-        let payload_json = Value::Object(signals.raw.clone()).to_string();
+        // The sidecar is the provider's own metrics document, so it is
+        // bounded as a whole rather than projected field by field -- same
+        // treatment as a compaction checkpoint below, and for the same reason:
+        // its keys are Grok's, not ours. Storing it whole bypassed the
+        // per-string and per-container bounds this column promises, which is
+        // the only thing that changes here; the shape is what it always was.
+        let payload_json =
+            serde_json::to_string(&bound_marker_value(Value::Object(signals.raw.clone())))
+                .unwrap_or_default();
         outcome.markers += insert_session_marker(
             conn,
             SOURCE,
@@ -7145,7 +7164,7 @@ fn ingest_grok_session_extras(
                 kind: "signals",
                 ts_ms: session.updates.last_ms.or(Some(session.last_ts)),
                 text: Some(&summary),
-                payload_json: Some(&payload_json),
+                payload_json: (!payload_json.is_empty()).then_some(payload_json.as_str()),
                 ..Default::default()
             },
         )?;
@@ -7155,12 +7174,12 @@ fn ingest_grok_session_extras(
     // a later consumer can tell whether two sessions ran with the same
     // instructions.
     if let Some(context) = &session.prompt_context {
-        let payload_json = json!({
-            "path": context.path,
-            "sha256": context.sha256,
-            "bytes": context.bytes,
-        })
-        .to_string();
+        let payload_json = marker_payload(vec![
+            ("path", json!(context.path)),
+            ("sha256", json!(context.sha256)),
+            ("bytes", json!(context.bytes)),
+        ])
+        .unwrap_or_default();
         outcome.markers += insert_session_marker(
             conn,
             SOURCE,
@@ -7169,13 +7188,19 @@ fn ingest_grok_session_extras(
                 marker_uid: "prompt_context",
                 kind: "prompt_context",
                 text: Some(&context.path),
-                payload_json: Some(&payload_json),
+                payload_json: (!payload_json.is_empty()).then_some(payload_json.as_str()),
                 ..Default::default()
             },
         )?;
     }
     for checkpoint in &session.compactions {
         let marker_uid = format!("compaction:{}", checkpoint.name);
+        // The checkpoint sidecar is the provider's own document, so it is
+        // bounded as a whole rather than projected field by field.
+        let payload_json = checkpoint
+            .detail_json
+            .as_deref()
+            .and_then(bound_marker_json);
         outcome.markers += insert_session_marker(
             conn,
             SOURCE,
@@ -7186,7 +7211,7 @@ fn ingest_grok_session_extras(
                 subkind: Some("compaction_checkpoint"),
                 ts_ms: checkpoint.ts_ms,
                 text: Some(&checkpoint.locator),
-                payload_json: checkpoint.detail_json.as_deref(),
+                payload_json: payload_json.as_deref(),
                 ..Default::default()
             },
         )?;
@@ -9222,6 +9247,102 @@ mod tests {
         assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
         let saved = state[super::GROK_SYNC_STATE_KEY].as_object().unwrap();
         assert_eq!(saved.len(), 1, "only the readable session is checkpointed");
+    }
+
+    /// A Grok sidecar cannot put an unbounded blob in `payload_json`.
+    ///
+    /// The column is documented as an allowlisted projection with every string
+    /// bounded at 128 characters and every container at 32 entries, and every
+    /// kind the Claude and Codex parsers write goes through that bounder. The
+    /// Grok signals and compaction writers stored their sidecar JSON whole, so
+    /// a single oversized nested string landed intact -- in the one place
+    /// nothing downstream expects to have to defend against it.
+    ///
+    /// Grok's readable prose is unaffected: it lives in `text`, which this does
+    /// not touch, so bounding the JSON loses nothing a reader wanted.
+    #[test]
+    fn grok_sidecar_payloads_are_bounded_like_every_other_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-bound-0001");
+        let huge = "x".repeat(5_000);
+        fs::write(
+            dir.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 2,
+                "contextTokensUsed": 10,
+                "note": huge,
+                "nested": { "deeper": huge },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let checkpoints = dir.join("compaction_checkpoints");
+        fs::create_dir_all(&checkpoints).unwrap();
+        fs::write(
+            checkpoints.join("c1.json"),
+            serde_json::json!({ "summary": huge }).to_string(),
+        )
+        .unwrap();
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+
+        let payload = |kind: &str| -> Value {
+            let raw: String = conn
+                .query_row(
+                    "SELECT payload_json FROM session_markers \
+                     WHERE source = 'grok' AND kind = ?",
+                    params![kind],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|err| panic!("a {kind} marker with a payload: {err}"));
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        // Every string anywhere in the payload, however deep, is bounded.
+        let longest = |value: &Value| -> usize {
+            fn walk(value: &Value, longest: &mut usize) {
+                match value {
+                    Value::String(text) => *longest = (*longest).max(text.chars().count()),
+                    Value::Array(items) => items.iter().for_each(|item| walk(item, longest)),
+                    Value::Object(fields) => fields.values().for_each(|field| walk(field, longest)),
+                    _ => {}
+                }
+            }
+            let mut result = 0;
+            walk(value, &mut result);
+            result
+        };
+        let signals = payload("signals");
+        assert_eq!(
+            longest(&signals),
+            MARKER_PAYLOAD_FIELD_LIMIT,
+            "the oversized signals string must be bounded: {signals}"
+        );
+        let compaction = payload("compaction_boundary");
+        assert_eq!(
+            longest(&compaction),
+            MARKER_PAYLOAD_FIELD_LIMIT,
+            "the oversized checkpoint string must be bounded: {compaction}"
+        );
+
+        // Positive control: the counters the sidecar really recorded survive,
+        // so this bounds the payload rather than emptying it.
+        assert_eq!(
+            signals.get("turnCount").and_then(Value::as_i64),
+            Some(2),
+            "bounding must not discard what the sidecar recorded: {signals}"
+        );
+        // And Grok's readable prose is untouched by any of it.
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_markers WHERE source = 'grok' AND kind = 'signals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.is_some_and(|text| !text.is_empty()));
     }
 
     /// Every sidecar read obeys the same three-way rule: absent is nothing,

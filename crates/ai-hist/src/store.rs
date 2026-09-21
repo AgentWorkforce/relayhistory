@@ -1603,11 +1603,31 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
         .exists([])?;
     if has_detail_json {
-        conn.execute(
-            "UPDATE session_markers SET payload_json = detail_json \
-             WHERE payload_json IS NULL AND detail_json IS NOT NULL",
-            [],
-        )?;
+        // Bounded on the way across, not copied verbatim. `payload_json` is
+        // documented as a projection whose strings and containers are bounded,
+        // and every kind the parsers write goes through that bounder -- so a
+        // legacy value carried over unchanged would leave rows breaking the
+        // promise the column makes, in upgraded databases only, where nobody
+        // would think to look. Row by row rather than in one `UPDATE` because
+        // the bound is applied by parsing the JSON, which SQL cannot do.
+        let legacy: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT id, detail_json FROM session_markers \
+                 WHERE payload_json IS NULL AND detail_json IS NOT NULL",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, detail_json) in legacy {
+            // A legacy value that does not parse is dropped rather than stored
+            // raw: unparsed text is exactly what the bound exists to keep out.
+            let Some(bounded) = crate::ingest::bound_marker_json(&detail_json) else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE session_markers SET payload_json = ? WHERE id = ?",
+                params![bounded, id],
+            )?;
+        }
         // The delivery capture triggers build their payload with a
         // `json_object` over the column list as it stood when they were
         // created, so on a v1 database all three name `detail_json`. SQLite
@@ -6042,6 +6062,77 @@ mod tests {
                 .all(|pair| pair[0].ts_ms <= pair[1].ts_ms),
             "the concatenated pages keep the paged order"
         );
+    }
+
+    /// A v1 payload is bounded on the way in, not carried over verbatim.
+    ///
+    /// `payload_json` is documented as an allowlisted projection with strings
+    /// and containers bounded, and every kind written by the Claude and Codex
+    /// parsers goes through that bounder. The legacy column had no such
+    /// contract, so copying it across unchanged would leave rows that break the
+    /// promise the column makes -- in an upgraded database only, where nobody
+    /// would think to look for it.
+    #[test]
+    fn v1_payloads_are_bounded_by_the_migration_not_copied_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-huge.db");
+        let huge = "x".repeat(5_000);
+        let small = r#"{"checkpoint":1}"#;
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_markers \
+                 (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
+                 VALUES ('grok', 'v1-b', 'big', 'signals', 1, 'prose', ?)",
+                params![serde_json::json!({ "note": huge }).to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_markers \
+                 (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
+                 VALUES ('grok', 'v1-b', 'small', 'compaction_boundary', 2, 'prose', ?)",
+                params![small],
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let markers = session_markers(&conn, "grok", "v1-b").unwrap();
+        assert_eq!(markers.len(), 2);
+        let big = markers.iter().find(|m| m.marker_uid == "big").unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(big.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload["note"].as_str().unwrap().chars().count(),
+            128,
+            "the migrated payload must be bounded like every other one"
+        );
+        // Positive control: bounding must not rewrite a payload that already fits.
+        let unchanged = markers.iter().find(|m| m.marker_uid == "small").unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(unchanged.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "checkpoint": 1 }));
+        // The prose column is untouched by any of this.
+        assert_eq!(big.text.as_deref(), Some("prose"));
     }
 
     /// The project-identity columns, marker and index reach a database that
