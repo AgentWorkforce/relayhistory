@@ -3575,6 +3575,24 @@ fn sync_claude_session_metadata(
         // run's coverage — and treating it as one kept the per-session probes
         // live for the life of the install.
         let known_before = cursor::locator_cursor_exists(conn, "claude", &path)?;
+        // Asked before the reader opens it. A file that cannot be opened at
+        // all — a socket, a device, a mode this process does not have — is
+        // the "unavailable on this run" case, not a run-ending failure: the
+        // walk absorbs it, withholds the generation if this file was one it
+        // would otherwise have skipped, and drops the cursor so the next walk
+        // reads it again rather than skipping it on a position that no longer
+        // describes anything readable.
+        if !transcript_is_readable(&path) {
+            walked_every_known_root &= !known_before;
+            if known_before {
+                cursor::forget_locator_cursor(conn, "claude", &path)?;
+            }
+            sync_note!(
+                "  [claude-sessions] could not open {} (skipped)",
+                path.display()
+            );
+            continue;
+        }
         if !indexed || backfill {
             // Either the cursor claims these bytes already produced rows and
             // the rows are not there — a wiped database, or evidence a repair
