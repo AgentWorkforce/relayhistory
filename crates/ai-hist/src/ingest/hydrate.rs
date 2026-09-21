@@ -20,7 +20,9 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Version 5 adds tool-result fidelity and reattributes identified Claude
 /// subagent events to their child sessions, and banks continuity evidence for
 /// sessions checkpointed by version 4.
-/// Version 6 re-parses Grok sessions that were prompt-only: they gain
+/// Version 6 makes pre-parity OpenCode sessions re-read their full event
+/// evidence after both version-5 changes have already landed. It also
+/// re-parses Grok sessions that were prompt-only: they gain
 /// `session_events`, `tool_calls`, `file_edits`, `session_markers`, subagent
 /// relationships and the timestamps `updates.jsonl` recorded, in place of the
 /// `created_at + index` times the previous parser synthesized. Plain `sync`
@@ -143,12 +145,27 @@ struct SourceSnapshot {
     bytes: i64,
     records: SnapshotRecords,
     path: Option<PathBuf>,
+    /// For OpenCode: which of the provider's two layouts this locator was
+    /// validated against. Carried rather than re-derived, because the only
+    /// thing that can be re-derived from a path is its spelling — and
+    /// `OPENCODE_DB` is an arbitrary path, so a SQLite store may perfectly
+    /// well be called `opencode.json`. Ingestion picks its loader from this.
+    opencode_layout: Option<OpencodeIngestLayout>,
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
     /// A bounded Codex child search cannot assert complete relationship coverage
     /// when newer date directories exist beyond its search window.
     codex_relationship_complete: bool,
+}
+
+/// Which OpenCode store a validated locator names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpencodeIngestLayout {
+    /// The configured `OPENCODE_DB`, whatever it is called.
+    Sqlite,
+    /// A session file inside the configured `OPENCODE_STORAGE_DIR`.
+    JsonTree,
 }
 
 /// How many records a source holds, and whether counting them is free.
@@ -368,6 +385,7 @@ fn hydrate_session_at_with_roots_and_connectors(
         &target,
         snapshot.path.as_deref(),
         &snapshot.claude_subagents,
+        snapshot.opencode_layout,
     )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
@@ -1225,6 +1243,7 @@ fn source_snapshot(
     }
     if options.source == "opencode" {
         let configured_path = &roots.opencode_db;
+        let configured_storage = &roots.opencode_storage_dir;
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
@@ -1232,7 +1251,62 @@ fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
-        if fs::canonicalize(&path).ok() != fs::canonicalize(configured_path).ok() {
+        // Which layout is current *now*, by the same precedence global sync
+        // uses -- not which one this catalog row was written from. A row
+        // written while only the tree existed still names a session file
+        // after `opencode.db` appears, and classifying that locator on its
+        // own would leave targeted hydration reading the superseded tree
+        // while `sync --local` reads SQLite: two paths disagreeing about one
+        // session.
+        //
+        // When the layouts disagree the row is stale as a whole, not just in
+        // its locator -- its prompt, models, timestamps and stamp all came
+        // from the other store -- so hydrating from the current one behind
+        // its back would stamp the checkpoint against a store the row does
+        // not describe. Refuse, and name the way out.
+        let current_layout =
+            crate::ingest::opencode::OpencodeLayout::detect(configured_path, configured_storage);
+        let superseded = |stale: &Path, current: &Path| {
+            hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "OpenCode catalog row points at {}, but {} is now the current store; \
+                     run discoverSessions() again to re-establish this session's provenance",
+                    stale.display(),
+                    current.display()
+                ),
+            )
+        };
+        // Classify the locator by what it *is*, not by which directory it sits
+        // under. `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` are independent
+        // paths, so the database can perfectly well live inside the storage
+        // directory -- and a prefix test then reads a live SQLite locator as a
+        // legacy session file, refuses it as superseded, and leaves the
+        // session permanently unhydratable, because rediscovery writes back
+        // the same database path.
+        //
+        // So: the configured store is matched on resolved identity first, and
+        // only then is the locator considered as a session file, which means
+        // sitting under the tree's own `session/` subtree rather than merely
+        // somewhere beneath the storage root.
+        let resolved = fs::canonicalize(&path).ok();
+        let is_configured_store =
+            resolved.is_some() && resolved == fs::canonicalize(configured_path).ok();
+        let is_tree_session_file = !is_configured_store
+            && opencode_locator_is_in_storage_tree(&path, &configured_storage.join("session"));
+
+        if is_tree_session_file {
+            if let Some(crate::ingest::opencode::OpencodeLayout::Sqlite(store)) = &current_layout {
+                return Err(superseded(&path, store));
+            }
+            return opencode_json_tree_snapshot(options, &path);
+        }
+        if is_configured_store {
+            if let Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) = &current_layout {
+                return Err(superseded(&path, tree));
+            }
+        }
+        if !is_configured_store {
             return Err(hydration_error(
                 "SESSION_SOURCE_MISMATCH",
                 format!(
@@ -1290,6 +1364,7 @@ fn source_snapshot(
             records: SnapshotRecords::Counted(0),
             path: Some(path),
             claude_subagents: Vec::new(),
+            opencode_layout: Some(OpencodeIngestLayout::Sqlite),
             codex_relationship_complete: true,
         });
     }
@@ -1371,7 +1446,51 @@ fn source_snapshot(
         records,
         path: Some(path),
         claude_subagents: subagents,
+        // Every other provider is file-backed with one layout; only OpenCode
+        // has a choice to record here.
+        opencode_layout: None,
         codex_relationship_complete,
+    })
+}
+
+/// Whether a catalog locator points inside the configured legacy tree. The
+/// comparison is on canonical paths so a symlinked storage root still matches,
+/// and a locator outside it is rejected rather than read.
+fn opencode_locator_is_in_storage_tree(path: &Path, storage_dir: &Path) -> bool {
+    let (Ok(path), Ok(root)) = (fs::canonicalize(path), fs::canonicalize(storage_dir)) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+/// Stamp one legacy-tree session over everything that composes it: the
+/// session file, its messages and its parts.
+///
+/// The session file alone does not change when a turn is appended — the new
+/// part is a *new file* — so stamping only that would make a growing session
+/// look unchanged and freeze its evidence at the first read. Discovery uses
+/// the same helper, so the catalog and the checkpoint cannot disagree about
+/// whether a session has moved.
+fn opencode_json_tree_snapshot(
+    options: &HydrateSessionOptions,
+    session_file: &Path,
+) -> Result<SourceSnapshot> {
+    if !session_file.is_file() {
+        return Err(hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!("OpenCode source {} is unavailable", session_file.display()),
+        ));
+    }
+    let stamp =
+        crate::ingest::opencode::stamp_json_tree_session(session_file, &options.session_id)?;
+    Ok(SourceSnapshot {
+        stamp: stamp.token(),
+        bytes: i64::try_from(stamp.bytes).unwrap_or(i64::MAX),
+        records: SnapshotRecords::Counted(i64::try_from(stamp.files).unwrap_or(i64::MAX)),
+        path: Some(session_file.to_path_buf()),
+        claude_subagents: Vec::new(),
+        opencode_layout: Some(OpencodeIngestLayout::JsonTree),
+        codex_relationship_complete: true,
     })
 }
 
@@ -1513,12 +1632,14 @@ fn stored_grok_context_tokens(conn: &Connection, session_id: &str) -> Result<Opt
 
 /// Index the selected session and hand back whatever the provider's own
 /// records could not establish, as diagnostics the caller reports verbatim.
+#[allow(clippy::too_many_arguments)]
 fn ingest_selected(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
+    opencode_layout: Option<OpencodeIngestLayout>,
 ) -> Result<(Vec<HydrationDiagnostic>, Option<u64>)> {
     match options.source.as_str() {
         "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents)
@@ -1530,7 +1651,25 @@ fn ingest_selected(
         }
         "grok" => ingest_grok(conn, options, path.unwrap()).map(|diagnostics| (diagnostics, None)),
         "opencode" => {
-            sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
+            let path = path.unwrap();
+            // Whichever layout `source_snapshot` validated this locator
+            // against. Not the file extension: `OPENCODE_DB` is an arbitrary
+            // path, so a perfectly good SQLite store may be called
+            // `opencode.json`, and sniffing the suffix would hand it to the
+            // JSON-tree loader and index nothing. Both layouts end in the
+            // same normalizer, so the evidence is identical either way.
+            match opencode_layout {
+                Some(OpencodeIngestLayout::JsonTree) => {
+                    crate::store::sync_opencode_session_from_storage_dir(
+                        conn,
+                        path,
+                        &options.session_id,
+                    )?;
+                }
+                _ => {
+                    sync_opencode_session(conn, path, &options.session_id)?;
+                }
+            }
             Ok((Vec::new(), None))
         }
         _ => Err(hydration_error(
@@ -4742,9 +4881,10 @@ mod tests {
         path
     }
 
-    /// Write an OpenCode store with one user prompt. OpenCode is the remaining
-    /// prompt-only local parser: Cursor and Grok both write events now.
-    fn opencode_prompt_only(home: &Path, session_id: &str, prompt: &str) -> PathBuf {
+    /// Write an OpenCode store whose one session happens to contain only a
+    /// user prompt. Capability describes the parser, not which kinds this
+    /// particular sparse session exercised.
+    fn opencode_prompt_store(home: &Path, session_id: &str, prompt: &str) -> PathBuf {
         let source = home.join(".local/share/opencode/opencode.db");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         let src = Connection::open(&source).unwrap();
@@ -4762,14 +4902,13 @@ mod tests {
         source
     }
 
-    /// A completed prompt-only hydration is `partial`, and says which evidence
-    /// nobody looked for. Reporting `full` here is the defect contract 3 fixes:
-    /// the SDK ranks merges on `capability`, so "prompts only" outranked a
-    /// remote presence that had the events.
+    /// A sparse session still reports the adapter's full parser capability.
+    /// Coverage says which kinds the adapter examined, not which row kinds one
+    /// particular session happened to contain.
     #[test]
-    fn prompt_only_providers_report_partial_capability_and_name_what_is_missing() {
+    fn a_prompt_only_opencode_session_still_reports_full_parser_capability() {
         let dir = tempfile::tempdir().unwrap();
-        let store = opencode_prompt_only(dir.path(), "oc-1", "opencode prompt");
+        let store = opencode_prompt_store(dir.path(), "oc-1", "opencode prompt");
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "opencode", "oc-1", Some(&store));
@@ -4779,37 +4918,22 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("opencode", "oc-1"), dir.path()).unwrap();
         assert_eq!(result.contract_version, 3);
         assert_eq!(result.status, "hydrated");
-        assert_eq!(result.capability, "partial");
-        assert_eq!(result.coverage, vec![EvidenceKind::History]);
-        // The prompt really was indexed: `partial` is about the kinds nobody
-        // parses, not about this pass having failed.
+        assert_eq!(result.capability, "full");
+        assert_eq!(result.coverage, FULL_SESSION_KINDS.to_vec());
         assert_eq!(result.evidence.prompts, 1);
-        let partial = result
+        assert!(!result
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE")
-            .expect("a partial hydration names the evidence it does not cover");
-        assert!(
-            partial
-                .message
-                .contains("session_event, tool_call, file_edit, relationship"),
-            "{}",
-            partial.message
-        );
-        assert!(
-            partial.message.contains("covers history"),
-            "{}",
-            partial.message
-        );
+            .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
 
         // Unchanged re-hydration reports the same capability: a consumer that
         // polls must not see the claim change under it.
         let unchanged =
             hydrate_session_at_with_home(&db, &options("opencode", "oc-1"), dir.path()).unwrap();
         assert_eq!(unchanged.status, "unchanged");
-        assert_eq!(unchanged.capability, "partial");
-        assert_eq!(unchanged.coverage, vec![EvidenceKind::History]);
-        assert!(unchanged
+        assert_eq!(unchanged.capability, "full");
+        assert_eq!(unchanged.coverage, FULL_SESSION_KINDS.to_vec());
+        assert!(!unchanged
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "HYDRATION_PARTIAL_COVERAGE"));
@@ -5090,13 +5214,12 @@ mod tests {
         }
     }
 
-    /// Dropping relationship coverage is scoped to providers that would
-    /// otherwise have claimed it; a prompt-only provider reports the same
-    /// thing either way.
+    /// OpenCode normally covers relationships through `parentID`; declining
+    /// related evidence drops that kind even for a session with no parent.
     #[test]
-    fn declining_related_evidence_does_not_change_a_prompt_only_provider() {
+    fn declining_related_evidence_drops_opencode_relationship_coverage() {
         let dir = tempfile::tempdir().unwrap();
-        let store = opencode_prompt_only(dir.path(), "oc-3", "opencode prompt");
+        let store = opencode_prompt_store(dir.path(), "oc-3", "opencode prompt");
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "opencode", "oc-3", Some(&store));
@@ -5106,7 +5229,15 @@ mod tests {
         request.include_related = false;
         let alone = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(alone.capability, "partial");
-        assert_eq!(alone.coverage, vec![EvidenceKind::History]);
+        assert_eq!(
+            alone.coverage,
+            vec![
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+            ]
+        );
     }
 
     /// The rule the SDK re-derives from `coverage` to validate a result. All
@@ -5436,7 +5567,7 @@ mod tests {
     /// and the hydration contract follows without another edit.
     #[test]
     fn declared_coverage_matches_what_each_local_parser_writes() {
-        for source in ["claude", "codex", "grok"] {
+        for source in ["claude", "codex", "grok", "opencode"] {
             assert_eq!(
                 crate::discover::declared_evidence_kinds(source),
                 FULL_SESSION_KINDS,
@@ -5459,20 +5590,6 @@ mod tests {
         assert_eq!(
             crate::discover::missing_evidence_kinds("cursor"),
             vec![EvidenceKind::Relationship],
-        );
-        assert_eq!(
-            crate::discover::declared_evidence_kinds("opencode"),
-            &[EvidenceKind::History],
-            "opencode parses prompts only"
-        );
-        assert_eq!(
-            crate::discover::missing_evidence_kinds("opencode"),
-            vec![
-                EvidenceKind::SessionEvent,
-                EvidenceKind::ToolCall,
-                EvidenceKind::FileEdit,
-                EvidenceKind::Relationship,
-            ],
         );
         // Relay rows come out of already-ingested history and an unknown
         // source has no adapter at all: neither declares anything.

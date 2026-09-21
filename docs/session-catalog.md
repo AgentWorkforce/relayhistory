@@ -463,7 +463,7 @@ which this table must stay consistent with.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
-| **opencode** | ✓ | ✓ (directory) | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
 ### Session markers
@@ -662,7 +662,7 @@ follows.
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
 | **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
-| **opencode** | ✓ | – | – | – | – | `partial` |
+| **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **relay** | – | – | – | – | – | targeted hydration unsupported |
 
 ### Per-message raw facts on `session_events`
@@ -727,9 +727,21 @@ Delegation is a separate capability, reported on every relationship result as
 | Source | Stable child identity | Agent type | Spawn time | Evidence locator |
 |---|---|---|---|---|
 | **codex** | always | ✓ | ✓ | ✓ |
+| **opencode** | always | – | ✓ | ✓ |
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
-| **cursor**, **opencode**, **relay** | never | – | – | – |
+| **cursor**, **relay** | never | – | – | – |
+
+OpenCode is `always` because a subagent session is a session in its own right
+and its own record names the parent, in `session.parentID`. Nothing is
+inferred from file names or ordering, so the edge is recorded with
+`evidence_kind = "opencode_parent_id"` and `identity_status = "observed"`.
+
+OpenCode is the one source whose four columns do not move together, which is
+the point of reporting them separately: it names the parent and the spawn
+time and keeps the evidence locator, but records no *type* for the child, so
+`childAgentType` and `childAgentName` are always null and the capability says
+so rather than promising a field the adapter never writes.
 
 Grok is `sometimes` for the same shape of reason: a `subagents/` metadata
 entry that records a child session id links to a child session in the normal
@@ -1427,8 +1439,44 @@ How each adapter works:
     `totalTokens` context proxy that decreases on compaction, the models
     `grok-composer-2.5-fast` and `grok-build`, and the tool-name list.
 
-- **opencode** — the SQLite store at `$OPENCODE_DB` (default
-  `~/.local/share/opencode/opencode.db`). Discovery opens the live store with
+- **opencode** — **two storage layouts**, because both are in the field.
+  RelayHistory prefers `opencode.db` when the host has it and falls back to the
+  legacy JSON tree when it does not; it never reads both, because a host that
+  upgraded has a stale tree sitting beside a live database.
+
+  | Layout | Location | Environment override |
+  |---|---|---|
+  | SQLite (current releases) | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB` |
+  | Legacy JSON tree (older installs) | `~/.local/share/opencode/storage` | `OPENCODE_STORAGE_DIR` |
+
+  The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
+  `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
+  The *payloads* are identical to the `data` columns in the SQLite tables, so
+  one normalizer parses both and the evidence a session produces does not
+  depend on how it was stored. `crates/ai-hist/tests/opencode_parity.rs`
+  asserts that by deriving a JSON tree from the SQLite fixture and comparing
+  every row apart from the provenance path.
+
+  A hydrated OpenCode session yields, per assistant message: `session_events`
+  of kind `text` for each non-synthetic `text` part, `tool_use` plus a
+  `tool_calls` row for each `tool` part (`tool_use_id` = `callID`, `is_error`
+  from `state.status == "error"` or `state.metadata.exit != 0`), a
+  `tool_result` event from `state.output`, and a `file_edits` row for
+  `write`/`edit`/`patch`. Each event carries `model` as
+  `"<providerID>/<modelID>"`, `provider` as the bare `providerID`, `token_json`
+  as the message's `tokens` object verbatim
+  (`{input, output, reasoning, cache:{read, write}}`), and `stop_reason` from
+  the message's last `step-finish.reason`. A `compaction` part records a
+  `session_markers` row of kind `compaction_boundary`.
+
+  Global sync reads the live store with session-keyed queries and copies
+  nothing. The old whole-database `Connection::backup` is now opt-in at both
+  compile time (the `opencode-backup` feature) *and* run time
+  (`AI_HIST_OPENCODE_BACKUP=1`); on a large store it is hundreds of megabytes
+  of I/O for evidence the default path already reads, so it exists only as an
+  escape hatch for a provider schema whose indexes make the bounded path slow.
+
+  For the SQLite layout, discovery opens the live store with
   SQLite read-only and `query_only` enforcement, then holds one deferred read
   transaction for the run. Candidate enumeration and every selected-session
   query therefore share one committed SQLite snapshot. In WAL mode OpenCode's
@@ -1532,8 +1580,22 @@ Each connector presence stores a `source_stamp` —
 |---|---|
 | claude, codex, cursor | `{mtime nanoseconds}:{file length}` |
 | grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker, `\|x:`, a digest over `signals.json`, `prompt_context.json` and the sorted entries of `compaction_checkpoints/` and `subagents/` |
-| opencode | `{database identity}:{schema version}:{time_created}:{time_updated}` |
+| opencode (SQLite) | `{database identity}:{schema version}:{time_created}:{time_updated}` |
+| opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}:{digest}` over the session file, its messages and their parts |
 | relay | `{newest synced timestamp}:{synced row count}` |
+
+The OpenCode JSON-tree marker is an aggregate for a reason: the provider
+appends a turn by writing *new* files under `message/` and `part/` and does
+not touch the session JSON, so a marker over that file alone reports an active
+session as unchanged forever. All four components earn their place —
+modification time because a birth time cannot see an in-place rewrite, the
+file count because a coarse filesystem clock can give an appended turn the
+same mtime as the read before it, and the byte total because an in-place edit
+can preserve the count. The digest folds each file's name, length and mtime
+together with the contents of recently modified files, catching same-length
+rewrites that land in the same filesystem clock tick. Discovery and hydration compute it with the same
+function, so the catalog and the checkpoint cannot disagree about whether a
+session has moved.
 
 On a rescan, a candidate whose stamp matches the stamp for that same location
 in `session_presences` is served straight from the catalog: no read, no parse,
@@ -1546,12 +1608,11 @@ copy. In the benchmark below, a rescan of 450 unchanged sessions performs
 The `v{N}` prefix is the *scanner* version (`SHALLOW_SCANNER_VERSION`), separate
 from `parser_version` (the full-ingest parser generation). Bumping it
 invalidates every stored stamp, so a scanner taught to extract a new field
-re-reads sources whose bytes never changed. It is at **4**: version 3 shipped
-the prompt-only Cursor reader, and 4 adds that provider's injected turn times,
-models and last assistant reply. Without the bump those rows would be served
-from cache with the new fields null forever, because a Cursor transcript'''s
-bytes do not change when the release does. The cost is one re-read per source,
-once.
+re-reads sources whose bytes never changed. It is at **5**: version 3 shipped
+the prompt-only Cursor reader, 4 added that provider's injected turn times,
+models and last assistant reply, and 5 qualifies OpenCode model IDs with their
+provider. Without these bumps, unchanged sources would keep serving the older
+cached shape forever. The cost is one re-read per source, once.
 
 ---
 

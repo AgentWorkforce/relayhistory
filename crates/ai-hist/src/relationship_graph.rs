@@ -268,27 +268,41 @@ pub struct SessionChildrenPage {
 /// What each provider's records establish about delegation. A pure table: no
 /// database access, so it answers correctly even for a missing database.
 pub fn relationship_capabilities(source: &str) -> RelationshipCapabilities {
-    let (stable_child_identity, records) = match source {
-        // Every Codex subagent rollout opens with its own thread id.
-        "codex" => ("always", true),
+    // Each flag is answered separately, because they are separate questions
+    // and for OpenCode they have different answers. A consumer reads this to
+    // tell "the provider does not support it" from "it was not recorded this
+    // time"; collapsing the three onto one boolean makes the adapter promise
+    // a field it never writes, which is worse than promising nothing.
+    let (stable_child_identity, agent_type, spawn_time, evidence_locator) = match source {
+        // Every Codex subagent rollout opens with its own thread id, and its
+        // `session_meta` names the subagent type.
+        "codex" => ("always", true, true, true),
+        // An OpenCode subagent session is a session in its own right and its
+        // record names the parent outright, in `session.parentID`, so the
+        // child identity is always stable and never inferred. But OpenCode
+        // records no *type* for that child: the parser writes the spawn time
+        // and the evidence locator, and leaves `child_agent_type` and
+        // `child_agent_name` null because nothing in the provider's records
+        // supplies them.
+        "opencode" => ("always", false, true, true),
         // Claude subagent transcripts carry the parent's `sessionId`; only
         // provider versions that also emit a per-child `agentId` give the
         // child a stable identity.
-        "claude" => ("sometimes", true),
+        "claude" => ("sometimes", true, true, true),
         // Grok records a delegation in two places. The `Task` call in the
         // transcript names no child at all; a `subagents/` metadata entry does
         // when it carries a session id, and the child session then lives in
         // the normal sessions tree. The id is never taken from the file name,
         // so an entry without one stays unlinked evidence.
-        "grok" => ("sometimes", true),
-        _ => ("never", false),
+        "grok" => ("sometimes", true, true, true),
+        _ => ("never", false, false, false),
     };
     RelationshipCapabilities {
         source: source.to_string(),
         stable_child_identity: stable_child_identity.to_string(),
-        records_agent_type: records,
-        records_spawn_time: records,
-        records_evidence_locator: records,
+        records_agent_type: agent_type,
+        records_spawn_time: spawn_time,
+        records_evidence_locator: evidence_locator,
     }
 }
 
@@ -1254,6 +1268,18 @@ mod tests {
             relationship_capabilities("codex").stable_child_identity,
             "always"
         );
+        // OpenCode's `session.parentID` names the parent outright, so its
+        // child identity is observed rather than inferred -- but the provider
+        // records no type for that child, and the parser writes none, so the
+        // three flags must not move together.
+        let opencode = relationship_capabilities("opencode");
+        assert_eq!(opencode.stable_child_identity, "always");
+        assert!(
+            !opencode.records_agent_type,
+            "OpenCode writes child_agent_type as null; advertising it is a promise the parser never keeps"
+        );
+        assert!(opencode.records_spawn_time);
+        assert!(opencode.records_evidence_locator);
         assert_eq!(
             relationship_capabilities("claude").stable_child_identity,
             "sometimes"
@@ -1262,7 +1288,7 @@ mod tests {
             relationship_capabilities("grok").stable_child_identity,
             "sometimes"
         );
-        for source in ["cursor", "opencode", "relay"] {
+        for source in ["cursor", "relay"] {
             let capabilities = relationship_capabilities(source);
             assert_eq!(capabilities.stable_child_identity, "never");
             assert!(!capabilities.records_agent_type);

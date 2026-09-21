@@ -58,12 +58,10 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
   }
 });
 
-// Bootstrap hydrates with includeRelated: false, so the absent `relationship`
-// coverage is its own choice. Only what the provider itself cannot produce is a
-// capability limitation -- otherwise every Claude bootstrap would report the
-// provider as limited and land in `partial`. OpenCode is the remaining
-// prompt-only local parser; Cursor and Grok both write events now.
-test('bootstrap reports only the evidence the provider cannot produce, not what it declined', { skip: needsNodeSqlite }, async () => {
+// Bootstrap hydrates with includeRelated: false, so the relationship evidence
+// it declined must not make a full provider look limited. OpenCode now writes
+// the complete normalized evidence shape, making it a useful regression case.
+test('bootstrap does not report declined evidence as a provider limitation', { skip: needsNodeSqlite }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
   const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
   const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',
@@ -74,13 +72,11 @@ test('bootstrap reports only the evidence the provider cannot produce, not what 
   try {
     await writeOpencodePrompt(home, 'oc-boot', 'bootstrap opencode prompt');
     const result = await call();
-    const limited = result.diagnostics.find((item) => item.code === 'CAPABILITY_LIMITED');
-    assert.ok(limited, 'a prompt-only provider is still reported as limited');
-    assert.equal(limited.source, 'opencode');
-    assert.equal(limited.message, 'Provider exposes no session_event, tool_call, file_edit evidence');
-    // `relationship` is absent from the message: bootstrap declined it.
-    assert.doesNotMatch(limited.message, /relationship/);
-    assert.equal(result.status, 'partial');
+    const limited = result.diagnostics.find(
+      (item) => item.source === 'opencode' && item.code === 'CAPABILITY_LIMITED',
+    );
+    assert.equal(limited, undefined, 'declining relationships does not limit the provider');
+    assert.equal(result.status, 'ready');
   } finally {
     await rm(home, { recursive: true, force: true });
   }

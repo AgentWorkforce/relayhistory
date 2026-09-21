@@ -165,9 +165,69 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     }
 }
 
+struct PassCountingProvider {
+    pass_starts: AtomicUsize,
+}
+
+impl ShallowSessionProvider for PassCountingProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        self.pass_starts.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn source(&self) -> &'static str {
+        "codex"
+    }
+
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        Ok(Vec::new())
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_provider_is_rejected_before_pass_guards_are_acquired() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = PassCountingProvider {
+        pass_starts: AtomicUsize::new(0),
+    };
+
+    let error = discover_sessions_with_provider_refs(
+        &env,
+        &DiscoverOptions::default(),
+        &[&provider, &provider],
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("duplicate source connector instance"),
+        "{error:#}"
+    );
+    assert_eq!(
+        provider.pass_starts.load(Ordering::Relaxed),
+        0,
+        "validation must finish before any provider pass lock is taken"
+    );
+}
 
 #[test]
 fn every_source_is_either_discoverable_or_explicitly_exempt() {
@@ -1537,7 +1597,9 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     opencode_db(
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
-           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"openai","modelID":"gpt-5"}');
+           INSERT INTO message VALUES ('m2', 'oc-1', NULL, '{"role":"assistant","time":{"created":200},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m3', 'oc-1', 100, '{"role":"assistant","time":{"created":100},"providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -1547,7 +1609,7 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(row.first_prompt.as_deref(), Some("port the parser"));
     assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
     assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
-    assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
+    assert_eq!(row.models, vec!["anthropic/claude-sonnet".to_string()]);
     assert_eq!(
         row.raw_path.as_deref(),
         Some(home.path().join("opencode.db").to_string_lossy().as_ref()),
@@ -1557,6 +1619,93 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     let second = discover(&conn, home.path(), &only(&["opencode"]));
     assert_eq!(second.summary.skipped_unchanged, 1);
     assert_eq!(second.summary.counters.shallow_reads, 0);
+}
+
+/// Version 4 learned the provider from OpenCode messages but stored only the
+/// bare model ID. Since the provider database can remain byte-for-byte
+/// unchanged across an ai-hist upgrade, the scanner version is the only cache
+/// key that can make the corrected reader qualify an existing catalog row.
+#[test]
+fn an_opencode_row_from_scanner_v4_is_read_again_to_qualify_its_model() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-v4', '/work/oc', 1750000600000, 1750000700000);
+           INSERT INTO message VALUES ('m1', 'oc-v4', 1750000600000, '{"role":"user"}');
+           INSERT INTO message VALUES ('m2', 'oc-v4', 1750000700000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO part VALUES ('p1', 'm1', 'oc-v4', 1750000600000, '{"type":"text","text":"qualify the cached model"}');"#,
+    );
+
+    let initial = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        initial.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'opencode' \
+             AND session_id = 'oc-v4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1;
+    let previous = format!("v4:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, models_json = '[\"claude-sonnet\"]' \
+         WHERE source = 'opencode' AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(upgraded.summary.counters.shallow_reads, 1);
+    assert_eq!(upgraded.summary.skipped_unchanged, 0);
+    assert_eq!(
+        upgraded.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"],
+        "the v4 cached model must be replaced with the provider-qualified ID"
+    );
+
+    let settled = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+}
+
+#[test]
+fn opencode_model_order_rejects_payload_times_outside_i64() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-overflow', '/work/oc', 1, 2);
+           INSERT INTO message VALUES ('m1', 'oc-overflow', 1, '{"role":"assistant","time":{"created":9223372036854775808},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m2', 'oc-overflow', 2, '{"role":"assistant","time":{"created":2},"providerID":"anthropic","modelID":"claude-sonnet"}');"#,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        found.row("oc-overflow").models,
+        vec!["anthropic/claude-opus"],
+        "the out-of-i64 payload time must fall back to relational time_created"
+    );
 }
 
 /// A single opencode part can hold a whole pasted file. The excerpt is cut in
@@ -1623,6 +1772,96 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
     assert_eq!(row.cwd, None);
     assert_eq!(row.first_prompt, None);
     assert!(row.models.is_empty());
+
+    // `time_created` is optional in older message schemas. Discovery still
+    // filters to assistant messages and deterministically falls back to id.
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE INDEX message_session_id_idx ON message(session_id, id); \
+         INSERT INTO session VALUES ('ses_legacy_message'); \
+         INSERT INTO message VALUES ('m1', 'ses_legacy_message', \
+             '{\"role\":\"user\",\"time\":{\"created\":1},\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
+         INSERT INTO message VALUES ('m2', 'ses_legacy_message', \
+             '{\"role\":\"assistant\",\"time\":{\"created\":2},\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let legacy = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        legacy.row("ses_legacy_message").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+}
+
+#[test]
+fn opencode_pins_the_json_layout_between_enumeration_and_read() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let storage = home.path().join("storage");
+    write(
+        &storage.join("session/global/ses_tree.json"),
+        r#"{"id":"ses_tree","directory":"/work/tree","time":{"created":10,"updated":20}}"#,
+    );
+    write(
+        &storage.join("message/ses_tree/msg_tree.json"),
+        r#"{"id":"msg_tree","sessionID":"ses_tree","role":"user","time":{"created":10}}"#,
+    );
+    write(
+        &storage.join("part/msg_tree/part_tree.json"),
+        r#"{"id":"part_tree","sessionID":"ses_tree","messageID":"msg_tree","type":"text","text":"tree prompt"}"#,
+    );
+
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let candidate = provider.enumerate(&env, None).unwrap().remove(0);
+    assert!(candidate.locator.ends_with("ses_tree.json"));
+
+    // Current OpenCode creates SQLite while this discovery pass still holds
+    // JSON-tree locators. Re-detecting here would look up the file path as a
+    // SQLite session id and silently return no row.
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_sqlite', '/work/sqlite', 30, 40);",
+    );
+    let row = provider
+        .read_shallow(&env.scan(), None, &candidate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id, "ses_tree");
+    assert_eq!(row.first_prompt.as_deref(), Some("tree prompt"));
+}
+
+#[test]
+fn opencode_redetects_its_layout_on_the_next_registry_pass() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let providers: [&dyn ShallowSessionProvider; 1] = [&provider];
+    let options = only(&["opencode"]);
+
+    let first = discover_sessions_with_provider_refs(&env, &options, &providers, |_| {}).unwrap();
+    assert_eq!(first.providers["opencode"].candidates, 0);
+
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_later', '/work/later', 30, 40);",
+    );
+    let mut rows = Vec::new();
+    discover_sessions_with_provider_refs(&env, &options, &providers, |row| {
+        rows.push(row.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_later"],
+        "a reusable registry must not keep the previous pass's absent layout"
+    );
 }
 
 #[test]
@@ -1670,6 +1909,11 @@ fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
         db.execute(
             "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"bounded-model\"}')",
             params![message, id, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"assistant\",\"modelID\":\"bounded-model\"}')",
+            params![format!("assistant_{index:06}"), id, index + 1],
         )
         .unwrap();
         db.execute(
@@ -1792,10 +2036,27 @@ fn opencode_selected_session_queries_use_provider_indexes() {
 
     let model = explain_details(
         &db,
-        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+        "SELECT json_extract(data, '$.providerID'),
+                COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
-         AND COALESCE(json_extract(data, '$.modelID'),
-                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+         AND json_extract(data, '$.role') = 'assistant'
+         AND COALESCE(
+               CASE WHEN json_type(data, '$.time.created') = 'integer'
+                    AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                    THEN json_extract(data, '$.time.created') END,
+               time_created
+             ) IS NOT NULL
+         AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
+              OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
+                                 json_extract(data, '$.model.modelID')), '') IS NOT NULL)
+         ORDER BY COALESCE(
+                    CASE WHEN json_type(data, '$.time.created') = 'integer'
+                         AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                         THEN json_extract(data, '$.time.created') END,
+                    time_created
+                  ) ASC,
+                  id ASC
+         LIMIT 1",
         [],
     );
     assert!(
@@ -1885,8 +2146,9 @@ fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
          CREATE INDEX part_message_id_id_idx ON part(message_id, id);
          INSERT INTO session VALUES ('ses_ffffffffffffold', '/old', 1, 1000);
          INSERT INTO session VALUES ('ses_000000000000new', '/new', 2, 2);
-         INSERT INTO message VALUES ('m_new', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"fallback-model\"}');
-         INSERT INTO part VALUES ('p_new', 'm_new', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
+         INSERT INTO message VALUES ('m_new_user', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"requested-model\"}');
+         INSERT INTO message VALUES ('m_new_assistant', 'ses_000000000000new', 3, '{\"role\":\"assistant\",\"modelID\":\"fallback-model\"}');
+         INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
     )
     .unwrap();
     let plan = explain_details(
@@ -1925,8 +2187,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_snapshot', '/work/oc', 10, 20);
-         INSERT INTO message VALUES ('m_old', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-model\"}');
-         INSERT INTO part VALUES ('p_old', 'm_old', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
+         INSERT INTO message VALUES ('m_old_user', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-requested-model\"}');
+         INSERT INTO message VALUES ('m_old_assistant', 'ses_snapshot', 11, '{\"role\":\"assistant\",\"modelID\":\"old-model\"}');
+         INSERT INTO part VALUES ('p_old', 'm_old_user', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
     );
     let writer = Connection::open(home.path().join("opencode.db")).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -1936,8 +2199,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     let candidate = provider.enumerate(&env, Some(1)).unwrap().remove(0);
     writer
         .execute_batch(
-            "INSERT INTO message VALUES ('m_new', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-model\"}');
-             INSERT INTO part VALUES ('p_new', 'm_new', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
+            "INSERT INTO message VALUES ('m_new_user', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-requested-model\"}');
+             INSERT INTO message VALUES ('m_new_assistant', 'ses_snapshot', 6, '{\"role\":\"assistant\",\"modelID\":\"new-model\"}');
+             INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
              UPDATE session SET time_updated = 30 WHERE id = 'ses_snapshot';",
         )
         .unwrap();

@@ -51,9 +51,10 @@ use napi_derive::napi;
 /// work and the project-identity work were developed in parallel and both
 /// claimed 16; a merged addon carries both, so it cannot answer with a
 /// number either side already published.
-/// 18 adds the per-request usage surface developed in parallel with those
-/// changes.
-pub const NATIVE_CONTRACT_VERSION: u32 = 18;
+/// 18 was claimed independently by the upstream `provider` field and the
+/// per-request usage surface. The merged addon exposes both shapes, so it is
+/// 19 rather than identifying itself as either incompatible contract 18.
+pub const NATIVE_CONTRACT_VERSION: u32 = 19;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -282,6 +283,9 @@ pub struct NativeSessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The upstream inference provider the harness named, when it names one
+    /// (OpenCode's `providerID`). Null elsewhere rather than inferred.
+    pub provider: Option<String>,
     pub event_uid: String,
     /// Per-tool-result fidelity. Null on every row that is not a tool result,
     /// and on a tool-result row whose provider does not record the fact.
@@ -305,6 +309,7 @@ pub struct NativeSessionEvent {
     pub subagent_session_id: Option<String>,
     pub agent_id: Option<String>,
     pub request_id: Option<String>,
+    /// Why the turn ended, as the harness reported it.
     pub stop_reason: Option<String>,
     pub agent_version: Option<String>,
     pub is_sidechain: Option<bool>,
@@ -330,6 +335,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             text: event.text,
             model: event.model,
             token_json: event.token_json,
+            provider: event.provider,
             event_uid: event.event_uid,
             tool_use_id: event.tool_use_id,
             payload_bytes: event.payload_bytes,

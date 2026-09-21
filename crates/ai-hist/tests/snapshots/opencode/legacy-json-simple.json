@@ -6,14 +6,58 @@
   "file_edits": [],
   "fixture": "opencode/legacy-json-simple",
   "history": [],
-  "hydration": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_simple",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
   "layout": "OpencodeLegacyJson",
   "notes": [],
   "origin": "burn",
   "quirk": "legacy `storage/{session,message,part}` JSON layout: one session, three parts",
-  "session_events": [],
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_simple_2",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_simple_asst",
+      "model": "anthropic/claude-sonnet-4-5",
+      "parent_id": "msg_simple_user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_simple",
+      "source": "opencode",
+      "text": "Hello.",
+      "token_json": "{\"cache\":{\"read\":500,\"write\":80},\"input\":10,\"output\":5,\"reasoning\":0}",
+      "ts_ms": 1776988802000
+    }
+  ],
   "session_relationships": [],
-  "sessions": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776988800000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776988803000,
+      "last_assistant_text": "Hello.",
+      "models_json": "[\"anthropic/claude-sonnet-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_simple.json",
+      "repo_url": null,
+      "session_id": "ses_simple",
+      "source": "opencode",
+      "source_stamp": "1297:6:<n>:c4c358f20afa1be3",
+      "workspace_roots_json": null
+    }
+  ],
   "source": "opencode",
   "tool_calls": []
 }

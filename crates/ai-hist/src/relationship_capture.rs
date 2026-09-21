@@ -100,6 +100,27 @@ impl ObservedRelationship<'_> {
 /// merged with `COALESCE` so a later, thinner observation cannot erase agent
 /// metadata an earlier one captured.
 pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_>) -> Result<()> {
+    record_relationship_with_child_model_mode(conn, observed, false)
+}
+
+/// Record a provider-owned snapshot whose absent model clears the prior one.
+///
+/// Most callers contribute partial observations, so [`record_relationship`]
+/// preserves richer metadata with `COALESCE`. OpenCode re-reads the complete
+/// child session, making a missing model an observed removal rather than a
+/// thinner observation.
+pub(crate) fn record_relationship_replacing_child_model(
+    conn: &Connection,
+    observed: &ObservedRelationship<'_>,
+) -> Result<()> {
+    record_relationship_with_child_model_mode(conn, observed, true)
+}
+
+fn record_relationship_with_child_model_mode(
+    conn: &Connection,
+    observed: &ObservedRelationship<'_>,
+    replace_child_model: bool,
+) -> Result<()> {
     let now = now_ms();
     // An observation that finally names the child supersedes the unlinked row
     // an earlier provider version left for the same artifact: one file is not
@@ -133,7 +154,8 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
            identity_status  = excluded.identity_status, \
            child_agent_type = COALESCE(excluded.child_agent_type, session_relationships.child_agent_type), \
            child_agent_name = COALESCE(excluded.child_agent_name, session_relationships.child_agent_name), \
-           child_model      = COALESCE(excluded.child_model,      session_relationships.child_model), \
+           child_model      = CASE WHEN ? THEN excluded.child_model \
+                                   ELSE COALESCE(excluded.child_model, session_relationships.child_model) END, \
            spawn_depth      = COALESCE(excluded.spawn_depth,      session_relationships.spawn_depth), \
            evidence_kind    = excluded.evidence_kind, \
            evidence_locator = COALESCE(excluded.evidence_locator, session_relationships.evidence_locator), \
@@ -161,6 +183,7 @@ pub fn record_relationship(conn: &Connection, observed: &ObservedRelationship<'_
             now,
             now,
             observed.origin_session_id,
+            replace_child_model,
         ],
     )?;
     Ok(())

@@ -150,8 +150,9 @@ test('local discovery, hydration and cached evidence survive malformed commercia
   });
 });
 
-// OpenCode is the remaining prompt-only local parser: its reader indexes
-// `history` rows and nothing else. Cursor and Grok both write events now.
+// A minimal OpenCode session still exercises the complete parser contract:
+// full capability describes the evidence kinds the provider can produce, not
+// whether this particular one-turn fixture happened to use a tool.
 async function opencodeSession(home: string, sessionId: string): Promise<void> {
   const { DatabaseSync } = await import('node:sqlite');
   const path = join(home, '.local', 'share', 'opencode', 'opencode.db');
@@ -170,28 +171,22 @@ async function opencodeSession(home: string, sessionId: string): Promise<void> {
   db.close();
 }
 
-// The bug this replaced: a prompt-only provider reported `full`, so the SDK's
-// merge ranking preferred it over a presence that actually had the events.
-test('a prompt-only provider reports partial capability and names the evidence nobody parsed', { skip: needsNodeSqlite }, async () => {
+test('OpenCode reports full capability and stores normalized events', { skip: needsNodeSqlite }, async () => {
   await withFixture(async ({ home, dbPath }) => {
     await opencodeSession(home, 'oc-contract');
     await discoverSessions({ dbPath, scope: 'local', sources: ['opencode'] });
     const hydrated = await hydrateSession({ source: 'opencode', sessionId: 'oc-contract', dbPath });
 
     assert.equal(hydrated.contractVersion, SESSION_HYDRATION_CONTRACT_VERSION);
-    assert.equal(hydrated.capability, 'partial');
-    assert.deepEqual(hydrated.coverage, ['history']);
-    // Partial is about the kinds no parser produces, not about this pass
-    // having failed: the prompt it can read did land.
+    assert.equal(hydrated.capability, 'full');
+    assert.deepEqual(hydrated.coverage, [...FULL_SESSION_KINDS]);
     assert.equal(hydrated.evidence.prompts, 1);
-    assert.equal(hydrated.evidence.events, 0);
+    assert.equal(hydrated.evidence.events, 1);
     assert.equal((await search('openeedle', { dbPath, scope: 'local' })).length, 1);
-
-    const partial = hydrated.diagnostics.find((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE');
-    assert.ok(partial, 'a partial hydration names its missing evidence kinds');
-    for (const kind of FULL_SESSION_KINDS.filter((item) => item !== 'history')) {
-      assert.ok(partial.message.includes(kind), `${kind} is named: ${partial.message}`);
-    }
+    assert.equal(
+      hydrated.diagnostics.some((item) => item.code === 'HYDRATION_PARTIAL_COVERAGE'),
+      false,
+    );
   });
 });
 

@@ -1343,6 +1343,7 @@ mod tests {
             text: Some(text.to_string()),
             model: None,
             token_json: token_json.map(str::to_string),
+            provider: None,
             event_uid: format!("{message_id}:0"),
             tool_use_id: None,
             payload_bytes: None,

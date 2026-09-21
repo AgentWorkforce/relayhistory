@@ -1,7 +1,8 @@
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
-    sync_opencode_session, HistoryEntry, NewSessionMarker, SessionLocation, SessionScope,
+    sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
+    SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -19,13 +20,20 @@ pub(crate) mod cursor;
 pub(crate) mod grok;
 pub(crate) mod hydrate;
 pub(crate) mod jsonl;
+pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
+
+/// `session_markers.kind` for the point a harness compacted its context. The
+/// turns either side of it are real, but the model's view of everything
+/// before it was replaced by a summary, so a consumer reading straight across
+/// the boundary is reading two different contexts as one.
+pub(crate) const OPENCODE_MARKER_COMPACTION_BOUNDARY: &str = "compaction_boundary";
 
 use crate::diagnostics::*;
 use crate::discover;
 #[cfg(test)]
 use crate::history_search::{search_all, SearchRole};
-use crate::paths::home_dir;
+use crate::paths::{default_opencode_storage_dir, home_dir};
 use crate::remote;
 
 pub use crate::discover::{
@@ -632,11 +640,35 @@ fn sync_basic(conn: &Connection, db_path: &Path, roots: &crate::ProviderRoots) -
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
     let opencode = roots.opencode_db.clone();
-    if let Some(open_inserted) = report.capture("opencode", sync_opencode_db(conn, &opencode)) {
-        if opencode.exists() {
-            sync_note!("  [opencode] +{open_inserted} rows");
-        } else {
-            sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
+    let opencode_storage = roots.opencode_storage_dir.clone();
+    // One owner, two layouts: `opencode.db` when the host has it, the legacy
+    // `storage/` tree when it does not. Never both — a host that upgraded has
+    // a stale tree sitting beside a live database.
+    //
+    // Asked once, through the same `detect` that discovery and hydration use.
+    // Asking it a second way here is how the two came apart: `exists()` is
+    // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
+    // SQLite and failed while detect read the legacy tree — catalog rows with
+    // no evidence behind them, and nothing saying why.
+    let layout = crate::ingest::opencode::OpencodeLayout::detect(&opencode, &opencode_storage);
+    let opencode_result = match &layout {
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_opencode_storage_dir(conn, tree)
+        }
+        None => Ok(0),
+    };
+    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
+        match &layout {
+            Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
+                sync_note!("  [opencode] +{open_inserted} rows");
+            }
+            Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+                sync_note!("  [opencode] +{open_inserted} rows from {}", tree.display());
+            }
+            None => {
+                sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
+            }
         }
         total_inserted += open_inserted;
     }
@@ -777,14 +809,35 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         return Ok(false);
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let inserted = sync_opencode_db(&conn, opencode_path)
-        .map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_note!("  [opencode] +{inserted} rows");
+    // Through `detect`, like every other path that has to decide what an
+    // OpenCode store *is*. This one asked for SQLite outright, so a host that
+    // only has the legacy `storage/` tree got discovery's catalog rows and no
+    // evidence at all behind them -- and an `OPENCODE_DB` naming a directory
+    // was opened as SQLite and failed, rather than falling through to the tree
+    // beside it. `sync --local` has classified this way since the layout gate
+    // landed; this path was simply never brought along.
+    let storage_dir = default_opencode_storage_dir();
+    let layout = crate::ingest::opencode::OpencodeLayout::detect(opencode_path, &storage_dir);
+    let inserted = match &layout {
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(&conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_opencode_storage_dir(&conn, tree)
+        }
+        None => Ok(0),
+    }
+    .map_err(|error| enrich_sync_error(db_path, error))?;
+    match &layout {
+        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_note!("  [opencode] +{inserted} rows from {}", tree.display());
+        }
+        _ => sync_note!("  [opencode] +{inserted} rows"),
+    }
     let home = home_dir();
     let env = DiscoveryEnv::with_provider_roots(
         &conn,
         crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
-    );
+    )
+    .with_opencode_storage_dir(storage_dir);
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()
@@ -5254,7 +5307,7 @@ fn ingest_claude_transcript_as(
                 // `tool_result` content block: both normalize to
                 // `kind = "tool_result"`, and the normalized vocabulary is
                 // deliberately not widened to carry the distinction.
-                insert_session_event_with_raw_kind(
+                insert_session_event_with_provenance(
                     conn,
                     "claude",
                     session_id,
@@ -5267,6 +5320,10 @@ fn ingest_claude_transcript_as(
                     "tool_result",
                     "tool_result",
                     notification_text,
+                    None,
+                    None,
+                    // Claude records neither an inference provider nor a
+                    // stop reason on this record.
                     None,
                     None,
                     identity,
@@ -5540,7 +5597,7 @@ fn ingest_claude_transcript_as(
                     let facts = tool_result_facts::claude_tool_result_facts(block)
                         .with_ordering(call_index, event_index);
                     let text = materialize_tool_result_text(content);
-                    insert_session_event_with_raw_kind(
+                    insert_session_event_with_provenance(
                         conn,
                         "claude",
                         session_id,
@@ -5555,6 +5612,8 @@ fn ingest_claude_transcript_as(
                         text.as_deref(),
                         model,
                         token_json.as_deref(),
+                        None,
+                        None,
                         identity,
                         &event_uid,
                         Some(&facts),
@@ -6228,10 +6287,8 @@ fn codex_marker_for_payload(
 /// `stop`, `length`, …). Stored as written, exactly like Claude's
 /// `message.stop_reason`; consumers map it to their own enum.
 ///
-/// The OpenCode adapter currently ingests prompt history only, so nothing calls
-/// this yet — the event-level parity work (#168) is what wires it into the
-/// assistant rows. It is landed with the column so that work is a call site
-/// rather than a schema change.
+/// The event-level OpenCode parser uses the equivalent shared normalizer; this
+/// helper keeps the envelope-facts regression test explicit at this layer.
 #[allow(dead_code)]
 fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
     (part.get("type").and_then(Value::as_str) == Some("step-finish"))
@@ -6325,6 +6382,9 @@ impl<'a> RequestIdentity<'a> {
     }
 }
 
+/// For providers that do not record an upstream inference provider.
+/// OpenCode does, so it calls [`insert_session_event_with_provenance`]
+/// directly. Stop reasons for every provider travel in [`RawMessageFacts`].
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event(
     conn: &Connection,
@@ -6349,7 +6409,7 @@ fn insert_session_event(
     tool_result_facts: Option<&ToolResultFacts>,
     raw_facts: RawMessageFacts<'_>,
 ) -> Result<()> {
-    insert_session_event_with_raw_kind(
+    insert_session_event_with_provenance(
         conn,
         source,
         session_id,
@@ -6364,6 +6424,8 @@ fn insert_session_event(
         text,
         model,
         token_json,
+        None,
+        None,
         identity,
         event_uid,
         tool_result_facts,
@@ -6372,16 +6434,23 @@ fn insert_session_event(
     )
 }
 
-/// As [`insert_session_event`], additionally recording the provider-native
-/// record or block type the event came from.
+/// One normalized event, including the columns only some providers can
+/// fill.
 ///
-/// Two very different provider records normalize to `kind = "tool_result"`: a
-/// `tool_result` content block, and a `type: "system"` subagent notification
-/// that reports a delegated call finishing. `raw_kind` is what keeps them
-/// apart without widening the normalized `kind` vocabulary, which downstream
-/// readers switch on exhaustively.
+/// `provider` is the upstream inference provider, which OpenCode records as
+/// `providerID`, and `stop_reason` is OpenCode's last `step-finish.reason`.
+/// Both stay null for a provider that does not record them rather than being
+/// inferred from the model string, which is a consumer's job and not a
+/// parser's.
+///
+/// `raw_kind` is the provider-native record or block type the event came
+/// from. Two very different provider records normalize to
+/// `kind = "tool_result"`: a `tool_result` content block, and a
+/// `type: "system"` subagent notification reporting a delegated call
+/// finishing. It keeps them apart without widening the normalized `kind`
+/// vocabulary, which downstream readers switch on exhaustively.
 #[allow(clippy::too_many_arguments)]
-fn insert_session_event_with_raw_kind(
+fn insert_session_event_with_provenance(
     conn: &Connection,
     source: &str,
     session_id: &str,
@@ -6396,6 +6465,8 @@ fn insert_session_event_with_raw_kind(
     text: Option<&str>,
     model: Option<&str>,
     token_json: Option<&str>,
+    provider: Option<&str>,
+    stop_reason: Option<&str>,
     identity: RequestIdentity<'_>,
     event_uid: &str,
     tool_result_facts: Option<&ToolResultFacts>,
@@ -6442,29 +6513,29 @@ fn insert_session_event_with_raw_kind(
     let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
     conn.execute(
         "INSERT INTO session_events \
-         (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, event_uid, \
+         (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind) \
          VALUES (?1, ?2, ?3, \
-           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?15), \
+           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
                 THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
-                ELSE ?16 END, \
-           ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-           ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37) \
+                ELSE ?17 END, \
+           ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+           ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
-         project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?15), \
+         project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
          project_key_method=CASE \
            WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
              THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
            WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
-           ELSE ?16 END, \
+           ELSE ?17 END, \
          cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json, \
+         model=excluded.model, token_json=excluded.token_json, provider=excluded.provider, \
          tool_use_id=excluded.tool_use_id, payload_bytes=excluded.payload_bytes, \
          payload_truncated=excluded.payload_truncated, payload_hash=excluded.payload_hash, \
          call_index=excluded.call_index, event_index=excluded.event_index, \
@@ -6490,6 +6561,7 @@ fn insert_session_event_with_raw_kind(
             text,
             model,
             token_json,
+            provider,
             event_uid,
             resolved_key,
             resolved_method,
@@ -6506,7 +6578,7 @@ fn insert_session_event_with_raw_kind(
             tool_result_facts.agent_id,
             identity.request_id.or(raw_facts.request_id),
             identity.provider_message_id,
-            raw_facts.stop_reason,
+            stop_reason.or(raw_facts.stop_reason),
             raw_facts.agent_version,
             raw_facts.is_sidechain,
             raw_facts.is_meta,
@@ -22699,10 +22771,7 @@ mod tests {
     }
 
     /// OpenCode records the stop reason on a `step-finish` part rather than on
-    /// the message, and writes it as its own wire string. The mapping hook is
-    /// landed here; wiring it to real OpenCode events waits on the OpenCode
-    /// parity work (#168), which is why the end-to-end assertion below is
-    /// ignored rather than absent.
+    /// the message, and writes it as its own wire string.
     #[test]
     fn opencode_step_finish_reason_is_read_verbatim() {
         assert_eq!(
@@ -22725,13 +22794,8 @@ mod tests {
         );
     }
 
-    /// The end-to-end half of the OpenCode stop-reason contract. OpenCode sync
-    /// ingests prompt history only today, so no assistant event exists to carry
-    /// a stop reason and this cannot pass yet; the OpenCode event parity work
-    /// (#168) is what makes it green. It is written now so that work has a
-    /// failing test to satisfy rather than a field to remember.
+    /// The end-to-end half of the OpenCode stop-reason contract.
     #[test]
-    #[ignore = "OpenCode assistant events land with the OpenCode parity work (#168)"]
     fn opencode_assistant_events_carry_step_finish_stop_reason() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("opencode.db");
