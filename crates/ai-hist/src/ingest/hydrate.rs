@@ -6709,22 +6709,44 @@ mod tests {
              \"message\":{{\"role\":\"user\",\"content\":\"small\"}},\
              \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
         );
-        let huge = format!(
-            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"type\":\"user\",\
-             \"message\":{{\"role\":\"user\",\"content\":\"{}\"}},\
-             \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n",
-            "z".repeat(super::transcript_cursor::MAX_RECORD_BYTES as usize)
-        );
         let after = format!(
             "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-3\",\"cwd\":\"/w\",\"type\":\"user\",\
              \"message\":{{\"role\":\"user\",\"content\":\"after\"}},\
              \"timestamp\":\"2026-08-31T10:00:02Z\"}}\n"
         );
-        let transcript = seed_claude_transcript(
-            dir.path(),
-            session_id,
-            format!("{small}{huge}{after}").as_bytes(),
-        );
+        // Four times the ceiling, and streamed to disk a megabyte at a time.
+        // Both matter. A record merely *at* the ceiling cannot prove anything:
+        // the reader fills one ceiling-sized buffer before it can know the
+        // record is over, so that much is the floor of what skipping costs,
+        // not a defect. At four times the ceiling, a reader that *held* the
+        // record shows it plainly. And building it as a `String` here would
+        // put those bytes in this process's own high-water mark before the
+        // measurement starts, which is how a memory assertion comes to prove
+        // nothing at all.
+        let ceiling = super::transcript_cursor::MAX_RECORD_BYTES as usize;
+        let oversized_len = 4 * ceiling;
+        let transcript = seed_claude_transcript(dir.path(), session_id, small.as_bytes());
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            let head = format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/w\",\"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\""
+            );
+            std::io::Write::write_all(&mut file, head.as_bytes()).unwrap();
+            let chunk = vec![b'z'; 1024 * 1024];
+            let mut written = 0;
+            while written < oversized_len {
+                let take = chunk.len().min(oversized_len - written);
+                std::io::Write::write_all(&mut file, &chunk[..take]).unwrap();
+                written += take;
+            }
+            std::io::Write::write_all(&mut file, b"\"},\"timestamp\":\"2026-08-31T10:00:01Z\"}\n")
+                .unwrap();
+            std::io::Write::write_all(&mut file, after.as_bytes()).unwrap();
+        }
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "claude", session_id, Some(&transcript));
@@ -6746,12 +6768,18 @@ mod tests {
             .expect("a skipped record is reported, not silently dropped");
         assert_eq!(skipped.records_parsed, Some(1));
 
-        // Never held: the record is 16 MiB and the ceiling is the only thing
-        // between it and the allocator.
+        // Walked past, not held. The bound is the ceiling rather than the
+        // record: each walk fills at most one ceiling-sized buffer before it
+        // can tell the record is over, drops it, and covers the rest in 64 KiB
+        // chunks — so the cost is the same whether the record is one byte over
+        // the ceiling or a hundred times it. Three ceilings of room for two
+        // walks, because an allocator under no pressure is free to keep what
+        // it has already taken from the OS, and on some it does.
+        let bound = 3 * super::transcript_cursor::MAX_RECORD_BYTES;
         assert!(
-            growth < super::transcript_cursor::MAX_RECORD_BYTES,
-            "hydration grew peak RSS by {growth} bytes over a {} byte record",
-            super::transcript_cursor::MAX_RECORD_BYTES
+            growth < bound,
+            "hydration grew peak RSS by {growth} bytes reading past a {oversized_len} byte \
+             record; the ceiling allows {bound}"
         );
     }
 
