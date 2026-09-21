@@ -1,6 +1,6 @@
 //! Content-free, best-effort progress. A slow/offline status endpoint never blocks capture.
-use ai_hist::delivery;
 use relayhistory_plugin::cloud;
+use relayhistory_plugin::delivery;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -745,15 +745,25 @@ mod tests {
                 }),
                 None,
             ));
-            started.recv_timeout(Duration::from_secs(2)).unwrap();
-            let start = Instant::now();
-            if let Some(success) = success {
-                monitor.finish(success);
-            } else {
-                drop(monitor);
-            }
-            assert!(start.elapsed() < Duration::from_millis(100));
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (returned, completion) = mpsc::channel();
+            let finisher = thread::spawn(move || {
+                if let Some(success) = success {
+                    monitor.finish(success);
+                } else {
+                    drop(monitor);
+                }
+                returned.send(()).unwrap();
+            });
+            // Prove finish/drop returns while the reporter is still blocked.
+            // The watchdog bounds a regression, not scheduler or disk latency.
+            let completed_while_blocked = completion.recv_timeout(Duration::from_secs(5));
             release.send(()).unwrap();
+            finisher.join().unwrap();
+            assert!(
+                completed_while_blocked.is_ok(),
+                "finish/drop waited for the reporter"
+            );
             let final_phase = done.recv_timeout(Duration::from_secs(2));
             if success == Some(true) {
                 assert_eq!(final_phase.unwrap(), "scanning");

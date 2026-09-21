@@ -36,6 +36,7 @@
   "quirk": "legacy layout with a `tool` part and its completed state",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:toolu_bash_1",
       "git_branch": null,
@@ -52,6 +53,7 @@
       "ts_ms": 1776988812000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:toolu_edit_1",
       "git_branch": null,
@@ -68,6 +70,7 @@
       "ts_ms": 1776988812000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:toolu_read_1",
       "git_branch": null,
@@ -84,6 +87,7 @@
       "ts_ms": 1776988812000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:toolu_bash_1",
       "git_branch": null,
@@ -100,6 +104,7 @@
       "ts_ms": 1776988812000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:toolu_edit_1",
       "git_branch": null,
@@ -116,6 +121,7 @@
       "ts_ms": 1776988812000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:toolu_read_1",
       "git_branch": null,
@@ -132,6 +138,7 @@
       "ts_ms": 1776988812000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

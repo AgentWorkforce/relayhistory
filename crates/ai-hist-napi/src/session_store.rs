@@ -11,17 +11,26 @@
 //! the SDK normalizes both paths with one set of functions and a consumer
 //! cannot tell which boundary served a page.
 //!
-//! This module calls only the public facade and the crate's pure capability
-//! tables: no connection, no SQL.
+//! The facade owns every open: it decides whether the database on disk is one
+//! this version can read, migrates it when it is not, and answers with its own
+//! typed error enum, whose `code()` is already the vocabulary the SDK matches
+//! on. The pages themselves come from the crate's paged queries, because the
+//! facade's `SessionStore::session` answers with one whole session in
+//! provider-native identities while this boundary pages by the ledger's
+//! `(ts_ms, id)` keyset — the cursor every other native page hands back.
+//! Capabilities are answered from the crate's pure capability tables, with no
+//! database at all.
 use std::path::{Path, PathBuf};
 
 use ai_hist::{
-    declared_evidence_kinds, missing_evidence_kinds, relationship_capabilities, SessionEventCursor,
-    SessionEvidenceCursor, SessionRequestCursor, SessionStore, Source, StoreOptions,
-    SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
+    declared_evidence_kinds, missing_evidence_kinds, open_db_readonly, relationship_capabilities,
+    session_markers_page, session_requests_page, session_usage_summary, session_user_turns_page,
+    SessionEventCursor, SessionEvidenceCursor, SessionRequestCursor, SessionStore, Source,
+    StoreOptions, SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
     SESSION_RELATIONSHIP_CONTRACT_VERSION, SESSION_USAGE_CONTRACT_VERSION,
 };
 use napi_derive::napi;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -193,32 +202,52 @@ fn open_store(path: &Path, read_only: bool) -> Result<SessionStore, ai_hist::Err
     SessionStore::open(options)
 }
 
+/// A read connection on the database the facade has just accepted.
+///
+/// `SessionStore` opens one per call and keeps it; the open is where the
+/// schema gate and the migration decision live, which is the part a page must
+/// not re-derive. What it validated is then read here.
+fn read_conn(store: &SessionStore) -> Result<Connection, ai_hist::Error> {
+    open_db_readonly(store.db_path())
+        .map_err(|error| ai_hist::Error::DatabaseOpen(format!("{error:#}")))
+}
+
+/// A paged query's failure, in the facade's vocabulary.
+fn query(error: anyhow::Error) -> ai_hist::Error {
+    ai_hist::Error::Query(format!("{error:#}"))
+}
+
+/// One typed facade failure at the Node boundary.
+///
+/// The enum's `code()` is the SDK's own vocabulary, so it is forwarded rather
+/// than re-derived — except `QUERY_FAILED`, which every native read spells
+/// `DATABASE_QUERY_FAILED`.
 fn query_error(error: ai_hist::Error) -> napi::Error {
-    native_error("DATABASE_QUERY_FAILED", format!("{error:#}"))
+    match error.code() {
+        "QUERY_FAILED" => native_error("DATABASE_QUERY_FAILED", error.message()),
+        code => native_error(code, error.message()),
+    }
 }
 
 /// Run one facade read against the database at `path`.
 ///
 /// A read-only handle is tried first so a query never contends with a writer.
-/// The facade refuses a read-only handle over a database older than the shape
-/// it reads, and says so with a typed error; that one failure — and no other
-/// — is answered by reopening writable, which migrates the database exactly
-/// as the typed functions do, because a Node caller asked for a page, not for
-/// a store it promised not to write. Every other failure is the caller's
-/// answer as it stands: a writable reopen takes the writer lock and runs
-/// initialization, so retrying a genuine query failure through it would at
-/// best repeat the failure and at worst replace it with a contention error
-/// from a writer the read had no business meeting.
+/// A read-only `SessionStore::open` refuses a database older than the shape
+/// this version reads, and says so as `Error::StaleSchema`; that one failure
+/// — and no other — is answered by reopening writable, which migrates the
+/// database exactly as the typed functions do, because a Node caller asked
+/// for a page, not for a store it promised not to write. Every other failure
+/// is the caller's answer as it stands: a writable reopen takes the writer
+/// lock and runs initialization, so retrying a genuine query failure through
+/// it would at best repeat the failure and at worst replace it with a
+/// contention error from a writer the read had no business meeting. The read
+/// therefore runs exactly once.
 fn with_store<T>(
     path: PathBuf,
     read: impl Fn(&SessionStore) -> Result<T, ai_hist::Error>,
 ) -> napi::Result<T> {
     match open_store(&path, true) {
-        Ok(store) => match read(&store) {
-            Ok(value) => return Ok(value),
-            Err(error) if error.is_stale_schema() => {}
-            Err(error) => return Err(query_error(error)),
-        },
+        Ok(store) => return read(&store).map_err(query_error),
         Err(error) if error.is_stale_schema() => {}
         Err(error) => return Err(database_error(&path, format!("{error:#}"))),
     }
@@ -267,7 +296,14 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
             let path = db_path(args.db_path);
             let page = if path.exists() {
                 with_store(path, |store| {
-                    store.session_markers_page(source, &session_id, limit, after.as_ref())
+                    session_markers_page(
+                        &read_conn(store)?,
+                        source.as_str(),
+                        &session_id,
+                        limit,
+                        after.as_ref(),
+                    )
+                    .map_err(query)
                 })?
             } else {
                 ai_hist::SessionMarkerPage {
@@ -298,7 +334,14 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
             let path = db_path(args.db_path);
             let page = if path.exists() {
                 with_store(path, |store| {
-                    store.session_requests_page(source, &session_id, limit, after.as_ref())
+                    session_requests_page(
+                        &read_conn(store)?,
+                        source.as_str(),
+                        &session_id,
+                        limit,
+                        after.as_ref(),
+                    )
+                    .map_err(query)
                 })?
             } else {
                 ai_hist::SessionRequestPage {
@@ -325,7 +368,10 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
             let session_id = required_session_id(&mut args)?;
             let path = db_path(args.db_path);
             let summary = if path.exists() {
-                with_store(path, |store| store.session_usage(source, &session_id))?
+                with_store(path, |store| {
+                    session_usage_summary(&read_conn(store)?, source.as_str(), &session_id)
+                        .map_err(query)
+                })?
             } else {
                 None
             };
@@ -342,7 +388,14 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
             let path = db_path(args.db_path);
             let page = if path.exists() {
                 with_store(path, |store| {
-                    store.session_user_turns_page(source, &session_id, limit, after.as_ref())
+                    session_user_turns_page(
+                        &read_conn(store)?,
+                        source.as_str(),
+                        &session_id,
+                        limit,
+                        after.as_ref(),
+                    )
+                    .map_err(query)
                 })?
             } else {
                 ai_hist::SessionUserTurnPage {
@@ -536,7 +589,9 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let error = super::with_store::<()>(db, |_store| {
             calls.set(calls.get() + 1);
-            Err(anyhow::anyhow!("no such column: payload_json").into())
+            Err(super::query(anyhow::anyhow!(
+                "no such column: payload_json"
+            )))
         })
         .unwrap_err();
         assert_eq!(calls.get(), 1, "the read ran once, on the read-only store");
@@ -549,8 +604,9 @@ mod tests {
     }
 
     /// The one failure a writable reopen answers: a read-only store refusing
-    /// a database older than the shape it reads. The reopen migrates it and
-    /// the same read then succeeds.
+    /// a database older than the shape it reads. The facade raises that
+    /// refusal at `open`, before the read runs at all; the reopen migrates
+    /// the database and the read then succeeds against it.
     #[test]
     fn a_stale_schema_is_migrated_by_a_writable_reopen_and_read_again() {
         let dir = seeded_markers();
@@ -564,10 +620,15 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let page = super::with_store(db.clone(), |store| {
             calls.set(calls.get() + 1);
-            store.session_markers_page(ai_hist::Source::Claude, "sess-1", 10, None)
+            ai_hist::session_markers_page(&super::read_conn(store)?, "claude", "sess-1", 10, None)
+                .map_err(super::query)
         })
         .unwrap();
-        assert_eq!(calls.get(), 2, "read-only refusal, then the migrated read");
+        assert_eq!(
+            calls.get(),
+            1,
+            "the read-only open refused before the read; only the migrated one ran"
+        );
         assert_eq!(page.markers.len(), 3);
         // And through the dispatcher, the page is simply served.
         let served = call(

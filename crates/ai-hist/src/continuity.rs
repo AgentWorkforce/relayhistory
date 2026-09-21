@@ -1220,17 +1220,18 @@ fn record_resume_marker(
     let Some(text) = plain_user_text(object) else {
         return;
     };
-    let trimmed = text.trim();
-    let (command, rest) = if crate::discover::is_claude_control_prompt(trimmed) {
-        match wrapped_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
-    } else {
-        match bare_command(trimmed) {
-            Some(parsed) => parsed,
-            None => return,
-        }
+    // The same text ingestion classifies: a `<system-reminder>` Claude Code
+    // puts ahead of the wrapper is not the record's own text, and left in
+    // place it would hide the command from both parsers below.
+    let split = crate::ingest::control::split_system_reminders(&text);
+    let trimmed = split.prompt.as_str();
+    // The wrapped form first: a record that opens with a control tag is never
+    // a bare command, and `bare_command` refuses anything not starting with
+    // `/`, so an unparseable wrapper falls through to nothing rather than to
+    // a false match.
+    let Some((command, rest)) = wrapped_command(trimmed).or_else(|| bare_command(trimmed))
+    else {
+        return;
     };
     if command != "resume" && command != "continue" {
         return;
@@ -1262,20 +1263,20 @@ fn bare_command(text: &str) -> Option<(String, &str)> {
 ///
 /// `<command-args>` is absent when the command took none, and the elements can
 /// arrive in either order, so each is read independently rather than by
-/// position.
+/// position -- the same read `ingest::control` makes for the `slash_command`
+/// marker.
 fn wrapped_command(text: &str) -> Option<(String, &str)> {
-    let name = tag_body(text, "command-name")?;
+    if crate::ingest::control::claude_text_control_kind(text)
+        != Some(crate::ingest::control::ControlKind::SlashCommandInvocation)
+    {
+        return None;
+    }
+    let name = crate::ingest::control::tag_body(text, "command-name")?;
     let command = name.trim().trim_start_matches('/').to_lowercase();
-    let args = tag_body(text, "command-args").unwrap_or("").trim_start();
+    let args = crate::ingest::control::tag_body(text, "command-args")
+        .unwrap_or("")
+        .trim_start();
     Some((command, args))
-}
-
-fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(&text[start..end])
 }
 
 /// The user's own typed text, from either content shape. Tool results and
@@ -1865,6 +1866,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![RELATIONSHIP_RESUME.to_string()]
         );
+    }
+
+    /// Claude Code can put a `<system-reminder>` block ahead of the wrapper
+    /// on the same record. Ingestion classifies the record with the reminder
+    /// removed, and continuity has to read the same text, or the resume the
+    /// ledger types as a slash command is a resume the graph never sees.
+    #[test]
+    fn a_reminder_ahead_of_a_wrapped_resume_does_not_hide_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reminded.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"reminded\",\"uuid\":\"u1\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[",
+                "{\"type\":\"text\",\"text\":\"<system-reminder>\\nbrief mode\\n</system-reminder>\"},",
+                "{\"type\":\"text\",\"text\":\"<command-message>resume is running…</command-message>\\n",
+                "<command-name>/resume</command-name>\\n",
+                "<command-args>prior-session</command-args>\"}]},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target.as_deref(), Some("prior-session"));
+
+        // And the bare form under the same reminder.
+        let path = dir.path().join("reminded-bare.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"reminded-bare\",\"uuid\":\"u1\",\"parentUuid\":null,",
+                "\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":",
+                "\"<system-reminder>brief</system-reminder>\\n/continue prior-session\"},",
+                "\"timestamp\":\"2026-08-31T10:00:00Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let evidence = scan_claude_transcript(&path).unwrap().unwrap();
+        assert!(evidence.has_resume_marker);
+        assert_eq!(evidence.resume_target.as_deref(), Some("prior-session"));
     }
 
     #[test]

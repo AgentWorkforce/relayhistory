@@ -28,6 +28,7 @@
   "quirk": "one user turn and one complete assistant turn with full usage, preceded by a `permission-mode` control record",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -58,6 +60,21 @@
       "text": "Hello!",
       "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":20,\"ephemeral_5m_input_tokens\":80},\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":500,\"input_tokens\":10,\"output_tokens\":5,\"service_tier\":\"standard\"}",
       "ts_ms": 1776643201000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "unknown",
+      "marker_uid": "simple-turn:sha256:8f3bfda087a13342:marker",
+      "message_id": "simple-turn:sha256:8f3bfda087a13342",
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "11111111-1111-1111-1111-111111111111",
+      "source": "claude",
+      "subkind": "permission-mode",
+      "text": null,
+      "ts_ms": null,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

@@ -68,6 +68,7 @@
   "quirk": "documented Grok Build layout: `chat_history.jsonl` with `tool_calls[]`, ACP `updates.jsonl` with real `agentTimestampMs` times, `compaction_checkpoints/`, `subagents/`, `signals.json` and `prompt_context.json`",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0001",
       "git_branch": "feat/http-retry",
@@ -84,6 +85,7 @@
       "ts_ms": 1789560000000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0002",
       "git_branch": "feat/http-retry",
@@ -100,6 +102,7 @@
       "ts_ms": 1789560003000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0003",
       "git_branch": "feat/http-retry",
@@ -116,6 +119,7 @@
       "ts_ms": 1789560005000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "tool:call_shell_1",
       "git_branch": "feat/http-retry",
@@ -132,6 +136,7 @@
       "ts_ms": 1789560007000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "result:call_shell_1",
       "git_branch": "feat/http-retry",
@@ -148,6 +153,7 @@
       "ts_ms": 1789560011000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "tool:call_edit_1",
       "git_branch": "feat/http-retry",
@@ -164,6 +170,7 @@
       "ts_ms": 1789560014000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "result:call_edit_1",
       "git_branch": "feat/http-retry",
@@ -180,6 +187,7 @@
       "ts_ms": 1789560019000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0009",
       "git_branch": "feat/http-retry",
@@ -196,6 +204,7 @@
       "ts_ms": 1789560120000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0010",
       "git_branch": "feat/http-retry",
@@ -212,6 +221,7 @@
       "ts_ms": 1789560124000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "tool:call_write_1",
       "git_branch": "feat/http-retry",
@@ -228,6 +238,7 @@
       "ts_ms": 1789560129000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "result:call_write_1",
       "git_branch": "feat/http-retry",
@@ -244,6 +255,7 @@
       "ts_ms": 1789560131000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "tool:call_shell_2",
       "git_branch": "feat/http-retry",
@@ -260,6 +272,7 @@
       "ts_ms": 1789560133000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "result:call_shell_2",
       "git_branch": "feat/http-retry",
@@ -276,6 +289,7 @@
       "ts_ms": 1789560135000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/demo",
       "event_uid": "ev:ev_0015",
       "git_branch": "feat/http-retry",
@@ -290,6 +304,86 @@
       "text": "The test fails; fixing next.",
       "token_json": "{\"context_total_tokens\":9210,\"source\":\"updates.jsonl\"}",
       "ts_ms": 1789560137000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "system",
+      "marker_uid": "r0",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": null,
+      "text": "You are Grok, an AI coding assistant. Follow /tmp/demo/AGENTS.md.",
+      "ts_ms": 1789560000000,
+      "turn_id": null
+    },
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "compaction:1789560090000.json",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"created_at\":\"2026-09-16T12:01:30.000Z\",\"reason\":\"auto\",\"tokens_after\":4096,\"tokens_before\":18432}",
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": "compaction_checkpoint",
+      "text": "<home>/.grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001/compaction_checkpoints/1789560090000.json",
+      "ts_ms": 1789560090000,
+      "turn_id": null
+    },
+    {
+      "kind": "encrypted_reasoning",
+      "marker_uid": "r16",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": "reasoning",
+      "text": null,
+      "ts_ms": 1789560120000,
+      "turn_id": null
+    },
+    {
+      "kind": "synthetic_turn",
+      "marker_uid": "r9",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"synthetic_reason\":\"compaction\"}",
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": null,
+      "text": "<system-reminder>context window compacted</system-reminder>",
+      "ts_ms": 1789560120000,
+      "turn_id": null
+    },
+    {
+      "kind": "signals",
+      "marker_uid": "signals",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"compactionCount\":1,\"contextTokensUsed\":9210,\"toolFailures\":1,\"turnCount\":2}",
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": null,
+      "text": "turns=2 compactions=1 context_tokens_used=9210",
+      "ts_ms": 1789560138000,
+      "turn_id": null
+    },
+    {
+      "kind": "prompt_context",
+      "marker_uid": "prompt_context",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"bytes\":112,\"path\":\"<home>/.grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001/prompt_context.json\",\"sha256\":\"c24cf6585a47898ada73009a64ff1e3f6ca14bc33abfac9df7d7720d20c1adda\"}",
+      "session_id": "grok-evt-0001",
+      "source": "grok",
+      "subkind": null,
+      "text": "<home>/.grok/sessions/%2Ftmp%2Fdemo/grok-evt-0001/prompt_context.json",
+      "ts_ms": null,
+      "turn_id": null
     }
   ],
   "session_relationships": [

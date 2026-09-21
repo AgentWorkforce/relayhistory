@@ -1,8 +1,9 @@
 //! Local coding-agent session history.
 //!
 //! The default public surface is [`SessionStore`] plus the evidence types an
-//! embedder reads back. Workspace crates enable `unstable-internal` for the
-//! maintenance APIs that still take a raw database connection.
+//! embedder reads back — see `docs/sourcing-sdk.md`. Workspace crates enable
+//! `unstable-internal` for the maintenance APIs that still take a raw database
+//! connection.
 
 macro_rules! workspace_mod {
     ($name:ident) => {
@@ -35,16 +36,12 @@ workspace_mod!(remote);
 workspace_mod!(source_intake);
 workspace_mod!(sources);
 workspace_mod!(watch);
+mod change_feed;
 mod file_lock;
 mod jsonl_temp;
 mod session_store;
 mod session_usage;
 mod usage;
-
-#[cfg(all(feature = "delivery", feature = "unstable-internal"))]
-pub mod delivery;
-#[cfg(all(feature = "delivery", not(feature = "unstable-internal")))]
-pub(crate) mod delivery;
 
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_helpers;
@@ -55,7 +52,8 @@ pub mod git_sdk;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
 mod git_sdk;
 
-pub(crate) use paths::{home_dir, ProviderRoots};
+pub(crate) use paths::home_dir;
+pub use paths::ProviderRoots;
 pub(crate) use relationship_capture::now_ms;
 #[cfg(feature = "unstable-internal")]
 pub use relationship_graph as relationships;
@@ -72,15 +70,24 @@ pub use store::*;
 #[cfg(not(feature = "unstable-internal"))]
 pub(crate) use store::*;
 
-pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
+pub use change_feed::{
+    Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, Watermark,
+    DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
+};
+pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_store::{
-    Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
+    Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, ControlKind,
+    Diagnostic, DiscoveryState, Error, FileEdit, HydrateOptions, HydrateReport, HydrateStatus,
+    Marker, Message, MessageIdOrigin, Prompt, Relationship, RelationshipSide, Role,
+    SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, SourceCapabilities,
+    StoreOptions, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
+    WatchOptions, WatchScope, WatchStop, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
-/// through [`SessionStore::session_requests_page`] and
-/// [`SessionStore::session_usage`], which open the store's configured path
-/// read-only; these are for the workspace crates that already hold a
-/// connection.
+/// through [`SessionStore::session`], whose `requests` and `usage` fields
+/// carry the same grouping; these are for the workspace crates that already
+/// hold a connection.
 #[cfg(feature = "unstable-internal")]
 pub use session_usage::{session_requests_page, session_usage_summary};
 pub use session_usage::{
@@ -92,11 +99,7 @@ pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
 };
-
-/// Reachable without `unstable-internal` so a crate that only builds the
-/// default surface still sees the same grouping rules the store applies.
-#[cfg(not(feature = "unstable-internal"))]
-pub(crate) use session_usage::{session_requests_page, session_usage_summary};
+pub use watch::{TickTrigger, WatchDriver};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
@@ -118,3 +121,6 @@ pub mod internal {
     pub use crate::store::*;
     pub use crate::usage::*;
 }
+
+#[cfg(feature = "export")]
+pub mod export;

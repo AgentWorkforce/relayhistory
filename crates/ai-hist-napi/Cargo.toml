@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-ai-hist = { path = "../ai-hist", features = ["delivery", "opencode-backup", "git-hooks", "unstable-internal"] }
+ai-hist = { path = "../ai-hist", features = ["export", "opencode-backup", "git-hooks", "unstable-internal"] }
 anyhow = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

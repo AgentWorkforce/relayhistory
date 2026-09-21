@@ -1,6 +1,6 @@
 //! Versioned durable transport. The local coordinator persists prepared bytes and owns retries.
 use crate::cloud;
-use ai_hist::delivery::{
+use crate::delivery::{
     worker::{PreparedBody, Receiver, ReceiverContext, ReceiverFailure},
     AcceptanceLevel, DeliveryAcknowledgment, DeliveryFailure, HistoryExportBatch, PreparedPayload,
     SUPPORTED_KINDS,
@@ -8,7 +8,11 @@ use ai_hist::delivery::{
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, io::Read, time::Duration};
+use std::{
+    collections::HashSet,
+    io::Read,
+    time::{Duration, Instant},
+};
 pub const MAPPING_VERSION: &str = "relayhistory-delivery-v1";
 pub const MAX_BODY_BYTES: usize = 2_097_152;
 pub const MAX_BATCH_RECORDS: usize = 100;
@@ -208,6 +212,43 @@ fn response_json(response: ureq::Response) -> Result<serde_json::Value> {
 }
 /// Send persisted bytes unchanged. No cursor, queue or acknowledgment is mutated here.
 pub fn send(base_url: Option<&str>, prepared: &PreparedPayload) -> Result<DeliveryAcknowledgment> {
+    let context = ReceiverContext {
+        cancelled: &|| false,
+        timeout_ms: 30_000,
+        idempotency_key: "",
+    };
+    send_with_budget(base_url, prepared, &CallBudget::new(&context))
+}
+
+struct CallBudget<'a> {
+    started: Instant,
+    timeout: Duration,
+    cancelled: &'a dyn Fn() -> bool,
+}
+impl<'a> CallBudget<'a> {
+    fn new(context: &ReceiverContext<'a>) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout: Duration::from_millis(context.timeout_ms.max(0) as u64),
+            cancelled: context.cancelled,
+        }
+    }
+    fn remaining(&self) -> Result<Duration> {
+        let remaining = self.timeout.saturating_sub(self.started.elapsed());
+        require(
+            !(self.cancelled)() && !remaining.is_zero(),
+            DeliveryFailure::Transient,
+        )?;
+        Ok(remaining)
+    }
+}
+
+fn send_with_budget(
+    base_url: Option<&str>,
+    prepared: &PreparedPayload,
+    budget: &CallBudget<'_>,
+) -> Result<DeliveryAcknowledgment> {
+    budget.remaining()?;
     require(
         prepared.mapping_version == MAPPING_VERSION,
         DeliveryFailure::MappingVersionMismatch,
@@ -235,12 +276,12 @@ pub fn send(base_url: Option<&str>, prepared: &PreparedPayload) -> Result<Delive
         cloud::normalized_stage(&auth.base_url)?
     );
     let agent = ureq::AgentBuilder::new().redirects(0).build();
-    let response = cloud::send_with_auth_refresh_checked(
+    let response = cloud::send_with_auth_refresh_checked_with_budget(
         &auth,
-        |current| {
+        |current, timeout| {
             agent
                 .post(&url)
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout.expect("receiver budget supplies a timeout"))
                 .set("Authorization", &format!("Bearer {}", current.access_token))
                 .set("Content-Type", &prepared.content_type)
                 .send_bytes(prepared.body.as_bytes())
@@ -248,15 +289,21 @@ pub fn send(base_url: Option<&str>, prepared: &PreparedPayload) -> Result<Delive
         },
         http_error,
         |current| check_account(current, &request.batch.account_id),
+        Some(&|| budget.remaining()),
     )
     .map_err(|error| {
         if error.is::<TransportFailure>() {
             error
+        } else if let Err(stopped) = budget.remaining() {
+            stopped
         } else {
             fail(DeliveryFailure::AuthenticationRequired)
         }
     })?;
-    receipt(response_json(response)?, &request.batch)
+    budget.remaining()?;
+    let response = response_json(response)?;
+    budget.remaining()?;
+    receipt(response, &request.batch)
 }
 
 /// Only the transport classifies the batch itself: `prepare` and `send` report
@@ -341,10 +388,13 @@ impl Receiver for RelayHistoryReceiver {
     fn prepare(
         &self,
         batch: &HistoryExportBatch,
-        _context: &ReceiverContext<'_>,
+        context: &ReceiverContext<'_>,
     ) -> Result<PreparedBody, ReceiverFailure> {
+        let budget = CallBudget::new(context);
+        budget.remaining().map_err(|error| verdict(&error))?;
         self.admit(batch)?;
         let payload = prepare(batch.clone()).map_err(|error| verdict(&error))?;
+        budget.remaining().map_err(|error| verdict(&error))?;
         Ok(PreparedBody {
             content_type: payload.content_type,
             body: payload.body,
@@ -354,10 +404,13 @@ impl Receiver for RelayHistoryReceiver {
         &self,
         payload: &PreparedPayload,
         batch: &HistoryExportBatch,
-        _context: &ReceiverContext<'_>,
+        context: &ReceiverContext<'_>,
     ) -> Result<DeliveryAcknowledgment, ReceiverFailure> {
+        let budget = CallBudget::new(context);
+        budget.remaining().map_err(|error| verdict(&error))?;
         self.admit(batch)?;
-        send(self.base_url.as_deref(), payload).map_err(|error| verdict(&error))
+        send_with_budget(self.base_url.as_deref(), payload, &budget)
+            .map_err(|error| verdict(&error))
     }
 }
 
@@ -378,7 +431,7 @@ pub struct ReadPage {
     pub protocol_version: u32,
     /// Live keyset listing. A later refresh starts from the beginning; this is not a change feed.
     pub listing: String,
-    pub records: Vec<ai_hist::delivery::HistoryExportRecord>,
+    pub records: Vec<crate::delivery::HistoryExportRecord>,
     pub next_cursor: Option<String>,
 }
 pub fn read_page(base_url: Option<&str>, options: &ReadOptions) -> Result<ReadPage> {

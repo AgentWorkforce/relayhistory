@@ -66,6 +66,7 @@
   "quirk": "the current SQLite store: two sessions (one a child through `parent_id`), text/tool/step-finish parts, provider+model and token payloads on the assistant messages",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_child_u1_text",
       "git_branch": null,
@@ -82,6 +83,7 @@
       "ts_ms": 1776643230000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_child_a1_text",
       "git_branch": null,
@@ -98,6 +100,7 @@
       "ts_ms": 1776643240000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_u1_text",
       "git_branch": null,
@@ -114,6 +117,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_a1_text",
       "git_branch": null,
@@ -130,6 +134,7 @@
       "ts_ms": 1776643210000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_result:toolu_sqlite_edit",
       "git_branch": null,
@@ -146,6 +151,7 @@
       "ts_ms": 1776643210000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "tool_use:toolu_sqlite_edit",
       "git_branch": null,
@@ -162,6 +168,7 @@
       "ts_ms": 1776643210000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_u2_text",
       "git_branch": null,
@@ -178,6 +185,7 @@
       "ts_ms": 1776643250000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_sqlite_a2_text",
       "git_branch": null,
@@ -194,6 +202,7 @@
       "ts_ms": 1776643260000
     }
   ],
+  "session_markers": [],
   "session_relationships": [
     {
       "child_agent_name": null,

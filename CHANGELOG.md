@@ -6,13 +6,17 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
-- Native contract 19 -> 20. The `ai-hist-native` addon gains
+- Native contract 19 -> 21. The `ai-hist-native` addon gains
+  `historyExport(requestJson, dbPath)`, which separates snapshot export from
+  the upload entry points the probe now owns, and
   `sessionStoreCall(op, argsJson)`, one JSON-in/JSON-out dispatcher over the
-  `SessionStore` facade, and the SDK's `getSessionRequestsPage`,
-  `getSessionUsage` and `getSessionUserTurnsPage` now read through it. A
-  consumer pairing the new SDK with an older platform package gets the
-  existing `NATIVE_CONTRACT_MISMATCH` error at load, not a missing function
-  at first use. The typed `getSessionRequestsPage` / `getSessionUsage` /
+  `SessionStore` facade, through which the SDK's `getSessionRequestsPage`,
+  `getSessionUsage` and `getSessionUserTurnsPage` now read. Both additions
+  claimed 20 independently, so the addon carrying both answers with 21 rather
+  than a number either incompatible contract already used. A consumer pairing
+  the new SDK with an older platform package gets the existing
+  `NATIVE_CONTRACT_MISMATCH` error at load, not a missing function at first
+  use. The typed `getSessionRequestsPage` / `getSessionUsage` /
   `getSessionUserTurnsPage` native exports stay for compatibility until a
   later major.
 
@@ -40,17 +44,22 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `usage_summary`, `user_turns` and `capabilities`; `sdk-ts/src/native.ts`
   (`SESSION_STORE_OPS`) is the one place in the SDK that spells an op. A new
   facade read is one arm in the Rust dispatcher and one entry there, not
-  another hand-mirrored native function. The dispatcher calls only the facade
-  and the crate's pure capability tables, and a missing database answers an
-  empty page without being created. It reads through a read-only store first
-  and reopens writable — which migrates — only when the facade reports a
-  stale schema; any other read failure is returned as `DATABASE_QUERY_FAILED`
-  rather than retried through a writer-lock-taking open.
-- `ai_hist::Error::is_stale_schema()` says whether a `SessionStore` failure
-  is a read-only store refusing a database it would have to migrate first,
-  so a caller that may write can apply that one remedy and no other.
-  `session_requests_page` and `session_usage` now make the same check the
-  marker page does instead of failing inside a query.
+  another hand-mirrored native function. Every open goes through
+  `SessionStore`, so the facade owns the schema gate and the typed failure,
+  and `capabilities` is answered from the crate's pure capability tables with
+  no database at all; a missing database answers an empty page without being
+  created. A read opens a read-only store first and reopens writable — which
+  migrates — only when the facade reports a stale schema; any other failure
+  is returned under the facade error's own code (`QUERY_FAILED` as this
+  boundary's `DATABASE_QUERY_FAILED`) rather than retried through a
+  writer-lock-taking open.
+- `ai_hist::Error::StaleSchema` (`DATABASE_STALE_SCHEMA`), with the
+  `Error::is_stale_schema()` predicate over it, is the one `SessionStore`
+  failure a caller that may write has a remedy for: reopening the same path
+  writable migrates it, which is the wrong answer to every other failure. A
+  read-only `SessionStore::open` now also checks the per-request usage schema
+  alongside the event, evidence and relationship ones, so a usage read
+  refuses up front instead of failing inside a query.
 
 ### Live capture
 
@@ -175,6 +184,165 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- `SessionStore` is now the whole default surface of the `ai-hist` crate:
+  nine operations, typed evidence, no raw connection, no contract constant
+  (`docs/sourcing-sdk.md`). `open` keeps its shape and `StoreOptions` gains
+  `roots: Option<ProviderRoots>` (`ProviderRoots` is public: `from_env` is
+  the CLI's resolution, `from_home` reads nothing from the environment); the
+  roots are resolved once at `open` and drive `sync`, `hydrate`, `watch` and
+  `Source::capabilities().watch_roots(&roots)` alike. `sync` takes
+  `SyncOptions { force, lock_timeout_ms }` and reports `swept` plus the
+  `changed` `SessionRef`s (catalog rows a sweep created or changed), and a
+  held `SyncRunLock` is `Error::SyncLocked` after the caller's timeout rather
+  than a silent skip. New: `hydrate(&SessionRef, HydrateOptions)` — by id, or
+  by transcript path for the hook fast path — `watch(WatchOptions)` returning
+  a `WatchHandle` iterator of `TickReport`s over the live-capture loop,
+  `sessions(CatalogQuery)` walking the catalog on an internal keyset, and
+  `session(&SessionRef, SessionQuery) -> Option<SessionEvidence>` reading
+  every table for one session on one SQLite snapshot: `prompts`, `messages`
+  (one per `message_id`, with `role`, `request_id`, `provider_message_id`,
+  `stop_reason`, `turn_id`, normalized `usage`, and typed `blocks`),
+  `tool_calls` (`args` parsed), `tool_results` (per-result fidelity),
+  `file_edits` (`structured_patch` parsed), `markers` (`payload` parsed),
+  `relationships` (delegation and continuity, with the side the session is
+  seen from), `requests`, `usage`, `user_turns`, `coverage` and `loaded`. A
+  `Block` carries `control: Option<ControlKind>`, the typed reason a user-role
+  block is not a human prompt, so the facade reports a control row classified
+  rather than dropping it.
+  `SessionQuery { include_text, kinds }` maps onto burn's content modes:
+  `include_text: false` keeps byte lengths and hashes and never moves the
+  `text` column out of SQLite; `kinds` skips the tables a consumer does not
+  need. Every JSON column arrives parsed and the stored string is reachable
+  only through `raw_args()`, `raw_structured_patch()`, `raw_payload()` and
+  `raw_usage()`. `Source::capabilities()` declares, statically, a source's
+  evidence kinds, relationship capabilities, usage accounting mode, whether
+  its message ids are provider-issued or synthesized, whether it hydrates by
+  path, and its watch roots. `Error` is now an enum whose `code()` mirrors the
+  TypeScript native error codes plus `SyncLocked`, `SourceMismatch`,
+  `StaleSchema`, `WatermarkAheadOfStore` and `ConsumerKindsMismatch`; `Display` renders
+  `CODE: message`, and the change feed's failures are variants of the same
+  enum rather than a second classification. Every value type the facade returns
+  — `SessionEvidence` and its parts, `CatalogSession`, the reports and
+  options, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
+  `Serialize`, `Deserialize` and `PartialEq`; `CatalogIter` and `WatchHandle`
+  are deliberately not value types (one holds a read snapshot, the other a
+  running thread) and implement none of those.
+  **Removed** the per-kind page methods `SessionStore::session_user_turns_page`,
+  `session_markers_page`, `session_requests_page` and `session_usage`; the
+  same data is `SessionEvidence::user_turns`, `markers`, `requests` and
+  `usage`. A read-only `open` now also checks the marker, relationship and
+  per-request usage schema, so it refuses at open — as the typed
+  `Error::StaleSchema`, naming the remedy — rather than inside a read. `crates/ai-hist/tests/sourcing_api.rs` holds the surface on the
+  crate's default features against the fixture-corpus snapshots.
+- A revision-stamped change feed for incremental downstream ingest:
+  `SessionStore::changes_since(from, ChangeQuery)`. Every row of `sessions`,
+  `session_events`, `tool_calls`, `file_edits`, `session_markers` and
+  `session_relationships` now carries a `revision` drawn from the
+  database-wide `observation_clock`, stamped by triggers on every insert and
+  update so no write site can forget it, and indexed per table. A deleted
+  row leaves a tombstone in `evidence_tombstones` at its own revision, which
+  a later insert of the same key clears. The drain yields `Change { kind,
+  source, session_id, record_key, revision, op }` in `(revision, kind,
+  record_key)` order, where `op` is `Upsert(EvidenceRow)` — the typed row,
+  so no second read is needed — or `Delete`; it is bounded to the head at
+  open, pages through the store in `batch`-sized indexed reads (at most
+  10,000), and exposes `head()` and `position()`. Named consumers keep their
+  progress in `consumer_cursors` inside the store: pass
+  `Watermark::CONSUMER` with `ChangeQuery::consumer` to resume from the last
+  commit, and call `Changes::commit()` to advance — an uncommitted drain
+  moves nothing, so a consumer that fails mid-batch resumes from its last
+  commit, and the cursor only moves forward, so a stale commit from an older
+  drain cannot rewind it (`commit` returns the cursor as stored). A presence
+  arriving or leaving re-stamps its catalog row, since the row's `locations`
+  is derived from `session_presences`. A page is read revision-first, so at
+  most one page of typed rows is resident however many kinds are fed; a
+  drain's start and head come from one read snapshot; and a read-only handle
+  over an unmigrated database reports `Watermark::START` rather than its
+  pre-feed `observation_clock`. Both passes of a page share that snapshot
+  too, and an empty page window steps forward instead of declaring the head,
+  so a writer re-stamping the rows mid-page cannot make a drain skip what is
+  still below its head. A named cursor is bound to the kind set it was
+  committed for (`consumer_cursors.kinds`); resuming or committing it under
+  another filter fails with `Error::ConsumerKindsMismatch`, because a
+  position in an events-only stream has accounted for no relationship,
+  marker or catalog row. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  report the head; a stored watermark beyond it (the database was reset)
+  fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
+  `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer
+  must treat a re-seen `record_key` as a replace, never a duplicate. A
+  message still being written is never in the feed: incremental hydration
+  holds it until it completes, and its blocks then arrive together, once.
+  An existing database is stamped once on its first writable open, so a
+  replay from `Watermark::START` reports everything it already held. The
+  `session_events` FTS update trigger now fires only for `text`, `role` and
+  `project`, so the stamp — and the bulk `project_key` pass — no longer
+  re-index every event. The delivery capture payload leaves `revision` out;
+  it is this database's bookkeeping, not a fact about the record.
+  `ShallowSession` and `SessionRelationship` are re-exported on the default
+  feature set as the rows a catalog or relationship change carries.
+- Type the rows a harness writes into the user role that are not prompts.
+  `session_events` gains `control_kind`, null for a genuine prompt and for
+  model output, and otherwise one of `slash_command_caveat`,
+  `slash_command_invocation`, `slash_command_output`, `task_notification`,
+  `hook_output`, `bash_passthrough_input`, `bash_passthrough_output`,
+  `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`. The
+  row keeps its role, kind and verbatim text; the column is what a consumer
+  building human turns, prompt roots or an overhead breakdown filters on.
+  Claude reads `origin.kind` and `attachment.{type, commandMode}` for task
+  notifications, and a slash command's caveat → invocation → output records,
+  chained by `parentUuid`, are grouped into one `session_markers` row of
+  `kind = "slash_command"` whose payload carries `command_name`,
+  `command_message`, `command_args`, `command_mode`, `origin_kind`, the three
+  rows' event uids and `stdout_bytes` — the whole of what an activity
+  classifier reads, with no raw JSON. The pending triad travels in the
+  transcript cursor, so a command split across two hydration passes is still
+  one marker. A `<system-reminder>` block inside a prompt becomes a
+  `system_reminder` row sharing the prompt's `message_id`
+  (`<uid>:reminder:<n>`), recreated from the current text on every re-read so
+  a record rewritten with fewer reminders, or without the block that carried
+  them, loses the rows it no longer has, and
+  the prompt row and `history` carry only the human's text. Codex's `<environment_context>` and sibling wrappers are
+  stored as `codex_context_wrapper` rows instead of falling to an `unknown`
+  marker. `history`, `sessions.first_prompt` and `attribute_usage_to_prompts`
+  all derive from that one classification (`ingest::control`), which
+  replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
+  `/resume <id>` is no longer a `history` row or a first prompt, and the
+  answer to a slash command is charged to the human prompt before it rather
+  than to the command's output row. `session_user_turns_page` leaves control
+  rows out too, so a Codex context wrapper is not a turn and a split reminder
+  is not one of its prompt's blocks; the relayhistory plugin does not publish
+  them as conversation turns, and pads a session's published tail with one
+  empty `system` turn per control row so a session an earlier release
+  published with its control rows as user turns is rewritten index for index
+  on the server, which upserts by `turnIndex` and never trims. Source-evidence
+  validation refuses a `control_kind` outside the vocabulary or on anything
+  but a user text row. `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on both the
+  Rust and TypeScript sides, since the session-event row shape changed; the
+  TypeScript `SessionEvent` exposes it as `controlKind` (a `ControlKind`
+  union or null) and the native addon carries it, with no native contract
+  bump because the field is additive. For Claude the full-transcript metadata
+  fold now settles `sessions.first_prompt` on every sync or hydration, null
+  included -- never from a fold superseded by a rewrite under it, which the
+  next pass rescans -- so a title an earlier release took from a row that is control now
+  (a bare `/resume <id>`, a task notification) is replaced on the one-time
+  re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
+  through the current classifier once as well. A standalone reminder row the
+  previous parser stored untyped under the block's own uid, and the `unknown`
+  marker it left for a Codex wrapper, are retired by the re-read rather than
+  kept beside the typed rows. `SessionEvent` gains `control_kind`,
+  returned by `session_events` and `session_events_page` and carried by the
+  source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
+  raw-facts generation 2 -> 3, so an existing install re-stamps every row
+  once on the next hydration or plain `sync`. That re-read also retires what
+  the previous parser wrote for a record it now stores differently: the
+  `history` row it wrote from the record's whole text (a reminder folded into
+  the prompt, a task notification as a prompt), keyed on this session, the
+  record's timestamp and that text; a row another session's human prompt
+  shares under `history`'s `(source, timestamp, prompt)` key is handed to
+  that session rather than deleted. Continuity reads a `/resume` through the
+  same reminder stripping, so a reminder ahead of the wrapper no longer hides
+  the resume. The fixture corpus snapshots now include `control_kind` and a
+  `session_markers` dump. napi/TS/MCP exposure is not included.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

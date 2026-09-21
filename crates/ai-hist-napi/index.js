@@ -310,8 +310,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { historyDelivery, historyDeliveryDrain, sessionStoreCall, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, getSessionRequestsPage, getSessionUsage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
+const { historyExport, historyDelivery, historyDeliveryDrain, sessionStoreCall, getSourceObservation, applySourceObservations, applySourceEvidence, nativeContractVersion, nativeBuildProfile, search, recent, getSession, getSessionEventsPage, getSessionToolCallsPage, getSessionUserTurnsPage, getSessionFileEditsPage, getSessionRequestsPage, getSessionUsage, stats, listSessionCatalogPage, listSessionCatalog, discoverSessions, hydrateSession, getSessionRelationships, getSessionTree, getSessionChildrenPage, sync, syncLocal, installGitHooks, linkGitCommit } = nativeBinding
 
+module.exports.historyExport = historyExport
 module.exports.historyDelivery = historyDelivery
 module.exports.historyDeliveryDrain = historyDeliveryDrain
 module.exports.sessionStoreCall = sessionStoreCall

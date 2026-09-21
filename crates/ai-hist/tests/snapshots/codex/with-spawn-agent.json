@@ -28,6 +28,7 @@
   "quirk": "a `spawn_agent` function call: delegation stated in the tool call, not in session metadata",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "2:response_item_user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776902400150
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:function_call",
       "git_branch": null,
@@ -60,6 +62,7 @@
       "ts_ms": 1776902400500
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "5:function_call_output",
       "git_branch": null,
@@ -76,6 +79,7 @@
       "ts_ms": 1776902401000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "7:function_call",
       "git_branch": null,
@@ -92,6 +96,7 @@
       "ts_ms": 1776902402500
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "9:function_call_output",
       "git_branch": null,
@@ -106,6 +111,47 @@
       "text": "done\n",
       "token_json": null,
       "ts_ms": 1776902402800
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_spawn_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776902400200,
+      "turn_id": "turn_spawn_1"
+    },
+    {
+      "kind": "subagent_notification",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": "call_spawn_1",
+      "payload_json": "{\"agent_id\":\"agent_inv_42\",\"call_id\":\"call_spawn_1\",\"success\":true}",
+      "session_id": "sess_spawn_1",
+      "source": "codex",
+      "subkind": "subagent_message_complete",
+      "text": null,
+      "ts_ms": 1776902402000,
+      "turn_id": null
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "11:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_spawn_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776902403100,
+      "turn_id": "turn_spawn_1"
     }
   ],
   "session_relationships": [],

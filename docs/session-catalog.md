@@ -546,8 +546,9 @@ text.
 A **user** message is deliberately not on that list, and the reason is the
 lesson the list itself taught. Codex writes a user turn in two representations
 and a deduplicator stores one row for the pair — but only when it accepts the
-turn. It refuses blank text, application-injected control wrappers, and content
-with no `input_text` part, such as an image-only turn. Exempting user messages
+turn. It refuses blank text and content with no `input_text` part, such as an
+image-only turn (an application-injected control wrapper is accepted and stored
+as a `codex_context_wrapper` row, so it writes). Exempting user messages
 by type alone therefore asserted a row had been written when none had, and
 those lines vanished. The exemption is now *earned*: it applies to a mirrored
 twin, where the deduplicator reports that its partner really did write, and

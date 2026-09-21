@@ -246,6 +246,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     isSidechain: nullableBoolean(value.isSidechain),
     isMeta: nullableBoolean(value.isMeta),
     turnId: nullableString(value.turnId),
+    controlKind: nullableString(value.controlKind) as SessionEvent['controlKind'],
   };
 }
 

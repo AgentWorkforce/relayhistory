@@ -40,6 +40,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::discover::{self, WatchDepth, WatchRoot};
 
@@ -99,7 +100,8 @@ pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 
 /// Which driver a running loop selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WatchDriver {
     /// Filesystem events, with the slow poll as a backstop.
     FsEvents,
@@ -134,7 +136,8 @@ pub struct DriverStatus {
 }
 
 /// What woke a tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TickTrigger {
     /// The first sweep, before the loop parks.
     Startup,

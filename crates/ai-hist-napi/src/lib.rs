@@ -4,7 +4,7 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
-pub mod delivery;
+pub mod export;
 pub mod session_store;
 pub mod sources;
 
@@ -56,11 +56,15 @@ use serde::Serialize;
 /// 18 was claimed independently by the upstream `provider` field and the
 /// per-request usage surface. The merged addon exposes both shapes, so it is
 /// 19 rather than identifying itself as either incompatible contract 18.
-/// 20 adds the `sessionStoreCall` JSON dispatcher over the `SessionStore`
+/// 20 was claimed independently by the `historyExport` bridge, which moved
+/// the upload lifecycle into the probe package, and by the `sessionStoreCall`
+/// dispatcher below. The merged addon exposes both, so it is 21 rather than
+/// answering with a number either incompatible contract 20 already used.
+/// 21 adds the `sessionStoreCall` JSON dispatcher over the `SessionStore`
 /// facade (markers, requests, usage summary, user turns, source
 /// capabilities) and moves the SDK's request, usage and user-turn reads onto
-/// it. The typed functions those reads used stay exported for compatibility.
-pub const NATIVE_CONTRACT_VERSION: u32 = 20;
+/// it, alongside contract 20's `historyExport` bridge.
+pub const NATIVE_CONTRACT_VERSION: u32 = 21;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -321,6 +325,9 @@ pub struct NativeSessionEvent {
     pub is_sidechain: Option<bool>,
     pub is_meta: Option<bool>,
     pub turn_id: Option<String>,
+    /// Why a user-role row is not a human prompt; null for a genuine prompt
+    /// and for every model-output row.
+    pub control_kind: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -360,6 +367,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             is_sidechain: event.is_sidechain.map(|value| value != 0),
             is_meta: event.is_meta.map(|value| value != 0),
             turn_id: event.turn_id,
+            control_kind: event.control_kind,
         }
     }
 }
