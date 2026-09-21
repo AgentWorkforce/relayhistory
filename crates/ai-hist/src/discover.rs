@@ -1885,6 +1885,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                 // JSON integer mirrors `Value::as_i64`; a string that merely
                 // looks numeric must not take precedence here.
                 let payload_created = "CASE WHEN json_type(data, '$.time.created') = 'integer' \
+                                       AND typeof(json_extract(data, '$.time.created')) = 'integer' \
                                        THEN json_extract(data, '$.time.created') END";
                 let created = if snapshot.message_columns.contains("time_created") {
                     format!("COALESCE({payload_created}, time_created)")

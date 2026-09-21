@@ -1561,6 +1561,25 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(second.summary.counters.shallow_reads, 0);
 }
 
+#[test]
+fn opencode_model_order_rejects_payload_times_outside_i64() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-overflow', '/work/oc', 1, 2);
+           INSERT INTO message VALUES ('m1', 'oc-overflow', 1, '{"role":"assistant","time":{"created":9223372036854775808},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m2', 'oc-overflow', 2, '{"role":"assistant","time":{"created":2},"providerID":"anthropic","modelID":"claude-sonnet"}');"#,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        found.row("oc-overflow").models,
+        vec!["anthropic/claude-opus"],
+        "the out-of-i64 payload time must fall back to relational time_created"
+    );
+}
+
 /// A single opencode part can hold a whole pasted file. The excerpt is cut in
 /// SQL so only the capped prefix ever crosses into Rust.
 #[test]
@@ -1827,6 +1846,7 @@ fn opencode_selected_session_queries_use_provider_indexes() {
          AND json_extract(data, '$.role') = 'assistant'
          AND COALESCE(
                CASE WHEN json_type(data, '$.time.created') = 'integer'
+                    AND typeof(json_extract(data, '$.time.created')) = 'integer'
                     THEN json_extract(data, '$.time.created') END,
                time_created
              ) IS NOT NULL
@@ -1835,6 +1855,7 @@ fn opencode_selected_session_queries_use_provider_indexes() {
                                  json_extract(data, '$.model.modelID')), '') IS NOT NULL)
          ORDER BY COALESCE(
                     CASE WHEN json_type(data, '$.time.created') = 'integer'
+                         AND typeof(json_extract(data, '$.time.created')) = 'integer'
                          THEN json_extract(data, '$.time.created') END,
                     time_created
                   ) ASC,
