@@ -1,0 +1,17 @@
+{"type":"system","content":"You are Grok, an AI coding assistant. Follow /tmp/demo/AGENTS.md."}
+{"type":"user","content":"<user_query>add a retry to the http client</user_query>"}
+{"type":"reasoning","summary":"Read the client first, then add a bounded retry around the fetch call.","encrypted_content":"ZW5jcnlwdGVkLXJlYXNvbmluZy1ibG9i"}
+{"type":"assistant","content":"Reading the client and patching it.","model_id":"grok-4-build"}
+{"type":"assistant","content":"","model_id":"grok-4-build","tool_calls":[{"id":"call_shell_1","name":"Shell","arguments":{"command":"rg -n retry src/http.ts"}}]}
+{"type":"tool_result","tool_call_id":"call_shell_1","content":"src/http.ts:12: // no retry yet"}
+{"type":"assistant","content":"","model_id":"grok-4-build","tool_calls":[{"id":"call_edit_1","name":"StrReplace","arguments":{"path":"/tmp/demo/src/http.ts","old_str":"  return fetch(url);","new_str":"  return withRetry(() => fetch(url), 3);"}}]}
+{"type":"tool_result","tool_call_id":"call_edit_1","content":"Edited /tmp/demo/src/http.ts"}
+{"type":"user","content":"<user_query>now a test</user_query>"}
+{"type":"user","content":"<system-reminder>context window compacted</system-reminder>","synthetic_reason":"compaction"}
+{"type":"assistant","content":"Writing the test.","model_id":"grok-4-build"}
+{"type":"assistant","content":"","model_id":"grok-4-build","tool_calls":[{"id":"call_write_1","name":"Write","arguments":{"path":"/tmp/demo/test/http.test.ts","content":"import { withRetry } from '../src/http';\n"}}]}
+{"type":"tool_result","tool_call_id":"call_write_1","content":"Wrote /tmp/demo/test/http.test.ts"}
+{"type":"assistant","content":"","model_id":"grok-4-build","tool_calls":[{"id":"call_shell_2","name":"Shell","arguments":{"command":"npm test"}}]}
+{"type":"tool_result","tool_call_id":"call_shell_2","content":"1 failing: expected 3 attempts, saw 1","is_error":true}
+{"type":"assistant","content":"The test fails; fixing next.","model_id":"grok-4-build"}
+{"type":"reasoning","encrypted_content":"ZW5jcnlwdGVkLXJlYXNvbmluZy10YWls"}

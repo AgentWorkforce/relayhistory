@@ -57,30 +57,82 @@ pub struct EvidenceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_id: Option<String>,
 }
+impl EvidenceKind {
+    /// The wire name, identical to this enum's serde representation. Callers
+    /// that name a kind in a diagnostic or a JSON contract use this rather
+    /// than `Debug`, which prints the Rust variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::SessionEvent => "session_event",
+            Self::ToolCall => "tool_call",
+            Self::FileEdit => "file_edit",
+            Self::Relationship => "relationship",
+            Self::CommitLink => "commit_link",
+            Self::SessionMarker => "session_marker",
+        }
+    }
+}
+
+/// Render a kind list the way diagnostics and docs name it.
+pub fn join_kinds(kinds: &[EvidenceKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct Spec {
     table: &'static str,
     columns: &'static str,
     required: &'static str,
     key: &'static str,
+    /// Columns that travel with the record but are not the adapter's to
+    /// vouch for: canonical state this database derives for itself.
+    ///
+    /// They are written back into the row *inside* the same transaction that
+    /// stores the adapter's snapshot, so comparing them against the snapshot
+    /// asks whether this database edited its own derived field — to which the
+    /// answer is always yes, and the consequence is that the connector is
+    /// protected against its own record. Ownership is about the fields the
+    /// adapter reports, so only those are compared.
+    derived: &'static str,
 }
 impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
-        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt"},
+        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
+        // `project_key` travels with the event so a snapshot round-trips the
+        // canonical identity the emitting side resolved, and `project_key_method`
+        // with it so the receiving side can tell a key the emitter resolved for
+        // itself from one it was lent. A key that arrives without a method
+        // ranks below every stated one, so an older adapter's events are
+        // improved by the first pass that knows better rather than defended as
+        // if the emitter had vouched for them. Neither is trusted as final:
+        // `refresh_project_identity`'s denormalization pass brings every event
+        // back in line with its own session's key.
+        //
+        // The per-message raw facts travel too, and are the adapter's to vouch
+        // for: they are what the provider wrote on the envelope, so a
+        // connector that read the transcript can report them. `raw_facts_version`
+        // is deliberately absent -- it records which local parser generation
+        // wrote a row, which is this database's bookkeeping and not something a
+        // remote emitter can speak to.
         // `raw_kind` is part of the projection, not just the table: the row
         // contract is what `read_session` reads back and what a snapshot is
         // compared against, and a column missing here is rejected outright as
         // an unsupported column when it appears in a payload. It stays out of
         // `required` because it is optional for every source.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid,raw_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid"},
-        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id"},
-        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id"},
-        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid"},
-        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method"},
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,raw_kind",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
+        Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
+        Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
+        Self::CommitLink=>Spec{table:"session_commit_links",columns:"source,session_id,repo,branch,commit_sha,note_ref,match_method,confidence,files_json,numstat_json,evidence_json,created_at_ms",required:"source,session_id,repo,commit_sha,match_method,confidence,created_at_ms",key:"source,session_id,commit_sha,match_method",derived:""},
         // The `kind` column here is the marker's own classification, not the
         // evidence kind. It is required because a marker without one is the
         // unclassified row this table exists to keep.
-        Self::SessionMarker=>Spec{table:"session_markers",columns:"source,session_id,marker_uid,ts_ms,message_id,parent_id,turn_id,kind,subkind,payload_json",required:"source,session_id,marker_uid,kind",key:"source,session_id,marker_uid"},
+        Self::SessionMarker=>Spec{table:"session_markers",columns:"source,session_id,marker_uid,ts_ms,message_id,parent_id,turn_id,kind,subkind,text,payload_json",required:"source,session_id,marker_uid,kind",key:"source,session_id,marker_uid",derived:""},
     }
     }
 }
@@ -97,10 +149,60 @@ fn numeric(field: &str) -> bool {
             | "updated_ms"
             | "created_at_ms"
             | "confidence"
+            | "payload_bytes"
+            | "call_index"
+            | "event_index"
     )
 }
+/// The `session_events` columns that only a tool-result row may carry, and
+/// the closed vocabulary each string-valued one is drawn from.
+///
+/// A submitted value reaches `SessionEvent.resultStatus` in the TypeScript
+/// SDK, which types it as a closed union. Accepting any string here would let
+/// an adapter put `"successful"` where every consumer has been told to expect
+/// `"completed"`, and the cast at the boundary would not notice -- a value
+/// that is well-formed and wrong, served beside measured ones.
+const TOOL_RESULT_FIELDS: &[&str] = &[
+    "tool_use_id",
+    "payload_bytes",
+    "payload_truncated",
+    "payload_hash",
+    "call_index",
+    "event_index",
+    "result_status",
+    "event_source",
+    "error_signal",
+    "subagent_session_id",
+    "agent_id",
+];
+const RESULT_STATUSES: &[&str] = &["running", "completed", "errored", "cancelled", "unknown"];
+const EVENT_SOURCES: &[&str] = &[
+    "tool_result",
+    "subagent_notification",
+    "function_call_output",
+];
+const ERROR_SIGNALS: &[&str] = &[
+    "tool_result.is_error",
+    "exit_code",
+    "patch_apply",
+    "mcp_err",
+    "subagent_status",
+];
+
+/// The fidelity counts that cannot be negative. A byte count of `-1` is not a
+/// small payload; it is a bug upstream, and ranking by it puts the row first.
+const NON_NEGATIVE_FIELDS: &[&str] = &["payload_bytes", "call_index", "event_index"];
+
 fn boolean(field: &str) -> bool {
-    matches!(field, "is_error" | "user_modified" | "child_has_events")
+    matches!(
+        field,
+        "is_error"
+            | "user_modified"
+            | "child_has_events"
+            | "payload_truncated"
+            | "is_sidechain"
+            | "is_meta"
+    )
 }
 
 /// Validate the complete response before opening a database or mutating history.
@@ -187,6 +289,39 @@ pub fn validate_records(
                         .contains(&record.payload["kind"].as_str().unwrap_or_default()),
                 "INVALID_ARGUMENT: invalid event role or kind"
             );
+            let tool_result = record.payload["kind"].as_str() == Some("tool_result");
+            for field in TOOL_RESULT_FIELDS {
+                let Some(value) = record.payload.get(*field).filter(|v| !v.is_null()) else {
+                    continue;
+                };
+                // The contract says these are null on anything that is not a
+                // tool result. An adapter that fills them anyway is describing
+                // a row it does not understand.
+                ensure!(
+                    tool_result,
+                    "INVALID_ARGUMENT: {field} is only valid on a tool_result event"
+                );
+                if NON_NEGATIVE_FIELDS.contains(field) {
+                    ensure!(
+                        value.as_i64().is_some_and(|n| n >= 0),
+                        "INVALID_ARGUMENT: {field} must not be negative"
+                    );
+                }
+                let vocabulary = match *field {
+                    "result_status" => Some(RESULT_STATUSES),
+                    "event_source" => Some(EVENT_SOURCES),
+                    "error_signal" => Some(ERROR_SIGNALS),
+                    _ => None,
+                };
+                if let Some(allowed) = vocabulary {
+                    ensure!(
+                        value
+                            .as_str()
+                            .is_some_and(|value| allowed.contains(&value)),
+                        "INVALID_ARGUMENT: unsupported {field} value"
+                    );
+                }
+            }
         }
         if record.kind == EvidenceKind::Relationship {
             let status = record.payload["identity_status"]
@@ -267,11 +402,22 @@ impl EvidenceRecord {
     }
     /// Whether the canonical row still equals this adapter-owned projection.
     /// Local ingestion can write directly; a changed value revokes remote ownership.
+    ///
+    /// [`Spec::derived`] columns are left out of the comparison. They are
+    /// rewritten by `refresh_project_identity` in the same transaction that
+    /// stores the snapshot they are compared against, so including them makes
+    /// every enriched record look externally edited — and an adapter whose own
+    /// event was enriched then loses it: its updates stop landing and the
+    /// records it drops are never deleted, while it goes on reporting into a
+    /// row it no longer owns. The fields still travel in the record, because a
+    /// snapshot should round-trip what the emitting side knew; they are simply
+    /// not evidence about who owns the row.
     pub fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
+        let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
         let mut values = vec![];
-        for column in spec.columns.split(',') {
+        for column in spec.columns.split(',').filter(|c| !derived.contains(c)) {
             clauses.push(format!("{column} IS ?"));
             values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null)));
         }
@@ -387,8 +533,141 @@ pub fn read_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
-    use std::collections::HashSet;
+    use crate::SessionLocation;
+
+    fn key() -> ObservationKey {
+        ObservationKey {
+            source: "claude".into(),
+            session_id: "s1".into(),
+            location: SessionLocation::Remote,
+            connector_id: "c".into(),
+            connector_instance: "i".into(),
+        }
+    }
+
+    /// A tool-result event with the fidelity fields a plugin may legitimately
+    /// submit, so each rejection test below changes exactly one thing.
+    fn tool_result_event() -> EvidenceRecord {
+        EvidenceRecord {
+            kind: EvidenceKind::SessionEvent,
+            payload: json!({
+                "source": "claude",
+                "session_id": "s1",
+                "ts_ms": 1,
+                "role": "tool_result",
+                "kind": "tool_result",
+                "event_uid": "e1",
+                "tool_use_id": "toolu_1",
+                "payload_bytes": 12,
+                "payload_truncated": false,
+                "payload_hash": "0123456789abcdef",
+                "call_index": 0,
+                "event_index": 0,
+                "result_status": "completed",
+                "event_source": "tool_result",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            record_id: None,
+            revision_id: None,
+        }
+    }
+
+    fn validate(record: EvidenceRecord) -> Result<()> {
+        validate_records(&key(), &[EvidenceKind::SessionEvent], &mut [record])
+    }
+
+    fn with(field: &str, value: Value) -> EvidenceRecord {
+        let mut record = tool_result_event();
+        record.payload.insert(field.to_string(), value);
+        record
+    }
+
+    #[test]
+    fn a_well_formed_tool_result_event_is_accepted() {
+        validate(tool_result_event()).expect("the documented shape must pass");
+    }
+
+    #[test]
+    fn negative_fidelity_counts_are_rejected() {
+        // A byte count of -1 is not a small payload. Accepted here it would
+        // sort first under `--rank-by bytes`, which is the one place the value
+        // is load-bearing.
+        for field in ["payload_bytes", "call_index", "event_index"] {
+            let error = validate(with(field, json!(-1)))
+                .expect_err("a negative {field} must be rejected");
+            assert!(
+                error.to_string().contains("must not be negative"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_outside_the_documented_vocabularies_are_rejected() {
+        // The SDK types these as closed unions and casts without checking, so
+        // a plausible synonym would reach consumers looking exactly like a
+        // value they were told to expect.
+        for (field, value) in [
+            ("result_status", "successful"),
+            ("event_source", "tool_output"),
+            ("error_signal", "nonzero_exit"),
+        ] {
+            let error = validate(with(field, json!(value)))
+                .expect_err("an undocumented {field} must be rejected");
+            assert!(
+                error.to_string().contains("unsupported"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fidelity_fields_are_rejected_on_a_row_that_is_not_a_tool_result() {
+        let mut record = tool_result_event();
+        record.payload.insert("role".into(), json!("assistant"));
+        record.payload.insert("kind".into(), json!("text"));
+        let error = validate(record).expect_err("fidelity on a text row must be rejected");
+        assert!(
+            error.to_string().contains("only valid on a tool_result event"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_fidelity_field_stays_legal_everywhere() {
+        // Absence is how a provider says it does not record the fact, so a
+        // null must never be the thing that fails a snapshot.
+        let mut record = tool_result_event();
+        record.payload.insert("role".into(), json!("assistant"));
+        record.payload.insert("kind".into(), json!("text"));
+        for field in TOOL_RESULT_FIELDS {
+            record.payload.insert((*field).to_string(), Value::Null);
+        }
+        validate(record).expect("null fidelity fields are legal on any row");
+    }
+
+    /// A diagnostic that names a kind and a JSON contract that serializes one
+    /// must agree, or a consumer matching on the wire name silently misses it.
+    #[test]
+    fn kind_names_match_their_serde_representation() {
+        for kind in [
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
+            EvidenceKind::CommitLink,
+            EvidenceKind::SessionMarker,
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+        }
+        assert_eq!(
+            join_kinds(FULL_SESSION_KINDS),
+            "history, session_event, tool_call, file_edit, relationship"
+        );
+    }
 
     /// Every column a canonical table has must appear in its evidence spec.
     ///
@@ -398,10 +677,44 @@ mod tests {
     /// of that table into `INVALID_ARGUMENT` -- and it surfaces in remote
     /// intake, a long way from the migration that caused it. Asserting the two
     /// agree here puts the failure next to the change that causes it.
+    ///
+    /// The one exemption is named, not a pattern: a column left out of a
+    /// projection has to say why, because the failure it otherwise causes is
+    /// invisible until a remote snapshot hits it.
     #[test]
     fn every_canonical_column_is_part_of_its_evidence_spec() {
-        let conn = Connection::open_in_memory().unwrap();
+        // Columns deliberately outside a projection, each with its reason.
+        //
+        // `raw_facts_version` is the local parser's own generation stamp, not
+        // a provider fact. Putting it in the projection would let a snapshot
+        // an installed adapter contributed claim a parser generation that
+        // never ran over it, and the backfill probes that read the column
+        // would then skip exactly the rows they exist to repair.
+        const LOCAL_ONLY: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();
+        // An exemption for a column that is in fact projected would sit here
+        // forever hiding the next real drift, so each one is checked to still
+        // be needed.
+        for (table, column) in LOCAL_ONLY {
+            let projected = [
+                EvidenceKind::History,
+                EvidenceKind::SessionEvent,
+                EvidenceKind::ToolCall,
+                EvidenceKind::FileEdit,
+                EvidenceKind::Relationship,
+                EvidenceKind::CommitLink,
+                EvidenceKind::SessionMarker,
+            ]
+            .into_iter()
+            .map(EvidenceKind::spec)
+            .filter(|spec| spec.table == *table)
+            .any(|spec| spec.columns.split(',').any(|name| name == *column));
+            assert!(
+                !projected,
+                "{table}.{column} is projected after all -- drop its exemption"
+            );
+        }
         for kind in [
             EvidenceKind::History,
             EvidenceKind::SessionEvent,
@@ -412,7 +725,7 @@ mod tests {
             EvidenceKind::SessionMarker,
         ] {
             let spec = kind.spec();
-            let declared: HashSet<&str> = spec.columns.split(',').collect();
+            let declared: std::collections::HashSet<&str> = spec.columns.split(',').collect();
             let actual: Vec<String> = conn
                 .prepare(&format!(
                     "SELECT name FROM pragma_table_info('{}')",
@@ -433,6 +746,7 @@ mod tests {
                 // `id` / `rowid` are surrogate keys `validate_records` accepts
                 // and ignores; they are deliberately not part of a projection.
                 .filter(|name| !matches!(name.as_str(), "id" | "rowid"))
+                .filter(|name| !LOCAL_ONLY.contains(&(spec.table, name.as_str())))
                 .filter(|name| !declared.contains(name.as_str()))
                 .collect();
             assert!(

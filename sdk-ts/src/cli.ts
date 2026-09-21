@@ -46,7 +46,7 @@ class CliExit extends Error {
 
 type PackageMetadata = { version?: string };
 
-export const BOOLEAN_FLAGS = new Set(['all', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
+export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'once', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
   'config', 'job', 'selection', 'poll-ms', 'timeout-ms', 'base-url', 'interval', 'label', 'max-content', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'config', 'source-connector', 'project', 'source', 'tag', 'token', 'tokens',
@@ -388,6 +388,9 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
   io.stdout(`${value.source}/${value.sessionId}: ${value.status}\n`);
   io.stdout(
+    `capability: ${value.capability} (coverage: ${value.coverage.join(', ') || 'none'})\n`,
+  );
+  io.stdout(
     `evidence: ${value.evidence.prompts} prompt(s), ${value.evidence.events} event(s), ` +
     `${value.evidence.toolCalls} tool call(s), ${value.evidence.fileEdits} file edit(s)\n`,
   );
@@ -399,8 +402,25 @@ function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSess
   }
 }
 
-function relationshipLine(direction: 'child' | 'parent', row: SessionRelationship): string {
-  const identity = direction === 'child' ? row.childSessionId ?? '(unlinked)' : row.parentSessionId;
+/**
+ * One relationship row, rendered from the point of view of the session that
+ * was asked about.
+ *
+ * A continuity row is returned for whichever end of it the caller named, so
+ * naming its child end and printing `childSessionId` printed the session back
+ * at itself. `queried` is the session the row was read for, and the line shows
+ * the *other* end: the origin when this session is the branch, the branch when
+ * this session is the origin.
+ */
+function relationshipLine(
+  direction: 'child' | 'parent' | 'continuity',
+  row: SessionRelationship,
+  queried?: string,
+): string {
+  const other = row.childSessionId === queried ? row.parentSessionId : row.childSessionId;
+  const identity = direction === 'parent'
+    ? row.parentSessionId
+    : (direction === 'continuity' ? other : row.childSessionId) ?? '(unlinked)';
   return [
     direction, identity, row.relationship, row.childAgentType ?? '-', row.spawnedAtMs ?? '-',
     `events=${row.childHasEvents ? 'yes' : 'no'}`, `identity=${row.identityStatus}`,
@@ -420,6 +440,14 @@ function outputRelationships(io: CliIo, value: Awaited<ReturnType<typeof getSess
       `${value.asChild.length} parent relationship(s)\n`);
   for (const row of value.asParent) io.stdout(`${relationshipLine('child', row)}\n`);
   for (const row of value.asChild) io.stdout(`${relationshipLine('parent', row)}\n`);
+  if (value.continuity.length > 0) {
+    io.stdout(`${value.continuity.length} continuity relationship(s)\n`);
+    for (const row of value.continuity) {
+      io.stdout(
+        `${relationshipLine('continuity', row, value.sessionId)}  origin=${row.originSessionId ?? '-'}\n`,
+      );
+    }
+  }
   io.stdout(`capability: stable child identity = ${value.capabilities.stableChildIdentity}\n`);
   for (const diagnostic of value.diagnostics) {
     io.stdout(`${diagnostic.code}: ${diagnostic.message}\n`);
@@ -663,7 +691,8 @@ export const FLAG_SPECS: Record<string, { flags: string; description: string }> 
   out: { flags: '--out <file>', description: 'Write to this file instead of standard output.' },
   'poll-ms': { flags: '--poll-ms <ms>', description: 'Delivery poll interval, in milliseconds.' },
   pretty: { flags: '--pretty', description: 'Render aligned, colourized rows.' },
-  project: { flags: '--project <path>', description: 'Only sessions from this project directory.' },
+  'by-cwd': { flags: '--by-cwd', description: 'Group projects by working directory instead of canonical project key.' },
+  project: { flags: '--project <value>', description: 'Restrict to one project: a canonical project key for `sessions list`, a project path elsewhere.' },
   remote: { flags: '--remote', description: 'Read only remote history.' },
   selection: { flags: '--selection <file>', description: 'Export selection file.' },
   source: { flags: '--source <source>', description: 'Restrict to one coding-agent source.' },
@@ -711,7 +740,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
     },
     allowed: [
       'after', 'after-ms', 'after-session-id', 'after-source', 'all', 'before-ms', 'db',
-      'json', 'limit', 'local', 'pretty', 'remote', 'source',
+      'json', 'limit', 'local', 'pretty', 'project', 'remote', 'source',
     ] }],
   ['sessions discover', { name: 'sessions discover', description: 'Find coding-agent sessions and index the new ones.',
     surface: ['discover'], positionals: [0, 0],
@@ -772,7 +801,7 @@ export const COMMANDS = new Map<string, CommandSpec>([
     allowed: ['all', 'db', 'fts', 'json', 'limit', 'local', 'project', 'remote', 'source', 'tag', 'tokens'] }],
   ['stats', { name: 'stats', description: 'Summarize what the history store holds.', surface: ['stats'],
     positionals: [0, 0], readsLocalStore: true,
-    allowed: ['all', 'db', 'json', 'local', 'remote', 'tag'] }],
+    allowed: ['all', 'by-cwd', 'db', 'json', 'local', 'remote', 'tag'] }],
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
   ['sync', { name: 'sync', description: 'Index new sessions from every configured source.', surface: ['sync'],
@@ -964,7 +993,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     const page = await listSessionCatalogPage({
       dbPath: textFlag(args, 'db'), scope: scopeFlag(args), sources: sources.length ? sources as never : undefined,
       limit: numberFlag(args, 'limit'), beforeMs: numberFlag(args, 'before-ms'),
-      after: catalogCursorFlag(args),
+      after: catalogCursorFlag(args), projectKey: textFlag(args, 'project'),
     });
     if (args.flags.has('pretty')) {
       const color = options.color && process.env.NO_COLOR === undefined;
@@ -1048,7 +1077,7 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     return runPack(io, args, subcommand, rest, json);
   }
   if (command === 'stats') {
-    output(io, await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag') }), json);
+    output(io, await stats({ dbPath: textFlag(args, 'db'), scope: scopeFlag(args), tag: textFlag(args, 'tag'), byCwd: args.flags.has('by-cwd') || undefined }), json);
     return 0;
   }
   if (command === 'sync') {

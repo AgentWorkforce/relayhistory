@@ -16,6 +16,9 @@ fn commercial_only_or_unconfigured_provider_hydration_leaves_fresh_database_abse
         .env("RH_HYDRATION_PREFLIGHT_HOME", dir.path())
         .env("HOME", dir.path())
         .env("USERPROFILE", dir.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
         .env("RELAYHISTORY_HOME", auth)
         .env(
             "RELAYHISTORY_CLAUDE_CREDENTIALS",

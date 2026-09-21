@@ -1,8 +1,8 @@
 use ai_hist::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_tool_calls, untag_session, HistoryEntry, QueryFilter,
-    SOURCE_CHOICES,
+    session_file_edits, session_tool_calls, untag_session, HistoryEntry, ProjectGrouping,
+    QueryFilter, SOURCE_CHOICES,
 };
 pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
@@ -168,6 +168,11 @@ enum Command {
         scope: SessionScopeArgs,
         #[arg(long)]
         tag: Option<String>,
+        /// Group `top_projects` by the raw working directory instead of the
+        /// canonical project key. The default merges two checkouts of one
+        /// repository; this restores the pre-#175 per-directory grouping.
+        #[arg(long)]
+        by_cwd: bool,
         #[arg(long)]
         json: bool,
     },
@@ -329,6 +334,12 @@ enum SessionsAction {
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
+        /// Restrict to one canonical project key, as `project_key` reports it:
+        /// `host/owner/repo` (for example `github.com/AgentWorkforce/relayhistory`),
+        /// or the working directory for a checkout with no git remote. Exact
+        /// match — this is the key, not a path or a search term.
+        #[arg(long)]
+        project: Option<String>,
         /// Maximum rows (default 50). Must not be negative.
         #[arg(long)]
         limit: Option<i64>,
@@ -719,8 +730,18 @@ pub fn run() -> Result<()> {
                 json,
             )
         }
-        Command::Stats { scope, tag, json } => {
-            print_stats(&conn, scope.resolve(), tag.as_deref(), json)
+        Command::Stats {
+            scope,
+            tag,
+            by_cwd,
+            json,
+        } => {
+            let grouping = if by_cwd {
+                ProjectGrouping::Cwd
+            } else {
+                ProjectGrouping::ProjectKey
+            };
+            print_stats(&conn, scope.resolve(), tag.as_deref(), grouping, json)
         }
         Command::Tag {
             session_id,
@@ -975,6 +996,7 @@ pub fn run() -> Result<()> {
             SessionsAction::List {
                 scope,
                 source,
+                project,
                 limit,
                 before_ms,
                 after_source,
@@ -1009,6 +1031,7 @@ pub fn run() -> Result<()> {
                         limit,
                         before_ms,
                         after,
+                        project_key: project,
                     },
                 )?;
                 print_session_catalog(&page, json)
@@ -1607,6 +1630,7 @@ fn print_stats(
     conn: &Connection,
     scope: SessionScope,
     tag: Option<&str>,
+    grouping: ProjectGrouping,
     as_json: bool,
 ) -> Result<()> {
     let tag_norm = tag.map(normalize_tag_name);
@@ -1632,10 +1656,14 @@ fn print_stats(
         .iter()
         .cloned()
         .collect::<serde_json::Map<_, _>>();
-    let project_where = format!("{where_sql} AND project IS NOT NULL");
+    let project_key = grouping.expression();
+    let project_where = format!("{where_sql} AND {project_key} IS NOT NULL");
     let top_projects = query_pairs(
         conn,
-        &format!("SELECT project, COUNT(*) FROM history h {project_where} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"),
+        &format!(
+            "SELECT {project_key}, COUNT(*) FROM history h {project_where} \
+             GROUP BY {project_key} ORDER BY COUNT(*) DESC LIMIT 10"
+        ),
         &params_vec,
     )?
     .into_iter()
@@ -1653,6 +1681,10 @@ fn print_stats(
                 "total": total,
                 "by_source": by_source,
                 "top_projects": top_projects,
+                // Which key `top_projects` is bucketed by. A consumer that
+                // reads counts without reading this cannot tell a canonical
+                // repository rollup from a per-directory one.
+                "grouped_by": grouping.as_str(),
                 "first_timestamp_ms": first,
                 "last_timestamp_ms": last,
                 "tag": tag_norm,
@@ -1681,7 +1713,7 @@ fn print_stats(
         println!("\nDate range:");
         println!("  {} to {}", format_date(first), format_date(last));
     }
-    println!("\nTop 10 projects:");
+    println!("\nTop 10 projects (by {}):", grouping.as_str());
     for item in top_projects {
         println!(
             "  {:>6}  {}",
@@ -2127,6 +2159,64 @@ fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
     command
 }
 
+const PROVIDER_ENV_VARS: [&str; 4] = [
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "OPENCODE_DB",
+];
+
+fn scheduler_environment_value(name: &str, value: std::ffi::OsString) -> Result<Option<String>> {
+    let value = value.into_string().map_err(|_| {
+        anyhow::anyhow!(
+            "cannot install sync service: {name} contains non-UTF-8 bytes; use a UTF-8 provider path"
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.contains(['\n', '\r']) {
+        anyhow::bail!(
+            "cannot install sync service: {name} contains a newline, which scheduler files cannot represent safely"
+        );
+    }
+    Ok(Some(value))
+}
+
+fn service_provider_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
+    if spec.subcommand != "sync" {
+        return Ok(Vec::new());
+    }
+    let mut environment = Vec::new();
+    for name in PROVIDER_ENV_VARS {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        if let Some(value) = scheduler_environment_value(name, value)? {
+            environment.push((name, value));
+        }
+    }
+    Ok(environment)
+}
+
+fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
+    if environment.is_empty() {
+        return String::new();
+    }
+    let entries = environment
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>",
+                xml_escape(name),
+                xml_escape(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}\n    </dict>\n")
+}
+
 fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
@@ -2148,6 +2238,12 @@ fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -
 /// the binary path don't break the scheduled command.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote one shell word and then protect `%` from cron's command-to-stdin
+/// splitting. The added backslash is consumed by cron before the shell sees it.
+fn cron_shell_word(s: &str) -> String {
+    shell_single_quote(s).replace('%', "\\%")
 }
 
 /// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
@@ -2211,6 +2307,8 @@ fn install_launchd_service(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    let environment = service_provider_environment(spec)?;
+    let environment_xml = launchd_environment_xml(&environment);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2223,7 +2321,7 @@ fn install_launchd_service(
         <string>{bin}</string>
 {command_args}
     </array>
-    <key>StartInterval</key>
+{environment_xml}    <key>StartInterval</key>
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <true/>
@@ -2237,6 +2335,7 @@ fn install_launchd_service(
         label = spec.label,
         bin = xml_escape(bin),
         command_args = command_args,
+        environment_xml = environment_xml,
         interval = interval,
         log_stem = spec.log_stem,
     );
@@ -2308,11 +2407,15 @@ fn install_cron_service(
         );
     }
     let marker = cron_marker(spec);
-    let command = std::iter::once(shell_single_quote(bin))
+    let environment = service_provider_environment(spec)?;
+    let command = environment
+        .iter()
+        .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
+        .chain(std::iter::once(cron_shell_word(bin)))
         .chain(
             service_command_args(spec, args)
                 .iter()
-                .map(|arg| shell_single_quote(arg)),
+                .map(|arg| cron_shell_word(arg)),
         )
         .collect::<Vec<_>>()
         .join(" ");
@@ -3104,6 +3207,7 @@ mod tests {
         assert!(super::is_read_only(&super::Command::Stats {
             scope: super::SessionScopeArgs::default(),
             tag: None,
+            by_cwd: false,
             json: false
         }));
         assert!(super::is_read_only(&super::Command::Show {
@@ -3187,6 +3291,46 @@ mod tests {
             xml_escape("/usr/local/bin/ai-hist"),
             "/usr/local/bin/ai-hist"
         );
+    }
+
+    #[test]
+    fn service_environment_rendering_preserves_relocated_provider_roots() {
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR", "/srv/Claude & tools".to_string()),
+            ("CODEX_HOME", "/srv/codex's 100% \\archive".to_string()),
+        ];
+        let xml = launchd_environment_xml(&environment);
+        assert!(xml.contains("<key>EnvironmentVariables</key>"));
+        assert!(xml.contains("<key>CLAUDE_CONFIG_DIR</key>"));
+        assert!(xml.contains("<string>/srv/Claude &amp; tools</string>"));
+        assert!(xml.contains("<key>CODEX_HOME</key>"));
+
+        let cron = environment
+            .iter()
+            .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            cron,
+            r"CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\''s 100\% \archive'"
+        );
+    }
+
+    #[test]
+    fn scheduler_environment_rejects_line_breaks() {
+        let error =
+            scheduler_environment_value("CODEX_HOME", "/srv/codex\narchive".into()).unwrap_err();
+        assert!(error.to_string().contains("contains a newline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_environment_rejects_non_utf8_paths_without_changing_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(b"/srv/codex-\xff".to_vec());
+        let error = scheduler_environment_value("CODEX_HOME", value).unwrap_err();
+        assert!(error.to_string().contains("contains non-UTF-8 bytes"));
     }
 
     #[test]

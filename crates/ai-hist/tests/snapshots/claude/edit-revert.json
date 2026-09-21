@@ -1,0 +1,228 @@
+{
+  "corpus_files": [
+    "claude/edit-revert.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/src/foo.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-1",
+      "session_id": "revert-session",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "tu_edit_1",
+      "ts_ms": 1776643201000,
+      "user_modified": null
+    },
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/src/foo.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "u-asst-3",
+      "session_id": "revert-session",
+      "source": "claude",
+      "structured_patch_json": null,
+      "tool_name": "Edit",
+      "tool_use_id": "tu_edit_2",
+      "ts_ms": 1776643205000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "claude/edit-revert",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "tweak the file",
+      "session_id": "revert-session",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "hmm that broke tests, revert it",
+      "session_id": "revert-session",
+      "source": "claude",
+      "timestamp_ms": 1776643204000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "revert-session",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "an Edit is applied and then reverted; tool_results carry pre/post file hashes",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "tweak the file",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "Edit /src/foo.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":100},\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":0,\"input_tokens\":10,\"output_tokens\":5}",
+      "ts_ms": 1776643201000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-2:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-2",
+      "model": null,
+      "parent_id": "u-asst-1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "ok",
+      "token_json": null,
+      "ts_ms": 1776643202000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-2",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "looking at other file",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":50},\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":100,\"input_tokens\":5,\"output_tokens\":3}",
+      "ts_ms": 1776643203000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-3:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-3",
+      "model": null,
+      "parent_id": "u-asst-2",
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "hmm that broke tests, revert it",
+      "token_json": null,
+      "ts_ms": 1776643204000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-3:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-asst-3",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-3",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "Edit /src/foo.ts",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":50},\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":150,\"input_tokens\":5,\"output_tokens\":5}",
+      "ts_ms": 1776643205000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-4:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "u-user-4",
+      "model": null,
+      "parent_id": "u-asst-3",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "revert-session",
+      "source": "claude",
+      "text": "ok",
+      "token_json": null,
+      "ts_ms": 1776643206000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "tweak the file",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643206000,
+      "last_assistant_text": "looking at other file",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/edit-revert.jsonl",
+      "repo_url": null,
+      "session_id": "revert-session",
+      "source": "claude",
+      "source_stamp": "<n>:2798",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"file_path\":\"/src/foo.ts\",\"new_string\":\"const FOO = 2;\",\"old_string\":\"const FOO = 1;\"}",
+      "is_error": null,
+      "message_id": "u-asst-1",
+      "name": "Edit",
+      "session_id": "revert-session",
+      "source": "claude",
+      "target": "/src/foo.ts",
+      "tool_use_id": "tu_edit_1",
+      "ts_ms": 1776643201000
+    },
+    {
+      "args_json": "{\"file_path\":\"/src/foo.ts\",\"new_string\":\"const FOO = 1;\",\"old_string\":\"const FOO = 2;\"}",
+      "is_error": null,
+      "message_id": "u-asst-3",
+      "name": "Edit",
+      "session_id": "revert-session",
+      "source": "claude",
+      "target": "/src/foo.ts",
+      "tool_use_id": "tu_edit_2",
+      "ts_ms": 1776643205000
+    }
+  ]
+}

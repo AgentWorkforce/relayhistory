@@ -31,6 +31,8 @@ ai-hist search "the thing i was working on"
 
 The bare `ai-hist` command bootstraps a searchable database on first use: it discovers your most recent local sessions and indexes their evidence, then tells you what it found. It leaves an already-populated database alone. Run `ai-hist sync` any time you want a full re-ingest rather than the bounded first-run pass.
 
+RelayHistory follows each harness's configured state directory. Set `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GROK_HOME` to relocate Claude Code, Codex, or Grok data; unset or empty values fall back to `~/.claude`, `~/.codex`, and `~/.grok`. OpenCode uses `OPENCODE_DB`, defaulting to `~/.local/share/opencode/opencode.db`.
+
 Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows x64 — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
 
 Rust embedders depend on the `ai-hist` crate (`SessionStore::open` / `sync`). See [crates/ai-hist/README.md](crates/ai-hist/README.md).
@@ -109,7 +111,7 @@ for authentication, durable delivery, readback, and the legacy sharing API.
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
-- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened.
+- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named: Grok, for instance, logs no per-turn billing tokens at all, so its only token fact is a context-window proxy, and its hydration says so every time.
 - **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.

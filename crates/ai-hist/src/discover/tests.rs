@@ -26,7 +26,14 @@ fn catalog() -> Connection {
 }
 
 fn env_at<'a>(conn: &'a Connection, home: &Path) -> DiscoveryEnv<'a> {
-    DiscoveryEnv::with_roots(conn, home.to_path_buf(), home.join("opencode.db"))
+    DiscoveryEnv::with_all_roots(
+        conn,
+        home.to_path_buf(),
+        home.join(".claude"),
+        home.join(".codex"),
+        home.join(".grok"),
+        home.join("opencode.db"),
+    )
 }
 
 fn write(path: &Path, contents: &str) {
@@ -861,6 +868,259 @@ fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
         row.last_activity_ms,
         crate::parse_iso_ms("2026-06-20T09:30:00.000Z")
     );
+}
+
+/// `summary.json` says when the session was opened and last touched;
+/// `updates.jsonl` says when it actually did things. The stream wins, and a
+/// session restored from a checkpoint — whose `created_at` predates its own
+/// first event — is the case that makes the difference visible.
+#[test]
+fn grok_activity_comes_from_the_update_stream_when_there_is_one() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-stream",
+        r#"{"info":{"id":"grok-stream","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:30:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-stream/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789560138,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":9210},"_meta":{"agentTimestampMs":1789560138000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-stream");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_560_138_000));
+}
+
+/// Grok compaction can drop earlier and later stream records. Discovery
+/// assigns the current snapshot's bounds rather than merging them with MIN/MAX,
+/// which would keep activity the files no longer contain.
+#[test]
+fn grok_discovery_replaces_activity_bounds_after_compaction() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-compact",
+        r#"{"info":{"id":"grok-compact","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T11:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-compact/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789563600,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789563600000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_563_600_000));
+
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789561800,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789561800000}}}"#,
+            "\n",
+            r#"{"timestamp":1789562700,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789562700000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_600_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_561_800_000),
+        "compaction moved the start later; the catalog has to follow"
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_562_700_000),
+        "compaction moved the end earlier; MIN/MAX merge would have kept 11:00"
+    );
+}
+
+/// An unreadable `summary.json` fails the shallow read instead of naming the
+/// session from its folder. A sibling with a valid summary still catalogs.
+#[cfg(unix)]
+#[test]
+fn grok_discovery_fails_an_unreadable_summary_rather_than_naming_the_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-ok",
+        r#"{"info":{"id":"grok-ok","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ok\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-blocked",
+        r#"{"info":{"id":"grok-blocked","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"secret\"}\n",
+        1_750_000_500_000,
+    );
+    let summary = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-blocked/summary.json");
+    // A file the walk can stat but cannot read: the stamp still covers it, so
+    // the candidate reaches the shallow reader instead of being skipped, and
+    // the identity sidecar is the one that must fail closed.
+    let mut permissions = fs::metadata(&summary).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&summary, permissions.clone()).unwrap();
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    permissions.set_mode(0o644);
+    fs::set_permissions(&summary, permissions).unwrap();
+    assert_eq!(found.ids(), vec!["grok:grok-ok"]);
+    assert!(
+        found
+            .summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.source == "grok"
+                && diagnostic.locator.as_deref().is_some_and(|locator| {
+                    locator.contains("grok-blocked")
+                })),
+        "unreadable identity has to be a diagnostic, not a folder-named row: {:?}",
+        found.summary.diagnostics
+    );
+    assert!(
+        found.rows.iter().all(|row| row.session_id != "grok-blocked"
+            && row.session_id != "local-folder"),
+        "the folder name must not become the session id: {:?}",
+        found.ids()
+    );
+}
+
+/// Discovery strips the `<user_query>` envelope, because hydration does.
+///
+/// Grok wraps a typed prompt in `<user_query>…</user_query>`. The full read
+/// unwraps it; the shallow read did not, so `sessions.first_prompt` held the
+/// XML envelope while `history.prompt` held the typed text -- for the *same*
+/// prompt of the *same* session. Catalog search and the session list showed
+/// the wrapper, and nothing said which of the two was the prompt.
+#[test]
+fn grok_discovery_unwraps_a_user_query_envelope_exactly_as_hydration_does() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-wrapped",
+        r#"{"info":{"id":"grok-wrapped","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"<user_query>ship it</user_query>\"}\n",
+        1_750_000_500_000,
+    );
+    // The positive control, in the same store: a prompt with no envelope is
+    // passed through untouched, so the fix cannot be "strip angle brackets".
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-plain",
+        r#"{"info":{"id":"grok-plain","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ship it\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-embedded",
+        r#"{"info":{"id":"grok-embedded","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"Compare a <user_query>x</user_query> element with HTML\"}\n",
+        1_750_000_500_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(
+        found.row("grok-wrapped").first_prompt.as_deref(),
+        Some("ship it"),
+        "the catalog stores what the person typed, not Grok's envelope"
+    );
+    assert_eq!(
+        found.row("grok-plain").first_prompt.as_deref(),
+        Some("ship it"),
+        "and an unwrapped prompt is unchanged"
+    );
+    assert_eq!(
+        found.row("grok-embedded").first_prompt.as_deref(),
+        Some("Compare a <user_query>x</user_query> element with HTML"),
+        "a tag inside the typed prompt is not the envelope"
+    );
+
+    // And the two readers agree, so they cannot drift apart again: the
+    // record interpretation the full read uses gives the same answer.
+    let wrapped = serde_json::json!({
+        "type": "user",
+        "content": "<user_query>ship it</user_query>",
+    });
+    let line = crate::ingest::grok::parse_chat_record(&wrapped);
+    match line.record {
+        crate::ingest::grok::GrokRecord::User { text, .. } => assert_eq!(
+            text.as_deref(),
+            found.row("grok-wrapped").first_prompt.as_deref(),
+            "shallow and full reads must store the same prompt"
+        ),
+        other => panic!("expected a user record, got {other:?}"),
+    }
+}
+
+/// A session whose update stream grew has new evidence even when the
+/// transcript is byte-identical, so the change stamp has to cover it.
+#[test]
+fn grok_rescan_sees_a_grown_update_stream() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-grow",
+        r#"{"info":{"id":"grok-grow","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"hey\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-grow/updates.jsonl");
+    write(&updates, "{}\n");
+    set_mtime(&updates, 1_750_000_500_000);
+    discover(&conn, home.path(), &only(&["grok"]));
+
+    write(&updates, "{}\n{}\n");
+    set_mtime(&updates, 1_750_000_900_000);
+    let second = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(second.summary.skipped_unchanged, 0);
+    assert_eq!(second.summary.counters.shallow_reads, 1);
 }
 
 #[test]
@@ -2330,4 +2590,502 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     let rescan = discover(&conn, home.path(), &only(&["claude"]));
     assert_eq!(rescan.summary.counters.shallow_reads, 1);
     assert_eq!(rescan.summary.skipped_unchanged, 0);
+}
+
+// ---------------------------------------------------------------------------
+// project identity on the cached path
+// ---------------------------------------------------------------------------
+
+fn stored_key(conn: &Connection, source: &str, session_id: &str) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT project_key, project_key_method FROM sessions WHERE source = ? AND session_id = ?",
+        params![source, session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or_else(|error| panic!("reading {source}/{session_id}: {error}"))
+}
+
+/// A codex rollout whose only interesting property is where it ran.
+fn codex_in(home: &Path, id: &str, cwd: &Path, mtime_ms: i64) {
+    let body = format!(
+        "{}\n{}\n",
+        format_args!(
+            r#"{{"timestamp":"2026-06-20T11:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+            cwd.display()
+        ),
+        r#"{"timestamp":"2026-06-20T11:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"delegated work"}}"#,
+    );
+    codex_rollout(home, id, &body, mtime_ms);
+}
+
+/// What discovery streams for a cached row must be what the pass then stores.
+///
+/// The cached-row upgrade resolves the working directory, which for a
+/// delegated child is frequently not a repository at all — a path key. The
+/// end-of-pass refresh then replaces that path with the parent's repository,
+/// because a borrowed key beats a machine-local directory. If the upgrade
+/// emits its own answer, the JSONL a consumer parses says one project and the
+/// database it came from says another, with nothing anywhere recording the
+/// disagreement.
+#[test]
+fn a_cached_child_is_streamed_the_key_the_refresh_pass_will_store() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/child");
+    fs::create_dir_all(&work).unwrap();
+    codex_in(home.path(), "child", &work, 1_750_000_000_000);
+
+    // Nothing to inherit from yet, so the child's own directory is all there
+    // is, and it is not a repository.
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(
+        first.row("child").project_key_method.as_deref(),
+        Some(ProjectKeyMethod::PathFallback.as_str()),
+        "the premise is a child that resolved to nothing canonical"
+    );
+
+    // The delegating parent lands, keyed to the repository it ran in.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    // The child's transcript is untouched, so this pass serves it by its stamp.
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let emitted = second.row("child");
+    let inherited = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        inherited,
+        "discovery streamed a path key for a child the refresh pass then made inherited"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        inherited,
+        "the streamed row and the stored row must not disagree"
+    );
+}
+
+/// An upgrade the catalog refuses must not be reported as if it happened.
+///
+/// The cached-row upgrade reads the row, resolves, and writes — three steps
+/// with no transaction around them, so a hydrate or a concurrent sync can
+/// settle the same session in between. The write is guarded and correctly
+/// declines to downgrade the settled key; the row streamed to the caller has
+/// to decline with it. Reporting the key the write *wanted* invents a value no
+/// row anywhere holds, which is worse than a stale one because nothing
+/// downstream can tell it is wrong.
+#[test]
+fn a_cached_upgrade_the_catalog_refuses_streams_the_stored_key() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/api");
+    fs::create_dir_all(&work).unwrap();
+    // A row from before project identity existed: no key at all.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'settled', ?, 1, 'shallow')",
+        params![work.to_string_lossy()],
+    )
+    .unwrap();
+    let mut row = fetch_catalog_row(&conn, "codex", "settled")
+        .unwrap()
+        .expect("the row was just inserted");
+
+    // Between that read and the upgrade, a hydrate settles the session on the
+    // repository it actually belongs to.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/api', project_key_method = 'remote' \
+         WHERE source = 'codex' AND session_id = 'settled'",
+        [],
+    )
+    .unwrap();
+
+    crate::project_identity::begin_acquisition_pass();
+    upgrade_cached_project_identity(&conn, &mut row).unwrap();
+
+    let settled = (
+        Some("github.com/acme/api".to_string()),
+        Some(ProjectKeyMethod::Remote.as_str().to_string()),
+    );
+    assert_eq!(
+        (row.project_key.clone(), row.project_key_method.clone()),
+        settled,
+        "the streamed row reported a key the catalog refused to store"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "settled"),
+        settled,
+        "a settled remote key must never be overwritten by a path"
+    );
+}
+
+/// The streamed key must survive the *whole* refresh, not just its first pass.
+///
+/// A cached row is decided and handed to the caller before the end-of-pass
+/// refresh runs at all. Asking the catalog what the parent holds right now is
+/// not enough to agree with what that refresh will store: the same refresh can
+/// promote the parent off a path and onto a `remote` of its own (pass 1) and
+/// only then lend it down (pass 2) — by which time the child has been streamed
+/// with a path key, and the JSONL a consumer parses disagrees with the
+/// database it came from.
+#[test]
+fn a_cached_child_is_streamed_the_key_its_parent_is_about_to_resolve() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The delegating parent is a checkout that has an `origin` — but the
+    // catalog still has it on a path key, exactly as a session first seen
+    // before its checkout was cloned would be. Pass 1 is what fixes that, and
+    // pass 1 has not run since.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/parent.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) VALUES ('codex', 'parent', ?1, ?1, 'path', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let expected = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        expected,
+        "the streamed key did not account for the promotion its own pass was about to make"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        expected,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the parent was not promoted, so nothing above was actually tested"
+    );
+}
+
+/// The streamed key must be the key the refresh will *leave*, which is not the
+/// same as the key the filesystem resolves.
+///
+/// Pass 1 never rewrites a `remote`: a session that resolved its repository
+/// once keeps that answer even if the checkout has since been re-pointed at a
+/// fork, because a settled canonical key is not something a later pass may
+/// quietly change underneath every consumer that has already grouped by it. A
+/// read-time walk that asks the filesystem instead would hand the caller the
+/// fork's key and then watch the refresh write the original back — the two
+/// disagreeing on every single pass, not just once.
+#[test]
+fn a_cached_child_is_streamed_the_settled_key_its_parent_keeps() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The parent settled on `acme/parent` at some earlier pass; its checkout
+    // now points somewhere else entirely.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/fork.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', ?, 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let settled = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        settled,
+        "the streamed key came from the checkout rather than from the row the pass will leave"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        settled,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent").0.as_deref(),
+        Some("github.com/acme/parent"),
+        "a settled remote key must not be rewritten by a later pass"
+    );
+}
+
+/// A stand-in follows the ancestor it stands in for, all the way down.
+///
+/// When pass 1 promotes a grandparent onto a `remote` of its own, pass 2
+/// carries that key through every borrowed key beneath it. A read-time walk
+/// that stops at the first ancestor already wearing a borrowed key answers
+/// with the stand-in the refresh is about to replace — so the row goes out on
+/// the wire naming one project while the database ends up naming another.
+#[test]
+fn a_cached_child_is_streamed_the_key_a_promoted_ancestor_will_lend() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted: its checkout has an `origin`
+    // but the catalog still has it wearing a key it borrowed.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The middle generation and the child both borrowed that same old key.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "parent", "gp->p"),
+        ("parent", "child", "p->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed key was the stand-in the refresh was about to replace"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
+}
+
+/// The streamed key must see what the stored key sees — including past a
+/// generation the catalog does not hold.
+///
+/// A delegated thread is evidence, not a session, so the generation between a
+/// root and its grandchild routinely has no catalog row. The refresh walks
+/// past it; a read-time walk that inner-joined `sessions` could not, so a
+/// cached grandchild was streamed with the stand-in it already wore while the
+/// same pass stored the promoted ancestor's key. Two answers for one session,
+/// one in `sessions discover --json` and one in the database, with nothing in
+/// either recording that they disagree.
+#[test]
+fn a_cached_grandchild_is_streamed_the_key_the_refresh_lends_across_a_gap() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted onto a `remote` of its own; the
+    // catalog still has it wearing a borrowed key.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The generation in between is evidence only: a relationship, no row.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "middle", "gp->m"),
+        ("middle", "child", "m->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'middle'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the premise of this test is that the middle generation has no catalog row"
+    );
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed walk stopped at the uncataloged generation the refresh walks past"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
 }

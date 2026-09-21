@@ -1,0 +1,19 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-simple"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/legacy-json-simple",
+  "history": [],
+  "hydration": [],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy `storage/{session,message,part}` JSON layout: one session, three parts",
+  "session_events": [],
+  "session_relationships": [],
+  "sessions": [],
+  "source": "opencode",
+  "tool_calls": []
+}

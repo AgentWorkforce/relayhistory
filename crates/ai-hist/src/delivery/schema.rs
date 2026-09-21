@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub(super) struct Table {
     pub name: &'static str,
@@ -101,6 +101,13 @@ pub(super) const TABLES: &[Table] = &[
             "evidence_uid",
         ],
     },
+    Table {
+        name: "session_markers",
+        kind: "session_marker",
+        source: "source",
+        session: "session_id",
+        key: &["source", "session_id", "marker_uid"],
+    },
 ];
 
 impl Table {
@@ -139,6 +146,48 @@ impl Table {
                 .join(",")
         ))
     }
+}
+
+/// Drop a table's capture triggers when they predate one of its columns.
+///
+/// Each trigger's payload is a `json_object` over the column list as it stood
+/// when the trigger was created, and every trigger is created `IF NOT EXISTS`.
+/// So a migration that adds a column to a captured table would otherwise leave
+/// the old trigger in place and deliver that column's value to no one, for the
+/// life of the database — a delivery that keeps reporting success while
+/// shipping an incomplete row. Dropping the stale trigger here is what makes
+/// adding a column to a captured table a one-place change.
+///
+/// Only genuine drift drops anything: the common case reads one `sqlite_master`
+/// row per table and leaves it alone.
+fn drop_triggers_that_predate_a_column(conn: &Connection, table: &Table) -> Result<()> {
+    let name = table.name;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            [format!("delivery_{name}_insert")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let columns = conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{name}')"))?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns
+        .iter()
+        .all(|column| existing.contains(&format!("'{column}',NEW.\"{column}\"")))
+    {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS delivery_{name}_insert; \
+         DROP TRIGGER IF EXISTS delivery_{name}_update; \
+         DROP TRIGGER IF EXISTS delivery_{name}_delete;"
+    ))?;
+    Ok(())
 }
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
@@ -199,7 +248,11 @@ CREATE TABLE IF NOT EXISTS delivery_exclusions (
     // A pre-upgrade job/export has no snapshot boundary for newly introduced
     // tables. Give it an empty historical snapshot; new observation writes are
     // captured by the journal. A newly created generation exports current rows.
-    for kind in ["source_observation", "observation_evidence"] {
+    for kind in [
+        "source_observation",
+        "observation_evidence",
+        "session_marker",
+    ] {
         conn.execute("INSERT OR IGNORE INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT id,?,0 FROM delivery_jobs UNION ALL SELECT id,?,0 FROM history_exports",[kind,kind])?;
     }
     // Count retained logical bytes, including key/payload duplication and row
@@ -232,6 +285,9 @@ END;
 "#))?;
     }
     let consumers = "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
+    for table in TABLES {
+        drop_triggers_that_predate_a_column(conn, table)?;
+    }
     for (index, table) in TABLES.iter().enumerate() {
         let old_payload = table.payload(conn, "OLD")?;
         let new_payload = table.payload(conn, "NEW")?;
@@ -258,6 +314,25 @@ END;
         };
         let insert_shadow = shadow("NEW", "NULL");
         let before_shadow = shadow("OLD", &old_payload);
+        // A capture trigger embeds the column list the table had when it was
+        // created. `CREATE TRIGGER IF NOT EXISTS` leaves that in place, so a
+        // table that later gains a column keeps being captured in the old
+        // shape: delivery goes on reporting success while the new field never
+        // reaches the destination. Rebuild any trigger whose payload no longer
+        // matches the table it captures.
+        let stale: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",
+            rusqlite::params![format!("delivery_{name}_insert"), new_payload.as_str()],
+            |row| row.get(0),
+        )?;
+        if stale {
+            for operation in ["insert", "update", "delete"] {
+                conn.execute_batch(&format!(
+                    "DROP TRIGGER IF EXISTS delivery_{name}_{operation};"
+                ))?;
+            }
+        }
         conn.execute_batch(&format!(r#"
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_insert AFTER INSERT ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
@@ -294,6 +369,33 @@ END;
     Ok(())
 }
 
+/// Whether a retained capture trigger still emits the column list its table
+/// has now.
+///
+/// Trigger *names* are what [`schema_is_current`] can check cheaply, but a
+/// name says nothing about the payload: a trigger embeds the column list its
+/// table had when it was created. Delivery is an optional feature, and that is
+/// what opens the hole -- a database can carry delivery tables and triggers
+/// from a delivery-enabled build, be opened by a `--no-default-features` build
+/// that adds a column without compiling the rebuild in, and then come back to
+/// a delivery-enabled build whose fast path the names alone satisfy. The
+/// rebuild is never reached and delivery goes on reporting success while the
+/// new field never leaves the machine.
+///
+/// Asked the same way the rebuild in `init_schema` asks it, so the two cannot
+/// disagree about what "current" means.
+fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> {
+    let name = table.name;
+    let payload = table.payload(conn, "NEW")?;
+    let stale: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type='trigger' AND name=?1 AND instr(sql, ?2)=0)",
+        rusqlite::params![format!("delivery_{name}_insert"), payload.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(!stale)
+}
+
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     let mut names = Vec::new();
     for table in TABLES {
@@ -325,5 +427,60 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         [],
         |r| r.get(0),
     )?;
-    Ok(count as usize == names.len())
+    if count as usize != names.len() {
+        return Ok(false);
+    }
+    // A trigger can carry the right name and a payload that predates a column
+    // its table has since gained; see `capture_payload_is_current`.
+    for table in TABLES {
+        if !capture_payload_is_current(conn, table)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::open_db;
+
+    /// A capture trigger that predates a column must not survive the upgrade
+    /// that adds it: it would keep delivering rows that look complete and are
+    /// missing a field, with nothing in the result to say so.
+    #[test]
+    fn a_capture_trigger_predating_a_column_is_rebuilt_on_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = open_db(&path).unwrap();
+        // Recreate the session_relationships capture as it stood before
+        // `origin_session_id`, which is exactly what an older release left.
+        let stale = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' \
+                 AND name='delivery_session_relationships_insert'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .replace("'origin_session_id',NEW.\"origin_session_id\",", "")
+            .replace(",'origin_session_id',NEW.\"origin_session_id\"", "");
+        conn.execute_batch("DROP TRIGGER delivery_session_relationships_insert;")
+            .unwrap();
+        conn.execute_batch(&stale).unwrap();
+        assert!(!schema_is_current(&conn).unwrap());
+        drop(conn);
+
+        let conn = open_db(&path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let rebuilt: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' \
+                 AND name='delivery_session_relationships_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rebuilt.contains("'origin_session_id',NEW.\"origin_session_id\""));
+    }
 }

@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.18.8"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -55,6 +55,7 @@ dependencies = [
  "clap",
  "flate2",
  "fs2",
+ "libc",
  "rusqlite",
  "serde_json",
  "sha2",
@@ -65,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist-napi"
-version = "0.18.8"
+version = "0.21.0"
 dependencies = [
  "ai-hist",
  "anyhow",

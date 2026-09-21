@@ -1,0 +1,54 @@
+{
+  "corpus_files": [
+    "claude/sidechain-turn.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/sidechain-turn",
+  "history": [],
+  "hydration": [],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "every record is `isSidechain: true` — a subagent sidecar, not a session of its own",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-side:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-side",
+      "model": "claude-haiku-4-5",
+      "parent_id": "u-sidechain-user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "44444444-4444-4444-4444-444444444444",
+      "source": "claude",
+      "text": "working on it",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":50,\"output_tokens\":10}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": null,
+      "child_session_id": null,
+      "evidence_kind": "claude_sidechain_records",
+      "evidence_locator": "<home>/.claude/projects/corpus/sidechain-turn.jsonl",
+      "evidence_ref": null,
+      "identity_status": "unlinked",
+      "parent_session_id": "44444444-4444-4444-4444-444444444444",
+      "relationship": "delegated",
+      "relationship_uid": "evidence:claude_sidechain_records:<home>/.claude/projects/corpus/sidechain-turn.jsonl",
+      "source": "claude",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776643200000
+    }
+  ],
+  "sessions": [],
+  "source": "claude",
+  "tool_calls": []
+}
