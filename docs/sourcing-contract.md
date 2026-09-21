@@ -99,10 +99,13 @@ harness writes into the user role that is not a human prompt keeps
 | `meta`                     | claude | `isMeta: true` and nothing above applies                                                   |
 | `resume_marker`            | claude | a bare `/resume <id>` or `/continue <id>`                                                  |
 
-`null` is a genuine prompt, or model output. `history`, `sessions.first_prompt`
-and `attribute_usage_to_prompts` all derive from the same classification
-(`crates/ai-hist/src/ingest/control.rs`), so a control row is never a prompt,
-never a first prompt and never a prompt root. A `<system-reminder>` inside a
+`null` is a genuine prompt, or model output. `history`, `sessions.first_prompt`,
+`session_user_turns_page` and `attribute_usage_to_prompts` all derive from the
+same classification (`crates/ai-hist/src/ingest/control.rs`), so a control row
+is never a prompt, never a first prompt, never a user turn (or a block of one)
+and never a prompt root. For Claude the full-transcript metadata fold settles
+`first_prompt`, null included, on every sync or hydration; the shallow catalog
+upsert still coalesces so a partial or remote read cannot blank a title. A `<system-reminder>` inside a
 prompt is split out into a `system_reminder` row sharing the prompt's
 `message_id` (`event_uid` = `<prompt uid>:reminder:<n>`), and the prompt row
 and `history` carry only the human's text.

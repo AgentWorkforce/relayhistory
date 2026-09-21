@@ -4336,6 +4336,18 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
             outcome.events += 1;
+            if message.control.is_some() {
+                // Before wrappers were typed this line stored nothing and was
+                // recorded as an `unknown` marker. It writes a row now, so
+                // the marker an earlier parser left for it is retired rather
+                // than kept beside the row as a second account of one line.
+                conn.execute(
+                    "DELETE FROM session_markers \
+                     WHERE source = 'codex' AND session_id = ? AND marker_uid = ? \
+                       AND kind = 'unknown'",
+                    params![session_id, format!("{index}:marker")],
+                )?;
+            }
             // A subagent's "user" turns are the parent agent's task prompts;
             // only human threads feed prompt history and session discovery.
             if !meta.is_subagent && message.control.is_none() {
@@ -5435,6 +5447,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
+            set_claude_first_prompt(conn, &meta)?;
             incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
             // Global sync is not scoped to one thread, so it indexes the
             // materialization edge like every other kind.
@@ -5820,6 +5833,11 @@ pub(crate) struct ClaudeSessionMeta {
     first_ts: i64,
     last_ts: i64,
     last_assistant_text: Option<String>,
+    /// The first substantive human turn, by the same classification the
+    /// shallow scan uses -- over the whole transcript rather than its head.
+    /// `None` is the whole file's answer, not a gap: a transcript of nothing
+    /// but control rows has no first prompt, and the catalog says so.
+    first_prompt: Option<String>,
     /// Every identified record is a sidechain row, so this file is a delegated
     /// sidecar rather than a session of its own — the same rule discovery uses
     /// to keep sidecars out of the catalog.
@@ -5857,6 +5875,9 @@ pub(crate) struct ClaudeMetaFold {
     pub last_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assistant_text: Option<String>,
+    /// First-wins, from the same classifier as discovery's `first_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     #[serde(default)]
     pub identified_records: usize,
     #[serde(default)]
@@ -5947,6 +5968,9 @@ impl ClaudeMetaFold {
         if self.cwd.is_none() {
             self.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
+        if self.first_prompt.is_none() {
+            self.first_prompt = crate::discover::claude_substantive_prompt(value);
+        }
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
             self.git_branch = Some(branch.to_string());
         }
@@ -5991,6 +6015,7 @@ impl ClaudeMetaFold {
             first_ts: first,
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
+            first_prompt: self.first_prompt.clone(),
             subagent: self.identified_records > 0
                 && self.sidechain_records == self.identified_records,
             agent_id: self.agent_id.clone(),
@@ -6034,6 +6059,23 @@ impl ClaudeScanPass {
     fn read_nothing_decodable(&self) -> bool {
         self.decoded == 0 && self.undecodable > 0
     }
+}
+
+/// Record what the whole-transcript fold found as the session's first prompt.
+///
+/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
+/// the row already holds, because a shallow or remote read may simply not
+/// have seen the prompt. The metadata fold has seen every record, so its
+/// answer replaces the row's -- including with null. Without that, a session
+/// whose stored title was a row the classifier now types as control (a bare
+/// `/resume <id>`, a task notification) would keep it for good on an upgraded
+/// install, while a fresh database stores nothing.
+pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
+        params![meta.first_prompt, meta.session_id],
+    )?;
+    Ok(())
 }
 
 /// The same metadata fold, over bytes the lifecycle hook already captured.
@@ -7050,8 +7092,30 @@ fn ingest_claude_record(
     let record_control = user_split
         .as_ref()
         .and_then(|split| control::claude_record_control_kind(obj, &split.prompt));
-    if let Some(split) = &user_split {
-        if record_control.is_none() && !split.prompt.is_empty() {
+    if let (Some(raw), Some(split)) = (raw_user_text.as_deref(), &user_split) {
+        // What this record contributes to `history` now: the human's text, or
+        // nothing for a control row.
+        let current =
+            (record_control.is_none() && !split.prompt.is_empty()).then_some(split.prompt.as_str());
+        // A parser before control rows were typed wrote this record's whole
+        // text -- reminders included, task notifications included -- as a
+        // history row, and nothing on the Claude path removes a history row on
+        // re-read: a re-read that stores a different prompt, or none, would
+        // leave the old one beside it as a second searchable prompt for the
+        // life of the database. So the row that parser would have written
+        // for this record is retired first, keyed exactly: this session, this
+        // record's timestamp, that text. A row another session shares the
+        // timestamp and text with is that session's and is left alone; a row
+        // this parser writes back unchanged is deleted and reinserted only
+        // when the text really did change.
+        if !raw.is_empty() && current != Some(raw) {
+            conn.execute(
+                "DELETE FROM history \
+                 WHERE source = 'claude' AND session_id = ? AND timestamp_ms = ? AND prompt = ?",
+                params![session_id, ts_ms, raw],
+            )?;
+        }
+        if let Some(prompt) = current {
             insert_history(
                 conn,
                 &HistoryEntry {
@@ -7059,8 +7123,8 @@ fn ingest_claude_record(
                     source: "claude".into(),
                     session_id: Some(session_id.to_string()),
                     project: project.map(str::to_string),
-                    prompt_hash: Some(prompt_hash(&split.prompt)),
-                    prompt: split.prompt.clone(),
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.to_string(),
                     timestamp_ms: ts_ms,
                 },
             )?;
@@ -7433,6 +7497,19 @@ impl ClaudeTextRows<'_> {
         let split = control::split_system_reminders(text);
         if split.reminders.is_empty() {
             return write(text, event_uid, None);
+        }
+        if split.prompt.trim().is_empty() {
+            // Nothing keeps `event_uid`. A parser before the split stored the
+            // whole reminder under it, untyped, and the upsert below writes
+            // only the suffixed rows -- so on an upgraded database that old
+            // row would stay beside them and read as a prompt for as long as
+            // the transcript stood still. Scoped to this one uid: every other
+            // row of the record keeps its identity and is upserted in place.
+            conn.execute(
+                "DELETE FROM session_events \
+                 WHERE source = 'claude' AND session_id = ? AND event_uid = ?",
+                params![self.session_id, event_uid],
+            )?;
         }
         write(&split.prompt, event_uid, None)?;
         for (index, reminder) in split.reminders.iter().enumerate() {
@@ -21333,6 +21410,285 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(prompts, vec!["real prompt"]);
+    }
+
+    fn corpus_fixture(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(relative)
+    }
+
+    fn typed_event_uids(
+        conn: &Connection,
+        session_id: &str,
+        message_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        conn.prepare(
+            "SELECT event_uid, control_kind FROM session_events \
+             WHERE source = 'claude' AND session_id = ? AND message_id = ? ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([session_id, message_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Before reminders were split out, a standalone `<system-reminder>` text
+    /// block was stored under the block's own uid, untyped. The split stores
+    /// it under a suffixed uid, so an upgraded database would otherwise keep
+    /// the old row beside the new one -- and usage attribution would go on
+    /// reading it as a prompt.
+    #[test]
+    fn a_reminder_row_the_previous_parser_stored_untyped_is_retired_on_reparse() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row shape the previous parser wrote for `u-rem-1`'s first block.
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid, raw_facts_version) \
+             VALUES ('claude', 'reminder-session', 'u-rem-1', 1779753600000, 'user', 'text', \
+                     '<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>', \
+                     'u-rem-1:0', 2)",
+            [],
+        )
+        .unwrap();
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+
+        assert_eq!(
+            typed_event_uids(&conn, "reminder-session", "u-rem-1"),
+            vec![
+                (
+                    "u-rem-1:0:reminder:0".to_string(),
+                    Some("system_reminder".to_string())
+                ),
+                ("u-rem-1:1".to_string(), None),
+            ],
+            "the untyped row under the old uid is gone, the typed one stands"
+        );
+        let events = crate::session_events(&conn, "reminder-session", Some("claude")).unwrap();
+        let attributed = crate::usage::attribute_usage_to_prompts(&events, "claude");
+        let prompts: Vec<&str> = attributed
+            .keys()
+            .map(|(_, prompt)| prompt.as_str())
+            .collect();
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| !prompt.contains("<system-reminder>")),
+            "no reminder text is a prompt: {prompts:?}"
+        );
+    }
+
+    /// The same shape for Codex: a context wrapper used to store nothing and
+    /// was recorded as an `unknown` marker. It stores a typed row now, so the
+    /// marker an earlier parser left for that line is retired.
+    #[test]
+    fn a_codex_wrapper_marker_the_previous_parser_left_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-current.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-08-31T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-wrapper","cwd":"/tmp/proj"}}"#,
+                response_user(
+                    "2026-08-31T10:00:01.000Z",
+                    "<environment_context>injected</environment_context>"
+                ),
+                response_user("2026-08-31T10:00:02.000Z", "fix the scanner"),
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the previous parser left for line 1.
+        crate::insert_session_marker(
+            &conn,
+            "codex",
+            "sess-wrapper",
+            &crate::NewSessionMarker {
+                marker_uid: "1:marker",
+                ts_ms: Some(1),
+                kind: "unknown",
+                subkind: Some("message"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        assert!(
+            markers_of(&conn, "codex", "sess-wrapper").is_empty(),
+            "the wrapper is a row now, not a marker: {:?}",
+            markers_of(&conn, "codex", "sess-wrapper")
+        );
+        let control: Vec<Option<String>> = conn
+            .prepare("SELECT control_kind FROM session_events WHERE role = 'user' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(control, vec![Some("codex_context_wrapper".into()), None]);
+    }
+
+    fn claude_history(conn: &Connection, session_id: &str) -> Vec<(i64, String)> {
+        conn.prepare(
+            "SELECT timestamp_ms, prompt FROM history \
+             WHERE source = 'claude' AND session_id = ? ORDER BY timestamp_ms, prompt",
+        )
+        .unwrap()
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The parser before control rows stored a record's whole text as its
+    /// history row: reminders folded into the prompt, task notifications as
+    /// prompts. Nothing on the Claude path removes a history row on re-read,
+    /// so the one-time re-read retires exactly the row that parser wrote for
+    /// each record it now stores differently -- and leaves a row another
+    /// session happens to share alone.
+    #[test]
+    fn a_reparse_retires_the_history_rows_the_previous_parser_wrote() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session_id, ts_ms, prompt) in [
+            // `u-rem-1`, with the reminder block folded into the prompt.
+            (
+                "reminder-session",
+                1_779_753_600_000_i64,
+                "<system-reminder>\nThe user has enabled brief mode. Keep answers short.\n</system-reminder>\ntighten the retry loop",
+            ),
+            // `u-rem-2`, the inline form.
+            (
+                "reminder-session",
+                1_779_753_602_000,
+                "now add a test for it\n<system-reminder>Remember to read AGENTS.md before editing.</system-reminder>",
+            ),
+            // `u-tn-1`, a task notification stored as a prompt.
+            (
+                "tn-session",
+                1_779_667_202_000,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+            // Another session's row at the same instant and text as `u-tn-1`
+            // is not this transcript's to retire.
+            (
+                "elsewhere",
+                1_779_667_202_001,
+                "<task-notification>background task bash_1 completed</task-notification>",
+            ),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session_id.into()),
+                    project: Some("/tmp/project".into()),
+                    prompt_hash: Some(prompt_hash(prompt)),
+                    prompt: prompt.into(),
+                    timestamp_ms: ts_ms,
+                },
+            )
+            .unwrap();
+        }
+
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/task-notification.jsonl")).unwrap();
+
+        assert_eq!(
+            claude_history(&conn, "reminder-session"),
+            vec![
+                (1_779_753_600_000, "tighten the retry loop".to_string()),
+                (1_779_753_602_000, "now add a test for it".to_string()),
+            ]
+        );
+        assert_eq!(
+            claude_history(&conn, "tn-session"),
+            vec![
+                (1_779_667_200_000, "please fix the build".to_string()),
+                (
+                    1_779_667_204_000,
+                    "thanks, also add a changelog entry".to_string()
+                ),
+            ]
+        );
+        assert_eq!(claude_history(&conn, "elsewhere").len(), 1);
+
+        // Idempotent: a second read changes nothing.
+        ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
+        assert_eq!(claude_history(&conn, "reminder-session").len(), 2);
+    }
+
+    fn stored_first_prompt(conn: &Connection, session_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The shallow catalog upsert coalesces a null `first_prompt` into the
+    /// stored one, so a title an earlier scanner derived from a row that is
+    /// control now -- a bare `/resume <id>` -- would survive every rescan of
+    /// an unchanged transcript. The full sync walks every record, so its
+    /// answer, null included, is the one the catalog keeps.
+    #[test]
+    fn a_full_claude_sync_replaces_a_control_only_first_prompt_with_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume-only.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"/resume 11111111-1111-1111-1111-111111111111"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"resume-only","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"assistant","model":"claude-test","content":[{"type":"text","text":"continuing"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The row an earlier scanner left: the marker text as the title.
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'resume-only', '/resume 11111111-1111-1111-1111-111111111111', 'shallow')",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(stored_first_prompt(&conn, "resume-only"), None);
+
+        // And where a substantive prompt does follow a control row, the sync
+        // names it rather than the control row.
+        let path = dir.path().join("notified-first.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:00.000Z","message":{"role":"user","content":"<task-notification>bash_1 done</task-notification>"}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","parentUuid":"u1","sessionId":"notified-first","cwd":"/tmp/project","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"now ship it"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, first_prompt, discovery_state) \
+             VALUES ('claude', 'notified-first', '<task-notification>bash_1 done</task-notification>', 'shallow')",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            stored_first_prompt(&conn, "notified-first").as_deref(),
+            Some("now ship it")
+        );
     }
 
     fn write_rich_claude_transcript(path: &std::path::Path) {

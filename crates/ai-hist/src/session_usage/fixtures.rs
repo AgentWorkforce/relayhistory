@@ -1055,3 +1055,47 @@ fn a_codex_context_wrapper_is_not_a_turn_boundary() {
     assert_eq!(prompt, "fix the importer");
     assert_eq!(usage.output_tokens, 60);
 }
+
+/// User turns are human turns. A Codex context wrapper is a user-role row and
+/// is not one, and a `<system-reminder>` split off a prompt shares the
+/// prompt's message id and is not one of its blocks.
+#[test]
+fn user_turn_pages_leave_out_control_rows() {
+    let conn = codex_store("codex/context-wrapper.jsonl");
+    let page =
+        crate::store::session_user_turns_page(&conn, "codex", "sess_context_wrapper_1", 10, None)
+            .unwrap();
+    assert_eq!(page.user_turns.len(), 1, "{:?}", page.user_turns);
+    assert_eq!(
+        page.user_turns[0].message_id.as_deref(),
+        Some("msg_ctx_prompt")
+    );
+    assert_eq!(page.user_turns[0].blocks.len(), 1);
+    assert_eq!(
+        page.user_turns[0].blocks[0].byte_len,
+        "fix the importer".len() as i64
+    );
+
+    let conn = claude_store("claude/system-reminder.jsonl");
+    let page = crate::store::session_user_turns_page(&conn, "claude", "reminder-session", 10, None)
+        .unwrap();
+    let turns: Vec<(Option<&str>, usize, i64)> = page
+        .user_turns
+        .iter()
+        .map(|turn| {
+            (
+                turn.message_id.as_deref(),
+                turn.blocks.len(),
+                turn.blocks.iter().map(|block| block.byte_len).sum(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        turns,
+        vec![
+            (Some("u-rem-1"), 1, "tighten the retry loop".len() as i64),
+            (Some("u-rem-2"), 1, "now add a test for it".len() as i64),
+        ],
+        "the meta record that is only a reminder is no turn at all"
+    );
+}

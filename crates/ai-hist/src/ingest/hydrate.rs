@@ -2210,6 +2210,9 @@ fn ingest_claude(
         meta.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
+    // The fold above walked the whole transcript, so its first prompt is the
+    // catalog's, null included.
+    crate::ingest::set_claude_first_prompt(conn, &meta)?;
     let mut outcome = IngestOutcome {
         bytes_read: scanned_bytes as i64,
         validation_bytes: scan_validation as i64,
@@ -11008,6 +11011,38 @@ mod tests {
         assert_eq!(edge.child_session_id.as_deref(), Some(resumed));
         assert_eq!(edge.origin_session_id.as_deref(), Some(prior));
         assert!(edge.child_has_events);
+    }
+
+    /// Targeted hydration walks the whole transcript too, so it settles the
+    /// same question the same way: a title an earlier scanner derived from a
+    /// row that is control now is replaced, with null when nothing else in
+    /// the file is a prompt.
+    #[test]
+    fn hydrating_a_control_only_transcript_clears_its_stale_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = claude_fixture(dir.path(), "resume-marker.jsonl");
+        let resumed = "99999999-9999-9999-9999-999999999999";
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", resumed, Some(&transcript));
+        conn.execute(
+            "UPDATE sessions SET first_prompt = '/resume 11111111-1111-1111-1111-111111111111' \
+             WHERE source = 'claude' AND session_id = ?",
+            [resumed],
+        )
+        .unwrap();
+        drop(conn);
+
+        hydrate_session_at_with_home(&db, &options("claude", resumed), dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let first_prompt: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+                [resumed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_prompt, None, "a resume marker is not a title");
     }
 
     #[test]

@@ -153,13 +153,28 @@ Notable changes to the native `ai-hist` CLI are documented here.
   replaced the `CLAUDE_CONTROL_PREFIXES` list: a task notification or a bare
   `/resume <id>` is no longer a `history` row or a first prompt, and the
   answer to a slash command is charged to the human prompt before it rather
-  than to the command's output row. `SessionEvent` gains `control_kind`,
+  than to the command's output row. `session_user_turns_page` leaves control
+  rows out too, so a Codex context wrapper is not a turn and a split reminder
+  is not one of its prompt's blocks; the relayhistory plugin skips them when
+  publishing conversation turns. For Claude the full-transcript metadata fold
+  now settles `sessions.first_prompt` on every sync or hydration, null
+  included, so a title an earlier release took from a row that is control now
+  (a bare `/resume <id>`, a task notification) is replaced on the one-time
+  re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
+  through the current classifier once as well. A standalone reminder row the
+  previous parser stored untyped under the block's own uid, and the `unknown`
+  marker it left for a Codex wrapper, are retired by the re-read rather than
+  kept beside the typed rows. `SessionEvent` gains `control_kind`,
   returned by `session_events` and `session_events_page` and carried by the
   source-evidence row contract. `HYDRATION_PARSER_VERSION` 10 -> 11 and the
   raw-facts generation 2 -> 3, so an existing install re-stamps every row
-  once on the next hydration or plain `sync`. `history` rows an earlier
-  parser wrote for rows now classified as control are not removed by that
-  re-read. The fixture corpus snapshots now include `control_kind` and a
+  once on the next hydration or plain `sync`. That re-read also retires what
+  the previous parser wrote for a record it now stores differently: the
+  `history` row it wrote from the record's whole text (a reminder folded into
+  the prompt, a task notification as a prompt), keyed on this session, the
+  record's timestamp and that text. Continuity reads a `/resume` through the
+  same reminder stripping, so a reminder ahead of the wrapper no longer hides
+  the resume. The fixture corpus snapshots now include `control_kind` and a
   `session_markers` dump. napi/TS/MCP exposure is not included.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider

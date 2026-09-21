@@ -419,9 +419,11 @@ impl SlashCommandTriads {
                 let entry = self.pending.entry(row.session_id.to_string()).or_default();
                 let chained_to_caveat =
                     row.parent_uuid.is_some() && entry.caveat_uuid.as_deref() == row.parent_uuid;
-                let caveat_event_uid = chained_to_caveat
-                    .then(|| entry.caveat_event_uid.clone())
-                    .flatten();
+                let caveat_event_uid = if chained_to_caveat {
+                    entry.caveat_event_uid.clone()
+                } else {
+                    None
+                };
                 let invocation = PendingInvocation {
                     uuid: row.uuid.to_string(),
                     event_uid: row.event_uid.to_string(),

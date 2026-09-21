@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 5;
+pub const SHALLOW_SCANNER_VERSION: u32 = 6;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -108,6 +108,14 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
 /// change marker, so only the scanner-version prefix can force those cached
 /// rows through the corrected reader once.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
+
+/// Version 5 derived `first_prompt` from a prefix list of Claude control
+/// wrappers. Version 6 derives it from `ingest::control`, which also types
+/// task notifications, bare `/resume` markers and `<system-reminder>` blocks
+/// as not-a-prompt, and the bytes of a transcript whose title one of those
+/// used to be never change -- so only this bump sends the cached row through
+/// the current classifier once.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 5);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -1265,8 +1273,9 @@ struct ClaudeProvider;
 /// `first_prompt` and the ledger's prompts cannot disagree about a record.
 /// `<system-reminder>` blocks are removed from the excerpt for the same
 /// reason: the record walk stores them as rows of their own, not as prompt
-/// text.
-fn claude_substantive_prompt(value: &Value) -> Option<String> {
+/// text. The full-transcript metadata fold (`ClaudeMetaFold`) asks this same
+/// question of every record, and its answer is the one the catalog keeps.
+pub(crate) fn claude_substantive_prompt(value: &Value) -> Option<String> {
     let role = value
         .pointer("/message/role")
         .and_then(Value::as_str)

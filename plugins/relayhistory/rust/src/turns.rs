@@ -175,6 +175,14 @@ fn build_turns_batch_in_snapshot(
         for event in rows {
             watermark = watermark.max(event.id);
 
+            // A control row -- a Codex context wrapper, a Claude slash-command
+            // record, a system reminder -- is the harness's, not a turn of the
+            // conversation. Skip it the same way, after the watermark has
+            // moved past it, so it neither uploads as a user turn nor shifts
+            // the indices of the turns that follow.
+            if event.control_kind.is_some() {
+                continue;
+            }
             // An event with no text carries nothing a reader can use. Skip it, but only
             // after the watermark has moved past it.
             let content = match event.text.as_deref().map(str::trim) {
@@ -378,6 +386,69 @@ mod tests {
         // Indices stay absolute across the chunk boundary, or the second request
         // overwrites the first at indices 0..25.
         assert_eq!(chunks[1][0].turn_index, MAX_TURNS_PER_REQUEST as i64);
+    }
+
+
+    fn insert_control(conn: &Connection, session: &str, ts: i64, text: &str, control_kind: &str) {
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid, control_kind)
+             VALUES ('codex', ?1, ?2, 'user', 'text', ?3, ?4, ?5)",
+            rusqlite::params![session, ts, text, format!("{session}-{ts}-control"), control_kind],
+        )
+        .unwrap();
+    }
+
+    /// A Codex context wrapper, a Claude slash-command record, a system
+    /// reminder: user-role rows the harness wrote, typed by `control_kind`.
+    /// None is a turn of the conversation, so none is uploaded and none
+    /// shifts the index of the turns around it -- but each still advances the
+    /// watermark, exactly as an empty row does.
+    #[test]
+    fn control_rows_are_skipped_but_still_advance_the_watermark() {
+        let conn = db();
+        insert_control(
+            &conn,
+            "s1",
+            1000,
+            "<environment_context>cwd=/tmp/proj</environment_context>",
+            "codex_context_wrapper",
+        );
+        insert(&conn, "s1", 2000, "user", "text", "fix the importer");
+        insert(&conn, "s1", 3000, "assistant", "text", "done");
+        insert_control(
+            &conn,
+            "s1",
+            4000,
+            "<task-notification>bash_1 completed</task-notification>",
+            "task_notification",
+        );
+
+        let batch = build_turns_batch(&conn, 0, 10, &HashSet::new()).unwrap();
+        let turns = &batch.sessions[0].chunks[0];
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.turn_index, turn.role.as_str(), turn.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "user", "fix the importer"), (1, "assistant", "done")],
+        );
+        assert_eq!(
+            batch.session_event_id, 4,
+            "watermark must pass the skipped control row"
+        );
+
+        // A session of nothing but control rows uploads nothing and stalls
+        // nothing.
+        insert_control(
+            &conn,
+            "s2",
+            5000,
+            "<environment_context>cwd=/tmp/other</environment_context>",
+            "codex_context_wrapper",
+        );
+        let batch = build_turns_batch(&conn, 4, 10, &HashSet::new()).unwrap();
+        assert!(batch.sessions.is_empty());
+        assert_eq!(batch.session_event_id, 5);
     }
 
     #[test]

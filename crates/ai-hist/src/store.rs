@@ -3123,8 +3123,13 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// proven to belong to a user message, so it is left out rather than guessed
 /// at. Those rows are transient: the one-time fidelity backfill pass populates
 /// `event_source` for every transcript it can still read.
-const USER_TURN_ROW_FILTER: &str =
-    "(role = 'user' OR (role = 'tool_result' AND event_source = 'tool_result'))";
+///
+/// A user-role row carrying a `control_kind` is the harness's, not the
+/// human's: a Codex context wrapper would otherwise read as a turn of its own,
+/// and a `<system-reminder>` row split off a prompt would be counted among the
+/// prompt's blocks and bytes.
+const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
+     OR (role = 'tool_result' AND event_source = 'tool_result'))";
 
 /// The message recorded next to a turn, on either side of it.
 ///
