@@ -19,6 +19,7 @@
   "files": [
     "dist/index.*",
     "dist/helper.*",
+    "dist/delivery.*",
     "dist/plugin.*",
     "dist/cloud-client.*",
     "dist/cloud-auth-runtime.*",

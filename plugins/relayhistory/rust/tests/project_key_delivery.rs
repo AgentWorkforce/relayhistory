@@ -13,7 +13,8 @@
 //! event straight back to the sweep. This asserts the journal, not the
 //! intention.
 
-use ai_hist::{delivery::*, open_db, sync_scoped_at, SessionScope};
+use ai_hist::{sync_scoped_at, SessionScope};
+use relayhistory_plugin::delivery::*;
 use std::{fs, path::Path};
 
 fn write(path: &Path, text: &str) {

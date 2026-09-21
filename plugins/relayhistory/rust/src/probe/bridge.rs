@@ -3,10 +3,10 @@
 //! replacing a delivery generation. An interrupted change fences startup until
 //! recovery completes, so it cannot accidentally broaden sharing.
 use super::{collector, lock, read_config, save_json, user_error, Config, Target};
-use ai_hist::delivery::{self, DeliveryJobConfig, SessionIdentity};
 use anyhow::{ensure, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use fs2::FileExt;
+use relayhistory_plugin::delivery::{self, DeliveryJobConfig, SessionIdentity};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -100,7 +100,7 @@ pub fn control_lock(directory: &Path) -> Result<fs::File> {
     Ok(file)
 }
 fn db(directory: &Path) -> Result<Connection> {
-    let conn = ai_hist::open_db(&directory.join("history.db"))?;
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
 }
@@ -428,7 +428,9 @@ fn change(
             let unchanged = identities_requested
                 .iter()
                 .map(|id| {
-                    delivery::job_session_included(&conn, &config.job_id, id).map(|v| v == include)
+                    let member = delivery::job_session_included(&conn, &config.job_id, id)?;
+                    let excluded: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)", rusqlite::params![id.source,id.session_id], |r| r.get(0))?;
+                    Ok(member == include && (!include || !excluded))
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
@@ -862,6 +864,20 @@ mod tests {
             assert_eq!(before, 1); // only the fixture's legacy unselected codex row
             eprintln!("probe-selected unrelated={count} two_inclusions_repeat_ms={:.3} exclusions={before}",started.elapsed().as_secs_f64()*1000.);
         }
+    }
+
+    #[test]
+    fn repeated_include_does_not_succeed_while_global_exclusion_remains() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let config = apply(dir.path(), config, None, &["claude:old"], true);
+        let conn = db(dir.path()).unwrap();
+        let identity = parse_key("claude:old").unwrap();
+        delivery::set_session_excluded(&conn, &identity, true).unwrap();
+        let error = change(dir.path(), None, &["claude:old".into()], true).unwrap_err();
+        assert!(format!("{error:#}").contains("DELIVERY_GENERATION_REQUIRED"));
+        assert!(delivery::job_session_included(&conn, &config.job_id, &identity).unwrap());
+        assert!(excluded(&conn).unwrap().contains(&identity));
+        assert!(dir.path().join("sharing-change.json").exists());
     }
 
     #[test]

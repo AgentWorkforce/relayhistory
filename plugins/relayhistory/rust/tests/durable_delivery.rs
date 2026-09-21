@@ -1,4 +1,4 @@
-use ai_hist::{delivery::*, init_db, open_db};
+use relayhistory_plugin::delivery::*;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 
@@ -1285,4 +1285,149 @@ fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisio
             assert!(records.iter().any(|r| r.payload["text"] == "latest"));
         }
     }
+}
+
+#[test]
+fn probe_split_adopts_legacy_queue_and_core_only_writes_preserve_capture() {
+    fn saved(conn: &Connection) -> Vec<String> {
+        ["SELECT json_array(id,config_json,state,cutoff,journal_cursor,fence,worker_id,lease_until_ms,next_attempt_ms,failure) FROM delivery_jobs ORDER BY id",
+         "SELECT json_array(id,job_id,state,payload,prepared,journal_end) FROM delivery_batches ORDER BY id",
+         "SELECT json_array(id,job_id,source,session_id,cutoff,cursor,bootstrap_kind,bootstrap_rowid,bootstrap_done,ready) FROM delivery_session_members ORDER BY id"]
+        .iter().flat_map(|sql|conn.prepare(sql).unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()).collect()
+    }
+    for state in ["active", "paused", "retry_wait", "blocked"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let conn = open_db(&path).unwrap();
+        for id in ["a", "b"] {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?1,?1,1,'user','text','synthetic')",[id]).unwrap();
+        }
+        let mut cfg = config(state);
+        cfg.limits.max_batch_records = 1;
+        let job = create_session_job(&conn, &cfg, 0).unwrap();
+        for id in ["a", "b"] {
+            set_job_session(
+                &conn,
+                &job.job_id,
+                &SessionIdentity {
+                    source: "claude".into(),
+                    session_id: id.into(),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let old = claim(&conn, &job.job_id, 1).unwrap();
+        prepare(&conn, &old, 1);
+        match state {
+            "paused" => {
+                pause_job(&conn, &job.job_id).unwrap();
+            }
+            "retry_wait" => {
+                record_failure(
+                    &conn,
+                    &old.lease,
+                    DeliveryFailure::Transient,
+                    Some(100_000),
+                    &|| 2,
+                )
+                .unwrap();
+            }
+            "blocked" => {
+                record_failure(
+                    &conn,
+                    &old.lease,
+                    DeliveryFailure::AuthenticationRequired,
+                    None,
+                    &|| 2,
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+        let before = saved(&conn);
+        let original_prepared: String = conn
+            .query_row(
+                "SELECT prepared FROM delivery_batches WHERE id=?",
+                [&old.batch.batch_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Restore pre-split capture consumers; no source file or network involved.
+        let triggers=conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql LIKE '%history_subscriptions%'").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        for (name, sql) in triggers {
+            let legacy=sql.replace("SELECT id,'active' AS state,bootstrap_done,bootstrap_kind,bootstrap_rowid,source AS member_source,session_id AS member_session FROM history_subscriptions", "SELECT m.id,j.state,m.bootstrap_done,m.bootstrap_kind,m.bootstrap_rowid,m.source AS member_source,m.session_id AS member_session FROM delivery_session_members m JOIN delivery_jobs j ON j.id=m.job_id WHERE j.state <> 'cancelled' UNION ALL SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM delivery_jobs WHERE state <> 'cancelled'").replace("EXISTS(SELECT 1 FROM history_subscriptions)","EXISTS(SELECT 1 FROM delivery_jobs WHERE state <> 'cancelled')");
+            conn.execute_batch(&format!("DROP TRIGGER \"{name}\"; {legacy};"))
+                .unwrap();
+        }
+        conn.execute_batch("ALTER TABLE delivery_session_jobs DROP COLUMN last_member; DROP TABLE history_subscriptions; DELETE FROM schema_migrations WHERE name IN ('history_export_storage_v1','probe_subscriptions_imported_v1');").unwrap();
+        drop(conn);
+        // Core alone migrates storage before any probe restart. Upload state is untouched.
+        let conn = ai_hist::open_db(&path).unwrap();
+        assert_eq!(saved(&conn), before);
+        conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','a','new',2,'user','text','after migration')",[]).unwrap();
+        conn.execute("DELETE FROM session_events WHERE session_id='b'", [])
+            .unwrap();
+        assert!(conn.query_row("SELECT COUNT(*) FROM delivery_journal WHERE kind='session_event' AND json_extract(payload,'$.event_uid')='new'",[],|r|r.get::<_,usize>(0)).unwrap()>0);
+        let captured = saved(&conn);
+        drop(conn);
+        let conn = open_db(&path).unwrap();
+        assert_eq!(
+            saved(&conn),
+            captured,
+            "probe reopen must preserve core capture and upload state"
+        );
+        let prepared: String = conn
+            .query_row(
+                "SELECT prepared FROM delivery_batches WHERE id=?",
+                [&old.batch.batch_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prepared, original_prepared);
+        retry_job(&conn, &job.job_id).unwrap();
+        let retry = claim_batch(&conn, &job.job_id, "after-upgrade", 1000, &|| 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.batch.batch_id, old.batch.batch_id);
+        assert!(retry.prepared.is_some());
+    }
+}
+
+#[test]
+fn ready_members_make_round_robin_progress_across_single_record_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let conn = open_db(&path).unwrap();
+    let mut cfg = config("fair");
+    cfg.limits.max_batch_records = 1;
+    let job = create_session_job(&conn, &cfg, 0).unwrap();
+    for id in ["a", "b"] {
+        for n in 0..5 {
+            conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude',?,?,1,'user','text','synthetic')", params![id,n.to_string()]).unwrap();
+        }
+        set_job_session(
+            &conn,
+            &job.job_id,
+            &SessionIdentity {
+                source: "claude".into(),
+                session_id: id.into(),
+            },
+            true,
+        )
+        .unwrap();
+    }
+    let first = claim(&conn, &job.job_id, 1).unwrap();
+    let first_session = first.batch.records[0].session_id.clone();
+    prepare(&conn, &first, 1);
+    acknowledge(&conn, &first.lease, &ack(&first), &|| 2).unwrap();
+    drop(conn);
+    // Progress persists across worker restarts while the first member is backlogged.
+    let conn = open_db(&path).unwrap();
+    let second = claim(&conn, &job.job_id, 3).unwrap();
+    assert_ne!(second.batch.records[0].session_id, first_session);
+    prepare(&conn, &second, 3);
+    acknowledge(&conn, &second.lease, &ack(&second), &|| 4).unwrap();
+    let third = claim(&conn, &job.job_id, 5).unwrap();
+    assert_eq!(third.batch.records[0].session_id, first_session);
 }

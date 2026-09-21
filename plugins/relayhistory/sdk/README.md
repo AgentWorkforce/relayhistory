@@ -1,8 +1,7 @@
 # Optional RelayHistory plugin
 
 Install alongside the local SDK: `npm install ai-hist @relayhistory/capture`.
-This package owns RelayHistory authentication, legacy sharing/replay, a durable
-destination, and explicit readback/source adapters. It depends on the public
+This package owns RelayHistory authentication, legacy sharing/replay, the probe upload engine, and explicit readback/source adapters. It depends on the public
 local SDK; installing or configuring it does not log in, read credentials, or
 start uploads. `ai-hist` itself has no cloud package dependency.
 
@@ -44,8 +43,8 @@ Create a selection file before enabling delivery:
 ```sh
 ai-hist plugin relayhistory-migration-status --config history.json
 ai-hist plugin relayhistory-enable --config history.json -- --selection selection.json
-ai-hist delivery run --config history.json
-ai-hist delivery status
+ai-hist plugin relayhistory-delivery --config history.json -- --action drain
+ai-hist plugin relayhistory-delivery --config history.json -- --action status
 ```
 
 Enable creates a new explicit delivery generation. It never interprets a legacy
@@ -55,8 +54,9 @@ acknowledged away. If the inspection is unavailable, explicitly set
 `acknowledgeUninspectedLegacySchedules: true` after checking your own schedules;
 this acknowledges an uninspected state, not a verified clear state. Arbitrary
 user-created supervisors remain their owner's responsibility. Migration checks
-are read-only and repeat before prepare/send. Background operation uses the same
-`ai-hist delivery run` coordinator under your existing supervisor.
+are read-only and repeat before prepare/send. Background operation runs in `agent-relay-probe`; bounded foreground drains
+use the same probe-owned Rust worker. Core `ai-hist delivery` commands now return
+`HISTORY_DELIVERY_MOVED`.
 
 Jobs bind both the canonical service endpoint and the auth-derived organization/
 workspace account. Changing endpoint requires a new instance/job; changing

@@ -1,7 +1,7 @@
+import { createHistoryDelivery, historyDeliveryStatus, controlHistoryDelivery, drainProbeDelivery } from './delivery.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
-  createHistoryDelivery,
   DEFAULT_DELIVERY_LIMITS,
   HistoryDeliveryError,
   InvalidArgumentError,
@@ -562,6 +562,23 @@ export function createHistoryPlugin(options: RelayHistoryPluginOptions = {}): Hi
         }),
       },
       {
+        name: 'relayhistory-delivery',
+        run: async (args) => {
+          const f = flags(args);
+          const selected = { ...options, dbPath: typeof f.db === 'string' ? f.db : undefined };
+          const job = typeof f.job === 'string' ? f.job : undefined;
+          const action = f.action ?? 'status';
+          if (action === 'status') return historyDeliveryStatus(job, selected);
+          if (action === 'drain') return drainProbeDelivery({ ...selected,
+            instanceId: relayHistoryInstance(selected), expectedAccount: await deliveryAccount(selected),
+            jobIds: job ? [job] : undefined,
+          });
+          if (!job || !['pause', 'resume', 'retry', 'cancel'].includes(String(action)))
+            throw new InvalidArgumentError('--job and a valid --action are required', 'INVALID_ARGUMENT');
+          return controlHistoryDelivery(job, action as 'pause' | 'resume' | 'retry' | 'cancel', selected);
+        },
+      },
+      {
         name: 'relayhistory-enable',
         run: async (args) => {
           const f = flags(args);
@@ -587,7 +604,7 @@ export function createHistoryPlugin(options: RelayHistoryPluginOptions = {}): Hi
               selection,
               limits: DEFAULT_DELIVERY_LIMITS,
             },
-            { dbPath: typeof f.db === 'string' ? f.db : undefined },
+            { ...selected, dbPath: typeof f.db === 'string' ? f.db : undefined },
           );
         },
       },

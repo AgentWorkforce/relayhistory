@@ -1,6 +1,6 @@
 use super::{lock, read_config, save_json, user_error, Config};
-use ai_hist::delivery::{self, worker, ExportSelection};
 use anyhow::{ensure, Context, Result};
+use relayhistory_plugin::delivery::{self, worker, ExportSelection};
 use relayhistory_plugin::destination;
 use rusqlite::Connection;
 use serde_json::json;
@@ -250,7 +250,7 @@ fn cycle_with_stop(
     before_exit: bool,
 ) -> Result<()> {
     super::bridge::enforce_selection(directory, config)?;
-    let conn = ai_hist::open_db(&directory.join("history.db"))?;
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let status = delivery::status(&conn, &config.job_id)?;
     let selected = super::bridge::mode(config) == super::bridge::SharingMode::Selected;
     if status.state == "paused" {
@@ -309,7 +309,7 @@ fn run_capture_cycle(
 }
 
 fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBool>) -> Result<()> {
-    let conn = ai_hist::open_db(&directory.join("history.db"))?;
+    let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
     let members = delivery::job_sessions(&conn, &config.job_id)?;
     let started = Instant::now();
     let mut captured = 0;
@@ -457,7 +457,7 @@ fn deliver_captured_with_stop(
     // a failed capture. Never reach the delivery worker with an unvetted row.
     super::bridge::enforce_selection(directory, config)?;
     {
-        let conn = ai_hist::open_db(&directory.join("history.db"))?;
+        let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
         if delivery::status(&conn, &config.job_id)?.state == "paused" {
             return Ok(());
         }
@@ -471,7 +471,7 @@ fn deliver_captured_with_stop(
     // only once one exists. An idle generation pointed at another destination
     // must not look healthy, so the saved configuration is checked outright.
     {
-        let conn = ai_hist::open_db(&db_path)?;
+        let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
         let job = delivery::status(&conn, &config.job_id)?;
         if job.state == "paused" {
             return Ok(());
@@ -616,7 +616,7 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
             }
             let started = Instant::now();
             let result = (|| -> Result<usize> {
-                let conn = ai_hist::open_db(&directory.join("history.db"))?;
+                let conn = relayhistory_plugin::delivery::open_db(&directory.join("history.db"))?;
                 let mut count = 0;
                 let stop = cancelled.clone();
                 ai_hist::discover_sessions_cancellable(
@@ -812,7 +812,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = ai_hist::open_db(&home.path().join("history.db")).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&home.path().join("history.db")).unwrap();
         let env = ai_hist::DiscoveryEnv::with_roots(
             &conn,
             home.path().to_path_buf(),
@@ -896,7 +896,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let conn = ai_hist::open_db(&home.path().join("history.db")).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&home.path().join("history.db")).unwrap();
         let job = delivery::create_session_job(&conn, &job_config(true), now()).unwrap();
         let env = ai_hist::DiscoveryEnv::with_roots(
             &conn,
@@ -974,7 +974,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
-        let conn = ai_hist::open_db(&path).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&path).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','selected')",
             [],
@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn selected_retry_backoff_does_not_starve_local_capture() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','selected')",
             [],
@@ -1269,7 +1269,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("history.db");
-        let conn = ai_hist::open_db(&db_path).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&db_path).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','in-flight')",
             [],
@@ -1376,7 +1376,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("history.db");
-        let conn = ai_hist::open_db(&db).unwrap();
+        let conn = relayhistory_plugin::delivery::open_db(&db).unwrap();
         conn.execute(
             "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
             [],
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn new_only_baseline_is_durable_and_independent_of_history_size() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         for index in 0..1200 {
             conn.execute(
                 "INSERT INTO sessions(source, session_id) VALUES ('claude', ?1)",
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn include_existing_records_no_baseline() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],
@@ -1527,7 +1527,7 @@ mod tests {
     #[test]
     fn an_abandoned_baseline_does_not_outlive_a_later_include_existing_setup() {
         let conn = Connection::open_in_memory().unwrap();
-        ai_hist::init_db(&conn).unwrap();
+        relayhistory_plugin::delivery::init_db(&conn).unwrap();
         conn.execute(
             "INSERT INTO sessions(source, session_id) VALUES ('claude','before')",
             [],
