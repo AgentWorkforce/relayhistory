@@ -20,6 +20,7 @@
   "quirk": "two turns in one rollout, each with its own cumulative `total_token_usage`",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "8:function_call",
       "git_branch": null,
@@ -34,6 +35,60 @@
       "text": "exec_command ls",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":2500,\"input_tokens\":5000,\"output_tokens\":500,\"reasoning_output_tokens\":50,\"total_tokens\":5500}",
       "ts_ms": 1776650411000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776650400200,
+      "turn_id": "turn_multi_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776650403000,
+      "turn_id": "turn_multi_1"
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776650410100,
+      "turn_id": "turn_multi_2"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_multi_1",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776650412500,
+      "turn_id": "turn_multi_2"
     }
   ],
   "session_relationships": [],

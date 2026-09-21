@@ -5,7 +5,7 @@
 //! — stays behind the `unstable-internal` feature. Cargo semver is the
 //! contract; there is no separate Rust contract-version constant.
 //!
-//! Seven operations, one entry type:
+//! Nine operations, one entry type:
 //!
 //! | Method | What it does |
 //! |---|---|
@@ -15,9 +15,12 @@
 //! | [`SessionStore::watch`] | the live-capture loop, as an iterator of ticks |
 //! | [`SessionStore::sessions`] | the catalog, keyset-paged internally |
 //! | [`SessionStore::session`] | everything the store holds about one session, typed |
+//! | [`SessionStore::changes_since`] | the revision-stamped change feed, with named consumer cursors |
+//! | [`SessionStore::head_revision`] | the feed head, for a consumer checking its stored watermark |
 //! | [`Source::capabilities`] | what a source can and cannot report, statically |
 //!
-//! The change feed (`changes_since`, #179) is not part of this module yet.
+//! The two change-feed methods live in [`crate::change_feed`]; they are
+//! inherent methods on this type, so the facade stays the one entry point.
 //!
 //! Every value type here is `#[non_exhaustive]`, `Clone`, `Serialize`,
 //! `Deserialize` and `PartialEq`; only [`CatalogIter`] (a read snapshot) and
@@ -28,6 +31,7 @@
 use crate::discover::{
     self, list_session_catalog_page, CatalogCursor, CatalogListOptions, ShallowSession,
 };
+pub use crate::ingest::control::ControlKind;
 use crate::ingest::hook::{ingest_transcript_at_with_roots, TranscriptStatus};
 use crate::ingest::hydrate::{
     hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
@@ -132,10 +136,16 @@ pub enum Error {
         /// How long this call waited before giving up.
         waited_ms: u64,
     },
-    /// A change-feed watermark names a revision this store has not reached.
-    /// Raised by `changes_since` (#179); listed here so the error vocabulary
-    /// is complete before that method lands.
+    /// A change-feed watermark names a revision this store has not reached:
+    /// the database was reset or replaced under a consumer that kept its
+    /// cursor elsewhere. Raised by [`SessionStore::changes_since`]; the only
+    /// recovery is a resync from [`crate::Watermark::START`].
     WatermarkAheadOfStore(String),
+    /// A named change-feed cursor was asked to serve, or be moved by, a drain
+    /// over a different kind set than it was committed for. A cursor is a
+    /// position in one kind set's stream; use another consumer name for
+    /// another filter. See [`SessionStore::changes_since`].
+    ConsumerKindsMismatch(String),
 }
 
 impl Error {
@@ -159,6 +169,7 @@ impl Error {
             Self::SyncFailed(_) => "SYNC_FAILED",
             Self::SyncLocked { .. } => "SYNC_LOCKED",
             Self::WatermarkAheadOfStore(_) => "WATERMARK_AHEAD_OF_STORE",
+            Self::ConsumerKindsMismatch(_) => "CONSUMER_KINDS_MISMATCH",
         }
     }
 
@@ -180,7 +191,8 @@ impl Error {
             | Self::Query(m)
             | Self::Discovery(m)
             | Self::SyncFailed(m)
-            | Self::WatermarkAheadOfStore(m) => m.clone(),
+            | Self::WatermarkAheadOfStore(m)
+            | Self::ConsumerKindsMismatch(m) => m.clone(),
             Self::SyncLocked { path, waited_ms } => format!(
                 "another sync holds the lock on {} (waited {waited_ms} ms); \
                  wait for it to finish or raise SyncOptions::lock_timeout_ms",
@@ -214,11 +226,11 @@ impl Error {
         otherwise(message)
     }
 
-    fn query(error: anyhow::Error) -> Self {
+    pub(crate) fn query(error: anyhow::Error) -> Self {
         Self::classify(error, Self::Query)
     }
 
-    fn sql(error: rusqlite::Error) -> Self {
+    pub(crate) fn sql(error: rusqlite::Error) -> Self {
         Self::Query(error.to_string())
     }
 
@@ -230,7 +242,7 @@ impl Error {
         Self::classify(error, Self::SyncFailed)
     }
 
-    fn read_only(operation: &str) -> Self {
+    pub(crate) fn read_only(operation: &str) -> Self {
         Self::UnsupportedOperation(format!(
             "SessionStore was opened read-only; `{operation}` needs a writable handle"
         ))
@@ -618,6 +630,7 @@ impl SessionStore {
         Ok(SyncReport {
             swept: tick.swept,
             changed,
+            head_revision: crate::change_feed::head_revision_at(&self.db_path)?.revision,
         })
     }
 
@@ -1134,10 +1147,15 @@ pub struct SyncReport {
     /// outside it, so a `hydrate` that lands inside the window is included
     /// even on an unswept call; one that landed before the lock was taken
     /// belongs to no `sync` report ([`SessionStore::watch`] reports it on
-    /// the next tick, and per-row attribution is what #179's
-    /// `sessions.revision` column is for). A session whose only change was
-    /// inside a table the catalog row does not summarise is not listed.
+    /// the next tick, and per-row attribution is what the change feed's
+    /// `revision` stamp is for — see [`SessionStore::changes_since`]). A
+    /// session whose only change was inside a table the catalog row does not
+    /// summarise is not listed.
     pub changed: Vec<SessionRef>,
+    /// The store's change-feed head after this sweep: the revision of the
+    /// newest stamped row. A consumer compares its stored watermark against
+    /// it before resuming; see [`SessionStore::changes_since`].
+    pub head_revision: u64,
 }
 
 /// One digest per catalog row over every column [`SyncReport::changed`]
@@ -1146,7 +1164,7 @@ pub struct SyncReport {
 /// A digest rather than the values: the point is to notice that a row moved,
 /// not to keep two copies of the catalog, and a fixed 32 bytes per row makes
 /// the before/after maps the same size whatever the row holds. Once every
-/// catalog write stamps a revision column (#179's `sessions.revision`), this
+/// catalog write stamps a revision column (the change feed's `revision`), this
 /// collapses to reading that one column.
 type CatalogFingerprint = BTreeMap<(String, String), [u8; 32]>;
 
@@ -2018,6 +2036,12 @@ pub struct Block {
     pub tool_use_id: Option<String>,
     /// Provider-native record or block type this block came from.
     pub raw_kind: Option<String>,
+    /// Why a block in the user role is not a human prompt: a slash-command
+    /// record, a hook's output, a `<system-reminder>`, a Codex context
+    /// wrapper. `None` on a genuine prompt and on every model-output block.
+    /// The vocabulary is closed and validated where evidence enters the
+    /// store, so a stored spelling always parses.
+    pub control: Option<ControlKind>,
     pub ts_ms: i64,
 }
 
@@ -2033,6 +2057,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
             text_bytes: *text_bytes,
             tool_use_id: event.tool_use_id.clone(),
             raw_kind: event.raw_kind.clone(),
+            control: event.control_kind.as_deref().and_then(ControlKind::parse),
             ts_ms: event.ts_ms,
         };
         let slot = event
@@ -3166,6 +3191,7 @@ mod tests {
                 waited_ms: 0,
             },
             Error::WatermarkAheadOfStore(String::new()),
+            Error::ConsumerKindsMismatch(String::new()),
         ] {
             let json = serde_json::to_value(&error).unwrap();
             assert_eq!(json["code"].as_str(), Some(error.code()), "{error:?}");

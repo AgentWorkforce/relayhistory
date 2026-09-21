@@ -288,7 +288,26 @@ export interface SessionEvent {
   isSidechain: boolean | null;
   isMeta: boolean | null;
   turnId: string | null;
+  /**
+   * Why a user-role row is not a human prompt, or null for a genuine prompt
+   * and for every model-output row. Only ever set on a `user` / `text` row;
+   * the row keeps its role, kind and verbatim text.
+   */
+  controlKind: ControlKind | null;
 }
+
+export type ControlKind =
+  | 'slash_command_caveat'
+  | 'slash_command_invocation'
+  | 'slash_command_output'
+  | 'task_notification'
+  | 'hook_output'
+  | 'bash_passthrough_input'
+  | 'bash_passthrough_output'
+  | 'system_reminder'
+  | 'codex_context_wrapper'
+  | 'meta'
+  | 'resume_marker';
 
 export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
 

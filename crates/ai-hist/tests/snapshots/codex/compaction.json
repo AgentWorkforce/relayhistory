@@ -35,6 +35,7 @@
   "quirk": "a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:user_message",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776654000300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:agent_message",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776654000900
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "11:user_message",
       "git_branch": null,
@@ -83,6 +86,7 @@
       "ts_ms": 1776654004200
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "12:agent_message",
       "git_branch": null,
@@ -97,6 +101,86 @@
       "text": "Continuing after compaction.",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":500,\"input_tokens\":3500,\"output_tokens\":250,\"reasoning_output_tokens\":40,\"total_tokens\":3750}",
       "ts_ms": 1776654004900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776654000200,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776654002000,
+      "turn_id": "turn_compact_1"
+    },
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"replacement_items\":2}",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "compacted",
+      "text": null,
+      "ts_ms": 1776654003000,
+      "turn_id": null
+    },
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "8:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "context_compacted",
+      "text": null,
+      "ts_ms": 1776654003100,
+      "turn_id": null
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "10:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776654004100,
+      "turn_id": "turn_compact_2"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "14:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776654006000,
+      "turn_id": "turn_compact_2"
     }
   ],
   "session_relationships": [],

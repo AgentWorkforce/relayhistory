@@ -28,6 +28,7 @@
   "quirk": "an unreadable cumulative snapshot is superseded by a later valid snapshot for the same waiting turn",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "3:user_message",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776664800300
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:agent_message",
       "git_branch": null,
@@ -58,6 +60,34 @@
       "text": "Answer.",
       "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":1000,\"input_tokens\":3000,\"output_tokens\":200,\"reasoning_output_tokens\":50,\"total_tokens\":3200}",
       "ts_ms": 1776664800900
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776664800200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_recovers",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776664802000,
+      "turn_id": "t1"
     }
   ],
   "session_relationships": [],

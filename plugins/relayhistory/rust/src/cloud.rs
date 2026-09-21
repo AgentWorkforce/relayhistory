@@ -925,6 +925,15 @@ fn refresh_lock_path(base_url: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
+    acquire_refresh_lock_with_budget(base_url, None)
+}
+
+type RequestBudget<'a> = Option<&'a dyn Fn() -> Result<std::time::Duration>>;
+
+fn acquire_refresh_lock_with_budget(
+    base_url: &str,
+    budget: RequestBudget<'_>,
+) -> Result<AuthRefreshLock> {
     let path = refresh_lock_path(base_url)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -935,8 +944,21 @@ pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
         .read(true)
         .write(true)
         .open(&path)?;
-    fs2::FileExt::lock_exclusive(&file)
-        .with_context(|| format!("locking token refresh state at {}", path.display()))?;
+    if let Some(remaining) = budget {
+        loop {
+            let wait = remaining()?;
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(wait.min(std::time::Duration::from_millis(10)));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    } else {
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking token refresh state at {}", path.display()))?;
+    }
     Ok(AuthRefreshLock { _file: file })
 }
 
@@ -963,15 +985,52 @@ pub(crate) fn send_with_auth_refresh_checked(
     map_error: impl Fn(ureq::Error) -> anyhow::Error,
     check: impl Fn(&StoredAuth) -> Result<()>,
 ) -> Result<ureq::Response> {
+    send_with_auth_refresh_checked_with_budget(
+        auth,
+        |current, _| send(current),
+        map_error,
+        check,
+        None,
+    )
+}
+
+/// Share one caller budget across lock acquisition, refresh and every retry.
+/// A successful rotation is persisted even if cancellation arrives meanwhile.
+pub(crate) fn send_with_auth_refresh_checked_with_budget(
+    auth: &StoredAuth,
+    send: impl Fn(
+        &StoredAuth,
+        Option<std::time::Duration>,
+    ) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+    map_error: impl Fn(ureq::Error) -> anyhow::Error,
+    check: impl Fn(&StoredAuth) -> Result<()>,
+    budget: RequestBudget<'_>,
+) -> Result<ureq::Response> {
+    let remaining = || budget.map(|remaining| remaining()).transpose();
+    let send = |current: &StoredAuth| -> Result<ureq::Response> {
+        // Keep raw HTTP errors until the shared unauthorized/refresh handling.
+        send(current, remaining()?).map_err(|error| anyhow::Error::new(*error))
+    };
+    let mapped = |error: anyhow::Error| match error.downcast::<ureq::Error>() {
+        Ok(error) => map_error(error),
+        Err(error) => error,
+    };
+    remaining()?;
     let attempted = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
     check(&attempted)?;
     let mut unauthorized = match send(&attempted) {
         Ok(response) => return Ok(response),
-        Err(error) if is_unauthorized(&error) => *error,
-        Err(error) => return Err(map_error(*error)),
+        Err(error)
+            if error
+                .downcast_ref::<ureq::Error>()
+                .is_some_and(is_unauthorized) =>
+        {
+            error
+        }
+        Err(error) => return Err(mapped(error)),
     };
 
-    let _refresh_lock = acquire_refresh_lock(&auth.base_url)?;
+    let _refresh_lock = acquire_refresh_lock_with_budget(&auth.base_url, budget)?;
     let current = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
 
     // A concurrent process may have completed rotation while this caller waited. Try its
@@ -980,8 +1039,14 @@ pub(crate) fn send_with_auth_refresh_checked(
     if current.access_token != attempted.access_token {
         match send(&current) {
             Ok(response) => return Ok(response),
-            Err(error) if is_unauthorized(&error) => unauthorized = *error,
-            Err(error) => return Err(map_error(*error)),
+            Err(error)
+                if error
+                    .downcast_ref::<ureq::Error>()
+                    .is_some_and(is_unauthorized) =>
+            {
+                unauthorized = error
+            }
+            Err(error) => return Err(mapped(error)),
         }
     }
 
@@ -990,11 +1055,21 @@ pub(crate) fn send_with_auth_refresh_checked(
         .as_deref()
         .is_none_or(|token| token.trim().is_empty())
     {
-        return Err(map_error(unauthorized));
+        return Err(mapped(unauthorized));
     }
-    let refreshed = refresh_and_save_auth(&current)?;
+    let refreshed = if let Some(timeout) = remaining()? {
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(timeout)
+            .build();
+        let refreshed = refresh_auth_with_agent(&current, &agent)?;
+        save_auth(&refreshed).context("persisting refreshed relayhistory session")?;
+        refreshed
+    } else {
+        refresh_and_save_auth(&current)?
+    };
     check(&refreshed)?;
-    send(&refreshed).map_err(|error| map_error(*error))
+    send(&refreshed).map_err(mapped)
 }
 
 /// Retry a rejected SDK bearer using the same locked rotation as native transports.
@@ -1517,12 +1592,22 @@ fn sdk_announcer(interactive: bool) -> Result<Announcer> {
 /// workspace, a default a caller may use, never an authorization.
 pub struct CloudIdentity {
     pub user_id: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
     pub workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WhoamiUser {
     id: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1546,6 +1631,9 @@ pub fn whoami(api_url: &str, bearer: &str) -> Result<CloudIdentity> {
     let identity: WhoamiResponse = serde_json::from_value(value)?;
     Ok(CloudIdentity {
         user_id: identity.user.id,
+        email: identity.user.email,
+        name: identity.user.name,
+        avatar_url: identity.user.avatar_url,
         workspace_id: identity.current_workspace.map(|workspace| workspace.id),
     })
 }
@@ -3329,6 +3417,72 @@ pub(crate) mod tests {
         });
     }
 
+    /// Serve exactly one `POST /v1/auth/token/refresh` with `body`, then stop.
+    fn one_refresh_response(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (line, _, _) = read_http_request(&mut stream);
+            assert!(line.starts_with("POST /v1/auth/token/refresh "), "{line}");
+            write_http_response(&mut stream, "200 OK", body);
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// Regression: a `/v1/cli/login` session was stored with no org because
+    /// the service never returned one, `recall_auth` refused it, and every `--remote`
+    /// read was empty while push kept working. A refresh that reports tenancy must
+    /// repair that session with no re-login, so `recall_auth` accepts it afterwards.
+    #[test]
+    fn refresh_adopts_reported_tenancy_and_unblocks_recall() {
+        with_temp_home(|| {
+            let (base_url, server) = one_refresh_response(
+                r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh","accessTokenExpiresAt":"2999-01-01T00:00:00.000Z","orgId":"org_a","workspaceId":"ws_a"}"#,
+            );
+            let stored = StoredAuth {
+                base_url,
+                access_token: "rth_at_old".into(),
+                access_token_expires_at: Some("2999-01-01T00:00:00.000Z".into()),
+                refresh_token: Some("rth_rt_old".into()),
+                org_id: None,
+                workspace_id: None,
+            };
+            save_auth(&stored).unwrap();
+            let before = recall_auth().unwrap_err().to_string();
+            assert!(before.contains("no orgId"), "{before}");
+
+            refresh_and_save_auth(&stored).unwrap();
+            server.join().unwrap();
+
+            let repaired = recall_auth().expect("a refreshed session with an org is readable");
+            assert_eq!(repaired.org_id.as_deref(), Some("org_a"));
+            assert_eq!(repaired.workspace_id.as_deref(), Some("ws_a"));
+        });
+    }
+
+    /// An older service that reports no tenancy must never erase an org already stored.
+    #[test]
+    fn refresh_without_reported_tenancy_keeps_the_stored_org() {
+        with_temp_home(|| {
+            let (base_url, server) = one_refresh_response(
+                r#"{"accessToken":"rth_at_fresh","refreshToken":"rth_rt_fresh","orgId":"  "}"#,
+            );
+            let stored = StoredAuth {
+                base_url,
+                access_token: "rth_at_old".into(),
+                access_token_expires_at: None,
+                refresh_token: Some("rth_rt_old".into()),
+                org_id: Some("org_a".into()),
+                workspace_id: Some("ws_a".into()),
+            };
+            let refreshed = refresh_auth(&stored).unwrap();
+            server.join().unwrap();
+            assert_eq!(refreshed.org_id.as_deref(), Some("org_a"));
+            assert_eq!(refreshed.workspace_id.as_deref(), Some("ws_a"));
+        });
+    }
+
     #[test]
     fn idle_progress_refresh_is_bounded_and_respects_the_rotation_lock() {
         with_temp_home(|| {
@@ -4247,6 +4401,9 @@ pub(crate) mod tests {
                         Err(_) => panic!("device client did not complete expected request"),
                     }
                 };
+                // Accepted sockets inherit nonblocking mode on macOS. The
+                // request reader below intentionally uses blocking reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                     .unwrap();

@@ -13,6 +13,7 @@
   "quirk": "every record is `isSidechain: true` — a subagent sidecar, not a session of its own",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-side:0",
       "git_branch": null,
@@ -29,6 +30,7 @@
       "ts_ms": 1776643201000
     }
   ],
+  "session_markers": [],
   "session_relationships": [
     {
       "child_agent_name": null,

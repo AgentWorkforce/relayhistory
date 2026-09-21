@@ -17,10 +17,18 @@ fn main() -> Result<(), ai_hist::Error> {
         let row = row?;
         println!("{} {} {:?}", row.source, row.session_id, row.project_key);
     }
+
+    // Incremental: everything since this consumer's last commit, oldest first.
+    let query = ai_hist::ChangeQuery::default().consumer("my-ingest");
+    let mut changes = store.changes_since(ai_hist::Watermark::CONSUMER, query)?;
+    for change in changes.by_ref() {
+        let _change = change?; // `Upsert(EvidenceRow)` or `Delete`, keyed by kind + record_key
+    }
+    changes.commit()?; // the cursor moves only here
     Ok(())
 }
 ```
 
-Default features expose `SessionStore` — `open`, `sync`, `hydrate`, `watch`, `sessions`, `session` — plus `Source::capabilities()`, the typed evidence structs and one `Error` enum; see `docs/sourcing-sdk.md` in the repository. Optional features: `delivery`, `opencode-backup`, `git-hooks`, `fs-events`. Workspace crates enable `unstable-internal` for connection-level maintenance APIs.
+Default features expose `SessionStore` — `open`, `sync`, `hydrate`, `watch`, `sessions`, `session`, `changes_since`, `head_revision` — plus `Source::capabilities()`, the typed evidence structs and one `Error` enum; see `docs/sourcing-sdk.md` in the repository. Optional features: `export` (consistent snapshots and change capture), `opencode-backup`, `git-hooks`, `fs-events`. The legacy `delivery` feature aliases `export`; upload jobs and workers are owned by the probe package, `plugins/relayhistory/rust`. Workspace crates enable `unstable-internal` for connection-level maintenance APIs.
 
 See the [repository README](https://github.com/AgentWorkforce/relayhistory) for CLI and Node usage.

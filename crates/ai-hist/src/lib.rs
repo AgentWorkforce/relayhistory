@@ -36,16 +36,12 @@ workspace_mod!(remote);
 workspace_mod!(source_intake);
 workspace_mod!(sources);
 workspace_mod!(watch);
+mod change_feed;
 mod file_lock;
 mod jsonl_temp;
 mod session_store;
 mod session_usage;
 mod usage;
-
-#[cfg(all(feature = "delivery", feature = "unstable-internal"))]
-pub mod delivery;
-#[cfg(all(feature = "delivery", not(feature = "unstable-internal")))]
-pub(crate) mod delivery;
 
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]
 pub mod git_helpers;
@@ -74,15 +70,19 @@ pub use store::*;
 #[cfg(not(feature = "unstable-internal"))]
 pub(crate) use store::*;
 
-pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
-pub use relationship_graph::RelationshipCapabilities;
+pub use change_feed::{
+    Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, Watermark,
+    DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
+};
+pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_store::{
-    Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, Diagnostic,
-    DiscoveryState, Error, FileEdit, HydrateOptions, HydrateReport, HydrateStatus, Marker, Message,
-    MessageIdOrigin, Prompt, Relationship, RelationshipSide, Role, SessionEvidence, SessionQuery,
-    SessionRef, SessionStore, Source, SourceCapabilities, StoreOptions, SyncOptions, SyncReport,
-    TickReport, ToolCall, ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop,
-    WatchedPath,
+    Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, ControlKind,
+    Diagnostic, DiscoveryState, Error, FileEdit, HydrateOptions, HydrateReport, HydrateStatus,
+    Marker, Message, MessageIdOrigin, Prompt, Relationship, RelationshipSide, Role,
+    SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, SourceCapabilities,
+    StoreOptions, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
+    WatchOptions, WatchScope, WatchStop, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields
@@ -121,3 +121,6 @@ pub mod internal {
     pub use crate::store::*;
     pub use crate::usage::*;
 }
+
+#[cfg(feature = "export")]
+pub mod export;

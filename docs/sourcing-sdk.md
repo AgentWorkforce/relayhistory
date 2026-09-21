@@ -2,7 +2,7 @@
 
 The Rust entry point for reading coding-agent session evidence out of
 RelayHistory. Everything a consumer needs is one type, `ai_hist::SessionStore`,
-seven operations, and the typed structs they return. Nothing on this surface
+nine operations, and the typed structs they return. Nothing on this surface
 names a `rusqlite` type, and no JSON column reaches a consumer as a string.
 
 This is the surface [`docs/sourcing-contract.md`](sourcing-contract.md) is
@@ -40,7 +40,7 @@ fn main() -> Result<(), ai_hist::Error> {
 }
 ```
 
-## The seven operations
+## The nine operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -50,11 +50,9 @@ fn main() -> Result<(), ai_hist::Error> {
 | `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven sweeps           | the same as `sync`, per tick                                              | `SyncRunLock`, per tick                          |
 | `sessions(CatalogQuery) -> CatalogIter`          | none                                        | keyset-paged reads over `sessions`                                        | none (WAL reader)                                |
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
+| `changes_since(Watermark, ChangeQuery)`          | none                                        | one indexed revision-range read per kind per page, plus tombstones        | none (one read snapshot per page)                |
+| `head_revision() -> Watermark`                   | none                                        | one read of the feed head                                                 | none                                             |
 | `Source::capabilities() -> SourceCapabilities`   | none                                        | none — static                                                             | none                                             |
-
-`changes_since(Watermark)` — the change feed with named consumer cursors — is
-[#179](https://github.com/AgentWorkforce/relayhistory/issues/179) and is not on
-the surface yet. `Error::WatermarkAheadOfStore` is reserved for it.
 
 ### `open`
 
@@ -93,7 +91,7 @@ default timeout is `0`: one try; a budget above seven days is treated as seven
 days, the same ceiling the watch intervals have. **It is never a silent no-op**; a caller that
 asked for a sweep and got none is told.
 
-`SyncReport { swept, changed }`: `swept` is false when the fingerprint matched
+`SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
 created or changed while the call held the lock — swept or not — derived from
 a per-row digest of the `sessions` table taken after the lock was acquired and
@@ -103,13 +101,14 @@ another sync cannot land inside the window (it needs the same lock); a
 hydration writes the catalog outside it, so one that lands inside the window is
 included even when the sweep itself opened nothing. `watch` reports a
 hydration between ticks once, on the next tick; per-row attribution to one
-writer is what #179's revision column is for. Every catalog
+writer is what the change feed's `revision` stamp is for. `head_revision` is
+the feed head after the sweep, which a consumer compares against its stored
+watermark before resuming. Every catalog
 column takes part except the two bounded text excerpts (`first_prompt`,
 `last_assistant_text`): a new session, new activity, a moved source stamp or
 discovery state, a re-resolved or inherited `project_key`, a metadata field the
-shallow read filled in. Once every catalog write stamps a revision
-([#179](https://github.com/AgentWorkforce/relayhistory/issues/179)'s
-`sessions.revision`), the digest can become a read of that one column.
+shallow read filled in. Once every catalog write stamps a revision (the change
+feed's `revision`), the digest can become a read of that one column.
 
 ### `hydrate`
 
@@ -179,7 +178,7 @@ Everything the store holds about one session, on one SQLite snapshot:
 pub struct SessionEvidence {
     pub session: CatalogSession,
     pub prompts: Vec<Prompt>,                 // history rows; every source
-    pub messages: Vec<Message>,               // one per message_id, with blocks
+    pub messages: Vec<Message>,               // one per message_id, with typed blocks
     pub tool_calls: Vec<ToolCall>,            // args: Option<serde_json::Value>
     pub tool_results: Vec<ToolResult>,        // payload_bytes / hash / status / event_source …
     pub file_edits: Vec<FileEdit>,            // structured_patch: Option<Value>
@@ -208,6 +207,15 @@ is read is `coverage ∩ kinds`, reported back as `loaded`, so a kind the source
 cannot produce is never fetched and never listed. `CommitLink` is not carried
 by `session()`.
 
+A `Block` carries `control: Option<ControlKind>`: why a block in the user role
+is not a human prompt — a slash-command caveat, invocation or output, a task
+notification, hook output, bash pass-through, a `<system-reminder>`, a Codex
+context wrapper, a meta record, a bare resume marker. It is `None` on a genuine
+prompt and on every model-output block, and the vocabulary is closed and
+validated where evidence enters the store, so a stored spelling always parses.
+`prompts` and `user_turns` already exclude control rows; `messages` reports
+them classified rather than dropping them.
+
 Every value type the facade returns — `SessionEvidence` and its parts,
 `CatalogSession`, `SyncReport`, `HydrateReport`, `TickReport`, the option
 structs, `SourceCapabilities`, `Error` — is `#[non_exhaustive]`, `Clone`,
@@ -230,6 +238,33 @@ Two facts about identity a consumer must not paper over:
   provider's (`Provider`: claude, opencode), synthesized from record position
   (`Synthesized`: codex, grok), `Mixed` (cursor) or `None` (relay,
   trajectory).
+
+### `changes_since`
+
+The revision-stamped change feed: every row of `sessions`, `session_events`,
+`tool_calls`, `file_edits`, `session_markers` and `session_relationships`
+carries a `revision` drawn from the database-wide `observation_clock` and
+stamped by a trigger on every insert and update, so no write site can forget
+one; a deleted row leaves a tombstone at its own revision, which a later insert
+of the same key clears. `changes_since(from, ChangeQuery)` drains
+`Change { kind, source, session_id, record_key, revision, op }` in
+`(revision, kind, record_key)` order, bounded to the head at open, in
+`batch`-sized indexed reads of at most `MAX_CHANGE_BATCH`; `op` is
+`Upsert(EvidenceRow)` — the typed row, so no second read is needed — or
+`Delete`. A re-seen `record_key` is a replace, never a duplicate.
+
+`from` is `Watermark::START` to replay everything, an explicit watermark to
+resume from one a consumer stored itself, or `Watermark::CONSUMER` with
+`ChangeQuery::consumer` to resume from a named cursor kept in `consumer_cursors`
+inside the store. The cursor moves only on `Changes::commit()` and only
+forward, so a drain that fails mid-page re-reads rather than skips, and a stale
+commit cannot rewind it. A named cursor is bound to the kind set it was first
+committed for: draining or committing it under another filter is
+`Error::ConsumerKindsMismatch`. A watermark past the head is
+`Error::WatermarkAheadOfStore` — the database was reset or replaced, and the
+only recovery is a resync from `Watermark::START`. `head_revision()` reports
+the head on its own, and `SyncReport::head_revision` reports it after a sweep.
+A read-only handle drains the feed but cannot commit a cursor.
 
 ### `Source::capabilities()`
 
@@ -270,7 +305,8 @@ codes where both sides have the failure; `Display` renders `CODE: message`.
 | `Discovery`                | `DISCOVERY_FAILED`           | shallow discovery failed during a sweep                                |
 | `SyncFailed`               | `SYNC_FAILED`                | a sweep failed with no narrower code                                   |
 | `SyncLocked`               | `SYNC_LOCKED`                | another process holds the `SyncRunLock` past the caller's timeout      |
-| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | reserved for `changes_since` (#179)                                    |
+| `WatermarkAheadOfStore`    | `WATERMARK_AHEAD_OF_STORE`   | a `changes_since` watermark names a revision the store has not reached  |
+| `ConsumerKindsMismatch`    | `CONSUMER_KINDS_MISMATCH`    | a named cursor was drained under a different kind set than it holds     |
 
 The four Node-only classes (`UNSUPPORTED_PLATFORM`, `NATIVE_PACKAGE_MISSING`,
 `NATIVE_LOAD_FAILED`, `NATIVE_CONTRACT_MISMATCH`) have no Rust counterpart.

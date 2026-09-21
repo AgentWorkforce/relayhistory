@@ -66,6 +66,7 @@
   "quirk": "an interrupted turn is resumed, and both halves hang off the same parent record",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-refactor:0",
       "git_branch": null,
@@ -82,6 +83,7 @@
       "ts_ms": 1777593600000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-bugfix:0",
       "git_branch": null,
@@ -98,6 +100,7 @@
       "ts_ms": 1777595400000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-bugfix:0",
       "git_branch": null,
@@ -114,6 +117,7 @@
       "ts_ms": 1777595460000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-refactor:0",
       "git_branch": null,
@@ -130,6 +134,7 @@
       "ts_ms": 1777597200000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {
