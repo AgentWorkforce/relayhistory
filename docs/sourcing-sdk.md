@@ -92,9 +92,14 @@ asked for a sweep and got none is told.
 
 `SyncReport { swept, changed }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
-created or changed by the sweep — new sessions, new activity, a moved discovery
-state or source stamp — derived from the `sessions` table before and after, not
-from the provider walk.
+created or changed by the sweep, derived from a per-row digest of the
+`sessions` table before and after, not from the provider walk. Every catalog
+column takes part except the two bounded text excerpts (`first_prompt`,
+`last_assistant_text`): a new session, new activity, a moved source stamp or
+discovery state, a re-resolved or inherited `project_key`, a metadata field the
+shallow read filled in. Once every catalog write stamps a revision
+([#179](https://github.com/AgentWorkforce/relayhistory/issues/179)'s
+`sessions.revision`), the digest can become a read of that one column.
 
 ### `hydrate`
 
@@ -127,12 +132,20 @@ tick is the same locked `sync`; one that finds the lock held reports
 sweep arrives as an `Err` and the loop keeps running. `WatchHandle::stopper()`
 hands another thread a `WatchStop`; iteration ends once the loop has stopped
 and every reported tick has been read, and dropping the handle stops it.
+`next_timeout(timeout)` waits at most `timeout` for a tick, never past a short
+deadline, and a `timeout` too large to name an instant simply waits without
+one.
 
 ### `sessions`
 
 The catalog, newest first, paged internally on
 `(last_activity_ms DESC, source ASC, session_id ASC)` so a page boundary inside
-one millisecond neither drops nor repeats a row. `CatalogQuery { scope,
+one millisecond neither drops nor repeats a row. Every page is read on one
+SQLite snapshot, taken at the first row and held until the iterator is dropped
+— the order key is `last_activity_ms`, which a concurrent sync moves, and pages
+on separate snapshots would skip or repeat a session that moved across the
+cursor. A WAL reader blocks no writer but pins the WAL while it lives, so drain
+or drop the iterator promptly. `CatalogQuery { scope,
 sources, project_key, before_ms, page_size }`. `CatalogSession` is the typed
 catalog row — `source: Source`, `project_key`, `discovery_state`, the
 provider-observed metadata — and `session_ref()` turns it into the reference

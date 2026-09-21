@@ -773,7 +773,14 @@ impl SessionStore {
     /// Pure SQL over the `sessions` table: no provider I/O. Paged internally
     /// on the catalog's total order `(last_activity_ms DESC, source, session_id)`,
     /// so a page boundary inside one millisecond neither drops nor repeats a
-    /// row. Each item is one row or the error that stopped the walk.
+    /// row. Every page is read on **one SQLite snapshot**, taken at the first
+    /// row and held until the iterator is dropped: the order key is
+    /// `last_activity_ms`, which a concurrent sync moves, and pages read on
+    /// separate snapshots would skip a session that gained activity behind
+    /// the cursor and repeat one that lost it. A WAL reader blocks no
+    /// writer, but it does pin the WAL until it ends, so drain or drop the
+    /// iterator promptly rather than holding it across a long-lived host
+    /// loop. Each item is one row or the error that stopped the walk.
     pub fn sessions(&self, q: CatalogQuery) -> CatalogIter {
         let options = CatalogListOptions {
             scope: q.scope,
@@ -794,6 +801,7 @@ impl SessionStore {
             buffer: VecDeque::new(),
             cursor: None,
             exhausted: false,
+            snapshot_open: false,
         }
     }
 
@@ -975,36 +983,76 @@ pub struct SyncReport {
     /// the previous sweep's and nothing was opened; `changed` is then empty
     /// by construction.
     pub swept: bool,
-    /// Sessions whose catalog row was created or changed by this sweep:
-    /// new sessions, sessions with new activity, sessions whose discovery
-    /// state or source stamp moved. Derived from the `sessions` table before
-    /// and after the sweep, not from the provider walk, so a session whose
-    /// only change was inside a table the catalog row does not summarise is
-    /// not listed.
+    /// Sessions whose catalog row was created or changed by this sweep.
+    ///
+    /// Derived from the `sessions` table before and after the sweep, not
+    /// from the provider walk: every catalog column takes part except the
+    /// two bounded text excerpts (`first_prompt`, `last_assistant_text`), so
+    /// a new session, new activity, a moved source stamp or discovery state,
+    /// a re-resolved or inherited `project_key`, and a metadata field the
+    /// shallow read filled in are all changes here. A session whose only
+    /// change was inside a table the catalog row does not summarise is not
+    /// listed.
     pub changed: Vec<SessionRef>,
 }
 
-/// The catalog columns a sweep updates when a session changes.
-type CatalogFingerprint =
-    BTreeMap<(String, String), (Option<String>, Option<i64>, Option<String>, i64)>;
+/// One digest per catalog row over every column [`SyncReport::changed`]
+/// covers, keyed by `(source, session_id)`.
+///
+/// A digest rather than the values: the point is to notice that a row moved,
+/// not to keep two copies of the catalog, and a fixed 32 bytes per row makes
+/// the before/after maps the same size whatever the row holds. Once every
+/// catalog write stamps a revision column (#179's `sessions.revision`), this
+/// collapses to reading that one column.
+type CatalogFingerprint = BTreeMap<(String, String), [u8; 32]>;
+
+/// The catalog columns the digest covers: everything a sweep, shallow
+/// discovery or the identity refresh can write, except the two text
+/// excerpts, which are the only columns whose size is not a few bytes.
+const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first_activity_ms, \
+     discovery_state, parser_version, project_key, project_key_method, cwd, git_branch, \
+     raw_path, models_json, originator, agent_version, repo_url, initial_commit, \
+     workspace_roots_json";
 
 fn catalog_fingerprint(conn: &Connection) -> Result<CatalogFingerprint, Error> {
+    use sha2::{Digest, Sha256};
     let mut stmt = conn
-        .prepare(
-            "SELECT source, session_id, source_stamp, last_activity_ms, discovery_state, \
-             parser_version FROM sessions",
-        )
+        .prepare(&format!(
+            "SELECT source, session_id, {CATALOG_FINGERPRINT_COLUMNS} FROM sessions"
+        ))
         .map_err(Error::sql)?;
+    let columns = stmt.column_count();
     let rows = stmt
         .query_map([], |row| {
+            let mut digest = Sha256::new();
+            for index in 2..columns {
+                // Type and value both, with a separator, so a NULL and an
+                // empty string differ and a shifted column boundary cannot
+                // read as the same row.
+                match row.get_ref(index)? {
+                    rusqlite::types::ValueRef::Null => digest.update(b"n|"),
+                    rusqlite::types::ValueRef::Integer(value) => {
+                        digest.update(b"i");
+                        digest.update(value.to_le_bytes());
+                        digest.update(b"|");
+                    }
+                    rusqlite::types::ValueRef::Real(value) => {
+                        digest.update(b"r");
+                        digest.update(value.to_le_bytes());
+                        digest.update(b"|");
+                    }
+                    rusqlite::types::ValueRef::Text(bytes)
+                    | rusqlite::types::ValueRef::Blob(bytes) => {
+                        digest.update(b"t");
+                        digest.update((bytes.len() as u64).to_le_bytes());
+                        digest.update(bytes);
+                        digest.update(b"|");
+                    }
+                }
+            }
             Ok((
                 (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                (
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                ),
+                digest.finalize().into(),
             ))
         })
         .map_err(Error::sql)?;
@@ -1302,9 +1350,11 @@ impl WatchHandle {
     }
 
     /// The next tick, or `None` once the loop has stopped and every reported
-    /// tick has been read; waits at most `timeout` for one.
+    /// tick has been read; waits at most `timeout` for one. A `timeout` too
+    /// large to name an instant (`Duration::MAX`) waits without a deadline,
+    /// which is what such a value means, rather than panicking.
     pub fn next_timeout(&mut self, timeout: Duration) -> Option<Result<TickReport, Error>> {
-        self.recv(Some(Instant::now() + timeout))
+        self.recv(Instant::now().checked_add(timeout))
     }
 
     /// Receive until `deadline` (or forever), ending when the loop's thread
@@ -1492,13 +1542,19 @@ impl CatalogSession {
     }
 }
 
-/// The iterator [`SessionStore::sessions`] returns.
+/// The iterator [`SessionStore::sessions`] returns. Holds one read snapshot
+/// of the catalog from its first row until it is dropped.
 pub struct CatalogIter {
     conn: Result<Connection, Error>,
     options: CatalogListOptions,
     buffer: VecDeque<ShallowSession>,
     cursor: Option<CatalogCursor>,
     exhausted: bool,
+    /// A deferred read transaction is open on `conn`, pinning the snapshot
+    /// every page reads. Begun by hand rather than through
+    /// `unchecked_transaction` because that guard borrows the connection it
+    /// lives beside, and this struct owns both.
+    snapshot_open: bool,
 }
 
 impl CatalogIter {
@@ -1507,12 +1563,30 @@ impl CatalogIter {
             Ok(conn) => conn,
             Err(error) => return Err(error.clone()),
         };
+        if !self.snapshot_open {
+            conn.execute_batch("BEGIN DEFERRED").map_err(Error::sql)?;
+            self.snapshot_open = true;
+        }
         self.options.after = self.cursor.take();
         let page = list_session_catalog_page(conn, &self.options).map_err(Error::query)?;
         self.exhausted = page.next_cursor.is_none();
         self.cursor = page.next_cursor;
         self.buffer.extend(page.sessions);
         Ok(())
+    }
+}
+
+impl Drop for CatalogIter {
+    fn drop(&mut self) {
+        // Ends the read snapshot explicitly; closing the connection would
+        // roll it back anyway, and a read-only transaction has nothing to
+        // commit, but leaving it to the close is how a snapshot outlives the
+        // iterator by however long the close takes.
+        if self.snapshot_open {
+            if let Ok(conn) = &self.conn {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
     }
 }
 
@@ -2221,6 +2295,130 @@ mod tests {
             })
             .expect("an unlocked store syncs");
         assert!(report.swept);
+    }
+
+    /// A timeout too large to name an instant waits without one; it does not
+    /// panic before the channel is read.
+    #[test]
+    fn an_unrepresentable_watch_timeout_is_no_deadline_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let mut watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 60_000,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        // The startup sweep is queued (or about to be); the unbounded wait
+        // returns it rather than overflowing an `Instant`.
+        let first = watch
+            .next_timeout(Duration::MAX)
+            .expect("the startup tick")
+            .expect("the sweep succeeds");
+        assert_eq!(first.trigger, TickTrigger::Startup);
+        watch.stop();
+        // And once the loop has stopped, an unbounded wait still ends.
+        assert!(watch.next_timeout(Duration::MAX).is_none());
+    }
+
+    /// Every page of a catalog walk reads the snapshot the first page took:
+    /// a sync landing between pages cannot move a row across the cursor.
+    #[test]
+    fn a_catalog_walk_is_one_snapshot_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let writer = open_db(&db).unwrap();
+        writer
+            .execute_batch(
+                "INSERT INTO sessions (session_id, source, discovery_state, last_activity_ms) \
+                 VALUES ('a', 'claude', 'full', 300), ('b', 'claude', 'full', 200), \
+                        ('c', 'claude', 'full', 100);",
+            )
+            .unwrap();
+
+        let mut walk = store.sessions(CatalogQuery {
+            page_size: 1,
+            ..CatalogQuery::default()
+        });
+        let first = walk.next().unwrap().unwrap();
+        assert_eq!(first.session_id, "a");
+        // Between pages: the oldest row gains activity (it would now sort
+        // before the cursor and be skipped) and the emitted row loses some
+        // (it would sort after the cursor and be repeated).
+        writer
+            .execute_batch(
+                "UPDATE sessions SET last_activity_ms = 400 WHERE session_id = 'c'; \
+                 UPDATE sessions SET last_activity_ms = 50 WHERE session_id = 'a';",
+            )
+            .unwrap();
+        let mut rest: Vec<String> = walk.by_ref().map(|row| row.unwrap().session_id).collect();
+        rest.sort();
+        assert_eq!(rest, vec!["b", "c"], "each session exactly once");
+        drop(walk);
+
+        // A fresh walk sees the writes, so the snapshot was the iterator's,
+        // not a stale connection.
+        let order: Vec<String> = store
+            .sessions(CatalogQuery::default())
+            .map(|row| row.unwrap().session_id)
+            .collect();
+        assert_eq!(order, vec!["c", "b", "a"]);
+    }
+
+    /// A catalog change the sweep makes indirectly — here the identity
+    /// refresh lending a parent's remote key to a delegated child whose own
+    /// key was only its path — is reported in `changed`, though nothing about
+    /// the child's stamp, activity or discovery state moved.
+    #[test]
+    fn an_inherited_project_key_is_a_reported_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, discovery_state, project_key, \
+              project_key_method) \
+             VALUES ('parent', 'codex', 'full', 'github.com/org/repo', 'remote'), \
+                    ('child', 'codex', 'full', '/tmp/elsewhere', 'path'), \
+                    ('bystander', 'codex', 'full', '/tmp/quiet', 'path');
+             INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+              child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+              updated_ms) \
+             VALUES ('codex', 'parent', 'uid-1', 'child', 'delegated', 'observed', \
+                     'session_meta', 1, 1);",
+        )
+        .unwrap();
+
+        let report = store.sync(SyncOptions::default()).unwrap();
+        assert!(report.swept);
+        assert_eq!(
+            report.changed,
+            vec![SessionRef::id(Source::Codex, "child")],
+            "the child moved and nothing else did: {:?}",
+            report.changed
+        );
+        let key: String = conn
+            .query_row(
+                "SELECT project_key FROM sessions WHERE session_id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "github.com/org/repo");
+
+        // And a sweep that moves no row reports none, so the digest is not
+        // sensitive to anything a sweep rewrites identically.
+        let again = store
+            .sync(SyncOptions {
+                force: true,
+                lock_timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(again.swept);
+        assert!(again.changed.is_empty(), "{:?}", again.changed);
     }
 
     /// `loaded` never names a kind the source cannot produce, whatever the
