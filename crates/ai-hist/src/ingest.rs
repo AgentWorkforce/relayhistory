@@ -1132,32 +1132,50 @@ const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
 /// name; plain `sync` would keep skipping the rest forever.
 const CURSOR_SYNC_STATE_KEY: &str = "cursor_events_v2";
 
-/// Byte cursor covering every complete record currently in `transcript`.
+/// Byte cursor covering the complete records hydration actually indexed.
 ///
 /// Targeted hydration re-reads the whole file and does not otherwise touch
 /// `.sync-state.json`. Without this, a later incremental sync resumes from
 /// the offset it had before hydration and re-inserts untimed prompts under
 /// the new mtime.
-pub(crate) fn record_cursor_hydrate_checkpoint(db_path: &Path, transcript: &Path) -> Result<()> {
+///
+/// `consumed_through` is the offset `ingest_cursor_transcript` stopped at.
+/// The live file is not scanned to EOF: a record appended after that read
+/// must be left for the next sync, and opening without the saved cursor
+/// would reset `rewrite_epoch` so a merge could throw this offset away.
+pub(crate) fn record_cursor_hydrate_checkpoint(
+    db_path: &Path,
+    transcript: &Path,
+    consumed_through: u64,
+) -> Result<()> {
     let state_path = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".sync-state.json");
-    let mut source = CompleteJsonlReader::open(transcript, None)
+    let existing = load_sync_state(&state_path)?;
+    let key = transcript.to_string_lossy().into_owned();
+    let saved = existing
+        .get(CURSOR_SYNC_STATE_KEY)
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(&key));
+    let mut source = CompleteJsonlReader::open(transcript, saved)
         .with_context(|| format!("open Cursor transcript {}", transcript.display()))?;
     let mut line = String::new();
     let mut consumed = source.position;
-    while let Some(position) = source
-        .next_line(&mut line)
-        .with_context(|| format!("read Cursor transcript {}", transcript.display()))?
-    {
-        consumed = position;
+    while consumed < consumed_through {
+        let Some(position) = source
+            .next_line(&mut line)
+            .with_context(|| format!("read Cursor transcript {}", transcript.display()))?
+        else {
+            break;
+        };
+        consumed = position.min(consumed_through);
     }
     let cursor = source
         .committed_cursor(consumed, true)
         .with_context(|| format!("validate Cursor transcript {}", transcript.display()))?;
     let mut cursor_state = Map::new();
-    cursor_state.insert(transcript.to_string_lossy().into_owned(), cursor.to_value());
+    cursor_state.insert(key, cursor.to_value());
     let mut ours = Map::new();
     ours.insert(
         CURSOR_SYNC_STATE_KEY.to_string(),
@@ -5989,6 +6007,8 @@ pub(crate) struct CursorTranscriptOutcome {
     pub models: Vec<String>,
     pub used_mtime_fallback: bool,
     pub subagent_calls: usize,
+    /// Byte offset after the last complete record this pass indexed.
+    pub consumed_through: u64,
 }
 
 /// Index one Cursor agent transcript into every evidence table.
@@ -6471,6 +6491,7 @@ pub(crate) fn ingest_cursor_transcript(
             outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
         }
     }
+    outcome.consumed_through = offset;
     Ok(outcome)
 }
 
@@ -11503,6 +11524,33 @@ mod tests {
         );
         assert_eq!(cursor_row_count(&conn, "session_events", "s-empty"), 0);
         assert_eq!(cursor_row_count(&conn, "file_edits", "s-empty"), 0);
+    }
+
+    /// Hydration must checkpoint the bytes it indexed, not a later scan of
+    /// the live file. An append between those two reads would otherwise be
+    /// covered by the cursor and skipped by the next sync.
+    #[test]
+    fn a_cursor_hydrate_checkpoint_stops_at_the_bytes_hydration_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>one</user_query>"}]}}"#,
+            "\n"
+        );
+        let second = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>two</user_query>"}]}}"#,
+            "\n"
+        );
+        let transcript =
+            write_cursor_transcript(dir.path(), "s-bound", &format!("{first}{second}"));
+        let db = dir.path().join("history.db");
+        super::record_cursor_hydrate_checkpoint(&db, &transcript, first.len() as u64).unwrap();
+        let state = super::load_sync_state(&dir.path().join(".sync-state.json")).unwrap();
+        let cursor = &state[super::CURSOR_SYNC_STATE_KEY][transcript.to_string_lossy().as_ref()];
+        assert_eq!(
+            saved_cursor_offset(cursor),
+            first.len() as u64,
+            "an unindexed append must not be covered by the hydration checkpoint"
+        );
     }
 
     /// Group B, targeted hydration: the same rebuild guarantee.

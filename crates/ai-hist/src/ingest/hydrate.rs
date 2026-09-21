@@ -328,7 +328,7 @@ fn hydrate_session_at_with_roots_and_connectors(
     // table has a provider-native uniqueness key, so interruption followed by
     // retry is safe for both new and growing sessions.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let source_diagnostics = ingest_selected(
+    let (source_diagnostics, cursor_consumed_through) = ingest_selected(
         &tx,
         options,
         &target,
@@ -394,15 +394,13 @@ fn hydrate_session_at_with_roots_and_connectors(
     // session with a null project key in between.
     crate::store::refresh_project_identity(&tx)?;
     tx.commit()?;
-    if options.source == "cursor" {
-        if let Some(path) = snapshot.path.as_deref() {
-            // Hydration rebuilt history from offset 0 and does not otherwise
-            // move the Cursor byte cursor. A later incremental sync would
-            // resume from the old offset and insert untimed prompts again
-            // under the current mtime. Record the file we just indexed so
-            // sync only reads bytes that landed after this pass.
-            record_cursor_hydrate_checkpoint(db_path, path)?;
-        }
+    if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
+        // Hydration rebuilt history from offset 0 and does not otherwise
+        // move the Cursor byte cursor. A later incremental sync would
+        // resume from the old offset and insert untimed prompts again
+        // under the current mtime. Checkpoint exactly the bytes this
+        // pass indexed: a later append is the next sync's work.
+        record_cursor_hydrate_checkpoint(db_path, path, consumed)?;
     }
 
     let status = if previous_stamp.is_some() {
@@ -1477,17 +1475,19 @@ fn ingest_selected(
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
-) -> Result<Vec<HydrationDiagnostic>> {
+) -> Result<(Vec<HydrationDiagnostic>, Option<u64>)> {
     match options.source.as_str() {
-        "claude" => {
-            ingest_claude(conn, options, path.unwrap(), claude_subagents).map(|()| Vec::new())
+        "claude" => ingest_claude(conn, options, path.unwrap(), claude_subagents)
+            .map(|()| (Vec::new(), None)),
+        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| (Vec::new(), None)),
+        "cursor" => {
+            let (diagnostics, consumed) = ingest_cursor(conn, options, target, path.unwrap())?;
+            Ok((diagnostics, Some(consumed)))
         }
-        "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| Vec::new()),
-        "cursor" => ingest_cursor(conn, options, target, path.unwrap()),
-        "grok" => ingest_grok(conn, options, path.unwrap()),
+        "grok" => ingest_grok(conn, options, path.unwrap()).map(|diagnostics| (diagnostics, None)),
         "opencode" => {
             sync_opencode_session(conn, path.unwrap(), &options.session_id)?;
-            Ok(Vec::new())
+            Ok((Vec::new(), None))
         }
         _ => Err(hydration_error(
             "HYDRATION_UNSUPPORTED",
@@ -1923,7 +1923,7 @@ fn ingest_cursor(
     options: &HydrateSessionOptions,
     _target: &CatalogTarget,
     path: &Path,
-) -> Result<Vec<HydrationDiagnostic>> {
+) -> Result<(Vec<HydrationDiagnostic>, u64)> {
     let project = path
         .ancestors()
         .find(|ancestor| {
@@ -1976,7 +1976,7 @@ fn ingest_cursor(
         outcome.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
-    Ok(cursor_diagnostics(&outcome))
+    Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
 }
 
 /// What a Cursor transcript could not establish on its own.
