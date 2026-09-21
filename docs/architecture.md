@@ -23,7 +23,7 @@ statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
 version 19, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-2 and session usage contract version 3, normalizes nullable fields, maps native
+3 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
 helpers.
 

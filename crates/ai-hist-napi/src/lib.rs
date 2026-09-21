@@ -315,6 +315,9 @@ pub struct NativeSessionEvent {
     pub is_sidechain: Option<bool>,
     pub is_meta: Option<bool>,
     pub turn_id: Option<String>,
+    /// Why a user-role row is not a human prompt; null for a genuine prompt
+    /// and for every model-output row.
+    pub control_kind: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -354,6 +357,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             is_sidechain: event.is_sidechain.map(|value| value != 0),
             is_meta: event.is_meta.map(|value| value != 0),
             turn_id: event.turn_id,
+            control_kind: event.control_kind,
         }
     }
 }

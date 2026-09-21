@@ -106,6 +106,11 @@ export interface NativeSessionEvent {
   isSidechain?: boolean
   isMeta?: boolean
   turnId?: string
+  /**
+   * Why a user-role row is not a human prompt; null for a genuine prompt
+   * and for every model-output row.
+   */
+  controlKind?: string
 }
 export interface EventCursor {
   tsMs: number

@@ -2520,7 +2520,10 @@ pub struct SessionFileEdit {
 ///
 /// 2: `session_events` rows carry per-message raw provider facts and
 /// per-tool-result fidelity, and the user-turn page is available.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 2;
+///
+/// 3: `session_events` rows carry `control_kind`, and the user-turn page
+/// leaves control rows out.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 3;
 
 /// Stable continuation for tool calls and file edits.
 ///

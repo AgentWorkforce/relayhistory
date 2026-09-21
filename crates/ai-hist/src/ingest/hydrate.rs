@@ -2211,8 +2211,12 @@ fn ingest_claude(
         Some(&path.to_string_lossy()),
     )?;
     // The fold above walked the whole transcript, so its first prompt is the
-    // catalog's, null included.
-    crate::ingest::set_claude_first_prompt(conn, &meta)?;
+    // catalog's, null included -- unless the file was rewritten under the
+    // walk, in which case the fold describes no generation that exists and
+    // the next pass, which rescans, settles it.
+    if !scan_superseded {
+        crate::ingest::set_claude_first_prompt(conn, &meta)?;
+    }
     let mut outcome = IngestOutcome {
         bytes_read: scanned_bytes as i64,
         validation_bytes: scan_validation as i64,
@@ -8119,6 +8123,124 @@ mod tests {
         let quiet =
             hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
         assert_eq!(quiet.status, "unchanged");
+    }
+
+    /// The title the metadata fold settles is only as good as the bytes the
+    /// fold read. A fold superseded by a rewrite under it must write no
+    /// title, and the next pass -- hydration, and the global sync whose fast
+    /// path consults only the record cursor -- must rescan and write the
+    /// real one.
+    #[test]
+    fn a_superseded_scan_writes_no_title_and_the_next_pass_settles_it() {
+        let session_id = "session-stale-title";
+        // The head is a control row, so the title is null until a prompt
+        // arrives.
+        let first = format!(
+            "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-1\",\"cwd\":\"/work/app\",\
+             \"type\":\"user\",\
+             \"message\":{{\"role\":\"user\",\"content\":\"/resume 11111111-1111-1111-1111-111111111111\"}},\
+             \"timestamp\":\"2026-08-31T10:00:00Z\"}}\n"
+        );
+        let appended = |prompt: &str| {
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"u-2\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\
+                 \"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}},\
+                 \"timestamp\":\"2026-08-31T10:00:01Z\"}}\n"
+            )
+        };
+        let mid = appended("mid prompt");
+        let new = appended("new prompt");
+        assert_eq!(mid.len(), new.len());
+        let title = |db: &Path| -> Option<String> {
+            let conn = open_db(db).unwrap();
+            conn.query_row(
+                "SELECT first_prompt FROM sessions WHERE source = 'claude' AND session_id = ?",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // The rewrite lands between the metadata read and its commit, keeps
+        // the size and restores the mtime, exactly as in
+        // `a_superseded_metadata_scan_is_read_again_rather_than_left_stale`.
+        let arm = |transcript: &Path, first: &str, new: &str| {
+            let stamped = fs::metadata(transcript).unwrap().modified().unwrap();
+            let target = transcript.to_path_buf();
+            let bytes = format!("{first}{new}");
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let armed = std::sync::Arc::clone(&fired);
+            super::transcript_cursor::set_before_commit_hook_for_test(Some(Box::new(
+                move |committing| {
+                    if committing != target || armed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    fs::write(&target, &bytes).unwrap();
+                    fs::File::open(&target)
+                        .unwrap()
+                        .set_modified(stamped)
+                        .unwrap();
+                },
+            )));
+            fired
+        };
+
+        // Targeted hydration.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+            let db = dir.path().join("history.db");
+            let conn = open_db(&db).unwrap();
+            catalog_row(&conn, "claude", session_id, Some(&transcript));
+            drop(conn);
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            assert_eq!(title(&db), None);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            write!(file, "{mid}").unwrap();
+            drop(file);
+            let fired = arm(&transcript, &first, &new);
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            super::transcript_cursor::set_before_commit_hook_for_test(None);
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                title(&db),
+                None,
+                "a superseded fold's prompt must not become the title"
+            );
+            hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+            assert_eq!(title(&db).as_deref(), Some("new prompt"));
+        }
+
+        // The global sync walk, whose fast path consults the record cursor
+        // alone: without forgetting that cursor after a superseded scan, the
+        // second sync would skip the file and the title would stay null.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+            let root = dir.path().join(".claude/projects");
+            let db = dir.path().join("history.db");
+            let conn = open_db(&db).unwrap();
+            let mut state = Map::new();
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            assert_eq!(title(&db), None);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            write!(file, "{mid}").unwrap();
+            drop(file);
+            let fired = arm(&transcript, &first, &new);
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            super::transcript_cursor::set_before_commit_hook_for_test(None);
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(title(&db), None);
+            super::sync_claude_session_metadata(&conn, &mut state, &root).unwrap();
+            assert_eq!(title(&db).as_deref(), Some("new prompt"));
+        }
     }
 
     /// Hashing a sidecar's metadata document is a provider read like any

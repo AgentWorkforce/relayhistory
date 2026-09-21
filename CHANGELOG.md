@@ -161,9 +161,14 @@ Notable changes to the native `ai-hist` CLI are documented here.
   published with its control rows as user turns is rewritten index for index
   on the server, which upserts by `turnIndex` and never trims. Source-evidence
   validation refuses a `control_kind` outside the vocabulary or on anything
-  but a user text row. For Claude the full-transcript metadata fold
-  now settles `sessions.first_prompt` on every sync or hydration, null
-  included, so a title an earlier release took from a row that is control now
+  but a user text row. `SESSION_EVIDENCE_CONTRACT_VERSION` 2 -> 3 on both the
+  Rust and TypeScript sides, since the session-event row shape changed; the
+  TypeScript `SessionEvent` exposes it as `controlKind` (a `ControlKind`
+  union or null) and the native addon carries it, with no native contract
+  bump because the field is additive. For Claude the full-transcript metadata
+  fold now settles `sessions.first_prompt` on every sync or hydration, null
+  included -- never from a fold superseded by a rewrite under it, which the
+  next pass rescans -- so a title an earlier release took from a row that is control now
   (a bare `/resume <id>`, a task notification) is replaced on the one-time
   re-read; `SHALLOW_SCANNER_VERSION` 5 -> 6 sends cached discovery rows
   through the current classifier once as well. A standalone reminder row the
@@ -177,7 +182,9 @@ Notable changes to the native `ai-hist` CLI are documented here.
   the previous parser wrote for a record it now stores differently: the
   `history` row it wrote from the record's whole text (a reminder folded into
   the prompt, a task notification as a prompt), keyed on this session, the
-  record's timestamp and that text. Continuity reads a `/resume` through the
+  record's timestamp and that text; a row another session's human prompt
+  shares under `history`'s `(source, timestamp, prompt)` key is handed to
+  that session rather than deleted. Continuity reads a `/resume` through the
   same reminder stripping, so a reminder ahead of the wrapper no longer hides
   the resume. The fixture corpus snapshots now include `control_kind` and a
   `session_markers` dump. napi/TS/MCP exposure is not included.

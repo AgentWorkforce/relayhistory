@@ -5447,8 +5447,21 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 meta.last_assistant_text.as_deref(),
                 Some(&path.to_string_lossy()),
             )?;
-            set_claude_first_prompt(conn, &meta)?;
+            // A superseded fold read bytes that were rewritten under it, so
+            // its first prompt describes no generation of the file that
+            // exists; writing it would put a title on the row that nothing
+            // rereads. Skipped here, and the cursor the record walk publishes
+            // below is forgotten afterwards, because the fast path consults
+            // that cursor alone: left standing over the new bytes it would
+            // skip this file on every later sync and the stale fold would
+            // never be replaced.
+            if !scan_superseded {
+                set_claude_first_prompt(conn, &meta)?;
+            }
             incremental::ingest_claude_transcript_at_locator(conn, &path, None)?;
+            if scan_superseded {
+                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+            }
             // Global sync is not scoped to one thread, so it indexes the
             // materialization edge like every other kind.
             record_claude_remote_relationship(conn, &meta, true)?;
@@ -6059,6 +6072,65 @@ impl ClaudeScanPass {
     fn read_nothing_decodable(&self) -> bool {
         self.decoded == 0 && self.undecodable > 0
     }
+}
+
+/// Retire the history row the previous parser wrote for a record this
+/// session now stores differently, without erasing another session's prompt.
+///
+/// `history` is unique on `(source, timestamp_ms, prompt)` with no session in
+/// the key, so a task notification in one session and a human prompt with the
+/// same text at the same millisecond in another are one row, owned by
+/// whichever transcript was read first. Deleting that row outright when the
+/// owner turns out to be control would erase the other session's prompt --
+/// its own re-read had already been ignored by the unique key -- so before
+/// the delete, the row is handed to a session that has a substantive user
+/// text event at that instant with that text. Only when no such session
+/// exists is it deleted. The lookup runs only when this session actually owns
+/// such a row, which outside the one-time re-read is never.
+fn retire_claude_history_row(
+    conn: &Connection,
+    session_id: &str,
+    ts_ms: i64,
+    raw: &str,
+) -> Result<()> {
+    let owned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM history \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3)",
+        params![session_id, ts_ms, raw],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Ok(());
+    }
+    let handed_over = conn.execute(
+        "UPDATE history SET session_id = ( \
+             SELECT e.session_id FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), \
+           project = COALESCE(( \
+             SELECT e.project FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3 \
+             ORDER BY e.session_id LIMIT 1), project) \
+         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3 \
+           AND EXISTS( \
+             SELECT 1 FROM session_events e \
+             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
+               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
+               AND TRIM(e.text) = ?3)",
+        params![session_id, ts_ms, raw],
+    )?;
+    if handed_over == 0 {
+        conn.execute(
+            "DELETE FROM history \
+             WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3",
+            params![session_id, ts_ms, raw],
+        )?;
+    }
+    Ok(())
 }
 
 /// Record what the whole-transcript fold found as the session's first prompt.
@@ -7109,11 +7181,7 @@ fn ingest_claude_record(
         // this parser writes back unchanged is deleted and reinserted only
         // when the text really did change.
         if !raw.is_empty() && current != Some(raw) {
-            conn.execute(
-                "DELETE FROM history \
-                 WHERE source = 'claude' AND session_id = ? AND timestamp_ms = ? AND prompt = ?",
-                params![session_id, ts_ms, raw],
-            )?;
+            retire_claude_history_row(conn, session_id, ts_ms, raw)?;
         }
         if let Some(prompt) = current {
             insert_history(
@@ -21625,6 +21693,98 @@ mod tests {
         // Idempotent: a second read changes nothing.
         ingest_claude_transcript(&conn, &corpus_fixture("claude/system-reminder.jsonl")).unwrap();
         assert_eq!(claude_history(&conn, "reminder-session").len(), 2);
+    }
+
+    /// `history` is unique on `(source, timestamp_ms, prompt)`, so a task
+    /// notification in one session and a human prompt with the same text at
+    /// the same millisecond in another are one row. Whichever order the
+    /// upgrade re-reads the two transcripts in, the human prompt has to be
+    /// the one left standing.
+    #[test]
+    fn retiring_a_control_row_hands_a_shared_history_row_to_the_human_session() {
+        let control = concat!(
+            r#"{"type":"user","uuid":"a1","sessionId":"sess-control","cwd":"/tmp/a","origin":{"kind":"task-notification"},"timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let human = concat!(
+            r#"{"type":"user","uuid":"b1","sessionId":"sess-human","cwd":"/tmp/b","timestamp":"2026-04-21T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            "\n",
+        );
+        let owners = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT session_id, prompt FROM history WHERE source = 'claude' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        for human_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let control_path = dir.path().join("control.jsonl");
+            let human_path = dir.path().join("human.jsonl");
+            fs::write(&control_path, control).unwrap();
+            fs::write(&human_path, human).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            // What the previous parser left: the control session owns the
+            // one row, and both sessions' events are stored untyped.
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("sess-control".into()),
+                    project: Some("/tmp/a".into()),
+                    prompt_hash: Some(prompt_hash("fix it")),
+                    prompt: "fix it".into(),
+                    timestamp_ms: 1_776_729_601_000,
+                },
+            )
+            .unwrap();
+            for (session, project, uid) in [
+                ("sess-control", "/tmp/a", "a1:0"),
+                ("sess-human", "/tmp/b", "b1:0"),
+            ] {
+                conn.execute(
+                    "INSERT INTO session_events (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('claude', ?1, ?2, ?3, 1776729601000, 'user', 'text', 'fix it', ?4)",
+                    params![session, project, &uid[..2], uid],
+                )
+                .unwrap();
+            }
+
+            let order: Vec<&Path> = if human_first {
+                vec![&human_path, &control_path]
+            } else {
+                vec![&control_path, &human_path]
+            };
+            for path in order {
+                ingest_claude_transcript(&conn, path).unwrap();
+            }
+            assert_eq!(
+                owners(&conn),
+                vec![("sess-human".to_string(), "fix it".to_string())],
+                "human first: {human_first}"
+            );
+            let project: Option<String> = conn
+                .query_row(
+                    "SELECT project FROM history WHERE source = 'claude' AND prompt = 'fix it'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                project.as_deref(),
+                Some("/tmp/b"),
+                "the row is the human session's now, project included: {human_first}"
+            );
+            // Idempotent: reading both again moves nothing.
+            ingest_claude_transcript(&conn, &control_path).unwrap();
+            ingest_claude_transcript(&conn, &human_path).unwrap();
+            assert_eq!(owners(&conn).len(), 1, "human first: {human_first}");
+        }
     }
 
     fn stored_first_prompt(conn: &Connection, session_id: &str) -> Option<String> {
