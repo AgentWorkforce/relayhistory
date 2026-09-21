@@ -153,6 +153,8 @@ fn summary(directory: &Path, config: &Config) -> Result<Value> {
     let job = delivery::status(&conn, &config.job_id)?;
     Ok(
         json!({"directory":directory, "site_url":config.site_url, "account_id":config.account_id,
+        "account_email":config.account_email, "account_name":config.account_name,
+        "account_avatar_url":config.account_avatar_url,
         "workspace_id":config.workspace_id, "org_id":config.org_id, "sharing_mode":mode(config),
         "running":collector::running(directory)?, "paused":job.state == "paused"}),
     )
@@ -721,6 +723,9 @@ mod tests {
             version: 1,
             site_url: "https://agentrelay.com".into(),
             account_id: "account".into(),
+            account_email: Some("person@example.com".into()),
+            account_name: Some("Example Person".into()),
+            account_avatar_url: Some("https://example.com/avatar.png".into()),
             org_id: "org".into(),
             workspace_id: "workspace".into(),
             history_url: "https://history.agentrelay.com".into(),
@@ -746,6 +751,18 @@ mod tests {
         save_json(&dir.join("sharing-change.json"), &plan).unwrap();
         recover(dir).unwrap();
         read_config(dir).unwrap()
+    }
+
+    #[test]
+    fn desktop_summary_includes_the_signed_in_profile() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let value = summary(dir.path(), &config).unwrap();
+        assert_eq!(value["account_email"], "person@example.com");
+        assert_eq!(value["account_name"], "Example Person");
+        assert_eq!(
+            value["account_avatar_url"],
+            "https://example.com/avatar.png"
+        );
     }
 
     #[test]

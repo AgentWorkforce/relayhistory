@@ -101,6 +101,12 @@ struct Config {
     version: u32,
     site_url: String,
     account_id: String,
+    #[serde(default)]
+    account_email: Option<String>,
+    #[serde(default)]
+    account_name: Option<String>,
+    #[serde(default)]
+    account_avatar_url: Option<String>,
     org_id: String,
     workspace_id: String,
     history_url: String,
@@ -405,6 +411,8 @@ fn install(options: Install) -> Result<()> {
     if bridge::json_mode() {
         bridge::emit(
             serde_json::json!({"event":"connected", "account_id":who.user_id,
+            "account_email":who.email, "account_name":who.name,
+            "account_avatar_url":who.avatar_url,
             "workspace_id":workspace, "org_id":org_id, "directory":directory}),
         );
     }
@@ -416,6 +424,9 @@ fn install(options: Install) -> Result<()> {
     let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
+            config.account_email = who.email;
+            config.account_name = who.name;
+            config.account_avatar_url = who.avatar_url;
             config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
             save_json(&directory.join("config.json"), &config)?;
             let job = relayhistory_plugin::delivery::status(&conn, &config.job_id)?;
@@ -486,6 +497,9 @@ fn install(options: Install) -> Result<()> {
                 version: 1,
                 site_url: site,
                 account_id: who.user_id,
+                account_email: who.email,
+                account_name: who.name,
+                account_avatar_url: who.avatar_url,
                 org_id,
                 workspace_id: workspace,
                 history_url,
