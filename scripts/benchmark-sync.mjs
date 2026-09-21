@@ -250,10 +250,20 @@ export function failureFooter(verdict, profile) {
   const band = warnings.find((warning) => warning.kind === "calibration-band");
   const machineClass = profile?.measuredOn?.machineClass ?? "another machine class";
   if (unknown) {
+    // Say it only if it happened: the widening is off when the calibration is
+    // `applied`, and a bound only moves when something widened it.
+    const anyWidened = (verdict.checks ?? [])
+      .some((check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
+    const widened = anyWidened
+      ? "\nThe bounds above were already widened for that — see the off-class line — and the\n"
+        + "failures survived the widening, so re-measuring the baselines on this machine\n"
+        + "class is the answer if the numbers are simply what this hardware costs.\n"
+      : "";
     return "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
       + `${machineClass}, and this run was on ${unknown.cpu}, not one of them. Off that\n`
       + "class a failure here is as likely to be the hardware as the code. Compare against\n"
-      + "a run on the baseline class before treating it as a regression.\n";
+      + "a run on the baseline class before treating it as a regression.\n"
+      + widened;
   }
   if (band) {
     const pace = band.raw >= 1
@@ -267,6 +277,28 @@ export function failureFooter(verdict, profile) {
       + "apart.\n";
   }
   return "";
+}
+
+/**
+ * One line of the gate's result table.
+ *
+ * A widened bound prints as `raw -> widened`, and a check that passed only
+ * because of the widening prints `warn` rather than `ok`. Both exist so that
+ * the number which actually decided the check is on the line a reader looks
+ * at, instead of having to be reconstructed from the off-class paragraph.
+ */
+export function renderCheck(check) {
+  const shown = check.normalized === check.value
+    ? check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)
+    : `${check.value.toFixed(1)} -> ${check.normalized.toFixed(1)}`;
+  const widened = check.effectiveBound !== undefined && check.effectiveBound !== check.bound;
+  const bound = widened
+    ? `${check.bound.toFixed(0)} -> ${check.effectiveBound.toFixed(0)} `
+      + `off-class x${check.widened.toFixed(2)}`
+    : check.bound.toFixed(0);
+  const verdict = check.ok ? (check.advisory ? "warn" : "ok  ") : "FAIL";
+  return `${verdict} ${check.phase}.${check.metric}: ${shown} `
+    + `(baseline ${check.baseline}, bound ${bound})`;
 }
 
 /** Turn `unsupportedPhases` findings into one actionable failure. */
@@ -484,14 +516,20 @@ async function main(argv) {
   for (const warning of verdict.warnings ?? []) {
     process.stdout.write(`warning [${warning.kind}]: ${warning.message}\n\n`);
   }
-  for (const check of verdict.checks) {
-    const shown = check.normalized === check.value
-      ? check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)
-      : `${check.value.toFixed(1)} -> ${check.normalized.toFixed(1)}`;
+  if (verdict.offClass) {
     process.stdout.write(
-      `${check.ok ? "ok  " : "FAIL"} ${check.phase}.${check.metric}: ${shown} ` +
-      `(baseline ${check.baseline}, bound ${check.bound.toFixed(0)})\n`,
+      `off-class: this CPU is not one the baselines were measured on, so the bounds below `
+      + `are widened, never tightened, and never past ${verdict.offClassCap.toFixed(2)}x. `
+      + `A bound derived from a stored baseline is widened ${verdict.offClassScale.toFixed(2)}x, `
+      + "the calibration ratio clamped to that cap; an elapsed ceiling that comes from a "
+      + `noise floor instead is widened the full ${verdict.offClassCap.toFixed(2)}x and a `
+      + "breach inside that widening is advisory. Peak RSS is not widened at all. Each "
+      + "bound below prints raw -> widened.\n\n",
     );
+  }
+  for (const check of verdict.checks) process.stdout.write(`${renderCheck(check)}\n`);
+  for (const advisory of verdict.advisories ?? []) {
+    process.stdout.write(`\nadvisory: ${advisory}\n`);
   }
   process.stdout.write(
     `\n${verdict.checks.length} checks over ${report.phases.length} phases in ${seconds}s ` +

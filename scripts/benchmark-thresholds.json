@@ -27,6 +27,18 @@
       "min": 0.7,
       "max": 1.4
     },
+    "offClassComment": [
+      "What happens on a runner whose CPU is not in `measuredOn.cpusSeen`. The bounds",
+      "are widened -- never tightened, never past `offClassCalibrationCap`. A bound",
+      "derived from a stored baseline is widened by the calibration ratio clamped to",
+      "[1, cap]; an elapsed ceiling that comes from an absolute floor is widened by the",
+      "full cap and a breach inside that widening is advisory rather than fatal, because",
+      "such a floor is a runner-noise allowance measured on the baseline class and the",
+      "calibration is a CPU-speed reading that does not describe walk-and-stat jitter.",
+      "peakRssBytes is never widened. On the baseline class none of this applies. See",
+      "docs/benchmarks.md, 'A runner the baselines were never measured on'."
+    ],
+    "offClassCalibrationCap": 2,
     "absoluteFloorsComment": [
       "A ceiling derived from a very small baseline measures the runner, not the",
       "code. These floors raise such a ceiling and never lower one. On the tiny PR",

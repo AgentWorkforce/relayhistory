@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   CALIBRATION_CLAMP,
+  OFF_CLASS_CALIBRATION_CAP,
   calibrationFactor,
   claudeTranscript,
   codexRollout,
@@ -18,7 +19,8 @@ import {
 } from "./benchmark-sync-lib.mjs";
 import { generateStore, opencodeAvailable } from "./gen-synthetic-history.mjs";
 import {
-  CALIBRATION_PHASE, PHASE_ORDER, failureFooter, findHarnessExecutable, updatedProfile,
+  CALIBRATION_PHASE, PHASE_ORDER, failureFooter, findHarnessExecutable, renderCheck,
+  updatedProfile,
 } from "./benchmark-sync.mjs";
 
 const warningText = (verdict) => (verdict.warnings ?? []).map((w) => w.message).join("\n");
@@ -427,6 +429,215 @@ test("the committed thresholds tolerate the observed healthy unchanged_sync jitt
     ],
   }, thresholds, "ci-debug");
   assert.equal(verdict.ok, true, verdict.failures.join("; "));
+});
+
+// ---------------------------------------------------------------------------
+// off-class runners
+// ---------------------------------------------------------------------------
+
+/**
+ * The three G1 pull requests the gate blocked on 2026-09-21, replayed from
+ * their `verify` logs. Every other check in each run was green; all three ran
+ * on the AMD EPYC 7763 that GitHub added to the `ubuntu-latest` pool after
+ * these baselines were measured, and all three died on the one phase with the
+ * least headroom over runner noise.
+ */
+const OFF_CLASS_CPU = "AMD EPYC 7763 64-Core Processor";
+const offClassRuns = {
+  "#194 run 35543384881": {
+    calibrationMs: 200.6,
+    machine: { cpu: OFF_CLASS_CPU },
+    phases: [
+      { phase: "cold_sync", recordsPerSecond: 565.7, peakRssBytes: 13991936 },
+      { phase: "incremental_sync", elapsedMs: 372.4, peakRssBytes: 12898304 },
+      { phase: "unchanged_sync", elapsedMs: 121.6, peakRssBytes: 12730368 },
+      { phase: "hydrate_cold", recordsPerSecond: 207.3, peakRssBytes: 12759040 },
+      { phase: "hydrate_unchanged", elapsedMs: 20.1, peakRssBytes: 10268672 },
+    ],
+  },
+  "#199 run 35543305734": {
+    calibrationMs: 197.3,
+    machine: { cpu: OFF_CLASS_CPU },
+    phases: [
+      { phase: "cold_sync", recordsPerSecond: 582.7, peakRssBytes: 14712832 },
+      { phase: "incremental_sync", elapsedMs: 364.4, peakRssBytes: 13651968 },
+      { phase: "unchanged_sync", elapsedMs: 121.6, peakRssBytes: 13283328 },
+      { phase: "hydrate_cold", recordsPerSecond: 207.4, peakRssBytes: 12951552 },
+      { phase: "hydrate_unchanged", elapsedMs: 20.0, peakRssBytes: 10477568 },
+    ],
+  },
+  "#204 run 35547876206": {
+    calibrationMs: 201.4,
+    machine: { cpu: OFF_CLASS_CPU },
+    phases: [
+      { phase: "cold_sync", recordsPerSecond: 544.6, peakRssBytes: 13926400 },
+      { phase: "incremental_sync", elapsedMs: 203.7, peakRssBytes: 13275136 },
+      { phase: "unchanged_sync", elapsedMs: 179.2, peakRssBytes: 12984320 },
+      { phase: "hydrate_cold", recordsPerSecond: 206.8, peakRssBytes: 12988416 },
+      { phase: "hydrate_unchanged", elapsedMs: 21.3, peakRssBytes: 10649600 },
+    ],
+  },
+};
+
+const check = (verdict, phase, metric) =>
+  verdict.checks.find((entry) => entry.phase === phase && entry.metric === metric);
+
+test("a runner the baselines never saw is not failed for being that runner", () => {
+  for (const [label, run] of Object.entries(offClassRuns)) {
+    const verdict = evaluateGate(run, thresholds, "ci-debug");
+    assert.equal(verdict.ok, true, `${label}: ${verdict.failures.join("; ")}`);
+    // The warning that says why is still printed: widening the bounds is not
+    // the same as pretending the machine is one of the baseline machines.
+    assert.match(warningText(verdict), /this is AMD EPYC 7763/);
+    assert.ok(verdict.offClass, `${label} is off the baseline class`);
+
+    // `unchanged_sync`'s ceiling comes from the absolute floor, not from its
+    // own baseline, so off class it is advisory rather than fatal.
+    const unchanged = check(verdict, "unchanged_sync", "elapsedMs");
+    assert.equal(unchanged.bound, 120, `${label} keeps the raw ceiling visible`);
+    assert.equal(unchanged.effectiveBound, 240, `${label} widens it by the cap`);
+    assert.equal(unchanged.advisory, true, `${label} reports it as advisory`);
+
+    // A bound that does come from a baseline is scaled by the calibration
+    // instead, and never past the cap.
+    const incremental = check(verdict, "incremental_sync", "elapsedMs");
+    const ratio = run.calibrationMs / thresholds.profiles["ci-debug"].calibrationMs;
+    assert.ok(Math.abs(incremental.effectiveBound - 848 * ratio) < 0.5, label);
+    assert.equal(incremental.advisory, false, `${label} did not need the widening`);
+
+    // The same numbers on a CPU the baselines were measured on still fail:
+    // nothing about the on-class gate moved.
+    const onClass = evaluateGate(
+      { ...run, machine: { cpu: "Intel(R) Xeon(R) 6973P-C" } }, thresholds, "ci-debug",
+    );
+    assert.equal(onClass.ok, false, `${label} on a baseline CPU must still fail`);
+    assert.match(onClass.failures.join("\n"), /unchanged_sync\.elapsedMs/);
+    for (const entry of onClass.checks) {
+      assert.equal(entry.effectiveBound, entry.bound, `${label} on class: bounds untouched`);
+      assert.equal(entry.advisory, false, `${label} on class: nothing is advisory`);
+    }
+  }
+});
+
+test("the off-class allowance only ever loosens, and stops at the cap", () => {
+  const run = offClassRuns["#199 run 35543305734"];
+  // Faster than the baseline machines on the reference workload: 0.68x. A
+  // corrector would tighten every ceiling by that; this one must not.
+  const faster = evaluateGate({ ...run, calibrationMs: 100 }, thresholds, "ci-debug");
+  assert.equal(faster.offClassScale, 1, "a ratio below 1 is not applied");
+  assert.equal(check(faster, "incremental_sync", "elapsedMs").effectiveBound, 848);
+  assert.equal(check(faster, "cold_sync", "recordsPerSecond").effectiveBound, 239);
+
+  // Ten times as long on the reference: the scale stops at the documented cap,
+  // so a slow runner cannot hide an arbitrary regression behind it.
+  const crawling = evaluateGate({ ...run, calibrationMs: 1479 }, thresholds, "ci-debug");
+  assert.equal(crawling.offClassScale, OFF_CLASS_CALIBRATION_CAP);
+  assert.equal(check(crawling, "incremental_sync", "elapsedMs").effectiveBound, 848 * 2);
+  assert.equal(check(crawling, "cold_sync", "recordsPerSecond").effectiveBound, 239 / 2);
+  assert.equal(check(crawling, "unchanged_sync", "elapsedMs").effectiveBound, 240);
+});
+
+test("a cap that would tighten the gate is refused", () => {
+  const run = offClassRuns["#199 run 35543305734"];
+  for (const bad of [0, 0.5, -2, "nonsense", null]) {
+    const misconfigured = {
+      ...thresholds,
+      policy: { ...thresholds.policy, offClassCalibrationCap: bad },
+    };
+    const verdict = evaluateGate(run, misconfigured, "ci-debug");
+    assert.equal(verdict.offClassCap, OFF_CLASS_CALIBRATION_CAP, `cap ${bad} falls back`);
+    for (const entry of verdict.checks) {
+      const tighter = entry.metric === "recordsPerSecond"
+        ? entry.effectiveBound > entry.bound
+        : entry.effectiveBound < entry.bound;
+      assert.equal(tighter, false, `${entry.phase}.${entry.metric} was not tightened`);
+    }
+  }
+});
+
+test("a regression past the off-class cap is still red", () => {
+  for (const [label, run] of Object.entries(offClassRuns)) {
+    const tripled = {
+      ...run,
+      phases: run.phases.map((phase) => ({
+        ...phase,
+        ...(phase.recordsPerSecond === undefined
+          ? {} : { recordsPerSecond: phase.recordsPerSecond / 3 }),
+        ...(phase.elapsedMs === undefined ? {} : { elapsedMs: phase.elapsedMs * 3 }),
+      })),
+    };
+    const verdict = evaluateGate(tripled, thresholds, "ci-debug");
+    assert.equal(verdict.ok, false, `${label} tripled must go red off class too`);
+    assert.match(verdict.failures.join("\n"), /hydrate_cold\.recordsPerSecond/);
+  }
+  // And the advisory phase is not a hole without a bottom: a `watch` tick that
+  // takes twenty times its baseline fails even off class.
+  const blown = {
+    ...offClassRuns["#199 run 35543305734"],
+    phases: offClassRuns["#199 run 35543305734"].phases.map((phase) => (
+      phase.phase === "unchanged_sync" ? { ...phase, elapsedMs: 1020 } : phase
+    )),
+  };
+  const verdict = evaluateGate(blown, thresholds, "ci-debug");
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.failures.join("\n"), /unchanged_sync\.elapsedMs/);
+});
+
+test("a widened bound is printed next to the raw one, on the line and in the failure", () => {
+  const run = offClassRuns["#204 run 35547876206"];
+  const verdict = evaluateGate(run, thresholds, "ci-debug");
+  const lines = verdict.checks.map(renderCheck);
+  const line = lines.find((entry) => entry.includes("unchanged_sync.elapsedMs"));
+  assert.match(line, /^warn /, "a check that only passed because of the widening says so");
+  assert.match(line, /bound 120 -> 240 off-class x2\.00/);
+  // A check the widening did not touch reads exactly as it did before.
+  assert.match(
+    lines.find((entry) => entry.includes("unchanged_sync.peakRssBytes")),
+    /^ok {3}unchanged_sync\.peakRssBytes: \d+ \(baseline 9687040, bound 67108864\)$/,
+  );
+  // A widened bound that was never breached still shows what it became.
+  assert.match(
+    lines.find((entry) => entry.includes("incremental_sync.elapsedMs")),
+    /^ok {3}.*bound 848 -> 1155 off-class x1\.36/,
+  );
+
+  // The same on the way out: a failure names the bound that decided it.
+  const blown = {
+    ...run,
+    phases: run.phases.map((phase) => (
+      phase.phase === "unchanged_sync" ? { ...phase, elapsedMs: 1020 } : phase
+    )),
+  };
+  const failed = evaluateGate(blown, thresholds, "ci-debug");
+  assert.match(
+    failed.failures.join("\n"),
+    /unchanged_sync\.elapsedMs = 1,020, baseline 51, ceiling 120 \(off-class ceiling 240, widened 2\.00x\)/,
+  );
+  // And the footer stops telling the reader to blame the hardware first.
+  const footer = failureFooter(failed, thresholds.profiles["ci-debug"]);
+  assert.match(footer, /AMD EPYC 7763/);
+  assert.match(footer, /already widened/);
+});
+
+test("memory bounds are not widened off class", () => {
+  const run = offClassRuns["#199 run 35543305734"];
+  for (const entry of evaluateGate(run, thresholds, "ci-debug").checks) {
+    if (entry.metric !== "peakRssBytes") continue;
+    assert.equal(entry.effectiveBound, entry.bound, `${entry.phase} RSS is not scaled`);
+    assert.equal(entry.advisory, false);
+  }
+  // RSS does not get bigger because the box is slower, so the blow-up guard
+  // stays exactly where it is.
+  const bloated = {
+    ...run,
+    calibrationMs: 1479,
+    phases: run.phases.map((phase) => (
+      phase.phase === "cold_sync" ? { ...phase, peakRssBytes: 200_000_000 } : phase
+    )),
+  };
+  const verdict = evaluateGate(bloated, thresholds, "ci-debug");
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.failures.join("\n"), /cold_sync\.peakRssBytes/);
 });
 
 test("re-measuring keeps the machine metadata the bounds depend on", () => {
