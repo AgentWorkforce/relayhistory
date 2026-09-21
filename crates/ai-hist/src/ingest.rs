@@ -1015,7 +1015,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     // Errors here mean an unreadable directory, not "no trajectories". The
     // fold simply omits what it could not enumerate, which can only cause an
     // extra sweep, never a skipped one.
-    paths.extend(trajectory_files(&roots.home).unwrap_or_default());
+    paths.extend(trajectory_files(roots).unwrap_or_default());
     let mut candidates: Vec<Candidate> = Vec::new();
     // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
     // lives in the message and part files under it rather than in the session
@@ -1127,7 +1127,7 @@ pub(crate) fn source_watch_roots(
             provider_roots.codex.join("history.jsonl"),
         )),
         "trajectory" => {
-            for root in trajectory_roots(&provider_roots.home).unwrap_or_default() {
+            for root in trajectory_roots(provider_roots).unwrap_or_default() {
                 roots.push(trajectory_watch_root(root));
             }
         }
@@ -1428,7 +1428,7 @@ fn sync_basic(
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "trajectory",
-        sync_trajectories(conn, &mut state, home, &mut coverage),
+        sync_trajectories(conn, &mut state, roots, &mut coverage),
     ) {
         total_inserted += inserted;
         checkpoint_sync_state(&state_path, &state);
@@ -11590,10 +11590,10 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
 fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    home: &Path,
+    roots: &crate::ProviderRoots,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let files = trajectory_files(home)?;
+    let files = trajectory_files(roots)?;
     if files.is_empty() {
         return Ok(0);
     }
@@ -11697,28 +11697,32 @@ struct TrajectoryRow {
 /// all, contributes no files — but it is exactly what has to be watched, so
 /// the first trajectory written into it wakes live capture instead of waiting
 /// for the backstop.
-pub(crate) fn trajectory_roots(home: &Path) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    if let Some(raw) = std::env::var_os("TRAJECTORY_ROOT") {
-        for part in std::env::split_paths(&raw) {
-            if !part.as_os_str().is_empty() {
-                roots.push(part);
+/// The trajectory roots these provider roots name: the explicit list when
+/// one was given (`TRAJECTORY_ROOT`, read once when the roots were built),
+/// otherwise every `.trajectories` directory under `<home>/Projects` as of
+/// now. The environment is not consulted here: an embedder that built its
+/// roots without it must not have a host's `TRAJECTORY_ROOT` redirect its
+/// sweep and its watcher outside the home it named.
+pub(crate) fn trajectory_roots(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
+    let mut roots = match &provider_roots.trajectory_roots {
+        Some(explicit) => explicit.clone(),
+        None => {
+            let mut derived = Vec::new();
+            let projects = provider_roots.home.join("Projects");
+            if projects.exists() {
+                collect_named_dirs(&projects, ".trajectories", &mut derived)?;
             }
+            derived
         }
-    } else {
-        let projects = home.join("Projects");
-        if projects.exists() {
-            collect_named_dirs(&projects, ".trajectories", &mut roots)?;
-        }
-    }
+    };
     roots.sort();
     roots.dedup();
     Ok(roots)
 }
 
-fn trajectory_files(home: &Path) -> Result<Vec<PathBuf>> {
+fn trajectory_files(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for root in trajectory_roots(home)? {
+    for root in trajectory_roots(provider_roots)? {
         check_capture_cancelled()?;
         if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(root);

@@ -1095,6 +1095,14 @@ fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
         HydrateStatus::Hydrated | HydrateStatus::Unchanged
     ));
 
+    // Trajectory roots follow the explicit value too, never the environment.
+    let watched_trajectories = Source::Trajectory.capabilities().watch_roots(&roots);
+    assert!(
+        watched_trajectories
+            .iter()
+            .all(|root| root.path.starts_with(dir.path())),
+        "explicit roots keep trajectory watching under the home: {watched_trajectories:?}"
+    );
     let watched = Source::Codex.capabilities().watch_roots(&roots);
     assert!(
         watched
@@ -1105,6 +1113,95 @@ fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
     assert!(!watched
         .iter()
         .any(|root| root.path.starts_with(dir.path().join(".codex"))));
+}
+
+/// Serialises the tests that set `TRAJECTORY_ROOT`; every other test here
+/// builds its roots with `from_home` and never reads the variable.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_trajectory_root<T>(value: &Path, body: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = std::env::var_os("TRAJECTORY_ROOT");
+    std::env::set_var("TRAJECTORY_ROOT", value);
+    let result = body();
+    match previous {
+        Some(previous) => std::env::set_var("TRAJECTORY_ROOT", previous),
+        None => std::env::remove_var("TRAJECTORY_ROOT"),
+    }
+    result
+}
+
+fn stage_trajectory(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("run.json"),
+        r#"{"id":"run-elsewhere","task":{"title":"someone else's run"},"decisions":[],"retrospective":{"summary":"done"}}"#,
+    )
+    .unwrap();
+}
+
+fn trajectory_history_rows(home: &Path) -> i64 {
+    rusqlite::Connection::open(home.join("ai-history.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM history WHERE source = 'trajectory'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// `from_home` roots are environment-free all the way down: a host's
+/// `TRAJECTORY_ROOT` neither feeds the sweep nor the advertised watch roots,
+/// while `from_env` roots pick it up — and both are decided when the roots
+/// are built, not when they are used.
+#[test]
+fn explicit_roots_ignore_trajectory_root_and_env_roots_honour_it() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let live = elsewhere.path().join("live/.trajectories");
+    stage_trajectory(&live);
+
+    let isolated = tempfile::tempdir().unwrap();
+    let hosted = tempfile::tempdir().unwrap();
+    let (explicit, from_env) = with_trajectory_root(&live, || {
+        let explicit = roots_under(isolated.path());
+        let from_env = ProviderRoots::from_env(hosted.path().to_path_buf());
+        (explicit, from_env)
+    });
+    // The variable is unset again from here on: everything below runs on
+    // what the roots stored, which is the point.
+    assert_eq!(explicit.trajectory_roots, None);
+    assert_eq!(from_env.trajectory_roots, Some(vec![live.clone()]));
+
+    let store = open_with_roots(isolated.path(), explicit.clone());
+    assert!(store.sync(SyncOptions::default()).unwrap().swept);
+    assert_eq!(trajectory_history_rows(isolated.path()), 0);
+    let advertised = Source::Trajectory.capabilities().watch_roots(&explicit);
+    assert!(
+        advertised
+            .iter()
+            .all(|root| root.path.starts_with(isolated.path())),
+        "nothing outside the home is watched: {advertised:?}"
+    );
+
+    let mut env_roots = from_env.clone();
+    // The rest of the hosted roots stay under the hosted home so the only
+    // difference between the two stores is the trajectory override.
+    env_roots.claude = hosted.path().join(".claude");
+    env_roots.codex = hosted.path().join(".codex");
+    env_roots.grok = hosted.path().join(".grok");
+    env_roots.opencode_db = hosted.path().join(".local/share/opencode/opencode.db");
+    env_roots.opencode_storage_dir = hosted.path().join(".local/share/opencode/storage");
+    let store = open_with_roots(hosted.path(), env_roots.clone());
+    assert!(store.sync(SyncOptions::default()).unwrap().swept);
+    assert_eq!(trajectory_history_rows(hosted.path()), 1);
+    let advertised = Source::Trajectory.capabilities().watch_roots(&env_roots);
+    assert!(
+        advertised.iter().any(|root| root.path == live),
+        "the configured root is watched: {advertised:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

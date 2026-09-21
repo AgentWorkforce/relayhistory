@@ -65,8 +65,11 @@ when `home` is set. `home` replaces the process `HOME` as the provider root;
 honoured, exactly as the CLI honours them. `roots: Option<ProviderRoots>` names
 every provider root explicitly instead — `ProviderRoots::from_home(home,
 opencode_db)` reads nothing from the environment, `ProviderRoots::from_env(home)`
-is the CLI's resolution — and is what a test or an embedder with its own layout
-passes. Whichever way they are resolved, the store resolves them **once** at
+is the CLI's resolution (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+`OPENCODE_DB`, `OPENCODE_STORAGE_DIR`, `TRAJECTORY_ROOT`, read once at
+construction and stored, including `trajectory_roots`) — and is what a test or
+an embedder with its own layout passes. Nothing on the sync, hydrate or watch
+paths reads the environment afterwards. Whichever way they are resolved, the store resolves them **once** at
 `open` (`SessionStore::roots()`), and `sync`, `hydrate`, `watch` and
 `SourceCapabilities::watch_roots` all read that one value, so a session the
 sweep catalogued is always hydrated from the same tree.

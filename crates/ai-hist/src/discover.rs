@@ -355,6 +355,7 @@ impl<'a> DiscoveryEnv<'a> {
                 grok: grok_home,
                 opencode_db,
                 opencode_storage_dir,
+                trajectory_roots: None,
                 use_env_roots: false,
             },
         )
