@@ -14,20 +14,52 @@ use rusqlite::{Connection, OpenFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// The environment is process-wide, so the tests in this binary take turns.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// An isolated provider home.
+///
+/// `StoreOptions::home` is not enough on its own: a local sweep resolves
+/// each provider root through its override (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, ...), and a runner that sets one would sync a live session
+/// into a test that expects exactly the rows it staged. Every override is
+/// pinned under the temporary home for as long as the `Home` lives.
 struct Home {
     dir: tempfile::TempDir,
+    _env: MutexGuard<'static, ()>,
 }
 
 impl Home {
     fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().unwrap(),
-        }
+        let env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::env::set_var("HOME", home);
+        std::env::set_var("USERPROFILE", home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
+        std::env::set_var("CODEX_HOME", home.join(".codex"));
+        std::env::set_var("GROK_HOME", home.join(".grok"));
+        std::env::set_var(
+            "OPENCODE_DB",
+            home.join(".local/share/opencode/opencode.db"),
+        );
+        std::env::set_var(
+            "OPENCODE_STORAGE_DIR",
+            home.join(".local/share/opencode/storage"),
+        );
+        std::env::set_var("TRAJECTORY_ROOT", home.join(".trajectories"));
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::remove_var("AI_HIST_DB");
+        Self { dir, _env: env }
     }
 
     fn path(&self) -> &Path {

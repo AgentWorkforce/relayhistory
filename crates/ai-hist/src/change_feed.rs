@@ -318,12 +318,19 @@ impl Changes {
         self.consumer.as_deref()
     }
 
-    /// Persist [`Changes::position`] as the consumer's cursor.
+    /// Persist [`Changes::position`] as the consumer's cursor, and return the
+    /// cursor as stored.
     ///
-    /// The cursor moves only here. A consumer that fails mid-drain and never
-    /// commits resumes from its previous commit, not from wherever the drain
-    /// had reached, so a partially applied page is re-read rather than
-    /// skipped. Fails on a read-only store and when no consumer was named.
+    /// The cursor moves only here, and only forward. A consumer that fails
+    /// mid-drain and never commits resumes from its previous commit, not from
+    /// wherever the drain had reached, so a partially applied page is re-read
+    /// rather than skipped. A commit at or below the stored cursor — an
+    /// older drain committing after a newer one, or a replay from an explicit
+    /// watermark under a name that has already moved past it — leaves the
+    /// cursor where it is, so the returned watermark can exceed
+    /// [`Changes::position`]; a consumer that wants to reprocess drains from
+    /// an explicit `from` and does not commit. Fails on a read-only store and
+    /// when no consumer was named.
     pub fn commit(&self) -> Result<Watermark, Error> {
         let Some(name) = &self.consumer else {
             return Err(Error::new(
@@ -338,8 +345,7 @@ impl Changes {
             ));
         }
         let conn = open_db(&self.db_path)?;
-        commit_cursor(&conn, name, self.position).map_err(Error::from_anyhow)?;
-        Ok(self.position)
+        commit_cursor(&conn, name, self.position).map_err(Error::from_anyhow)
     }
 
     fn fill(&mut self) -> Result<()> {
@@ -539,14 +545,21 @@ fn read_cursor(conn: &Connection, name: &str) -> Result<Option<Watermark>> {
     }))
 }
 
-fn commit_cursor(conn: &Connection, name: &str, position: Watermark) -> Result<()> {
-    conn.execute(
+/// Monotonic: the stored cursor is the greater of what it holds and what is
+/// offered, so a stale commit cannot rewind a consumer behind a newer one.
+fn commit_cursor(conn: &Connection, name: &str, position: Watermark) -> Result<Watermark> {
+    let revision: i64 = conn.query_row(
         "INSERT INTO consumer_cursors (name, revision, updated_ms) VALUES (?, ?, ?) \
-         ON CONFLICT(name) DO UPDATE SET revision = excluded.revision, \
-         updated_ms = excluded.updated_ms",
+         ON CONFLICT(name) DO UPDATE SET \
+             revision = MAX(consumer_cursors.revision, excluded.revision), \
+             updated_ms = excluded.updated_ms \
+         RETURNING revision",
         params![name, position.revision as i64, crate::now_ms()],
+        |row| row.get(0),
     )?;
-    Ok(())
+    Ok(Watermark {
+        revision: revision.max(0) as u64,
+    })
 }
 
 fn parse_source(name: &str) -> Result<Source> {
@@ -709,6 +722,18 @@ fn read_tombstones(
 // schema
 // ---------------------------------------------------------------------------
 
+/// The catalog row a consumer receives carries `locations`, which is derived
+/// from `session_presences` rather than stored on `sessions`. A presence
+/// coming or going is therefore a change to the session row as the feed
+/// reports it, and must re-stamp that row even though `sessions` itself was
+/// not written — a subagent cleanup that drops the local presence and keeps
+/// the remote one changes nothing else.
+const PRESENCE_TRIGGERS: &[&str] = &[
+    "change_feed_session_presences_insert",
+    "change_feed_session_presences_update",
+    "change_feed_session_presences_delete",
+];
+
 fn trigger_names(kind: ChangeKind) -> [String; 3] {
     let name = kind.table().name;
     [
@@ -750,6 +775,11 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
             |row| row.get(0),
         )?;
         if !stamped {
+            return Ok(false);
+        }
+    }
+    for trigger in PRESENCE_TRIGGERS {
+        if !object.exists([*trigger])? {
             return Ok(false);
         }
     }
@@ -869,6 +899,40 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
              END;"
         ))?;
     }
+    // A direct write of `revision` does not re-fire the sessions update
+    // trigger (its guard is `NEW.revision = OLD.revision`), so this is one
+    // stamp, not two. A key change is a presence leaving one session and
+    // arriving at another; both rows are stamped.
+    let stamp_session = |row: &str| {
+        format!(
+            "UPDATE observation_clock SET version = version + 1 WHERE singleton = 1;
+             UPDATE sessions SET {REVISION_COLUMN} = \
+                 (SELECT version FROM observation_clock WHERE singleton = 1) \
+                 WHERE source = {row}.source AND session_id = {row}.session_id;"
+        )
+    };
+    let stamp_new = stamp_session("NEW");
+    let stamp_old = stamp_session("OLD");
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS change_feed_session_presences_insert \
+             AFTER INSERT ON session_presences BEGIN
+             {stamp_new}
+         END;
+         CREATE TRIGGER IF NOT EXISTS change_feed_session_presences_update \
+             AFTER UPDATE ON session_presences BEGIN
+             {stamp_new}
+             UPDATE observation_clock SET version = version + 1 WHERE singleton = 1 \
+                 AND (OLD.source IS NOT NEW.source OR OLD.session_id IS NOT NEW.session_id);
+             UPDATE sessions SET {REVISION_COLUMN} = \
+                 (SELECT version FROM observation_clock WHERE singleton = 1) \
+                 WHERE source = OLD.source AND session_id = OLD.session_id \
+                 AND (OLD.source IS NOT NEW.source OR OLD.session_id IS NOT NEW.session_id);
+         END;
+         CREATE TRIGGER IF NOT EXISTS change_feed_session_presences_delete \
+             AFTER DELETE ON session_presences BEGIN
+             {stamp_old}
+         END;"
+    ))?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)",
         [MIGRATION],
@@ -1127,6 +1191,8 @@ mod tests {
             partial.next().unwrap().unwrap();
         }
         assert_eq!(partial.commit().unwrap().revision, 3);
+        // Committing again at the same position is a no-op, not an error.
+        assert_eq!(partial.commit().unwrap().revision, 3);
         let rest = store
             .changes_since(Watermark::CONSUMER, query("a"))
             .unwrap();
@@ -1174,6 +1240,127 @@ mod tests {
         assert!(store
             .changes_since(Watermark::CONSUMER, ChangeQuery::default())
             .is_err());
+    }
+
+    /// The cursor only moves forward. A drain opened earlier that commits
+    /// after a newer one, or an explicit replay from an old watermark under
+    /// a name that has moved past it, cannot rewind the consumer.
+    #[test]
+    fn a_stale_commit_does_not_rewind_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        for index in 0..5 {
+            insert_event(&conn, "s1", &format!("e{index}"), "x");
+        }
+        let query = || ChangeQuery::default().consumer("c");
+
+        // Two drains open against the same cursor; the older one commits
+        // last, at a lower position.
+        let mut older = store.changes_since(Watermark::CONSUMER, query()).unwrap();
+        let mut newer = store.changes_since(Watermark::CONSUMER, query()).unwrap();
+        older.next().unwrap().unwrap();
+        older.next().unwrap().unwrap();
+        while newer.next().is_some() {}
+        assert_eq!(newer.commit().unwrap().revision, 5);
+        assert_eq!(older.position().revision, 2);
+        assert_eq!(
+            older.commit().unwrap().revision,
+            5,
+            "a stale commit reports the cursor as stored, not what it offered"
+        );
+        let stored: i64 = conn
+            .query_row(
+                "SELECT revision FROM consumer_cursors WHERE name = 'c'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 5);
+        assert!(drain(store.changes_since(Watermark::CONSUMER, query()).unwrap()).is_empty());
+
+        // An explicit replay from START under the same name, committed
+        // partway, leaves the cursor alone as well.
+        let mut replay = store.changes_since(Watermark::START, query()).unwrap();
+        replay.next().unwrap().unwrap();
+        assert_eq!(replay.position().revision, 1);
+        assert_eq!(replay.commit().unwrap().revision, 5);
+        assert!(drain(store.changes_since(Watermark::CONSUMER, query()).unwrap()).is_empty());
+
+        // And a genuinely newer commit still moves it.
+        insert_event(&conn, "s1", "e5", "x");
+        let mut next = store.changes_since(Watermark::CONSUMER, query()).unwrap();
+        assert_eq!(next.position().revision, 5);
+        while next.next().is_some() {}
+        assert_eq!(next.commit().unwrap().revision, 6);
+    }
+
+    /// `locations` on a catalog row is derived from `session_presences`, so
+    /// a presence leaving or arriving is a change to the row the consumer
+    /// holds even though `sessions` itself was not written.
+    #[test]
+    fn a_presence_change_re_reports_the_session_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('s1', 'claude')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_presences (source, session_id, location) \
+             VALUES ('claude', 's1', 'local'), ('claude', 's1', 'remote')",
+            [],
+        )
+        .unwrap();
+        let query = || ChangeQuery::default().consumer("c");
+        let mut seen = store.changes_since(Watermark::CONSUMER, query()).unwrap();
+        let mut last = None;
+        for change in seen.by_ref() {
+            last = Some(change.unwrap());
+        }
+        match last.map(|change| change.op) {
+            Some(ChangeOp::Upsert(EvidenceRow::Session(session))) => {
+                assert_eq!(session.locations, vec!["local", "remote"]);
+            }
+            other => panic!("the last change is the row with both presences: {other:?}"),
+        }
+        seen.commit().unwrap();
+
+        // The local presence goes, the session row and the remote presence
+        // stay -- what a subagent cleanup does.
+        conn.execute(
+            "DELETE FROM session_presences WHERE source = 'claude' AND session_id = 's1' \
+             AND location = 'local'",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(Watermark::CONSUMER, query()).unwrap());
+        assert_eq!(delta.len(), 1, "{delta:?}");
+        assert_eq!(delta[0].kind, ChangeKind::Session);
+        assert_eq!(delta[0].record_key, "s1");
+        match &delta[0].op {
+            ChangeOp::Upsert(EvidenceRow::Session(session)) => {
+                assert_eq!(session.locations, vec!["remote"]);
+            }
+            other => panic!("a replacement row, not a tombstone: {other:?}"),
+        }
+
+        // A presence arriving is reported the same way.
+        let head = store.head_revision().unwrap();
+        conn.execute(
+            "INSERT INTO session_presences (source, session_id, location) \
+             VALUES ('claude', 's1', 'local')",
+            [],
+        )
+        .unwrap();
+        let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
+        assert_eq!(delta.len(), 1, "{delta:?}");
+        match &delta[0].op {
+            ChangeOp::Upsert(EvidenceRow::Session(session)) => {
+                assert_eq!(session.locations, vec!["local", "remote"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

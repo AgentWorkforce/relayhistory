@@ -352,7 +352,10 @@ the child, a session leaving the catalog and the cascade under it — leaves a
 tombstone in `evidence_tombstones(kind, source, session_id, record_key,
 revision)`; a later insert of the same key clears it. Every fed table has a
 `(revision)` index and the tombstone table a `(kind, revision)` one, so each
-page of the feed is an indexed range read with no scan and no sort.
+page of the feed is an indexed range read with no scan and no sort. A catalog
+row's `locations` is derived from `session_presences`, so a presence arriving
+or leaving re-stamps its `sessions` row too: a consumer sees the row replaced
+even though nothing wrote `sessions` itself.
 
 `changes_since(from, ChangeQuery { kinds, consumer, batch })` yields
 `Change { kind, source, session_id, record_key, revision, op }` in
@@ -372,12 +375,16 @@ Three rules a consumer must hold:
   the feed in order onto a keyed map reconstructs the tables (modulo rows
   whose tombstones it also applied); `crates/ai-hist/tests/change_feed.rs`
   pins that over the fixture corpus after each of a sequence of syncs.
-- **The cursor moves only on commit.** With `ChangeQuery::consumer` set,
-  `Watermark::CONSUMER` resumes from that consumer's last committed position
-  (`consumer_cursors`, inside the store, so it survives the consumer's own
-  ledger reset), and `Changes::commit()` persists `position()`. A drain that
-  fails partway re-reads from the previous commit rather than skipping what it
-  had reached. Two consumers advance independently.
+- **The cursor moves only on commit, and only forward.** With
+  `ChangeQuery::consumer` set, `Watermark::CONSUMER` resumes from that
+  consumer's last committed position (`consumer_cursors`, inside the store, so
+  it survives the consumer's own ledger reset), and `Changes::commit()`
+  persists `position()` and returns the cursor as stored. A drain that fails
+  partway re-reads from the previous commit rather than skipping what it had
+  reached. A stale commit — an older drain committing after a newer one, or a
+  replay from an explicit watermark under a name that has moved past it —
+  leaves the cursor where it is; a consumer that wants to reprocess drains from
+  an explicit `from` and does not commit. Two consumers advance independently.
 - **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
   and `SyncReport::head_revision` report the head; a stored watermark beyond it
   fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full

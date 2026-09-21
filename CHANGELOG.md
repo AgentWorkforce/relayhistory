@@ -144,7 +144,10 @@ Notable changes to the native `ai-hist` CLI are documented here.
   `Watermark::CONSUMER` with `ChangeQuery::consumer` to resume from the last
   commit, and call `Changes::commit()` to advance — an uncommitted drain
   moves nothing, so a consumer that fails mid-batch resumes from its last
-  commit. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  commit, and the cursor only moves forward, so a stale commit from an older
+  drain cannot rewind it (`commit` returns the cursor as stored). A presence
+  arriving or leaving re-stamps its catalog row, since the row's `locations`
+  is derived from `session_presences`. `SessionStore::head_revision()` and `SyncReport::head_revision`
   report the head; a stored watermark beyond it (the database was reset)
   fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
   `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer
