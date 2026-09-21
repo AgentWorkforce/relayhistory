@@ -8,6 +8,7 @@ import {
   CALIBRATION_CLAMP,
   OFF_CLASS_CALIBRATION_CAP,
   calibrationFactor,
+  offClassScaleFor,
   claudeTranscript,
   codexRollout,
   createRng,
@@ -658,6 +659,48 @@ test("the off-class diagnostics describe what actually happened, and no more", (
     failureFooter(evaluateGate(blown, thresholds, "ci-debug"), thresholds.profiles["ci-debug"]),
     /already widened/,
   );
+});
+
+test("a mixed failure does not blame the widening for the checks it never touched", () => {
+  // One failure past its widened ceiling, one on a bound the widening never
+  // touches. The footer must not tell the reader that re-measuring the machine
+  // class is the answer to a peak-RSS blow-up.
+  const run = offClassRuns["#199 run 35543305734"];
+  const mixed = {
+    ...run,
+    phases: run.phases.map((phase) => {
+      if (phase.phase === "unchanged_sync") return { ...phase, elapsedMs: 1020 };
+      if (phase.phase === "cold_sync") return { ...phase, peakRssBytes: 200_000_000 };
+      return phase;
+    }),
+  };
+  const verdict = evaluateGate(mixed, thresholds, "ci-debug");
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.failures.length, 2, verdict.failures.join("; "));
+  const footer = failureFooter(verdict, thresholds.profiles["ci-debug"]);
+  assert.match(footer, /AMD EPYC 7763/);
+  // It may say it of the check it is true of, by name, and must not say it of
+  // "the failures" as a whole.
+  assert.match(footer, /unchanged_sync\.elapsedMs/);
+  assert.doesNotMatch(footer, /the failures survived/);
+  assert.match(footer, /bounds the widening does not\s+touch/);
+});
+
+test("the exported off-class scale cannot be made to tighten by its own argument", () => {
+  // `evaluateGate` validates the policy, but this helper is exported and
+  // documents a widening-only factor, so it has to hold on its own.
+  assert.equal(offClassScaleFor(3, 0.5), OFF_CLASS_CALIBRATION_CAP);
+  assert.equal(offClassScaleFor(3, -1), OFF_CLASS_CALIBRATION_CAP);
+  assert.equal(offClassScaleFor(3, NaN), OFF_CLASS_CALIBRATION_CAP);
+  assert.equal(offClassScaleFor(3, undefined), OFF_CLASS_CALIBRATION_CAP);
+  assert.equal(offClassScaleFor(1.25, 0.5), 1.25, "a valid ratio is still honoured");
+  assert.equal(offClassScaleFor(0.5), 1, "and a faster machine never tightens");
+  for (const cap of [0, 0.5, -2, NaN, "nonsense", null, undefined]) {
+    for (const raw of [0.25, 1, 1.5, 3, 100]) {
+      assert.ok(offClassScaleFor(raw, cap) >= 1, `raw ${raw} cap ${cap}`);
+    }
+  }
+  assert.equal(offClassScaleFor(3, 4), 3, "a deliberately wider cap is honoured");
 });
 
 test("the off-class banner is not printed when nothing was widened", () => {

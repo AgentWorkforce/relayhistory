@@ -250,16 +250,27 @@ export function failureFooter(verdict, profile) {
   const band = warnings.find((warning) => warning.kind === "calibration-band");
   const machineClass = profile?.measuredOn?.machineClass ?? "another machine class";
   if (unknown) {
-    // Say it only of the checks it is true of. A failure on peak RSS, or a
-    // phase that produced no measurement at all, did not survive any widening
-    // — pointing at the hardware there sends the reader somewhere else.
-    const survivedWidening = (verdict.checks ?? []).some((check) => !check.ok
-      && check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
-    const widened = survivedWidening
-      ? "\nThe bounds above were already widened for that — see the off-class line — and the\n"
-        + "failures survived the widening, so re-measuring the baselines on this machine\n"
-        + "class is the answer if the numbers are simply what this hardware costs.\n"
-      : "";
+    // Say it only of the checks it is true of, and name them. A failure on peak
+    // RSS, or a phase that produced no measurement at all, did not survive any
+    // widening — pointing at the hardware there sends the reader somewhere
+    // else, and it is worse in a mixed failure, where a true sentence about one
+    // check reads as a claim about all of them.
+    const failed = (verdict.checks ?? []).filter((check) => !check.ok);
+    const survived = failed.filter(
+      (check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound,
+    );
+    const named = survived.map((check) => `${check.phase}.${check.metric}`).join(", ");
+    const everyFailure = survived.length === (verdict.failures ?? []).length;
+    const widened = survived.length === 0
+      ? ""
+      : `\n${named} ${survived.length === 1 ? "was" : "were"} already widened for that — see\n`
+        + "the off-class line — and still failed, so re-measuring the baselines on this\n"
+        + "machine class is the answer if those numbers are simply what this hardware\n"
+        + "costs.\n"
+        + (everyFailure
+          ? ""
+          : "The other failures above were checked against bounds the widening does not\n"
+            + "touch, so this does not explain them.\n");
     return "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
       + `${machineClass}, and this run was on ${unknown.cpu}, not one of them. Off that\n`
       + "class a failure here is as likely to be the hardware as the code. Compare against\n"

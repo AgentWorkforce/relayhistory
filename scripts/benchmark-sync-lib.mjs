@@ -412,7 +412,21 @@ export const OFF_CLASS_CALIBRATION_CAP = 2;
  */
 export function offClassScaleFor(raw, cap = OFF_CLASS_CALIBRATION_CAP) {
   if (!Number.isFinite(raw) || raw <= 1) return 1;
-  return Math.min(raw, cap);
+  return Math.min(raw, offClassCap(cap));
+}
+
+/**
+ * A usable off-class cap.
+ *
+ * A cap below 1 would turn the widening into a tightening — the one thing this
+ * must never do — and a non-numeric one would make every bound `NaN`, so
+ * either falls back to the default instead of quietly changing what the gate
+ * means. Both this and `offClassScaleFor` are exported, so neither may depend
+ * on `evaluateGate` having validated the policy first.
+ */
+export function offClassCap(cap) {
+  const configured = Number(cap ?? OFF_CLASS_CALIBRATION_CAP);
+  return Number.isFinite(configured) && configured >= 1 ? configured : OFF_CLASS_CALIBRATION_CAP;
 }
 
 /** Outside this band, the baselines probably came from different hardware. */
@@ -537,13 +551,7 @@ export function evaluateGate(report, thresholds, profileName) {
   // question, so only one of them is ever applied. `policy.calibration:
   // "applied"` already divides every measurement by the reference; doing both
   // would count the same machine twice.
-  // A cap below 1 would turn the widening into a tightening, which is the one
-  // thing this must never do, so a misconfigured one falls back to the default
-  // rather than quietly making the gate stricter off class.
-  const configuredCap = Number(policy.offClassCalibrationCap ?? OFF_CLASS_CALIBRATION_CAP);
-  const cap = Number.isFinite(configuredCap) && configuredCap >= 1
-    ? configuredCap
-    : OFF_CLASS_CALIBRATION_CAP;
+  const cap = offClassCap(policy.offClassCalibrationCap);
   const offClassScale = offClass && !applied ? offClassScaleFor(calibration?.raw, cap) : 1;
   const advisories = [];
   for (const [phaseName, baselines] of Object.entries(profile.phases ?? {})) {
