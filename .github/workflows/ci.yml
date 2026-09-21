@@ -76,6 +76,63 @@ jobs:
       - name: Installed local SDK and CLI smoke test
         run: node scripts/smoke-history-packages.mjs
 
+  # The crate's default-feature surface is what an embedder gets, and Cargo
+  # semver is the only contract it has. The listing is regenerated here and
+  # diffed against crates/ai-hist/public-api.txt, so a change to the surface
+  # is visible in the pull request that makes it, and must come with an
+  # updated snapshot and a `### Rust API` changelog entry. The check also
+  # fails on any `rusqlite` type in the listing: an embedder never holds a
+  # raw connection. See docs/sourcing-sdk.md.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustdoc's JSON output, which cargo-public-api reads, is nightly-only;
+      # the tool itself is built and run on stable and invokes `+nightly` for
+      # the rustdoc step. Nightly first so stable stays the default.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked
+      - name: Public API matches the checked-in snapshot
+        run: node scripts/check-public-api.mjs
+
+  # Nothing in the workspace proves that a crate outside it can consume
+  # ai-hist. examples/rust-consumer is that crate: not a workspace member, its
+  # own lockfile, a crates.io dependency on the default features. Here the
+  # dependency is redirected at this checkout with `[patch.crates-io]`, so a
+  # pull request is checked before the crate is published; the nightly
+  # published-crate-consumer workflow builds the same example against the
+  # crate crates.io actually serves.
+  rust-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Redirect the example's crates.io dependency at this checkout
+        working-directory: examples/rust-consumer
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [patch.crates-io]
+          ai-hist = { path = "${{ github.workspace }}/crates/ai-hist" }
+          EOF
+      - name: Build and run the consumer against the workspace crate
+        working-directory: examples/rust-consumer
+        run: cargo run
+      # A patch Cargo cannot apply is a warning, not an error, and the run
+      # above would then have tested the published crate. The version in
+      # crates/ai-hist must satisfy the example's requirement; the release
+      # script moves the two together.
+      - name: The workspace crate was the one built
+        working-directory: examples/rust-consumer
+        run: |
+          cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+
   msrv:
     runs-on: ubuntu-latest
     steps:

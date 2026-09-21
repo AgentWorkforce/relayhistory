@@ -1,0 +1,322 @@
+pub mod ai_hist
+pub mod ai_hist::project_identity
+pub enum ai_hist::project_identity::ProjectKeyMethod
+pub ai_hist::project_identity::ProjectKeyMethod::Inherited
+pub ai_hist::project_identity::ProjectKeyMethod::PathFallback
+pub ai_hist::project_identity::ProjectKeyMethod::Remote
+impl ai_hist::project_identity::ProjectKeyMethod
+pub fn ai_hist::project_identity::ProjectKeyMethod::as_str(self) -> &'static str
+pub fn ai_hist::project_identity::ProjectKeyMethod::parse(&str) -> core::option::Option<Self>
+pub struct ai_hist::project_identity::ProjectIdentity
+pub ai_hist::project_identity::ProjectIdentity::git_root: core::option::Option<std::path::PathBuf>
+pub ai_hist::project_identity::ProjectIdentity::method: ai_hist::project_identity::ProjectKeyMethod
+pub ai_hist::project_identity::ProjectIdentity::project_key: alloc::string::String
+pub ai_hist::project_identity::ProjectIdentity::repo_url: core::option::Option<alloc::string::String>
+pub struct ai_hist::project_identity::ProjectIdentityResolver
+impl ai_hist::project_identity::ProjectIdentityResolver
+pub fn ai_hist::project_identity::ProjectIdentityResolver::clear(&self)
+pub fn ai_hist::project_identity::ProjectIdentityResolver::new() -> Self
+pub fn ai_hist::project_identity::ProjectIdentityResolver::resolve(&self, &str) -> ai_hist::project_identity::ProjectIdentity
+pub fn ai_hist::project_identity::begin_acquisition_pass()
+pub fn ai_hist::project_identity::canonicalize_remote_url(&str) -> core::option::Option<alloc::string::String>
+pub fn ai_hist::project_identity::identity_for(core::option::Option<&str>, core::option::Option<&str>) -> core::option::Option<(alloc::string::String, ai_hist::project_identity::ProjectKeyMethod)>
+pub fn ai_hist::project_identity::origin_remote_url(&std::path::Path) -> core::option::Option<alloc::string::String>
+pub fn ai_hist::project_identity::parse_git_config(&str) -> ai_hist::project_identity::GitConfig
+pub fn ai_hist::project_identity::project_identity(&std::path::Path) -> ai_hist::project_identity::ProjectIdentity
+pub fn ai_hist::project_identity::resolve_project_identity(&str) -> ai_hist::project_identity::ProjectIdentity
+pub type ai_hist::project_identity::GitConfig = std::collections::hash::map::HashMap<alloc::string::String, std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>>
+pub enum ai_hist::EvidenceKind
+pub ai_hist::EvidenceKind::CommitLink
+pub ai_hist::EvidenceKind::FileEdit
+pub ai_hist::EvidenceKind::History
+pub ai_hist::EvidenceKind::Relationship
+pub ai_hist::EvidenceKind::SessionEvent
+pub ai_hist::EvidenceKind::SessionMarker
+pub ai_hist::EvidenceKind::ToolCall
+impl ai_hist::EvidenceKind
+pub fn ai_hist::EvidenceKind::as_str(self) -> &'static str
+#[non_exhaustive] pub enum ai_hist::RequestKeySource
+pub ai_hist::RequestKeySource::ProviderMessageId
+pub ai_hist::RequestKeySource::RecordId
+pub ai_hist::RequestKeySource::RequestId
+pub ai_hist::RequestKeySource::RequestSpan
+impl ai_hist::RequestKeySource
+pub fn ai_hist::RequestKeySource::as_str(self) -> &'static str
+pub fn ai_hist::RequestKeySource::is_request_identity(self) -> bool
+pub fn ai_hist::RequestKeySource::parse(&str) -> core::option::Option<Self>
+pub enum ai_hist::SessionLocation
+pub ai_hist::SessionLocation::Local
+pub ai_hist::SessionLocation::Remote
+impl ai_hist::SessionLocation
+pub fn ai_hist::SessionLocation::as_str(self) -> &'static str
+#[non_exhaustive] pub enum ai_hist::SessionRef
+pub ai_hist::SessionRef::Id
+pub ai_hist::SessionRef::Id::session_id: alloc::string::String
+pub ai_hist::SessionRef::Id::source: ai_hist::Source
+pub ai_hist::SessionRef::Path
+pub ai_hist::SessionRef::Path::path: std::path::PathBuf
+pub ai_hist::SessionRef::Path::source: ai_hist::Source
+pub enum ai_hist::SessionScope
+pub ai_hist::SessionScope::All
+pub ai_hist::SessionScope::Local
+pub ai_hist::SessionScope::Remote
+#[non_exhaustive] pub enum ai_hist::Source
+pub ai_hist::Source::Claude
+pub ai_hist::Source::Codex
+pub ai_hist::Source::Cursor
+pub ai_hist::Source::Grok
+pub ai_hist::Source::OpenCode
+pub ai_hist::Source::Relay
+pub ai_hist::Source::Trajectory
+impl ai_hist::Source
+pub fn ai_hist::Source::as_str(self) -> &'static str
+#[non_exhaustive] pub enum ai_hist::UsageAccounting
+pub ai_hist::UsageAccounting::ContextProxy
+pub ai_hist::UsageAccounting::CumulativeDelta
+pub ai_hist::UsageAccounting::PerMessage
+pub ai_hist::UsageAccounting::PerRequest
+impl ai_hist::UsageAccounting
+pub fn ai_hist::UsageAccounting::as_str(self) -> &'static str
+pub fn ai_hist::UsageAccounting::parse(&str) -> core::option::Option<Self>
+impl core::fmt::Display for ai_hist::UsageAccounting
+pub fn ai_hist::UsageAccounting::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum ai_hist::UsageDiagnostic
+pub ai_hist::UsageDiagnostic::AmbiguousModel
+pub ai_hist::UsageDiagnostic::AmbiguousProvider
+pub ai_hist::UsageDiagnostic::AmbiguousUsageCopies
+pub ai_hist::UsageDiagnostic::PartialCacheWriteSplit
+pub ai_hist::UsageDiagnostic::PartialReportedCost
+pub ai_hist::UsageDiagnostic::UnnormalizableUsage
+pub ai_hist::UsageDiagnostic::UnresolvedRequestIdentity
+impl ai_hist::UsageDiagnostic
+pub fn ai_hist::UsageDiagnostic::as_str(self) -> &'static str
+#[non_exhaustive] pub enum ai_hist::UsageError
+pub ai_hist::UsageError::CounterOverflow
+pub ai_hist::UsageError::CounterOverflow::field: &'static str
+pub ai_hist::UsageError::CounterRegressed
+pub ai_hist::UsageError::CounterRegressed::field: &'static str
+pub ai_hist::UsageError::CounterRegressed::subtracted: u64
+pub ai_hist::UsageError::CounterRegressed::value: u64
+pub ai_hist::UsageError::InvalidCost
+pub ai_hist::UsageError::InvalidCost::value: alloc::string::String
+pub ai_hist::UsageError::Malformed
+pub ai_hist::UsageError::Malformed::detail: alloc::string::String
+pub ai_hist::UsageError::NonIntegerCounter
+pub ai_hist::UsageError::NonIntegerCounter::field: &'static str
+pub ai_hist::UsageError::NonIntegerCounter::value: alloc::string::String
+pub ai_hist::UsageError::NotAnObject
+pub ai_hist::UsageError::UnknownSource
+pub ai_hist::UsageError::UnknownSource::source: alloc::string::String
+impl ai_hist::UsageError
+pub fn ai_hist::UsageError::code(&self) -> &'static str
+impl core::error::Error for ai_hist::UsageError
+impl core::fmt::Display for ai_hist::UsageError
+pub fn ai_hist::UsageError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct ai_hist::Error
+impl core::convert::From<anyhow::Error> for ai_hist::Error
+pub fn ai_hist::Error::from(anyhow::Error) -> Self
+impl core::error::Error for ai_hist::Error
+impl core::fmt::Display for ai_hist::Error
+pub fn ai_hist::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ai_hist::EvidenceRecord
+pub ai_hist::EvidenceRecord::kind: ai_hist::EvidenceKind
+pub ai_hist::EvidenceRecord::payload: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub ai_hist::EvidenceRecord::record_id: core::option::Option<alloc::string::String>
+pub ai_hist::EvidenceRecord::revision_id: core::option::Option<alloc::string::String>
+impl ai_hist::EvidenceRecord
+pub fn ai_hist::EvidenceRecord::identity(&self) -> alloc::string::String
+pub struct ai_hist::HistoryEntry
+pub ai_hist::HistoryEntry::id: i64
+pub ai_hist::HistoryEntry::project: core::option::Option<alloc::string::String>
+pub ai_hist::HistoryEntry::prompt: alloc::string::String
+pub ai_hist::HistoryEntry::prompt_hash: core::option::Option<alloc::string::String>
+pub ai_hist::HistoryEntry::session_id: core::option::Option<alloc::string::String>
+pub ai_hist::HistoryEntry::source: alloc::string::String
+pub ai_hist::HistoryEntry::timestamp_ms: i64
+#[non_exhaustive] pub struct ai_hist::NormalizedUsage
+pub ai_hist::NormalizedUsage::accounting: ai_hist::UsageAccounting
+pub ai_hist::NormalizedUsage::cache_read_tokens: u64
+pub ai_hist::NormalizedUsage::cache_write_1h_tokens: core::option::Option<u64>
+pub ai_hist::NormalizedUsage::cache_write_5m_tokens: core::option::Option<u64>
+pub ai_hist::NormalizedUsage::cache_write_tokens: u64
+pub ai_hist::NormalizedUsage::coverage: ai_hist::UsageCoverage
+pub ai_hist::NormalizedUsage::input_tokens: u64
+pub ai_hist::NormalizedUsage::output_tokens: u64
+pub ai_hist::NormalizedUsage::provider_total_tokens: core::option::Option<u64>
+pub ai_hist::NormalizedUsage::reasoning_tokens: core::option::Option<u64>
+pub ai_hist::NormalizedUsage::reported_cost_usd: core::option::Option<f64>
+impl ai_hist::NormalizedUsage
+pub fn ai_hist::NormalizedUsage::checked_add(&self, &Self) -> core::option::Option<Self>
+pub fn ai_hist::NormalizedUsage::is_zero(&self) -> bool
+pub struct ai_hist::SessionEvent
+pub ai_hist::SessionEvent::agent_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::agent_version: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::call_index: core::option::Option<i64>
+pub ai_hist::SessionEvent::cwd: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::error_signal: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::event_index: core::option::Option<i64>
+pub ai_hist::SessionEvent::event_source: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::event_uid: alloc::string::String
+pub ai_hist::SessionEvent::git_branch: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::id: i64
+pub ai_hist::SessionEvent::is_meta: core::option::Option<i64>
+pub ai_hist::SessionEvent::is_sidechain: core::option::Option<i64>
+pub ai_hist::SessionEvent::kind: alloc::string::String
+pub ai_hist::SessionEvent::message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::model: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::parent_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::payload_bytes: core::option::Option<i64>
+pub ai_hist::SessionEvent::payload_hash: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::payload_truncated: core::option::Option<i64>
+pub ai_hist::SessionEvent::project: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::project_key: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::provider: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::provider_message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::raw_kind: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::request_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::request_span: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::result_status: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::role: alloc::string::String
+pub ai_hist::SessionEvent::session_id: alloc::string::String
+pub ai_hist::SessionEvent::source: alloc::string::String
+pub ai_hist::SessionEvent::stop_reason: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::subagent_session_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::text: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::token_json: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::tool_use_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::ts_ms: i64
+pub ai_hist::SessionEvent::turn_id: core::option::Option<alloc::string::String>
+pub struct ai_hist::SessionEventCursor
+pub ai_hist::SessionEventCursor::id: i64
+pub ai_hist::SessionEventCursor::ts_ms: i64
+pub struct ai_hist::SessionEvidenceCursor
+pub ai_hist::SessionEvidenceCursor::id: i64
+pub ai_hist::SessionEvidenceCursor::ts_ms: core::option::Option<i64>
+pub struct ai_hist::SessionFileEdit
+pub ai_hist::SessionFileEdit::cwd: core::option::Option<alloc::string::String>
+pub ai_hist::SessionFileEdit::file_path: alloc::string::String
+pub ai_hist::SessionFileEdit::git_branch: core::option::Option<alloc::string::String>
+pub ai_hist::SessionFileEdit::id: i64
+pub ai_hist::SessionFileEdit::lines_added: core::option::Option<i64>
+pub ai_hist::SessionFileEdit::lines_removed: core::option::Option<i64>
+pub ai_hist::SessionFileEdit::message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionFileEdit::session_id: alloc::string::String
+pub ai_hist::SessionFileEdit::source: alloc::string::String
+pub ai_hist::SessionFileEdit::structured_patch_json: core::option::Option<alloc::string::String>
+pub ai_hist::SessionFileEdit::tool_name: core::option::Option<alloc::string::String>
+pub ai_hist::SessionFileEdit::tool_use_id: alloc::string::String
+pub ai_hist::SessionFileEdit::ts_ms: core::option::Option<i64>
+pub ai_hist::SessionFileEdit::user_modified: core::option::Option<i64>
+pub struct ai_hist::SessionMarker
+pub ai_hist::SessionMarker::id: i64
+pub ai_hist::SessionMarker::kind: alloc::string::String
+pub ai_hist::SessionMarker::marker_uid: alloc::string::String
+pub ai_hist::SessionMarker::message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionMarker::parent_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionMarker::payload_json: core::option::Option<alloc::string::String>
+pub ai_hist::SessionMarker::session_id: alloc::string::String
+pub ai_hist::SessionMarker::source: alloc::string::String
+pub ai_hist::SessionMarker::subkind: core::option::Option<alloc::string::String>
+pub ai_hist::SessionMarker::text: core::option::Option<alloc::string::String>
+pub ai_hist::SessionMarker::ts_ms: core::option::Option<i64>
+pub ai_hist::SessionMarker::turn_id: core::option::Option<alloc::string::String>
+pub struct ai_hist::SessionMarkerPage
+pub ai_hist::SessionMarkerPage::markers: alloc::vec::Vec<ai_hist::SessionMarker>
+pub ai_hist::SessionMarkerPage::next_cursor: core::option::Option<ai_hist::SessionEvidenceCursor>
+#[non_exhaustive] pub struct ai_hist::SessionRequest
+pub ai_hist::SessionRequest::diagnostics: alloc::vec::Vec<ai_hist::UsageDiagnostic>
+pub ai_hist::SessionRequest::event_count: i64
+pub ai_hist::SessionRequest::first_ts_ms: i64
+pub ai_hist::SessionRequest::has_thinking: bool
+pub ai_hist::SessionRequest::id: i64
+pub ai_hist::SessionRequest::last_ts_ms: i64
+pub ai_hist::SessionRequest::message_ids: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::SessionRequest::model: core::option::Option<alloc::string::String>
+pub ai_hist::SessionRequest::provider: core::option::Option<alloc::string::String>
+pub ai_hist::SessionRequest::request_key: alloc::string::String
+pub ai_hist::SessionRequest::request_key_source: ai_hist::RequestKeySource
+pub ai_hist::SessionRequest::session_id: alloc::string::String
+pub ai_hist::SessionRequest::source: alloc::string::String
+pub ai_hist::SessionRequest::tool_use_ids: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::SessionRequest::usage: core::option::Option<ai_hist::NormalizedUsage>
+pub ai_hist::SessionRequest::usage_error: core::option::Option<alloc::string::String>
+pub struct ai_hist::SessionRequestCursor
+pub ai_hist::SessionRequestCursor::id: i64
+pub ai_hist::SessionRequestCursor::ts_ms: i64
+pub struct ai_hist::SessionRequestPage
+pub ai_hist::SessionRequestPage::next_cursor: core::option::Option<ai_hist::SessionRequestCursor>
+pub ai_hist::SessionRequestPage::requests: alloc::vec::Vec<ai_hist::SessionRequest>
+pub struct ai_hist::SessionStore
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::open(ai_hist::StoreOptions) -> core::result::Result<Self, ai_hist::Error>
+pub fn ai_hist::SessionStore::session_markers_page(&self, ai_hist::Source, &str, i64, core::option::Option<&ai_hist::SessionEvidenceCursor>) -> core::result::Result<ai_hist::SessionMarkerPage, ai_hist::Error>
+pub fn ai_hist::SessionStore::session_requests_page(&self, ai_hist::Source, &str, i64, core::option::Option<&ai_hist::SessionRequestCursor>) -> core::result::Result<ai_hist::SessionRequestPage, ai_hist::Error>
+pub fn ai_hist::SessionStore::session_usage(&self, ai_hist::Source, &str) -> core::result::Result<core::option::Option<ai_hist::SessionUsageSummary>, ai_hist::Error>
+pub fn ai_hist::SessionStore::session_user_turns_page(&self, ai_hist::Source, &str, i64, core::option::Option<&ai_hist::SessionEventCursor>) -> core::result::Result<ai_hist::SessionUserTurnPage, ai_hist::Error>
+pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
+pub struct ai_hist::SessionToolCall
+pub ai_hist::SessionToolCall::args_json: core::option::Option<alloc::string::String>
+pub ai_hist::SessionToolCall::id: i64
+pub ai_hist::SessionToolCall::is_error: core::option::Option<i64>
+pub ai_hist::SessionToolCall::message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionToolCall::name: alloc::string::String
+pub ai_hist::SessionToolCall::session_id: alloc::string::String
+pub ai_hist::SessionToolCall::source: alloc::string::String
+pub ai_hist::SessionToolCall::target: core::option::Option<alloc::string::String>
+pub ai_hist::SessionToolCall::tool_use_id: alloc::string::String
+pub ai_hist::SessionToolCall::ts_ms: core::option::Option<i64>
+#[non_exhaustive] pub struct ai_hist::SessionUsageSummary
+pub ai_hist::SessionUsageSummary::accounting: alloc::vec::Vec<ai_hist::UsageAccounting>
+pub ai_hist::SessionUsageSummary::diagnostics: alloc::vec::Vec<ai_hist::UsageDiagnostic>
+pub ai_hist::SessionUsageSummary::first_ts_ms: i64
+pub ai_hist::SessionUsageSummary::last_ts_ms: i64
+pub ai_hist::SessionUsageSummary::models: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::SessionUsageSummary::overflowed: bool
+pub ai_hist::SessionUsageSummary::request_count: u64
+pub ai_hist::SessionUsageSummary::session_id: alloc::string::String
+pub ai_hist::SessionUsageSummary::source: alloc::string::String
+pub ai_hist::SessionUsageSummary::total_request_count: u64
+pub ai_hist::SessionUsageSummary::usage: core::option::Option<ai_hist::NormalizedUsage>
+pub struct ai_hist::SessionUserTurn
+pub ai_hist::SessionUserTurn::blocks: alloc::vec::Vec<ai_hist::SessionUserTurnBlock>
+pub ai_hist::SessionUserTurn::following_message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionUserTurn::id: i64
+pub ai_hist::SessionUserTurn::message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionUserTurn::preceding_message_id: core::option::Option<alloc::string::String>
+pub ai_hist::SessionUserTurn::session_id: alloc::string::String
+pub ai_hist::SessionUserTurn::source: alloc::string::String
+pub ai_hist::SessionUserTurn::ts_ms: i64
+pub struct ai_hist::SessionUserTurnBlock
+pub ai_hist::SessionUserTurnBlock::byte_len: i64
+pub ai_hist::SessionUserTurnBlock::is_error: core::option::Option<i64>
+pub ai_hist::SessionUserTurnBlock::kind: alloc::string::String
+pub ai_hist::SessionUserTurnBlock::tool_use_id: core::option::Option<alloc::string::String>
+pub struct ai_hist::SessionUserTurnPage
+pub ai_hist::SessionUserTurnPage::next_cursor: core::option::Option<ai_hist::SessionEventCursor>
+pub ai_hist::SessionUserTurnPage::user_turns: alloc::vec::Vec<ai_hist::SessionUserTurn>
+#[non_exhaustive] pub struct ai_hist::StoreOptions
+pub ai_hist::StoreOptions::db_path: core::option::Option<std::path::PathBuf>
+pub ai_hist::StoreOptions::home: core::option::Option<std::path::PathBuf>
+pub ai_hist::StoreOptions::read_only: bool
+#[non_exhaustive] pub struct ai_hist::SyncOptions
+#[non_exhaustive] pub struct ai_hist::SyncReport
+pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
+pub struct ai_hist::UsageCoverage
+pub ai_hist::UsageCoverage::has_cache_read_tokens: bool
+pub ai_hist::UsageCoverage::has_cache_write_tokens: bool
+pub ai_hist::UsageCoverage::has_input_tokens: bool
+pub ai_hist::UsageCoverage::has_output_tokens: bool
+pub ai_hist::UsageCoverage::has_reasoning_tokens: bool
+impl ai_hist::UsageCoverage
+pub fn ai_hist::UsageCoverage::is_complete(&self) -> bool
+pub const ai_hist::FULL_SESSION_KINDS: &[ai_hist::EvidenceKind]
+pub const ai_hist::NORMALIZABLE_SOURCES: &[&str]
+pub const ai_hist::PARSED_SESSION_KINDS: &[ai_hist::EvidenceKind]
+pub const ai_hist::SESSION_USAGE_CONTRACT_VERSION: u32
+pub fn ai_hist::attribute_usage_to_prompts(&[ai_hist::SessionEvent], &str) -> std::collections::hash::map::HashMap<ai_hist::PromptKey, ai_hist::NormalizedUsage>
+pub fn ai_hist::declared_evidence_kinds(&str) -> &'static [ai_hist::EvidenceKind]
+pub fn ai_hist::missing_evidence_kinds(&str) -> alloc::vec::Vec<ai_hist::EvidenceKind>
+pub fn ai_hist::normalize_usage(&str, &serde_json::value::Value) -> core::result::Result<core::option::Option<ai_hist::NormalizedUsage>, ai_hist::UsageError>
+pub fn ai_hist::normalize_usage_str(&str, &str) -> core::result::Result<core::option::Option<ai_hist::NormalizedUsage>, ai_hist::UsageError>
+pub fn ai_hist::source_accounting(&str) -> core::option::Option<ai_hist::UsageAccounting>
+pub type ai_hist::PromptKey = (i64, alloc::string::String)

@@ -127,6 +127,27 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Document and prove the embedder surface. `docs/sourcing-sdk.md` is the guide
+  for a Rust consumer of the published crate — `StoreOptions` resolution and
+  the provider-root overrides, the sync lock and what a concurrent
+  `ai-hist sync` does to an embedder's `sync`, one section per evidence struct
+  with a per-source population table checked against
+  `declared_evidence_kinds` by `tests/sourcing_sdk_doc.rs`, accounting
+  semantics, the change-feed and facade items still to land as marked target
+  contract, the semver policy, feature flags, the never-list, and which in-tree
+  call sites still need `unstable-internal`. `examples/rust-consumer` is a
+  standalone Cargo project outside the workspace that depends on `ai-hist` from
+  crates.io, stages the fixture corpus into a throwaway `HOME`, syncs, and
+  prints per-session usage totals by model; CI builds it with
+  `[patch.crates-io]` at the checkout on every pull request and nightly against
+  the published crate. `crates/ai-hist/public-api.txt` snapshots the
+  default-feature public API; `node scripts/check-public-api.mjs` diffs it in
+  CI and rejects any `rusqlite` type in it. `EvidenceRecord::{exists,
+  matches_canonical, remove, write}` — the four methods that took a raw
+  `rusqlite::Connection` on the default features — are crate-private now; they
+  had no caller outside the crate, and they were the only `rusqlite` types in
+  the surface. `scripts/set-release-version.mjs` stamps the example's
+  dependency and lock entry so a release keeps both CI variants honest.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

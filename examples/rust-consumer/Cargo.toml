@@ -1,0 +1,25 @@
+# A standalone consumer of the published `ai-hist` crate.
+#
+# Deliberately NOT a member of the repository workspace (see `exclude` in the
+# root Cargo.toml and the empty `[workspace]` below): the point is to build
+# the way an embedder outside this tree builds — against crates.io, on the
+# crate's default features, with its own lockfile. CI additionally builds it
+# with `[patch.crates-io]` pointing at `../../crates/ai-hist` so a pull request
+# is checked before the crate is published; see `docs/sourcing-sdk.md`.
+[package]
+name = "relayhistory-rust-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+rust-version = "1.88"
+description = "Smoke test: an out-of-tree embedder of the ai-hist crate"
+
+[workspace]
+
+[dependencies]
+# Bumped by hand after each crates.io release, together with Cargo.lock; the
+# nightly published-crate job (`.github/workflows/published-crate-consumer.yml`)
+# is what notices when a release does not build for an embedder.
+ai-hist = "0.24.0"
+serde_json = "1"
+tempfile = "3"

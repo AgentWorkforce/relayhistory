@@ -444,6 +444,11 @@ impl EvidenceRecord {
     /// Whether the canonical row still equals this adapter-owned projection.
     /// Local ingestion can write directly; a changed value revokes remote ownership.
     ///
+    /// Crate-private, like the three writes below: each takes a raw
+    /// `rusqlite::Connection`, and an embedder on the default features never
+    /// holds one. Exporting them put `rusqlite` in the crate's public API,
+    /// which `crates/ai-hist/public-api.txt` now forbids.
+    ///
     /// [`Spec::derived`] columns are left out of the comparison. They are
     /// rewritten by `refresh_project_identity` in the same transaction that
     /// stores the snapshot they are compared against, so including them makes
@@ -453,7 +458,7 @@ impl EvidenceRecord {
     /// row it no longer owns. The fields still travel in the record, because a
     /// snapshot should round-trip what the emitting side knew; they are simply
     /// not evidence about who owns the row.
-    pub fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
+    pub(crate) fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
         let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
@@ -472,7 +477,7 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
-    pub fn exists(&self, conn: &Connection) -> Result<bool> {
+    pub(crate) fn exists(&self, conn: &Connection) -> Result<bool> {
         let (condition, values) = self.key_sql();
         Ok(conn.query_row(
             &format!(
@@ -483,7 +488,7 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
-    pub fn remove(&self, conn: &Connection) -> Result<()> {
+    pub(crate) fn remove(&self, conn: &Connection) -> Result<()> {
         let (condition, values) = self.key_sql();
         conn.execute(
             &format!("DELETE FROM {} WHERE {condition}", self.kind.spec().table),
@@ -491,7 +496,7 @@ impl EvidenceRecord {
         )?;
         Ok(())
     }
-    pub fn write(&self, conn: &Connection) -> Result<()> {
+    pub(crate) fn write(&self, conn: &Connection) -> Result<()> {
         let spec = self.kind.spec();
         let columns = spec.columns.split(',').collect::<Vec<_>>();
         let values = columns
