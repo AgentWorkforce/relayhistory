@@ -5,6 +5,7 @@
 #![deny(clippy::all)]
 
 pub mod delivery;
+pub mod session_store;
 pub mod sources;
 
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ use ai_hist::{
     SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
 };
 use napi_derive::napi;
+use serde::Serialize;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
 /// 16 added `project_key` to catalog rows and session events, plus
@@ -54,7 +56,11 @@ use napi_derive::napi;
 /// 18 was claimed independently by the upstream `provider` field and the
 /// per-request usage surface. The merged addon exposes both shapes, so it is
 /// 19 rather than identifying itself as either incompatible contract 18.
-pub const NATIVE_CONTRACT_VERSION: u32 = 19;
+/// 20 adds the `sessionStoreCall` JSON dispatcher over the `SessionStore`
+/// facade (markers, requests, usage summary, user turns, source
+/// capabilities) and moves the SDK's request, usage and user-turn reads onto
+/// it. The typed functions those reads used stay exported for compatibility.
+pub const NATIVE_CONTRACT_VERSION: u32 = 20;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -359,6 +365,8 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventCursor {
     pub ts_ms: i64,
     pub id: i64,
@@ -458,6 +466,8 @@ impl From<CoreSessionFileEdit> for NativeSessionFileEdit {
 /// explicit JavaScript `null` cannot be converted to `i64` and fails at the
 /// boundary, so the SDK normalizes `null` to `undefined` before calling in.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvidenceCursor {
     pub ts_ms: Option<i64>,
     pub id: i64,
@@ -471,6 +481,8 @@ pub struct EvidencePageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionUserTurnBlock {
     /// `text` or `tool_result`.
     pub kind: String,
@@ -495,6 +507,8 @@ impl From<CoreSessionUserTurnBlock> for NativeSessionUserTurnBlock {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionUserTurn {
     pub id: i64,
     pub source: String,
@@ -537,6 +551,8 @@ pub struct UserTurnsPageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUserTurnsPage {
     pub contract_version: u32,
     pub source: String,
@@ -569,6 +585,8 @@ pub struct SessionFileEditsPage {
 /// provider did not report that counter, which is a different fact from a
 /// reported zero and the only thing that makes `coverage` interpretable.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeNormalizedUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -576,8 +594,10 @@ pub struct NativeNormalizedUsage {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     #[napi(js_name = "cacheWrite5mTokens")]
+    #[serde(rename = "cacheWrite5mTokens")]
     pub cache_write5m_tokens: Option<i64>,
     #[napi(js_name = "cacheWrite1hTokens")]
+    #[serde(rename = "cacheWrite1hTokens")]
     pub cache_write1h_tokens: Option<i64>,
     pub provider_total_tokens: Option<i64>,
     pub reported_cost_usd: Option<f64>,
@@ -647,6 +667,8 @@ impl NativeNormalizedUsage {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSessionRequest {
     pub id: i64,
     pub source: String,
@@ -710,6 +732,8 @@ impl From<CoreSessionRequest> for NativeSessionRequest {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestCursor {
     pub ts_ms: i64,
     pub id: i64,
@@ -723,6 +747,8 @@ pub struct RequestPageOptions {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRequestsPage {
     pub contract_version: u32,
     pub source: String,
@@ -739,6 +765,8 @@ pub struct SessionUsageOptions {
 /// One session's usage rollup. `usage` is absent when the session has no
 /// usage evidence at all — not zeroed, because zero is a claim.
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionUsage {
     pub contract_version: u32,
     pub source: String,
@@ -1777,6 +1805,8 @@ impl From<CoreSessionRelationship> for NativeSessionRelationship {
 }
 
 #[napi(object)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeRelationshipCapabilities {
     pub source: String,
     pub stable_child_identity: String,

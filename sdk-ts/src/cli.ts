@@ -7,10 +7,11 @@ import { pathToFileURL } from 'node:url';
 
 import {
   discoverSessions, ensureLocalStore, formatSessionRow, getSession, getSessionEventsPage, getSessionFileEditsPage,
-  getSessionRelationships, getSessionToolCallsPage, getSessionTree, hydrateSession,
-  listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
+  hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
-  type SessionFileEditsPage, type SessionRelationship, type SessionScope, type SessionToolCallsPage,
+  type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
+  type SessionToolCallsPage, type SessionUsage,
 } from './index.js';
 import { runDeliveryCommand, runHistoryExportCommand, loadHistoryApplicationConfig } from './delivery-cli.js';
 
@@ -215,7 +216,7 @@ function snakeCase(key: string): string {
 
 // Parsed provider payloads are data, not RelayHistory field names: their own
 // keys must reach stdout exactly as the provider wrote them.
-const OPAQUE_JSON_KEYS = new Set(['args', 'structuredPatch']);
+const OPAQUE_JSON_KEYS = new Set(['args', 'structuredPatch', 'payload']);
 
 function wireValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(wireValue);
@@ -261,6 +262,8 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions tree SOURCE SESSION_ID [--max-depth N] [--max-nodes N] [--db PATH] [--json]
   ai-hist sessions tools SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
+  ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
   ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--limit N] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
@@ -379,6 +382,47 @@ function outputFileEdits(io: CliIo, page: SessionFileEditsPage, json: boolean): 
     ].join('  ').concat('\n'));
   }
   continuationNotice(io, page.nextCursor);
+}
+
+function outputMarkers(io: CliIo, page: SessionMarkersPage, json: boolean): void {
+  if (json) {
+    output(io, page, true);
+    return;
+  }
+  if (page.markers.length === 0) {
+    io.stdout('No markers.\n');
+    return;
+  }
+  for (const marker of page.markers) {
+    io.stdout([
+      marker.tsMs ?? '-', marker.source, marker.kind, marker.subkind ?? '-',
+      marker.messageId ?? '-', marker.text ?? '-',
+    ].join('  ').concat('\n'));
+  }
+  continuationNotice(io, page.nextCursor);
+}
+
+// Usage is provider-reported and never estimated here: an absent total is
+// printed as absent, and cost appears only when the source data carried one.
+function outputUsage(io: CliIo, value: SessionUsage, json: boolean): void {
+  if (json) {
+    output(io, value, true);
+    return;
+  }
+  io.stdout(`${value.source}/${value.sessionId}: ${value.requestCount} of ${value.totalRequestCount} request(s) with usage\n`);
+  if (value.usage) {
+    const usage = value.usage;
+    io.stdout(
+      `tokens: input=${usage.inputTokens} output=${usage.outputTokens}` +
+      ` cache_read=${usage.cacheReadTokens} cache_write=${usage.cacheWriteTokens}` +
+      ` reasoning=${usage.reasoningTokens ?? '-'} provider_total=${usage.providerTotalTokens ?? '-'}\n`,
+    );
+    io.stdout(`accounting: ${usage.accounting}; reported cost: ${usage.reportedCostUsd ?? 'none'}\n`);
+  } else {
+    io.stdout(`tokens: none established${value.overflowed ? ' (overflowed)' : ''}\n`);
+  }
+  if (value.models.length) io.stdout(`models: ${value.models.join(', ')}\n`);
+  for (const diagnostic of value.diagnostics) io.stdout(`diagnostic: ${diagnostic}\n`);
 }
 
 function outputHydration(io: CliIo, value: Awaited<ReturnType<typeof hydrateSession>>, json: boolean): void {
@@ -765,6 +809,12 @@ export const COMMANDS = new Map<string, CommandSpec>([
   ['sessions edits', { name: 'sessions edits', description: 'Page through a session\'s file edits.',
     surface: ['edits'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
     requires: 'sessions edits requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
+  ['sessions markers', { name: 'sessions markers', description: 'Page through a session\'s markers: compaction and summary boundaries, provider system rows, non-text blocks.',
+    surface: ['markers'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
+    requires: 'sessions markers requires SOURCE and SESSION_ID', allowed: ['after', 'db', 'json', 'limit'] }],
+  ['sessions usage', { name: 'sessions usage', description: 'Provider-reported token usage rollup for a session; cost is never computed.',
+    surface: ['usage'], positionals: [2, 2], args: [{ name: 'source', description: 'Coding-agent source, e.g. claude or codex.', required: true }, { name: 'session-id', description: 'Session identifier.', required: true }], readsLocalStore: true,
+    requires: 'sessions usage requires SOURCE and SESSION_ID', allowed: ['db', 'json'] }],
   ['search', { name: 'search', description: 'Search indexed prompts.', surface: ['search'],
     positionals: [1, null], args: [{ name: 'query', description: 'Search terms.', required: true, variadic: true }],
     requires: 'search requires a query', readsLocalStore: true,
@@ -1049,6 +1099,16 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     } else {
       outputFileEdits(io, await getSessionFileEditsPage(sessionSource as never, sessionId!, options), json);
     }
+    return 0;
+  }
+  if (command === 'sessions' && subcommand === 'markers') {
+    outputMarkers(io, await getSessionMarkersPage(sessionSource as never, sessionId!, {
+      dbPath: textFlag(args, 'db'), limit: numberFlag(args, 'limit'), after: evidenceCursorFlag(args),
+    }), json);
+    return 0;
+  }
+  if (command === 'sessions' && subcommand === 'usage') {
+    outputUsage(io, await getSessionUsage(sessionSource as never, sessionId!, { dbPath: textFlag(args, 'db') }), json);
     return 0;
   }
   if (command === 'search') {

@@ -89,12 +89,12 @@ ai-hist search "auth rewrite" --all    # search both at once
 Commands that address one session by identity do not take a scope, and reject one rather than guessing — they already name a single session. They split by how they take that identity:
 
 ```sh
-ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits
+ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits, markers, usage
 ai-hist session SESSION_ID [--source SOURCE]   # session and events take the id alone
 ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused id
 ```
 
-`sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
+`sessions tree`, `sessions relationships`, `sessions tools`, `sessions edits`, `sessions markers` and `sessions usage` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
 Optional: install `@relayhistory/capture` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
 

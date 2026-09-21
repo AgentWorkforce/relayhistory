@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 19;
+export const NATIVE_CONTRACT_VERSION = 20;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
@@ -35,6 +35,7 @@ interface NativeBinding {
   linkGitCommit(optionsJson: string): Promise<string>;
   nativeContractVersion(): number;
   nativeBuildProfile?(): string;
+  sessionStoreCall(op: string, argsJson: string): Promise<string>;
   search(query: string, options?: object): Promise<UnknownRecord[]>;
   recent(options?: object): Promise<UnknownRecord[]>;
   getSession(sessionId: string, options?: object): Promise<UnknownRecord[]>;
@@ -128,6 +129,54 @@ async function loadNative(): Promise<NativeBinding> {
   return nativePromise.catch((error) => {
     nativePromise = null;
     throw error;
+  });
+}
+
+/**
+ * The operations the native `sessionStoreCall` dispatcher answers, in the
+ * spelling it expects. This is the one place in the SDK that knows an op's
+ * name: a new facade read is a new entry here and a new arm in the Rust
+ * dispatcher, not a new hand-mirrored native function.
+ */
+export const SESSION_STORE_OPS = Object.freeze({
+  markers: 'markers',
+  requests: 'requests',
+  usageSummary: 'usage_summary',
+  userTurns: 'user_turns',
+  capabilities: 'capabilities',
+} as const);
+export type SessionStoreOp = (typeof SESSION_STORE_OPS)[keyof typeof SESSION_STORE_OPS];
+
+/**
+ * The one argument document every dispatcher op reads. The native side
+ * rejects a key it does not know rather than ignoring it, so an option the
+ * SDK spells wrong is an error here, not a silently dropped filter.
+ */
+export interface SessionStoreCallArgs {
+  dbPath?: string;
+  source: string;
+  sessionId?: string;
+  limit?: number;
+  /** `tsMs` may be null only for the ops whose keyset has an undated tail. */
+  after?: { tsMs?: number | null; id: number };
+}
+
+/**
+ * One JSON request against the native `SessionStore` facade. The answer has
+ * the same camelCase shape the typed native functions return, so the callers
+ * normalize it with the same functions.
+ */
+export async function sessionStoreCall(op: SessionStoreOp, args: SessionStoreCallArgs): Promise<UnknownRecord> {
+  return nativeCall(async (native) => {
+    const answer = await native.sessionStoreCall(op, JSON.stringify(args));
+    const parsed: unknown = JSON.parse(answer);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new NativeContractMismatchError(
+        `ai-hist-native answered ${op} with something other than an object. Reinstall matching ai-hist packages.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    return parsed as UnknownRecord;
   });
 }
 

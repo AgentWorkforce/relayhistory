@@ -4,6 +4,46 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ## [Unreleased]
 
+### Breaking
+
+- Native contract 19 -> 20. The `ai-hist-native` addon gains
+  `sessionStoreCall(op, argsJson)`, one JSON-in/JSON-out dispatcher over the
+  `SessionStore` facade, and the SDK's `getSessionRequestsPage`,
+  `getSessionUsage` and `getSessionUserTurnsPage` now read through it. A
+  consumer pairing the new SDK with an older platform package gets the
+  existing `NATIVE_CONTRACT_MISMATCH` error at load, not a missing function
+  at first use. The typed `getSessionRequestsPage` / `getSessionUsage` /
+  `getSessionUserTurnsPage` native exports stay for compatibility until a
+  later major.
+
+### Added
+
+- Markers reach the SDK, MCP and both CLIs. `getSessionMarkersPage(source,
+  sessionId, {limit, after})`, the `sessionMarkers()` iterator and
+  `getSessionMarkers()` read one source's session on the evidence keyset
+  `(tsMs IS NULL, tsMs, id)`, so an undated marker pages last through a
+  null-timestamp cursor; each `SessionMarker` carries `kind`, `subkind`,
+  `text`, and the bounded payload both parsed (`payload`) and verbatim
+  (`payloadJson`). MCP: `get_session_markers`. CLI: `ai-hist sessions markers
+  SOURCE SESSION_ID [--limit N] [--after JSON] [--json]` (Node) and `ai-hist
+  sessions markers SOURCE SESSION_ID [--limit N] [--after-id N [--after-ms
+  MS]] [--json]` (Rust).
+- `getSourceCapabilities(source)` and the MCP `get_source_capabilities` tool
+  answer, from the provider tables alone, which evidence kinds a hydration of
+  that source covers, whether it can ever report `full`, and what its records
+  establish about delegation — the same table `getSessionRelationships`
+  returns as `capabilities` — so a consumer can ask before a first sync.
+- `ai-hist sessions usage SOURCE SESSION_ID [--json]` on both CLIs prints the
+  provider-reported rollup: usage is never estimated, and cost appears only
+  when the source data carried one.
+- The `sessionStoreCall` dispatcher answers `markers`, `requests`,
+  `usage_summary`, `user_turns` and `capabilities`; `sdk-ts/src/native.ts`
+  (`SESSION_STORE_OPS`) is the one place in the SDK that spells an op. A new
+  facade read is one arm in the Rust dispatcher and one entry there, not
+  another hand-mirrored native function. The dispatcher calls only the facade
+  and the crate's pure capability tables, and a missing database answers an
+  empty page without being created.
+
 ### Live capture
 
 - `ai-hist watch` now wakes on filesystem events over everything a local sweep

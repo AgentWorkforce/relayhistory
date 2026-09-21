@@ -10,6 +10,16 @@ export declare function historyDelivery(requestJson: string, dbPath?: string | u
  * `cancelled` reports a host stop request. None of them ever rejects.
  */
 export declare function historyDeliveryDrain(optionsJson: string, dbPath: string | undefined | null, prepare: (arg: string) => any, send: (arg: string) => any, cancelled: () => any): Promise<string>
+/**
+ * One JSON request against the `SessionStore` facade.
+ *
+ * `op` names the read (`markers`, `requests`, `usage_summary`, `user_turns`,
+ * `capabilities`) and `args_json` carries `{dbPath?, source, sessionId?,
+ * limit?, after?}`. The answer is the same camelCase document the matching
+ * typed function returns. A missing database answers an empty page, never an
+ * error, and never creates the file.
+ */
+export declare function sessionStoreCall(op: string, argsJson: string): Promise<string>
 export declare function getSourceObservation(requestJson: string): Promise<string>
 export declare function applySourceObservations(requestJson: string): Promise<string>
 export declare function applySourceEvidence(requestJson: string): Promise<string>

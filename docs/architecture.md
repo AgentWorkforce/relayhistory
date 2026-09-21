@@ -10,7 +10,8 @@ ai-hist (published Rust crate)
         │ typed Rust functions
         ▼
 ai-hist-native (Node-API, async worker tasks)
-        │ typed native objects
+        │ typed native objects, plus one JSON dispatcher
+        │ (`sessionStoreCall`) over the `SessionStore` facade
         ▼
 ai-hist TypeScript SDK
         ├── ai-hist Node CLI
@@ -21,7 +22,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 19, catalog contract version 4, hydration contract version 3,
+version 20, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
 2 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
@@ -29,6 +30,21 @@ helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
+
+The native addon exposes two kinds of entry point. The older operations are
+hand-mirrored typed functions with their own option and result objects. Reads
+added since the `SessionStore` facade go through one JSON dispatcher instead:
+`sessionStoreCall(op, argsJson)` takes `{dbPath?, source, sessionId?, limit?,
+after?}` and answers with the same camelCase document the typed function for
+that read returns, so the SDK normalizes both with one set of functions. The
+ops are `markers`, `requests`, `usage_summary`, `user_turns` and
+`capabilities`; `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
+in the SDK that spells them, and the SDK's request, usage and user-turn reads
+use the dispatcher. The dispatcher calls only the facade and the crate's pure
+capability tables — no connection, no SQL — and a new facade read is one new
+arm there rather than another typed native function. The typed
+`getSessionRequestsPage` / `getSessionUsage` / `getSessionUserTurnsPage`
+exports stay for compatibility until a later major.
 
 ## Session sourcing ownership
 
@@ -159,7 +175,9 @@ archive relocation.
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
-| `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
+| `getSessionMarkersPage`, `session_markers_page`, `SessionStore::session_markers_page` | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy (the native dispatcher then reopens writable and migrates, as the typed reads do) |
+| `getSessionRequestsPage`, `getSessionUsage` | none | bounded keyset page / streamed rollup over the derived request view | empty page / summary with no requests |
+| `getSourceCapabilities` | none | none: answered from the provider capability tables | the same answer |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |

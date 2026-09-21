@@ -2089,6 +2089,21 @@ provider's logs contain that relayhistory does not capture yet are written as
   estimate available here is a bytes-per-token heuristic, and a heuristic
   served beside measured values is indistinguishable from a measurement at the
   call site.
+- **Native (napi), markers and capabilities** — through the
+  `sessionStoreCall` JSON dispatcher (see
+  [architecture](architecture.md)), the SDK reads one keyset page of a
+  session's markers — the records the event model cannot carry: compaction
+  and summary boundaries, provider `system` rows, non-text content blocks,
+  agent lifecycle events — with `getSessionMarkersPage(source, sessionId,
+  options?)`, on the same `(tsMs IS NULL, tsMs, id)` order as tool calls and
+  file edits, so an undated marker pages last through a null-timestamp
+  cursor. `kind` is the classified vocabulary and `subkind` the provider's own
+  type; a record no classifier knows is `unknown` with its type intact.
+  `getSourceCapabilities(source)` answers, from the provider tables alone,
+  the evidence kinds a hydration of that source covers, whether it can ever
+  report `full`, and what its records establish about delegation — the same
+  table `getSessionRelationships` returns as `capabilities` — so a consumer
+  can ask before a first sync.
 - **Native (napi), delegation** — `getSessionRelationships(options)` returns one
   session's edges in both directions plus the provider's capabilities;
   `getSessionTree(options)` returns the pre-order descendant tree bounded by
@@ -2100,14 +2115,17 @@ provider's logs contain that relayhistory does not capture yet are written as
   same contract for Node consumers, as do `getSessionRelationships()`,
   `getSessionTree()`, `getSessionChildrenPage()`,
   `getSessionUserTurnsPage()` / `getSessionUserTurns()` / `sessionUserTurns()`,
-  and the `sessionDescendants()`
+  `getSessionMarkersPage()` / `getSessionMarkers()` / `sessionMarkers()`,
+  `getSourceCapabilities()`, and the `sessionDescendants()`
   / `sessionEventsIncludingDescendants()` iterators; see the SDK's own
   documentation for the exact signatures.
 - **MCP** — the stdio server exposes the cache-only listing as a `list_sessions`
   tool, so an agent can enumerate recent sessions without triggering any
-  provider I/O, and delegation topology as the read-only
-  `get_session_relationships` and `get_session_tree` tools. See the MCP
-  package's documentation for their arguments.
+  provider I/O, delegation topology as the read-only
+  `get_session_relationships` and `get_session_tree` tools, markers as
+  `get_session_markers`, and the provider tables as
+  `get_source_capabilities`. See the MCP package's documentation for their
+  arguments.
 
 Whatever the surface, `contract_version` means the same thing: check it, and
 fail loudly on a version you do not know.
