@@ -200,12 +200,21 @@ fn ingest_transcript_at_with_roots(
     } else {
         candidate_for(provider.source(), transcript)?
     };
-    let preloaded = claude_snapshot
+    let mut preloaded = claude_snapshot
         .as_ref()
         .map(|snapshot| {
             crate::discover::claude_shallow_session_from_bytes(&candidate, snapshot.text.as_bytes())
         })
         .transpose()?;
+    if let (Some(Some(session)), Some(snapshot)) = (&mut preloaded, claude_snapshot.as_ref()) {
+        if let Some(session_id) = snapshot.session_id() {
+            // Shallow discovery intentionally examines bounded head/tail
+            // bytes. A hook has already captured and validated the complete
+            // snapshot, so keep its authoritative identity if an unusually
+            // sparse transcript records it only in the middle.
+            session.session_id = session_id;
+        }
+    }
     let single = SingleCandidate {
         inner: provider,
         candidate,
@@ -228,13 +237,10 @@ fn ingest_transcript_at_with_roots(
         // that guess into a catalog row. Other providers retain their adapter
         // identity path; none currently advertises lifecycle-hook support.
         let observed_session = if source == "claude" {
-            crate::discover::claude_transcript_session_id_from_bytes(
-                claude_snapshot
-                    .as_ref()
-                    .expect("Claude hook snapshot exists")
-                    .text
-                    .as_bytes(),
-            )?
+            claude_snapshot
+                .as_ref()
+                .expect("Claude hook snapshot exists")
+                .session_id()
         } else {
             single
                 .read_shallow(&env.scan(), Some(&conn), &single.candidate)?

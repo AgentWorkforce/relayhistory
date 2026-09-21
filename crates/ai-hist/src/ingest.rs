@@ -3142,7 +3142,8 @@ fn record_codex_delegation(
 fn codex_delegation_recorded(conn: &Connection, child_session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_relationships \
-         WHERE source = 'codex' AND child_session_id = ? LIMIT 1)",
+         WHERE source = 'codex' AND child_session_id = ? \
+           AND relationship = 'delegated' LIMIT 1)",
         [child_session_id],
         |row| row.get(0),
     )?;
@@ -4709,6 +4710,7 @@ fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool
     Ok(exists != 0)
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct ClaudeSessionMeta {
     session_id: String,
     remote_session_id: Option<String>,
@@ -6260,6 +6262,7 @@ pub(crate) struct ClaudeTranscriptSnapshot {
     pub(crate) text: String,
     pub(crate) stamp: String,
     pub(crate) modified_ms: Option<i64>,
+    meta: Option<ClaudeSessionMeta>,
 }
 
 impl ClaudeTranscriptSnapshot {
@@ -6275,12 +6278,22 @@ impl ClaudeTranscriptSnapshot {
         let mut text = String::with_capacity(metadata.len() as usize);
         file.read_to_string(&mut text)
             .with_context(|| format!("reading Claude transcript {}", path.display()))?;
+        let meta = scan_claude_session_text(path, &text)?;
         Ok(Self {
             path: path.to_path_buf(),
             text,
             stamp: stamp_of(&metadata),
             modified_ms: modified_ms_of(&metadata),
+            meta,
         })
+    }
+
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.meta.as_ref().map(|meta| meta.session_id.clone())
+    }
+
+    pub(crate) fn meta(&self) -> Option<ClaudeSessionMeta> {
+        self.meta.clone()
     }
 
     pub(crate) fn records(&self) -> i64 {
@@ -8690,6 +8703,41 @@ mod tests {
 
         cleanup_codex_subagent_registration(&conn, "child").unwrap();
         assert!(destination_shortfall(&conn, &marker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_non_delegation_child_still_has_the_catalog_shortfall_guard() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('child', 'codex', '/tmp/project')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(&conn, "codex", "child", super::SessionLocation::Local)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'child', 1, 'assistant', 'text', 'kept', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let marker = destination_generation(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'parent', 'fork:child', 'child', 'fork', \
+                     'observed', 'source_fork', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        cleanup_codex_subagent_registration(&conn, "child").unwrap();
+        let repairs = destination_shortfall(&conn, &marker).unwrap();
+        assert!(repairs.contains("codex", "child"));
     }
 
     #[test]

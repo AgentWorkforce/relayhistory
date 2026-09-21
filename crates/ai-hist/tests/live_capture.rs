@@ -2722,6 +2722,51 @@ fn a_hook_transcript_with_conflicting_native_identities_is_rejected() {
 }
 
 #[test]
+fn a_hook_rejects_a_conflicting_identity_hidden_between_bounded_regions() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join(".claude/projects/proj");
+    std::fs::create_dir_all(&project).expect("create project");
+    let transcript = project.join("conflicting-middle.jsonl");
+    let padding = |uuid: &str, bytes: usize| {
+        let mut line = format!(
+            r#"{{"sessionId":"session-a","uuid":"{uuid}","type":"progress","padding":"{}"}}"#,
+            "x".repeat(bytes)
+        );
+        line.push('\n');
+        line
+    };
+    let mut text = String::from(
+        r#"{"sessionId":"session-a","uuid":"head","type":"user","message":{"role":"user","content":"first"}}"#,
+    );
+    text.push('\n');
+    text.push_str(&padding("head-padding", 300_000));
+    text.push_str(
+        r#"{"sessionId":"session-b","uuid":"middle","type":"assistant","message":{"role":"assistant","content":"wrong"}}"#,
+    );
+    text.push('\n');
+    text.push_str(&padding("tail-padding", 100_000));
+    text.push_str(
+        r#"{"sessionId":"session-a","uuid":"tail","type":"assistant","message":{"role":"assistant","content":"last"}}"#,
+    );
+    text.push('\n');
+    std::fs::write(&transcript, text).expect("write transcript");
+    let db = home.path().join("history.db");
+
+    let error = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("session-a"),
+        true,
+    )
+    .expect_err("a conflicting middle identity must fail before discovery writes");
+    assert!(error.to_string().contains("conflicting sessionId"));
+    assert_eq!(catalog_session_count(&db, "claude", "session-a"), 0);
+    assert_eq!(catalog_session_count(&db, "claude", "session-b"), 0);
+}
+
+#[test]
 fn a_missing_transcript_is_reported_not_raised() {
     let home = tempfile::tempdir().expect("tempdir");
     let db = home.path().join("history.db");

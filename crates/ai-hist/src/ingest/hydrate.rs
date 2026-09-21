@@ -1235,22 +1235,41 @@ fn source_snapshot(
         )
     })?;
     let path = PathBuf::from(locator);
-    if !path.is_file() {
-        return Err(hydration_error(
-            "SESSION_SOURCE_UNAVAILABLE",
-            format!(
-                "provider source {} disappeared after discovery",
-                path.display()
-            ),
-        ));
+    let captured_claude = if options.source == "claude" {
+        claude_snapshot
+    } else {
+        anyhow::ensure!(
+            claude_snapshot.is_none(),
+            "SESSION_SOURCE_MISMATCH: Claude snapshot supplied for another provider"
+        );
+        None
+    };
+    if let Some(snapshot) = captured_claude.as_ref() {
+        anyhow::ensure!(
+            snapshot.path == path,
+            "SESSION_SOURCE_MISMATCH: Claude hook snapshot does not match the catalog locator"
+        );
+        // The hook validated this path against the configured Claude root
+        // immediately before opening the snapshot. Do not canonicalize the
+        // live path again here: rotation may remove it after the bytes were
+        // safely captured, and those bytes are the evidence being hydrated.
+    } else {
+        if !path.is_file() {
+            return Err(hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                format!(
+                    "provider source {} disappeared after discovery",
+                    path.display()
+                ),
+            ));
+        }
+        validate_provider_path(&options.source, &path, roots)?;
     }
-    validate_provider_path(&options.source, &path, roots)?;
     // Grok's source is a directory, not a file. Its inventory is metadata
     // only — the same walk as its change stamp, so the two can never describe
     // different sets of files — and the record count is deferred, because
     // taking it means reading an update stream that is routinely megabytes
     // and a run that decides nothing changed has no use for it.
-    let mut captured_claude = None;
     let (mut bytes, mut records, mut stamp) = if options.source == "grok" {
         let inventory = grok_source_inventory(&path)?;
         (
@@ -1258,19 +1277,12 @@ fn source_snapshot(
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
         )
-    } else if options.source == "claude" && claude_snapshot.is_some() {
-        let snapshot = claude_snapshot.expect("checked above");
-        anyhow::ensure!(
-            snapshot.path == path,
-            "SESSION_SOURCE_MISMATCH: Claude hook snapshot does not match the catalog locator"
-        );
-        let values = (
+    } else if let Some(snapshot) = captured_claude.as_ref() {
+        (
             snapshot.text.len() as i64,
             SnapshotRecords::Counted(snapshot.records()),
             snapshot.stamp.clone(),
-        );
-        captured_claude = Some(snapshot);
-        values
+        )
     } else {
         (
             path.metadata()?.len() as i64,
@@ -1501,7 +1513,7 @@ fn ingest_claude(
     snapshot: Option<&ClaudeTranscriptSnapshot>,
 ) -> Result<()> {
     let meta = match snapshot {
-        Some(snapshot) => scan_claude_session_text(path, &snapshot.text),
+        Some(snapshot) => Ok(snapshot.meta()),
         None => scan_claude_session_file(path),
     }?
     .ok_or_else(|| {
@@ -2807,6 +2819,56 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_captured_claude_snapshot_survives_source_removal_before_hydration() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/proj");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("vanishing.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"sessionId":"vanishing","uuid":"1","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let opencode = home.path().join("opencode.db");
+        let roots = crate::ProviderRoots::from_home(home.path().to_path_buf(), opencode);
+        validate_provider_path("claude", &transcript, &roots).unwrap();
+        let snapshot = ClaudeTranscriptSnapshot::open(&transcript).unwrap();
+
+        let db = home.path().join("history.db");
+        let conn = crate::open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "vanishing", Some(&transcript));
+        drop(conn);
+        fs::remove_file(&transcript).unwrap();
+
+        let result = hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+            &db,
+            &HydrateSessionOptions {
+                source: "claude".into(),
+                session_id: "vanishing".into(),
+                scope: SessionScope::Local,
+                include_related: false,
+            },
+            &roots,
+            &crate::remote::SourceConnectorSelection::default(),
+            Some(snapshot),
+        )
+        .unwrap();
+        assert_eq!(result.status, "hydrated");
+        let conn = crate::open_db(&db).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='vanishing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "captured bytes must survive path removal");
     }
 
     /// One `tool_calls` row as the Grok assertions read it back:
