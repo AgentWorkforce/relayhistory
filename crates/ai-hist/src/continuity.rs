@@ -119,6 +119,10 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
     // what it said, and we simply failed to look.
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading Claude transcript {}", path.display()))?;
+    scan_claude_transcript_text(path, &text)
+}
+
+fn scan_claude_transcript_text(path: &Path, text: &str) -> Result<Option<ContinuityEvidence>> {
     let mut evidence = ContinuityEvidence {
         source: "claude".to_string(),
         locator: path.to_string_lossy().to_string(),
@@ -376,6 +380,19 @@ fn reopen_dependents(
 /// Read one transcript's evidence and store it, in one call.
 pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     capture(conn, "claude", path, scan_claude_transcript(path)?)
+}
+
+pub(crate) fn capture_claude_transcript_text(
+    conn: &Connection,
+    path: &Path,
+    text: &str,
+) -> Result<()> {
+    capture(
+        conn,
+        "claude",
+        path,
+        scan_claude_transcript_text(path, text)?,
+    )
 }
 
 /// Read one rollout's evidence and store it, in one call.

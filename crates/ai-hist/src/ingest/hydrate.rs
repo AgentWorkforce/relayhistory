@@ -91,6 +91,9 @@ struct SourceSnapshot {
     bytes: i64,
     records: SnapshotRecords,
     path: Option<PathBuf>,
+    /// Top-level Claude bytes captured by the lifecycle hook before catalog
+    /// writes. Ordinary hydration leaves this absent and reads by path.
+    claude_transcript: Option<ClaudeTranscriptSnapshot>,
     /// Claude subagent sidecars, parsed once while stamping the source so the
     /// ingestion pass does not walk and re-parse the same files.
     claude_subagents: Vec<ClaudeSubagentEvidence>,
@@ -187,6 +190,18 @@ pub(crate) fn hydrate_session_at_with_roots_and_connectors(
     roots: &crate::ProviderRoots,
     connectors: &crate::remote::SourceConnectorSelection,
 ) -> Result<HydrateSessionResult> {
+    hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+        db_path, options, roots, connectors, None,
+    )
+}
+
+pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
+    connectors: &crate::remote::SourceConnectorSelection,
+    claude_snapshot: Option<ClaudeTranscriptSnapshot>,
+) -> Result<HydrateSessionResult> {
     let home = &roots.home;
     validate_options(options)?;
     // One hydration is one acquisition pass; see `begin_acquisition_pass`.
@@ -239,7 +254,7 @@ pub(crate) fn hydrate_session_at_with_roots_and_connectors(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
-    let snapshot = source_snapshot(options, &target, roots)?;
+    let snapshot = source_snapshot(options, &target, roots, claude_snapshot)?;
     let previous = observations::checkpoint(&conn, &local_key)?.map(|checkpoint| {
         (
             checkpoint.source_stamp,
@@ -302,6 +317,7 @@ pub(crate) fn hydrate_session_at_with_roots_and_connectors(
         &target,
         snapshot.path.as_deref(),
         &snapshot.claude_subagents,
+        snapshot.claude_transcript.as_ref(),
     )?;
     tx.execute(
         "UPDATE sessions SET discovery_state = 'full', source_stamp = ?, parser_version = ? \
@@ -1132,6 +1148,7 @@ fn source_snapshot(
     options: &HydrateSessionOptions,
     target: &CatalogTarget,
     roots: &crate::ProviderRoots,
+    claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<SourceSnapshot> {
     if options.source == "relay" {
         return Err(hydration_error(
@@ -1205,6 +1222,7 @@ fn source_snapshot(
             // complete `part` table on older stores missing its usual index.
             records: SnapshotRecords::Counted(0),
             path: Some(path),
+            claude_transcript: None,
             claude_subagents: Vec::new(),
             codex_relationship_complete: true,
         });
@@ -1232,6 +1250,7 @@ fn source_snapshot(
     // different sets of files — and the record count is deferred, because
     // taking it means reading an update stream that is routinely megabytes
     // and a run that decides nothing changed has no use for it.
+    let mut captured_claude = None;
     let (mut bytes, mut records, mut stamp) = if options.source == "grok" {
         let inventory = grok_source_inventory(&path)?;
         (
@@ -1239,6 +1258,19 @@ fn source_snapshot(
             SnapshotRecords::DeferredGrok(path.clone()),
             inventory.stamp,
         )
+    } else if options.source == "claude" && claude_snapshot.is_some() {
+        let snapshot = claude_snapshot.expect("checked above");
+        anyhow::ensure!(
+            snapshot.path == path,
+            "SESSION_SOURCE_MISMATCH: Claude hook snapshot does not match the catalog locator"
+        );
+        let values = (
+            snapshot.text.len() as i64,
+            SnapshotRecords::Counted(snapshot.records()),
+            snapshot.stamp.clone(),
+        );
+        captured_claude = Some(snapshot);
+        values
     } else {
         (
             path.metadata()?.len() as i64,
@@ -1286,6 +1318,7 @@ fn source_snapshot(
         bytes,
         records,
         path: Some(path),
+        claude_transcript: captured_claude,
         claude_subagents: subagents,
         codex_relationship_complete,
     })
@@ -1435,11 +1468,17 @@ fn ingest_selected(
     target: &CatalogTarget,
     path: Option<&Path>,
     claude_subagents: &[ClaudeSubagentEvidence],
+    claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
 ) -> Result<Vec<HydrationDiagnostic>> {
     match options.source.as_str() {
-        "claude" => {
-            ingest_claude(conn, options, path.unwrap(), claude_subagents).map(|()| Vec::new())
-        }
+        "claude" => ingest_claude(
+            conn,
+            options,
+            path.unwrap(),
+            claude_subagents,
+            claude_snapshot,
+        )
+        .map(|()| Vec::new()),
         "codex" => ingest_codex(conn, options, path.unwrap()).map(|()| Vec::new()),
         "cursor" => ingest_cursor(conn, options, target, path.unwrap()).map(|()| Vec::new()),
         "grok" => ingest_grok(conn, options, path.unwrap()),
@@ -1459,8 +1498,13 @@ fn ingest_claude(
     options: &HydrateSessionOptions,
     path: &Path,
     subagents: &[ClaudeSubagentEvidence],
+    snapshot: Option<&ClaudeTranscriptSnapshot>,
 ) -> Result<()> {
-    let meta = scan_claude_session_file(path)?.ok_or_else(|| {
+    let meta = match snapshot {
+        Some(snapshot) => scan_claude_session_text(path, &snapshot.text),
+        None => scan_claude_session_file(path),
+    }?
+    .ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_MISMATCH",
             "Claude transcript has no session identity",
@@ -1483,13 +1527,21 @@ fn ingest_claude(
         meta.last_assistant_text.as_deref(),
         Some(&path.to_string_lossy()),
     )?;
-    ingest_claude_transcript(conn, path)?;
+    match snapshot {
+        Some(snapshot) => ingest_claude_transcript_text_as(conn, path, &snapshot.text, None)?,
+        None => ingest_claude_transcript(conn, path)?,
+    }
     record_claude_remote_relationship(conn, &meta, options.include_related)?;
     if options.include_related {
         // Bank this transcript's continuity evidence for reconciliation now.
         // A request for this session alone leaves relationship evidence for
         // a later hydration that includes related sessions.
-        crate::continuity::capture_claude_transcript(conn, path)?;
+        match snapshot {
+            Some(snapshot) => {
+                crate::continuity::capture_claude_transcript_text(conn, path, &snapshot.text)?
+            }
+            None => crate::continuity::capture_claude_transcript(conn, path)?,
+        }
         crate::continuity::reconcile(conn, "claude")?;
     }
     // The snapshot already walked and parsed these sidecars to stamp them, so

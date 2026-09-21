@@ -859,12 +859,23 @@ fn destination_shortfall(conn: &Connection, stored: &str) -> Result<SweepRepairs
         let Some(before) = stored.sessions.get(&key) else {
             continue;
         };
-        if !current
-            .get(&key)
-            .copied()
-            .unwrap_or_default()
-            .covers(before)
-        {
+        let current = current.get(&key).copied().unwrap_or_default();
+        // A local-only Codex subagent is deliberately removed from the root
+        // session catalog once its rollout proves the delegation. Its events
+        // remain queryable through the relationship, so the catalog drop is
+        // expected evidence reclassification rather than destination loss.
+        // A remote presence keeps the canonical catalog row and must retain
+        // the ordinary catalog guard.
+        let expected_subagent_deregistration = source == "codex"
+            && before.catalog > 0
+            && current.catalog == 0
+            && codex_delegation_recorded(conn, &session_id)?
+            && !codex_session_has_remote_presence(conn, &session_id)?;
+        let covered = current.events >= before.events
+            && current.tool_calls >= before.tool_calls
+            && current.file_edits >= before.file_edits
+            && (current.catalog >= before.catalog || expected_subagent_deregistration);
+        if !covered {
             repairs.sessions.insert((source, session_id));
         }
     }
@@ -4721,6 +4732,10 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
     // session, and the caller would record it as successfully read.
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
+    scan_claude_session_text(path, &text)
+}
+
+fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSessionMeta>> {
     let mut session_id = None;
     let mut remote_session_id = None;
     let mut cwd = None;
@@ -4735,14 +4750,22 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if value
+        let record_session_id = value
             .get("sessionId")
             .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-        {
+            .filter(|id| !id.is_empty());
+        if let Some(record_session_id) = record_session_id {
             identified_records += 1;
             if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
                 sidechain_records += 1;
+            }
+            match session_id.as_deref() {
+                Some(expected) => anyhow::ensure!(
+                    expected == record_session_id,
+                    "conflicting sessionId values in Claude transcript {}",
+                    path.display()
+                ),
+                None => session_id = Some(record_session_id.to_string()),
             }
         }
         if agent_id.is_none() {
@@ -4750,12 +4773,6 @@ fn scan_claude_session_file(path: &Path) -> Result<Option<ClaudeSessionMeta>> {
                 .get("agentId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .map(str::to_string);
-        }
-        if session_id.is_none() {
-            session_id = value
-                .get("sessionId")
-                .and_then(Value::as_str)
                 .map(str::to_string);
         }
         if remote_session_id.is_none() {
@@ -5246,6 +5263,15 @@ fn ingest_claude_transcript_as(
 ) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
+    ingest_claude_transcript_text_as(conn, path, &text, attributed_session_id)
+}
+
+fn ingest_claude_transcript_text_as(
+    conn: &Connection,
+    path: &Path,
+    text: &str,
+    attributed_session_id: Option<&str>,
+) -> Result<()> {
     // Ordering is assigned over the whole transcript, and this parser always
     // re-reads the file from the start, so a re-sync reproduces the same
     // indexes instead of advancing them.
@@ -6221,6 +6247,52 @@ fn modified_ms_of(metadata: &fs::Metadata) -> Option<i64> {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
+}
+
+/// One Claude transcript captured through one open file handle.
+///
+/// Lifecycle hooks carry an untrusted path. Keeping the bytes and metadata
+/// together prevents a path replacement between identity validation, shallow
+/// cataloging, and full ingestion from changing which transcript is written.
+#[derive(Debug)]
+pub(crate) struct ClaudeTranscriptSnapshot {
+    pub(crate) path: PathBuf,
+    pub(crate) text: String,
+    pub(crate) stamp: String,
+    pub(crate) modified_ms: Option<i64>,
+}
+
+impl ClaudeTranscriptSnapshot {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("opening Claude transcript {}", path.display()))?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "{} is not a regular file",
+            path.display()
+        );
+        let mut text = String::with_capacity(metadata.len() as usize);
+        file.read_to_string(&mut text)
+            .with_context(|| format!("reading Claude transcript {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            text,
+            stamp: stamp_of(&metadata),
+            modified_ms: modified_ms_of(&metadata),
+        })
+    }
+
+    pub(crate) fn records(&self) -> i64 {
+        jsonl::rows(&self.text)
+            .filter(|row| {
+                matches!(
+                    jsonl::classify(row.text, row.complete),
+                    jsonl::Row::Record(_)
+                )
+            })
+            .count() as i64
+    }
 }
 
 fn file_stamp(path: &Path) -> Result<String> {
@@ -8584,6 +8656,98 @@ mod tests {
         assert!(destination_shortfall_against(&conn, &state)
             .unwrap()
             .repairs_all());
+    }
+
+    #[test]
+    fn expected_codex_subagent_deregistration_is_not_a_catalog_shortfall() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd) \
+             VALUES ('child', 'codex', '/tmp/project')",
+            [],
+        )
+        .unwrap();
+        crate::mark_session_presence(&conn, "codex", "child", super::SessionLocation::Local)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'child', 1, 'assistant', 'text', 'kept', 'event-1')",
+            [],
+        )
+        .unwrap();
+        let marker = destination_generation(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_relationships \
+             (source, parent_session_id, relationship_uid, child_session_id, relationship, \
+              identity_status, evidence_kind, child_has_events, created_ms, updated_ms) \
+             VALUES ('codex', 'parent', 'parent:child', 'child', 'delegated', \
+                     'observed', 'codex_session_meta', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        cleanup_codex_subagent_registration(&conn, "child").unwrap();
+        assert!(destination_shortfall(&conn, &marker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_full_claude_scanner_rejects_conflicting_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflicting.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"sessionId":"one","uuid":"1","type":"user"}"#,
+                "\n",
+                r#"{"sessionId":"two","uuid":"2","type":"assistant"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let error = match scan_claude_session_file(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting identities must fail the full scanner"),
+        };
+        assert!(error.to_string().contains("conflicting sessionId"));
+    }
+
+    #[test]
+    fn a_claude_snapshot_keeps_the_opened_bytes_after_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"opened","uuid":"1","type":"assistant","message":{"role":"assistant","content":"kept"}}"#.to_string()
+                + "\n",
+        )
+        .unwrap();
+        let snapshot = ClaudeTranscriptSnapshot::open(&path).unwrap();
+        fs::write(
+            &path,
+            r#"{"sessionId":"replacement","uuid":"2","type":"assistant","message":{"role":"assistant","content":"wrong"}}"#.to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let meta = scan_claude_session_text(&path, &snapshot.text)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.session_id, "opened");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript_text_as(&conn, &path, &snapshot.text, None).unwrap();
+        let count = |session: &str| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id=?",
+                [session],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert!(count("opened") > 0);
+        assert_eq!(count("replacement"), 0);
     }
 
     /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative

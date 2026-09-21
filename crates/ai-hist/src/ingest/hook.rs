@@ -22,8 +22,8 @@
 //! hook fails the tool call the agent was in the middle of.
 
 use super::hydrate::{
-    hydrate_session_at_with_roots_and_connectors, validate_provider_path, HydrateSessionOptions,
-    HydrateSessionResult,
+    hydrate_session_at_with_roots_connectors_and_claude_snapshot, validate_provider_path,
+    HydrateSessionOptions, HydrateSessionResult,
 };
 use super::*;
 use crate::discover::{
@@ -186,10 +186,30 @@ fn ingest_transcript_at_with_roots(
         .find(|provider| provider.source() == source)
         .with_context(|| format!("INVALID_ARGUMENT: no local adapter for source '{source}'"))?;
 
-    let candidate = candidate_for(provider.source(), transcript)?;
+    let claude_snapshot = (source == "claude")
+        .then(|| ClaudeTranscriptSnapshot::open(transcript))
+        .transpose()?;
+    let candidate = if let Some(snapshot) = claude_snapshot.as_ref() {
+        Candidate {
+            source: provider.source(),
+            locator: transcript.to_string_lossy().into_owned(),
+            session_id: None,
+            recency_hint_ms: snapshot.modified_ms,
+            stamp: snapshot.stamp.clone(),
+        }
+    } else {
+        candidate_for(provider.source(), transcript)?
+    };
+    let preloaded = claude_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            crate::discover::claude_shallow_session_from_bytes(&candidate, snapshot.text.as_bytes())
+        })
+        .transpose()?;
     let single = SingleCandidate {
         inner: provider,
         candidate,
+        preloaded,
     };
 
     // Resolved the way the sweep resolves it, against the home this call was
@@ -208,7 +228,13 @@ fn ingest_transcript_at_with_roots(
         // that guess into a catalog row. Other providers retain their adapter
         // identity path; none currently advertises lifecycle-hook support.
         let observed_session = if source == "claude" {
-            crate::discover::claude_transcript_session_id(&env.scan(), transcript)?
+            crate::discover::claude_transcript_session_id_from_bytes(
+                claude_snapshot
+                    .as_ref()
+                    .expect("Claude hook snapshot exists")
+                    .text
+                    .as_bytes(),
+            )?
         } else {
             single
                 .read_shallow(&env.scan(), Some(&conn), &single.candidate)?
@@ -247,7 +273,7 @@ fn ingest_transcript_at_with_roots(
         ));
     };
 
-    let hydration = hydrate_session_at_with_roots_and_connectors(
+    let hydration = hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         db_path,
         &HydrateSessionOptions {
             source: source.to_string(),
@@ -257,6 +283,7 @@ fn ingest_transcript_at_with_roots(
         },
         roots,
         &crate::remote::SourceConnectorSelection::default(),
+        claude_snapshot,
     )?;
     let status = if hydration.status == "unchanged" {
         TranscriptStatus::Unchanged
@@ -291,12 +318,14 @@ fn candidate_for(source: &'static str, transcript: &Path) -> Result<Candidate> {
 
 /// One provider adapter narrowed to a single candidate.
 ///
-/// Everything except enumeration delegates, so the catalog row, the observation
-/// key and the connector identity are byte-for-byte what a full sweep would
-/// have written — the hook path adds no second way to describe a session.
+/// Enumeration is narrowed to the named file. Claude also supplies the shallow
+/// row parsed from the hook's immutable snapshot; every other provider
+/// delegates its read. Connector identity and catalog semantics remain those
+/// of the underlying adapter.
 struct SingleCandidate<'a> {
     inner: &'a dyn ShallowSessionProvider,
     candidate: Candidate,
+    preloaded: Option<Option<ShallowSession>>,
 }
 
 impl ShallowSessionProvider for SingleCandidate<'_> {
@@ -346,6 +375,9 @@ impl ShallowSessionProvider for SingleCandidate<'_> {
         catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        self.inner.read_shallow(scan, catalog, candidate)
+        match &self.preloaded {
+            Some(session) => Ok(session.clone()),
+            None => self.inner.read_shallow(scan, catalog, candidate),
+        }
     }
 }

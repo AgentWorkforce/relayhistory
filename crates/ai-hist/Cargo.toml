@@ -78,6 +78,10 @@ name = "live_capture"
 required-features = ["unstable-internal"]
 
 [[test]]
+name = "relative_watch_roots"
+required-features = ["unstable-internal"]
+
+[[test]]
 name = "local_history_boundary"
 required-features = ["unstable-internal"]
 

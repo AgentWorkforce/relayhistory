@@ -2690,6 +2690,38 @@ fn a_hook_transcript_without_native_identity_creates_no_catalog_row() {
 }
 
 #[test]
+fn a_hook_transcript_with_conflicting_native_identities_is_rejected() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join(".claude/projects/proj");
+    std::fs::create_dir_all(&project).expect("create project");
+    let transcript = project.join("conflicting.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"sessionId":"session-a","uuid":"a","type":"user","message":{"role":"user","content":"first"}}"#,
+            "\n",
+            r#"{"sessionId":"session-b","uuid":"b","type":"assistant","message":{"role":"assistant","content":"second"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write transcript");
+    let db = home.path().join("history.db");
+
+    let error = ai_hist::ingest_transcript_at_with_home(
+        &db,
+        home.path(),
+        "claude",
+        &transcript,
+        Some("session-a"),
+        true,
+    )
+    .expect_err("conflicting provider identities must not be ingested");
+    assert!(error.to_string().contains("conflicting sessionId"));
+    assert_eq!(catalog_session_count(&db, "claude", "session-a"), 0);
+    assert_eq!(catalog_session_count(&db, "claude", "session-b"), 0);
+}
+
+#[test]
 fn a_missing_transcript_is_reported_not_raised() {
     let home = tempfile::tempdir().expect("tempdir");
     let db = home.path().join("history.db");

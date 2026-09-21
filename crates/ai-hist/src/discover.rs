@@ -1091,6 +1091,32 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     Ok(BoundedJsonl { head, tail })
 }
 
+/// Build the same bounded head/tail view from bytes already captured through
+/// one open file handle. Hook ingestion uses this so identity validation,
+/// shallow cataloging, and full ingestion all describe one immutable read.
+fn bounded_jsonl_from_bytes(bytes: &[u8]) -> BoundedJsonl {
+    if bytes.len() as u64 <= HEAD_SCAN_MAX_BYTES {
+        let mut head = bytes.to_vec();
+        keep_complete_lines(&mut head);
+        return BoundedJsonl {
+            head,
+            tail: Vec::new(),
+        };
+    }
+
+    let mut head = bytes[..HEAD_SCAN_MAX_BYTES as usize].to_vec();
+    keep_complete_lines(&mut head);
+    let tail_start = bytes.len().saturating_sub(TAIL_SCAN_MAX_BYTES as usize);
+    let mut tail = bytes[tail_start..].to_vec();
+    if let Some(first_newline) = tail.iter().position(|&byte| byte == b'\n') {
+        tail.drain(..=first_newline);
+    } else {
+        tail.clear();
+    }
+    keep_complete_lines(&mut tail);
+    BoundedJsonl { head, tail }
+}
+
 /// Read Claude's provider-native identity without accepting the shallow
 /// catalog adapter's filename fallback.
 ///
@@ -1100,12 +1126,12 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
 /// must prove which session it belongs to. Claude writes the id on every
 /// normal record, so the same bounded head/tail read used by shallow discovery
 /// is sufficient without turning the hook fast path into a full-file scan.
-pub(crate) fn claude_transcript_session_id(
-    scan: &ScanEnv<'_>,
-    path: &Path,
-) -> Result<Option<String>> {
-    let bounded = read_bounded_jsonl(scan, path)?;
-    let session_id = bounded
+pub(crate) fn claude_transcript_session_id_from_bytes(bytes: &[u8]) -> Result<Option<String>> {
+    claude_session_id_from_bounded(&bounded_jsonl_from_bytes(bytes))
+}
+
+fn claude_session_id_from_bounded(bounded: &BoundedJsonl) -> Result<Option<String>> {
+    let session_ids = bounded
         .head_records()
         .chain(bounded.tail_records_rev())
         .filter_map(parse_record)
@@ -1116,8 +1142,12 @@ pub(crate) fn claude_transcript_session_id(
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
         })
-        .next();
-    Ok(session_id)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        session_ids.len() <= 1,
+        "conflicting sessionId values in Claude transcript"
+    );
+    Ok(session_ids.into_iter().next())
 }
 
 pub(crate) fn excerpt(text: &str) -> String {
@@ -1265,13 +1295,30 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Option<ShallowSession>> {
         let path = PathBuf::from(&candidate.locator);
         let bounded = read_bounded_jsonl(scan, &path)?;
+        read_claude_shallow(candidate, &path, &bounded)
+    }
+}
+
+pub(crate) fn claude_shallow_session_from_bytes(
+    candidate: &Candidate,
+    bytes: &[u8],
+) -> Result<Option<ShallowSession>> {
+    let path = PathBuf::from(&candidate.locator);
+    read_claude_shallow(candidate, &path, &bounded_jsonl_from_bytes(bytes))
+}
+
+fn read_claude_shallow(
+    candidate: &Candidate,
+    path: &Path,
+    bounded: &BoundedJsonl,
+) -> Result<Option<ShallowSession>> {
         let mut session = ShallowSession {
             source: "claude".into(),
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
         };
         let mut models = Vec::new();
-        let mut session_id = None;
+        let session_id = claude_session_id_from_bounded(bounded)?;
         // A subagent sidecar transcript is its own file whose records carry the
         // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
         // as a session would emit the parent twice per run and let the two
@@ -1299,13 +1346,6 @@ impl ShallowSessionProvider for ClaudeProvider {
                 } else {
                     primary_record_seen = true;
                 }
-            }
-            if session_id.is_none() {
-                session_id = value
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
             }
             if session.cwd.is_none() {
                 session.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -1394,7 +1434,6 @@ impl ShallowSessionProvider for ClaudeProvider {
         session.session_id = session_id;
         session.models = models;
         Ok(Some(session))
-    }
 }
 
 // ---------------------------------------------------------------------------
