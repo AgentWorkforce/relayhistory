@@ -1879,16 +1879,31 @@ impl ShallowSessionProvider for OpencodeProvider {
         {
             scan.note_query();
             let model = {
-                let mut stmt = conn.prepare_cached(
+                // Match `OpencodeSession::first_model`: the earliest assistant
+                // message, not a user message carrying the requested model.
+                // Older stores may lack the optional timestamp column, so the
+                // stable message id is the fallback ordering key.
+                let order_by = match (
+                    snapshot.message_columns.contains("time_created"),
+                    snapshot.message_columns.contains("id"),
+                ) {
+                    (true, true) => "ORDER BY time_created ASC, id ASC",
+                    (true, false) => "ORDER BY time_created ASC",
+                    (false, true) => "ORDER BY id ASC",
+                    (false, false) => "",
+                };
+                let sql = format!(
                     "SELECT json_extract(data, '$.providerID'), \
                             COALESCE(json_extract(data, '$.modelID'), \
                                      json_extract(data, '$.model.modelID')) \
                      FROM message WHERE session_id = ? AND json_valid(data) \
+                     AND json_extract(data, '$.role') = 'assistant' \
                      AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
                           OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
                                              json_extract(data, '$.model.modelID')), '') IS NOT NULL) \
-                     LIMIT 1",
-                )?;
+                     {order_by} LIMIT 1"
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
                 stmt.query_row([&candidate.locator], |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,

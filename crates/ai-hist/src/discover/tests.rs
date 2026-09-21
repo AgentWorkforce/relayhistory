@@ -1537,7 +1537,8 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     opencode_db(
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
-           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"openai","modelID":"gpt-5"}');
+           INSERT INTO message VALUES ('m2', 'oc-1', 1750000601000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -1623,6 +1624,28 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
     assert_eq!(row.cwd, None);
     assert_eq!(row.first_prompt, None);
     assert!(row.models.is_empty());
+
+    // `time_created` is optional in older message schemas. Discovery still
+    // filters to assistant messages and deterministically falls back to id.
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE INDEX message_session_id_idx ON message(session_id, id); \
+         INSERT INTO session VALUES ('ses_legacy_message'); \
+         INSERT INTO message VALUES ('m1', 'ses_legacy_message', \
+             '{\"role\":\"user\",\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
+         INSERT INTO message VALUES ('m2', 'ses_legacy_message', \
+             '{\"role\":\"assistant\",\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let legacy = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        legacy.row("ses_legacy_message").models,
+        vec!["anthropic/claude-sonnet"]
+    );
 }
 
 #[test]
@@ -1670,6 +1693,11 @@ fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
         db.execute(
             "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"bounded-model\"}')",
             params![message, id, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"assistant\",\"modelID\":\"bounded-model\"}')",
+            params![format!("assistant_{index:06}"), id, index + 1],
         )
         .unwrap();
         db.execute(
@@ -1795,10 +1823,11 @@ fn opencode_selected_session_queries_use_provider_indexes() {
         "SELECT json_extract(data, '$.providerID'),
                 COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
+         AND json_extract(data, '$.role') = 'assistant'
          AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
               OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
                                  json_extract(data, '$.model.modelID')), '') IS NOT NULL)
-         LIMIT 1",
+         ORDER BY time_created ASC, id ASC LIMIT 1",
         [],
     );
     assert!(
@@ -1888,8 +1917,9 @@ fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
          CREATE INDEX part_message_id_id_idx ON part(message_id, id);
          INSERT INTO session VALUES ('ses_ffffffffffffold', '/old', 1, 1000);
          INSERT INTO session VALUES ('ses_000000000000new', '/new', 2, 2);
-         INSERT INTO message VALUES ('m_new', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"fallback-model\"}');
-         INSERT INTO part VALUES ('p_new', 'm_new', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
+         INSERT INTO message VALUES ('m_new_user', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"requested-model\"}');
+         INSERT INTO message VALUES ('m_new_assistant', 'ses_000000000000new', 3, '{\"role\":\"assistant\",\"modelID\":\"fallback-model\"}');
+         INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
     )
     .unwrap();
     let plan = explain_details(
@@ -1928,8 +1958,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_snapshot', '/work/oc', 10, 20);
-         INSERT INTO message VALUES ('m_old', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-model\"}');
-         INSERT INTO part VALUES ('p_old', 'm_old', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
+         INSERT INTO message VALUES ('m_old_user', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-requested-model\"}');
+         INSERT INTO message VALUES ('m_old_assistant', 'ses_snapshot', 11, '{\"role\":\"assistant\",\"modelID\":\"old-model\"}');
+         INSERT INTO part VALUES ('p_old', 'm_old_user', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
     );
     let writer = Connection::open(home.path().join("opencode.db")).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -1939,8 +1970,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     let candidate = provider.enumerate(&env, Some(1)).unwrap().remove(0);
     writer
         .execute_batch(
-            "INSERT INTO message VALUES ('m_new', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-model\"}');
-             INSERT INTO part VALUES ('p_new', 'm_new', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
+            "INSERT INTO message VALUES ('m_new_user', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-requested-model\"}');
+             INSERT INTO message VALUES ('m_new_assistant', 'ses_snapshot', 6, '{\"role\":\"assistant\",\"modelID\":\"new-model\"}');
+             INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
              UPDATE session SET time_updated = 30 WHERE id = 'ses_snapshot';",
         )
         .unwrap();
