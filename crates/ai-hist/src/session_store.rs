@@ -1605,7 +1605,7 @@ impl Prompt {
                 .clone()
                 .unwrap_or_else(|| prompt_hash(&entry.prompt)),
             prompt_bytes: entry.prompt.len() as i64,
-            prompt: Some(entry.prompt).filter(|_| include_text),
+            prompt: include_text.then_some(entry.prompt),
             project: entry.project,
             timestamp_ms: entry.timestamp_ms,
         }
