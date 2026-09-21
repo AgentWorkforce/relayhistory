@@ -1782,15 +1782,25 @@ impl ShallowSessionProvider for OpencodeProvider {
             scan.note_query();
             let model = {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT COALESCE(json_extract(data, '$.modelID'), \
-                                            json_extract(data, '$.model.modelID')) \
+                    "SELECT json_extract(data, '$.providerID'), \
+                            COALESCE(json_extract(data, '$.modelID'), \
+                                     json_extract(data, '$.model.modelID')) \
                      FROM message WHERE session_id = ? AND json_valid(data) \
-                     AND COALESCE(json_extract(data, '$.modelID'), \
-                                  json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+                     AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
+                          OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
+                                             json_extract(data, '$.model.modelID')), '') IS NOT NULL) \
+                     LIMIT 1",
                 )?;
-                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
-                    .optional()?
-                    .flatten()
+                stmt.query_row([&candidate.locator], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .optional()?
+                .and_then(|(provider, model)| {
+                    crate::ingest::opencode::build_model(provider.as_deref(), model.as_deref())
+                })
             };
             scan.note_records(u64::from(model.is_some()));
             push_unique(&mut models, model.as_deref());

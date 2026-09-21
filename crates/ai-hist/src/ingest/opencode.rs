@@ -1071,7 +1071,7 @@ fn finish(
 
 /// `"<providerID>/<modelID>"`, degrading to whichever half the provider
 /// recorded. Ported from burn's `build_model`.
-fn build_model(provider_id: Option<&str>, model_id: Option<&str>) -> Option<String> {
+pub(crate) fn build_model(provider_id: Option<&str>, model_id: Option<&str>) -> Option<String> {
     match (provider_id, model_id) {
         (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
             Some(format!("{provider}/{model}"))

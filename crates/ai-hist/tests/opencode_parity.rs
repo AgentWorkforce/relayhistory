@@ -277,6 +277,7 @@ fn use_layout(home: &Path, db: Option<&Path>, storage: Option<&Path>) {
 #[test]
 fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     targeted_sync_honors_the_configured_legacy_storage_root();
+    shallow_discovery_qualifies_models_identically_across_layouts();
     the_two_layouts_normalize_to_identical_evidence();
     every_session_in_the_corpus_is_parsed();
     a_parent_id_links_a_child_session_and_the_tree_returns_it();
@@ -308,6 +309,49 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event();
     the_exclusive_sync_reads_whichever_layout_the_host_has();
     a_hydration_does_not_move_catalog_recency_backwards();
+}
+
+fn shallow_discovery_qualifies_models_identically_across_layouts() {
+    let root = temp_root("shallow-model-parity");
+    let provider_db = root.join("provider/opencode.db");
+    build_sqlite_store(&provider_db);
+
+    let sqlite_home = root.join("sqlite-home");
+    use_layout(&sqlite_home, Some(&provider_db), None);
+    let sqlite_catalog = root.join("sqlite-catalog.db");
+    discover_sessions_scoped_at(&sqlite_catalog, &opencode_only()).unwrap();
+    let sqlite_model = catalog_model(&sqlite_catalog, "ses_sqlite_root");
+
+    let json_home = root.join("json-home");
+    let tree = json_home.join(".local/share/opencode/storage");
+    sqlite_store_as_json_tree(&provider_db, &tree);
+    use_layout(&json_home, None, Some(&tree));
+    let json_catalog = root.join("json-catalog.db");
+    discover_sessions_scoped_at(&json_catalog, &opencode_only()).unwrap();
+    let json_model = catalog_model(&json_catalog, "ses_sqlite_root");
+
+    assert_eq!(
+        sqlite_model.as_deref(),
+        Some("[\"anthropic/claude-sonnet-4-5\"]"),
+        "SQLite discovery must preserve the provider that qualifies the event model"
+    );
+    assert_eq!(
+        sqlite_model, json_model,
+        "the same provider payload must produce the same catalog model in both layouts"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+fn catalog_model(db_path: &Path, session_id: &str) -> Option<String> {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT models_json FROM sessions WHERE source='opencode' AND session_id=?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn targeted_sync_honors_the_configured_legacy_storage_root() {

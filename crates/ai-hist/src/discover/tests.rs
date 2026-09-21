@@ -1152,7 +1152,7 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     opencode_db(
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
-           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -1162,7 +1162,7 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(row.first_prompt.as_deref(), Some("port the parser"));
     assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
     assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
-    assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
+    assert_eq!(row.models, vec!["anthropic/claude-sonnet".to_string()]);
     assert_eq!(
         row.raw_path.as_deref(),
         Some(home.path().join("opencode.db").to_string_lossy().as_ref()),
@@ -1407,10 +1407,13 @@ fn opencode_selected_session_queries_use_provider_indexes() {
 
     let model = explain_details(
         &db,
-        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+        "SELECT json_extract(data, '$.providerID'),
+                COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
-         AND COALESCE(json_extract(data, '$.modelID'),
-                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+         AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
+              OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
+                                 json_extract(data, '$.model.modelID')), '') IS NOT NULL)
+         LIMIT 1",
         [],
     );
     assert!(
