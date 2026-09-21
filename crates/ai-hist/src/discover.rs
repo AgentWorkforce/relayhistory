@@ -1541,6 +1541,11 @@ fn grok_update_bounds(
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
 struct OpencodeProvider {
+    /// `None` means no choice has been made; `Some(None)` means the pass found
+    /// no store. Enumeration fixes the choice before it creates locators, and
+    /// every read uses that same choice even if OpenCode upgrades layouts in
+    /// the middle of the pass.
+    layout: Mutex<Option<Option<OpencodeLayout>>>,
     live: Mutex<Option<OpencodeReadSnapshot>>,
 }
 
@@ -1566,13 +1571,21 @@ struct OpencodeReadSnapshot {
 }
 
 impl OpencodeProvider {
+    fn layout(&self, scan: &ScanEnv<'_>) -> Option<OpencodeLayout> {
+        let mut guard = self.layout.lock().expect("opencode layout lock");
+        if guard.is_none() {
+            *guard = Some(scan.opencode_layout());
+        }
+        guard.as_ref().cloned().flatten()
+    }
+
     /// Open the provider once, read-only, and start the transaction that pins
     /// the run's SQLite snapshot. `None` means this host is not on the SQLite
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
+        if guard.is_none() && matches!(self.layout(scan), Some(OpencodeLayout::Sqlite(_))) {
             *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
@@ -1705,7 +1718,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
-        if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
+        if let Some(OpencodeLayout::JsonTree(root)) = self.layout(&scan) {
             return enumerate_opencode_json_tree(&scan, &root);
         }
         let mut guard = self.snapshot(&scan)?;
@@ -1811,7 +1824,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        if let Some(OpencodeLayout::JsonTree(_)) = scan.opencode_layout() {
+        if let Some(OpencodeLayout::JsonTree(_)) = self.layout(scan) {
             return read_shallow_opencode_json_tree(scan, candidate);
         }
         let guard = self.snapshot(scan)?;

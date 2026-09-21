@@ -1737,6 +1737,44 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
 }
 
 #[test]
+fn opencode_pins_the_json_layout_between_enumeration_and_read() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let storage = home.path().join("storage");
+    write(
+        &storage.join("session/global/ses_tree.json"),
+        r#"{"id":"ses_tree","directory":"/work/tree","time":{"created":10,"updated":20}}"#,
+    );
+    write(
+        &storage.join("message/ses_tree/msg_tree.json"),
+        r#"{"id":"msg_tree","sessionID":"ses_tree","role":"user","time":{"created":10}}"#,
+    );
+    write(
+        &storage.join("part/msg_tree/part_tree.json"),
+        r#"{"id":"part_tree","sessionID":"ses_tree","messageID":"msg_tree","type":"text","text":"tree prompt"}"#,
+    );
+
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let candidate = provider.enumerate(&env, None).unwrap().remove(0);
+    assert!(candidate.locator.ends_with("ses_tree.json"));
+
+    // Current OpenCode creates SQLite while this discovery pass still holds
+    // JSON-tree locators. Re-detecting here would look up the file path as a
+    // SQLite session id and silently return no row.
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_sqlite', '/work/sqlite', 30, 40);",
+    );
+    let row = provider
+        .read_shallow(&env.scan(), None, &candidate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id, "ses_tree");
+    assert_eq!(row.first_prompt.as_deref(), Some("tree prompt"));
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn opencode_rejects_a_limit_that_sqlite_cannot_represent() {
     let catalog = catalog();
