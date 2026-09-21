@@ -1905,7 +1905,11 @@ fn ingest_claude(
         // Bank this transcript's continuity evidence for reconciliation now.
         // A request for this session alone leaves relationship evidence for
         // a later hydration that includes related sessions.
-        crate::continuity::capture_claude_transcript(conn, path)?;
+        // Counted: this walk is provider I/O like any other, and leaving it
+        // out let a hydration read the whole transcript and report only the
+        // append.
+        outcome.bytes_read +=
+            crate::continuity::capture_claude_transcript_resumed(conn, path, cursor)? as i64;
         crate::continuity::reconcile(conn, "claude")?;
     }
     // The snapshot already walked and parsed these sidecars to stamp them, so
@@ -2239,7 +2243,7 @@ fn ingest_codex(
     if options.include_related {
         // Codex records continuity only when a producer writes explicit
         // fields on `session_meta`; a plain `codex resume` leaves no signal.
-        crate::continuity::capture_codex_rollout(conn, path)?;
+        indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
         crate::continuity::reconcile(conn, "codex")?;
         indexed.absorb_outcome(ingest_codex_children(conn, options, path)?);
     }
@@ -5139,15 +5143,15 @@ mod tests {
         assert!(usage.contains("\"output_tokens\":3"), "{usage}");
 
         // Only the appended bytes were read on the second pass, plus the held
-        // message the record walk declined to commit past. The metadata walk
-        // holds nothing back, so it reads the append alone.
+        // message the record walk declined to commit past. The metadata and
+        // continuity walks hold nothing back, so they read the append alone.
         let appended = incomplete_fixture_completion().len() as i64;
         let held_line = bytes.len() as i64 - INCOMPLETE_INPROGRESS_OFFSET;
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
-        assert_eq!(second_records, 2 * appended + held_line);
+        assert_eq!(second_records, 3 * appended + held_line);
         assert_eq!(
             stored_cursor(&db, INCOMPLETE_SESSION).committed_offset(),
             bytes.len() as i64 + appended
@@ -5271,13 +5275,13 @@ mod tests {
         let diagnostic = diagnostic(&rotated, "HYDRATION_SOURCE_ROTATED")
             .expect("truncation below the cursor is reported");
         assert!(diagnostic.message.contains("re-read in full"));
-        // Re-read from zero: every byte of the shorter file, by both walks,
-        // not a resume.
+        // Re-read from zero: every byte of the shorter file, by all three
+        // walks, not a resume.
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
-        assert_eq!(rotated_records, 2 * truncated.len() as i64);
+        assert_eq!(rotated_records, 3 * truncated.len() as i64);
         assert_eq!(
             stored_cursor(&db, session_id).committed_offset(),
             truncated.len() as i64
@@ -5355,7 +5359,7 @@ mod tests {
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
-        assert_eq!(upgraded_records, 2 * bytes.len() as i64);
+        assert_eq!(upgraded_records, 3 * bytes.len() as i64);
         assert!(diagnostic(&upgraded, "HYDRATION_SOURCE_ROTATED").is_none());
 
         // And from here the cursor carries: an append reads only the append.
@@ -5370,7 +5374,7 @@ mod tests {
             hydrate_counting_records(&db, &options("claude", session_id), dir.path());
         // Records only; the bounded validation windows are counted too and
         // reported by the code that spends them.
-        assert_eq!(resumed_records, 2 * addition.len() as i64);
+        assert_eq!(resumed_records, 3 * addition.len() as i64);
     }
 
     #[test]
@@ -5603,6 +5607,70 @@ mod tests {
     /// `bytes_read` is the **whole hydration's** total, which is the only
     /// figure worth asserting. It once covered the record walk alone while a
     /// metadata walk ahead of it read the file from the start, so a 1 KiB
+    /// Tool-result ordering is assigned over the whole transcript, so a pass
+    /// that resumes has to continue the sequence rather than start it again.
+    ///
+    /// The indexer lives on the cursor for this reason, and it is stored as of
+    /// the *committed* offset: a pass that backs up for a held or unterminated
+    /// record re-reads it, and end-of-pass state would hand those rows a
+    /// larger index every time the file grew.
+    #[test]
+    fn tool_result_ordering_continues_across_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-ordering";
+        let record = |uuid: &str, tool_use_id: &str, ts: &str| {
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\
+                 \"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[\
+                 {{\"type\":\"tool_result\",\"tool_use_id\":\"{tool_use_id}\",\"content\":\"ok\"}}]}},\
+                 \"timestamp\":\"{ts}\"}}\n"
+            )
+        };
+        let first = record("r-1", "tu_1", "2026-08-31T10:00:00Z");
+        let transcript = seed_claude_transcript(dir.path(), session_id, first.as_bytes());
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", session_id, Some(&transcript));
+        drop(conn);
+
+        let indexes = |db: &Path| -> Vec<i64> {
+            let conn = open_db(db).unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT event_index FROM session_events \
+                     WHERE source = 'claude' AND session_id = ? AND kind = 'tool_result' \
+                     ORDER BY id",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([session_id], |row| row.get::<_, Option<i64>>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.into_iter().flatten().collect()
+        };
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(indexes(&db), vec![0]);
+
+        // A second turn arrives. The cursor resumes past the first record, so
+        // nothing re-reads it — and the new result must be 1, not 0.
+        let mut file = OpenOptions::new().append(true).open(&transcript).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            record("r-2", "tu_2", "2026-08-31T10:00:01Z").as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        hydrate_session_at_with_home(&db, &options("claude", session_id), dir.path()).unwrap();
+        assert_eq!(
+            indexes(&db),
+            vec![0, 1],
+            "a resumed pass restarted the sequence instead of continuing it"
+        );
+    }
+
     /// append to a 200 MB transcript read 200 MB and reported about 1 KiB —
     /// the shape of a success, computed over one of the two walks.
     #[test]
@@ -5626,12 +5694,14 @@ mod tests {
 
         let (_first, first_records) =
             hydrate_counting_records(&db, &options("claude", session_id), dir.path());
-        // Both walks read the whole file once.
+        // Three folds read the whole file once each: the record walk, the
+        // metadata walk, and the continuity walk. A cold pass is where that
+        // shows; the point of the cursors is the append below.
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
-        assert_eq!(first_records, 2 * size as i64);
+        assert_eq!(first_records, 3 * size as i64);
         let events_after_first = session_event_snapshot(&db, session_id).len();
 
         let addition = format!(
@@ -5653,12 +5723,20 @@ mod tests {
         // reported by the code that spends them.
         assert_eq!(
             appended_records,
-            2 * addition.len() as i64,
-            "an append must cost its own size across both walks, not the file's"
+            3 * addition.len() as i64,
+            "an append must cost its own size across all three walks, not the file's"
         );
-        // And the whole pass, validation included, is still nowhere near the
-        // file: bounded windows, not a re-read.
-        assert!(appended.bytes_read * 4 < size as i64);
+        // And the whole pass, validation included, is a *constant*: three
+        // cursors' worth of bounded windows plus the append. Not a fraction
+        // of the file — the same nine windows would validate a 200 MB
+        // transcript, which is the property that matters and the one a
+        // "much smaller than the file" assertion states only by accident.
+        let window = super::cursor::prefix_window_bytes(size as u64) as i64;
+        assert_eq!(
+            appended.bytes_read,
+            9 * window + 3 * addition.len() as i64,
+            "a changed pass pays its records plus a fixed number of bounded windows"
+        );
         assert_eq!(
             session_event_snapshot(&db, session_id).len(),
             events_after_first + 1
@@ -5711,7 +5789,7 @@ mod tests {
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
-        assert_eq!(result_records, 2 * records.len() as i64);
+        assert_eq!(result_records, 3 * records.len() as i64);
 
         // A pass that changes nothing must not duplicate the record, and the
         // cursor must sit at the end of the file so an untouched transcript is
@@ -5752,11 +5830,12 @@ mod tests {
             hydrate_counting_records(&db, &options("claude", session_id), dir.path());
         assert_eq!(session_event_snapshot(&db, session_id).len(), 526);
         // The re-read covers the previously unterminated record plus the new
-        // one, and nothing before it.
+        // one, and nothing before it — for each of the three walks. None of
+        // them committed past a record the file ended inside.
         let last_record_len = records.len() as i64 - (records.rfind('\n').unwrap() as i64 + 1);
         // Records only; the bounded validation windows are counted too and
         // reported by the code that spends them.
-        assert_eq!(grown_records, 2 * (last_record_len + tail.len() as i64));
+        assert_eq!(grown_records, 3 * (last_record_len + tail.len() as i64));
     }
 
     /// A partial line is still withheld: the distinction is whether it parses.
@@ -5922,10 +6001,12 @@ mod tests {
         let (first, first_records) =
             hydrate_counting_records(&db, &options("codex", "big"), dir.path());
         assert_eq!(first.status, "hydrated");
-        // The whole rollout, plus its `session_meta` record read twice from
-        // the head: once to stamp the source, once to identify it for
-        // ingestion. One record either way, never the file.
-        let head_reads = 2 * meta_line.len() as i64;
+        // The whole rollout, plus its `session_meta` record read three times
+        // from the head: once to stamp the source, once to identify it for
+        // ingestion, once for continuity. One record each, never the file —
+        // and the reader hands a record over without its delimiter, hence the
+        // `- 1`.
+        let head_reads = 3 * meta_line.len() as i64 - 1;
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
@@ -6548,9 +6629,13 @@ mod tests {
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
+        // The rollout once, plus its `session_meta` record from the head
+        // three times: stamping the source, identifying it for ingestion, and
+        // the continuity scan. One record each, never the file — the reader
+        // hands a record over without its delimiter, hence the `- 1`.
         assert_eq!(
             first_records,
-            complete.len() as i64 + 2 * meta_line.len() as i64
+            complete.len() as i64 + 3 * meta_line.len() as i64 - 1
         );
 
         // A half-written record arrives with no newline. The pass reads it,
@@ -6566,7 +6651,7 @@ mod tests {
         // reported by the code that spends them.
         assert_eq!(
             appended_records,
-            tail.len() as i64 + 2 * meta_line.len() as i64,
+            tail.len() as i64 + 3 * meta_line.len() as i64 - 1,
             "an unterminated tail the reader consumed must appear in bytes_read"
         );
         // Positive control: the tail was not committed, so the cursor has not
@@ -6745,17 +6830,17 @@ mod tests {
 
         let (_result, result_records) =
             hydrate_counting_records(&db, &options("claude", session_id), dir.path());
-        // A Claude transcript is walked twice — once for identity and
-        // metadata, once to index records — and each walk drains the tail, so
-        // each walk reports it. Counting a read once per read is what makes
-        // this counter mean anything.
+        // A Claude transcript is walked three times — for identity and
+        // metadata, to index records, and for continuity — and each walk
+        // drains the tail, so each walk reports it. Counting a read once per
+        // read is what makes this counter mean anything.
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
         // records.
         assert_eq!(
             result_records,
-            2 * (small.len() + huge_tail.len()) as i64,
+            3 * (small.len() + huge_tail.len()) as i64,
             "the drained tail was read in chunks and must be counted"
         );
         // Positive control: counting it did not commit it. The cursor stops

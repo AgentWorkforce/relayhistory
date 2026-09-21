@@ -161,9 +161,20 @@ pub(crate) struct ClaudeCursorState {
     /// from where it rewound to rather than from where it stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_line_index: Option<usize>,
+    /// Tool-result ordering as it stood *before* the record at `resume_from`.
+    ///
+    /// That record was indexed and committed past, so `tool_results` includes
+    /// it. A pass that rewinds re-reads it, and without this it would claim
+    /// fresh indexes for rows it had already numbered — once per append, for
+    /// as long as the transcript keeps an unterminated tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_tool_results: Option<super::tool_result_facts::ToolResultIndexer>,
     /// The metadata walk's position and fold over the same file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ClaudeScanState>,
+    /// The continuity walk's position and fold over the same file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<ClaudeContinuityState>,
     /// Tool-result ordering as of the committed offset.
     ///
     /// `call_index` and `event_index` are assigned over the whole transcript,
@@ -196,6 +207,31 @@ pub(crate) struct ClaudeScanState {
     pub fold: super::ClaudeMetaFold,
 }
 
+/// The continuity walk's own resumable position and running fold.
+///
+/// Continuity is a fold like the metadata walk's: every field it keeps is
+/// first-wins, last-wins or accumulating, so folding newly arrived records
+/// onto a saved state gives the same answer as folding the file. It keeps its
+/// own position rather than sharing the record walk's, for the same reason the
+/// metadata fold does — the record walk backs up for a message still being
+/// written, and this walk has no reason to.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ClaudeContinuityState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<TranscriptFileCursor>,
+    #[serde(default)]
+    pub evidence: crate::continuity::ContinuityEvidence,
+    /// Whether the first non-sidechain user record has been seen, so a
+    /// resumed pass does not take a later record's `parentUuid` for the
+    /// conversation's own first parent.
+    #[serde(default)]
+    pub first_user_seen: bool,
+    /// Whether any record has ever folded in. Distinguishes "this file says
+    /// nothing" — which retracts — from "nothing new arrived".
+    #[serde(default)]
+    pub any: bool,
+}
+
 /// Codex's per-source resume state: everything `ingest_codex_rollout` carries
 /// between records that a resumed pass cannot re-derive from the bytes it is
 /// about to read.
@@ -214,6 +250,15 @@ pub(crate) struct CodexCursorState {
     pub untokened_assistant_uid: Option<String>,
     #[serde(default)]
     pub saw_model_output: bool,
+    /// Tool-result ordering as of the committed offset.
+    ///
+    /// `call_index` and `event_index` are assigned over the whole rollout, so
+    /// a pass that resumes after a completed turn has to continue the
+    /// sequence. A fresh indexer restarted every resumed pass at zero and
+    /// gave the next turn's first result the index the last turn's already
+    /// had.
+    #[serde(default, skip_serializing_if = "is_default_indexer")]
+    pub tool_results: super::tool_result_facts::ToolResultIndexer,
     /// The turn a record falls inside, carried from the last `turn_context`.
     /// Codex writes it once per turn rather than on every record, so a pass
     /// that resumed mid-turn cannot re-derive it from the bytes it reads and
@@ -933,21 +978,39 @@ impl TranscriptReader {
         // extends `raw` until it finds a newline or reaches EOF, so a budget
         // consulted afterwards can only observe an allocation that already
         // happened.
-        let read = (&mut self.reader)
+        let mut read = (&mut self.reader)
             .take(MAX_RECORD_BYTES)
             .read_until(b'\n', &mut raw)?;
         if read == 0 {
             return Ok(None);
         }
-        if raw.last() != Some(&b'\n') {
-            if read as u64 == MAX_RECORD_BYTES {
-                // Over the ceiling. Get past it without ever holding it: drop
+        // Stopping at the ceiling is not the same claim as passing it: the
+        // limited read stops there whether the record ends at the ceiling or
+        // runs past it. One byte tells them apart, and a record that ends
+        // exactly on the ceiling is an ordinary record — refusing it would
+        // drop a complete line on every pass and report it as corruption.
+        if raw.last() != Some(&b'\n') && read as u64 == MAX_RECORD_BYTES {
+            match self.reader.fill_buf()?.first().copied() {
+                // The file ends here. Falls through to the tail handling
+                // below, which is what an unterminated final record gets.
+                None => {}
+                // Terminated, exactly on the ceiling.
+                Some(b'\n') => {
+                    self.reader.consume(1);
+                    raw.push(b'\n');
+                    read += 1;
+                }
+                // Genuinely over. Get past it without ever holding it: drop
                 // what was read and walk to the newline in fixed-size chunks.
-                drop(raw);
-                let terminated = self.drain_oversized_record()?;
-                return Ok(Some(ReadRecord::Oversized { terminated }));
+                Some(_) => {
+                    drop(raw);
+                    let terminated = self.drain_oversized_record()?;
+                    return Ok(Some(ReadRecord::Oversized { terminated }));
+                }
             }
-            // A genuine tail: the file ends here, under the ceiling.
+        }
+        if raw.last() != Some(&b'\n') {
+            // A genuine tail: the file ends here, at or under the ceiling.
             let Some(text) = decode_record(&raw) else {
                 self.undecodable += 1;
                 self.tail_bytes = read as u64;
@@ -1324,6 +1387,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A record that ends exactly on the ceiling is an ordinary record.
+    ///
+    /// The limited read stops at `MAX_RECORD_BYTES` whether the record ends
+    /// there or runs past it, so the read length alone cannot tell the two
+    /// apart. Treating both as oversized dropped a complete line on every
+    /// pass and reported it as corruption.
+    #[test]
+    fn a_record_ending_exactly_on_the_ceiling_is_a_record_not_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        // Valid JSON whose encoded length is exactly the ceiling.
+        let head = br#"{"a":""#;
+        let tail = br#""}"#;
+        let pad = MAX_RECORD_BYTES as usize - head.len() - tail.len();
+        let mut record = Vec::with_capacity(MAX_RECORD_BYTES as usize + 2);
+        record.extend_from_slice(head);
+        record.extend(std::iter::repeat_n(b'x', pad));
+        record.extend_from_slice(tail);
+        assert_eq!(record.len() as u64, MAX_RECORD_BYTES);
+
+        let read_first = |bytes: &[u8]| -> (ReadRecord, usize) {
+            let path = dir.path().join("transcript.jsonl");
+            fs::write(&path, bytes).unwrap();
+            let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+            let mut line = String::new();
+            let kind = reader.next_line(&mut line).unwrap().unwrap();
+            (kind, line.len())
+        };
+
+        // The file ends on the ceiling: a complete tail, handed over.
+        let (kind, len) = read_first(&record);
+        assert_eq!(kind, ReadRecord::Unterminated);
+        assert_eq!(len, MAX_RECORD_BYTES as usize);
+
+        // Terminated on the ceiling: an ordinary complete record. The reader
+        // hands the delimiter over with the line, as it does for every other
+        // terminated record; callers trim it before parsing.
+        let mut terminated = record.clone();
+        terminated.push(b'\n');
+        let (kind, len) = read_first(&terminated);
+        assert_eq!(kind, ReadRecord::Terminated);
+        assert_eq!(len, MAX_RECORD_BYTES as usize + 1);
+
+        // One byte past it, and it is over the ceiling after all.
+        let mut oversized = record.clone();
+        oversized.insert(head.len(), b'x');
+        oversized.push(b'\n');
+        let (kind, len) = read_first(&oversized);
+        assert_eq!(kind, ReadRecord::Oversized { terminated: true });
+        assert_eq!(len, 0, "an oversized record is never handed over");
     }
 
     /// Past the point where the ends meet, the window is what it says it is:

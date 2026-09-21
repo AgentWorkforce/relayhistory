@@ -2804,7 +2804,7 @@ fn ingest_codex_rollout_incremental(
     // These buffers need no resume state of their own: they are drained at
     // `task_complete`, which is the only record the cursor commits at, so they
     // are always empty at a committed offset.
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    let mut indexer = resume.tool_results.clone();
     let mut turn_error_signals: HashMap<String, &'static str> = HashMap::new();
     let mut pending_results: Vec<(String, String)> = Vec::new();
     let mut line_index = resume.next_line_index;
@@ -3020,6 +3020,7 @@ fn ingest_codex_rollout_incremental(
                             prev_totals,
                             pending_delta,
                             untokened_assistant_uid: untokened_assistant_uid.clone(),
+                            tool_results: indexer.clone(),
                             turn_id: turn_id.clone(),
                             saw_model_output,
                             previous_human_message: human_messages.remembered(),
@@ -3565,7 +3566,7 @@ fn sync_claude_session_metadata(
             // this skip through its delegation evidence instead, and a sidecar
             // is not a session: it has no row to owe and must not be re-read.
             if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
-                crate::continuity::capture_claude_transcript(conn, &path)?;
+                crate::continuity::capture_claude_transcript_at_locator(conn, &path)?;
             }
             continue;
         }
@@ -3686,7 +3687,7 @@ fn sync_claude_session_metadata(
             // reconciled once the whole walk has indexed everything it can
             // reach; a branch read before its origin is resolved by the same
             // pass rather than needing a second sync.
-            crate::continuity::capture_claude_transcript(conn, &path)?;
+            crate::continuity::capture_claude_transcript_at_locator(conn, &path)?;
             upserted += 1;
         }
     }

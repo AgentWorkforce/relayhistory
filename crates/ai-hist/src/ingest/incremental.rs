@@ -74,6 +74,12 @@ struct DeferredMessage {
     line_index: usize,
     lines: Vec<(usize, String)>,
     bytes: usize,
+    /// Tool-result ordering as it stood before this message was held.
+    ///
+    /// The commit backs up to the earliest held message, so this is the state
+    /// that belongs with the committed offset. Storing the end-of-pass state
+    /// instead let every re-read of the held region claim fresh indexes.
+    tool_results: crate::ingest::tool_result_facts::ToolResultIndexer,
 }
 
 /// Read a Claude transcript from its cursor and index what is complete.
@@ -121,6 +127,11 @@ pub(crate) fn ingest_claude_transcript_incremental(
     } else {
         claude.next_line_index
     };
+    if reader.start_offset() == saved_claude.resume_from.unwrap_or(u64::MAX) {
+        if let Some(rewound) = saved_claude.resume_tool_results.clone() {
+            claude.tool_results = rewound;
+        }
+    }
     // Nothing has been appended since the last pass, so whatever was still
     // being written then is not going to be finished. Holding it back again
     // would hold it back forever.
@@ -132,6 +143,10 @@ pub(crate) fn ingest_claude_transcript_incremental(
     let mut deferred_order: Vec<String> = Vec::new();
     let mut deferred_bytes = 0usize;
 
+    // Tool-result ordering as it stood before the unterminated trailing
+    // record, if there is one.
+    let mut unterminated_tool_results: Option<crate::ingest::tool_result_facts::ToolResultIndexer> =
+        None;
     // Where an unterminated trailing record began, and the index it was given.
     let mut unterminated: Option<(u64, usize)> = None;
     let mut line = String::new();
@@ -154,6 +169,11 @@ pub(crate) fn ingest_claude_transcript_incremental(
             break;
         }
         let index = line_index;
+        // Taken before the record is indexed, and only for the one record a
+        // later pass can rewind to.
+        if kind == ReadRecord::Unterminated {
+            unterminated_tool_results = Some(claude.tool_results.clone());
+        }
         // A record with no newline is considered only if it is complete
         // JSON. A half-written line is not, and a writer appends a line at a
         // time, so parsing is the available evidence that the provider
@@ -224,6 +244,9 @@ pub(crate) fn ingest_claude_transcript_incremental(
                         DeferredMessage {
                             offset: line_start,
                             line_index: index,
+                            // Held, not indexed, so the current state is the
+                            // state before this message.
+                            tool_results: claude.tool_results.clone(),
                             lines: vec![(index, line.clone())],
                             bytes: line.len(),
                         },
@@ -267,16 +290,20 @@ pub(crate) fn ingest_claude_transcript_incremental(
     // reads it again from its first byte and can see the completion when it
     // arrives. With nothing in progress the commit is the end of the last
     // complete line.
-    let (commit_offset, commit_line_index) =
+    let (commit_offset, commit_line_index, commit_tool_results) =
         match deferred_order.first().and_then(|id| deferred.get(id)) {
-            Some(entry) => (entry.offset, entry.line_index),
+            Some(entry) => (entry.offset, entry.line_index, entry.tool_results.clone()),
             // With an unterminated record indexed, commit past it so a file
             // nobody has touched compares equal to its cursor and is skipped
             // outright; `resume_from` is what brings the reader back to it if
             // the file ever grows.
             None => match unterminated {
-                Some((start, _)) => (start + reader.tail_bytes(), line_index),
-                None => (reader.position(), line_index),
+                Some((start, _)) => (
+                    start + reader.tail_bytes(),
+                    line_index,
+                    claude.tool_results.clone(),
+                ),
+                None => (reader.position(), line_index, claude.tool_results.clone()),
             },
         };
     pass.in_progress = deferred_order.clone();
@@ -291,6 +318,10 @@ pub(crate) fn ingest_claude_transcript_incremental(
     };
     claude.resume_from = resume_from;
     claude.resume_line_index = resume_line_index;
+    claude.resume_tool_results = resume_from.and(unterminated_tool_results);
+    // The ordering that belongs with the committed offset, not with wherever
+    // the pass happened to stop.
+    claude.tool_results = commit_tool_results;
     // A pass whose file was rewritten under it records nothing at all — not
     // the position, not the parser state. Its rows came from bytes that are no
     // longer there, and the next pass reads the same region again and upserts
