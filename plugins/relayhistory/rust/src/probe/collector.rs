@@ -240,10 +240,15 @@ fn capture_with_stop(
 
 #[cfg(test)]
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
-    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)))
+    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), false)
 }
 
-fn cycle_with_stop(directory: &Path, config: &Config, cancelled: Arc<AtomicBool>) -> Result<()> {
+fn cycle_with_stop(
+    directory: &Path,
+    config: &Config,
+    cancelled: Arc<AtomicBool>,
+    before_exit: bool,
+) -> Result<()> {
     super::bridge::enforce_selection(directory, config)?;
     let conn = ai_hist::open_db(&directory.join("history.db"))?;
     let status = delivery::status(&conn, &config.job_id)?;
@@ -261,17 +266,22 @@ fn cycle_with_stop(directory: &Path, config: &Config, cancelled: Arc<AtomicBool>
     }
     run_capture_cycle(
         selected,
-        || deliver_captured_with_stop(directory, config, false, &cancelled),
-        || {
-            let status = delivery::status(&conn, &config.job_id)?;
-            Ok(status.bootstrap_complete
-                && status.pending_records == 0
-                && status.unqueued_changes == 0)
-        },
+        || deliver_captured_with_stop(directory, config, before_exit, &cancelled),
+        || ready_to_capture(&conn, &config.job_id),
         || capture_selected(directory, config, &cancelled),
         || capture_with_stop(directory, &config.history_url, cancelled.clone()),
         || stopping(&cancelled),
     )
+}
+
+fn ready_to_capture(conn: &Connection, job_id: &str) -> Result<bool> {
+    let status = delivery::status(conn, job_id)?;
+    // A retry deadline means delivery cannot progress yet. Keep capturing
+    // locally while offline rather than waiting for the remote queue to clear.
+    Ok(status.next_attempt_ms > now()
+        || (status.bootstrap_complete
+            && status.pending_records == 0
+            && status.unqueued_changes == 0))
 }
 
 // Tests inject a failing/blocked unrelated provider. Selected cycles never
@@ -279,21 +289,23 @@ fn cycle_with_stop(directory: &Path, config: &Config, cancelled: Arc<AtomicBool>
 fn run_capture_cycle(
     selected: bool,
     deliver: impl Fn() -> Result<()>,
-    caught_up: impl Fn() -> Result<bool>,
+    capture_ready: impl Fn() -> Result<bool>,
     targeted: impl Fn() -> Result<()>,
     broad: impl Fn() -> Result<()>,
     stopped: impl Fn() -> bool,
 ) -> Result<()> {
-    deliver()?;
-    if stopped() || (selected && !caught_up()?) {
-        return Ok(());
+    let delivered = deliver();
+    if stopped() || (delivered.is_ok() && selected && !capture_ready()?) {
+        return delivered;
     }
+    // Delivery errors must remain visible, but must not prevent acquiring
+    // local evidence while credentials, transport or receiver state recover.
     let capture = if selected { targeted() } else { broad() };
     if stopped() {
-        return capture;
+        return delivered.and(capture);
     }
     let drained = deliver();
-    capture.and(drained)
+    delivered.and(capture).and(drained)
 }
 
 fn capture_selected(directory: &Path, config: &Config, cancelled: &Arc<AtomicBool>) -> Result<()> {
@@ -394,6 +406,16 @@ fn capture_diagnostic(
         eprintln!("{diagnostic}");
     }
     Ok(())
+}
+
+/// All/new setup has already captured before creating its baseline. Selected
+/// setup stays shallow unless --once makes this the only capture opportunity.
+pub fn finish_setup(directory: &Path, config: &Config, once: bool) -> Result<()> {
+    if once && super::bridge::mode(config) == super::bridge::SharingMode::Selected {
+        cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)), true)
+    } else {
+        deliver_captured(directory, config, true)
+    }
 }
 
 pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
@@ -543,6 +565,16 @@ impl Drop for InventoryWorker {
         let _ = self.0.send(());
     }
 }
+fn inventory_options() -> ai_hist::DiscoverOptions {
+    ai_hist::DiscoverOptions {
+        scope: ai_hist::SessionScope::Local,
+        sources: vec![],
+        // This independent worker builds the complete catalog. A recency cap
+        // would rediscover the same newest rows forever on selected installs.
+        limit: None,
+    }
+}
+
 fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWorker {
     let directory = directory.to_path_buf();
     let (finish, done) = mpsc::channel();
@@ -562,11 +594,7 @@ fn start_inventory(directory: &Path, cancelled: Arc<AtomicBool>) -> InventoryWor
                 let stop = cancelled.clone();
                 ai_hist::discover_sessions_cancellable(
                     &conn,
-                    &ai_hist::DiscoverOptions {
-                        scope: ai_hist::SessionScope::Local,
-                        sources: vec![],
-                        limit: Some(1000),
-                    },
+                    &inventory_options(),
                     |_| count += 1,
                     move || stopping(&stop),
                 )?;
@@ -625,7 +653,7 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
     while !stopping(&stop.cancelled) {
         let result = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
-            cycle_with_stop(directory, &config, stop.cancelled.clone())
+            cycle_with_stop(directory, &config, stop.cancelled.clone(), false)
         } else {
             deliver_captured_with_stop(directory, &config, false, &stop.cancelled)
         };
@@ -729,6 +757,154 @@ pub fn start_background(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use fs2::FileExt;
+    #[test]
+    fn selected_once_setup_hydrates_only_members_even_when_delivery_is_unavailable() {
+        // Hydration validates source paths against configured provider roots.
+        // Run alone in a subprocess so fixture roots cannot race other tests.
+        const CHILD: &str = "RELAYHISTORY_TEST_SELECTED_ONCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "collector::tests::selected_once_setup_hydrates_only_members_even_when_delivery_is_unavailable", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        let project = home.path().join(".claude/projects/synthetic");
+        fs::create_dir_all(&project).unwrap();
+        for session in ["selected", "private"] {
+            let record = json!({"sessionId":session,"uuid":format!("u-{session}"),"type":"user","message":{"role":"user","content":"synthetic"},"timestamp":"2026-09-01T01:00:00Z"});
+            fs::write(
+                project.join(format!("{session}.jsonl")),
+                format!("{record}\n"),
+            )
+            .unwrap();
+        }
+        let conn = ai_hist::open_db(&home.path().join("history.db")).unwrap();
+        let env = ai_hist::DiscoveryEnv::with_roots(
+            &conn,
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        ai_hist::discover_sessions_with_env(&env, &inventory_options(), |_| {}).unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(false), now()).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &job.job_id,
+            &delivery::SessionIdentity {
+                source: "claude".into(),
+                session_id: "selected".into(),
+            },
+            true,
+        )
+        .unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://synthetic.invalid".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            // Invalid URL fails before any credentials or transport can be used.
+            history_url: "invalid synthetic URL".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: false,
+            sharing_mode: Some(super::super::bridge::SharingMode::Selected),
+            acknowledge_uninspected_schedules: false,
+        };
+        save_json(&home.path().join("config.json"), &config).unwrap();
+        let events = || {
+            conn.query_row("SELECT COUNT(*) FROM session_events", [], |r| {
+                r.get::<_, usize>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(events(), 0);
+        // Background setup stays shallow; the collector will hydrate later.
+        assert!(finish_setup(home.path(), &config, false).is_err());
+        assert_eq!(events(), 0);
+        delivery::pause_job(&conn, &config.job_id).unwrap();
+        finish_setup(home.path(), &config, true).unwrap();
+        assert_eq!(events(), 0, "paused selected setup must not hydrate");
+        delivery::resume_job(&conn, &config.job_id).unwrap();
+        assert!(finish_setup(home.path(), &config, true).is_err());
+        assert_eq!(
+            events(),
+            1,
+            "selected --once must capture before returning the delivery error"
+        );
+        let session: String = conn
+            .query_row("SELECT session_id FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session, "selected");
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join("capture-diagnostic.json")).unwrap())
+                .unwrap();
+        assert_eq!(diagnostic["sessions_captured"], 1);
+        assert_eq!(diagnostic["failures"], 0);
+    }
+
+    #[test]
+    fn selected_inventory_discovers_sessions_older_than_the_first_thousand() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/synthetic");
+        fs::create_dir_all(&project).unwrap();
+        for n in 0..1001 {
+            let path = project.join(format!("session-{n:04}.jsonl"));
+            let record = json!({"sessionId":format!("session-{n:04}"),"uuid":format!("u-{n}"),"type":"user","message":{"role":"user","content":"synthetic"},"timestamp":"2026-09-01T01:00:00Z"});
+            fs::write(&path, format!("{record}\n")).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(n + 1),
+                    ),
+                )
+                .unwrap();
+        }
+        let conn = ai_hist::open_db(&home.path().join("history.db")).unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(true), now()).unwrap();
+        let env = ai_hist::DiscoveryEnv::with_roots(
+            &conn,
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        for _ in 0..2 {
+            let mut found = std::collections::HashSet::new();
+            ai_hist::discover_sessions_with_env(&env, &inventory_options(), |row| {
+                found.insert(row.session_id.clone());
+            })
+            .unwrap();
+            assert_eq!(
+                found.len(),
+                1001,
+                "periodic inventory must not repeatedly cap the same newest sessions"
+            );
+            assert!(found.contains("session-0000"));
+        }
+        let oldest_known: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE source='claude' AND session_id='session-0000')", [], |r| r.get(0)).unwrap();
+        assert!(oldest_known);
+        assert!(delivery::job_sessions(&conn, &job.job_id)
+            .unwrap()
+            .is_empty());
+        assert!(delivery::prepare_batch(&conn, &job.job_id, now())
+            .unwrap()
+            .batch_id
+            .is_none());
+    }
+
     #[test]
     fn fake_receiver_drains_selected_backlog_despite_failing_capture_and_private_discovery() {
         struct Fake(std::cell::RefCell<Vec<String>>);
@@ -845,6 +1021,94 @@ mod tests {
             21
         );
     }
+    #[test]
+    fn delivery_errors_do_not_prevent_selected_or_broad_capture() {
+        for selected in [true, false] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let error = run_capture_cycle(
+                selected,
+                || {
+                    calls.borrow_mut().push("deliver");
+                    Err(anyhow::anyhow!("synthetic credential failure"))
+                },
+                || panic!("delivery failure must not suppress capture behind backlog"),
+                || {
+                    calls.borrow_mut().push("targeted");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("broad");
+                    Ok(())
+                },
+                || false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                calls.into_inner(),
+                vec![
+                    "deliver",
+                    if selected { "targeted" } else { "broad" },
+                    "deliver"
+                ]
+            );
+            assert_eq!(error.to_string(), "synthetic credential failure");
+        }
+    }
+
+    #[test]
+    fn selected_retry_backoff_does_not_starve_local_capture() {
+        let conn = Connection::open_in_memory().unwrap();
+        ai_hist::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','selected')",
+            [],
+        )
+        .unwrap();
+        let job = delivery::create_session_job(&conn, &job_config(true), now()).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &job.job_id,
+            &delivery::SessionIdentity {
+                source: "claude".into(),
+                session_id: "selected".into(),
+            },
+            true,
+        )
+        .unwrap();
+        delivery::prepare_batch(&conn, &job.job_id, now()).unwrap();
+        assert!(
+            delivery::status(&conn, &job.job_id)
+                .unwrap()
+                .pending_records
+                > 0
+        );
+        let captures = std::cell::Cell::new(0);
+        for waiting in [false, true, false] {
+            conn.execute(
+                "UPDATE delivery_jobs SET next_attempt_ms=? WHERE id=?",
+                rusqlite::params![if waiting { now() + 60_000 } else { 0 }, job.job_id],
+            )
+            .unwrap();
+            run_capture_cycle(
+                true,
+                || Ok(()),
+                || ready_to_capture(&conn, &job.job_id),
+                || {
+                    captures.set(captures.get() + 1);
+                    Ok(())
+                },
+                || panic!("selected mode must not use broad capture"),
+                || false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            captures.get(),
+            1,
+            "capture runs during backoff, but an eligible backlog retains priority"
+        );
+    }
+
     #[test]
     fn selected_backlog_does_not_enter_unrelated_capture() {
         use std::cell::Cell;

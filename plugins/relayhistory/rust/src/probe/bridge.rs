@@ -183,12 +183,27 @@ pub fn start(directory: &Path) -> Result<()> {
     Ok(())
 }
 pub fn status(directory: &Path) -> Result<()> {
+    emit(status_value(directory)?);
+    Ok(())
+}
+fn status_value(directory: &Path) -> Result<Value> {
     let config = read_config(directory)?;
     let conn = read_db(directory)?;
     let job = delivery::status(&conn, &config.job_id)?;
     let withheld = excluded(&conn)?;
     let rows = identities(&conn)?;
-    let shared = rows.iter().filter(|r| !withheld.contains(*r)).count();
+    let scoped = delivery::is_session_job(&conn, &config.job_id)?;
+    let members: HashSet<_> = if scoped {
+        delivery::job_sessions(&conn, &config.job_id)?
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let shared = rows
+        .iter()
+        .filter(|r| !withheld.contains(*r) && (!scoped || members.contains(*r)))
+        .count();
     let mut result = summary(directory, &config)?;
     result["probe_version"] = json!(env!("CARGO_PKG_VERSION"));
     result["delivery"] = serde_json::to_value(job)?;
@@ -203,8 +218,7 @@ pub fn status(directory: &Path) -> Result<()> {
         .ok()
         .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
         .unwrap_or(Value::Null);
-    emit(result);
-    Ok(())
+    Ok(result)
 }
 pub fn pause(directory: &Path, paused: bool) -> Result<()> {
     let _control = control_lock(directory)?;
@@ -660,6 +674,70 @@ mod tests {
         save_json(&dir.join("sharing-change.json"), &plan).unwrap();
         recover(dir).unwrap();
         read_config(dir).unwrap()
+    }
+
+    #[test]
+    fn selected_status_counts_only_known_members_not_globally_excluded() {
+        for fresh in [true, false] {
+            let (dir, mut config) = fixture(if fresh {
+                SharingMode::All
+            } else {
+                SharingMode::Selected
+            });
+            let conn = db(dir.path()).unwrap();
+            if fresh {
+                let old = delivery::status(&conn, &config.job_id).unwrap();
+                delivery::cancel_job(&conn, &config.job_id).unwrap();
+                config.job_id = delivery::create_session_job(&conn, &old.config, collector::now())
+                    .unwrap()
+                    .job_id;
+                config.sharing_mode = Some(SharingMode::Selected);
+                config.include_existing = false;
+                save_json(&dir.path().join("config.json"), &config).unwrap();
+            }
+            config = apply(dir.path(), config, None, &["claude:old"], true);
+            conn.execute(
+                "INSERT INTO sessions(source,session_id) VALUES ('codex','private-discovery')",
+                [],
+            )
+            .unwrap();
+            delivery::set_job_session(
+                &conn,
+                &config.job_id,
+                &parse_key("claude:not-in-catalog").unwrap(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                status_value(dir.path()).unwrap()["sessions"],
+                json!({"total":3,"shared":1,"excluded":2})
+            );
+            let rows = session_rows(dir.path(), &config, 500).unwrap();
+            assert_eq!(rows.iter().filter(|r| r["included"] == true).count(), 1);
+            delivery::set_session_excluded(&conn, &parse_key("claude:old").unwrap(), true).unwrap();
+            assert_eq!(
+                status_value(dir.path()).unwrap()["sessions"],
+                json!({"total":3,"shared":0,"excluded":3})
+            );
+            assert!(session_rows(dir.path(), &config, 500)
+                .unwrap()
+                .iter()
+                .all(|r| r["included"] == false));
+        }
+    }
+
+    #[test]
+    fn status_keeps_exclusion_counts_for_all_new_and_legacy_jobs() {
+        for mode in [SharingMode::All, SharingMode::New, SharingMode::Selected] {
+            let (dir, config) = fixture(mode);
+            let conn = db(dir.path()).unwrap();
+            assert!(!delivery::is_session_job(&conn, &config.job_id).unwrap());
+            let shared = if mode == SharingMode::All { 2 } else { 0 };
+            assert_eq!(
+                status_value(dir.path()).unwrap()["sessions"],
+                json!({"total":2,"shared":shared,"excluded":2-shared})
+            );
+        }
     }
 
     #[test]

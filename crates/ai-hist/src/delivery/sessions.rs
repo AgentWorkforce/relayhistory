@@ -138,7 +138,9 @@ pub(super) fn record_allowed(
             .get("child_session_id")
             .and_then(|v| v.as_str())
         {
-            return Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND source=? AND session_id=?)",params![job_id,record.source,child],|r|r.get(0))?);
+            // Both endpoints must still belong to the inclusion that admitted
+            // this revision. Child re-inclusion journals a fresh eligible edge.
+            return allowed(Some(child));
         }
     }
     Ok(true)

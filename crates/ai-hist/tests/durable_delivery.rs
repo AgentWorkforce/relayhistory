@@ -1174,3 +1174,48 @@ fn scoped_child_inclusion_restores_relationship_without_replaying_parent_records
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].kind, "relationship");
 }
+
+#[test]
+fn scoped_child_reinclusion_rejects_old_prepared_relationships() {
+    for prepared in [false, true] {
+        let conn = db();
+        conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES('claude','parent','edge','child','delegation','observed','old',1,1)",[]).unwrap();
+        let mut cfg = config("relationship-reinclude");
+        cfg.selection.kinds = vec!["relationship".into()];
+        let root = create_session_job(&conn, &cfg, 0).unwrap();
+        let child = SessionIdentity {
+            source: "claude".into(),
+            session_id: "child".into(),
+        };
+        let parent = SessionIdentity {
+            source: "claude".into(),
+            session_id: "parent".into(),
+        };
+        set_job_session(&conn, &root.job_id, &child, true).unwrap();
+        set_job_session(&conn, &root.job_id, &parent, true).unwrap();
+        let old = claim(&conn, &root.job_id, 1).unwrap();
+        assert_eq!(old.batch.records.len(), 1);
+        if prepared {
+            prepare(&conn, &old, 1);
+        }
+        set_job_session(&conn, &root.job_id, &child, false).unwrap();
+        assert!(validate_dispatch(&conn, &old.lease, &|| 2).is_err());
+        conn.execute("UPDATE session_relationships SET evidence_kind='fresh'", [])
+            .unwrap();
+        set_job_session(&conn, &root.job_id, &child, true).unwrap();
+        let cutoff: i64 = conn.query_row("SELECT cutoff FROM delivery_session_members WHERE job_id=? AND source='claude' AND session_id='child'", [&root.job_id], |r| r.get(0)).unwrap();
+        assert!(old.batch.records[0].revision < cutoff);
+        assert!(
+            claim_batch(&conn, &root.job_id, "retry", 1000, &|| 3)
+                .unwrap()
+                .is_none(),
+            "a child's new membership must not revive a stale relationship"
+        );
+        let records = drain(&conn, &root.job_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "relationship");
+        assert_eq!(records[0].payload["evidence_kind"], "fresh");
+        assert!(records[0].revision >= cutoff);
+        assert_ne!(records[0].revision_id, old.batch.records[0].revision_id);
+    }
+}

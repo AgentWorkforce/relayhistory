@@ -492,7 +492,7 @@ fn install(options: Install) -> Result<()> {
     // Desktop setup becomes ready after capture/credentials; the supervised
     // collector handles delivery and offline retries without blocking login.
     if options.once || !bridge::json_mode() {
-        collector::deliver_captured(&directory, &config, true)?;
+        collector::finish_setup(&directory, &config, options.once)?;
     }
     if options.once {
         humanln!("One capture/delivery cycle completed.");
