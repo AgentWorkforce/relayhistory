@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  installChildEnv,
   installWithRegistryRetry,
   isRegistryVisibilityFailure,
 } from './npm-install-with-registry-retry.mjs';
@@ -78,6 +79,22 @@ test('fails after the bounded number of registry visibility attempts', async () 
     /after 3 attempts/,
   );
   assert.equal(calls, 3);
+});
+
+test('supplied env is the child environment, not a patch on process.env', () => {
+  const previous = process.env.NODE_AUTH_TOKEN;
+  process.env.NODE_AUTH_TOKEN = 'from-parent';
+  try {
+    const patched = installChildEnv({ env: { PATH: '/bin' } }, '/tmp/cache');
+    assert.equal(patched.PATH, '/bin');
+    assert.equal(patched.npm_config_cache, '/tmp/cache');
+    assert.equal('NODE_AUTH_TOKEN' in patched, false);
+    const inherited = installChildEnv({}, '/tmp/cache');
+    assert.equal(inherited.NODE_AUTH_TOKEN, 'from-parent');
+  } finally {
+    if (previous === undefined) delete process.env.NODE_AUTH_TOKEN;
+    else process.env.NODE_AUTH_TOKEN = previous;
+  }
 });
 
 test('retries clear node_modules under options.cwd, not process.cwd', async () => {

@@ -13,13 +13,18 @@ export function isRegistryVisibilityFailure(output) {
   return /\b(?:ETARGET|E404)\b/.test(output);
 }
 
+/** Child env for npm install. `extra.env`, when present, is the whole env — not a patch. */
+export function installChildEnv(extra = {}, cache) {
+  return { ...(extra.env ?? process.env), npm_config_cache: cache };
+}
+
 function runNpmInstall(args, extra = {}) {
   const cache = mkdtempSync(join(tmpdir(), 'ai-hist-npm-cache-'));
   try {
     const result = spawnSync('npm', ['install', '--prefer-online', ...args], {
       encoding: 'utf8',
       cwd: extra.cwd,
-      env: { ...process.env, ...extra.env, npm_config_cache: cache },
+      env: installChildEnv(extra, cache),
     });
     if (result.error) throw result.error;
     return {

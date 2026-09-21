@@ -158,7 +158,7 @@ test("linux install tells npm the helper's libc family", () => {
     pluginInstallArgs("/tmp/verify", "musl"),
     ["--prefix", "/tmp/verify", "--libc=musl"],
   );
-  assert.deepEqual(pluginInstallArgs("/tmp/verify", undefined), ["--prefix", "/tmp/verify"]);
+  assert.deepEqual(pluginInstallArgs("/tmp/verify", null), ["--prefix", "/tmp/verify"]);
 });
 
 test("public registry install drops the publish job's npm token and userconfig", () => {
