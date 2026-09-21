@@ -483,6 +483,10 @@ const offClassRuns = {
 const check = (verdict, phase, metric) =>
   verdict.checks.find((entry) => entry.phase === phase && entry.metric === metric);
 
+/** The committed noise floor for `unchanged_sync`, and the off-class cap. */
+const noiseFloor = thresholds.policy.absoluteFloorsByPhase.unchanged_sync.elapsedMs;
+const cap = thresholds.policy.offClassCalibrationCap ?? OFF_CLASS_CALIBRATION_CAP;
+
 test("a runner the baselines never saw is not failed for being that runner", () => {
   for (const [label, run] of Object.entries(offClassRuns)) {
     const verdict = evaluateGate(run, thresholds, "ci-debug");
@@ -493,11 +497,15 @@ test("a runner the baselines never saw is not failed for being that runner", () 
     assert.ok(verdict.offClass, `${label} is off the baseline class`);
 
     // `unchanged_sync`'s ceiling comes from the absolute floor, not from its
-    // own baseline, so off class it is advisory rather than fatal.
+    // own baseline, so off class it is widened by the cap and a breach inside
+    // that widening is advisory rather than fatal. Both numbers are read from
+    // the policy: #166 moved the floor from 120 ms to 140 ms and this rule is
+    // about where a bound comes from, not about its value.
     const unchanged = check(verdict, "unchanged_sync", "elapsedMs");
-    assert.equal(unchanged.bound, 120, `${label} keeps the raw ceiling visible`);
-    assert.equal(unchanged.effectiveBound, 240, `${label} widens it by the cap`);
-    assert.equal(unchanged.advisory, true, `${label} reports it as advisory`);
+    assert.equal(unchanged.bound, noiseFloor, `${label} keeps the raw ceiling visible`);
+    assert.equal(unchanged.effectiveBound, noiseFloor * cap, `${label} widens it by the cap`);
+    assert.equal(unchanged.advisory, unchanged.value > noiseFloor,
+      `${label} is advisory exactly when it is past the raw ceiling`);
 
     // A bound that does come from a baseline is scaled by the calibration
     // instead, and never past the cap.
@@ -506,18 +514,31 @@ test("a runner the baselines never saw is not failed for being that runner", () 
     assert.ok(Math.abs(incremental.effectiveBound - 848 * ratio) < 0.5, label);
     assert.equal(incremental.advisory, false, `${label} did not need the widening`);
 
-    // The same numbers on a CPU the baselines were measured on still fail:
-    // nothing about the on-class gate moved.
+    // The same numbers on a CPU the baselines were measured on get the raw
+    // bounds: nothing about the on-class gate moved.
     const onClass = evaluateGate(
       { ...run, machine: { cpu: "Intel(R) Xeon(R) 6973P-C" } }, thresholds, "ci-debug",
     );
-    assert.equal(onClass.ok, false, `${label} on a baseline CPU must still fail`);
-    assert.match(onClass.failures.join("\n"), /unchanged_sync\.elapsedMs/);
+    assert.deepEqual(onClass.warnings, [], `${label} on class: no unfamiliar-CPU warning`);
     for (const entry of onClass.checks) {
       assert.equal(entry.effectiveBound, entry.bound, `${label} on class: bounds untouched`);
       assert.equal(entry.advisory, false, `${label} on class: nothing is advisory`);
     }
+    // And a run over the raw ceiling is still red there. #204 is the one that
+    // is: #166 raised the floor to 140 ms, which absorbs the other two.
+    assert.equal(onClass.ok, unchanged.value <= noiseFloor,
+      `${label} on a baseline CPU: ${onClass.failures.join("; ")}`);
+    if (unchanged.value > noiseFloor) {
+      assert.match(onClass.failures.join("\n"), /unchanged_sync\.elapsedMs/);
+    }
   }
+  // The strictness the widening is measured against, stated once: on the
+  // baseline class #204 fails, off it the same numbers are advisory.
+  assert.ok(
+    offClassRuns["#204 run 35547876206"].phases
+      .find((phase) => phase.phase === "unchanged_sync").elapsedMs > noiseFloor,
+    "#204 is still past the raw ceiling, so the on-class assertion above has teeth",
+  );
 });
 
 test("the off-class allowance only ever loosens, and stops at the cap", () => {
@@ -535,7 +556,7 @@ test("the off-class allowance only ever loosens, and stops at the cap", () => {
   assert.equal(crawling.offClassScale, OFF_CLASS_CALIBRATION_CAP);
   assert.equal(check(crawling, "incremental_sync", "elapsedMs").effectiveBound, 848 * 2);
   assert.equal(check(crawling, "cold_sync", "recordsPerSecond").effectiveBound, 239 / 2);
-  assert.equal(check(crawling, "unchanged_sync", "elapsedMs").effectiveBound, 240);
+  assert.equal(check(crawling, "unchanged_sync", "elapsedMs").effectiveBound, noiseFloor * cap);
 });
 
 test("a cap that would tighten the gate is refused", () => {
@@ -590,7 +611,7 @@ test("a widened bound is printed next to the raw one, on the line and in the fai
   const lines = verdict.checks.map(renderCheck);
   const line = lines.find((entry) => entry.includes("unchanged_sync.elapsedMs"));
   assert.match(line, /^warn /, "a check that only passed because of the widening says so");
-  assert.match(line, /bound 120 -> 240 off-class x2\.00/);
+  assert.match(line, new RegExp(`bound ${noiseFloor} -> ${noiseFloor * cap} off-class x2\\.00`));
   // A check the widening did not touch reads exactly as it did before.
   assert.match(
     lines.find((entry) => entry.includes("unchanged_sync.peakRssBytes")),
@@ -612,7 +633,8 @@ test("a widened bound is printed next to the raw one, on the line and in the fai
   const failed = evaluateGate(blown, thresholds, "ci-debug");
   assert.match(
     failed.failures.join("\n"),
-    /unchanged_sync\.elapsedMs = 1,020, baseline 51, ceiling 120 \(off-class ceiling 240, widened 2\.00x\)/,
+    new RegExp(`unchanged_sync\\.elapsedMs = 1,020, baseline 51, ceiling ${noiseFloor} `
+      + `\\(off-class ceiling ${noiseFloor * cap}, widened 2\\.00x\\)`),
   );
   // And the footer stops telling the reader to blame the hardware first.
   const footer = failureFooter(failed, thresholds.profiles["ci-debug"]);

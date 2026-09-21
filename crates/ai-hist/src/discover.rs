@@ -83,7 +83,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 3;
+pub const SHALLOW_SCANNER_VERSION: u32 = 4;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -91,6 +91,15 @@ pub const SHALLOW_SCANNER_VERSION: u32 = 3;
 /// is this version, and reusing 2 would leave those catalogs permanently missing
 /// the sessions. Kept as a compile-time guard so the pair cannot drift apart.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
+
+/// Version 3 shipped the prompt-only Cursor reader: it recorded a first
+/// prompt and an mtime, and nothing else. Version 4 extracts the injected turn
+/// times, the models and the last assistant reply, and a Cursor transcript's
+/// bytes do not change when the release does — so without this bump every row
+/// an earlier install wrote would be served from cache with those fields null
+/// forever. Kept as a compile-time guard for the same reason as the pair
+/// above.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -135,15 +144,19 @@ pub struct ShallowSession {
     /// Git branch the provider reported, last observed value. Observed.
     pub git_branch: Option<String>,
     /// Earliest activity timestamp the provider records. Observed. `None`
-    /// when the provider records no timestamps at all (cursor).
+    /// when the provider recorded none — for cursor that means the build
+    /// wrote no `<timestamp>` tag into any turn it read, not that cursor
+    /// never records a time.
     pub first_activity_ms: Option<i64>,
     /// Latest activity timestamp. Observed where the provider records one;
-    /// filesystem-derived (file mtime) for cursor, which records none.
+    /// for cursor that is the last readable injected `<timestamp>`, falling
+    /// back to the file mtime when the read found none.
     pub last_activity_ms: Option<i64>,
     /// Bounded excerpt of the first substantive human prompt. **Derived.**
     pub first_prompt: Option<String>,
-    /// Bounded excerpt of the last assistant text. Observed; only populated by
-    /// the full-ingest path, so a purely shallow row leaves it `None`.
+    /// Bounded excerpt of the last assistant text. Observed. Most providers
+    /// populate it only on the full-ingest path, so their shallow rows leave
+    /// it `None`; cursor fills it from the bounded tail read.
     pub last_assistant_text: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
@@ -1134,10 +1147,16 @@ impl ShallowSessionProvider for CursorProvider {
     fn source(&self) -> &'static str {
         "cursor"
     }
-    /// The local parser reads user prompts only. Cursor's store exposes no
-    /// assistant turns, tool calls, file edits or delegation to this reader.
+    /// The transcript parser writes prompts, events, tool calls and file edits.
+    /// Delegation is deliberately absent: a Cursor `Task` block names no child
+    /// transcript, so no relationship row is ever written.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[EvidenceKind::History]
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ]
     }
 
     fn enumerate(
@@ -1191,6 +1210,41 @@ impl ShallowSessionProvider for CursorProvider {
             })
             .map(|prompt| excerpt(&prompt))
             .find(|prompt| !prompt.is_empty());
+        // Cursor writes no timestamp field and no model on its records. The
+        // only time signal in the file is the localized `<timestamp>` tag its
+        // client injects into a human turn, so the head read looks for that
+        // and reports nothing when the build did not write one. `models` is
+        // read from `message.model` for the builds that write it; an empty
+        // list means "not seen", never "no model".
+        let mut head_times = bounded.head_records().filter_map(cursor_record_time);
+        let first_activity_ms = head_times.next();
+        // For a transcript past the head budget the tail is a separate region,
+        // so a turn time that only appears in the head is unreachable from the
+        // tail scan. A long run of assistant and tool records after one dated
+        // human turn is the ordinary shape of that: the tail finds no tag,
+        // because only a human turn carries one, and falling straight to the
+        // mtime reported a session as having last spoken "now". Full ingestion
+        // disagrees — those records inherit the open turn's time — and because
+        // the discovery upsert merges `last_activity_ms` with `MAX`, the mtime
+        // would also re-expand a window a rebuild had just retracted. The last
+        // time the head could read is the best recorded evidence there is; the
+        // mtime stays for a transcript with no readable turn time at all.
+        let last_head_ms = head_times.last().or(first_activity_ms);
+        let last_activity_ms = bounded
+            .tail_records_rev()
+            .find_map(cursor_record_time)
+            .or(last_head_ms)
+            .or_else(|| crate::file_modified_ms(&path));
+        let mut models = Vec::new();
+        for model in bounded.head_records().filter_map(cursor_record_model) {
+            if !models.contains(&model) {
+                models.push(model);
+            }
+        }
+        let last_assistant_text = bounded
+            .tail_records_rev()
+            .find_map(cursor_assistant_text)
+            .map(|text| excerpt(&text));
         let cwd = path
             .parent()
             .and_then(Path::parent)
@@ -1202,17 +1256,61 @@ impl ShallowSessionProvider for CursorProvider {
             source: "cursor".into(),
             session_id,
             cwd,
-            // Cursor transcripts carry no per-message timestamps at all. The
-            // file mtime is the only time signal, so it is reported as
-            // last_activity (filesystem-derived) and first_activity stays
-            // NULL rather than being invented.
-            first_activity_ms: None,
-            last_activity_ms: crate::file_modified_ms(&path),
+            first_activity_ms,
+            last_activity_ms,
             first_prompt,
+            last_assistant_text,
+            models,
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
         }))
     }
+}
+
+/// Epoch milliseconds for one Cursor record, from the injected `<timestamp>`
+/// tag or from a record `timestamp` field if a build writes one.
+fn cursor_record_time(line: &[u8]) -> Option<i64> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if let Some(ts) = obj.get("timestamp").and_then(|v| {
+        v.as_str()
+            .and_then(crate::parse_iso_ms)
+            .or_else(|| v.as_i64())
+    }) {
+        return Some(ts);
+    }
+    crate::ingest::cursor::injected_turn_time(
+        crate::ingest::cursor::record_role(obj),
+        &crate::ingest::cursor::record_blocks(obj),
+    )
+}
+
+/// `message.model` for the Cursor builds that record one.
+fn cursor_record_model(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let model = value.get("message")?.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// The assistant prose in one Cursor record, ignoring tool and marker blocks.
+fn cursor_assistant_text(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if crate::ingest::cursor::record_role(obj) != Some("assistant") {
+        return None;
+    }
+    // One assistant record can hold several text blocks — prose, a tool call,
+    // then more prose. Full ingestion walks them in order and keeps the last
+    // non-empty one, so the summary is the reply's closing line. Taking the
+    // first here instead would make the catalog advertise the opening line and
+    // hydration silently rewrite it.
+    crate::ingest::cursor::record_blocks(obj)
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .rfind(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

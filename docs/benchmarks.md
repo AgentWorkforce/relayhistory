@@ -392,8 +392,8 @@ Four things that rule deliberately does **not** do:
   comes from a baseline, that puts the furthest an off-class run can go at 4×
   the baseline — on top of the policy's own 2× and 0.5× margins — so a real
   slowdown cannot hide behind a slow runner. Where the ceiling comes from a
-  noise floor the same cap puts the ledge at twice that floor (240 ms for
-  `unchanged_sync`, against its 51 ms baseline), and past it the check fails
+  noise floor the same cap puts the ledge at twice that floor (280 ms for
+  `unchanged_sync`, against its 140 ms ceiling), and past it the check fails
   off class as well. Each of the three recorded off-class runs, tripled, is
   red off class; so is a `watch` tick that takes 1,020 ms. Both are asserted in
   `scripts/benchmark-sync.test.mjs` rather than argued.
@@ -403,10 +403,10 @@ Four things that rule deliberately does **not** do:
   from `absoluteFloors` rather than from the baseline, it is not a proportional
   statement about the code at all — it is the jitter a `watch` tick shows on one
   machine class. The calibration does not describe that jitter: #204 spent
-  179 ms on `unchanged_sync` against a 120 ms floor while the reference said
-  only 1.36×, so scaling would have kept it red for the wrong reason. Off class
-  such a check gets the cap and reports a breach as `warn` rather than `FAIL`,
-  up to 2× the floor — past that it fails again.
+  179 ms on `unchanged_sync` against the 120 ms floor of the day while the
+  reference said only 1.36×, so scaling would have kept it red for the wrong
+  reason. Off class such a check gets the cap and reports a breach as `warn`
+  rather than `FAIL`, up to 2× the floor — past that it fails again.
 
 What a reader sees: the `unknown-cpu` warning is unchanged, an `off-class:`
 paragraph states what was applied, every bound prints as `raw -> widened`, and
@@ -418,7 +418,7 @@ warning [unknown-cpu]: these baselines were measured on … and this is AMD EPYC
 off-class: this CPU is not one the baselines were measured on, so the bounds below are
 widened, never tightened, and never past 2.00x. …
 ok   incremental_sync.elapsedMs: 203.7 (baseline 424, bound 848 -> 1155 off-class x1.36)
-warn unchanged_sync.elapsedMs: 179.2 (baseline 51, bound 120 -> 240 off-class x2.00)
+warn unchanged_sync.elapsedMs: 179.2 (baseline 51, bound 140 -> 280 off-class x2.00)
 ok   unchanged_sync.peakRssBytes: 12984320 (baseline 9687040, bound 67108864)
 ```
 
@@ -447,12 +447,31 @@ orders of magnitude larger.
 
 For the tiniest elapsed-time phases the thresholds file can also raise a ceiling
 for one named phase without loosening the others. Today `unchanged_sync` uses a
-120 ms phase-specific ceiling floor because healthy `ubuntu-latest` runs have
-already reached about 113 ms there; a lower ceiling measures runner jitter
+140 ms phase-specific ceiling floor; a lower ceiling measures runner jitter
 instead of a real no-op `watch` tick slowdown. That number is jitter measured on
 the CPUs in `cpusSeen`, which is why a ceiling of this kind is treated
 differently off that class — see "A runner the baselines were never measured
 on" above.
+
+It was 120 ms, set because healthy `ubuntu-latest` runs had already reached
+about 113 ms there. [#166](https://github.com/AgentWorkforce/relayhistory/issues/166)
+moved it to 140, and the reason is a store change rather than a slower no-op
+tick: making Cursor an event-level source means the synthetic store's Cursor
+transcripts now produce 192 `session_events` rows that no earlier release
+stored, so the database grows about 0.3 MiB and an unchanged tick reads about
+0.4 MiB more of it. On one machine, across four commits, the phase went ~100 ms
+on the pre-#166 main, ~102 ms with continuity relationships on top, and ~112 ms
+with #166 — and on a github-hosted `ubuntu-latest` (AMD EPYC 7763) the same head
+measured 125.3 ms. 120 gave about 6% of headroom over the runs it was set
+against; 140 keeps about 12% over the 125.3 ms worst case observed on the
+slowest CPU in the pool.
+
+The stored `ci-debug` baseline for the phase is still 51 ms and was **not**
+touched, because re-measuring it means running on the machine class the gate
+runs on. Raising the phase ceiling is the sanctioned move here — these floors
+"raise such a ceiling and never lower one" — but the baseline is now far enough
+from what the phase actually costs that it is worth a re-measure on
+`ubuntu-latest` the next time someone is in a position to take one.
 
 A phase that a profile names but that produced no measurement is a failure, not
 a skip. A run that measured nothing must not read as a pass.
