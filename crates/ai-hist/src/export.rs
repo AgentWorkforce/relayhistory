@@ -226,23 +226,58 @@ pub fn compact_journal(conn: &Connection, limit: usize) -> Result<usize> {
         end = boundary(after)?;
     }
     let removed = if let Some(end) = end {
-        let removed = tx.execute(
-            "DELETE FROM delivery_journal AS j WHERE seq>? AND seq<=? AND NOT EXISTS (
-                SELECT 1 FROM history_subscriptions s
-                WHERE s.journal_cursor < j.seq
-                  AND (s.source IS NULL OR (s.source=j.source AND s.session_id=j.session_id))
-            )",
-            params![after, end],
-        )?;
-        tx.execute(
-            "UPDATE history_compaction SET cursor=? WHERE singleton=1",
-            [end],
-        )?;
-        removed
+        compact_journal_range(&tx, after, end)?
     } else {
         0
     };
     tx.commit()?;
+    Ok(removed)
+}
+
+/// Reclaim consumed changes across one complete journal pass for retention recovery.
+/// Each transaction scans at most `page_size` rows, including retained rows.
+/// Freeze the upper sequence bound so concurrent appends cannot extend this pass.
+/// Unlike the background compactor, this starts at zero regardless of its saved cursor.
+pub fn compact_journal_pass(conn: &Connection, page_size: usize) -> Result<usize> {
+    ensure!(
+        (1..=10_000).contains(&page_size),
+        "invalid compaction limit"
+    );
+    let through: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM delivery_journal",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut after = 0;
+    let mut removed = 0;
+    while after < through {
+        let tx = write_transaction(conn)?;
+        let end: Option<i64> = tx.query_row(
+            "SELECT MAX(seq) FROM (SELECT seq FROM delivery_journal WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?)",
+            params![after, through, page_size as i64],
+            |r| r.get(0),
+        )?;
+        let Some(end) = end else { break };
+        removed += compact_journal_range(&tx, after, end)?;
+        tx.commit()?;
+        after = end;
+    }
+    Ok(removed)
+}
+
+fn compact_journal_range(tx: &Transaction<'_>, after: i64, end: i64) -> Result<usize> {
+    let removed = tx.execute(
+        "DELETE FROM delivery_journal AS j WHERE seq>? AND seq<=? AND NOT EXISTS (
+            SELECT 1 FROM history_subscriptions s
+            WHERE s.journal_cursor < j.seq
+              AND (s.source IS NULL OR (s.source=j.source AND s.session_id=j.session_id))
+        )",
+        params![after, end],
+    )?;
+    tx.execute(
+        "UPDATE history_compaction SET cursor=? WHERE singleton=1",
+        [end],
+    )?;
     Ok(removed)
 }
 

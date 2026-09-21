@@ -171,3 +171,54 @@ fn compaction_passes_a_retained_prefix_in_bounded_steps() {
         1025
     );
 }
+
+#[test]
+fn recovery_compaction_visits_the_whole_journal_despite_the_background_cursor() {
+    for cursor in [0, 1000, 9999] {
+        let conn = db();
+        let identity = SessionIdentity {
+            source: "claude".into(),
+            session_id: "pinned".into(),
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        capture::save_subscription(
+            &tx,
+            &capture::Subscription {
+                id: "reader",
+                session: Some(&identity),
+                cursor: 0,
+                kind: 0,
+                rowid: 0,
+                complete: true,
+            },
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','before')",
+            [],
+        )
+        .unwrap();
+        for id in 0..1025 {
+            tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','pinned',?,1,'user','text','retained')", [id.to_string()]).unwrap();
+        }
+        tx.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','after')",
+            [],
+        )
+        .unwrap();
+        tx.execute("UPDATE history_compaction SET cursor=?", [cursor])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(export::compact_journal_pass(&conn, 1000).unwrap(), 2);
+        // A complete, all-pinned pass terminates and preserves every revision.
+        assert_eq!(export::compact_journal_pass(&conn, 1000).unwrap(), 0);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM delivery_journal", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            1025
+        );
+        assert!(export::compact_journal_pass(&conn, 0).is_err());
+        assert!(export::compact_journal_pass(&conn, 10_001).is_err());
+    }
+}

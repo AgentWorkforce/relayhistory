@@ -334,8 +334,10 @@ pub fn adopt_session_job(
             // could compact consumed revisions. Retry only after reclaiming
             // data that every consumer has already copied; never raise the
             // cap, discard pending batches, or advance an unread cursor.
+            // Scan a complete bounded pass: a pinned page can remove nothing
+            // even when later journal pages contain reclaimable records.
             Err(error) if is_retention_limit(&error) => {
-                if compact_journal(conn, 1_000)? == 0 {
+                if ai_hist::export::compact_journal_pass(conn, 1_000)? == 0 {
                     return Err(error);
                 }
             }

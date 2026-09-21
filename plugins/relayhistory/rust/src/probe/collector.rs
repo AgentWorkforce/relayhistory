@@ -389,6 +389,10 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
                     "database_busy"
                 }
                 Some(rusqlite::ErrorCode::DiskFull) => "disk_full",
+                Some(rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::PermissionDenied) => {
+                    "permission_denied"
+                }
+                Some(rusqlite::ErrorCode::CannotOpen) => "database_unavailable",
                 Some(rusqlite::ErrorCode::DatabaseCorrupt) => "database_corrupt",
                 _ => "database_error",
             };
@@ -397,6 +401,7 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
             return match io.kind() {
                 std::io::ErrorKind::NotFound => "source_missing",
                 std::io::ErrorKind::PermissionDenied => "permission_denied",
+                std::io::ErrorKind::StorageFull => "disk_full",
                 _ => "io_error",
             };
         }
@@ -413,6 +418,7 @@ pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static st
         "database_corrupt" => Some("The local history database needs repair. Preserve the database before recovery; reconnecting will not repair it."),
         "disk_full" => Some("The local disk is full. Free disk space to resume session uploads."),
         "database_busy" => Some("Local history is busy. Agent Relay will retry when the other operation finishes."),
+        "database_unavailable" => Some("Agent Relay cannot open local history. Check that its directory exists and local file permissions allow access."),
         "permission_denied" => Some("Agent Relay cannot access local history. Check local file permissions."),
         _ => None,
     }
@@ -1247,6 +1253,13 @@ mod tests {
             (rusqlite::ffi::SQLITE_CORRUPT, "database_corrupt"),
             (rusqlite::ffi::SQLITE_FULL, "disk_full"),
             (rusqlite::ffi::SQLITE_BUSY, "database_busy"),
+            (rusqlite::ffi::SQLITE_READONLY, "permission_denied"),
+            (
+                rusqlite::ffi::SQLITE_READONLY_DIRECTORY,
+                "permission_denied",
+            ),
+            (rusqlite::ffi::SQLITE_PERM, "permission_denied"),
+            (rusqlite::ffi::SQLITE_CANTOPEN, "database_unavailable"),
         ] {
             let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(code),
@@ -1269,6 +1282,31 @@ mod tests {
         assert_eq!(healthy["ok"], true);
         assert!(healthy["message"].is_null());
         assert!(healthy["error_class"].is_null());
+    }
+
+    #[test]
+    fn filesystem_disk_full_uses_safe_local_guidance_through_context() {
+        let errors = vec![std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "secret prompt /private/token",
+        )];
+        #[cfg(unix)]
+        let errors = {
+            let mut errors = errors;
+            errors.push(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            errors
+        };
+        for error in errors {
+            let error = anyhow::Error::new(error).context("writing secret runtime.json");
+            assert!(local_failure_message(&error)
+                .unwrap()
+                .contains("Free disk space"));
+            let report = cycle_report(&Err(error));
+            assert_eq!(report["error_class"], "disk_full");
+            assert_eq!(report["ok"], false);
+            assert!(!report.to_string().contains("secret"));
+            assert!(!report.to_string().contains("offline"));
+        }
     }
 
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {

@@ -1225,6 +1225,29 @@ fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisio
     for pinned_by_other_job in [false, true] {
         let conn = db();
         let seed = create_job(&conn, &config("retention-seed"), 0).unwrap();
+        // A separate consumer pins more than one compaction page. Recovery
+        // must reach the reclaimable suffix in this same adoption attempt.
+        let pinned = SessionIdentity {
+            source: "claude".into(),
+            session_id: "pinned".into(),
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        ai_hist::export::capture::save_subscription(
+            &tx,
+            &ai_hist::export::capture::Subscription {
+                id: "pinned-reader",
+                session: Some(&pinned),
+                cursor: 0,
+                kind: 0,
+                rowid: 0,
+                complete: true,
+            },
+        )
+        .unwrap();
+        for id in 0..1025 {
+            tx.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','pinned',?,1,'user','text','retained')", [id.to_string()]).unwrap();
+        }
+        tx.commit().unwrap();
         event(&conn, "private", &"private backlog".repeat(10_000));
         event(&conn, "a", &"original".repeat(4_000));
         if !pinned_by_other_job {
@@ -1250,6 +1273,15 @@ fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisio
             "must not raise the retention cap"
         );
         assert_eq!(status(&conn, &old.job_id).unwrap().state, "paused");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM delivery_journal WHERE session_id='pinned'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1025
+        );
         if pinned_by_other_job {
             assert!(is_retention_limit(&result.unwrap_err()));
             assert!(!is_session_job(&conn, &old.job_id).unwrap());
@@ -1261,7 +1293,7 @@ fn scoped_adoption_recovers_full_retention_without_discarding_unconsumed_revisio
                     |r| r.get::<_, i64>(0)
                 )
                 .unwrap(),
-                3
+                1028
             );
             assert_eq!(
                 conn.query_row(
