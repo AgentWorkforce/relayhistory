@@ -1,0 +1,87 @@
+{
+  "corpus_files": [
+    "codex/resume-baseline-corrupt.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/resume-baseline-corrupt",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "carry on",
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "timestamp_ms": 1776668400300
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "text": "carry on",
+      "token_json": null,
+      "ts_ms": 1776668400300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "5:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "5:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "text": "Answer.",
+      "token_json": null,
+      "ts_ms": 1776668400900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776668400000,
+      "first_prompt": "carry on",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776668402000,
+      "last_assistant_text": "Answer.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-resume-baseline-corrupt.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_resume_corrupt",
+      "source": "codex",
+      "source_stamp": "<n>:1220",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

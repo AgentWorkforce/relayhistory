@@ -386,6 +386,49 @@ export function formatNumber(value) {
  */
 export const CALIBRATION_CLAMP = { min: 0.2, max: 8 };
 
+/**
+ * How far the bounds may be widened on a runner the baselines were never
+ * measured on — and no further.
+ *
+ * GitHub added an AMD EPYC 7763 to the `ubuntu-latest` pool after these
+ * baselines were taken on two Intel Xeons. The gate already said so
+ * ("a failure here may be the hardware rather than the code") and then failed
+ * the pull request anyway, which blocked three of them on 2026-09-21 with
+ * every other check green. Off the baseline class the bounds are therefore
+ * widened rather than merely annotated — but only ever widened, only by a
+ * measured amount, and never past this cap, so a genuinely regressed run
+ * cannot hide behind a slow runner. 2x on top of the policy's own 2x/0.5x
+ * margins leaves a 4x regression red on any machine.
+ */
+export const OFF_CLASS_CALIBRATION_CAP = 2;
+
+/**
+ * The factor a bound derived from a stored baseline is widened by off class.
+ *
+ * It is the calibration ratio, clamped to `[1, cap]`. The lower clamp is the
+ * important half: below 1 the reference says this machine is *faster* than the
+ * baseline machines, and tightening a ceiling on that reading is exactly the
+ * corrector that failed a healthy runner in #202. This one may only loosen.
+ */
+export function offClassScaleFor(raw, cap = OFF_CLASS_CALIBRATION_CAP) {
+  if (!Number.isFinite(raw) || raw <= 1) return 1;
+  return Math.min(raw, offClassCap(cap));
+}
+
+/**
+ * A usable off-class cap.
+ *
+ * A cap below 1 would turn the widening into a tightening — the one thing this
+ * must never do — and a non-numeric one would make every bound `NaN`, so
+ * either falls back to the default instead of quietly changing what the gate
+ * means. Both this and `offClassScaleFor` are exported, so neither may depend
+ * on `evaluateGate` having validated the policy first.
+ */
+export function offClassCap(cap) {
+  const configured = Number(cap ?? OFF_CLASS_CALIBRATION_CAP);
+  return Number.isFinite(configured) && configured >= 1 ? configured : OFF_CLASS_CALIBRATION_CAP;
+}
+
 /** Outside this band, the baselines probably came from different hardware. */
 export const CALIBRATION_WARN_BAND = { min: 0.7, max: 1.4 };
 
@@ -411,6 +454,10 @@ export function calibrationFactor(measuredMs, baselineMs) {
  * what is compared is "what this phase would have cost on the machine the
  * baseline came from". Peak RSS is not scaled: memory does not get bigger
  * because the box is busy.
+ *
+ * On a CPU that is not one of `measuredOn.cpusSeen` the bounds are widened —
+ * see `OFF_CLASS_CALIBRATION_CAP`, and the two rules below. On the baseline
+ * class none of it runs and the verdict is exactly what it was before.
  */
 export function evaluateGate(report, thresholds, profileName) {
   const profile = thresholds?.profiles?.[profileName];
@@ -469,7 +516,10 @@ export function evaluateGate(report, thresholds, profileName) {
   // directly rather than inferring it.
   const cpu = report.machine?.cpu;
   const cpusSeen = profile.measuredOn?.cpusSeen;
-  if (cpu && Array.isArray(cpusSeen) && cpusSeen.length > 0 && !cpusSeen.includes(cpu)) {
+  const offClass = Boolean(
+    cpu && Array.isArray(cpusSeen) && cpusSeen.length > 0 && !cpusSeen.includes(cpu),
+  );
+  if (offClass) {
     warnings.push({
       kind: "unknown-cpu",
       cpu,
@@ -497,6 +547,13 @@ export function evaluateGate(report, thresholds, profileName) {
     });
   }
   const load = applied ? (calibration?.factor ?? 1) : 1;
+  // Widening off class and normalizing by `load` are two answers to the same
+  // question, so only one of them is ever applied. `policy.calibration:
+  // "applied"` already divides every measurement by the reference; doing both
+  // would count the same machine twice.
+  const cap = offClassCap(policy.offClassCalibrationCap);
+  const offClassScale = offClass && !applied ? offClassScaleFor(calibration?.raw, cap) : 1;
+  const advisories = [];
   for (const [phaseName, baselines] of Object.entries(profile.phases ?? {})) {
     const phase = measured.get(phaseName);
     if (!phase) {
@@ -519,20 +576,56 @@ export function evaluateGate(report, thresholds, profileName) {
       // floor only ever loosens a ceiling; it never tightens one, and it never
       // applies to a throughput floor.
       const floor = phaseFloors[phaseName]?.[metric] ?? floors[metric] ?? 0;
-      const bound = rule.direction === "max"
-        ? Math.max(baseline * rule.factor, floor)
-        : baseline * rule.factor;
+      const proportional = baseline * rule.factor;
+      const bound = rule.direction === "max" ? Math.max(proportional, floor) : proportional;
+      // Where the bound came from decides how much room an off-class runner
+      // gets, because the two kinds of bound say different things:
+      //
+      //   * `baseline x factor` is a proportional statement about the code, so
+      //     the calibration — a reading of how fast this machine is — is the
+      //     right correction, capped.
+      //   * an absolute floor is a runner-noise allowance measured on the
+      //     baseline class. Off that class there is no measured noise floor at
+      //     all, and the calibration does not describe walk-and-stat jitter:
+      //     PR #204 spent 179 ms on `unchanged_sync` against a 120 ms floor
+      //     while the reference said only 1.36x. Such a check gets the full
+      //     cap, and a breach inside it is advisory rather than fatal.
+      //
+      // Memory gets neither. RSS does not grow because the CPU is slower, and
+      // its floor is a blow-up guard that is valid on any machine.
+      const fromFloor = rule.direction === "max" && floor > proportional;
+      const widen = offClass && !applied && metric !== "peakRssBytes"
+        ? (fromFloor ? cap : offClassScale)
+        : 1;
+      const effectiveBound = rule.direction === "max" ? bound * widen : bound / widen;
       const normalized = rule.scale && applied ? rule.scale(Number(value), load) : Number(value);
-      const ok = rule.direction === "min" ? normalized >= bound : normalized <= bound;
+      const ok = rule.direction === "min"
+        ? normalized >= effectiveBound
+        : normalized <= effectiveBound;
+      const breachesRaw = rule.direction === "min" ? normalized < bound : normalized > bound;
+      const advisory = Boolean(ok && fromFloor && widen > 1 && breachesRaw);
+      const limit = rule.direction === "min" ? "floor" : "ceiling";
       checks.push({
-        phase: phaseName, metric, value: Number(value), normalized, baseline, bound, ok,
+        phase: phaseName, metric, value: Number(value), normalized, baseline, bound,
+        effectiveBound, widened: widen, advisory, ok,
       });
+      if (advisory) {
+        advisories.push(
+          `${phaseName}.${metric} = ${formatNumber(value)} is past its ${formatNumber(bound)} `
+          + `${limit}, which is a noise allowance measured on ${cpusSeen.join(" and ")}. `
+          + `This ran on ${cpu}, so it is reported rather than failed, up to the `
+          + `${formatNumber(effectiveBound)} the ${cap.toFixed(2)}x off-class cap allows.`,
+        );
+      }
       if (!ok) {
         failures.push(
           `${phaseName}.${metric} = ${formatNumber(value)}` +
           (rule.scale && applied ? ` (${formatNumber(normalized)} machine-normalized)` : "") +
           `, baseline ${formatNumber(baseline)}, ` +
-          `${rule.direction === "min" ? "floor" : "ceiling"} ${formatNumber(bound)}`,
+          `${limit} ${formatNumber(bound)}` +
+          (widen > 1
+            ? ` (off-class ${limit} ${formatNumber(effectiveBound)}, widened ${widen.toFixed(2)}x)`
+            : ""),
         );
       }
     }
@@ -544,6 +637,10 @@ export function evaluateGate(report, thresholds, profileName) {
     ok: failures.length === 0,
     profile: profileName,
     calibrationApplied: applied,
+    offClass,
+    offClassScale,
+    offClassCap: cap,
+    advisories,
     calibration: calibration
       ? { measuredMs: report.calibrationMs, baselineMs: profile.calibrationMs, ...calibration }
       : null,

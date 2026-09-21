@@ -169,7 +169,52 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Breaking
 
-- The native-addon contract is now 17 and the session evidence contract is now
+- Bump the native-addon contract from 17 to 18 for the usage surface below. An older
+  addon is rejected rather than served a shape it does not implement.
+
+### Added
+
+- Normalize token usage in the core crate. `ai_hist::normalize_usage` turns a
+  provider's stored `token_json` into a `NormalizedUsage`: input always
+  excludes cache reads, Anthropic's `cache_creation.ephemeral_5m`/`1h` split is
+  preserved, `provider_total_tokens` is what the provider wrote and is never
+  recomputed, and `reported_cost_usd` appears only when the source data carried
+  a cost. A negative, fractional, non-finite, or out-of-range counter is a
+  `UsageError` with a stable code, never a clamped zero, and a `UsageCoverage`
+  records which counters the provider actually wrote so a reported zero stays
+  distinguishable from silence.
+
+- Capture the provider's own request identity on `session_events`:
+  `request_id` (Claude's `requestId`) and `provider_message_id`
+  (`message.id`), both stored verbatim. The pre-existing `message_id` column
+  holds each JSONL record's `uuid`, and one Claude request is written as
+  several records, so only these establish which rows belong to one API call.
+  Hydration parser version 5 -> 6 so existing sessions backfill them; until a
+  session is re-parsed its requests carry an `unresolved-request-identity`
+  diagnostic and its rollup reports no totals rather than one figure per
+  content block.
+
+- Carry `request_id` and `provider_message_id` through the session-event
+  evidence contract and on the normalized `SessionEvent`, so a remotely
+  hydrated Claude session and a connector supplying normalized events both
+  keep the request identity their records had.
+
+- Add per-request usage records and a session rollup. The `session_requests`
+  view is one row per model request — Claude's per-content-block copies of
+  `message.usage` collapse into one — read with `session_requests_page` /
+  `getSessionRequestsPage` (keyset on `(firstTsMs, id)`) and
+  `session_usage_summary` / `getSessionUsage`, plus the MCP tools
+  `get_session_requests` and `get_session_usage`. Session usage contract 1. A
+  session with no usage evidence reports `null`, not zeros. See
+  [docs/usage-accounting.md](docs/usage-accounting.md).
+
+- Move prompt usage attribution out of the commercial plugin into
+  `ai_hist::attribute_usage_to_prompts`, refusal semantics unchanged; the
+  plugin keeps its wire shape and becomes a thin caller.
+
+### Breaking
+
+- The native-addon contract is now 18 and the session evidence contract is now
   2: `session_events` rows carry the per-message raw provider facts and the
   per-tool-result fidelity columns (see Added). Hydration parser version 3 re-parses existing databases once on the
   next `sessions hydrate` so rows already indexed gain the facts instead of

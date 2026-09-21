@@ -54,15 +54,21 @@ and `crates/ai-hist-napi/src/lib.rs`).
    and publishes the crate from that tag.
 5. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
-   and creates the `sdk-ts-v<version>` tag and GitHub Release.
+   and creates the `sdk-ts-v<version>` tag and GitHub Release. The registry
+   smoke installs `ai-hist` as an ordinary dependency with npm's `--libc` set
+   to this runner's family so `ai-hist-native-linux-x64-gnu` (or musl) is
+   selected.
 6. `plugins` checks out that persisted commit, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
    plugin before its JavaScript package. Post-publish verification waits for
-   all 16 exact-version manifests to become visible on npm before installing
-   and loading the plugins. Missing versions (`E404`/`ETARGET`) are retried up
-   to 60 times, five seconds apart; other lookup errors or invalid metadata
-   fail immediately. Exhausted retries include npm's original error output.
+   all 16 exact-version manifests to become visible on npm, then installs the
+   JavaScript packages as ordinary dependencies with npm's `--libc` set to this
+   runner's family (`glibc` or `musl`) so the matching platform helper is
+   selected, and loads the plugins. Missing versions (`E404`/`ETARGET`) are
+   retried up to 60 times, five seconds apart; other lookup errors or invalid
+   metadata fail immediately. Exhausted retries include npm's original error
+   output.
 7. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
    the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
    asset names the website mirrors.

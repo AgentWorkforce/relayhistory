@@ -244,8 +244,15 @@ pub(crate) struct CodexCursorState {
     /// The cumulative token snapshot the next delta is measured against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_totals: Option<CodexTokenTotals>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_delta: Option<CodexTokenTotals>,
+    /// The API request the rows being written belong to, and which baseline
+    /// `prev_totals` holds. Both only ever increase, and a resumed pass has to
+    /// continue them: restarting `request_span` at zero would merge a new
+    /// call into an old one, and restarting the generation would let a later
+    /// delta silently resolve a refusal recorded against an earlier baseline.
+    #[serde(default)]
+    pub request_span: u64,
+    #[serde(default)]
+    pub baseline_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub untokened_assistant_uid: Option<String>,
     #[serde(default)]

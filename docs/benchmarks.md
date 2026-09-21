@@ -429,6 +429,74 @@ One wording note, because it cost a real investigation: the factor is a ratio of
 to print it as "0.67x its speed", which reads as slower; it now spells out both
 halves.
 
+#### A runner the baselines were never measured on
+
+A warning was not enough. GitHub later added an **AMD EPYC 7763** to the
+`ubuntu-latest` pool, and on 2026-09-21 the gate failed three pull requests on
+it — #194 (run 35543384881), #199 (35543305734) and #204 (35547876206) — each
+on `unchanged_sync.elapsedMs` alone, with every other check green and nothing
+in the diff touching the sync path. The gate printed "a failure here may be the
+hardware rather than the code", measured the reference at 1.33×–1.36×, said
+"the checks below are not scaled by it", and went red anyway. An advisory that
+blocks a merge is not an advisory.
+
+So off the baseline class the bounds are now **widened**, on these rules. None
+of it runs when the CPU is one of `measuredOn.cpusSeen`: the on-class gate is
+byte-for-byte the gate it was.
+
+| bound | off class |
+|---|---|
+| derived from a stored baseline (`baseline × factor`) | widened by the calibration ratio, clamped to `[1, offClassCalibrationCap]` |
+| an elapsed ceiling set by `absoluteFloors` / `absoluteFloorsByPhase` | widened by the full cap; a breach *inside* that widening is advisory (printed, annotated, does not fail) |
+| `peakRssBytes` | not widened at all |
+
+Four things that rule deliberately does **not** do:
+
+* **It never tightens.** A ratio below 1 says this machine is *faster* than the
+  baseline machines; scaling a ceiling down on that reading is precisely the
+  corrector that failed a healthy runner in #202. The clamp starts at 1.
+* **It never exceeds the cap** (`offClassCalibrationCap`, 2×). On a bound that
+  comes from a baseline, that puts the furthest an off-class run can go at 4×
+  the baseline — on top of the policy's own 2× and 0.5× margins — so a real
+  slowdown cannot hide behind a slow runner. Where the ceiling comes from a
+  noise floor the same cap puts the ledge at twice that floor (280 ms for
+  `unchanged_sync`, against its 140 ms ceiling), and past it the check fails
+  off class as well. Each of the three recorded off-class runs, tripled, is
+  red off class; so is a `watch` tick that takes 1,020 ms. Both are asserted in
+  `scripts/benchmark-sync.test.mjs` rather than argued.
+* **It does not scale memory.** RSS does not grow because the CPU is slower,
+  and the 64 MiB floor is a blow-up guard that means the same thing everywhere.
+* **It does not scale a noise floor by a CPU reading.** Where a ceiling comes
+  from `absoluteFloors` rather than from the baseline, it is not a proportional
+  statement about the code at all — it is the jitter a `watch` tick shows on one
+  machine class. The calibration does not describe that jitter: #204 spent
+  179 ms on `unchanged_sync` against the 120 ms floor of the day while the
+  reference said only 1.36×, so scaling would have kept it red for the wrong
+  reason. Off class such a check gets the cap and reports a breach as `warn`
+  rather than `FAIL`, up to 2× the floor — past that it fails again.
+
+What a reader sees: the `unknown-cpu` warning is unchanged, an `off-class:`
+paragraph states what was applied, every bound prints as `raw -> widened`, and
+a check that passed only because of the widening prints `warn` instead of `ok`
+with an `advisory:` line naming both numbers.
+
+```text
+warning [unknown-cpu]: these baselines were measured on … and this is AMD EPYC 7763 …
+off-class: this CPU is not one the baselines were measured on, so the bounds below are
+widened, never tightened, and never past 2.00x. …
+ok   incremental_sync.elapsedMs: 203.7 (baseline 424, bound 848 -> 1155 off-class x1.36)
+warn unchanged_sync.elapsedMs: 179.2 (baseline 51, bound 140 -> 280 off-class x2.00)
+ok   unchanged_sync.peakRssBytes: 12984320 (baseline 9687040, bound 67108864)
+```
+
+The widening is a bridge, not a destination. Two of the profile's three elapsed
+ceilings (`unchanged_sync`, `hydrate_unchanged`) are floor-derived and can
+therefore go advisory off class, which is weaker coverage than an on-class run
+gets; the fix is to fold the new
+CPU into the baselines — re-measure on it, take the worse of each metric across
+the pool, and add it to `cpusSeen`. Once it is in that list the widening stops
+applying to it and the gate is strict there again.
+
 Bounds come from `scripts/benchmark-thresholds.json`:
 
 * throughput must stay at or above **half** its stored baseline (a > 2×
@@ -447,7 +515,10 @@ orders of magnitude larger.
 For the tiniest elapsed-time phases the thresholds file can also raise a ceiling
 for one named phase without loosening the others. Today `unchanged_sync` uses a
 140 ms phase-specific ceiling floor; a lower ceiling measures runner jitter
-instead of a real no-op `watch` tick slowdown.
+instead of a real no-op `watch` tick slowdown. That number is jitter measured on
+the CPUs in `cpusSeen`, which is why a ceiling of this kind is treated
+differently off that class — see "A runner the baselines were never measured
+on" above.
 
 It was 120 ms, set because healthy `ubuntu-latest` runs had already reached
 about 113 ms there. [#166](https://github.com/AgentWorkforce/relayhistory/issues/166)

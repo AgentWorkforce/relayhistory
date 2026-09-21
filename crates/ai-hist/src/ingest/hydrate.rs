@@ -44,11 +44,23 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates by name. Databases that already ran Grok's 6 keep that number
 /// until this bump, so Cursor would otherwise stay prompt-only forever.
 ///
-/// Version 8 is incremental transcript hydration (#173). A checkpoint written
-/// by an earlier parser has no byte cursor, so the first hydration after
-/// upgrading re-parses that transcript once from offset 0 and writes the
-/// cursor; every hydration after that resumes from it.
-const HYDRATION_PARSER_VERSION: i64 = 8;
+/// Version 8 is usage grouping. It captures Claude's provider message id, so
+/// records from transcripts without a request id can still be grouped per API
+/// call, and Codex's `request_span`, so the rows of one Codex call group
+/// together instead of each becoming a request of its own. Both live only in
+/// the transcript, so an already indexed session keeps the old grouping until
+/// it is read again.
+///
+/// This began as a second version 7, written before Cursor's landed on main.
+/// Two different re-parses cannot share a number: a database that ran the
+/// Cursor 7 would report the usage 7 as already done and keep answering with
+/// the old grouping forever.
+///
+/// Version 9 is incremental transcript hydration (#173), for the same reason
+/// again: a checkpoint written by an earlier parser has no byte cursor, so the
+/// first hydration after upgrading re-parses that transcript once from offset
+/// 0 and writes the cursor; every hydration after that resumes from it.
+const HYDRATION_PARSER_VERSION: i64 = 9;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

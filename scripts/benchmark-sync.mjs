@@ -250,10 +250,32 @@ export function failureFooter(verdict, profile) {
   const band = warnings.find((warning) => warning.kind === "calibration-band");
   const machineClass = profile?.measuredOn?.machineClass ?? "another machine class";
   if (unknown) {
+    // Say it only of the checks it is true of, and name them. A failure on peak
+    // RSS, or a phase that produced no measurement at all, did not survive any
+    // widening — pointing at the hardware there sends the reader somewhere
+    // else, and it is worse in a mixed failure, where a true sentence about one
+    // check reads as a claim about all of them.
+    const failed = (verdict.checks ?? []).filter((check) => !check.ok);
+    const survived = failed.filter(
+      (check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound,
+    );
+    const named = survived.map((check) => `${check.phase}.${check.metric}`).join(", ");
+    const everyFailure = survived.length === (verdict.failures ?? []).length;
+    const widened = survived.length === 0
+      ? ""
+      : `\n${named} ${survived.length === 1 ? "was" : "were"} already widened for that — see\n`
+        + "the off-class line — and still failed, so re-measuring the baselines on this\n"
+        + "machine class is the answer if those numbers are simply what this hardware\n"
+        + "costs.\n"
+        + (everyFailure
+          ? ""
+          : "The other failures above were checked against bounds the widening does not\n"
+            + "touch, so this does not explain them.\n");
     return "\nThe warnings above apply: these bounds are absolute numbers measured on\n"
       + `${machineClass}, and this run was on ${unknown.cpu}, not one of them. Off that\n`
       + "class a failure here is as likely to be the hardware as the code. Compare against\n"
-      + "a run on the baseline class before treating it as a regression.\n";
+      + "a run on the baseline class before treating it as a regression.\n"
+      + widened;
   }
   if (band) {
     const pace = band.raw >= 1
@@ -267,6 +289,50 @@ export function failureFooter(verdict, profile) {
       + "apart.\n";
   }
   return "";
+}
+
+/**
+ * The paragraph that explains an off-class widening, or "" when there was none.
+ *
+ * It is keyed on bounds that actually moved, not on the CPU alone. With
+ * `policy.calibration: "applied"` the run is still off class and the widening
+ * is deliberately disabled, and a banner there would contradict the very check
+ * lines printed under it.
+ */
+export function offClassBanner(verdict) {
+  if (!verdict.offClass) return "";
+  const widened = (verdict.checks ?? [])
+    .some((check) => check.effectiveBound !== undefined && check.effectiveBound !== check.bound);
+  if (!widened) return "";
+  const cap = verdict.offClassCap.toFixed(2);
+  return "off-class: this CPU is not one the baselines were measured on, so the bounds below "
+    + `are widened, never tightened, and never past ${cap}x. A bound derived from a stored `
+    + `baseline is widened ${verdict.offClassScale.toFixed(2)}x, the calibration ratio clamped `
+    + "to that cap; an elapsed ceiling that comes from a noise floor instead is widened the "
+    + `full ${cap}x and a breach inside that widening is advisory. Peak RSS is not widened at `
+    + "all. Each bound below prints raw -> widened.";
+}
+
+/**
+ * One line of the gate's result table.
+ *
+ * A widened bound prints as `raw -> widened`, and a check that passed only
+ * because of the widening prints `warn` rather than `ok`. Both exist so that
+ * the number which actually decided the check is on the line a reader looks
+ * at, instead of having to be reconstructed from the off-class paragraph.
+ */
+export function renderCheck(check) {
+  const shown = check.normalized === check.value
+    ? check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)
+    : `${check.value.toFixed(1)} -> ${check.normalized.toFixed(1)}`;
+  const widened = check.effectiveBound !== undefined && check.effectiveBound !== check.bound;
+  const bound = widened
+    ? `${check.bound.toFixed(0)} -> ${check.effectiveBound.toFixed(0)} `
+      + `off-class x${check.widened.toFixed(2)}`
+    : check.bound.toFixed(0);
+  const verdict = check.ok ? (check.advisory ? "warn" : "ok  ") : "FAIL";
+  return `${verdict} ${check.phase}.${check.metric}: ${shown} `
+    + `(baseline ${check.baseline}, bound ${bound})`;
 }
 
 /** Turn `unsupportedPhases` findings into one actionable failure. */
@@ -484,14 +550,11 @@ async function main(argv) {
   for (const warning of verdict.warnings ?? []) {
     process.stdout.write(`warning [${warning.kind}]: ${warning.message}\n\n`);
   }
-  for (const check of verdict.checks) {
-    const shown = check.normalized === check.value
-      ? check.value.toFixed(check.metric === "peakRssBytes" ? 0 : 1)
-      : `${check.value.toFixed(1)} -> ${check.normalized.toFixed(1)}`;
-    process.stdout.write(
-      `${check.ok ? "ok  " : "FAIL"} ${check.phase}.${check.metric}: ${shown} ` +
-      `(baseline ${check.baseline}, bound ${check.bound.toFixed(0)})\n`,
-    );
+  const banner = offClassBanner(verdict);
+  if (banner) process.stdout.write(`${banner}\n\n`);
+  for (const check of verdict.checks) process.stdout.write(`${renderCheck(check)}\n`);
+  for (const advisory of verdict.advisories ?? []) {
+    process.stdout.write(`\nadvisory: ${advisory}\n`);
   }
   process.stdout.write(
     `\n${verdict.checks.length} checks over ${report.phases.length} phases in ${seconds}s ` +

@@ -552,6 +552,171 @@ export interface SessionFileEditsPage {
   nextCursor: EvidenceCursor | null;
 }
 
+/** How a source accounts for the usage one stored record stands for. */
+export type UsageAccounting =
+  | 'per-request'
+  | 'per-message'
+  | 'cumulative-delta'
+  | 'context-proxy'
+  /** A session summary spanning more than one accounting mode. */
+  | 'mixed';
+
+/**
+ * Where a request's grouping key came from.
+ *
+ * `request-id` and `provider-message-id` are identities the provider gave the
+ * API call. `request-span` is one the provider implied rather than named: a
+ * source that reports a cumulative usage snapshot after each call ends a
+ * request with every snapshot, so the span between two of them is one call.
+ * `record-id` is not an API identity at all: it is the stored event's own id,
+ * and for a source that writes one call as several records a key built from it
+ * can be finer than one row per request.
+ */
+export type RequestKeySource =
+  | 'request-id'
+  | 'provider-message-id'
+  | 'request-span'
+  | 'record-id';
+
+/** Why a request's usage is absent, or narrower than it looks. */
+export type UsageDiagnostic =
+  | 'ambiguous-usage-copies'
+  | 'unnormalizable-usage'
+  | 'ambiguous-model'
+  /** No provider request identity was captured, so rows may be per record. */
+  | 'unresolved-request-identity'
+  /** Only some contributing requests reported the cache-write TTL split. */
+  | 'partial-cache-write-split'
+  /** Only some contributing requests carried a cost. */
+  | 'partial-reported-cost'
+  /** A count exceeded `Number.MAX_SAFE_INTEGER` and was not rounded to fit. */
+  | 'count-not-representable';
+
+/**
+ * Usage in provider-neutral terms. `inputTokens` always excludes cache reads,
+ * whatever the provider's own convention was.
+ *
+ * A `null` count means the provider did not report it, which is a different
+ * fact from a reported zero — the `has*` flags are what tell them apart.
+ * `providerTotalTokens` is what the provider wrote and is never recomputed
+ * from the parts, and `reportedCostUsd` appears only when the source data
+ * carried a cost. Nothing here is priced or estimated.
+ */
+export interface NormalizedUsage {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number | null;
+  cacheReadTokens: number;
+  /** Total cache-write tokens across every TTL bucket. */
+  cacheWriteTokens: number;
+  /** Claude's `cache_creation.ephemeral_5m_input_tokens`, when split. */
+  cacheWrite5mTokens: number | null;
+  /** Claude's `cache_creation.ephemeral_1h_input_tokens`, when split. */
+  cacheWrite1hTokens: number | null;
+  providerTotalTokens: number | null;
+  reportedCostUsd: number | null;
+  accounting: UsageAccounting;
+  // Every count above is a safe integer. A value JavaScript cannot represent
+  // exactly is refused at the native boundary — reported as
+  // `count-not-representable` with the usage absent — rather than rounded
+  // into something that looks like a measurement.
+  hasInputTokens: boolean;
+  hasOutputTokens: boolean;
+  hasReasoningTokens: boolean;
+  hasCacheReadTokens: boolean;
+  hasCacheWriteTokens: boolean;
+}
+
+/** One model request, with its usage normalized. */
+export interface SessionRequest {
+  id: number;
+  source: Source;
+  sessionId: string;
+  /** The provider request id when the store has one, else the message id. */
+  requestKey: string;
+  requestKeySource: RequestKeySource;
+  /**
+   * Every event message id this request collapsed. More than one means the
+   * provider split the request across records — Claude's per-content-block
+   * layout.
+   */
+  messageIds: string[];
+  model: string | null;
+  /** The provider behind the model, when a source records one. Never inferred. */
+  provider: string | null;
+  firstTsMs: number;
+  lastTsMs: number;
+  /** Null when the request carried no usage evidence, or none that could be trusted. */
+  usage: NormalizedUsage | null;
+  /** The stable normalization error code when usage could not be read. */
+  usageError: string | null;
+  toolUseIds: string[];
+  hasThinking: boolean;
+  /** How many session event rows this one request collapsed. */
+  eventCount: number;
+  diagnostics: UsageDiagnostic[];
+}
+
+/**
+ * Continuation for a request page. Requests inside one session routinely
+ * share a timestamp, so `id` is part of the cursor.
+ */
+export interface RequestCursor {
+  tsMs: number;
+  id: number;
+}
+
+export interface RequestPageOptions {
+  dbPath?: string;
+  limit?: number;
+  after?: RequestCursor;
+}
+
+export interface SessionRequestsPage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  requests: SessionRequest[];
+  nextCursor: RequestCursor | null;
+}
+
+export interface SessionUsageOptions {
+  dbPath?: string;
+}
+
+/**
+ * One session's usage rollup.
+ *
+ * `usage` is null whenever the totals are not established — no request
+ * carried usage, every request's usage was rejected, the totals overflowed,
+ * or the requests are not known to be one per API call. It is never zeroed,
+ * because zero is a claim.
+ *
+ * The summary itself is still returned in all of those cases, with the
+ * request counts, models, timestamps and `diagnostics` intact: a session
+ * whose usage is unreadable and a session that does not exist are different
+ * answers, and only the second one is nothing.
+ */
+export interface SessionUsage {
+  contractVersion: number;
+  source: Source;
+  sessionId: string;
+  usage: NormalizedUsage | null;
+  /** Requests that contributed to `usage`. */
+  requestCount: number;
+  /** Requests seen, including ones with no usage. */
+  totalRequestCount: number;
+  /** Every accounting mode present; more than one means the totals mix units. */
+  accounting: UsageAccounting[];
+  models: string[];
+  firstTsMs: number | null;
+  lastTsMs: number | null;
+  /** Everything that kept a request out of the totals, or narrows them. */
+  diagnostics: UsageDiagnostic[];
+  /** The totals exceeded what can be represented and must not be used. */
+  overflowed: boolean;
+}
+
 /**
  * One block inside a user turn. `approxTokens` is deliberately absent: every
  * estimate available here is a bytes-per-token heuristic, and a heuristic
