@@ -138,7 +138,9 @@ with the `fs-events` feature and `WatchOptions::use_fs_events` is on; it polls
 at `poll_interval_ms` otherwise, with a `slow_poll_ms` backstop either way. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
-sweep arrives as an `Err` and the loop keeps running. `WatchHandle::stopper()`
+sweep arrives as an `Err` and the loop keeps running; the rolling catalog
+baseline survives it, so rows a failed sweep had already committed are
+reported by the next tick that succeeds rather than lost. `WatchHandle::stopper()`
 hands another thread a `WatchStop`; iteration ends once the loop has stopped
 and every reported tick has been read, and dropping the handle stops it.
 `next_timeout(timeout)` waits at most `timeout` for a tick, never past a short
@@ -220,7 +222,8 @@ Two facts about identity a consumer must not paper over:
 
 Static, per source: `evidence_kinds` (the parser's ceiling — a kind absent here
 is one the source never reports; a kind present with no rows means the session
-has none), `relationships` (`RelationshipCapabilities`: `always` / `sometimes`
+has none; relay and trajectory, which shallow discovery exempts, still declare
+`History` because their sweeps write prompt rows), `relationships` (`RelationshipCapabilities`: `always` / `sometimes`
 / `never` stable child identity and which delegation facts are recorded),
 `usage_accounting` (`per-request`, `per-message`, `cumulative-delta`,
 `context-proxy`, or `None`), `message_ids`, `hydrates_by_path`, and

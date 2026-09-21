@@ -304,11 +304,17 @@ impl Source {
     pub fn capabilities(self) -> SourceCapabilities {
         let name = self.as_str();
         let mut evidence_kinds = discover::declared_evidence_kinds(name).to_vec();
-        // Relay has no local parser to declare anything, but its prompts do
-        // reach the `history` table through the remote connector, and a
-        // consumer reading them must not be told the source cannot produce
-        // them.
-        if self == Self::Relay {
+        // Two sources declare nothing through shallow discovery yet write
+        // `history` rows all the same: relay's prompts arrive through the
+        // remote connector, and a trajectory's search text is indexed as a
+        // prompt by the trajectory sweep (`.trajectories` records are exempt
+        // from discovery, not from ingestion). A consumer reading those rows
+        // must not be told the source cannot produce them — and since
+        // `session()` reads only what is declared here, an undeclared kind
+        // is also an unread one.
+        if matches!(self, Self::Relay | Self::Trajectory)
+            && !evidence_kinds.contains(&EvidenceKind::History)
+        {
             evidence_kinds.push(EvidenceKind::History);
         }
         // Markers are derived by this crate's own parser rather than declared
@@ -713,31 +719,24 @@ impl SessionStore {
             // change another process made in between is a change since the
             // last report either way — and a fresh read otherwise.
             let mut base = tick_baseline.lock().expect("watch baseline");
-            let outcome = sync_facade_tick(
-                &db_path,
-                &tick_roots,
-                force,
-                |conn| match base.take() {
-                    Some(before) => Ok(before),
-                    None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
-                },
-                |conn, before, tick| {
-                    if !tick.swept {
-                        return Ok((before, Vec::new()));
-                    }
-                    let after = catalog_fingerprint(conn)?;
-                    let changed = catalog_changes(&before, &after);
-                    Ok((after, changed))
-                },
-            )?;
-            match outcome {
-                Some((tick, (digest, changed))) => {
-                    *base = Some(digest);
-                    *tick_pending.lock().expect("watch pending") = changed;
-                    Ok(TickOutcome::from(tick))
-                }
-                None => Ok(TickOutcome::from(SyncTick::default())),
-            }
+            let (outcome, changed) = rolling_tick(&mut base, |previous| {
+                let outcome = sync_facade_tick(
+                    &db_path,
+                    &tick_roots,
+                    force,
+                    |conn| match previous {
+                        Some(before) => Ok(before),
+                        None => catalog_fingerprint(conn).map_err(anyhow::Error::from),
+                    },
+                    |conn, before, tick| {
+                        let after = tick.swept.then(|| catalog_fingerprint(conn)).transpose()?;
+                        Ok((before, after))
+                    },
+                )?;
+                Ok(outcome.map(|(tick, (before, after))| (tick, before, after)))
+            })?;
+            *tick_pending.lock().expect("watch pending") = changed;
+            Ok(outcome)
         });
 
         let report_sink = reports.clone();
@@ -971,6 +970,38 @@ impl SessionStore {
         evidence.loaded = selected;
         evidence.diagnostics = diagnostics;
         Ok(Some(evidence))
+    }
+}
+
+/// One watch tick's bookkeeping around a bracketed sweep: hand the sweep the
+/// rolling baseline, and roll it forward only when the sweep came back.
+///
+/// `sweep` receives the previous swept tick's digest (or `None` for a fresh
+/// read under the lock) and answers with what it used as `before` and, when
+/// it swept, the `after` digest; `None` means the lock was held elsewhere.
+/// The baseline is *cloned* into the sweep rather than taken: a sweep that
+/// fails part-way has usually committed some of its rows already, and a
+/// baseline lost with it would make the next tick start afresh and never
+/// report them. On failure `base` is exactly what it was, so the next
+/// successful tick diffs against the last digest that was reported.
+fn rolling_tick(
+    base: &mut Option<CatalogFingerprint>,
+    sweep: impl FnOnce(
+        Option<CatalogFingerprint>,
+    ) -> anyhow::Result<
+        Option<(SyncTick, CatalogFingerprint, Option<CatalogFingerprint>)>,
+    >,
+) -> anyhow::Result<(TickOutcome, Vec<SessionRef>)> {
+    match sweep(base.clone())? {
+        None => Ok((TickOutcome::from(SyncTick::default()), Vec::new())),
+        Some((tick, before, after)) => {
+            let changed = after
+                .as_ref()
+                .map(|after| catalog_changes(&before, after))
+                .unwrap_or_default();
+            *base = Some(after.unwrap_or(before));
+            Ok((TickOutcome::from(tick), changed))
+        }
     }
 }
 
@@ -2601,6 +2632,142 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    /// A tick that fails keeps the rolling baseline, so the rows it (or
+    /// anyone) committed before the failure are reported by the next tick
+    /// that succeeds, rather than silently folded into a fresh baseline.
+    #[test]
+    fn a_failed_tick_keeps_the_baseline_for_the_next_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        store_at(&db);
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, discovery_state) \
+             VALUES ('known', 'claude', 'full')",
+        )
+        .unwrap();
+        let reported = catalog_fingerprint(&conn).unwrap();
+        let mut base = Some(reported.clone());
+        let swept = SyncTick {
+            attempted: true,
+            swept: true,
+        };
+
+        // The tick fails after committing a row — a provider read that died
+        // half-way through the sweep.
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, discovery_state) \
+             VALUES ('committed-then-failed', 'claude', 'full')",
+        )
+        .unwrap();
+        let failed = rolling_tick(&mut base, |previous| {
+            assert_eq!(
+                previous.as_ref(),
+                Some(&reported),
+                "the sweep sees the baseline"
+            );
+            Err(anyhow::anyhow!("provider read failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            base.as_ref(),
+            Some(&reported),
+            "the baseline survives the failure"
+        );
+
+        // A contended tick touches nothing either.
+        let (contended, changed) = rolling_tick(&mut base, |_| Ok(None)).unwrap();
+        assert!(contended.contended);
+        assert!(changed.is_empty());
+        assert_eq!(base.as_ref(), Some(&reported));
+
+        // The next successful tick reports the row the failed one committed,
+        // plus its own, and rolls the baseline forward.
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, discovery_state) \
+             VALUES ('this-tick', 'claude', 'full')",
+        )
+        .unwrap();
+        let after = catalog_fingerprint(&conn).unwrap();
+        let (outcome, changed) = rolling_tick(&mut base, |previous| {
+            Ok(Some((
+                swept,
+                previous.expect("baseline kept"),
+                Some(after.clone()),
+            )))
+        })
+        .unwrap();
+        assert!(outcome.swept);
+        let mut ids: Vec<String> = changed
+            .iter()
+            .map(|r| match r {
+                SessionRef::Id { session_id, .. } => session_id.clone(),
+                SessionRef::Path { .. } => unreachable!(),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["committed-then-failed", "this-tick"]);
+        assert_eq!(base.as_ref(), Some(&after));
+
+        // An unswept tick keeps the baseline where the last swept one left it.
+        let (_, changed) = rolling_tick(&mut base, |previous| {
+            Ok(Some((
+                SyncTick {
+                    attempted: true,
+                    swept: false,
+                },
+                previous.unwrap(),
+                None,
+            )))
+        })
+        .unwrap();
+        assert!(changed.is_empty());
+        assert_eq!(base.as_ref(), Some(&after));
+    }
+
+    /// A source exempt from shallow discovery still declares the rows its
+    /// own sweep writes, so its prompts are read rather than filtered out as
+    /// "not produced by this source".
+    #[test]
+    fn a_trajectory_session_reads_its_prompt_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        open_db(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sessions (session_id, source, discovery_state) \
+                 VALUES ('traj-1', 'trajectory', 'full');
+                 INSERT INTO history (source, session_id, project, prompt, prompt_hash, \
+                  timestamp_ms) \
+                 VALUES ('trajectory', 'traj-1', 'proj', 'ship the thing', 'h', 10);",
+            )
+            .unwrap();
+        for source in [Source::Trajectory, Source::Relay] {
+            assert!(
+                source
+                    .capabilities()
+                    .evidence_kinds
+                    .contains(&EvidenceKind::History),
+                "{source} writes history rows and says so"
+            );
+        }
+        let evidence = store
+            .session(
+                &SessionRef::id(Source::Trajectory, "traj-1"),
+                SessionQuery::default(),
+            )
+            .unwrap()
+            .expect("catalogued");
+        assert_eq!(evidence.coverage, vec![EvidenceKind::History]);
+        assert_eq!(evidence.loaded, vec![EvidenceKind::History]);
+        assert_eq!(evidence.prompts.len(), 1);
+        assert_eq!(
+            evidence.prompts[0].prompt.as_deref(),
+            Some("ship the thing")
         );
     }
 
