@@ -13,8 +13,8 @@
 use ai_hist::internal::{session_markers, session_tree, SessionTreeOptions};
 use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, open_db, session_events,
-    session_relationships, sync_local_at, sync_opencode_at, sync_opencode_db, DiscoverOptions,
-    HydrateSessionOptions, SessionScope, SyncOutput,
+    session_relationships, session_requests_page, sync_local_at, sync_opencode_at,
+    sync_opencode_db, DiscoverOptions, HydrateSessionOptions, SessionScope, SyncOutput,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::fs;
@@ -321,12 +321,22 @@ fn shallow_discovery_qualifies_models_identically_across_layouts() {
     let root = temp_root("shallow-model-parity");
     let provider_db = root.join("provider/opencode.db");
     build_sqlite_store(&provider_db);
+    Connection::open(&provider_db)
+        .unwrap()
+        .execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, data) \
+             VALUES ('aaa_synthetic', 'msg_sqlite_u1', 'ses_sqlite_root', 1776643199000, \
+                     '{\"id\":\"aaa_synthetic\",\"sessionID\":\"ses_sqlite_root\",\"messageID\":\"msg_sqlite_u1\",\"type\":\"text\",\"text\":\"continue from summary\",\"synthetic\":true}')",
+            [],
+        )
+        .unwrap();
 
     let sqlite_home = root.join("sqlite-home");
     use_layout(&sqlite_home, Some(&provider_db), None);
     let sqlite_catalog = root.join("sqlite-catalog.db");
     discover_sessions_scoped_at(&sqlite_catalog, &opencode_only()).unwrap();
     let sqlite_model = catalog_model(&sqlite_catalog, "ses_sqlite_root");
+    let sqlite_prompt = catalog_prompt(&sqlite_catalog, "ses_sqlite_root");
 
     let json_home = root.join("json-home");
     let tree = json_home.join(".local/share/opencode/storage");
@@ -335,6 +345,7 @@ fn shallow_discovery_qualifies_models_identically_across_layouts() {
     let json_catalog = root.join("json-catalog.db");
     discover_sessions_scoped_at(&json_catalog, &opencode_only()).unwrap();
     let json_model = catalog_model(&json_catalog, "ses_sqlite_root");
+    let json_prompt = catalog_prompt(&json_catalog, "ses_sqlite_root");
 
     assert_eq!(
         sqlite_model.as_deref(),
@@ -345,6 +356,15 @@ fn shallow_discovery_qualifies_models_identically_across_layouts() {
         sqlite_model, json_model,
         "the same provider payload must produce the same catalog model in both layouts"
     );
+    assert_eq!(
+        sqlite_prompt.as_deref(),
+        Some("add a retry to the client"),
+        "SQLite discovery must skip the leading synthetic text part"
+    );
+    assert_eq!(
+        sqlite_prompt, json_prompt,
+        "both layouts must apply the shared parser's synthetic-text rule"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -354,6 +374,17 @@ fn catalog_model(db_path: &Path, session_id: &str) -> Option<String> {
         .unwrap()
         .query_row(
             "SELECT models_json FROM sessions WHERE source='opencode' AND session_id=?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn catalog_prompt(db_path: &Path, session_id: &str) -> Option<String> {
+    open_db(db_path)
+        .unwrap()
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='opencode' AND session_id=?",
             [session_id],
             |row| row.get(0),
         )
@@ -418,6 +449,16 @@ fn full_ingest_preserves_the_earlier_session_creation_time() {
         first_activity,
         Some(1_776_643_199_000),
         "the session was created before its first message and that earlier timestamp must win"
+    );
+    let requests = session_requests_page(&conn, "opencode", "ses_sqlite_root", 50, None)
+        .unwrap()
+        .requests;
+    assert!(!requests.is_empty(), "the fixture must produce requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.provider.as_deref() == Some("anthropic")),
+        "request aggregation must preserve OpenCode's recorded provider"
     );
 
     drop(conn);
@@ -1706,6 +1747,12 @@ fn an_upgraded_database_delivers_the_new_event_columns() {
             .unwrap();
             stripped.push(old_shape);
         }
+        // The current derived request view reads provider. A pre-provider
+        // database did not have that view shape, and SQLite will not drop a
+        // column while a view still references it. Writable reopen rebuilds
+        // the view after restoring the column below.
+        conn.execute_batch("DROP VIEW IF EXISTS session_requests;")
+            .unwrap();
         for column in ["provider", "stop_reason"] {
             conn.execute_batch(&format!("ALTER TABLE session_events DROP COLUMN {column};"))
                 .unwrap();

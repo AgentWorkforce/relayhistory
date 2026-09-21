@@ -359,6 +359,7 @@ const USAGE_ACCOUNTING: readonly string[] = [
 ];
 const USAGE_DIAGNOSTICS: readonly string[] = [
   'ambiguous-usage-copies', 'unnormalizable-usage', 'ambiguous-model',
+  'ambiguous-provider',
   'unresolved-request-identity', 'partial-cache-write-split',
   'partial-reported-cost', 'count-not-representable',
 ];

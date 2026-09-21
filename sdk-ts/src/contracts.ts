@@ -576,6 +576,7 @@ export type UsageDiagnostic =
   | 'ambiguous-usage-copies'
   | 'unnormalizable-usage'
   | 'ambiguous-model'
+  | 'ambiguous-provider'
   /** No provider request identity was captured, so rows may be per record. */
   | 'unresolved-request-identity'
   /** Only some contributing requests reported the cache-write TTL split. */

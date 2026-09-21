@@ -1854,6 +1854,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                  WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
                  AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
+                 AND COALESCE(json_type(p.data, '$.synthetic'), 'null') <> 'true' \
                  AND json_type(p.data, '$.text') = 'text' \
                  AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
                  ORDER BY {order} ASC LIMIT 1"
