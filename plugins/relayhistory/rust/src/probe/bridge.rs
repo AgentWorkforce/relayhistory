@@ -48,6 +48,8 @@ pub fn mode(config: &Config) -> SharingMode {
 #[derive(Subcommand)]
 pub enum SessionCommand {
     List(SessionList),
+    /// Local-only shallow catalog; never reads delivery batches or sends data.
+    Preview(SessionPreview),
     Include(SessionMutation),
     Exclude(SessionMutation),
 }
@@ -57,6 +59,13 @@ pub struct SessionList {
     target: Target,
     #[arg(long, default_value_t = 500)]
     limit: usize,
+}
+#[derive(Args)]
+pub struct SessionPreview {
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=100))]
+    limit: u16,
+    #[arg(long)]
+    refresh: bool,
 }
 #[derive(Args)]
 pub struct SessionMutation {
@@ -229,6 +238,37 @@ pub fn pause(directory: &Path, paused: bool) -> Result<()> {
 
 pub fn sessions(command: SessionCommand) -> Result<()> {
     match command {
+        SessionCommand::Preview(options) => {
+            let directory = super::home()?.join(".agentworkforce/session-preview");
+            super::private_directory(&directory)?;
+            let db = directory.join("catalog.db");
+            if options.refresh {
+                // A separate local metadata cache cannot wait behind the capture writer
+                // or accidentally add unselected sessions to a delivery generation.
+                ai_hist::discover_sessions_local_at(
+                    &db,
+                    &ai_hist::DiscoverOptions {
+                        limit: Some(options.limit as usize),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            let rows = if db.exists() {
+                ai_hist::list_sessions_local_at(
+                    &db,
+                    &ai_hist::CatalogListOptions {
+                        limit: Some(options.limit as i64),
+                        ..Default::default()
+                    },
+                )?
+                .sessions
+            } else {
+                Vec::new()
+            };
+            let response = preview_response(&rows);
+            super::save_json(&directory.join("sessions.json"), &response)?;
+            emit(response);
+        }
         SessionCommand::List(options) => {
             let directory = options.target.directory()?;
             let config = read_config(&directory)?;
@@ -245,6 +285,17 @@ pub fn sessions(command: SessionCommand) -> Result<()> {
     }
     Ok(())
 }
+fn preview_response(rows: &[ai_hist::ShallowSession]) -> Value {
+    let sessions: Vec<_> = rows.iter().map(|row| json!({
+        "source": row.source, "session_id": row.session_id,
+        "title": row.first_prompt.as_deref().unwrap_or(&row.session_id),
+        "cwd": row.cwd, "git_branch": row.git_branch,
+        "first_activity_ms": row.first_activity_ms, "last_activity_ms": row.last_activity_ms,
+        "included": false, "status": "unknown"
+    })).collect();
+    json!({"bridge_version":1, "sessions":sessions})
+}
+
 fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<Value>> {
     let conn = read_db(directory)?;
     let job = delivery::status(&conn, &config.job_id)?;
@@ -538,6 +589,26 @@ pub fn disconnect(directory: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_contains_titles_without_upload_permission_or_transcript_data() {
+        let response = super::preview_response(&[ai_hist::ShallowSession {
+            source: "codex".into(),
+            session_id: "one".into(),
+            first_prompt: Some("A local title".into()),
+            last_assistant_text: Some("Do not expose transcript bodies".into()),
+            raw_path: Some("/private/transcript.jsonl".into()),
+            last_activity_ms: Some(1234),
+            ..Default::default()
+        }]);
+        let row = &response["sessions"][0];
+        assert_eq!(row["title"], "A local title");
+        assert_eq!(row["included"], false);
+        assert_eq!(row["status"], "unknown");
+        assert_eq!(row["last_activity_ms"], 1234);
+        assert!(row.get("last_assistant_text").is_none());
+        assert!(row.get("raw_path").is_none());
+    }
+
     use super::*;
     use clap::Parser;
 

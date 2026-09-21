@@ -206,6 +206,8 @@ impl Monitor {
         confirm_completion: bool,
     ) -> Self {
         let url = history_url.to_owned();
+        let local_directory = directory.to_owned();
+        let report_delivery = job.is_some();
         let schedule = heartbeat_schedule(directory, history_url);
         let started = Instant::now();
         Self::start_with_report(
@@ -213,12 +215,28 @@ impl Monitor {
             job,
             !super::bridge::json_mode(),
             move |progress, finished| {
+                // Full capture details stay on this Mac, including during first sign-in.
+                let _ = super::save_json(
+                    &local_directory.join("progress.json"),
+                    &serde_json::json!({
+                        "updated_at_ms": chrono::Utc::now().timestamp_millis(), "progress": progress
+                    }),
+                );
+                if super::bridge::json_mode() {
+                    super::bridge::emit(
+                        serde_json::json!({"event":"progress", "progress":progress}),
+                    );
+                }
+                if !report_delivery {
+                    return true;
+                }
+                let progress = cloud_delivery_progress(progress);
                 schedule.lock().unwrap().report(
-                    progress,
+                    &progress,
                     started.elapsed(),
                     finished && confirm_completion,
                     Instant::now(),
-                    || heartbeat(&url, progress),
+                    || heartbeat(&url, &progress),
                 )
             },
         )
@@ -321,7 +339,23 @@ impl Drop for Monitor {
         self.stop.take();
     }
 }
+// Cloud sees delivery of permitted records only, never the local capture inventory.
+fn cloud_delivery_progress(progress: &Progress) -> Progress {
+    Progress {
+        phase: progress.phase.clone(),
+        records_uploaded: progress.records_uploaded,
+        records_queued: progress.records_queued,
+        backlog_complete: progress.backlog_complete,
+        ..Progress::default()
+    }
+}
+
 fn heartbeat(url: &str, progress: &Progress) -> bool {
+    if matches!(progress.phase.as_str(), "scanning" | "capture_paused") {
+        return true;
+    }
+    // Sanitize at the network boundary too, so future callers cannot leak counts.
+    let progress = cloud_delivery_progress(progress);
     // Capture updates only read cached credentials. Every actual delivery or idle
     // report may renew a token: the closing report can now be suppressed. Renewal
     // is bounded and never waits for another transport's refresh lock.
@@ -367,6 +401,36 @@ fn heartbeat(url: &str, progress: &Progress) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_delivery_never_contains_local_inventory() {
+        let local = Progress {
+            phase: "uploading".into(),
+            source: "codex".into(),
+            processed_files: 481,
+            total_files: Some(2357),
+            sessions_captured: 1687,
+            records_uploaded: 12,
+            records_queued: 3,
+            backlog_complete: true,
+        };
+        let cloud = cloud_delivery_progress(&local);
+        assert!(cloud.source.is_empty());
+        assert_eq!(cloud.processed_files, 0);
+        assert_eq!(cloud.total_files, None);
+        assert_eq!(cloud.sessions_captured, 0);
+        assert_eq!(cloud.records_uploaded, 12);
+        assert_eq!(cloud.records_queued, 3);
+        for phase in ["scanning", "capture_paused"] {
+            let capture = Progress {
+                phase: phase.into(),
+                ..local.clone()
+            };
+            // This deliberately invalid endpoint proves capture never tries HTTP/auth.
+            assert!(heartbeat("not a URL", &capture));
+        }
+    }
+
     fn watching() -> Progress {
         Progress {
             phase: "watching".into(),
@@ -431,6 +495,10 @@ mod tests {
                     assert!(authorized);
                     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(body["progress"]["phase"], "watching");
+                    assert_eq!(body["progress"]["sessionsCaptured"], 0);
+                    assert_eq!(body["progress"]["processedFiles"], 0);
+                    assert_eq!(body["progress"]["source"], "");
+                    assert!(body["progress"]["totalFiles"].is_null());
                 }
                 let body = if path.ends_with("refresh") {
                     serde_json::json!({"accessToken":"rth_at_fresh", "refreshToken":"rth_rt_fresh",

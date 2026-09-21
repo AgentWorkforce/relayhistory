@@ -97,11 +97,15 @@ job waits out its own backoff, which is normal operation rather than a fault.
 Transport credentials refresh through the existing RelayHistory auth
 implementation.
 
-The probe reports initial capture immediately, then changed progress at most every
-three seconds. Completion and failure transitions report immediately. Unchanged
-progress uses a jittered 270–330 second presence heartbeat shared across capture
-and delivery monitors; empty background cycles and short repeat scans do not
-produce extra requests. Failed reports retry no faster than every 30 seconds,
+Local capture progress is written to private `progress.json` and emitted as
+`event: "progress"` on the desktop install JSON stream every three seconds.
+Source names, files processed/total, and sessions captured never leave the Mac.
+Cloud heartbeats contain only delivery progress for permitted records; the legacy
+capture fields are empty/zero for wire compatibility, and capture-only monitors
+never send heartbeats. Changed delivery progress reports at most every three
+seconds. Completion and failure transitions report immediately. Unchanged delivery
+progress uses a jittered 270–330 second presence heartbeat; empty background
+cycles do not produce extra requests. Failed reports retry no faster than every 30 seconds,
 except for a new terminal transition or explicit setup/one-shot confirmation.
 Cloud determines whether session data has actually arrived. A running process
 alone does not mark the dashboard's data step complete.
@@ -234,3 +238,18 @@ Disconnect stops the collector, cancels jobs, best-effort revokes the workspace
 RelayHistory token, and removes this install's stage credentials/configuration.
 The local history database is retained. It does not remove shared Cloud login
 credentials belonging to other Cloud clients.
+
+### Local title preview
+
+`agent-relay-probe sessions preview --json --limit 100 [--refresh]` has no
+Cloud target, credentials, or transport. `--refresh` uses RelayHistory's existing
+shallow discovery adapters and a separate private metadata catalog under
+`~/.agentworkforce/session-preview/`; it does not contend with full capture's
+writer or change inclusion. The cache-only form lists recent metadata and writes
+`sessions.json` for immediate desktop startup. Both return the desktop session
+shape with `included: false` and `status: "unknown"`. These rows are previews;
+only the normal target-scoped session list can make them selectable for upload.
+
+The desktop prewarms discovery during sign-in and displays cached titles before
+awaiting capture or delivery status. The preview is limited to 100 recent sessions;
+full browsing continues through the normal session list when preparation finishes.
