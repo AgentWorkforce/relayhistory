@@ -978,14 +978,13 @@ fn scoped_backfill_has_constant_unrelated_record_visits() {
             );
             let started = std::time::Instant::now();
             let before = conn.total_changes();
-            set_job_session(
+            include_job_session(
                 &conn,
                 &root.job_id,
                 &SessionIdentity {
                     source: "claude".into(),
                     session_id: "selected".into(),
                 },
-                true,
             )
             .unwrap();
             let select_ms = started.elapsed().as_secs_f64() * 1000.;
@@ -1363,4 +1362,139 @@ fn ready_members_make_round_robin_progress_across_single_record_batches() {
     acknowledge(&conn, &second.lease, &ack(&second), &|| 4).unwrap();
     let third = claim(&conn, &job.job_id, 5).unwrap();
     assert_eq!(third.batch.records[0].session_id, first_session);
+}
+
+#[test]
+fn scoped_include_clears_legacy_exclusion_with_fresh_relationships() {
+    let conn = db();
+    let parent = SessionIdentity {
+        source: "claude".into(),
+        session_id: "parent".into(),
+    };
+    let child = SessionIdentity {
+        source: "claude".into(),
+        session_id: "child".into(),
+    };
+    event(&conn, "parent", "parent evidence");
+    event(&conn, "child", "child evidence");
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude','parent','edge','child','delegation','observed','fixture',1,1)", []).unwrap();
+    set_session_excluded(&conn, &child, true).unwrap();
+    let mut cfg = config("legacy-inclusion");
+    cfg.selection.kinds.push("relationship".into());
+    let job = create_job(&conn, &cfg, 0).unwrap();
+    adopt_session_job(&conn, &job.job_id, std::slice::from_ref(&parent)).unwrap();
+    let before = drain(&conn, &job.job_id);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].session_id.as_deref(), Some("parent"));
+    pause_job(&conn, &job.job_id).unwrap();
+    assert!(include_job_session(&conn, &job.job_id, &child).unwrap());
+    assert_eq!(status(&conn, &job.job_id).unwrap().state, "paused");
+    assert_eq!(
+        status(&conn, &job.job_id).unwrap().generation,
+        job.generation
+    );
+    resume_job(&conn, &job.job_id).unwrap();
+    let after = drain(&conn, &job.job_id);
+    assert_eq!(after.len(), 2);
+    assert!(after
+        .iter()
+        .any(|r| r.kind == "session_event" && r.session_id.as_deref() == Some("child")));
+    let edge = after.iter().find(|r| r.kind == "relationship").unwrap();
+    let cutoff: i64 = conn
+        .query_row(
+            "SELECT cutoff FROM delivery_session_members WHERE job_id=? AND session_id='child'",
+            [&job.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(edge.revision >= cutoff);
+    assert!(!include_job_session(&conn, &job.job_id, &child).unwrap());
+    assert!(drain(&conn, &job.job_id).is_empty());
+}
+
+#[test]
+fn scoped_include_preserves_other_jobs_and_rolls_back_a_failed_guard() {
+    for existing in [false, true] {
+        for scoped_other in [false, true] {
+            let conn = db();
+            let parent = SessionIdentity {
+                source: "claude".into(),
+                session_id: "parent".into(),
+            };
+            let child = SessionIdentity {
+                source: "claude".into(),
+                session_id: "child".into(),
+            };
+            let mut cfg = config("target");
+            cfg.selection.kinds.push("relationship".into());
+            let root = create_session_job(&conn, &cfg, 0).unwrap();
+            set_job_session(&conn, &root.job_id, &parent, true).unwrap();
+            if existing {
+                set_job_session(&conn, &root.job_id, &child, true).unwrap();
+            }
+            set_session_excluded(&conn, &child, true).unwrap();
+            cfg.instance_id = "other".into();
+            let other = if scoped_other {
+                let other = create_session_job(&conn, &cfg, 0).unwrap();
+                set_job_session(&conn, &other.job_id, &parent, true).unwrap();
+                other
+            } else {
+                create_job(&conn, &cfg, 0).unwrap()
+            };
+            let before = serde_json::to_value(status(&conn, &root.job_id).unwrap()).unwrap();
+            let members = job_sessions(&conn, &root.job_id).unwrap();
+            let error = include_job_session(&conn, &root.job_id, &child).unwrap_err();
+            assert!(error.to_string().contains("DELIVERY_GENERATION_REQUIRED"));
+            assert_eq!(
+                serde_json::to_value(status(&conn, &root.job_id).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(job_sessions(&conn, &root.job_id).unwrap(), members);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM delivery_exclusions WHERE session_id='child'",
+                    [],
+                    |r| r.get::<_, usize>(0)
+                )
+                .unwrap(),
+                1
+            );
+            cancel_job(&conn, &other.job_id).unwrap();
+            assert!(include_job_session(&conn, &root.job_id, &child).unwrap());
+        }
+    }
+}
+
+#[test]
+fn scoped_include_rolls_back_exclusion_and_fences_when_snapshot_fails() {
+    let conn = db();
+    let child = SessionIdentity {
+        source: "claude".into(),
+        session_id: "child".into(),
+    };
+    let root = create_session_job(&conn, &config("failed-snapshot"), 0).unwrap();
+    set_session_excluded(&conn, &child, true).unwrap();
+    let before = serde_json::to_value(status(&conn, &root.job_id).unwrap()).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_member_snapshot BEFORE INSERT ON delivery_bootstrap_bounds WHEN NEW.job_id <> 'irrelevant' BEGIN SELECT RAISE(ABORT,'fixture snapshot failure'); END;").unwrap();
+    assert!(include_job_session(&conn, &root.job_id, &child)
+        .unwrap_err()
+        .to_string()
+        .contains("fixture snapshot failure"));
+    assert_eq!(
+        serde_json::to_value(status(&conn, &root.job_id).unwrap()).unwrap(),
+        before
+    );
+    assert!(!job_session_included(&conn, &root.job_id, &child).unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM delivery_exclusions WHERE session_id='child'",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute_batch("DROP TRIGGER fail_member_snapshot;")
+        .unwrap();
+    assert!(include_job_session(&conn, &root.job_id, &child).unwrap());
 }

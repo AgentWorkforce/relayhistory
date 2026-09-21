@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { DEFAULT_DELIVERY_LIMITS, controlHistoryDelivery as removedCoreControl } from 'ai-hist';
-import { createHistoryDelivery, historyDeliveryStatus, controlHistoryDelivery, drainProbeDelivery, historyDeliveryRetention } from './delivery.js';
+import { createHistoryDelivery, historyDeliveryStatus, controlHistoryDelivery, drainProbeDelivery, historyDeliveryRetention, compactHistoryDelivery } from './delivery.js';
 
 const binaryPath = process.env.RELAYHISTORY_PLUGIN_BIN;
 test('probe helper owns persisted jobs and drains paused work without credentials', { skip: !binaryPath }, async t => {
@@ -27,4 +27,5 @@ test('probe helper owns persisted jobs and drains paused work without credential
   assert.ok((await historyDeliveryRetention(options)).limitBytes > 0);
   await controlHistoryDelivery(job.job_id, 'cancel', options);
   assert.equal((await historyDeliveryStatus(job.job_id, options))[0].state, 'cancelled');
+  await compactHistoryDelivery(options);
 });

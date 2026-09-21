@@ -593,8 +593,7 @@ fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
         delivery::adopt_session_job(&conn, &plan.config.job_id, &selected(directory)?)?;
         for identity in identities {
             if *include {
-                delivery::set_session_excluded(&conn, identity, false)?;
-                delivery::set_job_session(&conn, &plan.config.job_id, identity, true)?;
+                delivery::include_job_session(&conn, &plan.config.job_id, identity)?;
             } else {
                 delivery::set_job_session(&conn, &plan.config.job_id, identity, false)?;
             }
@@ -867,17 +866,21 @@ mod tests {
     }
 
     #[test]
-    fn repeated_include_does_not_succeed_while_global_exclusion_remains() {
+    fn repeated_include_rebaselines_a_globally_excluded_member() {
         let (dir, config) = fixture(SharingMode::Selected);
         let config = apply(dir.path(), config, None, &["claude:old"], true);
         let conn = db(dir.path()).unwrap();
         let identity = parse_key("claude:old").unwrap();
+        let cutoff = || {
+            conn.query_row("SELECT cutoff FROM delivery_session_members WHERE job_id=? AND source='claude' AND session_id='old'", [&config.job_id], |r| r.get::<_,i64>(0)).unwrap()
+        };
+        let original = cutoff();
         delivery::set_session_excluded(&conn, &identity, true).unwrap();
-        let error = change(dir.path(), None, &["claude:old".into()], true).unwrap_err();
-        assert!(format!("{error:#}").contains("DELIVERY_GENERATION_REQUIRED"));
+        change(dir.path(), None, &["claude:old".into()], true).unwrap();
         assert!(delivery::job_session_included(&conn, &config.job_id, &identity).unwrap());
-        assert!(excluded(&conn).unwrap().contains(&identity));
-        assert!(dir.path().join("sharing-change.json").exists());
+        assert!(!excluded(&conn).unwrap().contains(&identity));
+        assert!(cutoff() > original);
+        assert!(!dir.path().join("sharing-change.json").exists());
     }
 
     #[test]

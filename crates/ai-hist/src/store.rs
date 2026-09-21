@@ -2145,10 +2145,10 @@ pub fn mark_session_presence(
     session_id: &str,
     location: SessionLocation,
 ) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO session_presences (source, session_id, location) VALUES (?, ?, ?)",
-        params![source, session_id, location.as_str()],
-    )?;
+    )?
+    .execute(params![source, session_id, location.as_str()])?;
     Ok(())
 }
 
@@ -2295,8 +2295,9 @@ pub fn insert_history_at_location(
     if let Some(session_id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
         mark_session_presence(conn, &entry.source, session_id, location)?;
     }
-    let inserted = conn.execute(
+    let inserted = conn.prepare_cached(
         "INSERT OR IGNORE INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) VALUES (?, ?, ?, ?, ?, ?)",
+    )?.execute(
         params![entry.source, entry.session_id, entry.project, entry.prompt, entry.prompt_hash, entry.timestamp_ms],
     )?;
     Ok(inserted)
