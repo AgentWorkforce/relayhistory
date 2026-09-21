@@ -113,17 +113,27 @@ impl ContinuityEvidence {
 /// past the ceiling is walked to its newline in fixed-size chunks and `raw` is
 /// left empty, so one pathological line cannot cost this walk the file's size
 /// in memory. `raw` is reused across calls, so the buffer is grown once.
-fn next_record(reader: &mut impl std::io::BufRead, raw: &mut Vec<u8>) -> std::io::Result<bool> {
+/// Read one record; `None` at end of file, else the bytes it consumed.
+///
+/// The count is what the reader *spent*, not what `raw` ends up holding:
+/// `raw` loses the delimiter, and an oversized record is drained and dropped
+/// entirely. Measuring the buffer instead reported a 16 MiB record as zero
+/// bytes read, and every ordinary record one or two bytes short.
+fn next_record(
+    reader: &mut impl std::io::BufRead,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<Option<u64>> {
     use std::io::{BufRead, Read};
     const CEILING: u64 = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
     raw.clear();
     // The cap is on the reader rather than a check around it: `read_until`
     // extends `raw` until it finds a newline, so a budget consulted afterwards
     // can only observe an allocation that already happened.
-    let read = reader.take(CEILING).read_until(b'\n', raw)? as u64;
-    if read == 0 {
-        return Ok(false);
+    let mut consumed = reader.take(CEILING).read_until(b'\n', raw)? as u64;
+    if consumed == 0 {
+        return Ok(None);
     }
+    let read = consumed;
     // The limited read stops at the ceiling whether the record ends there or
     // runs past it, so the ceiling alone cannot tell them apart. The same
     // boundary rule as the ingest reader: one byte decides, and a record that
@@ -131,10 +141,10 @@ fn next_record(reader: &mut impl std::io::BufRead, raw: &mut Vec<u8>) -> std::io
     if raw.last() != Some(&b'\n') && read == CEILING {
         match reader.fill_buf()?.first().copied() {
             // The file ends here: a complete tail, exactly on the ceiling.
-            None => return Ok(true),
+            None => return Ok(Some(consumed)),
             Some(b'\n') => {
                 reader.consume(1);
-                return Ok(true);
+                return Ok(Some(consumed + 1));
             }
             Some(_) => {}
         }
@@ -157,24 +167,26 @@ fn next_record(reader: &mut impl std::io::BufRead, raw: &mut Vec<u8>) -> std::io
                 match available.iter().position(|byte| *byte == b'\n') {
                     Some(at) => {
                         reader.consume(at + 1);
+                        consumed += at as u64 + 1;
                         break;
                     }
                     None => {
                         let all = available.len();
                         reader.consume(all);
+                        consumed += all as u64;
                     }
                 }
             }
-            return Ok(true);
+            return Ok(Some(consumed));
         }
         // A genuine tail: the file ends here, under the ceiling.
-        return Ok(true);
+        return Ok(Some(consumed));
     }
     raw.pop();
     if raw.last() == Some(&b'\r') {
         raw.pop();
     }
-    Ok(true)
+    Ok(Some(consumed))
 }
 
 /// Read one Claude transcript's continuity evidence in a single pass.
@@ -196,6 +208,7 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
     let mut any = false;
     while next_record(&mut reader, &mut raw)
         .with_context(|| format!("reading Claude transcript {}", path.display()))?
+        .is_some()
     {
         crate::ingest::check_capture_cancelled()?;
         // An oversized record is not buffered and an undecodable one is not
@@ -325,12 +338,11 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
         .with_context(|| format!("reading Codex rollout {}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut raw = Vec::new();
-    if !next_record(&mut reader, &mut raw)
+    let Some(bytes_read) = next_record(&mut reader, &mut raw)
         .with_context(|| format!("reading Codex rollout {}", path.display()))?
-    {
+    else {
         return Ok((None, 0));
-    }
-    let bytes_read = raw.len() as u64;
+    };
     let Ok(first) = std::str::from_utf8(&raw) else {
         return Ok((None, bytes_read));
     };
@@ -2644,5 +2656,49 @@ mod tests {
         ingest(&conn, "fork-branch-a.jsonl");
         assert_eq!(held(&conn).len(), 4);
         assert_eq!(edges(&conn, SHARED_FORK).len(), 2);
+    }
+
+    /// A record the reader drained is counted, not reported as nothing read.
+    ///
+    /// `next_record` clears `raw` for a record over the ceiling and strips the
+    /// delimiter from every other, so measuring the buffer reported a 16 MiB
+    /// record as zero bytes and an ordinary one a byte or two short. The count
+    /// is what the reader spent.
+    #[test]
+    fn a_drained_record_is_counted_as_the_bytes_it_cost() {
+        use crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+
+        let ordinary = "{\"a\":1}\n";
+        std::fs::write(&path, ordinary).unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut raw = Vec::new();
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            Some(ordinary.len() as u64),
+            "the delimiter was read, so it is counted"
+        );
+        assert_eq!(raw.len(), ordinary.len() - 1, "but it is not handed over");
+
+        // A record past the ceiling: drained and dropped, and every byte of it
+        // still cost a read.
+        let oversized_len = MAX_RECORD_BYTES as usize + 64;
+        let mut bytes = vec![b'x'; oversized_len];
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut raw = Vec::new();
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            Some(bytes.len() as u64),
+            "a drained record reported the empty buffer instead of what it read"
+        );
+        assert!(raw.is_empty(), "an oversized record is not buffered");
+        assert_eq!(
+            super::next_record(&mut reader, &mut raw).unwrap(),
+            None,
+            "the drain stopped on the newline rather than overrunning"
+        );
     }
 }

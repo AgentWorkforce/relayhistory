@@ -6124,10 +6124,8 @@ mod tests {
         assert_eq!(first.status, "hydrated");
         // The whole rollout, plus its `session_meta` record read three times
         // from the head: once to stamp the source, once to identify it for
-        // ingestion, once for continuity. One record each, never the file —
-        // and the reader hands a record over without its delimiter, hence the
-        // `- 1`.
-        let head_reads = 3 * meta_line.len() as i64 - 1;
+        // ingestion, once for continuity. One record each, never the file.
+        let head_reads = 3 * meta_line.len() as i64;
         // Records only: a pass also hashes bounded windows to validate its
         // cursor, and those bytes are in `bytes_read` too. Reported by the
         // code that spends them, so this stays an exact statement about the
@@ -6752,11 +6750,10 @@ mod tests {
         // records.
         // The rollout once, plus its `session_meta` record from the head
         // three times: stamping the source, identifying it for ingestion, and
-        // the continuity scan. One record each, never the file — the reader
-        // hands a record over without its delimiter, hence the `- 1`.
+        // the continuity scan. One record each, never the file.
         assert_eq!(
             first_records,
-            complete.len() as i64 + 3 * meta_line.len() as i64 - 1
+            complete.len() as i64 + 3 * meta_line.len() as i64
         );
 
         // A half-written record arrives with no newline. The pass reads it,
@@ -6772,7 +6769,7 @@ mod tests {
         // reported by the code that spends them.
         assert_eq!(
             appended_records,
-            tail.len() as i64 + 3 * meta_line.len() as i64 - 1,
+            tail.len() as i64 + 3 * meta_line.len() as i64,
             "an unterminated tail the reader consumed must appear in bytes_read"
         );
         // Positive control: the tail was not committed, so the cursor has not
