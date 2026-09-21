@@ -182,7 +182,7 @@ provider-issued or synthesized, and its watch roots.
 
 Shipped as `Source::capabilities()` — `evidence_kinds`, `relationships`,
 `usage_accounting`, `message_ids` (`Provider` / `Synthesized` / `Mixed` /
-`None`), `hydrates_by_path` and `watch_roots(home)`; `SessionEvidence::coverage`
+`None`), `hydrates_by_path` and `watch_roots(&roots)`; `SessionEvidence::coverage`
 repeats the kinds per read.
 
 This is the contract that lets a consumer distinguish "this session has no tool

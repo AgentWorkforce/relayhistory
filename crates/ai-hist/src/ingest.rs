@@ -235,18 +235,23 @@ fn capture_files(source: &'static str, files: Vec<PathBuf>) -> impl Iterator<Ite
 /// remains for the in-module tests that predate it.
 #[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
-    sync_facade_tick(db_path, home, false).map(|tick| tick.attempted)
+    let roots = crate::ProviderRoots::from_env(home.to_path_buf());
+    sync_facade_tick(db_path, &roots, false).map(|tick| tick.attempted)
 }
 
-/// One local sweep for [`crate::SessionStore`]: silent, against an explicit
-/// provider home, forcing past the source fingerprint when asked.
+/// One local sweep for [`crate::SessionStore`]: silent, against the store's
+/// resolved provider roots, forcing past the source fingerprint when asked.
 ///
 /// The facade reads the returned [`SyncTick`] rather than a boolean because
 /// it has to tell "another process holds the sync lock" apart from "nothing
 /// moved", and turn the former into an error instead of a silent no-op.
-pub(crate) fn sync_facade_tick(db_path: &Path, home: &Path, force: bool) -> Result<SyncTick> {
+pub(crate) fn sync_facade_tick(
+    db_path: &Path,
+    roots: &crate::ProviderRoots,
+    force: bool,
+) -> Result<SyncTick> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    sync_exclusive_with_home(db_path, home, force)
+    sync_exclusive_with_roots(db_path, roots, force)
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -1064,7 +1069,7 @@ pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchR
     sync_watch_roots_with_provider_roots(&provider_roots)
 }
 
-fn sync_watch_roots_with_provider_roots(
+pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
     let home = &provider_roots.home;

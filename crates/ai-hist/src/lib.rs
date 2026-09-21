@@ -56,7 +56,8 @@ pub mod git_sdk;
 #[cfg(all(feature = "git-hooks", not(feature = "unstable-internal")))]
 mod git_sdk;
 
-pub(crate) use paths::{home_dir, ProviderRoots};
+pub(crate) use paths::home_dir;
+pub use paths::ProviderRoots;
 pub(crate) use relationship_capture::now_ms;
 #[cfg(feature = "unstable-internal")]
 pub use relationship_graph as relationships;

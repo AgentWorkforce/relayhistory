@@ -3142,6 +3142,23 @@ fn fetch_catalog_row(
         .ok())
 }
 
+/// The catalog columns with the two text excerpts replaced by `NULL`, for a
+/// read that asked for no transcript text: the excerpts are bounded, but
+/// "bounded" is not "not moved", and a hash-only consumer is promised the
+/// latter.
+static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
+    SESSION_COLUMNS
+        .replacen("first_prompt, last_assistant_text,", "NULL AS first_prompt, NULL AS last_assistant_text,", 1)
+});
+
+fn catalog_columns(include_text: bool) -> &'static str {
+    if include_text {
+        SESSION_COLUMNS
+    } else {
+        &SESSION_COLUMNS_NO_TEXT
+    }
+}
+
 /// One catalog row, or `None` when the session is not catalogued.
 ///
 /// Unlike [`fetch_catalog_row`] this propagates a query failure instead of
@@ -3151,9 +3168,13 @@ pub(crate) fn catalog_row(
     conn: &Connection,
     source: &str,
     session_id: &str,
+    include_text: bool,
 ) -> Result<Option<ShallowSession>> {
     Ok(conn
-        .prepare_cached(&CATALOG_ROW_SQL)?
+        .prepare_cached(&format!(
+            "SELECT {} FROM sessions WHERE source = ? AND session_id = ?",
+            catalog_columns(include_text)
+        ))?
         .query_row(params![source, session_id], row_to_session)
         .optional()?)
 }
@@ -3163,11 +3184,13 @@ pub(crate) fn catalog_row_by_path(
     conn: &Connection,
     source: &str,
     raw_path: &str,
+    include_text: bool,
 ) -> Result<Option<ShallowSession>> {
     Ok(conn
         .prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE source = ? AND raw_path = ? \
-             ORDER BY session_id LIMIT 1"
+            "SELECT {} FROM sessions WHERE source = ? AND raw_path = ? \
+             ORDER BY session_id LIMIT 1",
+            catalog_columns(include_text)
         ))?
         .query_row(params![source, raw_path], row_to_session)
         .optional()?)

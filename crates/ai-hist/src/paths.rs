@@ -1,4 +1,5 @@
 //! Local provider locations shared by discovery, ingestion, and applications.
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 fn env_dir(var: &str) -> Option<PathBuf> {
@@ -35,19 +36,43 @@ pub fn opencode_storage_dir(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share/opencode/storage"))
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProviderRoots {
+/// Where every local provider keeps its sessions.
+///
+/// One value, resolved once, drives `sync`, `hydrate`, `watch` and the
+/// advertised watch roots alike — the same tree is scanned, hydrated and
+/// watched, or a session the sweep catalogued cannot be hydrated afterwards.
+/// Build it with [`ProviderRoots::from_env`] (the CLI's rules: the process
+/// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+/// `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` override the defaults under
+/// `home`) or [`ProviderRoots::from_home`] (the defaults under `home`, with
+/// nothing read from the environment — what a test or an embedder with its
+/// own layout wants).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ProviderRoots {
+    /// The home the file-backed providers are rooted at.
     pub home: PathBuf,
+    /// Claude Code configuration root (`~/.claude`).
     pub claude: PathBuf,
+    /// Codex state root (`~/.codex`).
     pub codex: PathBuf,
+    /// Grok state root (`~/.grok`).
     pub grok: PathBuf,
+    /// The OpenCode SQLite store.
     pub opencode_db: PathBuf,
+    /// OpenCode's legacy `storage/` JSON tree, read only when there is no
+    /// `opencode.db`.
     pub opencode_storage_dir: PathBuf,
+    /// Whether these roots came from environment overrides, so a sweep can
+    /// say when a configured root does not exist rather than silently
+    /// scanning nothing.
     pub use_env_roots: bool,
 }
 
 impl ProviderRoots {
-    pub(crate) fn from_env(home: PathBuf) -> Self {
+    /// Roots under `home`, with the process environment's provider overrides
+    /// applied — the CLI's resolution.
+    pub fn from_env(home: PathBuf) -> Self {
         Self {
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
@@ -59,7 +84,9 @@ impl ProviderRoots {
         }
     }
 
-    pub(crate) fn from_home(home: PathBuf, opencode_db: PathBuf) -> Self {
+    /// Roots under `home` and the given OpenCode store, reading nothing from
+    /// the environment.
+    pub fn from_home(home: PathBuf, opencode_db: PathBuf) -> Self {
         let opencode_storage_dir = opencode_db
             .parent()
             .map(|parent| parent.join("storage"))

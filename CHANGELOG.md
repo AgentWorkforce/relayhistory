@@ -129,7 +129,11 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 - `SessionStore` is now the whole default surface of the `ai-hist` crate:
   seven operations, typed evidence, no raw connection, no contract constant
-  (`docs/sourcing-sdk.md`). `open` and `sync` keep their shape; `sync` takes
+  (`docs/sourcing-sdk.md`). `open` keeps its shape and `StoreOptions` gains
+  `roots: Option<ProviderRoots>` (`ProviderRoots` is public: `from_env` is
+  the CLI's resolution, `from_home` reads nothing from the environment); the
+  roots are resolved once at `open` and drive `sync`, `hydrate`, `watch` and
+  `Source::capabilities().watch_roots(&roots)` alike. `sync` takes
   `SyncOptions { force, lock_timeout_ms }` and reports `swept` plus the
   `changed` `SessionRef`s (catalog rows a sweep created or changed), and a
   held `SyncRunLock` is `Error::SyncLocked` after the caller's timeout rather

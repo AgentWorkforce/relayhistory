@@ -27,13 +27,17 @@
 use crate::discover::{
     self, list_session_catalog_page, CatalogCursor, CatalogListOptions, ShallowSession,
 };
-use crate::ingest::hook::{ingest_transcript_at, ingest_transcript_at_with_home, TranscriptStatus};
+use crate::ingest::hook::{ingest_transcript_at_with_roots, TranscriptStatus};
 use crate::ingest::hydrate::{
-    hydrate_session_at, hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult,
+    hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
 };
-use crate::ingest::{sync_facade_tick, sync_watch_roots, SyncTick, HOOK_HARNESSES};
-use crate::paths::{home_dir, opencode_db_path};
+use crate::ingest::{
+    sync_facade_tick, sync_watch_roots_with_provider_roots, SyncTick, HOOK_HARNESSES,
+};
+use crate::paths::home_dir;
+pub use crate::paths::ProviderRoots;
 use crate::relationship_graph::{self, RelationshipCapabilities, SessionRelationship};
+use crate::remote::SourceConnectorSelection;
 use crate::session_usage::{
     session_requests_page, session_usage_summary, SessionRequest, SessionUsageSummary,
 };
@@ -41,8 +45,9 @@ use crate::source_evidence::EvidenceKind;
 use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current, session_events_sized,
-    session_file_edits, session_markers, session_tool_calls, session_user_turns_page, HistoryEntry,
-    SessionEvent, SessionFileEdit, SessionMarker, SessionScope, SessionToolCall, SessionUserTurn,
+    session_file_edits, session_markers_sized, session_prompts_sized, session_tool_calls,
+    session_user_turns_page, PromptRow, SessionEvent, SessionFileEdit, SessionMarker, SessionScope,
+    SessionToolCall, SessionUserTurn,
 };
 use crate::usage::{normalize_usage_str, source_accounting, NormalizedUsage, UsageAccounting};
 use crate::watch::{TickOutcome, TickTrigger, WatchDriver, WatchLoop};
@@ -299,6 +304,13 @@ impl Source {
     pub fn capabilities(self) -> SourceCapabilities {
         let name = self.as_str();
         let mut evidence_kinds = discover::declared_evidence_kinds(name).to_vec();
+        // Relay has no local parser to declare anything, but its prompts do
+        // reach the `history` table through the remote connector, and a
+        // consumer reading them must not be told the source cannot produce
+        // them.
+        if self == Self::Relay {
+            evidence_kinds.push(EvidenceKind::History);
+        }
         // Markers are derived by this crate's own parser rather than declared
         // by an adapter (a remote connector cannot supply them, so the
         // connector-facing declaration leaves them out); the parsers that
@@ -390,13 +402,13 @@ pub struct SourceCapabilities {
 }
 
 impl SourceCapabilities {
-    /// The filesystem roots this source's adapter watches for a provider
-    /// home, as [`SessionStore::watch`] registers them. Empty for a source
-    /// with no local files (relay) or no live-capture root (trajectory reads
-    /// project directories, which `watch` derives per run).
-    pub fn watch_roots(&self, home: &Path) -> Vec<PathBuf> {
-        let roots = crate::ProviderRoots::from_home(home.to_path_buf(), opencode_db_path(home));
-        discover::provider_watch_roots(self.source.as_str(), &roots)
+    /// The filesystem roots this source's adapter watches under `roots`, as
+    /// [`SessionStore::watch`] registers them for a store opened with the
+    /// same roots ([`SessionStore::roots`]). Empty for a source with no local
+    /// files (relay) or no live-capture root (trajectory reads project
+    /// directories, which `watch` derives per run).
+    pub fn watch_roots(&self, roots: &ProviderRoots) -> Vec<PathBuf> {
+        discover::provider_watch_roots(self.source.as_str(), roots)
             .iter()
             .map(|root| root.registered_path().to_path_buf())
             .collect()
@@ -414,10 +426,17 @@ pub struct StoreOptions {
     /// The database. Defaults to `$AI_HIST_DB`, then the XDG data path, or
     /// `<home>/.local/share/ai-hist/ai-history.db` when `home` is set.
     pub db_path: Option<PathBuf>,
-    /// Provider home to scan instead of the process `HOME`. Provider roots
-    /// still honour `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` and
-    /// `OPENCODE_DB` when they are set, exactly as the CLI does.
+    /// Provider home to scan instead of the process `HOME`. Ignored when
+    /// `roots` is set. Provider roots derived from it still honour
+    /// `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` and `OPENCODE_DB` when
+    /// they are set, exactly as the CLI does.
     pub home: Option<PathBuf>,
+    /// Exactly where each provider keeps its sessions, resolved by the
+    /// caller. `None` derives them from `home` (or the process `HOME`) with
+    /// the environment overrides applied, as [`ProviderRoots::from_env`]
+    /// does. One resolution drives `sync`, `hydrate`, `watch` and
+    /// [`SourceCapabilities::watch_roots`] alike.
+    pub roots: Option<ProviderRoots>,
     /// Never write. `sync`, `hydrate` and `watch` return
     /// [`Error::UnsupportedOperation`]; a database older than the shape this
     /// version reads is refused at `open` rather than failing inside a query.
@@ -469,7 +488,7 @@ impl SessionRef {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     db_path: PathBuf,
-    home: Option<PathBuf>,
+    roots: ProviderRoots,
     read_only: bool,
 }
 
@@ -503,9 +522,12 @@ impl SessionStore {
         } else {
             open_db(&db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
         }
+        let roots = opts
+            .roots
+            .unwrap_or_else(|| ProviderRoots::from_env(opts.home.unwrap_or_else(home_dir)));
         Ok(Self {
             db_path,
-            home: opts.home,
+            roots,
             read_only: opts.read_only,
         })
     }
@@ -515,13 +537,15 @@ impl SessionStore {
         &self.db_path
     }
 
+    /// The provider roots every operation on this store scans, hydrates from
+    /// and watches.
+    pub fn roots(&self) -> &ProviderRoots {
+        &self.roots
+    }
+
     /// Whether this handle was opened read-only.
     pub fn read_only(&self) -> bool {
         self.read_only
-    }
-
-    fn provider_home(&self) -> PathBuf {
-        self.home.clone().unwrap_or_else(home_dir)
     }
 
     fn read_conn(&self) -> Result<Connection, Error> {
@@ -541,9 +565,8 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("sync"));
         }
-        let home = self.provider_home();
         let before = catalog_fingerprint(&self.read_conn()?)?;
-        let tick = self.sync_tick(&home, opts.force, opts.lock_timeout_ms)?;
+        let tick = self.sync_tick(opts.force, opts.lock_timeout_ms)?;
         let changed = if tick.swept {
             catalog_changes(&before, &catalog_fingerprint(&self.read_conn()?)?)
         } else {
@@ -556,11 +579,16 @@ impl SessionStore {
     }
 
     /// Run the sweep, retrying a held lock until `lock_timeout_ms` is spent.
-    fn sync_tick(&self, home: &Path, force: bool, lock_timeout_ms: u64) -> Result<SyncTick, Error> {
+    fn sync_tick(&self, force: bool, lock_timeout_ms: u64) -> Result<SyncTick, Error> {
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(lock_timeout_ms);
+        // Bounded where it enters, like every watch interval: `Instant +
+        // Duration` panics when the sum is not representable, and a caller
+        // passing `u64::MAX` to mean "wait as long as it takes" would die
+        // here before the first attempt. Seven days is far longer than any
+        // lock this crate holds.
+        let deadline = started + Duration::from_millis(lock_timeout_ms.min(MAX_LOCK_WAIT_MS));
         loop {
-            let tick = sync_facade_tick(&self.db_path, home, force).map_err(Error::sync)?;
+            let tick = sync_facade_tick(&self.db_path, &self.roots, force).map_err(Error::sync)?;
             if tick.attempted {
                 return Ok(tick);
             }
@@ -597,10 +625,12 @@ impl SessionStore {
                     scope: SessionScope::Local,
                     include_related: opts.include_related,
                 };
-                let result = match &self.home {
-                    Some(home) => hydrate_session_at_with_home(&self.db_path, &options, home),
-                    None => hydrate_session_at(&self.db_path, &options),
-                }
+                let result = hydrate_session_at_with_roots_and_connectors(
+                    &self.db_path,
+                    &options,
+                    &self.roots,
+                    &SourceConnectorSelection::default(),
+                )
                 .map_err(Error::hydration)?;
                 let status = HydrateStatus::parse(&result.status)?;
                 hydrate_report(*source, session_id.clone(), status, Some(result))
@@ -612,20 +642,14 @@ impl SessionStore {
                         HOOK_HARNESSES.join(", ")
                     )));
                 }
-                let name = source.as_str();
-                let ingest = match &self.home {
-                    Some(home) => ingest_transcript_at_with_home(
-                        &self.db_path,
-                        home,
-                        name,
-                        path,
-                        None,
-                        opts.include_related,
-                    ),
-                    None => {
-                        ingest_transcript_at(&self.db_path, name, path, None, opts.include_related)
-                    }
-                }
+                let ingest = ingest_transcript_at_with_roots(
+                    &self.db_path,
+                    &self.roots,
+                    source.as_str(),
+                    path,
+                    None,
+                    opts.include_related,
+                )
                 .map_err(Error::hydration)?;
                 let status = match ingest.status {
                     TranscriptStatus::Ingested => HydrateStatus::Hydrated,
@@ -659,9 +683,7 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("watch"));
         }
-        let home = self.provider_home();
-        let opencode_db = opencode_db_path(&home);
-        let roots = sync_watch_roots(&home, &opencode_db);
+        let roots = sync_watch_roots_with_provider_roots(&self.roots);
         let (reports, receiver) = mpsc::channel::<Result<TickReport, Error>>();
         let reports = Arc::new(Mutex::new(reports));
 
@@ -669,7 +691,7 @@ impl SessionStore {
         // a time, so a single slot carries "what this tick changed" from the
         // one to the other.
         let db_path = self.db_path.clone();
-        let tick_home = home.clone();
+        let tick_roots = self.roots.clone();
         let baseline: Arc<Mutex<Option<CatalogFingerprint>>> = Arc::new(Mutex::new(None));
         let pending: Arc<Mutex<Vec<SessionRef>>> = Arc::new(Mutex::new(Vec::new()));
         let tick_baseline = baseline.clone();
@@ -681,7 +703,7 @@ impl SessionStore {
                 *base = Some(catalog_fingerprint(&conn)?);
             }
             drop(conn);
-            let tick = sync_facade_tick(&db_path, &tick_home, force)?;
+            let tick = sync_facade_tick(&db_path, &tick_roots, force)?;
             if tick.swept {
                 let after = catalog_fingerprint(&open_db_readonly(&db_path)?)?;
                 let changed = catalog_changes(base.as_ref().expect("baseline set"), &after);
@@ -694,7 +716,7 @@ impl SessionStore {
         let report_sink = reports.clone();
         let report_pending = pending;
         let error_sink = reports;
-        let refresh_home = home.clone();
+        let refresh_roots = self.roots.clone();
         let mut watch = WatchLoop::new(tick)
             .with_roots(roots)
             .with_fs_events(opts.use_fs_events)
@@ -723,7 +745,7 @@ impl SessionStore {
                     .send(Err(Error::sync(anyhow::anyhow!("{error:#}"))));
             }));
         watch = watch.with_roots_refresh(Arc::new(move || {
-            sync_watch_roots(&refresh_home, &opencode_db_path(&refresh_home))
+            sync_watch_roots_with_provider_roots(&refresh_roots)
         }));
         let watch = Arc::new(watch);
         let runner = watch.clone();
@@ -795,10 +817,13 @@ impl SessionStore {
         let tx = conn.unchecked_transaction().map_err(Error::sql)?;
         let source = r.source();
         let name = source.as_str();
+        let include_text = opts.include_text;
         let row = match r {
-            SessionRef::Id { session_id, .. } => discover::catalog_row(&tx, name, session_id),
+            SessionRef::Id { session_id, .. } => {
+                discover::catalog_row(&tx, name, session_id, include_text)
+            }
             SessionRef::Path { path, .. } => {
-                discover::catalog_row_by_path(&tx, name, &path.to_string_lossy())
+                discover::catalog_row_by_path(&tx, name, &path.to_string_lossy(), include_text)
             }
         }
         .map_err(Error::query)?;
@@ -806,17 +831,21 @@ impl SessionStore {
             return Ok(None);
         };
         let session_id = row.session_id.clone();
-        let wants = |kind: EvidenceKind| {
-            opts.kinds
-                .as_ref()
-                .is_none_or(|kinds| kinds.contains(&kind))
-        };
-        let include_text = opts.include_text;
-        let mut loaded = Vec::new();
+        // What this read fetches is the source's declared coverage narrowed
+        // by the query, in the coverage's canonical order — never a kind the
+        // source cannot produce, so `loaded` is always within `coverage` and
+        // an empty list for a covered kind means the session has none of it.
+        let coverage = source.capabilities().evidence_kinds;
+        let selected: Vec<EvidenceKind> = coverage
+            .iter()
+            .copied()
+            .filter(|kind| opts.kinds.as_ref().is_none_or(|kinds| kinds.contains(kind)))
+            .collect();
+        let wants = |kind: EvidenceKind| selected.contains(&kind);
         let mut diagnostics = Vec::new();
 
         let mut evidence = SessionEvidence {
-            session: CatalogSession::from_row(row, include_text)?,
+            session: CatalogSession::from_row(row)?,
             prompts: Vec::new(),
             messages: Vec::new(),
             tool_calls: Vec::new(),
@@ -827,23 +856,20 @@ impl SessionStore {
             requests: Vec::new(),
             usage: None,
             user_turns: Vec::new(),
-            coverage: source.capabilities().evidence_kinds,
+            coverage,
             loaded: Vec::new(),
             include_text,
             diagnostics: Vec::new(),
         };
 
         if wants(EvidenceKind::History) {
-            loaded.push(EvidenceKind::History);
-            let entries =
-                crate::store::session(&tx, &session_id, Some(name), None).map_err(Error::query)?;
-            evidence.prompts = entries
+            evidence.prompts = session_prompts_sized(&tx, name, &session_id, include_text)
+                .map_err(Error::query)?
                 .into_iter()
-                .map(|entry| Prompt::from_entry(entry, include_text))
+                .map(Prompt::from_row)
                 .collect();
         }
         if wants(EvidenceKind::SessionEvent) {
-            loaded.push(EvidenceKind::SessionEvent);
             let events =
                 session_events_sized(&tx, name, &session_id, include_text).map_err(Error::query)?;
             evidence.messages = group_messages(source, &events);
@@ -857,7 +883,6 @@ impl SessionStore {
             evidence.usage = session_usage_summary(&tx, name, &session_id).map_err(Error::query)?;
         }
         if wants(EvidenceKind::ToolCall) {
-            loaded.push(EvidenceKind::ToolCall);
             evidence.tool_calls = session_tool_calls(&tx, &session_id, Some(name))
                 .map_err(Error::query)?
                 .into_iter()
@@ -865,7 +890,6 @@ impl SessionStore {
                 .collect();
         }
         if wants(EvidenceKind::FileEdit) {
-            loaded.push(EvidenceKind::FileEdit);
             evidence.file_edits = session_file_edits(&tx, &session_id, Some(name))
                 .map_err(Error::query)?
                 .into_iter()
@@ -873,15 +897,13 @@ impl SessionStore {
                 .collect();
         }
         if wants(EvidenceKind::SessionMarker) {
-            loaded.push(EvidenceKind::SessionMarker);
-            evidence.markers = session_markers(&tx, name, &session_id)
+            evidence.markers = session_markers_sized(&tx, name, &session_id, include_text)
                 .map_err(Error::query)?
                 .into_iter()
-                .map(|marker| Marker::from_row(marker, include_text))
+                .map(Marker::from_row)
                 .collect();
         }
         if wants(EvidenceKind::Relationship) {
-            loaded.push(EvidenceKind::Relationship);
             let graph = relationship_graph::session_relationships(&tx, name, &session_id)
                 .map_err(Error::query)?;
             let mut relationships = Vec::new();
@@ -902,7 +924,7 @@ impl SessionStore {
                 subject: diagnostic.relationship_uid,
             }));
         }
-        evidence.loaded = loaded;
+        evidence.loaded = selected;
         evidence.diagnostics = diagnostics;
         Ok(Some(evidence))
     }
@@ -910,6 +932,10 @@ impl SessionStore {
 
 /// How often a held sync lock is re-tried while a caller's timeout runs.
 const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);
+
+/// The longest [`SyncOptions::lock_timeout_ms`] is honoured for: seven days,
+/// the same ceiling the watch intervals have.
+const MAX_LOCK_WAIT_MS: u64 = crate::watch::MAX_INTERVAL_MS;
 
 fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
     if let Some(path) = &opts.db_path {
@@ -936,7 +962,8 @@ pub struct SyncOptions {
     pub force: bool,
     /// How long to wait for another process's `SyncRunLock` before returning
     /// [`Error::SyncLocked`]. `0` (the default) tries once. The lock is
-    /// re-tried every 100 ms while the budget lasts.
+    /// re-tried every 100 ms while the budget lasts; a budget above seven
+    /// days is treated as seven days.
     pub lock_timeout_ms: u64,
 }
 
@@ -1286,7 +1313,14 @@ impl WatchHandle {
     /// say that the loop is over; the thread can.
     fn recv(&mut self, deadline: Option<Instant>) -> Option<Result<TickReport, Error>> {
         loop {
-            match self.receiver.recv_timeout(WATCH_POLL) {
+            // Never sleep past a short deadline: the poll is the ceiling on
+            // one wait, and the remaining budget the floor under it.
+            let wait = deadline.map_or(WATCH_POLL, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WATCH_POLL)
+            });
+            match self.receiver.recv_timeout(wait) {
                 Ok(item) => return Some(item),
                 Err(mpsc::RecvTimeoutError::Disconnected) => return None,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1417,7 +1451,7 @@ pub struct CatalogSession {
 }
 
 impl CatalogSession {
-    fn from_row(row: ShallowSession, include_text: bool) -> Result<Self, Error> {
+    fn from_row(row: ShallowSession) -> Result<Self, Error> {
         let source = Source::parse(&row.source).ok_or_else(|| {
             Error::Query(format!(
                 "catalog row {}/{} names a source this build does not know",
@@ -1431,8 +1465,8 @@ impl CatalogSession {
             git_branch: row.git_branch,
             first_activity_ms: row.first_activity_ms,
             last_activity_ms: row.last_activity_ms,
-            first_prompt: row.first_prompt.filter(|_| include_text),
-            last_assistant_text: row.last_assistant_text.filter(|_| include_text),
+            first_prompt: row.first_prompt,
+            last_assistant_text: row.last_assistant_text,
             models: row.models,
             originator: row.originator,
             agent_version: row.agent_version,
@@ -1505,9 +1539,7 @@ impl Iterator for CatalogIter {
                 return Some(Err(error));
             }
         }
-        self.buffer
-            .pop_front()
-            .map(|row| CatalogSession::from_row(row, true))
+        self.buffer.pop_front().map(CatalogSession::from_row)
     }
 }
 
@@ -1590,24 +1622,25 @@ pub struct SessionEvidence {
 pub struct Prompt {
     /// `None` when the query asked for no text.
     pub prompt: Option<String>,
-    /// sha256 of the prompt, hex — present whether or not the text is.
-    pub prompt_hash: String,
+    /// sha256 of the prompt, hex: the hash the ledger stored, or one computed
+    /// from the text when it was carried. `None` only for a row written
+    /// without a stored hash and read without its text.
+    pub prompt_hash: Option<String>,
     pub prompt_bytes: i64,
     pub project: Option<String>,
     pub timestamp_ms: i64,
 }
 
 impl Prompt {
-    fn from_entry(entry: HistoryEntry, include_text: bool) -> Self {
+    fn from_row(row: PromptRow) -> Self {
         Self {
-            prompt_hash: entry
+            prompt_hash: row
                 .prompt_hash
-                .clone()
-                .unwrap_or_else(|| prompt_hash(&entry.prompt)),
-            prompt_bytes: entry.prompt.len() as i64,
-            prompt: include_text.then_some(entry.prompt),
-            project: entry.project,
-            timestamp_ms: entry.timestamp_ms,
+                .or_else(|| row.prompt.as_deref().map(prompt_hash)),
+            prompt_bytes: row.prompt_bytes,
+            prompt: row.prompt,
+            project: row.project,
+            timestamp_ms: row.timestamp_ms,
         }
     }
 }
@@ -2032,7 +2065,7 @@ impl Marker {
         self.payload_json.as_deref()
     }
 
-    fn from_row(row: SessionMarker, include_text: bool) -> Self {
+    fn from_row(row: SessionMarker) -> Self {
         Self {
             marker_uid: row.marker_uid,
             ts_ms: row.ts_ms,
@@ -2041,7 +2074,7 @@ impl Marker {
             turn_id: row.turn_id,
             kind: row.kind,
             subkind: row.subkind,
-            text: row.text.filter(|_| include_text),
+            text: row.text,
             payload: row
                 .payload_json
                 .as_deref()
@@ -2159,12 +2192,140 @@ fn all_requests(
 mod tests {
     use super::*;
 
+    /// A store over `db` whose provider roots are the (empty) directory
+    /// beside it, resolved without the environment, so a `CODEX_HOME` on
+    /// the machine running the tests cannot reach in.
     fn store_at(db: &Path) -> SessionStore {
+        let home = db.parent().expect("db parent").to_path_buf();
         SessionStore::open(StoreOptions {
             db_path: Some(db.to_path_buf()),
+            roots: Some(ProviderRoots::from_home(
+                home.clone(),
+                home.join("opencode.db"),
+            )),
             ..StoreOptions::default()
         })
         .unwrap()
+    }
+
+    /// `u64::MAX` means "wait as long as it takes", not "panic before the
+    /// first attempt".
+    #[test]
+    fn an_oversized_lock_timeout_is_clamped_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let report = store
+            .sync(SyncOptions {
+                force: false,
+                lock_timeout_ms: u64::MAX,
+            })
+            .expect("an unlocked store syncs");
+        assert!(report.swept);
+    }
+
+    /// `loaded` never names a kind the source cannot produce, whatever the
+    /// query asked for, and the rows behind such a kind are not read.
+    #[test]
+    fn loaded_kinds_stay_within_the_source_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, cwd, discovery_state) \
+             VALUES ('c1', 'cursor', '/tmp/p', 'full');
+             INSERT INTO session_markers (source, session_id, marker_uid, kind) \
+             VALUES ('cursor', 'c1', 'mk', 'unknown');",
+        )
+        .unwrap();
+        let cursor = Source::Cursor.capabilities().evidence_kinds;
+        assert!(!cursor.contains(&EvidenceKind::SessionMarker));
+
+        let evidence = store
+            .session(
+                &SessionRef::id(Source::Cursor, "c1"),
+                SessionQuery {
+                    include_text: true,
+                    kinds: Some(vec![EvidenceKind::SessionMarker, EvidenceKind::History]),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.loaded, vec![EvidenceKind::History]);
+        assert!(evidence.markers.is_empty());
+        assert_eq!(evidence.coverage, cursor);
+
+        let all = store
+            .session(
+                &SessionRef::id(Source::Cursor, "c1"),
+                SessionQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            all.loaded, cursor,
+            "the default query loads exactly the coverage"
+        );
+    }
+
+    /// A hash-only read answers with the stored hash and byte length and
+    /// carries no prompt, excerpt or marker text.
+    #[test]
+    fn a_hash_only_read_carries_no_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, cwd, discovery_state, first_prompt, \
+              last_assistant_text) \
+             VALUES ('s1', 'grok', '/tmp/p', 'full', 'hello there', 'bye');
+             INSERT INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) \
+             VALUES ('grok', 's1', '/tmp/p', 'hello', 'stored-hash', 10);
+             INSERT INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) \
+             VALUES ('grok', 's1', '/tmp/p', 'unhashed', NULL, 20);
+             INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, kind, text) \
+             VALUES ('grok', 's1', 'mk', 5, 'system', 'preamble');",
+        )
+        .unwrap();
+
+        let hashed = store
+            .session(
+                &SessionRef::id(Source::Grok, "s1"),
+                SessionQuery {
+                    include_text: false,
+                    kinds: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(hashed.session.first_prompt.is_none());
+        assert!(hashed.session.last_assistant_text.is_none());
+        assert_eq!(hashed.prompts.len(), 2);
+        assert!(hashed.prompts[0].prompt.is_none());
+        assert_eq!(
+            hashed.prompts[0].prompt_hash.as_deref(),
+            Some("stored-hash")
+        );
+        assert_eq!(hashed.prompts[0].prompt_bytes, 5);
+        // No stored hash and no text: `None`, never a hash of nothing.
+        assert!(hashed.prompts[1].prompt_hash.is_none());
+        assert_eq!(hashed.prompts[1].prompt_bytes, 8);
+        assert!(hashed.markers[0].text.is_none());
+
+        let full = store
+            .session(&SessionRef::id(Source::Grok, "s1"), SessionQuery::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.session.first_prompt.as_deref(), Some("hello there"));
+        assert_eq!(full.prompts[0].prompt.as_deref(), Some("hello"));
+        assert_eq!(full.prompts[0].prompt_hash.as_deref(), Some("stored-hash"));
+        assert_eq!(
+            full.prompts[1].prompt_hash.as_deref(),
+            Some(prompt_hash("unhashed").as_str()),
+            "with the text in hand the hash is computed"
+        );
+        assert_eq!(full.markers[0].text.as_deref(), Some("preamble"));
     }
 
     #[test]

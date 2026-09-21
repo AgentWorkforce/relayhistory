@@ -58,11 +58,18 @@ the surface yet. `Error::WatermarkAheadOfStore` is reserved for it.
 
 ### `open`
 
-`StoreOptions { db_path, home, read_only }`. `db_path` defaults to
+`StoreOptions { db_path, home, roots, read_only }`. `db_path` defaults to
 `$AI_HIST_DB`, then the XDG data path, then `<home>/.local/share/ai-hist/ai-history.db`
 when `home` is set. `home` replaces the process `HOME` as the provider root;
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` and `OPENCODE_DB` are still
-honoured, exactly as the CLI honours them.
+honoured, exactly as the CLI honours them. `roots: Option<ProviderRoots>` names
+every provider root explicitly instead — `ProviderRoots::from_home(home,
+opencode_db)` reads nothing from the environment, `ProviderRoots::from_env(home)`
+is the CLI's resolution — and is what a test or an embedder with its own layout
+passes. Whichever way they are resolved, the store resolves them **once** at
+`open` (`SessionStore::roots()`), and `sync`, `hydrate`, `watch` and
+`SourceCapabilities::watch_roots` all read that one value, so a session the
+sweep catalogued is always hydrated from the same tree.
 
 A **writable** open migrates the database. A **read-only** open cannot, so it
 checks the schema and returns `Error::DatabaseOpen` naming the remedy (open it
@@ -79,7 +86,8 @@ It takes the same `SyncRunLock` (an exclusive advisory lock on
 `<db>.sync.lock`) the CLI, the napi addon and every plugin take. When another
 process holds it, `sync` waits up to `SyncOptions::lock_timeout_ms`, re-trying
 every 100 ms, and then returns `Error::SyncLocked { path, waited_ms }`. The
-default timeout is `0`: one try. **It is never a silent no-op**; a caller that
+default timeout is `0`: one try; a budget above seven days is treated as seven
+days, the same ceiling the watch intervals have. **It is never a silent no-op**; a caller that
 asked for a sweep and got none is told.
 
 `SyncReport { swept, changed }`: `swept` is false when the fingerprint matched
@@ -148,7 +156,7 @@ pub struct SessionEvidence {
     pub usage: Option<SessionUsageSummary>,   // whole-session rollup
     pub user_turns: Vec<SessionUserTurn>,     // human turns with per-block byte accounting
     pub coverage: Vec<EvidenceKind>,          // what the source's parser can produce
-    pub loaded: Vec<EvidenceKind>,            // what this read fetched
+    pub loaded: Vec<EvidenceKind>,            // coverage ∩ the query's kinds, in coverage order
     pub include_text: bool,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -156,11 +164,16 @@ pub struct SessionEvidence {
 
 `SessionQuery { include_text, kinds }`. `include_text: false` is burn's
 hash-only / off content mode: every transcript string is `None`, byte lengths
-(`text_bytes`, `payload_bytes`, `prompt_bytes`) and hashes stay, and the event
-query does not move the `text` column out of SQLite at all. `kinds` skips the
-tables a consumer does not need: `SessionEvent` loads messages, tool results,
-user turns, requests and the usage summary together; `History` the prompts; the
-other kinds their own table. `CommitLink` is not carried by `session()`.
+(`text_bytes`, `payload_bytes`, `prompt_bytes`) and hashes stay, and none of
+the text columns — event text, prompt bodies, marker text, the catalog's
+`first_prompt` / `last_assistant_text` excerpts — is moved out of SQLite at
+all; `Prompt::prompt_hash` is then the ledger's stored hash (`None` only for a
+row written without one). `kinds` skips the tables a consumer does not need:
+`SessionEvent` loads messages, tool results, user turns, requests and the usage
+summary together; `History` the prompts; the other kinds their own table. What
+is read is `coverage ∩ kinds`, reported back as `loaded`, so a kind the source
+cannot produce is never fetched and never listed. `CommitLink` is not carried
+by `session()`.
 
 Every struct is `#[non_exhaustive]`, `Clone`, `Serialize`, `Deserialize` and
 `PartialEq`, so a consumer can persist and round-trip it. JSON columns arrive
@@ -188,8 +201,8 @@ has none), `relationships` (`RelationshipCapabilities`: `always` / `sometimes`
 / `never` stable child identity and which delegation facts are recorded),
 `usage_accounting` (`per-request`, `per-message`, `cumulative-delta`,
 `context-proxy`, or `None`), `message_ids`, `hydrates_by_path`, and
-`watch_roots(home)` — the paths the watcher registers for that source under a
-provider home.
+`watch_roots(&roots)` — the paths the watcher registers for that source under a
+`ProviderRoots`, the same value a store opened with those roots watches.
 
 ## Errors
 

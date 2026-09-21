@@ -14,9 +14,9 @@
 //! the facade a projection of the store rather than a second reading of it.
 
 use ai_hist::{
-    CatalogQuery, DiscoveryState, EvidenceKind, HydrateOptions, HydrateStatus, RelationshipSide,
-    Role, SessionEvidence, SessionQuery, SessionRef, SessionStore, Source, StoreOptions,
-    SyncOptions, TickTrigger, WatchOptions,
+    CatalogQuery, DiscoveryState, EvidenceKind, HydrateOptions, HydrateStatus, ProviderRoots,
+    RelationshipSide, Role, SessionEvidence, SessionQuery, SessionRef, SessionStore, Source,
+    StoreOptions, SyncOptions, TickTrigger, WatchOptions,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -166,14 +166,28 @@ fn stage(fixture: &Fixture, home: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The provider roots under a fixture home, resolved without consulting the
+/// environment: a `CODEX_HOME` or `CLAUDE_CONFIG_DIR` set on the machine
+/// running this suite must not pull real sessions into a fixture's store.
+fn roots_under(home: &Path) -> ProviderRoots {
+    ProviderRoots::from_home(
+        home.to_path_buf(),
+        home.join(".local/share/opencode/opencode.db"),
+    )
+}
+
 // `StoreOptions` is `#[non_exhaustive]`, so an outside crate builds it field
 // by field; this test is written as that crate.
 #[allow(clippy::field_reassign_with_default)]
-fn open(home: &Path) -> SessionStore {
+fn open_with_roots(home: &Path, roots: ProviderRoots) -> SessionStore {
     let mut options = StoreOptions::default();
     options.db_path = Some(home.join("ai-history.db"));
-    options.home = Some(home.to_path_buf());
+    options.roots = Some(roots);
     SessionStore::open(options).expect("open")
+}
+
+fn open(home: &Path) -> SessionStore {
+    open_with_roots(home, roots_under(home))
 }
 
 fn synced(fixture: &Fixture) -> (tempfile::TempDir, SessionStore, Option<PathBuf>) {
@@ -624,7 +638,10 @@ fn every_corpus_fixture_reads_back_through_the_facade_as_the_snapshot_says() {
             }
             for prompt in &hashed.prompts {
                 assert!(prompt.prompt.is_none());
-                assert!(!prompt.prompt_hash.is_empty());
+                assert!(
+                    prompt.prompt_hash.is_some(),
+                    "the stored hash is read, not the text"
+                );
             }
             assert!(hashed.session.first_prompt.is_none());
         }
@@ -922,12 +939,14 @@ fn source_capabilities_are_static_and_honest() {
     assert_eq!(claude.relationships.stable_child_identity, "sometimes");
     assert!(claude.usage_accounting.is_some());
     let home = tempfile::tempdir().unwrap();
-    assert!(!claude.watch_roots(home.path()).is_empty());
+    let roots = roots_under(home.path());
+    assert!(!claude.watch_roots(&roots).is_empty());
 
     let relay = Source::Relay.capabilities();
     assert!(!relay.hydrates_by_path);
     assert!(relay.usage_accounting.is_none());
-    assert!(relay.watch_roots(home.path()).is_empty());
+    assert!(relay.watch_roots(&roots).is_empty());
+    assert!(relay.evidence_kinds.contains(&EvidenceKind::History));
     assert_eq!(
         Source::Codex
             .capabilities()
@@ -935,6 +954,54 @@ fn source_capabilities_are_static_and_honest() {
             .stable_child_identity,
         "always"
     );
+}
+
+/// Explicit roots drive every operation the same way: a session the sweep
+/// catalogued from a configured Codex root is hydrated from that root, and
+/// the advertised watch roots name it too. Before, `hydrate` re-derived the
+/// roots from `home` alone, so a `CODEX_HOME` the sweep honoured made the
+/// hydration fail with `SESSION_SOURCE_MISMATCH`.
+#[test]
+fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = roots_under(dir.path());
+    roots.codex = dir.path().join("configured-codex");
+    // The rollout lives only under the configured root; `~/.codex` is empty.
+    let day = roots.codex.join("sessions/2026/04/20");
+    fs::create_dir_all(&day).unwrap();
+    fs::copy(
+        fixtures_root().join(CORPUS[7].file),
+        day.join("rollout-2026-04-20T00-00-00-simple-turn.jsonl"),
+    )
+    .unwrap();
+
+    let store = open_with_roots(dir.path(), roots.clone());
+    assert_eq!(store.roots(), &roots);
+    let report = store.sync(SyncOptions::default()).expect("sync");
+    assert_eq!(report.changed.len(), 1);
+    let row = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .expect("the configured root was scanned")
+        .unwrap();
+    assert_eq!(row.source, Source::Codex);
+
+    let hydrated = store
+        .hydrate(&row.session_ref(), HydrateOptions::default())
+        .expect("hydration resolves the same configured root the sweep did");
+    assert!(matches!(
+        hydrated.status,
+        HydrateStatus::Hydrated | HydrateStatus::Unchanged
+    ));
+
+    let watched = Source::Codex.capabilities().watch_roots(&roots);
+    assert!(
+        watched.iter().any(|path| path.starts_with(&roots.codex)),
+        "the advertised watch roots follow the configured root: {watched:?}"
+    );
+    assert!(!watched
+        .iter()
+        .any(|path| path.starts_with(dir.path().join(".codex"))));
 }
 
 // ---------------------------------------------------------------------------

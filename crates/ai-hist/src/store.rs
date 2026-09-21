@@ -2663,6 +2663,67 @@ pub(crate) fn session_events_sized(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// One `history` row as [`crate::SessionStore::session`] reads it: the
+/// stored hash and byte length always, the prompt only when asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptRow {
+    pub project: Option<String>,
+    pub timestamp_ms: i64,
+    /// The stored `prompt_hash`; `None` for a row written without one.
+    pub prompt_hash: Option<String>,
+    pub prompt_bytes: i64,
+    /// `None` when the read asked for no text.
+    pub prompt: Option<String>,
+}
+
+/// A session's prompts, oldest first, without moving the prompt column out
+/// of SQLite when `include_text` is false.
+pub(crate) fn session_prompts_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<PromptRow>> {
+    let prompt = if include_text { "prompt" } else { "NULL" };
+    let sql = format!(
+        "SELECT project, timestamp_ms, prompt_hash, LENGTH(CAST(prompt AS BLOB)), {prompt} \
+         FROM history WHERE source = ? AND session_id = ? ORDER BY timestamp_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
+        Ok(PromptRow {
+            project: row.get(0)?,
+            timestamp_ms: row.get(1)?,
+            prompt_hash: row.get(2)?,
+            prompt_bytes: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            prompt: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every marker of a session, oldest first, on the caller's snapshot, without
+/// moving the `text` column when `include_text` is false.
+pub(crate) fn session_markers_sized(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> Result<Vec<SessionMarker>> {
+    let columns = if include_text {
+        SESSION_MARKER_COLUMNS.to_string()
+    } else {
+        SESSION_MARKER_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
+    };
+    let sql = format!(
+        "SELECT {columns} FROM session_markers WHERE source = ? AND session_id = ? \
+         ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], row_to_session_marker)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// One bounded page of normalized events for a session, oldest first.
 pub fn session_events_page(
     conn: &Connection,
