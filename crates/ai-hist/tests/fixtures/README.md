@@ -145,6 +145,7 @@ source without deciding which one fails the test.
 | `codex/resume-baseline-corrupt` | relayhistory | `codex/resume-baseline-corrupt.jsonl` | a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta |
 | `codex/two-unreadable-turns` | relayhistory | `codex/two-unreadable-turns.jsonl` | two unrecovered turns each retain their own unreadable usage refusal |
 | `codex/one-request-three-rows` | relayhistory | `codex/one-request-three-rows.jsonl` | one API call written as reasoning, a tool call and a message is one request, not three |
+| `codex/recovered-span-covers-two-turns` | relayhistory | `codex/recovered-span-covers-two-turns.jsonl` | a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request |
 | `codex/two-requests-one-turn` | relayhistory | `codex/two-requests-one-turn.jsonl` | a tool loop makes two API calls inside one turn_id, so the turn is not the request |
 
 ### `cursor`

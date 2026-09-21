@@ -2893,6 +2893,21 @@ pub(crate) fn ingest_codex_rollout(
     // with different measurements into one request and report no usage for
     // either.
     let mut request_span: u64 = 0;
+    // The first span no measured delta has accounted for yet, and the spans a
+    // single delta turned out to cover.
+    //
+    // An unreadable snapshot ends a request but measures nothing, and it does
+    // not advance the baseline — so the next readable snapshot's delta is the
+    // spend of *every* span since the last measured one, not of the last span
+    // alone. Attributing it to the last span charged one request for what
+    // several did, and left the others reading as unmeasured with nothing to
+    // say why.
+    //
+    // Those spans are therefore one request: the unit the provider actually
+    // measured. The merge is applied after the walk, because which spans a
+    // delta covers is only known when it arrives.
+    let mut span_run_start: u64 = 0;
+    let mut span_merges: Vec<(u64, u64)> = Vec::new();
     // Set when a snapshot is unreadable while no baseline has been
     // established. A resumed rollout opens with the cumulative total it
     // carried over; if that opening snapshot cannot be read, there is no
@@ -3084,6 +3099,7 @@ pub(crate) fn ingest_codex_rollout(
                     // `surviving_refusals`: a span whose snapshot could not be
                     // read has its spend reported inside whichever later delta
                     // covers it, and reads as a request with no usage.
+                    let closing_span = request_span;
                     request_span += 1;
                     let Some(totals) = CodexTokenTotals::from_usage(usage) else {
                         // A counter that is not a non-negative integer cannot
@@ -3126,6 +3142,9 @@ pub(crate) fn ingest_codex_rollout(
                         None if !saw_model_output => {
                             prev_totals = Some(totals);
                             baseline_generation += 1;
+                            // Nothing was measured, and the baseline moved:
+                            // no later delta can reach the spans before it.
+                            span_run_start = request_span;
                         }
                         // The carried-over baseline was unreadable, so this
                         // snapshot establishes one and measures nothing. A
@@ -3136,6 +3155,7 @@ pub(crate) fn ingest_codex_rollout(
                         None if baseline_unknown => {
                             prev_totals = Some(totals);
                             baseline_unknown = false;
+                            span_run_start = request_span;
                             // This installs a baseline without measuring, so
                             // everything spent up to here — a refused turn
                             // included — is absorbed into it and can never
@@ -3161,7 +3181,13 @@ pub(crate) fn ingest_codex_rollout(
                             // nothing and settles nothing.
                             if measured.is_some() {
                                 measured_generations.insert(baseline_generation);
+                                // This delta is the spend of the whole run,
+                                // so the run is one request.
+                                if closing_span > span_run_start {
+                                    span_merges.push((span_run_start, closing_span));
+                                }
                             }
+                            span_run_start = request_span;
                             baseline_generation += 1;
                             let next = match measured {
                                 Some(delta) => match pending_usage.take() {
@@ -3445,6 +3471,18 @@ pub(crate) fn ingest_codex_rollout(
                 _ => {}
             },
             _ => {}
+        }
+    }
+    // Collapse each measured run onto its first span, so the rows a single
+    // delta accounted for read as the one request it measured rather than as
+    // one measured request and a trail of unmeasured ones.
+    for (from, to) in span_merges {
+        for span in (from + 1)..=to {
+            conn.execute(
+                "UPDATE session_events SET request_span = ?1 \
+                 WHERE source = 'codex' AND session_id = ?2 AND request_span = ?3",
+                params![from.to_string(), session_id, span.to_string()],
+            )?;
         }
     }
     // The whole rollout is known, so the refusals can be worked out from what

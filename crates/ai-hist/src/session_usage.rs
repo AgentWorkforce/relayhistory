@@ -181,8 +181,17 @@ impl RequestKeySource {
     }
 
     /// Whether this key identifies an API request rather than a stored record.
+    ///
+    /// `RequestSpan` counts: the provider did not name the call, but it ended
+    /// one with every usage snapshot, and the parser read those boundaries
+    /// from the rollout. Only `RecordId` is a fallback — the stored event's
+    /// own id, which for a source that writes one call as several records is
+    /// finer than one row per request.
     pub fn is_request_identity(self) -> bool {
-        matches!(self, Self::RequestId | Self::ProviderMessageId)
+        matches!(
+            self,
+            Self::RequestId | Self::ProviderMessageId | Self::RequestSpan
+        )
     }
 }
 
@@ -655,9 +664,11 @@ pub fn session_usage_summary(
     // A total is only reported when it means what it appears to mean.
     let unresolved_identity = diagnostics.contains(&UsageDiagnostic::UnresolvedRequestIdentity);
     if let Some(folded) = &total {
+        // Either bucket, not both. A contributor that omits only the 1h
+        // bucket leaves the 5m one populated, and requiring both to vanish
+        // reported that half-split as a complete one.
         if saw_cache_write_split
-            && folded.cache_write_5m_tokens.is_none()
-            && folded.cache_write_1h_tokens.is_none()
+            && (folded.cache_write_5m_tokens.is_none() || folded.cache_write_1h_tokens.is_none())
         {
             diagnostics.insert(UsageDiagnostic::PartialCacheWriteSplit);
         }
@@ -808,6 +819,77 @@ mod tests {
         assert_eq!(
             raw_row_sum, 172,
             "the per-block copies really are duplicated"
+        );
+    }
+
+    /// Which key sources name an API call, read off the classifier directly.
+    ///
+    /// A parser-established span names one: the provider ended a call with
+    /// every usage snapshot, and the parser read those boundaries from the
+    /// rollout. Only the record id is a fallback. Classifying a span as a
+    /// fallback would make a correctly grouped Codex request look like one
+    /// whose identity was never captured.
+    #[test]
+    fn a_request_span_names_a_call_and_a_record_id_does_not() {
+        assert!(RequestKeySource::RequestId.is_request_identity());
+        assert!(RequestKeySource::ProviderMessageId.is_request_identity());
+        assert!(RequestKeySource::RequestSpan.is_request_identity());
+        assert!(!RequestKeySource::RecordId.is_request_identity());
+    }
+
+    /// A contributor that omits exactly one TTL bucket leaves the other
+    /// populated. Requiring both to vanish before flagging reported that
+    /// half-split as a complete one.
+    #[test]
+    fn a_split_missing_only_one_bucket_is_still_partial() {
+        let conn = db();
+        // Both buckets reported.
+        event(
+            &conn,
+            "claude",
+            "s1",
+            "m_full",
+            1_000,
+            "assistant",
+            "text",
+            None,
+            Some(
+                r#"{"input_tokens":1,"cache_creation_input_tokens":8,
+                    "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":5}}"#,
+            ),
+            "m_full:0",
+        );
+        // Cache writes reported, but only the 5m bucket broken out.
+        event(
+            &conn,
+            "claude",
+            "s1",
+            "m_half",
+            2_000,
+            "assistant",
+            "text",
+            None,
+            Some(
+                r#"{"input_tokens":1,"cache_creation_input_tokens":4,
+                    "cache_creation":{"ephemeral_5m_input_tokens":4}}"#,
+            ),
+            "m_half:0",
+        );
+        let summary = session_usage_summary(&conn, "claude", "s1")
+            .unwrap()
+            .unwrap();
+        let usage = summary.usage.as_ref().expect("both requests are readable");
+        assert_eq!(usage.cache_write_tokens, 12);
+        assert_eq!(
+            usage.cache_write_1h_tokens, None,
+            "one contributor never broke out the 1h bucket"
+        );
+        assert!(
+            summary
+                .diagnostics
+                .contains(&UsageDiagnostic::PartialCacheWriteSplit),
+            "a half-known split is reported as partial: {:?}",
+            summary.diagnostics
         );
     }
 

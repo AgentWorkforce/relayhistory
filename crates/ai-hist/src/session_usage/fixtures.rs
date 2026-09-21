@@ -710,6 +710,69 @@ fn a_second_refusal_does_not_erase_one_owed_against_an_older_baseline() {
     );
 }
 
+/// When a readable snapshot recovers a span that an unreadable one left open,
+/// its delta measures **everything since the last good baseline** - both turns,
+/// not the latest one. Charging the whole 140 to the second request, and
+/// leaving the first with no usage and no diagnostic, states two things the
+/// evidence does not support: that the second call cost 140, and that nothing
+/// is known to be missing from the first.
+///
+/// The spans a single delta covers are therefore one request. That is the unit
+/// the provider actually measured, and it keeps the uncertainty at request
+/// granularity instead of hiding it in a per-request number.
+#[test]
+fn a_delta_that_recovers_several_spans_is_one_request() {
+    let conn = codex_store("codex/recovered-span-covers-two-turns.jsonl");
+    let page =
+        session_requests_page(&conn, "codex", "sess_codex_recovered_span", 50, None).unwrap();
+    assert_eq!(
+        page.requests.len(),
+        1,
+        "one measurement, one request: {:?}",
+        page.requests
+            .iter()
+            .map(|r| (r.request_key.as_str(), r.usage.is_some()))
+            .collect::<Vec<_>>()
+    );
+    let request = &page.requests[0];
+    assert_eq!(
+        request.event_count, 2,
+        "and it holds both turns the delta covered"
+    );
+    let usage = request
+        .usage
+        .as_ref()
+        .expect("the later snapshot measured it");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (200, 140));
+    assert!(
+        request.diagnostics.is_empty(),
+        "nothing was rejected, the span was measured: {:?}",
+        request.diagnostics
+    );
+
+    let summary = session_usage_summary(&conn, "codex", "sess_codex_recovered_span")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.total_request_count, 1);
+    assert_eq!(
+        summary
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens)),
+        Some((200, 140)),
+        "the session total stays available"
+    );
+
+    // And no prompt is charged for what the other one spent: the request
+    // spans two prompts, so it resolves to neither.
+    let events =
+        crate::store::session_events(&conn, "sess_codex_recovered_span", Some("codex")).unwrap();
+    assert!(
+        crate::usage::attribute_usage_to_prompts(&events, "codex").is_empty(),
+        "a measurement spanning two prompts charges neither"
+    );
+}
+
 /// A resumed rollout opens with the cumulative total it carried over. If that
 /// snapshot is unreadable there is no baseline, and differencing the next good
 /// one against zero charges the whole carried-over history to a single

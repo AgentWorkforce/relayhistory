@@ -75,16 +75,27 @@ pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
 pub use session_store::{
     Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
+/// The usage reads that take a raw connection. Embedders reach the same data
+/// through [`SessionStore::session_requests_page`] and
+/// [`SessionStore::session_usage`], which open the store's configured path
+/// read-only; these are for the workspace crates that already hold a
+/// connection.
+#[cfg(feature = "unstable-internal")]
+pub use session_usage::{session_requests_page, session_usage_summary};
 pub use session_usage::{
-    session_requests_page, session_usage_summary, RequestKeySource, SessionRequest,
-    SessionRequestCursor, SessionRequestPage, SessionUsageSummary, UsageDiagnostic,
-    SESSION_USAGE_CONTRACT_VERSION,
+    RequestKeySource, SessionRequest, SessionRequestCursor, SessionRequestPage,
+    SessionUsageSummary, UsageDiagnostic, SESSION_USAGE_CONTRACT_VERSION,
 };
 pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
 pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
 };
+
+/// Reachable without `unstable-internal` so a crate that only builds the
+/// default surface still sees the same grouping rules the store applies.
+#[cfg(not(feature = "unstable-internal"))]
+pub(crate) use session_usage::{session_requests_page, session_usage_summary};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{

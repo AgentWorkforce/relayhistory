@@ -166,7 +166,22 @@ call by the number of records it was split across.
   usage where it now reports a correct total. The boundary is the snapshot.
 
   A span is closed by **every** snapshot the provider reported, whether or not
-  it could be differenced. Two turns whose snapshots were both unreadable are
+  it could be differenced.
+
+  **The spans one delta covers are one request.** An unreadable snapshot ends a
+  call but measures nothing, and it does not move the baseline, so the next
+  readable snapshot's delta is the spend of every span since the last measured
+  one. Attributing it to the last span charged one request for what several
+  did, and left the rest reading as unmeasured with nothing to say why. Those
+  spans are collapsed onto the first of them after the rollout is read, because
+  which spans a delta covers is only known when it arrives.
+
+  That keeps the uncertainty at request granularity rather than hiding it in a
+  per-request number: the merged request reports exactly what was measured, the
+  session total stays available, and because the merged rows can belong to
+  different prompts, prompt attribution resolves them to different owners and
+  so charges neither. A number that cannot be split is reported as one that was
+  not split. Two turns whose snapshots were both unreadable are
   two refused requests; folding them into one span would merge their refusals
   into a single request holding two disagreeing blobs, reported as ambiguous
   rather than as two rejections. What a span *cost* is a separate question,

@@ -165,7 +165,13 @@ test('a session rollup counts each request once and reports its accounting mode'
     assert.deepEqual(summary.accounting, ['per-message']);
     assert.deepEqual(summary.models, ['claude-test']);
     assert.equal(summary.overflowed, false);
-    assert.deepEqual(summary.diagnostics, []);
+    // The second request reports `{input_tokens: 10}` and says nothing about
+    // cache writes, so it cannot certify the pair's TTL split. The buckets are
+    // withheld and the summary says why, rather than passing the first
+    // request's split off as the session's.
+    assert.equal(usage.cacheWrite5mTokens, null);
+    assert.equal(usage.cacheWrite1hTokens, null);
+    assert.deepEqual(summary.diagnostics, ['partial-cache-write-split']);
 
     const codex = await getSessionUsage('codex', CODEX_SESSION, { dbPath });
     assert.deepEqual(codex.accounting, ['cumulative-delta']);

@@ -176,8 +176,31 @@ impl NormalizedUsage {
             && self.reasoning_tokens.unwrap_or(0) == 0
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
+            // The TTL buckets are counted too. A provider that reports
+            // `cache_creation_input_tokens: 0` beside an `ephemeral_5m` of 10
+            // has told us about 10 tokens, and reading the pair as "nothing
+            // reported" dropped the record from prompt attribution entirely.
+            && self.cache_write_5m_tokens.unwrap_or(0) == 0
+            && self.cache_write_1h_tokens.unwrap_or(0) == 0
             && self.provider_total_tokens.unwrap_or(0) == 0
             && self.reported_cost_usd.unwrap_or(0.0) == 0.0
+    }
+
+    /// This record's contribution to one TTL bucket of the cache-write split.
+    ///
+    /// `None` means the split is unknown here, which makes the pair's split
+    /// unknown. A record that wrote no cache is the one exception: its split
+    /// is a *known* zero and must not erase a real one.
+    ///
+    /// The exception requires the provider to have **reported** the zero.
+    /// `cache_write_tokens` is 0 for a record that never mentioned cache
+    /// writes at all, and reading that as a known zero let a contributor with
+    /// no cache evidence keep another request's buckets while the summary
+    /// stayed unflagged — a split presented as complete on the strength of a
+    /// number nobody wrote.
+    fn split_bucket(&self, bucket: Option<u64>) -> Option<u64> {
+        bucket
+            .or((self.cache_write_tokens == 0 && self.coverage.has_cache_write_tokens).then_some(0))
     }
 
     /// Add two records of the same accounting mode, or `None` on overflow.
@@ -205,12 +228,12 @@ impl NormalizedUsage {
                 .cache_write_tokens
                 .checked_add(other.cache_write_tokens)?,
             cache_write_5m_tokens: checked_add_split(
-                (self.cache_write_5m_tokens, self.cache_write_tokens),
-                (other.cache_write_5m_tokens, other.cache_write_tokens),
+                self.split_bucket(self.cache_write_5m_tokens),
+                other.split_bucket(other.cache_write_5m_tokens),
             )?,
             cache_write_1h_tokens: checked_add_split(
-                (self.cache_write_1h_tokens, self.cache_write_tokens),
-                (other.cache_write_1h_tokens, other.cache_write_tokens),
+                self.split_bucket(self.cache_write_1h_tokens),
+                other.split_bucket(other.cache_write_1h_tokens),
             )?,
             provider_total_tokens: checked_add_optional(
                 self.provider_total_tokens,
@@ -245,15 +268,11 @@ fn checked_add_optional(a: Option<u64>, b: Option<u64>) -> Option<Option<u64>> {
 
 /// Sum one TTL bucket of the cache-write split.
 ///
-/// A record that wrote no cache tokens has a known split — zero in every
-/// bucket — so it does not make the pair's split unknown. Any other
+/// A record that *reported* writing no cache tokens has a known split — zero
+/// in every bucket — so it does not make the pair's split unknown. Any other
 /// unreported split does.
-fn checked_add_split(a: (Option<u64>, u64), b: (Option<u64>, u64)) -> Option<Option<u64>> {
-    checked_add_optional(known_split(a), known_split(b))
-}
-
-fn known_split((bucket, total): (Option<u64>, u64)) -> Option<u64> {
-    bucket.or((total == 0).then_some(0))
+fn checked_add_split(a: Option<u64>, b: Option<u64>) -> Option<Option<u64>> {
+    checked_add_optional(a, b)
 }
 
 /// Why a `token_json` blob could not be normalized.
@@ -592,6 +611,15 @@ struct UsageMessage {
 enum Contribution<'a> {
     /// Nothing that bears on the request's cost or its owner.
     Silent,
+    /// The prompt this record is owed to, with no measurement of its own.
+    ///
+    /// It still constrains the request: a request whose records resolve to
+    /// different prompts cannot be charged to either, and a record carrying no
+    /// usage is evidence about ownership all the same. Codex's unmeasured
+    /// turns are exactly this — when a later snapshot's delta covers several
+    /// turns they become one request, and without this the one row holding the
+    /// measurement would charge its own prompt for all of them.
+    Owned(PromptKey),
     /// A measurement and the prompt it is owed to.
     Measured(PromptKey, &'a NormalizedUsage),
     /// Evidence that cannot be reconciled: an unreadable measurement, or an
@@ -709,8 +737,11 @@ pub fn attribute_usage_to_prompts(
     // `session_requests` view exists to prevent, and it must not survive in
     // the path that feeds prompt costs.
     //
-    // `None` marks a request whose records contradict each other.
-    let mut requests: HashMap<&str, Option<(PromptKey, &NormalizedUsage)>> = HashMap::new();
+    // `None` marks a request whose records contradict each other. The inner
+    // `Option` is the measurement, which a request may not have yet even once
+    // its owner is known.
+    type RequestState<'a> = Option<(PromptKey, Option<&'a NormalizedUsage>)>;
+    let mut requests: HashMap<&str, RequestState<'_>> = HashMap::new();
     for message in messages.values().filter(|m| m.role == "assistant") {
         let contribution = contribution_of(
             message,
@@ -731,20 +762,32 @@ pub fn attribute_usage_to_prompts(
             Contribution::Contradictory => {
                 requests.insert(message.request.as_str(), None);
             }
-            Contribution::Measured(key, usage) => match requests.entry(message.request.as_str()) {
+            // The copies of one request must agree on both the measurement and
+            // the prompt that caused it. If they do not, the evidence does not
+            // say which reading is real, so the request contributes nothing
+            // rather than one of them.
+            Contribution::Owned(key) => match requests.entry(message.request.as_str()) {
                 Entry::Vacant(slot) => {
-                    slot.insert(Some((key, usage)));
+                    slot.insert(Some((key, None)));
                 }
                 Entry::Occupied(mut slot) => {
-                    // The copies of one request must agree on both the
-                    // measurement and the prompt that caused it. If they do
-                    // not, the evidence does not say which reading is real, so
-                    // the request contributes nothing rather than one of them.
-                    let agrees = slot
-                        .get()
-                        .as_ref()
-                        .is_some_and(|(owner, seen)| *owner == key && *seen == usage);
+                    let agrees = slot.get().as_ref().is_some_and(|(owner, _)| *owner == key);
                     if !agrees {
+                        slot.insert(None);
+                    }
+                }
+            },
+            Contribution::Measured(key, usage) => match requests.entry(message.request.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Some((key, Some(usage))));
+                }
+                Entry::Occupied(mut slot) => {
+                    let agrees = slot.get().as_ref().is_some_and(|(owner, seen)| {
+                        *owner == key && seen.is_none_or(|seen| seen == usage)
+                    });
+                    if agrees {
+                        slot.insert(Some((key, Some(usage))));
+                    } else {
                         slot.insert(None);
                     }
                 }
@@ -753,7 +796,11 @@ pub fn attribute_usage_to_prompts(
     }
 
     let mut attributed: HashMap<PromptKey, Option<NormalizedUsage>> = HashMap::new();
-    for (key, usage) in requests.into_values().flatten() {
+    for (key, usage) in requests
+        .into_values()
+        .flatten()
+        .filter_map(|(key, usage)| usage.map(|usage| (key, usage)))
+    {
         // Seed from the first contribution rather than from an all-zero
         // record. `empty()` reports *nothing* optional, and an optional field
         // is only reported when every contributor reported it — so folding
@@ -788,12 +835,15 @@ fn contribution_of<'a>(
     prompt_counts: &HashMap<PromptKey, i32>,
 ) -> Contribution<'a> {
     let usage = match &message.usage {
-        RecordUsage::Absent => return Contribution::Silent,
+        // No measurement, but possibly an owner — resolved below, because a
+        // record that names a different prompt than its request's other
+        // records is evidence even when it reports no cost.
+        RecordUsage::Absent => None,
         // The request's own cost is in dispute. A sibling whose copy parses is
         // not the tie-breaker: reporting it would publish one of two
         // contradicting readings as the measurement.
         RecordUsage::Unreadable => return Contribution::Contradictory,
-        RecordUsage::Measured(usage) => usage,
+        RecordUsage::Measured(usage) => Some(usage),
     };
     let owner = if message.parent.is_some() {
         parent_prompt(message, messages)
@@ -833,7 +883,10 @@ fn contribution_of<'a>(
     if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
         return Contribution::Contradictory;
     }
-    Contribution::Measured(key, usage)
+    match usage {
+        Some(usage) => Contribution::Measured(key, usage),
+        None => Contribution::Owned(key),
+    }
 }
 
 /// Walk `parent_id` to the user message that owns a response.
@@ -1202,6 +1255,68 @@ mod tests {
             "answer",
             Some(token_json),
         )
+    }
+
+    /// A TTL bucket is a measurement even when the total beside it reads
+    /// zero. Leaving the buckets out of `is_zero` made such a record "no
+    /// evidence", so prompt attribution dropped it and the tokens vanished.
+    #[test]
+    fn a_ttl_bucket_alone_is_not_an_empty_record() {
+        let usage = normalize_usage_str(
+            "claude",
+            r#"{"cache_creation_input_tokens":0,
+                "cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":0}}"#,
+        )
+        .unwrap()
+        .expect("a reported bucket is usage");
+        assert_eq!(usage.cache_write_5m_tokens, Some(10));
+        assert!(!usage.is_zero(), "10 tokens were reported: {usage:?}");
+    }
+
+    /// A contributor that never mentioned cache writes has no split to
+    /// contribute. Reading its defaulted `cache_write_tokens == 0` as a
+    /// *reported* zero let it pass another request's buckets through as
+    /// though the pair's split were complete.
+    #[test]
+    fn a_contributor_with_no_cache_evidence_does_not_certify_a_split() {
+        let split = normalize_usage_str(
+            "claude",
+            r#"{"cache_creation_input_tokens":8,
+                "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":5}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let silent = normalize_usage_str("claude", r#"{"input_tokens":5,"output_tokens":7}"#)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !silent.coverage.has_cache_write_tokens,
+            "the fixture really says nothing about cache writes"
+        );
+
+        let total = split.checked_add(&silent).unwrap();
+        assert_eq!(total.cache_write_tokens, 8);
+        assert_eq!(
+            (total.cache_write_5m_tokens, total.cache_write_1h_tokens),
+            (None, None),
+            "the split is unknown for the pair, not inherited from one side"
+        );
+
+        // And a contributor that *reported* writing nothing still has a known
+        // zero split, which must not be turned into an unknown one.
+        let reported_zero = normalize_usage_str(
+            "claude",
+            r#"{"cache_creation_input_tokens":0,"input_tokens":5}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reported_zero.coverage.has_cache_write_tokens);
+        let total = split.checked_add(&reported_zero).unwrap();
+        assert_eq!(
+            (total.cache_write_5m_tokens, total.cache_write_1h_tokens),
+            (Some(3), Some(5)),
+            "a reported zero keeps the split known"
+        );
     }
 
     fn session_event(

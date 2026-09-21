@@ -550,6 +550,14 @@ const CORPUS: &[Fixture] = &[
     },
     Fixture {
         source: "codex",
+        name: "recovered-span-covers-two-turns",
+        layout: Layout::CodexRollout,
+        origin: Origin::RelayHistory,
+        files: &["codex/recovered-span-covers-two-turns.jsonl"],
+        quirk: "a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request",
+    },
+    Fixture {
+        source: "codex",
         name: "two-requests-one-turn",
         layout: Layout::CodexRollout,
         origin: Origin::RelayHistory,
