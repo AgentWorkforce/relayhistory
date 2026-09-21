@@ -4062,7 +4062,7 @@ fn sync_claude_session_metadata(
             // this skip through its delegation evidence instead, and a sidecar
             // is not a session: it has no row to owe and must not be re-read.
             if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
-                crate::continuity::capture_claude_transcript_at_locator(conn, &path)?;
+                crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
         }
@@ -4116,36 +4116,37 @@ fn sync_claude_session_metadata(
         };
         let mut scan_cursor = transcript_cursor::load_cursor(conn, &scan_key)?;
         let mut scan = scan_cursor.claude.clone().unwrap_or_default().scan;
-        let scanned_meta = match scan_claude_session_file_resumed(&path, &mut scan) {
-            Ok(scanned) if scanned.read_nothing_decodable() => {
-                // Nothing in the file decoded. Publishing the cursor would
-                // claim these bytes were read, and since a restored file keeps
-                // its length and mtime, the transcript would be skipped for
-                // good the moment it became readable again.
-                walked_every_known_root &= !known_before;
-                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
-                let error = anyhow::anyhow!(
-                    "could not read claude transcript {}: no record decoded",
-                    path.display()
-                );
-                sync_note!("  [claude-sessions] {error:#}");
-                read_error.get_or_insert(error);
-                continue;
-            }
-            Ok(scanned) => scanned.meta,
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
+        let (scanned_meta, scanned_continuity) =
+            match scan_claude_session_file_resumed(&path, &mut scan) {
+                Ok(scanned) if scanned.read_nothing_decodable() => {
+                    // Nothing in the file decoded. Publishing the cursor would
+                    // claim these bytes were read, and since a restored file keeps
+                    // its length and mtime, the transcript would be skipped for
+                    // good the moment it became readable again.
+                    walked_every_known_root &= !known_before;
+                    transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+                    let error = anyhow::anyhow!(
+                        "could not read claude transcript {}: no record decoded",
+                        path.display()
+                    );
+                    sync_note!("  [claude-sessions] {error:#}");
+                    read_error.get_or_insert(error);
+                    continue;
                 }
-                walked_every_known_root &= !known_before;
-                sync_note!(
-                    "  [claude-sessions] could not read {}: {error:#}",
-                    path.display()
-                );
-                read_error.get_or_insert(error);
-                continue;
-            }
-        };
+                Ok(scanned) => (scanned.meta, scanned.continuity),
+                Err(error) => {
+                    if error.is::<CaptureCancelled>() {
+                        return Err(error);
+                    }
+                    walked_every_known_root &= !known_before;
+                    sync_note!(
+                        "  [claude-sessions] could not read {}: {error:#}",
+                        path.display()
+                    );
+                    read_error.get_or_insert(error);
+                    continue;
+                }
+            };
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -4185,8 +4186,9 @@ fn sync_claude_session_metadata(
             // Continuity is cross-file, so the evidence is banked here and
             // reconciled once the whole walk has indexed everything it can
             // reach; a branch read before its origin is resolved by the same
-            // pass rather than needing a second sync.
-            crate::continuity::capture_claude_transcript_at_locator(conn, &path)?;
+            // pass rather than needing a second sync. Folded by the metadata
+            // walk above, so banking it reads nothing.
+            crate::continuity::capture_folded(conn, &path, scanned_continuity)?;
             upserted += 1;
         }
     }
@@ -4523,11 +4525,35 @@ pub(crate) struct ClaudeMetaFold {
     pub sidechain_records: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Continuity's fold, carried here rather than walked separately.
+    ///
+    /// Continuity asks different questions of the same records — where this
+    /// conversation came from rather than what it is — but it asks them of
+    /// *every* record, in file order, accumulating. That is this walk's
+    /// contract exactly, so a second resumable walk over the same bytes bought
+    /// nothing but a second read and a second cursor to keep honest.
+    #[serde(default)]
+    pub continuity: crate::continuity::ContinuityEvidence,
+    #[serde(default)]
+    pub continuity_first_user_seen: bool,
+    /// Whether any record folded in. Distinguishes a file that says nothing —
+    /// which retracts the edges it used to establish — from one that has not
+    /// grown since the last pass.
+    #[serde(default)]
+    pub continuity_any: bool,
 }
 
 impl ClaudeMetaFold {
     /// Fold one record in. Must be called in file order, once per record.
     pub(crate) fn observe(&mut self, value: &Value) {
+        if let Some(object) = value.as_object() {
+            self.continuity_any = true;
+            crate::continuity::fold_claude_record(
+                &mut self.continuity,
+                &mut self.continuity_first_user_seen,
+                object,
+            );
+        }
         if value
             .get("sessionId")
             .and_then(Value::as_str)
@@ -4640,6 +4666,8 @@ pub(crate) struct ClaudeScanPass {
     /// that decoded none of the records it read did not read the file.
     pub decoded: u64,
     pub undecodable: u64,
+    /// Continuity evidence folded by the same walk, ready to record.
+    pub continuity: Option<crate::continuity::ContinuityEvidence>,
 }
 
 impl ClaudeScanPass {
@@ -4724,6 +4752,8 @@ pub(crate) fn scan_claude_session_file_resumed(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(validation_bytes);
+    let continuity =
+        crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
     Ok(ClaudeScanPass {
         meta: fold.finish(),
         bytes_read,
@@ -4731,6 +4761,7 @@ pub(crate) fn scan_claude_session_file_resumed(
         superseded,
         decoded: reader.decoded(),
         undecodable: reader.undecodable(),
+        continuity,
     })
 }
 

@@ -182,116 +182,72 @@ fn next_record(reader: &mut impl std::io::BufRead, raw: &mut Vec<u8>) -> std::io
 /// Returns `None` for a transcript with no in-log session id: relayhistory has
 /// no identity to attach the evidence to, and inventing one from the file name
 /// is exactly what the delegation model already refuses to do.
+/// The metadata walk folds this as it goes, so hydration and the global sync
+/// never call it. It is the one-time backfill on the *skip* path: a transcript
+/// indexed before continuity existed owes its evidence, and no metadata walk
+/// runs for a file that is being skipped.
 pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    Ok(scan_claude_transcript_counted(path)?.0)
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("reading Claude transcript {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw = Vec::new();
+    let mut evidence = ContinuityEvidence::default();
+    let mut first_user_seen = false;
+    let mut any = false;
+    while next_record(&mut reader, &mut raw)
+        .with_context(|| format!("reading Claude transcript {}", path.display()))?
+    {
+        crate::ingest::check_capture_cancelled()?;
+        // An oversized record is not buffered and an undecodable one is not
+        // repaired; both leave `raw` empty or unparseable and take the same
+        // skip any other malformed record takes.
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        any = true;
+        fold_claude_record(&mut evidence, &mut first_user_seen, object);
+    }
+    Ok(finish_claude_fold(evidence, any, path))
 }
 
-/// The same scan, and the provider bytes it read.
+/// Settle a folded evidence set into the row it should record, or `None`.
 ///
-/// Every provider read a hydration makes belongs in `bytesRead`. This walk's
-/// did not, so a hydration that appended a kilobyte and then read the whole
-/// transcript for continuity reported the kilobyte.
-pub fn scan_claude_transcript_counted(path: &Path) -> Result<(Option<ContinuityEvidence>, u64)> {
-    let mut state = None;
-    let pass = scan_claude_transcript_resumed(path, &mut state)?;
-    Ok((pass.evidence, pass.bytes_read))
-}
-
-/// What one resumed continuity pass read and folded.
-pub(crate) struct ContinuityPass {
-    pub evidence: Option<ContinuityEvidence>,
-    pub bytes_read: u64,
-    /// The file was rewritten under the walk, so no position was recorded.
-    pub superseded: bool,
-}
-
-/// Fold this transcript's continuity evidence from where the last pass left
-/// off.
-///
-/// The whole point of the cursor: a 1 KiB append used to cost a read of the
-/// entire transcript here, which is the cost incremental hydration exists to
-/// remove — and because this walk's bytes were not counted, the result
-/// reported the kilobyte while the process read the file.
-pub(crate) fn scan_claude_transcript_resumed(
+/// `any` is whether a record ever folded in: a file that says nothing retracts
+/// what it used to say, which is a different answer from a file that has
+/// simply not grown since the last pass.
+pub(crate) fn finish_claude_fold(
+    mut evidence: ContinuityEvidence,
+    any: bool,
     path: &Path,
-    state: &mut Option<crate::ingest::transcript_cursor::ClaudeContinuityState>,
-) -> Result<ContinuityPass> {
-    use crate::ingest::transcript_cursor::{CommitOutcome, TranscriptReader};
-    let saved = state.clone().unwrap_or_default();
-    let mut reader = TranscriptReader::open(path, saved.file.as_ref(), None)?;
-    let resumed = reader.start_offset() > 0;
-    let mut evidence = if resumed {
-        saved.evidence.clone()
-    } else {
-        ContinuityEvidence::default()
-    };
+) -> Option<ContinuityEvidence> {
+    if !any {
+        return None;
+    }
     evidence.source = "claude".to_string();
     evidence.locator = path.to_string_lossy().to_string();
-    if !resumed {
+    // An explicit `fileSessionId` in the records wins; the file name is the
+    // fallback, which is why it is filled in here rather than seeded before
+    // the walk.
+    if evidence.file_session_id.is_none() {
         evidence.file_session_id = file_session_id_from_path(path);
     }
-    let mut first_user_seen = resumed && saved.first_user_seen;
-    let mut any = resumed && saved.any;
-    let start_offset = reader.start_offset();
-    let mut line = String::new();
-    loop {
-        crate::ingest::check_capture_cancelled()?;
-        let Some(kind) = reader.next_line(&mut line)? else {
-            break;
-        };
-        let record = line.trim_end_matches(['\n', '\r']);
-        if let Ok(value) = serde_json::from_str::<Value>(record) {
-            if let Some(object) = value.as_object() {
-                any = true;
-                fold_claude_record(&mut evidence, &mut first_user_seen, object);
-            }
-        }
-        if kind == crate::ingest::transcript_cursor::ReadRecord::Unterminated {
-            break;
-        }
-    }
-    let mut superseded = false;
-    let consumed = reader.position();
-    match reader.commit(consumed)? {
-        CommitOutcome::Published(file) => {
-            *state = Some(crate::ingest::transcript_cursor::ClaudeContinuityState {
-                file: Some(file),
-                evidence: evidence.clone(),
-                first_user_seen,
-                any,
-            });
-        }
-        // Rewritten under the walk: record nothing, and read it again next
-        // time rather than resuming a fold over bytes that are gone.
-        CommitOutcome::Superseded => superseded = true,
-    }
-    // After the commit: writing the cursor hashes a window, and that is a
-    // provider read this pass made like any other. Taken before the commit it
-    // went uncounted, and `bytesRead` was short by exactly that window.
-    let bytes_read = consumed
-        .saturating_sub(start_offset)
-        .saturating_add(reader.tail_bytes())
-        .saturating_add(reader.validation_bytes());
-    if !any {
-        return Ok(ContinuityPass {
-            evidence: None,
-            bytes_read,
-            superseded,
-        });
-    }
-    let Some(session_id) = evidence.in_log_session_ids.first().cloned() else {
-        return Ok(ContinuityPass {
-            evidence: None,
-            bytes_read,
-            superseded,
-        });
-    };
-    evidence.session_id = session_id;
-    Ok(ContinuityPass {
-        evidence: Some(evidence),
-        bytes_read,
-        superseded,
-    })
+    evidence.session_id = evidence.in_log_session_ids.first().cloned()?;
+    Some(evidence)
+}
+
+/// Record continuity evidence a walk has already folded, reading nothing.
+pub(crate) fn capture_folded(
+    conn: &Connection,
+    path: &Path,
+    evidence: Option<ContinuityEvidence>,
+) -> Result<()> {
+    capture(conn, "claude", path, evidence)
 }
 
 /// Fold one Claude record into the running continuity evidence.
@@ -299,7 +255,7 @@ pub(crate) fn scan_claude_transcript_resumed(
 /// Every field is first-wins, last-wins or accumulating, which is what makes
 /// the walk resumable: the same records in the same order give the same
 /// answer whether they arrive in one pass or several.
-fn fold_claude_record(
+pub(crate) fn fold_claude_record(
     evidence: &mut ContinuityEvidence,
     first_user_seen: &mut bool,
     object: &serde_json::Map<String, Value>,
@@ -342,98 +298,6 @@ fn fold_claude_record(
         }
         record_resume_marker(evidence, object);
     }
-}
-
-#[allow(dead_code)]
-fn scan_claude_transcript_whole(path: &Path) -> Result<(Option<ContinuityEvidence>, u64)> {
-    // Propagated, never collapsed into empty content. `Ok(None)` is what the
-    // caller retracts on, so a transient read failure returning it would have
-    // deleted real topology and reported a clean sync — the file still says
-    // what it said, and we simply failed to look.
-    // Streamed under the same record ceiling the ingest readers use.
-    // `read_to_string` here made hydration of a live transcript unbounded in
-    // memory and fatal on one stray byte. `TranscriptReader` is deliberately
-    // not reused: it hashes a prefix window on open so a commit can detect a
-    // rewrite, and this walk keeps no position, so that window would be 128
-    // KiB of provider reads charged to a hydration for a cursor nobody writes.
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading Claude transcript {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut raw = Vec::new();
-    let mut evidence = ContinuityEvidence {
-        source: "claude".to_string(),
-        locator: path.to_string_lossy().to_string(),
-        file_session_id: file_session_id_from_path(path),
-        ..ContinuityEvidence::default()
-    };
-    let mut first_user_seen = false;
-    let mut any = false;
-    let mut bytes_read = 0u64;
-    while next_record(&mut reader, &mut raw)
-        .with_context(|| format!("reading Claude transcript {}", path.display()))?
-    {
-        bytes_read += raw.len() as u64;
-        // An oversized record is not buffered and an undecodable one is not
-        // repaired; both leave `raw` empty or unparseable and take the same
-        // skip any other malformed record takes.
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        any = true;
-        if let Some(explicit) = string_field(object, &["fileSessionId", "file_session_id"]) {
-            evidence.file_session_id = Some(explicit);
-        }
-        if let Some(session_id) = string_field(object, &["sessionId", "session_id"]) {
-            if !evidence.in_log_session_ids.contains(&session_id) {
-                evidence.in_log_session_ids.push(session_id);
-            }
-            if evidence.first_ts_ms.is_none() {
-                evidence.first_ts_ms = record_ts_ms(object);
-            }
-        }
-        if evidence.source_version.is_none() {
-            evidence.source_version = string_field(object, &["version", "source_version"]);
-        }
-        if let Some(target) =
-            string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
-        {
-            push_unique(&mut evidence.explicit_continuation_targets, target);
-        }
-        if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
-            push_unique(&mut evidence.explicit_fork_targets, target);
-        }
-        if evidence.explicit_source_session_id.is_none() {
-            evidence.explicit_source_session_id =
-                string_field(object, &["sourceSessionId", "source_session_id"]);
-        }
-        let sidechain = object
-            .get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_user = object.get("type").and_then(Value::as_str) == Some("user");
-        if is_user && !sidechain {
-            if !first_user_seen {
-                first_user_seen = true;
-                evidence.first_parent_uuid =
-                    string_field(object, &["parentUuid", "parent_uuid"]);
-            }
-            record_resume_marker(&mut evidence, object);
-        }
-    }
-    if !any {
-        return Ok((None, bytes_read));
-    }
-    let Some(session_id) = evidence.in_log_session_ids.first().cloned() else {
-        return Ok((None, bytes_read));
-    };
-    evidence.session_id = session_id;
-    Ok((Some(evidence), bytes_read))
 }
 
 /// Codex records continuity on the `session_meta` line that opens a rollout,
@@ -645,55 +509,14 @@ fn reopen_dependents(
 }
 
 /// Read one transcript's evidence and store it, in one call.
-pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<u64> {
-    let (evidence, bytes_read) = scan_claude_transcript_counted(path)?;
-    capture(conn, "claude", path, evidence)?;
-    Ok(bytes_read)
+///
+/// The backfill entry point: hydration and the global sync hand over evidence
+/// the metadata walk already folded, through [`capture_folded`].
+pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
+    let evidence = scan_claude_transcript(path)?;
+    capture(conn, "claude", path, evidence)
 }
 
-/// The same capture, resumed from and recorded on `cursor`.
-///
-/// Returns the provider bytes it read, which the caller owes to `bytesRead`.
-pub(crate) fn capture_claude_transcript_resumed(
-    conn: &Connection,
-    path: &Path,
-    cursor: &mut crate::ingest::transcript_cursor::TranscriptCursorState,
-) -> Result<u64> {
-    let mut state = cursor
-        .claude
-        .as_ref()
-        .and_then(|claude| claude.continuity.clone());
-    let pass = scan_claude_transcript_resumed(path, &mut state)?;
-    // A pass whose file moved under it records no position, so the next pass
-    // folds the file again rather than resuming over bytes that are gone.
-    if !pass.superseded {
-        cursor.claude.get_or_insert_with(Default::default).continuity = state;
-    }
-    capture(conn, "claude", path, pass.evidence)?;
-    Ok(pass.bytes_read)
-}
-
-/// The same capture, resumed from the transcript's own locator-keyed cursor.
-///
-/// What the global sync walk uses: it has no session cursor in hand, and the
-/// locator is what it reads transcripts by.
-pub fn capture_claude_transcript_at_locator(conn: &Connection, path: &Path) -> Result<u64> {
-    let locator = path.to_string_lossy().to_string();
-    let key = crate::ingest::transcript_cursor::CursorKey::Locator {
-        source: CONTINUITY_CURSOR_SOURCE,
-        locator: &locator,
-    };
-    let mut cursor = crate::ingest::transcript_cursor::load_cursor(conn, &key)?;
-    let bytes = capture_claude_transcript_resumed(conn, path, &mut cursor)?;
-    crate::ingest::transcript_cursor::store_cursor(conn, &key, &cursor)?;
-    Ok(bytes)
-}
-
-/// The cursor namespace for the continuity fold's own position.
-///
-/// Not the transcript's own namespace: that cursor belongs to the record
-/// walk, and the two advance independently.
-pub(crate) const CONTINUITY_CURSOR_SOURCE: &str = "claude-continuity";
 
 /// Read one rollout's evidence and store it, in one call.
 pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<u64> {
