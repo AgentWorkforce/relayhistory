@@ -54,7 +54,10 @@ and `crates/ai-hist-napi/src/lib.rs`).
    and publishes the crate from that tag.
 5. After the clean registry install and the older-glibc CLI smoke tests pass,
    `publish` pushes the version commit — only if the branch has not advanced —
-   and creates the `sdk-ts-v<version>` tag and GitHub Release.
+   and creates the `sdk-ts-v<version>` tag and GitHub Release. The registry
+   smoke installs `ai-hist` as an ordinary dependency with npm's `--libc` set
+   to this runner's family so `ai-hist-native-linux-x64-gnu` (or musl) is
+   selected.
 6. `plugins` checks out that persisted commit, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each

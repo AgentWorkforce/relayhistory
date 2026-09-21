@@ -34,32 +34,15 @@ import { createRequire } from "node:module";
 
 import { packageName, platforms, plugins } from "./history-package-contract.mjs";
 import { installWithRegistryRetry, isRegistryVisibilityFailure } from "./npm-install-with-registry-retry.mjs";
+import {
+  currentPlatform,
+  hostInstallArgs,
+  hostLibc,
+  publicRegistryEnv,
+} from "./npm-host-install.mjs";
 
-/** This machine's platform key, to check the helper that should have installed. */
-export function currentPlatform() {
-  const libc =
-    process.platform === "linux"
-      ? (process.report?.getReport()?.header?.glibcVersionRuntime ? "gnu" : "musl")
-      : undefined;
-  const key = [process.platform, process.arch, libc].filter(Boolean).join("-");
-  const known = Object.keys(platforms);
-  const match = known.find((candidate) => candidate === key)
-    ?? known.find((candidate) => candidate.startsWith(`${process.platform}-${process.arch}`));
-  assert.ok(match, `no platform entry for ${key}; known: ${known.join(", ")}`);
-  return match;
-}
-
-/** npm `libc` field for this machine (`glibc` / `musl`), or undefined off Linux. */
-export function hostLibc(platform = currentPlatform()) {
-  return platforms[platform]?.[2];
-}
-
-/** `npm install` args that select the helper this runner's package.json declares. */
-export function pluginInstallArgs(project, libc = hostLibc()) {
-  const args = ["--prefix", project];
-  if (libc) args.push(`--libc=${libc}`);
-  return args;
-}
+export { currentPlatform, hostLibc, publicRegistryEnv };
+export const pluginInstallArgs = hostInstallArgs;
 
 /** Clean project that depends on the published JS packages the way a user does. */
 export function verifyPluginManifest(version) {
@@ -71,15 +54,6 @@ export function verifyPluginManifest(version) {
       Object.values(plugins).map((info) => [packageName(info), version]),
     ),
   };
-}
-
-/** Drop the publish job's npmrc/token so this is a public registry install. */
-export function publicRegistryEnv(base = process.env) {
-  const env = { ...base };
-  delete env.NODE_AUTH_TOKEN;
-  delete env.NPM_CONFIG_USERCONFIG;
-  delete env.npm_config_userconfig;
-  return env;
 }
 
 /** Every name this release published, JavaScript package and platform helper. */
