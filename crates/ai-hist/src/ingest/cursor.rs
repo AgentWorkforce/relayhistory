@@ -52,7 +52,10 @@
 //! byte before the offset, or a bounded window. **This is the bounded window**:
 //! SHA-256 over a domain-separated header, the committed offset itself, the
 //! first [`PREFIX_WINDOW_BYTES`] of the file, and the last
-//! [`PREFIX_WINDOW_BYTES`] before the offset.
+//! [`PREFIX_WINDOW_BYTES`] before the offset — or, when those two ends meet,
+//! the committed prefix in one read. A prefix of `2 * PREFIX_WINDOW_BYTES` or
+//! less is entirely covered either way, and reading it once is both cheaper
+//! and free of the double-hashed overlap the two-window form has there.
 //!
 //! Hashing the whole prefix would be strictly stronger and is what the flat
 //! prompt logs do, but it costs a read of the entire committed region **on
@@ -299,15 +302,21 @@ fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
 /// code having to remember a second list.
 fn prefix_window_digest_counted(file: &mut fs::File, offset: u64) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
-    hasher.update(b"relayhistory/transcript-prefix/v1\0");
+    // v2: the two windows are hashed as one span whenever they meet, so a
+    // committed prefix of 128 KiB or less is covered by a single read rather
+    // than by two that overlap. A v1 digest of such a file was taken over the
+    // overlapping region twice and will not match, so those cursors are
+    // rejected once and rewritten on the next pass -- the same one-time
+    // re-read any rotation causes, and the reason this tag moved rather than
+    // the rule changing quietly underneath a stored hash.
+    hasher.update(b"relayhistory/transcript-prefix/v2\0");
     hasher.update(offset.to_le_bytes());
     if offset == 0 {
         return Ok((format!("{:x}", hasher.finalize()), 0));
     }
-    let window = PREFIX_WINDOW_BYTES.min(offset);
-    let mut read_window = |start: u64, hasher: &mut Sha256| -> Result<()> {
+    let mut read_span = |start: u64, len: u64, hasher: &mut Sha256| -> Result<()> {
         file.seek(std::io::SeekFrom::Start(start))?;
-        let mut remaining = window;
+        let mut remaining = len;
         let mut buffer = [0u8; 32 * 1024];
         while remaining > 0 {
             let wanted =
@@ -322,11 +331,47 @@ fn prefix_window_digest_counted(file: &mut fs::File, offset: u64) -> Result<(Str
         }
         Ok(())
     };
-    read_window(0, &mut hasher)?;
-    read_window(offset - window, &mut hasher)?;
+    match prefix_window_spans(offset) {
+        PrefixSpans::Whole { len } => read_span(0, len, &mut hasher)?,
+        PrefixSpans::Ends { window, tail_start } => {
+            read_span(0, window, &mut hasher)?;
+            read_span(tail_start, window, &mut hasher)?;
+        }
+    }
+    let bytes = prefix_window_bytes(offset);
     #[cfg(test)]
-    VALIDATION_METER.with(|meter| meter.set(meter.get() + 2 * window));
-    Ok((format!("{:x}", hasher.finalize()), 2 * window))
+    VALIDATION_METER.with(|meter| meter.set(meter.get() + bytes));
+    Ok((format!("{:x}", hasher.finalize()), bytes))
+}
+
+/// Which regions of the committed prefix a digest covers.
+enum PrefixSpans {
+    /// The whole committed prefix, as one read.
+    Whole { len: u64 },
+    /// Two disjoint windows, one at each end.
+    Ends { window: u64, tail_start: u64 },
+}
+
+/// The regions [`prefix_window_digest_counted`] hashes for a cursor at
+/// `offset`.
+///
+/// Two windows, one at each end -- except when they meet. `window` is
+/// `min(PREFIX_WINDOW_BYTES, offset)`, so the tail begins at
+/// `offset - window`, and for any prefix of `2 * PREFIX_WINDOW_BYTES` or less
+/// that is at or before the end of the head window. Reading them separately
+/// then covers some bytes twice and, for a file smaller than one window, the
+/// same bytes twice over -- which is what made an unchanged sync over a tree
+/// of small transcripts read each file four times to prove it had not
+/// changed. One read of the union is cheaper and strictly stronger: there is
+/// no gap between the ends left uncovered.
+fn prefix_window_spans(offset: u64) -> PrefixSpans {
+    let window = PREFIX_WINDOW_BYTES.min(offset);
+    let tail_start = offset - window;
+    if tail_start <= window {
+        PrefixSpans::Whole { len: offset }
+    } else {
+        PrefixSpans::Ends { window, tail_start }
+    }
 }
 
 #[cfg(unix)]
@@ -390,11 +435,17 @@ impl PrefixCheck {
 }
 
 /// How many bytes validating a cursor at `offset` reads.
-fn prefix_window_bytes(offset: u64) -> u64 {
+///
+/// At most `2 * PREFIX_WINDOW_BYTES`, and `offset` itself below that, because
+/// a prefix the two windows would both reach is read once. Per digest: a
+/// Claude transcript validates two positions and pays this twice.
+pub(crate) fn prefix_window_bytes(offset: u64) -> u64 {
     if offset == 0 {
-        0
-    } else {
-        2 * PREFIX_WINDOW_BYTES.min(offset)
+        return 0;
+    }
+    match prefix_window_spans(offset) {
+        PrefixSpans::Whole { len } => len,
+        PrefixSpans::Ends { window, .. } => 2 * window,
     }
 }
 
@@ -467,10 +518,14 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     // say. The file was then skipped on every sync, forever, serving rows
     // from bytes that no longer exist.
     //
-    // The same bounded window the cursor already stores, so this costs two
-    // seeks and at most 128 KiB, and only on the files that were about to be
+    // The same bounded window the cursor already stores, so this costs at
+    // most 128 KiB per digest, and only on the files that were about to be
     // skipped anyway. Shared with hydration's own skip path, which asks the
     // same question about the same cursor.
+    //
+    // Note the *two* digests below: a Claude transcript carries the record
+    // walk's position and the metadata fold's in one document, and both have
+    // to be current. That is the real per-file ceiling on this path.
     //
     // Both positions in the document have to be current, not just the record
     // walk's: a superseded metadata scan leaves a fold that has to be made
@@ -1217,4 +1272,94 @@ pub(crate) struct IncrementalPass {
     /// The file was rewritten while this pass was reading it, so the pass
     /// recorded no cursor and the next one reads the same region again.
     pub superseded: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest_of(bytes: &[u8], offset: u64) -> (String, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, bytes).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        prefix_window_digest_counted(&mut file, offset).unwrap()
+    }
+
+    /// Every byte of a committed prefix that fits inside the two windows is
+    /// covered, and flipping any one of them is caught.
+    ///
+    /// The sizes straddle the boundary deliberately. At `2 *
+    /// PREFIX_WINDOW_BYTES` or less the ends meet, and the prefix is hashed as
+    /// one span; an earlier attempt at that optimization dropped the tail read
+    /// whenever the windows overlapped *at all*, which silently stopped
+    /// covering the bytes only the tail reached -- caught here by the 96 KiB
+    /// case, where the head window ends at 64 KiB.
+    #[test]
+    fn a_prefix_the_windows_meet_over_is_covered_end_to_end() {
+        for offset in [
+            1024u64,
+            PREFIX_WINDOW_BYTES,
+            PREFIX_WINDOW_BYTES + PREFIX_WINDOW_BYTES / 2,
+            2 * PREFIX_WINDOW_BYTES,
+        ] {
+            let bytes = vec![b'a'; offset as usize];
+            let (baseline, read) = digest_of(&bytes, offset);
+            assert_eq!(
+                read, offset,
+                "a prefix the windows meet over is read once, not twice"
+            );
+            for at in [
+                0,
+                offset / 3,
+                PREFIX_WINDOW_BYTES.min(offset - 1),
+                offset - 1,
+            ] {
+                let mut rewritten = bytes.clone();
+                rewritten[at as usize] = b'b';
+                assert_ne!(
+                    digest_of(&rewritten, offset).0,
+                    baseline,
+                    "a byte changed at {at} of a {offset} byte prefix went unnoticed"
+                );
+            }
+        }
+    }
+
+    /// Past the point where the ends meet, the window is what it says it is:
+    /// both ends are covered, and the middle deliberately is not.
+    #[test]
+    fn a_prefix_longer_than_both_windows_covers_its_ends_only() {
+        let offset = 4 * PREFIX_WINDOW_BYTES;
+        let bytes = vec![b'a'; offset as usize];
+        let (baseline, read) = digest_of(&bytes, offset);
+        assert_eq!(read, 2 * PREFIX_WINDOW_BYTES, "two windows, no more");
+
+        for at in [
+            0,
+            PREFIX_WINDOW_BYTES - 1,
+            offset - PREFIX_WINDOW_BYTES,
+            offset - 1,
+        ] {
+            let mut rewritten = bytes.clone();
+            rewritten[at as usize] = b'b';
+            assert_ne!(
+                digest_of(&rewritten, offset).0,
+                baseline,
+                "a byte changed at {at}, inside a window, went unnoticed"
+            );
+        }
+
+        // The documented limit, asserted rather than left to be discovered:
+        // an edit strictly between the windows that preserves the length is
+        // not caught by the hash.
+        let mut middle = bytes.clone();
+        middle[(2 * PREFIX_WINDOW_BYTES) as usize] = b'b';
+        assert_eq!(
+            digest_of(&middle, offset).0,
+            baseline,
+            "the gap between the windows is a known blind spot; if this now \
+             fails the window rule changed and the docs above must follow"
+        );
+    }
 }

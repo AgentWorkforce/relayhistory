@@ -5726,10 +5726,11 @@ mod tests {
         // Not zero: skipping the file means validating that the bytes behind
         // its cursors are still the bytes on disk. A Claude transcript has two
         // positions in its document — the record walk's and the metadata
-        // fold's — and both are checked before a skip, so that is two digests
-        // of two windows each. Recomputed from the window size rather than
-        // pasted from a run.
-        let digest = 2 * super::cursor::PREFIX_WINDOW_BYTES.min(records.len() as u64) as i64;
+        // fold's — and both are checked before a skip, so that is two digests.
+        // Asked of the window rule rather than pasted from a run, so a change
+        // to what a digest covers shows up here as a decision rather than a
+        // number that needs re-pasting.
+        let digest = super::cursor::prefix_window_bytes(records.len() as u64) as i64;
         assert_eq!(again.bytes_read, 2 * digest);
         assert_eq!(session_event_snapshot(&db, session_id).len(), 525);
 
@@ -5872,11 +5873,11 @@ mod tests {
             hydrate_session_at_with_home(&db, &options("claude", INCOMPLETE_SESSION), dir.path())
                 .unwrap();
         assert_eq!(third.status, "unchanged");
-        // Each cursor covers the whole file, so a digest's window is the file
-        // read twice — the first window and the last are the same bytes — and
-        // there are two positions to check, the record walk's and the metadata
-        // fold's.
-        let digest = 2 * super::cursor::PREFIX_WINDOW_BYTES.min(bytes.len() as u64) as i64;
+        // Each cursor's committed prefix fits inside the window, so a digest
+        // is one read of the file — the two ends meet, and reading them
+        // separately would hash the same bytes twice — and there are two
+        // positions to check, the record walk's and the metadata fold's.
+        let digest = super::cursor::prefix_window_bytes(bytes.len() as u64) as i64;
         assert_eq!(third.bytes_read, 2 * digest);
     }
 
