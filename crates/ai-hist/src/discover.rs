@@ -3261,6 +3261,7 @@ pub fn discover_sessions_with_provider_refs(
     let mut candidates: Vec<(usize, Candidate)> = Vec::new();
     let mut failed_providers = 0usize;
     for (provider_index, provider) in providers.iter().enumerate() {
+        crate::ingest::check_capture_cancelled()?;
         let entry = summary
             .providers
             .entry(provider.source().to_string())
@@ -3334,6 +3335,7 @@ pub fn discover_sessions_with_provider_refs(
     let mut position = 0usize;
 
     while position < candidates.len() {
+        crate::ingest::check_capture_cancelled()?;
         let window_cap = if emitted >= limit {
             MAX_READ_WINDOW
         } else {
@@ -3342,6 +3344,7 @@ pub fn discover_sessions_with_provider_refs(
         let mut entries: Vec<WindowEntry<'_>> = Vec::new();
         let mut potential = 0usize;
         while position < candidates.len() && potential < window_cap {
+            crate::ingest::check_capture_cancelled()?;
             let (provider_index, candidate) = &candidates[position];
             position += 1;
             if emitted >= limit
@@ -3450,6 +3453,9 @@ pub fn discover_sessions_with_provider_refs(
                 }
             }
         }
+
+        // Shallow reads are bounded; stop before opening the next write transaction.
+        crate::ingest::check_capture_cancelled()?;
 
         // Writes for the whole window share one transaction; a fresh archive
         // costs one commit per window instead of one per row. Cached-only

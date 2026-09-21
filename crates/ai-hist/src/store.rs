@@ -3701,6 +3701,7 @@ fn opencode_backup_requested() -> bool {
 /// cost is proportional to the history actually read rather than to the size
 /// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
     // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
     // looser guard let a directory reach `Connection::open` and fail there --
@@ -3742,6 +3743,7 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
 
 /// Index every OpenCode session in a legacy `storage/` JSON tree.
 pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     if !storage_dir.join("session").is_dir() {
         return Ok(0);
     }
@@ -3762,6 +3764,7 @@ pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Resul
         .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
         .collect();
     for session_file in listing.sessions {
+        crate::ingest::check_capture_cancelled()?;
         let indexed =
             crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
                 match loaded {
@@ -3795,6 +3798,7 @@ fn sync_opencode_sessions_from_source(
     src: &Connection,
     raw_path: &Path,
 ) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     let raw_path = raw_path.to_string_lossy().into_owned();
     let mut inserted = 0;
     // One session's failure is that session's failure, the same way the legacy
@@ -3810,6 +3814,7 @@ fn sync_opencode_sessions_from_source(
     match crate::ingest::opencode::sync_plan(src)? {
         crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
             for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
+                crate::ingest::check_capture_cancelled()?;
                 let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
                     |loaded| match loaded {
                         Some(loaded) => {
@@ -3826,6 +3831,7 @@ fn sync_opencode_sessions_from_source(
             }
         }
         crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
+            crate::ingest::check_capture_cancelled()?;
             let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
             failures.extend(
                 load.failures
@@ -3833,6 +3839,7 @@ fn sync_opencode_sessions_from_source(
                     .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
             );
             for loaded in load.sessions {
+                crate::ingest::check_capture_cancelled()?;
                 match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
                     Ok(counts) => inserted += counts.prompts,
                     Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
@@ -3876,6 +3883,7 @@ pub fn sync_opencode_session_from_storage_dir(
     session_file: &Path,
     session_id: &str,
 ) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     let Some(loaded) = crate::ingest::opencode::load_from_json_tree(session_file)? else {
         return Ok(0);
     };
@@ -3895,6 +3903,7 @@ fn sync_opencode_session_from_connection(
     session_id: &str,
     raw_path: &Path,
 ) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     let Some(loaded) = crate::ingest::opencode::load_from_sqlite(src, session_id)? else {
         return Ok(0);
     };

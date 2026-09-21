@@ -151,6 +151,7 @@ pub(crate) fn load_from_sqlite(
     src: &Connection,
     session_id: &str,
 ) -> Result<Option<OpencodeSession>> {
+    super::check_capture_cancelled()?;
     let session_columns = table_columns(src, "session")?;
     if !session_columns.contains("id") {
         return Ok(None);
@@ -206,6 +207,7 @@ pub(crate) fn load_from_sqlite(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (id, data, fallback_ts) in rows {
+            super::check_capture_cancelled()?;
             let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
@@ -263,6 +265,7 @@ pub(crate) fn load_from_sqlite(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, message_id, data) in rows {
+                super::check_capture_cancelled()?;
                 push(id, message_id, data);
             }
         } else {
@@ -270,6 +273,7 @@ pub(crate) fn load_from_sqlite(
                 "SELECT id, message_id, data FROM part WHERE message_id = ? AND json_valid(data)",
             )?;
             for message in &messages {
+                super::check_capture_cancelled()?;
                 let rows = stmt
                     .query_map([&message.id], |row| {
                         Ok((
@@ -280,6 +284,7 @@ pub(crate) fn load_from_sqlite(
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 for (id, message_id, data) in rows {
+                    super::check_capture_cancelled()?;
                     push(id, message_id, data);
                 }
             }
@@ -365,6 +370,7 @@ pub(crate) struct OpencodeSessionFailure {
 /// replaced copied the entire database to a temporary file first, so holding
 /// the rows costs no more than that did and reads each one exactly once.
 pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad> {
+    super::check_capture_cancelled()?;
     let mut load = OpencodeStoreLoad::default();
     // Sessions whose rows this pass could not map. Dropped from the output at
     // the end rather than as they are found, because a message can fail after
@@ -403,6 +409,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
             Ok((id, mapped))
         })?;
         for row in rows {
+            super::check_capture_cancelled()?;
             let (id, mapped) = row?;
             match mapped {
                 Ok(mut info) => {
@@ -446,6 +453,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
         })?;
         let mut rows = Vec::new();
         for row in mapped {
+            super::check_capture_cancelled()?;
             let (session_id, rest) = row?;
             match (session_id, rest) {
                 (Ok(session_id), Ok((id, data, fallback_ts))) => {
@@ -463,6 +471,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
             }
         }
         for (id, session_id, data, fallback_ts) in rows {
+            super::check_capture_cancelled()?;
             if !infos.contains_key(&session_id) {
                 continue;
             }
@@ -498,6 +507,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
         })?;
         let mut rows = Vec::new();
         for row in mapped {
+            super::check_capture_cancelled()?;
             let (message_id, rest) = row?;
             match (message_id, rest) {
                 (Ok(message_id), Ok((id, data))) => rows.push((id, message_id, data)),
@@ -512,6 +522,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
             }
         }
         for (id, message_id, data) in rows {
+            super::check_capture_cancelled()?;
             let Some(session_id) = session_of_message.get(&message_id) else {
                 continue;
             };
@@ -539,6 +550,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     let ids: Vec<String> = infos.keys().cloned().collect();
     load.sessions.reserve(ids.len());
     for id in ids {
+        super::check_capture_cancelled()?;
         if failed.contains_key(&id) {
             continue;
         }
@@ -660,6 +672,7 @@ fn collect_session_files(dir: &Path, listing: &mut OpencodeTreeListing) {
 
 /// Read one session out of the JSON tree, given its session file.
 pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<OpencodeSession>> {
+    super::check_capture_cancelled()?;
     // A read that fails is not a verdict. `Ok(None)` means "this candidate is
     // not a session", and discovery records that against the current source
     // stamp; hydration commits its checkpoint over whatever came back. An
@@ -713,6 +726,7 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
 
     let mut messages = Vec::new();
     for (message_id, object) in read_json_dir(&storage_root.join("message").join(&info.id))? {
+        super::check_capture_cancelled()?;
         if let Some(message) = parse_message(&message_id, &object, None) {
             messages.push(message);
         }
@@ -720,7 +734,9 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
 
     let mut parts_by_message: BTreeMap<String, Vec<OpencodePart>> = BTreeMap::new();
     for message in &messages {
+        super::check_capture_cancelled()?;
         for (part_id, object) in read_json_dir(&storage_root.join("part").join(&message.id))? {
+            super::check_capture_cancelled()?;
             let kind = object
                 .get("type")
                 .and_then(Value::as_str)
@@ -922,6 +938,7 @@ fn json_file_stems(
     paths.sort();
     let mut stems = Vec::new();
     for path in &paths {
+        super::check_capture_cancelled()?;
         visit(path, stamp)?;
         if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
             stems.push(stem.to_string());
@@ -939,6 +956,7 @@ fn read_json_dir(dir: &Path) -> Result<Vec<(String, Map<String, Value>)>> {
     paths.sort();
     let mut out = Vec::new();
     for path in paths {
+        super::check_capture_cancelled()?;
         let raw = match fs::read_to_string(&path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -978,6 +996,7 @@ fn json_paths_in(dir: &Path) -> Result<Vec<PathBuf>> {
     };
     let mut paths = Vec::new();
     for entry in entries {
+        super::check_capture_cancelled()?;
         let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
@@ -1255,6 +1274,7 @@ fn normalize_session(
     loaded: &OpencodeSession,
     raw_path: &str,
 ) -> Result<OpencodeIngestCounts> {
+    super::check_capture_cancelled()?;
     let mut counts = OpencodeIngestCounts::default();
     let mut keys = OpencodeSnapshotKeys::default();
     let session_id = loaded.session.id.as_str();
@@ -1293,6 +1313,7 @@ fn normalize_session(
     let mut last_assistant_text: Option<String> = None;
 
     for message in &loaded.messages {
+        super::check_capture_cancelled()?;
         let parts = loaded.parts(&message.id);
         let model = build_model(message.provider_id.as_deref(), message.model_id.as_deref());
         let token_json = message
@@ -1304,6 +1325,7 @@ fn normalize_session(
 
         if message.role == "user" {
             for part in parts {
+                super::check_capture_cancelled()?;
                 if part.kind == "compaction" {
                     // A compaction part sits on the user message OpenCode
                     // inserts at the boundary; the marker is the boundary
@@ -1385,6 +1407,7 @@ fn normalize_session(
         // ordered the parts, so "last" here is the provider's own order.
         let final_part_for_call = last_part_index_per_call(parts);
         for (index, part) in parts.iter().enumerate() {
+            super::check_capture_cancelled()?;
             if let Some(text) = part_text(part) {
                 let event_uid = format!("text:{}", part.id);
                 insert_session_event_with_provenance(
