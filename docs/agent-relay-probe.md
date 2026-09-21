@@ -212,18 +212,49 @@ human-readable install/status/stop commands remain available.
   establish a new-only baseline, or share only explicitly selected sessions.
   Previously selected sessions are retained across mode changes.
 
-Selected mode excludes each unselected discovery after capture and before
-any delivery. Paused jobs continue local capture without delivery or progress
-heartbeats. Session lists and status use read-only database connections.
+Selected mode uses the core's normalized, deny-by-default session membership.
+Adding a session creates its own immutable historical snapshot and indexed
+journal cursor. Adding B keeps A's acknowledged progress and pending immutable
+batch; repeating an inclusion is a no-op. A removal fences an in-flight lease
+and is checked again before dispatch. Re-inclusion takes a fresh snapshot, so
+previously skipped records are backfilled. New discoveries stay private without
+writing an exclusion for every catalog row. The selected-session manifest is
+still written for desktop compatibility; its size follows explicit selections,
+not the machine's history. Session lists and status remain read-only.
+
+Selected delivery drains captured records before targeted hydration and keeps
+draining a backlog before reading provider files. Hydration uses the core's
+parser, observation locks, cancellation and checkpoints. A separate periodic
+shallow inventory worker refreshes catalog metadata; slow provider enumeration
+never runs on the selected delivery scheduler. Selected setup does not run a
+full-history capture. Paused selected jobs do not hydrate or deliver; the
+background inventory can still discover metadata. All/new sharing modes retain
+their capture behavior, with eligible delivery attempted before capture.
 
 Sharing mutations serialize on `desktop.lock`, stop the collector, and take
-its lock before replacing a generation. Includes, excludes and mode changes
-all use the same recovery path: persist `sharing-change.json`, cancel the old
-job, apply the exclusion set, create a replacement, preserve pause state, and
-atomically save `selected.json` and `config.json` before clearing the intent.
-If interrupted, startup replays the intent before it can deliver. This also
-means selection changes can temporarily restart record-level progress as
-acknowledged revisions are rechecked; remote delivery is idempotent.
+its lock. A durable `sharing-change.json` records the intended change before
+any writes; replay completes it before delivery can restart. Selected-mode
+include/exclude operations update only changed membership. Explicit sharing
+mode changes retain generation replacement semantics and preserve pause state.
+
+On the first writable use of an older selected install, core adopts the same
+job in place: destination generation, pending/prepared batches, acknowledgments,
+retry state, paused/blocked state, historical bounds and preimages survive.
+This one-time upgrade copies only explicitly selected snapshots and can require
+retention headroom; a capacity error rolls the entire adoption back. New delivery
+indexes are built once during schema upgrade. Existing exclusions remain
+privacy guards, including exclusions needed by another active destination.
+No destructive queue migration occurs. Read-only commands also accept the old
+schema before the writable upgrade.
+
+`capture-diagnostic.json` reports capture stage, elapsed time, counts and an
+allowlisted error class; inventory diagnostics use a separate file. Logs never
+include raw provider errors, transcript content, paths or credentials. A
+successful include command means consent and preparation were recorded, not
+that a receiver acknowledged the session. `shared`, `queued`, `uploading` and
+`uploaded` retain their existing bridge meanings. The historical 77/86-second
+capture failures cannot be diagnosed from the old generic logs; their cause
+remains unknown until a redacted diagnostic is reproduced.
 
 Disconnect stops the collector, cancels jobs, best-effort revokes the workspace
 RelayHistory token, and removes this install's stage credentials/configuration.

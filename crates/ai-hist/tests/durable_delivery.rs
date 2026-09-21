@@ -874,3 +874,303 @@ fn clearing_exclusions_does_not_require_cancelling_unaffected_jobs() {
     set_session_excluded(&conn, &session, false).unwrap();
     set_session_excluded(&conn, &session, false).unwrap();
 }
+
+#[test]
+fn scoped_membership_backfills_only_changes_and_preserves_pending_batches() {
+    let conn = db();
+    event(&conn, "a", "before");
+    event(&conn, "b", "second");
+    let root = create_session_job(&conn, &config("scoped"), 0).unwrap();
+    let a = SessionIdentity {
+        source: "claude".into(),
+        session_id: "a".into(),
+    };
+    let b = SessionIdentity {
+        source: "claude".into(),
+        session_id: "b".into(),
+    };
+    assert!(claim(&conn, &root.job_id, 1).is_none());
+    assert!(set_job_session(&conn, &root.job_id, &a, true).unwrap());
+    assert!(!set_job_session(&conn, &root.job_id, &a, true).unwrap());
+    let first = claim(&conn, &root.job_id, 2).unwrap();
+    prepare(&conn, &first, 2);
+    assert!(set_job_session(&conn, &root.job_id, &b, true).unwrap());
+    assert!(validate_dispatch(&conn, &first.lease, &|| 3).is_err());
+    let reclaimed = claim_batch(&conn, &root.job_id, "worker", 1000, &|| 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.batch.batch_id, reclaimed.batch.batch_id);
+    acknowledge(&conn, &reclaimed.lease, &ack(&reclaimed), &|| 4).unwrap();
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id.as_deref(), Some("b"));
+    assert!(set_job_session(&conn, &root.job_id, &a, false).unwrap());
+    event(&conn, "private", "must not upload");
+    assert!(set_job_session(&conn, &root.job_id, &a, true).unwrap());
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id.as_deref(), Some("a"));
+}
+
+#[test]
+fn scoped_snapshot_keeps_preimages_deletions_and_reassigned_identities() {
+    let conn = db();
+    event(&conn, "a", "before");
+    event(&conn, "outside", "private");
+    let root = create_session_job(&conn, &config("snapshot-member"), 0).unwrap();
+    set_job_session(
+        &conn,
+        &root.job_id,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "a".into(),
+        },
+        true,
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_events SET session_id='elsewhere',text='after' WHERE session_id='a'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_events SET session_id='a' WHERE session_id='outside'",
+        [],
+    )
+    .unwrap();
+    let records = drain(&conn, &root.job_id);
+    assert!(records.iter().any(|r| r.payload["text"] == "before"));
+    assert!(!records.iter().any(|r| r.payload["text"] == "after"));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.payload["text"] == "private")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scoped_backfill_has_constant_unrelated_record_visits() {
+    for count in [100, 10_000, 50_000] {
+        for early in [true, false] {
+            let conn = db();
+            if early {
+                event(&conn, "selected", "fixed");
+            }
+            conn.execute_batch("BEGIN").unwrap();
+            for n in 0..count {
+                event(&conn, &format!("unrelated-{n}"), "unrelated");
+            }
+            if !early {
+                event(&conn, "selected", "fixed");
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            let root = create_session_job(&conn, &config("scale"), 0).unwrap();
+            let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = steps.clone();
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }),
+            );
+            let started = std::time::Instant::now();
+            let before = conn.total_changes();
+            set_job_session(
+                &conn,
+                &root.job_id,
+                &SessionIdentity {
+                    source: "claude".into(),
+                    session_id: "selected".into(),
+                },
+                true,
+            )
+            .unwrap();
+            let select_ms = started.elapsed().as_secs_f64() * 1000.;
+            let writes = conn.total_changes() - before;
+            let selected_steps = steps.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let prep = prepare_batch(&conn, &root.job_id, 1).unwrap();
+            let prepare_ms = started.elapsed().as_secs_f64() * 1000.;
+            let prepare_steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            eprintln!("scoped count={count} early={early} select_ms={select_ms:.3} prepare_ms={prepare_ms:.3} writes={writes} select_vm={selected_steps} prepare_vm={prepare_steps} visits={}",prep.scanned_records);
+            assert_eq!(prep.scanned_records, 1);
+            assert!(prep.batch_id.is_some());
+            assert!(selected_steps < 10_000);
+            assert!(prepare_steps < 15_000);
+            assert!(writes < 30);
+            let claimed = claim_batch(&conn, &root.job_id, "fake", 1000, &|| 2)
+                .unwrap()
+                .unwrap();
+            prepare(&conn, &claimed, 2);
+            validate_dispatch(&conn, &claimed.lease, &|| 2).unwrap();
+            acknowledge(&conn, &claimed.lease, &ack(&claimed), &|| 3).unwrap();
+            assert_eq!(status(&conn, &root.job_id).unwrap().acknowledged_records, 1);
+        }
+    }
+}
+
+#[test]
+fn scoped_adoption_preserves_deleted_records_pending_batches_and_pause() {
+    let conn = db();
+    event(&conn, "a", "snapshot");
+    event(&conn, "private", "hidden");
+    let old = create_job(&conn, &config("adopt"), 0).unwrap();
+    conn.execute("DELETE FROM session_events WHERE session_id='a'", [])
+        .unwrap();
+    let original = claim(&conn, &old.job_id, 1).unwrap();
+    prepare(&conn, &original, 1);
+    pause_job(&conn, &old.job_id).unwrap();
+    let a = SessionIdentity {
+        source: "claude".into(),
+        session_id: "a".into(),
+    };
+    adopt_session_job(&conn, &old.job_id, &[a.clone(), a.clone()]).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(DISTINCT job_id) FROM delivery_bootstrap_bounds",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    adopt_session_job(&conn, &old.job_id, &[]).unwrap();
+    assert_eq!(status(&conn, &old.job_id).unwrap().state, "paused");
+    assert_eq!(job_sessions(&conn, &old.job_id).unwrap(), vec![a]);
+    resume_job(&conn, &old.job_id).unwrap();
+    let records = drain(&conn, &old.job_id);
+    assert!(records.iter().all(|r| r.session_id.as_deref() == Some("a")));
+    assert!(records.iter().any(|r| r.payload["text"] == "snapshot"));
+    assert!(records.iter().any(|r| r.operation == "delete"));
+}
+
+#[test]
+fn scoped_adoption_preserves_ownership_preimage_and_global_exclusion_guard() {
+    let conn = db();
+    event(&conn, "outside", "private");
+    let old = create_job(&conn, &config("adopt-owner"), 0).unwrap();
+    conn.execute(
+        "UPDATE session_events SET session_id='a' WHERE session_id='outside'",
+        [],
+    )
+    .unwrap();
+    let a = SessionIdentity {
+        source: "claude".into(),
+        session_id: "a".into(),
+    };
+    adopt_session_job(&conn, &old.job_id, std::slice::from_ref(&a)).unwrap();
+    let records = drain(&conn, &old.job_id);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].revision > old.journal_cursor);
+    set_session_excluded(&conn, &a, true).unwrap();
+    assert!(set_session_excluded(&conn, &a, false).is_err());
+    set_job_session(&conn, &old.job_id, &a, false).unwrap();
+    let other = create_job(&conn, &config("other-account"), 2).unwrap();
+    assert!(set_session_excluded(&conn, &a, false).is_err());
+    cancel_job(&conn, &other.job_id).unwrap();
+    set_session_excluded(&conn, &a, false).unwrap();
+    set_job_session(&conn, &old.job_id, &a, true).unwrap();
+    assert_eq!(drain(&conn, &old.job_id).len(), 1);
+}
+
+#[test]
+fn scoped_exclusion_invalidates_prepared_and_leased_reinclude_has_fresh_revision() {
+    let conn = db();
+    event(&conn, "a", "same");
+    let root = create_session_job(&conn, &config("private"), 0).unwrap();
+    let a = SessionIdentity {
+        source: "claude".into(),
+        session_id: "a".into(),
+    };
+    set_job_session(&conn, &root.job_id, &a, true).unwrap();
+    let before = claim(&conn, &root.job_id, 1).unwrap();
+    prepare(&conn, &before, 1);
+    set_job_session(&conn, &root.job_id, &a, false).unwrap();
+    assert!(validate_dispatch(&conn, &before.lease, &|| 2).is_err());
+    assert!(acknowledge(&conn, &before.lease, &ack(&before), &|| 2).is_err());
+    set_job_session(&conn, &root.job_id, &a, true).unwrap();
+    assert!(claim_batch(&conn, &root.job_id, "filter", 1000, &|| 2)
+        .unwrap()
+        .is_none());
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].revision > before.batch.records[0].revision);
+}
+
+#[test]
+fn scoped_members_are_not_config_json_or_active_job_count_and_unrelated_preimages_stay_empty() {
+    let conn = db();
+    event(&conn, "outside", "before");
+    let root = create_session_job(&conn, &config("many"), 0).unwrap();
+    for n in 0..400 {
+        set_job_session(
+            &conn,
+            &root.job_id,
+            &SessionIdentity {
+                source: "claude".into(),
+                session_id: format!("{n}-{}", "x".repeat(180)),
+            },
+            true,
+        )
+        .unwrap();
+    }
+    assert_eq!(job_sessions(&conn, &root.job_id).unwrap().len(), 400);
+    assert!(
+        serde_json::to_vec(&status(&conn, &root.job_id).unwrap().config)
+            .unwrap()
+            .len()
+            < 1000
+    );
+    conn.execute(
+        "UPDATE session_events SET text='after' WHERE session_id='outside'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM delivery_shadow", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(list_jobs(&conn).unwrap().len(), 1);
+}
+
+#[test]
+fn scoped_child_inclusion_restores_relationship_without_replaying_parent_records() {
+    let conn = db();
+    event(&conn, "parent", "parent-record");
+    conn.execute("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES('claude','parent','edge','child','delegation','observed','fixture',1,1)",[]).unwrap();
+    let mut cfg = config("relations");
+    cfg.selection.kinds.push("relationship".into());
+    let root = create_session_job(&conn, &cfg, 0).unwrap();
+    set_job_session(
+        &conn,
+        &root.job_id,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "parent".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, "session_event");
+    set_job_session(
+        &conn,
+        &root.job_id,
+        &SessionIdentity {
+            source: "claude".into(),
+            session_id: "child".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let records = drain(&conn, &root.job_id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, "relationship");
+}

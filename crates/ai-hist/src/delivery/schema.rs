@@ -12,7 +12,7 @@ pub(super) struct Table {
 /// Every consumer a capture trigger has to serve: live delivery jobs and
 /// unexpired file exports. Named once so the preimage sweep below cannot drift
 /// from the triggers it stands in for.
-const CONSUMERS: &str = "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
+const CONSUMERS: &str = "SELECT m.id,j.state,m.bootstrap_done,m.bootstrap_kind,m.bootstrap_rowid,m.source AS member_source,m.session_id AS member_session FROM delivery_session_members m JOIN delivery_jobs j ON j.id=m.job_id WHERE j.state <> 'cancelled' UNION ALL SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)";
 
 pub(super) const TABLES: &[Table] = &[
     Table {
@@ -246,6 +246,22 @@ CREATE TABLE IF NOT EXISTS history_export_pages (
  cursor TEXT PRIMARY KEY, export_id TEXT NOT NULL, payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS history_export_page_owner ON history_export_pages(export_id);
+CREATE TABLE IF NOT EXISTS delivery_session_jobs (job_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS delivery_session_members (
+ id TEXT NOT NULL UNIQUE, job_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
+ cutoff INTEGER NOT NULL, cursor INTEGER NOT NULL, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
+ bootstrap_rowid INTEGER NOT NULL DEFAULT 0, bootstrap_done INTEGER NOT NULL DEFAULT 0,
+ ready INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(job_id,source,session_id)
+);
+CREATE INDEX IF NOT EXISTS delivery_member_ready ON delivery_session_members(job_id,ready,id);
+CREATE INDEX IF NOT EXISTS delivery_member_snapshot ON delivery_session_members(job_id,bootstrap_done);
+CREATE INDEX IF NOT EXISTS delivery_member_cursor ON delivery_session_members(job_id,cursor);
+CREATE INDEX IF NOT EXISTS delivery_member_identity ON delivery_session_members(source,session_id);
+CREATE INDEX IF NOT EXISTS delivery_journal_session ON delivery_journal(source,session_id,seq);
+CREATE INDEX IF NOT EXISTS delivery_shadow_session ON delivery_shadow(job_id,kind,source,session_id,row_id);
+CREATE TRIGGER IF NOT EXISTS delivery_session_ready AFTER INSERT ON delivery_journal BEGIN
+ UPDATE delivery_session_members SET ready=1 WHERE source=NEW.source AND session_id=NEW.session_id AND ready=0;
+END;
 CREATE TABLE IF NOT EXISTS delivery_exclusions (
     source TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(source,session_id)
 );
@@ -289,6 +305,32 @@ CREATE TRIGGER IF NOT EXISTS {table}_count_delete AFTER DELETE ON {table} BEGIN
 END;
 "#))?;
     }
+    let members_current: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='delivery_session_members_v1')",
+        [],
+        |r| r.get(0),
+    )?;
+    for table in TABLES {
+        // An index with only identity columns carries rowid as its implicit
+        // suffix, allowing ordered seeks without sorting a session's records.
+        let columns = if table.source.starts_with('\'') {
+            table.session.to_string()
+        } else {
+            format!("{},{}", table.source, table.session)
+        };
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS delivery_identity_{} ON {}({})",
+            table.name, table.name, columns
+        ))?;
+        if !members_current {
+            for operation in ["insert", "update", "delete"] {
+                conn.execute_batch(&format!(
+                    "DROP TRIGGER IF EXISTS delivery_{}_{}",
+                    table.name, operation
+                ))?;
+            }
+        }
+    }
     let consumers = CONSUMERS;
     for table in TABLES {
         drop_triggers_that_predate_a_column(conn, table)?;
@@ -303,13 +345,14 @@ END;
         let name = table.name;
         let kind = table.kind;
         let session = table.session;
-        let shadow = |row: &str, payload: &str| {
+        let shadow = |row: &str, payload: &str, extra: &str| {
             format!(
                 r#"
  INSERT OR IGNORE INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload)
  SELECT j.id,'{kind}',{row}.rowid,{source},{row}.{session},{key},{payload}
  FROM ({consumers}) j JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}'
  WHERE j.state <> 'cancelled' AND j.bootstrap_done=0 AND {row}.rowid <= b.max_rowid
+ AND (j.member_source IS NULL OR (j.member_source={source} AND j.member_session={row}.{session}) {extra})
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < {row}.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id={row}.rowid);
 "#,
@@ -317,8 +360,13 @@ END;
                 key = table.key(row)
             )
         };
-        let insert_shadow = shadow("NEW", "NULL");
-        let before_shadow = shadow("OLD", &old_payload);
+        let insert_shadow = shadow("NEW", "NULL", "");
+        let before_shadow = shadow("OLD", &old_payload, "");
+        let update_shadow = shadow(
+            "OLD",
+            &old_payload,
+            &format!("OR (j.member_source={new_source} AND j.member_session=NEW.{session})"),
+        );
         // A capture trigger embeds the column list the table had when it was
         // created. `CREATE TRIGGER IF NOT EXISTS` leaves that in place, so a
         // table that later gains a column keeps being captured in the old
@@ -347,11 +395,12 @@ WHEN EXISTS(SELECT 1 FROM ({consumers})) BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS delivery_{name}_update AFTER UPDATE ON {name}
 WHEN EXISTS(SELECT 1 FROM ({consumers})) AND {old_payload} <> {new_payload} BEGIN
- {before_shadow}
+ {update_shadow}
  INSERT OR IGNORE INTO delivery_shadow(job_id,kind,row_id,source,session_id,record_key,payload)
  SELECT j.id,'{kind}',NEW.rowid,{new_source},NEW.{session},{new_key},NULL
  FROM ({consumers}) j JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}'
  WHERE OLD.rowid <> NEW.rowid AND j.state <> 'cancelled' AND j.bootstrap_done=0 AND NEW.rowid <= b.max_rowid
+ AND (j.member_source IS NULL OR (j.member_source={new_source} AND j.member_session=NEW.{session}))
  AND (j.bootstrap_kind < {index} OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < NEW.rowid))
  AND NOT EXISTS(SELECT 1 FROM delivery_shadow s WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=NEW.rowid);
  INSERT INTO delivery_journal(kind,source,session_id,record_key,operation,payload)
@@ -369,6 +418,10 @@ END;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('delivery_v1')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(name) VALUES ('delivery_session_members_v1')",
         [],
     )?;
     Ok(())
@@ -421,6 +474,16 @@ pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()
     if !ready {
         return Ok(());
     }
+    let session_schema: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='delivery_session_members')",
+        [],
+        |r| r.get(0),
+    )?;
+    let consumers = if session_schema {
+        CONSUMERS
+    } else {
+        "SELECT id,state,bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL AS member_source,NULL AS member_session FROM delivery_jobs WHERE state <> 'cancelled' UNION ALL SELECT id,'active',bootstrap_done,bootstrap_kind,bootstrap_rowid,NULL,NULL FROM history_exports WHERE expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)"
+    };
     let payload = table.payload(conn, "m")?;
     let key = table.key("m");
     let source = table.source("m");
@@ -436,11 +499,12 @@ pub(crate) fn shadow_preimages(conn: &Connection, table_name: &str) -> Result<()
              JOIN ({consumers}) j \
              JOIN delivery_bootstrap_bounds b ON b.job_id=j.id AND b.kind='{kind}' \
              WHERE j.state <> 'cancelled' AND j.bootstrap_done=0 AND m.rowid <= b.max_rowid \
+             AND (j.member_source IS NULL OR (j.member_source={source} AND j.member_session=m.{session})) \
              AND (j.bootstrap_kind < {index} \
                   OR (j.bootstrap_kind={index} AND j.bootstrap_rowid < m.rowid)) \
              AND NOT EXISTS(SELECT 1 FROM delivery_shadow s \
                             WHERE s.job_id=j.id AND s.kind='{kind}' AND s.row_id=m.rowid)",
-            consumers = CONSUMERS,
+            consumers = consumers,
         ),
         [],
     )?;
@@ -516,6 +580,42 @@ fn capture_payload_is_current(conn: &Connection, table: &Table) -> Result<bool> 
 }
 
 pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='delivery_session_members_v1')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(false);
+    }
+    let required = [
+        "delivery_session_jobs",
+        "delivery_session_members",
+        "delivery_member_ready",
+        "delivery_member_snapshot",
+        "delivery_member_cursor",
+        "delivery_member_identity",
+        "delivery_journal_session",
+        "delivery_shadow_session",
+        "delivery_session_ready",
+    ];
+    for name in required {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
+            [name],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
+    for table in TABLES {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
+            [format!("delivery_identity_{}", table.name)],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(false);
+        }
+    }
     let mut names = Vec::new();
     for table in TABLES {
         for operation in ["insert", "update", "delete"] {

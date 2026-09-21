@@ -428,7 +428,20 @@ impl Worker<'_> {
             self.clock,
         )?
         else {
-            return Ok(Step::Idle);
+            // A privacy recheck can suppress the obsolete pending batch. If
+            // re-inclusion has a fresh baseline ready, continue this bounded
+            // drain instead of waiting for another host scheduling interval.
+            let current = status(&self.conn, job_id)?;
+            return Ok(
+                if current.state == "active"
+                    && current.pending_records == 0
+                    && (!current.bootstrap_complete || current.unqueued_changes > 0)
+                {
+                    Step::Progressed
+                } else {
+                    Step::Idle
+                },
+            );
         };
         self.attempts += 1;
         self.attempt(receiver, &claim, &job.config)?;

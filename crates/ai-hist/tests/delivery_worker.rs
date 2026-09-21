@@ -1242,3 +1242,54 @@ fn a_stop_after_the_outcome_decision_does_not_turn_success_into_failure() {
     assert_eq!(result.statuses[0].failure, None);
     assert_eq!(result.statuses[0].next_attempt_ms, 0);
 }
+
+#[test]
+fn reinclusion_filters_old_batch_then_sends_fresh_snapshot_in_the_same_drain() {
+    let fixture = fixture();
+    let mut cfg = config("one");
+    cfg.selection.all_sources = true;
+    cfg.selection.sources.clear();
+    let job = create_session_job(&fixture.conn, &cfg, 0).unwrap();
+    let session = SessionIdentity {
+        source: "claude".into(),
+        session_id: SESSIONS[0].into(),
+    };
+    set_job_session(&fixture.conn, &job.job_id, &session, true).unwrap();
+    prepare_batch(&fixture.conn, &job.job_id, system_clock()).unwrap();
+    let old = claim_batch(
+        &fixture.conn,
+        &job.job_id,
+        "original",
+        60_000,
+        &system_clock,
+    )
+    .unwrap()
+    .unwrap();
+    store_prepared_payload(
+        &fixture.conn,
+        &old.lease,
+        "1",
+        "application/json",
+        "{}",
+        &system_clock,
+    )
+    .unwrap();
+    let leased = run(&fixture.path(), &one(&Fake::default()), &options());
+    assert_eq!(leased.attempts, 0);
+    assert!(leased.issues.is_empty());
+    set_job_session(&fixture.conn, &job.job_id, &session, false).unwrap();
+    set_job_session(&fixture.conn, &job.job_id, &session, true).unwrap();
+    let old_revision = old.batch.records[0].revision;
+    let fake = Fake {
+        send: Box::new(move |_, batch| {
+            assert_eq!(batch.records.len(), 1);
+            assert!(batch.records[0].revision > old_revision);
+            Ok(ack(batch))
+        }),
+        ..Fake::default()
+    };
+    let delivered = run(&fixture.path(), &one(&fake), &options());
+    assert_eq!(delivered.attempts, 1);
+    assert!(delivered.issues.is_empty());
+    assert_eq!(delivered.statuses[0].acknowledged_records, 1);
+}

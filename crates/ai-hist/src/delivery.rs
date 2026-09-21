@@ -19,7 +19,12 @@
 //! that supports them. Presence is its own revisioned provenance evidence kind.
 
 mod schema;
+mod sessions;
 mod snapshot;
+pub use sessions::{
+    adopt_session_job, create_session_job, is_session_job, job_session_included, job_sessions,
+    set_job_session,
+};
 pub mod worker;
 pub use snapshot::{
     close_export, create_export, expire_exports, export_page, ExportHandle, HistoryExportPage,
@@ -328,11 +333,24 @@ pub fn create_job(
     config: &DeliveryJobConfig,
     now_ms: i64,
 ) -> Result<DeliveryStatus> {
+    create_job_inner(conn, config, now_ms, false)
+}
+
+fn create_job_inner(
+    conn: &Connection,
+    config: &DeliveryJobConfig,
+    now_ms: i64,
+    scoped: bool,
+) -> Result<DeliveryStatus> {
     validate(config)?;
     ensure!(now_ms >= 0, "invalid clock");
     let tx = write_transaction(conn)?;
     let existing: Option<String> = tx.query_row("SELECT id FROM delivery_jobs WHERE destination_id=? AND instance_id=? AND account_id=? AND state <> 'cancelled'", params![config.destination_id,config.instance_id,config.account_id], |row| row.get(0)).optional()?;
     if let Some(id) = existing {
+        ensure!(
+            is_session_job(&tx, &id)? == scoped,
+            "delivery selection mode changed; cancel the old generation first"
+        );
         ensure!(job(&tx,&id)?.config == *config, "delivery configuration changed; explicitly cancel the old generation before creating a new one");
         tx.commit()?;
         return status(conn, &id);
@@ -350,6 +368,16 @@ pub fn create_job(
     tx.execute("INSERT INTO delivery_journal(kind,source,record_key,operation,payload) VALUES ('__cutoff','','','checkpoint','null')", [])?;
     let cutoff = tx.last_insert_rowid();
     tx.execute("INSERT INTO delivery_jobs(id,destination_id,instance_id,account_id,generation,config_json,state,created_ms,cutoff,journal_cursor) VALUES (?,?,?,?,?,?,'active',?,?,?)", params![id,config.destination_id,config.instance_id,config.account_id,generation,serde_json::to_string(config)?,now_ms,cutoff,cutoff])?;
+    if scoped {
+        tx.execute(
+            "INSERT INTO delivery_session_jobs(job_id) VALUES (?)",
+            [&id],
+        )?;
+        tx.execute(
+            "UPDATE delivery_jobs SET bootstrap_done=1 WHERE id=?",
+            [&id],
+        )?;
+    }
     for table in schema::TABLES {
         tx.execute(&format!("INSERT INTO delivery_bootstrap_bounds(job_id,kind,max_rowid) SELECT ?,?,COALESCE(MAX(rowid),0) FROM {}",table.name), params![id,table.kind])?;
     }
@@ -358,11 +386,14 @@ pub fn create_job(
 }
 
 pub fn status(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
-    let job = job(conn, job_id)?;
+    let mut job = job(conn, job_id)?;
+    if is_session_job(conn, job_id)? {
+        job.bootstrap_done = !conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND bootstrap_done=0)", [job_id], |r| r.get::<_, bool>(0))?;
+    }
     let (pending_records,pending_bytes,oldest_pending_ms): (i64,i64,Option<i64>) = conn.query_row("SELECT COALESCE(SUM(records),0),COALESCE(SUM(bytes+COALESCE(length(CAST(prepared AS BLOB)),0)),0),MIN(created_ms) FROM delivery_batches WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')", [job_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
     let unqueued_changes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM delivery_journal WHERE seq>?",
-        [job.cursor],
+        if is_session_job(conn, job_id)? { "SELECT count(*) FROM delivery_session_members m CROSS JOIN delivery_journal j INDEXED BY delivery_journal_session WHERE m.job_id=?2 AND m.ready=1 AND j.source=m.source AND j.session_id=m.session_id AND j.seq>m.cursor" } else { "SELECT COUNT(*) FROM delivery_journal WHERE seq>?1 AND ?2 IS NOT NULL" },
+        params![job.cursor, job_id],
         |row| row.get(0),
     )?;
     conn.query_row("SELECT acknowledged_cursor,next_attempt_ms,last_attempt_ms,last_acknowledged_ms,acceptance_level,failure,suppressed_records,acknowledged_records FROM delivery_jobs WHERE id=?", [job_id], |row| Ok(DeliveryStatus {
@@ -423,6 +454,15 @@ pub fn set_session_excluded(
     value: bool,
 ) -> Result<()> {
     let tx = write_transaction(conn)?;
+    let current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delivery_exclusions WHERE source=? AND session_id=?)",
+        params![session.source, session.session_id],
+        |r| r.get(0),
+    )?;
+    if current == value {
+        tx.commit()?;
+        return Ok(());
+    }
     if value {
         tx.execute(
             "INSERT OR IGNORE INTO delivery_exclusions(source,session_id) VALUES (?,?)",
@@ -435,10 +475,14 @@ pub fn set_session_excluded(
             |row| row.get::<_, bool>(0),
         )? {
             let mut statement =
-                tx.prepare("SELECT config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
-            let configs = statement.query_map([], |row| row.get::<_, String>(0))?;
+                tx.prepare("SELECT id,config_json FROM delivery_jobs WHERE state <> 'cancelled'")?;
+            let configs = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for config in configs {
-                let config: DeliveryJobConfig = serde_json::from_str(&config?)?;
+                let (id, config) = config?;
+                let config: DeliveryJobConfig = serde_json::from_str(&config)?;
+                if is_session_job(&tx,&id)? && !tx.query_row("SELECT EXISTS(SELECT 1 FROM delivery_session_members WHERE job_id=? AND source=? AND (session_id=? OR ?))",params![id,session.source,session.session_id,config.selection.kinds.iter().any(|k|k=="relationship")],|r|r.get::<_,bool>(0))? { continue; }
                 let selection = &config.selection;
                 // A child exclusion also suppresses relationship records selected
                 // through a parent. Conservatively include same-source parent
@@ -532,6 +576,11 @@ pub fn prepare_batch(conn: &Connection, job_id: &str, now_ms: i64) -> Result<Pre
     let tx = write_transaction(conn)?;
     let mut job = job(&tx, job_id)?;
     ensure!(job.state == "active", "delivery job is not active");
+    if is_session_job(&tx, job_id)? {
+        let result = sessions::prepare(&tx, &job, now_ms)?;
+        tx.commit()?;
+        return Ok(result);
+    }
     let existing: Option<String> = tx.query_row("SELECT id FROM delivery_batches WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')",[job_id],|row| row.get(0)).optional()?;
     if existing.is_some() {
         return Ok(PrepareResult {
@@ -746,7 +795,9 @@ pub fn claim_batch(
     };
     let mut allowed = Vec::new();
     for record in &batch.records {
-        if !record_excluded(&tx, &job.config.selection, record)? {
+        if !record_excluded(&tx, &job.config.selection, record)?
+            && sessions::record_allowed(&tx, &job.id, record)?
+        {
             allowed.push(record.clone());
         }
     }
@@ -883,7 +934,8 @@ pub fn store_prepared_payload(
         pending_batch(&tx, &lease.job_id)?.context("delivery batch missing")?;
     for record in &batch.records {
         ensure!(
-            !record_excluded(&tx, &job.config.selection, record)?,
+            !record_excluded(&tx, &job.config.selection, record)?
+                && sessions::record_allowed(&tx, &job.id, record)?,
             "delivery batch is now excluded"
         );
     }
@@ -1113,6 +1165,7 @@ pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<DeliveryStatus> {
     job(&tx, job_id)?;
     tx.execute("UPDATE delivery_jobs SET state='cancelled',fence=fence+1,worker_id=NULL,lease_until_ms=NULL WHERE id=?",[job_id])?;
     tx.execute("UPDATE delivery_batches SET state='cancelled',payload=NULL,prepared=NULL WHERE job_id=? AND state IN ('pending','leased','retry_wait','blocked')",[job_id])?;
+    sessions::cancel(&tx, job_id)?;
     tx.execute("DELETE FROM delivery_shadow WHERE job_id=?", [job_id])?;
     tx.execute(
         "DELETE FROM delivery_bootstrap_bounds WHERE job_id=?",
@@ -1232,7 +1285,8 @@ pub fn validate_dispatch(
         pending_batch(&tx, &lease.job_id)?.context("delivery batch missing")?;
     for record in &batch.records {
         ensure!(
-            !record_excluded(&tx, &job.config.selection, record)?,
+            !record_excluded(&tx, &job.config.selection, record)?
+                && sessions::record_allowed(&tx, &job.id, record)?,
             "delivery batch is now excluded"
         );
     }

@@ -406,8 +406,10 @@ fn install(options: Install) -> Result<()> {
         );
     }
     let db_path = directory.join("history.db");
-    humanln!("Preparing local session capture…");
-    collector::capture(&directory, &history_url)?;
+    if sharing_mode != bridge::SharingMode::Selected {
+        humanln!("Preparing local session capture…");
+        collector::capture(&directory, &history_url)?;
+    }
     let conn = ai_hist::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
@@ -459,8 +461,13 @@ fn install(options: Install) -> Result<()> {
                 None => {
                     // No generation to inherit a baseline from, so the exclusion
                     // table has to be brought in line with this choice first.
-                    collector::record_baseline(&conn, include_existing)?;
-                    ai_hist::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                    if sharing_mode == bridge::SharingMode::Selected {
+                        ai_hist::delivery::create_session_job(&conn, &job_config, collector::now())?
+                            .job_id
+                    } else {
+                        collector::record_baseline(&conn, include_existing)?;
+                        ai_hist::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                    }
                 }
             };
             let config = Config {

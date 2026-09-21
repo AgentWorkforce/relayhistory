@@ -162,6 +162,26 @@ pub(crate) fn check_capture_cancelled() -> Result<()> {
     Ok(())
 }
 
+/// Shallow local inventory with cooperative provider/file cancellation.
+pub fn discover_sessions_cancellable(
+    conn: &Connection,
+    options: &DiscoverOptions,
+    on_row: impl FnMut(&ShallowSession),
+    cancelled: impl Fn() -> bool + 'static,
+) -> Result<DiscoverySummary> {
+    with_capture_stop(cancelled, || discover_sessions(conn, options, on_row))
+}
+
+/// Targeted hydration with the same cooperative cancellation boundaries as
+/// sync. It retains the normal observation locks and checkpoint transaction.
+pub fn hydrate_session_at_cancellable(
+    db_path: &Path,
+    options: &HydrateSessionOptions,
+    cancelled: impl Fn() -> bool + 'static,
+) -> Result<HydrateSessionResult> {
+    with_capture_stop(cancelled, || hydrate_session_at(db_path, options))
+}
+
 /// Capture with cooperative cancellation at provider, file and record boundaries.
 /// Committed chunks remain durable; an unfinished transaction rolls back and
 /// its checkpoint is retried by the next capture. The callback is scoped to

@@ -546,7 +546,7 @@ fn hydrate_session_at_with_roots_and_connectors(
     // the child's inheritance can only be settled once the whole selected
     // session has landed. Leaving it to the next sync would serve a hydrated
     // session with a null project key in between.
-    crate::store::refresh_project_identity(&tx)?;
+    crate::store::refresh_session_project_identity(&tx, &options.source, &options.session_id)?;
     tx.commit()?;
     if let (Some(path), Some(consumed)) = (snapshot.path.as_deref(), cursor_consumed_through) {
         // Hydration rebuilt history from offset 0 and does not otherwise

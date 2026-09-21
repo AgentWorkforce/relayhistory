@@ -3427,6 +3427,69 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
+/// Reconcile one hydrated session and its delegation descendants with indexed
+/// identity lookups. Ancestor resolution uses the same cycle-safe ranking walk
+/// as the global maintenance pass; unrelated events are never examined.
+pub(crate) fn refresh_session_project_identity(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<usize> {
+    let mut pending = std::collections::VecDeque::from([(session_id.to_string(), 0usize)]);
+    let mut seen = HashSet::new();
+    let mut written = 0;
+    while let Some((id, depth)) = pending.pop_front() {
+        crate::ingest::check_capture_cancelled()?;
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let row=conn.query_row("SELECT cwd,repo_url,project_key,project_key_method FROM sessions WHERE source=? AND session_id=?",params![source,id],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
+        let (key, method) = if let Some((cwd, repo_url, mut key, mut method)) = row {
+            if key.is_none() || matches!(method.as_deref(), Some("path" | "inherited")) {
+                if let Some((own, how)) =
+                    crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
+                {
+                    if key.is_none()
+                        || how.as_str() == "remote"
+                        || method.as_deref() == Some("path")
+                    {
+                        key = Some(own);
+                        method = Some(how.as_str().to_string());
+                    }
+                }
+                if key.is_none() || matches!(method.as_deref(), Some("path" | "inherited")) {
+                    if let Some(parent) = lendable_ancestor_key_for(conn, source, &id)? {
+                        key = Some(parent);
+                        method = Some("inherited".into());
+                    }
+                }
+            }
+            written+=conn.execute("UPDATE sessions SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (project_key IS NOT ?3 OR project_key_method IS NOT ?4)",params![source,id,key,method])?;
+            (key, method)
+        } else {
+            (
+                lendable_ancestor_key_for(conn, source, &id)?,
+                Some("inherited".into()),
+            )
+        };
+        if let Some(key) = key {
+            let rank = match method.as_deref() {
+                Some("remote") => 3,
+                Some("inherited") => 2,
+                Some("path") => 1,
+                _ => 0,
+            };
+            let stored = event_key_rank_sql("project_key", "project_key_method");
+            written+=conn.execute(&format!("UPDATE session_events SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (({stored})<?5 OR (({stored})=?5 AND project_key IS NOT ?3))"),params![source,id,key,method,rank])?;
+        }
+        if depth < PROJECT_KEY_INHERITANCE_PASSES {
+            let children=conn.prepare("SELECT DISTINCT child_session_id FROM session_relationships WHERE source=? AND parent_session_id=? AND child_session_id IS NOT NULL")?.query_map(params![source,id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            pending.extend(children.into_iter().map(|child| (child, depth + 1)));
+        }
+    }
+    Ok(written)
+}
+
 /// Pass 1: stamp sessions with no key, and upgrade ones stuck on a borrowed
 /// or provisional key.
 ///
@@ -8236,5 +8299,65 @@ mod tests {
         assert_eq!(event.is_sidechain, Some(0));
         assert_eq!(event.is_meta, Some(1));
         assert_eq!(event.turn_id.as_deref(), Some("turn_1"));
+    }
+}
+
+#[cfg(test)]
+mod scoped_project_identity_tests {
+    use super::*;
+    #[test]
+    fn targeted_identity_scales_with_selected_records_and_keeps_descendants() {
+        for count in [100, 10_000, 50_000] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            conn.execute_batch("INSERT INTO sessions(source,session_id,project_key,project_key_method) VALUES ('codex','root','github.com/acme/root','remote'),('codex','grandchild',NULL,NULL),('codex','own','github.com/acme/own','remote');
+                INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('codex','root','one','child','delegation','observed','fixture',1,1),('codex','child','two','grandchild','delegation','observed','fixture',1,1),('codex','root','three','own','delegation','observed','fixture',1,1);
+                INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES ('codex','root','r',1,'user','text','r'),('codex','child','c',1,'user','text','c'),('codex','grandchild','g',1,'user','text','g'),('codex','own','o',1,'user','text','o');").unwrap();
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) SELECT 'codex','unrelated-'||x,'u-'||x,1,'user','text','private' FROM n",[count]).unwrap();
+            let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = steps.clone();
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }),
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                refresh_session_project_identity(&conn, "codex", "root").unwrap(),
+                5
+            );
+            let count_steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "targeted-project unrelated={count} vm={count_steps} elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.
+            );
+            conn.progress_handler(0, None::<fn() -> bool>);
+            assert!(count_steps < 10_000);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT project_key FROM session_events WHERE session_id='grandchild'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "github.com/acme/root"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT project_key FROM session_events WHERE session_id='own'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "github.com/acme/own"
+            );
+            assert_eq!(conn.query_row("SELECT count(*) FROM session_events WHERE session_id LIKE 'unrelated-%' AND project_key IS NOT NULL",[],|r|r.get::<_,usize>(0)).unwrap(),0);
+            assert_eq!(
+                refresh_session_project_identity(&conn, "codex", "root").unwrap(),
+                0
+            );
+        }
     }
 }

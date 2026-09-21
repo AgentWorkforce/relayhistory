@@ -133,12 +133,8 @@ pub fn enforce_selection(directory: &Path, config: &Config) -> Result<()> {
         return Ok(());
     }
     let conn = db(directory)?;
-    let allowed: HashSet<_> = selected(directory)?.into_iter().collect();
-    let withheld = excluded(&conn)?;
-    for identity in identities(&conn)? {
-        if !allowed.contains(&identity) && !withheld.contains(&identity) {
-            delivery::set_session_excluded(&conn, &identity, true)?;
-        }
+    if !delivery::is_session_job(&conn, &config.job_id)? {
+        delivery::adopt_session_job(&conn, &config.job_id, &selected(directory)?)?;
     }
     Ok(())
 }
@@ -270,6 +266,14 @@ fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<V
             }
         }
     }
+    let scoped = delivery::is_session_job(&conn, &config.job_id)?;
+    let members: HashSet<_> = if scoped {
+        delivery::job_sessions(&conn, &config.job_id)?
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut query = conn.prepare("SELECT s.source,s.session_id,s.cwd,s.git_branch,s.first_activity_ms,s.last_activity_ms,
         COALESCE(NULLIF(trim(s.first_prompt),''),NULLIF(trim(s.last_assistant_text),''),s.session_id),
         NOT EXISTS(SELECT 1 FROM delivery_exclusions e WHERE e.source=s.source AND e.session_id=s.session_id)
@@ -277,9 +281,10 @@ fn session_rows(directory: &Path, config: &Config, limit: usize) -> Result<Vec<V
     let rows = query.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
         let source: String = r.get(0)?;
         let session_id: String = r.get(1)?;
-        let included: bool = r.get(7)?;
+        let policy_allowed: bool = r.get(7)?;
         let title: String = r.get(6)?;
         let identity = SessionIdentity {source:source.clone(), session_id:session_id.clone()};
+        let included = policy_allowed && (!scoped || members.contains(&identity));
         let state = if !included { "not_shared" }
             else if pending.get(&identity) == Some(&true) { "uploading" }
             else if pending.contains_key(&identity) { "queued" }
@@ -317,6 +322,8 @@ struct ChangePlan {
     selected: Vec<SessionIdentity>,
     excluded: Vec<SessionIdentity>,
     paused: bool,
+    #[serde(default)]
+    delta: Option<(Vec<SessionIdentity>, bool)>,
 }
 fn parse_key(key: &str) -> Result<SessionIdentity> {
     let (source, id) = key
@@ -346,6 +353,31 @@ fn change(
     // under collector.lock after stopping so newly captured sessions are seen.
     let was_running = collector::running(directory)?;
     let config = read_config(directory)?;
+    if requested.is_none()
+        && mode(&config) == SharingMode::Selected
+        && !directory.join("sharing-change.json").exists()
+    {
+        let conn = read_db(directory)?;
+        if delivery::is_session_job(&conn, &config.job_id)? {
+            validate_identities(&conn, &identities_requested)?;
+            let unchanged = identities_requested
+                .iter()
+                .map(|id| {
+                    delivery::job_session_included(&conn, &config.job_id, id).map(|v| v == include)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|v| v);
+            if unchanged {
+                if include {
+                    emit(json!({"included":keys,"regenerated":false}));
+                } else {
+                    emit(json!({"excluded":keys,"regenerated":false}));
+                }
+                return Ok(());
+            }
+        }
+    }
     make_plan(
         &read_db(directory)?,
         directory,
@@ -396,12 +428,14 @@ fn change(
         (Ok(()), Err(restart)) => return Err(restart),
         (Ok(()), Ok(_)) => {}
     }
+    let regenerated =
+        requested.is_some() || mode(&read_config(directory)?) != SharingMode::Selected;
     if let Some(mode) = requested {
-        emit(json!({"sharing_mode":mode,"regenerated":true}));
+        emit(json!({"sharing_mode":mode,"regenerated":regenerated}));
     } else if include {
-        emit(json!({"included":keys,"regenerated":true}));
+        emit(json!({"included":keys,"regenerated":regenerated}));
     } else {
-        emit(json!({"excluded":keys,"regenerated":true}));
+        emit(json!({"excluded":keys,"regenerated":regenerated}));
     }
     Ok(())
 }
@@ -411,6 +445,18 @@ fn prepare_restart(directory: &Path) -> Result<bool> {
     recover(directory)?;
     Ok(pending)
 }
+fn validate_identities(conn: &Connection, identities_requested: &[SessionIdentity]) -> Result<()> {
+    let mut known_requested = true;
+    for id in identities_requested {
+        let exists: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE source=?1 AND session_id=?2) OR EXISTS(SELECT 1 FROM history WHERE source=?1 AND session_id=?2) OR EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2)",rusqlite::params![id.source,id.session_id],|r|r.get(0))?;
+        known_requested &= exists;
+    }
+    ensure!(
+        known_requested,
+        user_error("Unknown session. Refresh sessions list and try again.")
+    );
+    Ok(())
+}
 fn make_plan(
     conn: &Connection,
     directory: &Path,
@@ -419,21 +465,22 @@ fn make_plan(
     identities_requested: &[SessionIdentity],
     include: bool,
 ) -> Result<ChangePlan> {
-    let known = identities(conn)?;
-    ensure!(
-        identities_requested.iter().all(|id| known.contains(id)),
-        user_error("Unknown session. Refresh sessions list and try again.")
-    );
+    validate_identities(conn, identities_requested)?;
     let old = delivery::status(conn, &config.job_id)?;
     let mut selected = selected(directory)?;
-    let mut withheld = excluded(conn)?;
+    let incremental = requested.is_none() && mode(&config) == SharingMode::Selected;
+    let mut withheld = if incremental {
+        HashSet::new()
+    } else {
+        excluded(conn)?
+    };
     if let Some(mode) = requested {
         config.sharing_mode = Some(mode);
         config.include_existing = mode == SharingMode::All;
         withheld = if mode == SharingMode::All {
             HashSet::new()
         } else {
-            known
+            identities(conn)?
                 .into_iter()
                 .filter(|id| !selected.contains(id))
                 .collect()
@@ -459,6 +506,7 @@ fn make_plan(
         selected,
         excluded: withheld.into_iter().collect(),
         paused: old.state == "paused",
+        delta: incremental.then(|| (identities_requested.to_vec(), include)),
     })
 }
 /// Caller owns collector.lock and desktop.lock. A durable plan survives every
@@ -472,6 +520,23 @@ pub fn recover(directory: &Path) -> Result<()> {
 }
 fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
     let conn = db(directory)?;
+    if let Some((identities, include)) = &plan.delta {
+        // Adoption preserves legacy pending batches, snapshots and retries. It
+        // is idempotent across a crash between any two steps of this intent.
+        delivery::adopt_session_job(&conn, &plan.config.job_id, &selected(directory)?)?;
+        for identity in identities {
+            if *include {
+                delivery::set_session_excluded(&conn, identity, false)?;
+                delivery::set_job_session(&conn, &plan.config.job_id, identity, true)?;
+            } else {
+                delivery::set_job_session(&conn, &plan.config.job_id, identity, false)?;
+            }
+        }
+        save_json(&directory.join("selected.json"), &plan.selected)?;
+        save_json(&directory.join("config.json"), &plan.config)?;
+        fs::remove_file(directory.join("sharing-change.json"))?;
+        return Ok(());
+    }
     for job in delivery::list_jobs(&conn)? {
         if job.state != "cancelled"
             && job.config.destination_id == plan.job.destination_id
@@ -487,10 +552,19 @@ fn apply_plan(directory: &Path, mut plan: ChangePlan) -> Result<()> {
             delivery::set_session_excluded(&conn, &id, false)?;
         }
     }
-    for id in &wanted {
+    let current = excluded(&conn)?;
+    for id in wanted.difference(&current) {
         delivery::set_session_excluded(&conn, id, true)?;
     }
-    let job = delivery::create_job(&conn, &plan.job, collector::now())?;
+    let job = if mode(&plan.config) == SharingMode::Selected {
+        let job = delivery::create_session_job(&conn, &plan.job, collector::now())?;
+        for identity in &plan.selected {
+            delivery::set_job_session(&conn, &job.job_id, identity, true)?;
+        }
+        job
+    } else {
+        delivery::create_job(&conn, &plan.job, collector::now())?
+    };
     if plan.paused {
         delivery::pause_job(&conn, &job.job_id)?;
     }
@@ -588,6 +662,91 @@ mod tests {
         read_config(dir).unwrap()
     }
 
+    #[test]
+    fn scoped_control_does_not_rebuild_catalog_exclusions_or_other_backfills() {
+        for count in [100, 10_000, 50_000] {
+            let (dir, mut config) = fixture(SharingMode::Selected);
+            let conn = db(dir.path()).unwrap();
+            let old = delivery::status(&conn, &config.job_id).unwrap();
+            delivery::cancel_job(&conn, &config.job_id).unwrap();
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO sessions(source,session_id) SELECT 'codex','unrelated-'||x FROM n",[count]).unwrap();
+            conn.execute(
+                "INSERT INTO sessions(source,session_id) VALUES ('claude','last')",
+                [],
+            )
+            .unwrap();
+            config.job_id = delivery::create_session_job(&conn, &old.config, collector::now())
+                .unwrap()
+                .job_id;
+            save_json(&dir.path().join("config.json"), &config).unwrap();
+            let started = std::time::Instant::now();
+            config = apply(dir.path(), config, None, &["claude:old"], true);
+            let a = delivery::status(&conn, &config.job_id).unwrap();
+            let pending = delivery::prepare_batch(&conn, &config.job_id, collector::now())
+                .unwrap()
+                .batch_id
+                .unwrap();
+            config = apply(dir.path(), config, None, &["claude:last"], true);
+            assert_eq!(config.job_id, a.job_id);
+            assert_eq!(
+                delivery::prepare_batch(&conn, &config.job_id, collector::now())
+                    .unwrap()
+                    .batch_id,
+                Some(pending)
+            );
+            let before = conn
+                .query_row("SELECT count(*) FROM delivery_exclusions", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            change(dir.path(), None, &["claude:old".into()], true).unwrap();
+            assert_eq!(
+                delivery::job_sessions(&conn, &config.job_id).unwrap().len(),
+                2
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM delivery_exclusions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                before
+            );
+            assert_eq!(before, 1); // only the fixture's legacy unselected codex row
+            eprintln!("probe-selected unrelated={count} two_inclusions_repeat_ms={:.3} exclusions={before}",started.elapsed().as_secs_f64()*1000.);
+        }
+    }
+
+    #[test]
+    fn partial_member_intent_replay_keeps_same_job_and_selected_privacy() {
+        let (dir, config) = fixture(SharingMode::Selected);
+        let config = apply(dir.path(), config, None, &["claude:old"], true);
+        let conn = db(dir.path()).unwrap();
+        let plan = make_plan(
+            &conn,
+            dir.path(),
+            config.clone(),
+            None,
+            &[parse_key("codex:recent").unwrap()],
+            true,
+        )
+        .unwrap();
+        save_json(&dir.path().join("sharing-change.json"), &plan).unwrap();
+        delivery::set_session_excluded(&conn, &parse_key("codex:recent").unwrap(), false).unwrap();
+        delivery::set_job_session(
+            &conn,
+            &config.job_id,
+            &parse_key("codex:recent").unwrap(),
+            true,
+        )
+        .unwrap();
+        change(dir.path(), None, &["codex:recent".into()], true).unwrap();
+        assert_eq!(read_config(dir.path()).unwrap().job_id, config.job_id);
+        assert_eq!(selected(dir.path()).unwrap().len(), 2);
+        assert_eq!(
+            delivery::job_sessions(&conn, &config.job_id).unwrap().len(),
+            2
+        );
+        assert!(!dir.path().join("sharing-change.json").exists());
+    }
     #[test]
     fn paused_capture_contention_is_not_an_offline_failure() {
         let (dir, config) = fixture(SharingMode::Selected);
@@ -690,7 +849,12 @@ mod tests {
         .unwrap();
         enforce_selection(dir.path(), &config).unwrap();
         let withheld = excluded(&conn).unwrap();
-        assert!(withheld.contains(&parse_key("codex:later").unwrap()));
+        assert!(!delivery::job_session_included(
+            &conn,
+            &config.job_id,
+            &parse_key("codex:later").unwrap()
+        )
+        .unwrap());
         assert!(!withheld.contains(&parse_key("claude:old").unwrap()));
         assert_eq!(
             selected(dir.path()).unwrap(),
@@ -712,19 +876,23 @@ mod tests {
         // No destination credentials are installed in this fixture. Selection
         // must be enforced before the drain reaches any transport setup.
         let _ = collector::deliver_captured(dir.path(), &config, false);
-        assert!(excluded(&conn)
-            .unwrap()
-            .contains(&parse_key("codex:discovered").unwrap()));
+        assert!(delivery::is_session_job(&conn, &config.job_id).unwrap());
+        assert!(!delivery::job_session_included(
+            &conn,
+            &config.job_id,
+            &parse_key("codex:discovered").unwrap()
+        )
+        .unwrap());
     }
     #[test]
-    fn including_a_session_regenerates_and_preserves_pause() {
+    fn including_a_session_adopts_in_place_and_preserves_pause() {
         let (dir, config) = fixture(SharingMode::Selected);
         let old = config.job_id.clone();
         let conn = db(dir.path()).unwrap();
         delivery::pause_job(&conn, &old).unwrap();
         let config = apply(dir.path(), config, None, &["claude:old"], true);
-        assert_ne!(config.job_id, old);
-        assert_eq!(delivery::status(&conn, &old).unwrap().state, "cancelled");
+        assert_eq!(config.job_id, old);
+        assert!(delivery::is_session_job(&conn, &old).unwrap());
         assert_eq!(
             delivery::status(&conn, &config.job_id).unwrap().state,
             "paused"
