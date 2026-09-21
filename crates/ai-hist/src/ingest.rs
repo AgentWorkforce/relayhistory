@@ -4305,6 +4305,14 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
     Ok(lacking != 0)
 }
 
+/// Whether this transcript has left any evidence behind, of any kind.
+///
+/// Not just `session_events`, for the same reason the Codex probe counts
+/// markers: a transcript can store only markers -- a summary, a compaction
+/// boundary, an image-only turn, a system row -- and asking about events alone
+/// answers "nothing indexed" forever for those, so the stamp fast path
+/// re-reads and re-upserts an unchanged file on every sync. Nothing is lost by
+/// that; the cost simply never converges.
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let exists: i64 = conn.query_row(
@@ -4314,8 +4322,14 @@ fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool
             JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
             WHERE s.source = 'claude' AND s.raw_path = ?
             LIMIT 1
+        ) OR EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
         )",
-        [raw_path.as_ref()],
+        [raw_path.as_ref(), raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
@@ -4894,6 +4908,19 @@ fn ingest_claude_transcript_as(
     // re-reads the file from the start, so a re-sync reproduces the same
     // indexes instead of advancing them.
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    // The session this file belongs to, found before the loop rather than as
+    // it goes. Claude writes a conversation's summary as the *first* line and
+    // gives it `leafUuid` instead of `sessionId`, so a fallback that learned
+    // the id from earlier records would always be too late for the one record
+    // that needs it.
+    let file_session_id = text.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("sessionId")?
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    });
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -4903,7 +4930,28 @@ fn ingest_claude_transcript_as(
         };
         let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
-            _ => continue,
+            // A record with no session of its own is still evidence about the
+            // transcript it sits in, and this guard runs before everything --
+            // so a summary, the one record type Claude writes without a
+            // `sessionId`, was dropped before the classifier ever saw it. That
+            // is the record type this table exists to keep, lost at the first
+            // gate.
+            //
+            // It is attributed to the file's own session, because a transcript
+            // has exactly one. Nothing else about such a record is ingested:
+            // it takes the marker path and then this iteration ends, so a
+            // future sessionless record type cannot become an event under a
+            // session it never named.
+            //
+            // A transcript that names no session anywhere has no answer, and
+            // inventing one would put the record on a session that does not
+            // exist. Those are still skipped.
+            _ => {
+                if let Some(session_id) = file_session_id.as_deref() {
+                    insert_sessionless_record_marker(conn, session_id, obj)?;
+                }
+                continue;
+            }
         };
         let session_id = attributed_session_id.unwrap_or(record_session_id);
         // Subagent sidecar transcripts share the parent's sessionId with
@@ -5458,6 +5506,53 @@ fn ingest_claude_transcript_as(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Record a transcript line that names no session, under the file's own.
+///
+/// Keyed by whatever identity the record does carry -- Claude's summaries have
+/// `leafUuid` -- and falling back to a hash of the line, so re-reading the same
+/// transcript upserts rather than accumulating. The line is hashed rather than
+/// counted by position because a record inserted above it would otherwise
+/// renumber every marker below.
+fn insert_sessionless_record_marker(
+    conn: &Connection,
+    session_id: &str,
+    obj: &Map<String, Value>,
+) -> Result<()> {
+    let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("record");
+    let identity = obj
+        .get("leafUuid")
+        .or_else(|| obj.get("uuid"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let digest = Sha256::digest(Value::Object(obj.clone()).to_string().as_bytes());
+            format!(
+                "sha256:{}",
+                digest
+                    .iter()
+                    .take(8)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        });
+    let marker_uid = format!("{record_type}:{identity}:marker");
+    let draft = claude_marker_for_record(obj, None)
+        .unwrap_or_else(|| MarkerDraft::new("unknown", Some(record_type)));
+    insert_session_marker(
+        conn,
+        "claude",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            kind: draft.kind,
+            subkind: draft.subkind.as_deref(),
+            payload_json: draft.payload_json.as_deref(),
+            ..Default::default()
+        },
+    )?;
     Ok(())
 }
 
@@ -10930,6 +11025,170 @@ mod tests {
         assert!(
             survivors > 0,
             "an unchanged marker-only rollout must not be re-read on every sync"
+        );
+    }
+
+    /// A summary with no `sessionId` of its own is still the session's summary.
+    ///
+    /// Claude writes the summary of a conversation as the first line of the
+    /// transcript, and it carries `leafUuid` rather than `sessionId`. The
+    /// identity guard at the top of the record loop drops any record without
+    /// one, so summaries were skipped before the classifier ever saw them --
+    /// the exact record type this table exists to keep, lost at the one gate
+    /// that runs before everything.
+    ///
+    /// A record with no session of its own still belongs to the file it is in,
+    /// and that file has exactly one owning session. That is the attribution
+    /// used here; nothing else about the record is ingested.
+    #[test]
+    fn a_summary_without_a_session_id_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summarised.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"What we did","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"summarised-session","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a0","sessionId":"summarised-session","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = crate::session_markers_page(&conn, "claude", "summarised-session", 100, None)
+            .unwrap()
+            .markers;
+        let summary = markers
+            .iter()
+            .find(|marker| marker.kind == "summary")
+            .unwrap_or_else(|| panic!("the summary must be recorded: {markers:?}"));
+        assert_eq!(summary.subkind.as_deref(), Some("summary"));
+        assert!(
+            summary
+                .payload_json
+                .as_deref()
+                .is_some_and(|payload| payload.contains("leaf-1")),
+            "and must keep what it did carry: {summary:?}"
+        );
+
+        // Positive control: the ordinary records are untouched by the fallback,
+        // so this widens the marker path rather than ingesting stray records.
+        let events = crate::session_events(&conn, "summarised-session", Some("claude")).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            markers.iter().all(|marker| marker.kind != "unknown"),
+            "no record gained a spurious unknown marker: {markers:?}"
+        );
+    }
+
+    /// A summary in a file whose session is never named has nowhere to go.
+    ///
+    /// The fallback attributes to the file's own session, so a transcript that
+    /// names none -- every record sessionless -- still has no answer. Recorded
+    /// as the deliberate limit rather than left to be rediscovered: inventing
+    /// an id would put the summary on a session that does not exist.
+    #[test]
+    fn a_summary_in_a_transcript_that_names_no_session_is_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anonymous.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"orphan","leafUuid":"leaf-9"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT count(*) FROM session_markers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "a marker with no session would be unreachable");
+    }
+
+    /// The Claude half of the marker-only fast path.
+    ///
+    /// Same defect as the Codex one, in the other parser: the stamp fast path
+    /// asks whether the transcript has `session_events`, which was the whole
+    /// question before markers existed. A transcript whose records are all
+    /// marker-only -- a summary, a compaction boundary, an image-only turn --
+    /// answers no forever, so an unchanged file is re-parsed and re-upserted
+    /// on every sync and the cost never converges.
+    #[test]
+    fn a_marker_only_claude_transcript_stays_on_the_stamp_fast_path() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude/projects/p");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marker-only.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"only a summary","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+
+        // The premise: markers, and no events at all.
+        assert!(
+            !super::session_events_exist(&conn, "claude", "claude-markers-only").unwrap(),
+            "the fixture must produce no events, or it proves nothing"
+        );
+        let markers = crate::session_markers_page(&conn, "claude", "claude-markers-only", 50, None)
+            .unwrap()
+            .markers;
+        assert!(!markers.is_empty(), "the fixture must produce markers");
+
+        // A sentinel a re-ingest would overwrite.
+        conn.execute(
+            "UPDATE session_markers SET subkind = 'sentinel' \
+             WHERE source = 'claude' AND session_id = 'claude-markers-only'",
+            [],
+        )
+        .unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+        let survivors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'claude-markers-only' \
+                 AND subkind = 'sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            survivors > 0,
+            "an unchanged marker-only transcript must not be re-read on every sync"
+        );
+
+        // Positive control: a file that really changed is still re-read.
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"only a summary","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s2","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+        let after = crate::session_markers_page(&conn, "claude", "claude-markers-only", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            after.len() > markers.len(),
+            "a changed transcript must still be re-read: {after:?}"
         );
     }
 

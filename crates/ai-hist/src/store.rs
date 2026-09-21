@@ -1440,20 +1440,32 @@ fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
 /// no delivery tables at all, or no snapshot in flight -- migrates normally.
 #[cfg(not(feature = "delivery"))]
 fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
-    let has_bounds: bool = conn
+    let ready: bool = conn
         .prepare(
-            "SELECT 1 FROM sqlite_master \
-             WHERE type = 'table' AND name = 'delivery_bootstrap_bounds'",
+            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('delivery_bootstrap_bounds','delivery_jobs','history_exports')",
         )?
-        .exists([])?;
-    if !has_bounds {
+        .query_row([], |row| row.get(0))?;
+    if !ready {
         return Ok(());
     }
+    // The same union the capture triggers serve: live delivery jobs *and*
+    // unexpired file exports. Asking only about jobs let a database whose only
+    // in-flight consumer was an export migrate and drop the column with no
+    // preimage taken -- the identical unrecoverable loss, reached through the
+    // other half of the set. Spelled out here rather than reusing `CONSUMERS`
+    // because that constant lives in the module this build compiles out.
     let unfinished: bool = conn
         .prepare(
-            "SELECT 1 FROM delivery_jobs j \
-             JOIN delivery_bootstrap_bounds b ON b.job_id = j.id AND b.kind = 'session_marker' \
-             WHERE j.state <> 'cancelled' AND j.bootstrap_done = 0",
+            "SELECT 1 FROM delivery_bootstrap_bounds b \
+             WHERE b.kind = 'session_marker' AND ( \
+               EXISTS(SELECT 1 FROM delivery_jobs j \
+                      WHERE j.id = b.job_id AND j.state <> 'cancelled' \
+                        AND j.bootstrap_done = 0) \
+               OR EXISTS(SELECT 1 FROM history_exports e \
+                         WHERE e.id = b.job_id AND e.bootstrap_done = 0 \
+                           AND e.expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)) \
+             )",
         )?
         .exists([])?;
     anyhow::ensure!(
@@ -6699,6 +6711,123 @@ mod tests {
         let markers = session_markers(&conn, "grok", "pre").unwrap();
         assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
         assert!(preimage.get("payload_json").is_none(), "{preimage}");
+    }
+
+    /// An export is a consumer too, and a build that cannot shadow must say so.
+    ///
+    /// `CONSUMERS` -- the set every capture trigger serves -- is live delivery
+    /// jobs **union** unexpired file exports. The refusal in a build without
+    /// the delivery feature asked only about jobs, so a database whose only
+    /// in-flight consumer was an export migrated happily and dropped
+    /// `detail_json` with no preimage taken. The export then resumes and reads
+    /// v2 payloads where its cutoff promised v1 -- the same unrecoverable loss
+    /// the refusal exists to prevent, reached by the other half of the union.
+    #[cfg(not(feature = "delivery"))]
+    #[test]
+    fn a_no_delivery_build_refuses_to_migrate_under_an_unfinished_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("export-consumer.db");
+        let v1 = |conn: &Connection| {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','exp','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        };
+        // The delivery tables as a delivery-enabled build would have left them,
+        // built here by hand because this build cannot create them.
+        let delivery_tables = "
+            CREATE TABLE IF NOT EXISTS delivery_jobs (
+                id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                bootstrap_kind INTEGER NOT NULL DEFAULT 0,
+                bootstrap_rowid INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS history_exports (
+                id TEXT PRIMARY KEY, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
+                bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
+                bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                expires_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS delivery_bootstrap_bounds (
+                job_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
+                PRIMARY KEY(job_id,kind)
+            );";
+
+        {
+            let conn = open_db(&db_path).unwrap();
+            v1(&conn);
+            conn.execute_batch(delivery_tables).unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            // No delivery job at all -- only an unexpired export still reading.
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
+                 VALUES ('e1', 0, 0, 0, ?)",
+                params![now_ms() + 3_600_000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+        }
+        let refused =
+            open_db(&db_path).expect_err("an in-flight export must not be migrated out from under");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("delivery"),
+            "the refusal must name the remedy: {message}"
+        );
+        // And it must not have destroyed anything on the way to refusing.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('session_markers') \
+                 WHERE name = 'detail_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "refusing must leave the old column in place");
+
+        // Positive control: the same build, the same tables, but the export has
+        // expired -- nobody is owed a preimage, so it migrates normally.
+        let other = dir.path().join("expired-export.db");
+        {
+            let conn = open_db(&other).unwrap();
+            v1(&conn);
+            conn.execute_batch(delivery_tables).unwrap();
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
+                 VALUES ('e1', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&other).expect("an expired export owes nothing");
+        assert_eq!(session_markers(&conn, "grok", "exp").unwrap().len(), 1);
     }
 
     /// The project-identity columns, marker and index reach a database that
