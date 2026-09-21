@@ -9,7 +9,10 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,49 @@ use std::{
 const DESTINATION: &str = "relayhistory";
 const INSTANCE: &str = "teams-probe";
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Poll the generation-scoped stop file independently of a long capture. The
+/// hot record loops read an atomic flag rather than opening a file per record.
+struct StopWatch {
+    cancelled: Arc<AtomicBool>,
+    finish: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl StopWatch {
+    fn start(directory: &Path, startup_id: &str) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(stop_requested(directory, startup_id)));
+        let flag = cancelled.clone();
+        let directory = directory.to_owned();
+        let startup_id = startup_id.to_owned();
+        let (finish, receive) = mpsc::channel();
+        let thread = std::thread::spawn(move || loop {
+            if stop_requested(&directory, &startup_id) {
+                flag.store(true, Ordering::Relaxed);
+                break;
+            }
+            match receive.recv_timeout(Duration::from_millis(100)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                _ => break,
+            }
+        });
+        Self {
+            cancelled,
+            finish,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for StopWatch {
+    fn drop(&mut self) {
+        let _ = self.finish.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+fn stopping(cancelled: &AtomicBool) -> bool {
+    cancelled.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed)
+}
+
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -81,19 +127,24 @@ pub fn record_baseline(conn: &Connection, include_existing: bool) -> Result<usiz
 /// eligibility recheck before dispatch, retry classification and compaction;
 /// the receiver owns only the legacy-scheduler/account/instance guards and the
 /// transport. Returns the job status the drain left behind.
-fn deliver(db_path: &Path, config: &Config) -> Result<delivery::DeliveryStatus> {
+fn deliver(
+    db_path: &Path,
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> Result<delivery::DeliveryStatus> {
     let receiver = destination::RelayHistoryReceiver {
         base_url: Some(config.history_url.clone()),
         expected_account: Some(config.delivery_account.clone()),
         instance_id: Some(INSTANCE.into()),
         acknowledge_uninspected_schedules: config.acknowledge_uninspected_schedules,
     };
-    deliver_with_receiver(db_path, config, &receiver)
+    deliver_with_receiver(db_path, config, &receiver, &|| stopping(cancelled))
 }
 fn deliver_with_receiver(
     db_path: &Path,
     config: &Config,
     receiver: &dyn worker::Receiver,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<delivery::DeliveryStatus> {
     let options = worker::DrainOptions {
         job_ids: Some(vec![config.job_id.clone()]),
@@ -107,7 +158,7 @@ fn deliver_with_receiver(
         &worker::SingleReceiver::new(DESTINATION, INSTANCE, receiver),
         &options,
         &worker::system_clock,
-        &|| STOP.load(Ordering::Relaxed),
+        cancelled,
     )?;
     let status = result
         .statuses
@@ -135,15 +186,30 @@ fn deliver_with_receiver(
     Ok(status)
 }
 pub fn capture(directory: &Path, history_url: &str) -> Result<()> {
+    capture_with_stop(directory, history_url, Arc::new(AtomicBool::new(false)))
+}
+fn capture_with_stop(
+    directory: &Path,
+    history_url: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
     let progress = super::progress::Monitor::start(directory, history_url, None);
-    let result =
-        ai_hist::sync_local_at_with_progress(&directory.join("history.db"), progress.observer());
+    let result = ai_hist::sync_local_at_cancellable(
+        &directory.join("history.db"),
+        progress.observer(),
+        move || stopping(&cancelled),
+    );
     progress.finish(matches!(result, Ok(true)));
     ensure!(result?, "capture not complete");
     Ok(())
 }
 
+#[cfg(test)]
 pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
+    cycle_with_stop(directory, config, Arc::new(AtomicBool::new(false)))
+}
+
+fn cycle_with_stop(directory: &Path, config: &Config, cancelled: Arc<AtomicBool>) -> Result<()> {
     let paused = {
         let conn = ai_hist::open_db(&directory.join("history.db"))?;
         delivery::status(&conn, &config.job_id)?.state == "paused"
@@ -151,18 +217,37 @@ pub fn cycle(directory: &Path, config: &Config) -> Result<()> {
     if paused {
         // Another sync owns capture when this returns false. The paused
         // collector can retry next cycle without reporting an offline error.
-        ai_hist::sync_local_at(&directory.join("history.db"))?;
+        let stop = cancelled.clone();
+        ai_hist::sync_local_at_cancellable(
+            &directory.join("history.db"),
+            |_| {},
+            move || stopping(&stop),
+        )?;
     } else {
         ensure!(
             destination::selected_account(Some(&config.history_url))? == config.delivery_account,
             "wrong destination"
         );
-        capture(directory, &config.history_url)?;
+        capture_with_stop(directory, &config.history_url, cancelled.clone())?;
     }
-    deliver_captured(directory, config, false)
+    if stopping(&cancelled) {
+        return Ok(());
+    }
+    deliver_captured_with_stop(directory, config, false, &cancelled)
 }
 
 pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) -> Result<()> {
+    deliver_captured_with_stop(directory, config, before_exit, &AtomicBool::new(false))
+}
+fn deliver_captured_with_stop(
+    directory: &Path,
+    config: &Config,
+    before_exit: bool,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if stopping(cancelled) {
+        return Ok(());
+    }
     // Every drain must apply selected-mode exclusions, including retries after
     // a failed capture. Never reach the delivery worker with an unvetted row.
     super::bridge::enforce_selection(directory, config)?;
@@ -198,7 +283,7 @@ pub fn deliver_captured(directory: &Path, config: &Config, before_exit: bool) ->
     super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
     let progress =
         super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
-    let result = deliver(&db_path, config);
+    let result = deliver(&db_path, config, cancelled);
     if before_exit {
         let connected =
             progress.finish_before_exit(result.is_ok(), super::progress::COMPLETION_TIMEOUT);
@@ -275,7 +360,7 @@ fn stop_with_timeout(directory: &Path, timeout: Option<Duration>) -> Result<()> 
                 "Stop was requested. The probe is finishing its current capture operation.",
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 pub(super) fn stop_requested(directory: &Path, startup_id: &str) -> bool {
@@ -316,14 +401,19 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         &directory.join("runtime.json"),
         &json!({"startup_id":startup_id,"pid":std::process::id(),"ready":true}),
     )?;
+    let stop = StopWatch::start(directory, startup_id);
     let mut capture_due = Instant::now();
-    while !stop_requested(directory, startup_id) {
+    while !stopping(&stop.cancelled) {
         let result = if Instant::now() >= capture_due {
             capture_due = Instant::now() + Duration::from_secs(60);
-            cycle(directory, &config)
+            cycle_with_stop(directory, &config, stop.cancelled.clone())
         } else {
-            deliver_captured(directory, &config, false)
+            deliver_captured_with_stop(directory, &config, false, &stop.cancelled)
         };
+        // A user stop is not a failed/offline cycle and must not start delivery.
+        if stopping(&stop.cancelled) {
+            break;
+        }
         save_json(
             &directory.join("cycle.json"),
             &json!({
@@ -334,11 +424,11 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         if result.is_err() {
             eprintln!("Sync paused or offline. Retrying; local data remains queued.");
         }
-        for _ in 0..20 {
-            if stop_requested(directory, startup_id) {
+        for _ in 0..200 {
+            if stopping(&stop.cancelled) {
                 break;
             }
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     save_json(
@@ -496,13 +586,117 @@ mod tests {
             job_id: &config.job_id,
             sent: std::cell::Cell::new(false),
         };
-        let status = deliver_with_receiver(&db_path, &config, &receiver).unwrap();
+        let status = deliver_with_receiver(&db_path, &config, &receiver, &|| false).unwrap();
         assert!(receiver.sent.get());
         assert_eq!(status.state, "paused");
         assert_eq!(status.acknowledged_records, 0);
         assert!(status.pending_records > 0);
         delivery::cancel_job(&conn, &config.job_id).unwrap();
-        assert!(deliver_with_receiver(&db_path, &config, &receiver).is_err());
+        assert!(deliver_with_receiver(&db_path, &config, &receiver, &|| false).is_err());
+    }
+
+    #[test]
+    fn stop_watch_ignores_other_generations_and_cancels_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        save_json(&dir.path().join("stop.json"), &json!({"startup_id":"old"})).unwrap();
+        let watch = StopWatch::start(dir.path(), "current");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!stopping(&watch.cancelled));
+        let started = Instant::now();
+        save_json(
+            &dir.path().join("stop.json"),
+            &json!({"startup_id":"current"}),
+        )
+        .unwrap();
+        while !stopping(&watch.cancelled) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopping(&watch.cancelled));
+        // The same token used by capture is also passed to the delivery drain.
+        let stop = watch.cancelled.clone();
+        let error = ai_hist::sync_local_at_cancellable(
+            &dir.path().join("history.db"),
+            |_| {},
+            move || stopping(&stop),
+        )
+        .unwrap_err();
+        assert!(error.is::<ai_hist::CaptureCancelled>());
+        assert!(!dir.path().join("history.db").exists());
+    }
+
+    #[test]
+    fn stop_file_during_batch_preparation_prevents_send_and_keeps_pending_records() {
+        struct StoppingReceiver<'a>(&'a Path);
+        impl worker::Receiver for StoppingReceiver<'_> {
+            fn mapping_version(&self) -> &str {
+                destination::MAPPING_VERSION
+            }
+            fn supported_kinds(&self) -> &[&str] {
+                &["history", "session_event", "session"]
+            }
+            fn supports_tombstones(&self) -> bool {
+                true
+            }
+            fn prepare(
+                &self,
+                _: &delivery::HistoryExportBatch,
+                ctx: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<worker::PreparedBody, worker::ReceiverFailure> {
+                save_json(&self.0.join("stop.json"), &json!({"startup_id":"drain"})).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !(ctx.cancelled)() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    (ctx.cancelled)(),
+                    "normal stop must reach the receiver context"
+                );
+                Ok(worker::PreparedBody {
+                    content_type: "application/json".into(),
+                    body: "{}".into(),
+                })
+            }
+            fn send(
+                &self,
+                _: &delivery::PreparedPayload,
+                _: &delivery::HistoryExportBatch,
+                _: &worker::ReceiverContext<'_>,
+            ) -> std::result::Result<delivery::DeliveryAcknowledgment, worker::ReceiverFailure>
+            {
+                panic!("must not send after stop");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let conn = ai_hist::open_db(&db).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(source,session_id) VALUES ('claude','queued')",
+            [],
+        )
+        .unwrap();
+        let job = delivery::create_job(&conn, &job_config(true), now()).unwrap();
+        let config = Config {
+            version: 1,
+            site_url: "https://agentrelay.com".into(),
+            account_id: "account".into(),
+            org_id: "org".into(),
+            workspace_id: "workspace".into(),
+            history_url: "https://history.agentrelay.com".into(),
+            delivery_account: job.config.account_id,
+            job_id: job.job_id,
+            include_existing: true,
+            sharing_mode: None,
+            acknowledge_uninspected_schedules: false,
+        };
+        let stop = StopWatch::start(dir.path(), "drain");
+        let status = deliver_with_receiver(&db, &config, &StoppingReceiver(dir.path()), &|| {
+            stopping(&stop.cancelled)
+        })
+        .unwrap();
+        assert!(stopping(&stop.cancelled));
+        assert_eq!(status.state, "active");
+        assert_eq!(status.acknowledged_records, 0);
+        assert!(status.pending_records > 0);
     }
 
     #[test]
