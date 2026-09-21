@@ -421,6 +421,30 @@ const CORPUS: &[Fixture] = &[
         files: &["cursor/prompt-transcript"],
         quirk: "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
     },
+    Fixture {
+        source: "cursor",
+        name: "observed-3-13-25",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/observed-3.13.25.jsonl"],
+        quirk: "the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness",
+    },
+    Fixture {
+        source: "cursor",
+        name: "legacy-string-content",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/legacy-string-content.jsonl"],
+        quirk: "the older row shape, `message.content` as a bare string with no framing; staged by the ai-hist cursor parser tests rather than by this harness",
+    },
+    Fixture {
+        source: "cursor",
+        name: "extended-unverified",
+        layout: Layout::Reference,
+        origin: Origin::RelayHistory,
+        files: &["cursor/extended-unverified.jsonl"],
+        quirk: "an **unverified** build that also writes `message.model`, `message.usage`, `thinking` blocks, `tool_use` ids and `tool_result` blocks; it proves the parser records them when present, not that Cursor writes them",
+    },
     // -- grok, authored here -----------------------------------------------
     Fixture {
         source: "grok",
@@ -1455,10 +1479,17 @@ fn codex_parent_thread_id_becomes_a_delegation_edge() {
     assert_eq!(catalog, vec!["sess_parent_thread_root".to_string()]);
 }
 
-/// Cursor records no timestamps at all, so every prompt in one transcript is
-/// stamped from the file's mtime. The prompts themselves are the raw fact:
-/// string content, block-array content and a `<user_query>` wrapper all
+/// This transcript carries no `<timestamp>` tag on any turn, so every prompt
+/// in it is stamped from the file's mtime. The prompts themselves are the raw
+/// fact: string content, block-array content and a `<user_query>` wrapper all
 /// unwrap, assistant and tool records do not.
+///
+/// A user turn is one prompt carrying every text block the record held. The
+/// prompt-only parser this replaced stopped at the first block, so a second
+/// one ("ignored second block" here) was dropped on the floor; emitting a row
+/// per block instead would collide on `history`'s
+/// `(source, timestamp_ms, prompt)` identity whenever a turn repeated itself.
+/// Joining the blocks loses neither. `session_events` still keeps them apart.
 #[test]
 fn cursor_transcript_yields_only_unwrapped_user_prompts() {
     let prompts = rows("cursor/prompt-transcript", "history")
@@ -1469,7 +1500,7 @@ fn cursor_transcript_yields_only_unwrapped_user_prompts() {
         prompts,
         vec![
             "add a retry to the client".to_string(),
-            "now write the test".to_string(),
+            "now write the test\n\nignored second block".to_string(),
             "wrapped query".to_string(),
         ],
         "assistant text, tool uses, tool results and blank prompts are not prompts"
@@ -1798,10 +1829,9 @@ fn opencode_assistant_messages_carry_model_and_tokens() {
     assert!(models.contains("claude-opus-4-5"), "{models:?}");
 }
 
-/// Cursor records assistant text, tool uses and tool results that never reach
-/// `session_events` today.
+/// Cursor records assistant text, tool uses and tool results, and all three
+/// reach `session_events` now that the transcript parser is event-level.
 #[test]
-#[ignore = "closed by #166"]
 fn cursor_assistant_and_tool_records_reach_session_events() {
     let events = rows("cursor/prompt-transcript", "session_events");
     assert!(
