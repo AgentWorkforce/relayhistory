@@ -529,6 +529,44 @@ pub fn capture_claude_transcript(conn: &Connection, path: &Path) -> Result<()> {
     capture(conn, "claude", path, evidence)
 }
 
+/// The same fold, over bytes the lifecycle hook already captured.
+///
+/// The hook hands over what it read, so there is no file to walk and no
+/// position to keep: this is the one caller with no cursor behind it.
+pub(crate) fn scan_claude_transcript_text(
+    path: &Path,
+    text: &str,
+) -> Result<Option<ContinuityEvidence>> {
+    let mut evidence = ContinuityEvidence::default();
+    let mut first_user_seen = false;
+    let mut any = false;
+    for line in text.lines() {
+        crate::ingest::check_capture_cancelled()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        any = true;
+        fold_claude_record(&mut evidence, &mut first_user_seen, object);
+    }
+    Ok(finish_claude_fold(evidence, any, path))
+}
+
+/// Store the evidence in bytes the hook captured, in one call.
+pub(crate) fn capture_claude_transcript_text(
+    conn: &Connection,
+    path: &Path,
+    text: &str,
+) -> Result<()> {
+    capture(
+        conn,
+        "claude",
+        path,
+        scan_claude_transcript_text(path, text)?,
+    )
+}
 
 /// Read one rollout's evidence and store it, in one call.
 pub fn capture_codex_rollout(conn: &Connection, path: &Path) -> Result<u64> {

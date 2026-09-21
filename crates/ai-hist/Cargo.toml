@@ -1,6 +1,6 @@
 [package]
 name = "ai-hist"
-version = "0.23.0"
+version = "0.24.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,6 +18,10 @@ path = "src/lib.rs"
 [features]
 default = []
 delivery = []
+# Filesystem-event driver for the live-capture watch loop. Optional so the
+# crate still builds with --no-default-features on a host with no watcher
+# backend; without it `watch` falls back to polling.
+fs-events = ["dep:notify"]
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
@@ -26,7 +30,11 @@ unstable-internal = []
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+notify = { version = "8", default-features = false, features = [
+    "macos_fsevent",
+], optional = true }
+rusqlite ={ version = "0.32", features = ["bundled", "functions"] }
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -48,6 +56,12 @@ rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 name = "fixture_corpus"
 required-features = ["unstable-internal"]
 
+# Already a dependency of the crate on every platform; declared here too so the
+# live-capture suite can take the sync path's advisory lock from a second
+# handle, which is the only way to test a contended sweep honestly.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "delivery_worker"
 required-features = ["delivery", "unstable-internal"]
@@ -59,6 +73,14 @@ required-features = ["delivery", "unstable-internal"]
 [[test]]
 name = "delivery_capture"
 required-features = ["delivery", "unstable-internal"]
+
+[[test]]
+name = "live_capture"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "relative_watch_roots"
+required-features = ["unstable-internal"]
 
 [[test]]
 name = "local_history_boundary"

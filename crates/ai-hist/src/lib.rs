@@ -34,6 +34,7 @@ workspace_mod!(discover);
 workspace_mod!(remote);
 workspace_mod!(source_intake);
 workspace_mod!(sources);
+workspace_mod!(watch);
 mod file_lock;
 mod jsonl_temp;
 mod session_store;

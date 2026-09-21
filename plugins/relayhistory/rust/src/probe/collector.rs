@@ -194,7 +194,7 @@ fn capture_with_stop(
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     let started = Instant::now();
-    let progress = super::progress::Monitor::start(directory, history_url, None);
+    let progress = super::progress::Monitor::start(directory, history_url, None, false);
     let latest = Arc::new(std::sync::Mutex::new(ai_hist::CaptureProgress::default()));
     let seen = latest.clone();
     let observer = progress.observer();
@@ -387,6 +387,29 @@ fn capture_error_class(error: &anyhow::Error) -> &'static str {
     }
     "capture_error"
 }
+
+pub(super) fn local_failure_message(error: &anyhow::Error) -> Option<&'static str> {
+    match capture_error_class(error) {
+        "retention_limit" => Some("The local upload journal is full. Uploads will retry after consumed records can be compacted; queued sessions are preserved."),
+        "database_corrupt" => Some("The local history database needs repair. Preserve the database before recovery; reconnecting will not repair it."),
+        "disk_full" => Some("The local disk is full. Free disk space to resume session uploads."),
+        "database_busy" => Some("Local history is busy. Agent Relay will retry when the other operation finishes."),
+        "permission_denied" => Some("Agent Relay cannot access local history. Check local file permissions."),
+        _ => None,
+    }
+}
+
+fn cycle_report(result: &Result<()>) -> serde_json::Value {
+    let error = result.as_ref().err();
+    json!({
+        "at_ms": now(), "ok": result.is_ok(),
+        "error_class": error.map(capture_error_class),
+        "message": error.map(|error| local_failure_message(error).unwrap_or(
+            "Sync paused or offline. Retrying; local data remains queued."
+        )),
+    })
+}
+
 fn capture_diagnostic(
     directory: &Path,
     stage: &str,
@@ -463,8 +486,12 @@ fn deliver_captured_with_stop(
     // its verdict is a generic permission refusal. Name the cause here first so
     // the user sees which uploader to stop instead of a reconnect suggestion.
     super::check_legacy_schedules(config.acknowledge_uninspected_schedules)?;
-    let progress =
-        super::progress::Monitor::start(directory, &config.history_url, Some(&config.job_id));
+    let progress = super::progress::Monitor::start(
+        directory,
+        &config.history_url,
+        Some(&config.job_id),
+        before_exit,
+    );
     let result = deliver(&db_path, config, cancelled);
     if before_exit {
         let connected =
@@ -661,15 +688,10 @@ pub fn run_background(directory: &Path, startup_id: &str) -> Result<()> {
         if stopping(&stop.cancelled) {
             break;
         }
-        save_json(
-            &directory.join("cycle.json"),
-            &json!({
-                "at_ms":now(), "ok":result.is_ok(),
-                "message":if result.is_err() { Some("Sync paused or offline. Retrying; local data remains queued.") } else { None }
-            }),
-        )?;
-        if result.is_err() {
-            eprintln!("Sync paused or offline. Retrying; local data remains queued.");
+        let report = cycle_report(&result);
+        save_json(&directory.join("cycle.json"), &report)?;
+        if let Some(message) = report["message"].as_str() {
+            eprintln!("{message}");
         }
         for _ in 0..200 {
             if stopping(&stop.cancelled) {
@@ -1164,6 +1186,36 @@ mod tests {
         for forbidden in ["secret", "prompt", "private", "https", "example"] {
             assert!(!value.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn cycle_errors_classify_local_storage_without_exposing_raw_details() {
+        for (code, class) in [
+            (rusqlite::ffi::SQLITE_CORRUPT, "database_corrupt"),
+            (rusqlite::ffi::SQLITE_FULL, "disk_full"),
+            (rusqlite::ffi::SQLITE_BUSY, "database_busy"),
+        ] {
+            let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("secret prompt https://token:secret@example.invalid".into()),
+            ));
+            let report = cycle_report(&Err(error));
+            assert_eq!(report["error_class"], class);
+            assert_eq!(report["ok"], false);
+            assert!(!report["message"].as_str().unwrap().contains("offline"));
+            for forbidden in ["secret", "prompt", "https", "example"] {
+                assert!(!report.to_string().contains(forbidden));
+            }
+        }
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+            Some("delivery retention limit exceeded; secret".into()),
+        ));
+        assert_eq!(cycle_report(&Err(error))["error_class"], "retention_limit");
+        let healthy = cycle_report(&Ok(()));
+        assert_eq!(healthy["ok"], true);
+        assert!(healthy["message"].is_null());
+        assert!(healthy["error_class"].is_null());
     }
 
     fn job_config(include_existing: bool) -> delivery::DeliveryJobConfig {
