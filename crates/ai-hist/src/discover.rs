@@ -3255,13 +3255,6 @@ pub fn discover_sessions_with_provider_refs(
     // up across many passes must not keep answering from a checkout's state at
     // the first one.
     crate::project_identity::begin_acquisition_pass();
-    // Provider instances can belong to a reusable SourceRegistry. Hold each
-    // adapter's pass guard across enumeration, parallel reads and writes so a
-    // concurrent call cannot replace live provider state mid-pass.
-    let _pass_guards = providers
-        .iter()
-        .map(|provider| provider.begin_discovery_pass())
-        .collect::<Result<Vec<_>>>()?;
     let mut identities = std::collections::HashSet::new();
     for provider in providers {
         observation_key(*provider, provider.source(), "validation").validate()?;
@@ -3275,6 +3268,15 @@ pub fn discover_sessions_with_provider_refs(
             "INVALID_ARGUMENT: duplicate source connector instance"
         );
     }
+    // Provider instances can belong to a reusable SourceRegistry. Validate
+    // the whole set before taking any non-reentrant pass lock: callers of the
+    // public ref API may accidentally repeat the same provider instance.
+    // Hold each guard across enumeration, parallel reads and writes so a
+    // concurrent call cannot replace live provider state mid-pass.
+    let _pass_guards = providers
+        .iter()
+        .map(|provider| provider.begin_discovery_pass())
+        .collect::<Result<Vec<_>>>()?;
     let conn = env.conn();
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,

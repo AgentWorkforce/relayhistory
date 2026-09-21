@@ -165,9 +165,69 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     }
 }
 
+struct PassCountingProvider {
+    pass_starts: AtomicUsize,
+}
+
+impl ShallowSessionProvider for PassCountingProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        self.pass_starts.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn source(&self) -> &'static str {
+        "codex"
+    }
+
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        Ok(Vec::new())
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_provider_is_rejected_before_pass_guards_are_acquired() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = PassCountingProvider {
+        pass_starts: AtomicUsize::new(0),
+    };
+
+    let error = discover_sessions_with_provider_refs(
+        &env,
+        &DiscoverOptions::default(),
+        &[&provider, &provider],
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("duplicate source connector instance"),
+        "{error:#}"
+    );
+    assert_eq!(
+        provider.pass_starts.load(Ordering::Relaxed),
+        0,
+        "validation must finish before any provider pass lock is taken"
+    );
+}
 
 #[test]
 fn every_source_is_either_discoverable_or_explicitly_exempt() {
