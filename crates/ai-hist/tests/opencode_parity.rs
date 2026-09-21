@@ -203,7 +203,7 @@ fn evidence(db_path: &Path, session_ids: &[&str]) -> Evidence {
                 marker.marker_uid,
                 marker.message_id,
                 marker.ts_ms,
-                marker.detail_json,
+                marker.payload_json,
             ));
         }
         // `evidence_locator` is the provenance path, so it is left out for the
@@ -842,7 +842,7 @@ fn a_compaction_part_records_one_boundary_marker() {
     assert_eq!(markers[0].kind, "compaction_boundary");
     assert_eq!(markers[0].message_id.as_deref(), Some("msg_compact_uc"));
     assert_eq!(markers[0].ts_ms, Some(1776999003000));
-    assert_eq!(markers[0].detail_json.as_deref(), Some("{\"auto\":true}"));
+    assert_eq!(markers[0].payload_json.as_deref(), Some("{\"auto\":true}"));
 
     // The turns either side of the boundary are still real turns.
     let texts: Vec<String> = session_events(&conn, "ses_compact", Some("opencode"))
@@ -875,7 +875,7 @@ fn a_compaction_part_records_one_boundary_marker() {
     let markers = session_markers(&conn, "opencode", "ses_compact").unwrap();
     assert_eq!(markers.len(), 1);
     assert_eq!(
-        markers[0].detail_json, None,
+        markers[0].payload_json, None,
         "a removed compaction detail must not survive the replacement part"
     );
 

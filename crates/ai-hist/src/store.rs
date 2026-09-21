@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     turn_id TEXT,
     request_span TEXT,
     raw_facts_version INTEGER,
+    raw_kind TEXT,
     UNIQUE(source, session_id, event_uid)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
@@ -230,12 +231,15 @@ CREATE TABLE IF NOT EXISTS session_markers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
     session_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    message_id TEXT,
-    ts_ms INTEGER,
-    text TEXT,
-    detail_json TEXT,
     marker_uid TEXT NOT NULL,
+    ts_ms INTEGER,
+    message_id TEXT,
+    parent_id TEXT,
+    turn_id TEXT,
+    kind TEXT NOT NULL,
+    subkind TEXT,
+    text TEXT,
+    payload_json TEXT,
     UNIQUE(source, session_id, marker_uid)
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -514,7 +518,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "session_hydration_checkpoints",
     "session_identity_correlations",
     "session_relationships",
-    "session_markers",
     "session_continuity_evidence",
     "schema_migrations",
     "discovery_skips",
@@ -616,6 +619,12 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // not carry it (it is absent from the session-event evidence spec), so the
     // probes that read it exclude sessions with remote provenance.
     ("raw_facts_version", "INTEGER"),
+    // The provider-native record or block type an event was derived from,
+    // so a `tool_result` that came from a Claude `tool_result` content
+    // block stays distinguishable from one synthesized out of a
+    // `type: "system"` subagent notification. Both land in the same `kind`;
+    // the normalized `kind` vocabulary is deliberately not widened for it.
+    ("raw_kind", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -658,6 +667,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_events_page",
     "idx_tool_calls_page_v2",
     "idx_file_edits_page_v2",
+    "idx_session_markers_page",
     "idx_session_presences_location",
     "idx_session_presences_locator",
     "idx_session_relationships_parent",
@@ -702,11 +712,14 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 ];
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
-/// Indexes the session-scoped tool call and file edit pages depend on. Both
-/// pages always name one source and one session, so a single composite index
-/// per table carries the whole lookup and its ordering.
-const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] =
-    &["idx_tool_calls_page_v2", "idx_file_edits_page_v2"];
+/// Indexes the session-scoped tool call, file edit and marker pages depend
+/// on. All three always name one source and one session, so a single
+/// composite index per table carries the whole lookup and its ordering.
+const REQUIRED_EVIDENCE_READ_INDEXES: &[&str] = &[
+    "idx_tool_calls_page_v2",
+    "idx_file_edits_page_v2",
+    "idx_session_markers_page",
+];
 const REQUIRED_SCOPE_READ_INDEXES: &[&str] = &["idx_session_presences_location"];
 const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     "idx_session_relationships_parent",
@@ -726,6 +739,12 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
     "session_markers_v1",
+    // v2 is the merged marker model: the typed `message_id` / `parent_id` /
+    // `turn_id` / `subkind` / `payload_json` columns alongside the `text`
+    // the Grok parser writes. A database created by the v1 code has the
+    // v1 marker set and none of those columns, so v1 alone is not enough
+    // to call such a database current.
+    "session_markers_v2",
     "session_markers_combined_v1",
     "session_events_tool_result_fidelity_v1",
     // `delete_session_hydration_state` gained a step, and `CREATE TRIGGER IF
@@ -784,7 +803,8 @@ pub fn schema_is_relationship_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_RELATIONSHIP_READ_INDEXES)
 }
 
-/// Whether bounded tool call and file edit pagination has its page indexes.
+/// Whether bounded tool call, file edit and marker pagination has its page
+/// indexes.
 pub fn schema_is_evidence_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVIDENCE_READ_INDEXES)
 }
@@ -1153,7 +1173,6 @@ BEGIN
     DELETE FROM session_markers
     WHERE source = OLD.source AND session_id = OLD.session_id;
 END;
-INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');
 CREATE TRIGGER IF NOT EXISTS delete_session_continuity_evidence
 AFTER DELETE ON sessions
 BEGIN
@@ -1381,6 +1400,10 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_markers_page ON session_markers(source, session_id, (ts_ms IS NULL), ts_ms, id)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
         [],
     )?;
@@ -1400,12 +1423,23 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_commit_links_repo ON session_commit_links(repo, branch)",
         [],
     )?;
+    // The marker table and `session_events.raw_kind` both arrive above; the
+    // marker is what makes a database that predates them fail
+    // [`schema_is_current`] exactly once, so a read-only handle is never
+    // served a query against a column it does not have.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v1');",
+    )?;
+    migrate_session_markers_v2(conn)?;
     // Derived from `session_events`, so it must come after the DDL and the
     // column migrations above, and needs no backfill: the first query over an
     // upgraded database already sees every request its events describe.
     crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
+    // Only now, with the capture triggers rebuilt and the journal certain to
+    // exist, is the debt the marker migration recorded payable.
+    resolve_marker_journal_backfill(conn)?;
     Ok(())
 }
 
@@ -1416,6 +1450,107 @@ fn init_delivery_schema(conn: &Connection) -> Result<()> {
 
 #[cfg(not(feature = "delivery"))]
 fn init_delivery_schema(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+/// Preserve the pre-migration marker rows for consumers mid-snapshot.
+#[cfg(feature = "delivery")]
+fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
+    crate::delivery::shadow_preimages(conn, "session_markers")
+}
+
+/// Without the delivery feature there is no `delivery_shadow` to write to and
+/// no way to build the payload, so a database with a consumer mid-snapshot is
+/// refused rather than migrated.
+///
+/// This is the one place the migration stops instead of deferring, and the
+/// asymmetry is the point. Everywhere else the rows survive, so the work can
+/// wait for a build that can do it. A preimage cannot wait: proceeding would
+/// drop the only copy of a shape a consumer was promised, and no later open
+/// could put it back. A failed open naming the remedy is recoverable; silent
+/// destruction is not.
+///
+/// Only an *unfinished* consumer is owed anything, so an ordinary install --
+/// no delivery tables at all, or no snapshot in flight -- migrates normally.
+#[cfg(not(feature = "delivery"))]
+fn shadow_marker_preimages(conn: &Connection) -> Result<()> {
+    let ready: bool = conn
+        .prepare(
+            "SELECT count(*) = 3 FROM sqlite_master WHERE type = 'table' \
+             AND name IN ('delivery_bootstrap_bounds','delivery_jobs','history_exports')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if !ready {
+        return Ok(());
+    }
+    // The same union the capture triggers serve: live delivery jobs *and*
+    // unexpired file exports. Asking only about jobs let a database whose only
+    // in-flight consumer was an export migrate and drop the column with no
+    // preimage taken -- the identical unrecoverable loss, reached through the
+    // other half of the set. Spelled out here rather than reusing `CONSUMERS`
+    // because that constant lives in the module this build compiles out.
+    let unfinished: bool = conn
+        .prepare(
+            "SELECT 1 FROM delivery_bootstrap_bounds b \
+             WHERE b.kind = 'session_marker' AND ( \
+               EXISTS(SELECT 1 FROM delivery_jobs j \
+                      WHERE j.id = b.job_id AND j.state <> 'cancelled' \
+                        AND j.bootstrap_done = 0) \
+               OR EXISTS(SELECT 1 FROM history_exports e \
+                         WHERE e.id = b.job_id AND e.bootstrap_done = 0 \
+                           AND e.expires_at_ms > CAST(unixepoch('subsec')*1000 AS INTEGER)) \
+             )",
+        )?
+        .exists([])?;
+    anyhow::ensure!(
+        !unfinished,
+        "session_markers cannot be migrated by a build without the delivery feature while a \
+         delivery snapshot is still in flight: the pre-migration rows would be lost for it \
+         and cannot be recovered afterwards. Open this database once with a delivery-enabled \
+         build, or let the snapshot finish, and retry."
+    );
+    Ok(())
+}
+
+/// Pay off what the marker migration recorded, once the schema can take it.
+///
+/// The migration has to retire the capture triggers -- SQLite validates them
+/// when a column is dropped -- so every write it makes is invisible to
+/// delivery, and so is every marker written afterwards until the triggers come
+/// back. Rebuilt triggers only ever see future writes, and a no-op touch
+/// cannot wake them either: their `WHEN old_payload <> new_payload` guard is
+/// false for a row whose values did not change.
+///
+/// So the gap is closed by journalling the marker table once, here, after
+/// `init_delivery_schema` has rebuilt the triggers. Every row rather than the
+/// migrated ones, because the gap covers both: in a build without the delivery
+/// feature the migration runs, the triggers stay down for the rest of that
+/// process, and the markers a sync writes in the meantime are captured by
+/// nothing. That build leaves the flag set and the next delivery-enabled open
+/// settles all of it.
+///
+/// The upserts are idempotent at the destination -- they carry the same record
+/// key capture would -- so paying a little more than is strictly owed is the
+/// safe direction, and the alternative is a revision that exists nowhere.
+#[cfg(feature = "delivery")]
+fn resolve_marker_journal_backfill(conn: &Connection) -> Result<()> {
+    if !migration_applied(conn, "session_markers_v2_journal_pending")? {
+        return Ok(());
+    }
+    crate::delivery::journal_migrated_rows(conn, "session_markers")?;
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE name = 'session_markers_v2_journal_pending'",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Without the delivery feature there is no journal to write to and no trigger
+/// DDL reachable to rebuild, so the flag is left standing for a build that has
+/// both. Doing nothing is the point: clearing it here would retire a debt
+/// nobody paid.
+#[cfg(not(feature = "delivery"))]
+fn resolve_marker_journal_backfill(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -1601,6 +1736,131 @@ fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> 
         )
         .with_context(|| format!("adding column {table}.{column}"))?;
     }
+    Ok(())
+}
+
+/// Bring a v1 `session_markers` table up to the merged marker model.
+///
+/// The v1 table shipped as `(kind, ts_ms, text, detail_json)`: one verbatim
+/// JSON blob and no way to say which message a marker belonged to. The merged
+/// model adds the typed `message_id` / `parent_id` / `turn_id` / `subkind`
+/// columns and renames the blob to `payload_json`, whose contract is an
+/// allowlisted bounded projection rather than whatever the provider sent.
+///
+/// `CREATE TABLE IF NOT EXISTS` cannot do any of that, and the v1 databases
+/// already exist, so the rows are carried across rather than re-parsed: the
+/// columns are added, `detail_json` is copied into the still-empty
+/// `payload_json`, and only then is it dropped. Copy before drop, always --
+/// the other order loses every v1 marker's payload and looks like a clean
+/// migration while doing it.
+fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
+    let has_detail_json: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('session_markers') WHERE name = 'detail_json'")?
+        .exists([])?;
+    if has_detail_json {
+        // Freeze the old shape for anyone mid-snapshot, before anything at all
+        // happens to the table -- ahead of the added columns as well as the
+        // writes, so the preimage is the shape their snapshot was promised
+        // rather than that shape plus some nulls.
+        //
+        // This one is not recoverable later: the journal backfill can be
+        // deferred because the rows survive, but a preimage cannot be
+        // reconstructed once the column it holds is gone.
+        shadow_marker_preimages(conn)?;
+    }
+    ensure_columns(
+        conn,
+        "session_markers",
+        &[
+            ("message_id", "TEXT"),
+            ("parent_id", "TEXT"),
+            ("turn_id", "TEXT"),
+            ("subkind", "TEXT"),
+            ("text", "TEXT"),
+            ("payload_json", "TEXT"),
+        ],
+    )?;
+    if has_detail_json {
+        // Retire the capture triggers *before* touching a row, not merely
+        // before the column drop.
+        //
+        // They are built from the column list they were created with, so on a
+        // v1 database they know nothing of `payload_json`: the copy below
+        // would run under triggers whose `WHEN old_payload <> new_payload`
+        // guard compares two `json_object`s that both omit the column being
+        // written, so it is false and nothing is journalled at all. A
+        // destination with an active job would never be told that any marker
+        // predating the upgrade had gained a payload, and no part of the
+        // delivery would look wrong. Dropping them first makes that explicit
+        // rather than incidental, and it is required anyway for the column
+        // drop, which SQLite refuses while a dependent trigger names it.
+        //
+        // `IF EXISTS` because a database opened by a build without the
+        // delivery feature has none of them.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
+        )?;
+        // Bounded on the way across, not copied verbatim. `payload_json` is
+        // documented as a projection whose strings and containers are bounded,
+        // and every kind the parsers write goes through that bounder -- so a
+        // legacy value carried over unchanged would leave rows breaking the
+        // promise the column makes, in upgraded databases only, where nobody
+        // would think to look. Row by row rather than in one `UPDATE` because
+        // the bound is applied by parsing the JSON, which SQL cannot do.
+        let legacy: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT id, detail_json FROM session_markers \
+                 WHERE payload_json IS NULL AND detail_json IS NOT NULL",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut migrated = Vec::new();
+        for (id, detail_json) in legacy {
+            // A legacy value that does not parse is dropped rather than stored
+            // raw: unparsed text is exactly what the bound exists to keep out.
+            let Some(bounded) = crate::ingest::bound_marker_json(&detail_json) else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE session_markers SET payload_json = ? WHERE id = ?",
+                params![bounded, id],
+            )?;
+            migrated.push(id);
+        }
+        conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
+        // Record that these rows still owe delivery a revision; do not pay it
+        // here. Two reasons, and each on its own is fatal:
+        //
+        // This runs *before* `init_delivery_schema`, so `delivery_journal` may
+        // not exist yet -- delivery is opt-in, and a database only ever opened
+        // by builds without the feature has none of its tables. A statement
+        // naming a missing table fails when it is prepared, before any `WHERE`
+        // clause can spare it, so journalling inline turns the most ordinary
+        // upgrade into a failed open.
+        //
+        // And this migration is not feature-gated while the journal is, so a
+        // build without delivery gets here, drops the capture triggers it
+        // cannot rebuild, and can neither journal now nor be made to later.
+        // A flag it leaves set is the one thing that survives it.
+        //
+        // `migrated` is deliberately not recorded with the flag. What is owed
+        // is not "these rows" but "every marker row", because capture is off
+        // from here until the triggers come back -- in a no-delivery process
+        // that is the rest of the run, including markers a sync writes after
+        // this point.
+        let _ = migrated;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) \
+             VALUES ('session_markers_v2_journal_pending')",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v2')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1903,70 +2163,53 @@ pub fn upsert_session_presence(
 /// `kind` that are both untrue. Markers carry no role and their `ts_ms` is
 /// nullable, because a provider may record that something happened without
 /// recording when.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionMarker {
-    pub source: String,
-    pub session_id: String,
-    /// Stable per-session identity, so re-reading the same evidence upserts.
-    pub marker_uid: String,
-    pub kind: String,
-    pub message_id: Option<String>,
-    pub ts_ms: Option<i64>,
-    pub text: Option<String>,
-    /// The provider's own fields for this marker, verbatim.
-    pub detail_json: Option<String>,
-}
-
-/// Record one marker, replacing what a previous read of the same evidence
-/// wrote.
-pub fn insert_session_marker(conn: &Connection, marker: &SessionMarker) -> Result<usize> {
-    let changed = conn.execute(
-        "INSERT INTO session_markers \
-         (source, session_id, marker_uid, kind, message_id, ts_ms, text, detail_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
-         kind = excluded.kind, message_id = excluded.message_id, \
-         ts_ms = excluded.ts_ms, text = excluded.text, detail_json = excluded.detail_json",
-        params![
-            marker.source,
-            marker.session_id,
-            marker.marker_uid,
-            marker.kind,
-            marker.message_id,
-            marker.ts_ms,
-            marker.text,
-            marker.detail_json,
-        ],
-    )?;
-    Ok(changed)
-}
-
 /// Every marker recorded for one session, oldest known time first. Markers
 /// with no recorded time sort last, in insertion order.
+///
+/// Built on [`session_markers_page`] rather than a second `SELECT`, so callers
+/// that want every marker do not get a different row shape or a different
+/// order from the paged read. It follows the cursor to the end: the paged call
+/// clamps at 1,000, and returning one page of a busier session would be a
+/// complete-looking answer computed over part of the data -- worse than an
+/// error, because the truncation is invisible and the cursor that would have
+/// reported it is discarded.
 pub fn session_markers(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionMarker>> {
-    let mut stmt = conn.prepare(
-        "SELECT source, session_id, marker_uid, kind, message_id, ts_ms, text, detail_json \
-         FROM session_markers WHERE source = ? AND session_id = ? \
-         ORDER BY ts_ms IS NULL, ts_ms, id",
-    )?;
-    let rows = stmt.query_map(params![source, session_id], |row| {
-        Ok(SessionMarker {
-            source: row.get(0)?,
-            session_id: row.get(1)?,
-            marker_uid: row.get(2)?,
-            kind: row.get(3)?,
-            message_id: row.get(4)?,
-            ts_ms: row.get(5)?,
-            text: row.get(6)?,
-            detail_json: row.get(7)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    // Every page on one SQLite snapshot. The walk issues a statement per page
+    // and the keyset includes `ts_ms`, so a sync writing between them can move
+    // a row the walk has already returned past the cursor and hand it back
+    // again -- or move an unread one behind it, so it is never returned at
+    // all. Either way the caller gets a list that existed at no instant.
+    //
+    // WAL readers do not block the writer, so this costs nothing. The paged
+    // call is deliberately left alone: a caller holding a cursor across time
+    // is reading the database as it changes, which is the point of a cursor.
+    //
+    // A caller that already holds a transaction supplies the snapshot itself;
+    // opening a nested one would fail outright.
+    let snapshot = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let mut markers = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = session_markers_page(conn, source, session_id, 1_000, cursor.as_ref())?;
+        markers.extend(page.markers);
+        match page.next_cursor {
+            // A cursor is handed back only alongside a full page, so this
+            // terminates on the first short page.
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    if let Some(snapshot) = snapshot {
+        snapshot.finish()?;
+    }
+    Ok(markers)
 }
 
 pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<usize> {
@@ -2087,6 +2330,14 @@ pub struct SessionEvent {
     /// The upstream inference provider the harness named, when it names one.
     pub provider: Option<String>,
     pub event_uid: String,
+    /// Provider-native record or block type this event was derived from.
+    ///
+    /// Two very different provider records normalize to `kind = "tool_result"`
+    /// -- a `tool_result` content block and a Claude `type: "system"` subagent
+    /// notification -- and only this column tells them apart. `None` for rows
+    /// written before the column existed, and for sources that do not yet set
+    /// it.
+    pub raw_kind: Option<String>,
     /// Per-tool-result fidelity. Every field below is `None` on a row that is
     /// not a tool result, and on a tool-result row whose provider does not
     /// record that fact — never a stand-in value, because a fabricated zero
@@ -2217,6 +2468,44 @@ pub struct SessionFileEditPage {
     pub next_cursor: Option<SessionEvidenceCursor>,
 }
 
+/// One provider record that the normalized `session_events` model cannot
+/// carry, kept rather than dropped.
+///
+/// Compaction and summary boundaries, provider system rows, non-text content
+/// blocks and agent lifecycle events all describe a session without being a
+/// message in it. `kind` is the classified vocabulary; `subkind` is the
+/// provider-native type verbatim, so a record type that no classifier knows
+/// yet still lands as `kind = "unknown"` with its real name intact.
+/// `payload_json` carries an allowlisted, bounded projection only — never the
+/// bytes of an image or a document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMarker {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub marker_uid: String,
+    pub ts_ms: Option<i64>,
+    pub message_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub kind: String,
+    pub subkind: Option<String>,
+    /// The provider's own readable text for this marker, when it wrote one.
+    ///
+    /// Grok records a system preamble and a synthetic turn as text; Claude and
+    /// Codex record their markers as structure. The column is what keeps the
+    /// Grok text from being flattened into a JSON payload that no longer reads
+    /// as prose.
+    pub text: Option<String>,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMarkerPage {
+    pub markers: Vec<SessionMarker>,
+    pub next_cursor: Option<SessionEvidenceCursor>,
+}
+
 /// Column list and row mapper for [`SessionEvent`], declared once.
 ///
 /// The full listing and the paged listing must return identical rows; when
@@ -2228,7 +2517,7 @@ const SESSION_EVENT_COLUMNS: &str =
      ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
-     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span";
+     stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind";
 
 fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -2268,6 +2557,7 @@ fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEven
         is_meta: row.get(33)?,
         turn_id: row.get(34)?,
         request_span: row.get(35)?,
+        raw_kind: row.get(36)?,
     })
 }
 
@@ -2376,6 +2666,132 @@ const TOOL_CALL_COLUMNS: &str = "id, source, session_id, message_id, tool_use_id
 const FILE_EDIT_COLUMNS: &str =
     "id, source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, \
      lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd";
+const SESSION_MARKER_COLUMNS: &str = "id, source, session_id, marker_uid, ts_ms, message_id, \
+                                      parent_id, turn_id, kind, subkind, text, payload_json";
+
+fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
+    Ok(SessionMarker {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        session_id: row.get(2)?,
+        marker_uid: row.get(3)?,
+        ts_ms: row.get(4)?,
+        message_id: row.get(5)?,
+        parent_id: row.get(6)?,
+        turn_id: row.get(7)?,
+        kind: row.get(8)?,
+        subkind: row.get(9)?,
+        text: row.get(10)?,
+        payload_json: row.get(11)?,
+    })
+}
+
+/// One bounded page of session markers for one session, oldest first.
+///
+/// Markers carry the same `(ts_ms IS NULL, ts_ms, id)` order as tool calls and
+/// file edits, and for the same reason: a provider record type that carries no
+/// timestamp at all must still be reachable, and it must sort after everything
+/// dated rather than in front of it. Scoped to one `source` because native
+/// session ids collide across providers.
+pub fn session_markers_page(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    limit: i64,
+    after: Option<&SessionEvidenceCursor>,
+) -> Result<SessionMarkerPage> {
+    let limit = limit.clamp(1, 1_000);
+    let (sql, params_vec) = evidence_page_query(
+        SESSION_MARKER_COLUMNS,
+        "session_markers",
+        source,
+        session_id,
+        limit,
+        after,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(params_vec),
+        row_to_session_marker,
+    )?;
+    let mut markers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // One extra row was requested, so `has_more` already implies a full page.
+    let has_more = markers.len() > limit as usize;
+    if has_more {
+        markers.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = markers.last().expect("non-empty page");
+        SessionEvidenceCursor {
+            ts_ms: last.ts_ms,
+            id: last.id,
+        }
+    });
+    Ok(SessionMarkerPage {
+        markers,
+        next_cursor,
+    })
+}
+
+/// A marker about to be written, keyed by `(source, session_id, marker_uid)`.
+///
+/// `marker_uid` is derived the same deterministic way `event_uid` is, so a
+/// re-parse of the same transcript updates the row in place instead of
+/// accumulating duplicates.
+#[derive(Debug, Clone, Default)]
+pub struct NewSessionMarker<'a> {
+    pub marker_uid: &'a str,
+    pub ts_ms: Option<i64>,
+    pub message_id: Option<&'a str>,
+    pub parent_id: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub subkind: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub payload_json: Option<&'a str>,
+}
+
+/// Record one provider record the normalized event model cannot carry.
+///
+/// `kind` deliberately has no CHECK constraint. The table exists because both
+/// parsers used to drop what they could not classify, and a constraint would
+/// reintroduce exactly that: a provider shipping a new record type would turn
+/// an unclassified row into a failed insert. An unrecognized type is stored as
+/// `kind = "unknown"` with the provider-native type in `subkind` instead.
+///
+/// Returns how many rows the statement changed, so a caller counting what it
+/// recorded does not have to re-read the table to find out.
+pub fn insert_session_marker(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    marker: &NewSessionMarker<'_>,
+) -> Result<usize> {
+    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    let changed = conn.execute(
+        "INSERT INTO session_markers \
+         (source, session_id, marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, text, payload_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
+         ts_ms=excluded.ts_ms, message_id=excluded.message_id, parent_id=excluded.parent_id, \
+         turn_id=excluded.turn_id, kind=excluded.kind, subkind=excluded.subkind, \
+         text=excluded.text, payload_json=excluded.payload_json",
+        params![
+            source,
+            session_id,
+            marker.marker_uid,
+            marker.ts_ms,
+            marker.message_id,
+            marker.parent_id,
+            marker.turn_id,
+            marker.kind,
+            marker.subkind,
+            marker.text,
+            marker.payload_json,
+        ],
+    )?;
+    Ok(changed)
+}
 
 fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
     Ok(SessionToolCall {
@@ -5216,6 +5632,15 @@ mod tests {
                    ('claude', 's1', 'm3', 'fe-f', '/tmp/p/f.rs', 'Edit', 0, 1, NULL, NULL, NULL, NULL, NULL),
                    ('codex', 's1', 'm9', 'fe-x', '/tmp/p/z.rs', 'apply_patch', 1, 1, NULL, NULL, 150, NULL, NULL),
                    ('claude', 's2', 'm8', 'fe-y', '/tmp/q/a.rs', 'Edit', 1, 0, NULL, NULL, 150, NULL, NULL);
+            INSERT INTO session_markers (source, session_id, marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, payload_json)
+            VALUES ('claude', 's1', 'mk-a', 200, 'm1', NULL, NULL, 'compaction_boundary', 'compact_boundary', '{"tokens_before_compact":9000}'),
+                   ('claude', 's1', 'mk-b', 100, 'm1', NULL, NULL, 'summary', 'summary', NULL),
+                   ('claude', 's1', 'mk-c', 200, 'm2', 'tu-a', NULL, 'subagent_notification', 'subagent_completed', NULL),
+                   ('claude', 's1', 'mk-d', NULL, 'm2', NULL, NULL, 'unknown', 'zzz_future', NULL),
+                   ('claude', 's1', 'mk-e', 100, 'm3', NULL, NULL, 'unsupported_block', 'image', '{"bytes":42,"has_signature":false}'),
+                   ('claude', 's1', 'mk-f', NULL, 'm3', NULL, NULL, 'unsupported_block', 'document', NULL),
+                   ('codex', 's1', 'mk-x', 150, NULL, NULL, 't1', 'turn_diff', 'turn_diff', NULL),
+                   ('claude', 's2', 'mk-y', 150, 'm8', NULL, NULL, 'stream_error', 'stream_error', NULL);
             "#,
         )
         .unwrap();
@@ -5254,6 +5679,104 @@ mod tests {
             }
         }
         panic!("file edit pagination did not terminate");
+    }
+
+    fn walk_markers(conn: &Connection, source: &str, session_id: &str, limit: i64) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        for _ in 0..100 {
+            let page =
+                session_markers_page(conn, source, session_id, limit, cursor.as_ref()).unwrap();
+            assert!(page.markers.len() as i64 <= limit.clamp(1, 1_000));
+            ids.extend(page.markers.iter().map(|marker| marker.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return ids,
+            }
+        }
+        panic!("marker pagination did not terminate");
+    }
+
+    /// Markers share the evidence keyset, so they inherit the two properties
+    /// that keyset exists for: the undated tail sorts last rather than first,
+    /// and a walk at any page size yields exactly the same rows, once each, in
+    /// the same order as the unpaged read.
+    #[test]
+    fn session_marker_pages_scope_and_page_like_the_other_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_evidence(&conn);
+
+        let page = session_markers_page(&conn, "claude", "s1", 100, None).unwrap();
+        assert!(page
+            .markers
+            .iter()
+            .all(|marker| marker.source == "claude" && marker.session_id == "s1"));
+        assert_eq!(
+            page.markers
+                .iter()
+                .map(|marker| marker.marker_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mk-b", "mk-e", "mk-a", "mk-c", "mk-d", "mk-f"],
+            "dated markers come first in timestamp order; the undated tail follows"
+        );
+        assert!(page.next_cursor.is_none());
+        assert_eq!(
+            page.markers[0].kind, "summary",
+            "kind is stored verbatim, with no CHECK constraint to reject it"
+        );
+        assert_eq!(
+            session_markers_page(&conn, "codex", "s1", 100, None)
+                .unwrap()
+                .markers
+                .iter()
+                .map(|marker| marker.marker_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mk-x"],
+            "a native session id shared across providers must not interleave"
+        );
+
+        let whole = walk_markers(&conn, "claude", "s1", 100);
+        for limit in [1, 2, 3, 5, 6, 7] {
+            assert_eq!(
+                walk_markers(&conn, "claude", "s1", limit),
+                whole,
+                "a walk at page size {limit} must neither drop nor repeat a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_session_marker_upserts_on_its_deterministic_uid() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for kind in ["unknown", "compaction_boundary"] {
+            insert_session_marker(
+                &conn,
+                "claude",
+                "s1",
+                &NewSessionMarker {
+                    marker_uid: "u-1:marker",
+                    ts_ms: Some(7),
+                    message_id: Some("u-1"),
+                    parent_id: None,
+                    turn_id: None,
+                    kind,
+                    subkind: Some("compact_boundary"),
+                    text: None,
+                    payload_json: Some(r#"{"tokens_before_compact":9000}"#),
+                },
+            )
+            .unwrap();
+        }
+
+        let page = session_markers_page(&conn, "claude", "s1", 10, None).unwrap();
+        assert_eq!(page.markers.len(), 1, "a re-parse must not duplicate");
+        assert_eq!(
+            page.markers[0].kind, "compaction_boundary",
+            "a re-parse that classifies better must overwrite in place"
+        );
     }
 
     #[test]
@@ -5536,6 +6059,11 @@ mod tests {
             for (table, columns, index) in [
                 ("tool_calls", TOOL_CALL_COLUMNS, "idx_tool_calls_page_v2"),
                 ("file_edits", FILE_EDIT_COLUMNS, "idx_file_edits_page_v2"),
+                (
+                    "session_markers",
+                    SESSION_MARKER_COLUMNS,
+                    "idx_session_markers_page",
+                ),
             ] {
                 for (shape, after) in [
                     ("the first page", None),
@@ -5665,7 +6193,8 @@ mod tests {
             conn.execute_batch(
                 "DROP TRIGGER delete_session_markers;
                  DROP TABLE session_markers;
-                 DELETE FROM schema_migrations WHERE name = 'session_markers_v1';",
+                 DELETE FROM schema_migrations
+                 WHERE name IN ('session_markers_v1', 'session_markers_v2');",
             )
             .unwrap();
             assert!(
@@ -5678,30 +6207,27 @@ mod tests {
         assert!(schema_is_current(&conn).unwrap());
         insert_session_marker(
             &conn,
-            &SessionMarker {
-                source: "grok".into(),
-                session_id: "kept-1".into(),
-                marker_uid: "compaction:1.json".into(),
-                kind: "compaction_boundary".into(),
-                message_id: None,
+            "grok",
+            "kept-1",
+            &NewSessionMarker {
+                marker_uid: "compaction:1.json",
+                kind: "compaction_boundary",
                 ts_ms: Some(11),
-                text: None,
-                detail_json: None,
+                ..Default::default()
             },
         )
         .unwrap();
         // Re-reading the same evidence updates the row rather than adding one.
         insert_session_marker(
             &conn,
-            &SessionMarker {
-                source: "grok".into(),
-                session_id: "kept-1".into(),
-                marker_uid: "compaction:1.json".into(),
-                kind: "compaction_boundary".into(),
-                message_id: None,
+            "grok",
+            "kept-1",
+            &NewSessionMarker {
+                marker_uid: "compaction:1.json",
+                kind: "compaction_boundary",
                 ts_ms: Some(12),
-                text: Some("second read".into()),
-                detail_json: None,
+                text: Some("second read"),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -5723,6 +6249,1125 @@ mod tests {
         conn.execute("DELETE FROM sessions WHERE session_id = 'kept-1'", [])
             .unwrap();
         assert!(session_markers(&conn, "grok", "kept-1").unwrap().is_empty());
+    }
+
+    /// A database written by the v1 marker code must come forward with its
+    /// rows, not be served against columns it does not have.
+    ///
+    /// v1 shipped `(kind, ts_ms, text, detail_json)` under the marker name
+    /// `session_markers_v1`. That marker is still set on such a database, so
+    /// nothing about "has the table" distinguishes it from a current one --
+    /// which is exactly how a read-only handle came to be served a `SELECT`
+    /// naming `payload_json` against a table without it. `session_markers_v2`
+    /// is what tells the two apart, and the payload has to survive the trip:
+    /// dropping `detail_json` before copying it reads as a clean migration
+    /// while erasing every v1 marker's payload.
+    #[test]
+    fn v1_markers_migrate_forward_with_their_rows_and_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-markers.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, last_activity_ms) \
+                 VALUES ('v1-1', 'grok', 7)",
+                [],
+            )
+            .unwrap();
+            // Rebuild the exact v1 table and re-set only the v1 marker.
+            conn.execute_batch(
+                "DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES
+                     ('grok', 'v1-1', 'c1', 'compaction_boundary', 11, 'compacted',
+                      '{\"checkpoint\":1}'),
+                     ('grok', 'v1-1', 'p1', 'prompt_context', NULL, 'preamble', NULL);
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            assert!(
+                !schema_is_current(&conn).unwrap(),
+                "a v1 marker table must not be served read-only: the v1 marker is \
+                 set, so only session_markers_v2 can tell it from a current one"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let markers = session_markers(&conn, "grok", "v1-1").unwrap();
+        assert_eq!(
+            markers.len(),
+            2,
+            "both v1 rows must survive the migration, not just the shape"
+        );
+        // Dated first, undated last -- the paged order, through the wrapper.
+        assert_eq!(markers[0].marker_uid, "c1");
+        assert_eq!(markers[0].ts_ms, Some(11));
+        assert_eq!(markers[0].text.as_deref(), Some("compacted"));
+        assert_eq!(
+            markers[0].payload_json.as_deref(),
+            Some("{\"checkpoint\":1}"),
+            "detail_json must be carried into payload_json, not dropped with the column"
+        );
+        assert_eq!(markers[1].marker_uid, "p1");
+        assert_eq!(markers[1].ts_ms, None);
+        assert_eq!(markers[1].payload_json, None);
+        // The renamed column is gone, so nothing can read it by accident.
+        let detail_json_columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('session_markers') \
+                 WHERE name = 'detail_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail_json_columns, 0);
+        // A migrated table takes writes in the merged shape.
+        insert_session_marker(
+            &conn,
+            "grok",
+            "v1-1",
+            &NewSessionMarker {
+                marker_uid: "s1",
+                kind: "system",
+                ts_ms: Some(12),
+                message_id: Some("m1"),
+                text: Some("system preamble"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let markers = session_markers(&conn, "grok", "v1-1").unwrap();
+        assert_eq!(markers.len(), 3);
+        assert_eq!(
+            markers
+                .iter()
+                .find(|marker| marker.marker_uid == "s1")
+                .unwrap()
+                .message_id
+                .as_deref(),
+            Some("m1")
+        );
+    }
+
+    /// The same v1 migration, on a database whose delivery capture is live.
+    ///
+    /// The delivery triggers build their payload with a `json_object` over the
+    /// column list as it stood when they were created, so on a v1 database all
+    /// three name `detail_json`. SQLite validates dependent triggers when a
+    /// column is dropped, so `ALTER TABLE ... DROP COLUMN detail_json` fails
+    /// against them -- and it fails inside `open_db`, which means every open of
+    /// that database errors, not just the first. The migration therefore
+    /// retires the three triggers itself; `init_delivery_schema` recreates them
+    /// over the new column list later in the same open.
+    ///
+    /// The plain v1 test above cannot catch this: it opens a database whose
+    /// delivery schema was never initialised, so there are no triggers to
+    /// validate against and the drop succeeds.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn v1_markers_migrate_forward_on_a_database_with_live_delivery_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-delivery.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            // Rebuild the v1 table, then let the delivery schema build its
+            // triggers over that shape -- which is what a real v1 database has.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok', 'v1-d', 'c1', 'compaction_boundary', 11, 'compacted',
+                         '{\"checkpoint\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            let trigger: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
+                     AND name = 'delivery_session_markers_insert'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the v1 database must really have the trigger this test is about");
+            assert!(
+                trigger.contains("detail_json"),
+                "the setup is only a control if the trigger names the dropped column: {trigger}"
+            );
+        }
+
+        // The whole finding: without the trigger drop this `open_db` fails, and
+        // fails again on every retry, because nothing about it is one-shot.
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let markers = session_markers(&conn, "grok", "v1-d").unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0].payload_json.as_deref(),
+            Some("{\"checkpoint\":1}")
+        );
+        // The triggers came back over the new shape, not the old one. A
+        // recreated trigger still naming `detail_json` would deliver a column
+        // that no longer exists.
+        let trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
+                 AND name = 'delivery_session_markers_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delivery capture must be restored, not left dropped");
+        assert!(trigger.contains("payload_json"), "{trigger}");
+        assert!(!trigger.contains("detail_json"), "{trigger}");
+    }
+
+    /// Every marker for a session, not the first page of them.
+    ///
+    /// This wrapper's contract is "every marker recorded for one session", and
+    /// it delegates to the paged read, which clamps at 1,000 and hands back a
+    /// cursor. Calling it once and returning `.markers` silently truncates a
+    /// busier session and drops the cursor that would have said so -- a
+    /// complete-looking answer computed over part of the data, which is worse
+    /// than an error because nothing downstream can tell.
+    #[test]
+    fn session_markers_returns_every_marker_past_one_page() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let total = 1_002;
+        for index in 0..total {
+            insert_session_marker(
+                &conn,
+                "codex",
+                "busy",
+                &NewSessionMarker {
+                    marker_uid: &format!("m{index:04}"),
+                    ts_ms: Some(index as i64),
+                    kind: "unknown",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let markers = session_markers(&conn, "codex", "busy").unwrap();
+        assert_eq!(markers.len(), total, "every marker, not one page of them");
+        // Still one ordering, and still no duplicates across the page seam.
+        let uids: std::collections::HashSet<&str> =
+            markers.iter().map(|m| m.marker_uid.as_str()).collect();
+        assert_eq!(uids.len(), total, "a page boundary must not repeat a row");
+        assert_eq!(markers[0].marker_uid, "m0000");
+        assert_eq!(markers[total - 1].marker_uid, "m1001");
+        assert!(
+            markers
+                .windows(2)
+                .all(|pair| pair[0].ts_ms <= pair[1].ts_ms),
+            "the concatenated pages keep the paged order"
+        );
+    }
+
+    /// A v1 payload is bounded on the way in, not carried over verbatim.
+    ///
+    /// `payload_json` is documented as an allowlisted projection with strings
+    /// and containers bounded, and every kind written by the Claude and Codex
+    /// parsers goes through that bounder. The legacy column had no such
+    /// contract, so copying it across unchanged would leave rows that break the
+    /// promise the column makes -- in an upgraded database only, where nobody
+    /// would think to look for it.
+    #[test]
+    fn v1_payloads_are_bounded_by_the_migration_not_copied_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-huge.db");
+        let huge = "x".repeat(5_000);
+        let small = r#"{"checkpoint":1}"#;
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_markers \
+                 (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
+                 VALUES ('grok', 'v1-b', 'big', 'signals', 1, 'prose', ?)",
+                params![serde_json::json!({ "note": huge }).to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_markers \
+                 (source, session_id, marker_uid, kind, ts_ms, text, detail_json) \
+                 VALUES ('grok', 'v1-b', 'small', 'compaction_boundary', 2, 'prose', ?)",
+                params![small],
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let markers = session_markers(&conn, "grok", "v1-b").unwrap();
+        assert_eq!(markers.len(), 2);
+        let big = markers.iter().find(|m| m.marker_uid == "big").unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(big.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload["note"].as_str().unwrap().chars().count(),
+            128,
+            "the migrated payload must be bounded like every other one"
+        );
+        // Positive control: bounding must not rewrite a payload that already fits.
+        let unchanged = markers.iter().find(|m| m.marker_uid == "small").unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(unchanged.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "checkpoint": 1 }));
+        // The prose column is untouched by any of this.
+        assert_eq!(big.text.as_deref(), Some("prose"));
+    }
+
+    /// What a delivery destination receives for a migrated marker.
+    ///
+    /// The v1 capture triggers build their payload from the column list they
+    /// were created with, so while they are live they journal `detail_json`
+    /// and no `payload_json`. The migration's copy is an ordinary `UPDATE`, so
+    /// it fired them — a subscriber got an update in the *old* shape, and once
+    /// the triggers were rebuilt nothing ever journalled the migrated rows
+    /// again. A destination with an active job would never receive
+    /// `payload_json` for any marker that existed before the upgrade, and
+    /// nothing about the delivery would look wrong.
+    ///
+    /// So: retire the triggers before the copy rather than only before the
+    /// column drop, and journal the migrated rows explicitly afterwards, in the
+    /// new shape, exactly once.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn migrated_markers_are_delivered_in_the_new_shape_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-journal.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok', 'v1-j', 'c1', 'compaction_boundary', 11, 'compacted',
+                         '{\"checkpoint\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            // A destination is subscribed, or nothing is journalled at all and
+            // the test would pass over an empty table.
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM delivery_journal", []).unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT operation, payload FROM delivery_journal \
+                 WHERE kind = 'session_marker' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one journal row per migrated marker, in one shape: {rows:?}"
+        );
+        let (operation, payload) = &rows[0];
+        assert_eq!(operation, "upsert");
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            payload.get("payload_json").and_then(|v| v.as_str()),
+            Some("{\"checkpoint\":1}"),
+            "the destination must receive the migrated payload: {payload}"
+        );
+        assert!(
+            payload.get("detail_json").is_none(),
+            "and never the retired column: {payload}"
+        );
+    }
+
+    /// The common upgrade: a v1 database that has never had delivery at all.
+    ///
+    /// Delivery is opt-in, so its tables exist only if a delivery-enabled build
+    /// has opened this database. The migration runs inside `init_db` *before*
+    /// `init_delivery_schema`, so anything it writes to `delivery_journal`
+    /// names a table that may not exist yet -- and a statement against a
+    /// missing table fails when it is prepared, whatever its `WHERE` clause
+    /// says. That is a hard failure on open, for the most ordinary install
+    /// there is.
+    #[test]
+    fn a_v1_database_that_never_had_delivery_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-no-delivery.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','v1-nd','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            // Everything the delivery schema creates is removed, so the state
+            // is the self-consistent one a database only ever opened by builds
+            // without the delivery feature is in -- no journal, no jobs, no
+            // capture triggers. Enumerated rather than listed by hand, so this
+            // keeps matching the schema as it grows.
+            let objects: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT type, name FROM sqlite_master \
+                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for (kind, name) in objects {
+                if kind == "trigger" || kind == "table" || kind == "index" {
+                    conn.execute_batch(&format!("DROP {kind} IF EXISTS \"{name}\";"))
+                        .unwrap();
+                }
+            }
+            // The premise, asserted rather than assumed, and non-vacuous in
+            // both feature configurations: a build without delivery never
+            // creates these, and one with delivery has just had them removed.
+            let left: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "the premise: nothing of delivery is present");
+        }
+
+        let conn = open_db(&db_path).expect("a v1 database without delivery must still open");
+        let markers = session_markers(&conn, "grok", "v1-nd").unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
+    }
+
+    /// A build without the delivery feature must not silently swallow the debt.
+    ///
+    /// It runs this migration too -- the migration is not feature-gated, and
+    /// cannot be, since the column shape is not optional. It therefore drops
+    /// capture triggers it has no way to rebuild: the trigger DDL lives in the
+    /// delivery module, which is compiled out. Everything it writes afterwards,
+    /// including markers a sync adds later in the same process, is captured by
+    /// nothing.
+    ///
+    /// The flag is what survives that process. This build's whole job is to
+    /// leave it standing.
+    #[cfg(not(feature = "delivery"))]
+    #[test]
+    fn a_no_delivery_build_leaves_the_marker_journal_debt_for_a_build_that_can_pay_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-nodelivery-build.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','v1-nb','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        // The migration ran, so the rows are readable in the new shape...
+        assert!(schema_is_current(&conn).unwrap());
+        assert_eq!(session_markers(&conn, "grok", "v1-nb").unwrap().len(), 1);
+        // ...and the debt is still on the books for a build that can settle it.
+        assert!(
+            migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
+            "a build that cannot journal must leave the flag standing"
+        );
+    }
+
+    /// Settling that debt, from the state the build above leaves behind.
+    ///
+    /// Cross-feature cannot be exercised in one test binary, so this starts
+    /// from that build's output rather than running it: the table already
+    /// migrated, the capture triggers gone, the flag set, and -- the part that
+    /// matters -- a marker written *after* the migration, which no trigger saw.
+    /// A backfill that covered only the migrated rows would leave that one
+    /// unjournalled forever.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_delivery_open_settles_what_a_no_delivery_build_could_not_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("handover.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0)",
+                [],
+            )
+            .unwrap();
+            // What the other build left: triggers down, flag up, one migrated
+            // row and one written blind afterwards.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, payload_json)
+                 VALUES ('grok','hand','migrated','compaction_boundary','{\"c\":1}'),
+                        ('codex','hand','written-blind','stream_error',NULL);
+                 INSERT OR IGNORE INTO schema_migrations (name)
+                 VALUES ('session_markers_v2_journal_pending');
+                 DELETE FROM delivery_journal;",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let keys: Vec<String> = conn
+            .prepare(
+                "SELECT record_key FROM delivery_journal \
+                 WHERE kind = 'session_marker' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            2,
+            "both the migrated row and the one written while capture was off: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("written-blind")),
+            "{keys:?}"
+        );
+        assert!(keys.iter().any(|key| key.contains("migrated")), "{keys:?}");
+        assert!(
+            !migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
+            "a paid debt is cleared, or every open repeats it"
+        );
+
+        // Positive control: reopening a settled database journals nothing more.
+        let conn = open_db(&db_path).unwrap();
+        let again: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM delivery_journal WHERE kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, 2, "a cleared flag must not re-journal on every open");
+    }
+
+    /// The shape every upgraded install actually has.
+    ///
+    /// The v1 marker table this migration was written against was the one this
+    /// branch forked from. Main moved underneath it: #199 gave `session_markers`
+    /// `message_id` and `text` of its own, so a database written by current main
+    /// already carries three of the six columns the migration adds -- and an
+    /// `ALTER TABLE ... ADD COLUMN` for a column that is already there is an
+    /// error, not a no-op.
+    ///
+    /// So this starts from main's post-#199 DDL verbatim, with a populated row,
+    /// because that is the shape the next release upgrades from. It is not a
+    /// hypothetical older shape: it is the current one.
+    #[test]
+    fn a_post_199_marker_table_upgrades_to_the_v2_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("post-199.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 -- main's DDL after #199, column for column.
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     message_id TEXT,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     marker_uid TEXT NOT NULL,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, kind, message_id, ts_ms, text, detail_json, marker_uid)
+                 VALUES ('opencode','ses_compact','compaction_boundary','msg_uc',
+                         1776999003000,'compacted','{\"auto\":true}','part:prt_uc');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).expect("the upgrade must not fail the open");
+        assert!(
+            schema_is_current(&conn).unwrap(),
+            "and it must leave the database current"
+        );
+        let markers = session_markers(&conn, "opencode", "ses_compact").unwrap();
+        assert_eq!(markers.len(), 1, "no row may be lost or duplicated");
+        let marker = &markers[0];
+        // Every column main populated survives...
+        assert_eq!(marker.kind, "compaction_boundary");
+        assert_eq!(marker.message_id.as_deref(), Some("msg_uc"));
+        assert_eq!(marker.ts_ms, Some(1776999003000));
+        assert_eq!(marker.text.as_deref(), Some("compacted"));
+        // ...and the blob arrives in the column that replaced it.
+        assert_eq!(marker.payload_json.as_deref(), Some("{\"auto\":true}"));
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('session_markers') \
+                 WHERE name = 'detail_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "the old column must be gone, not merely unused");
+
+        // Positive control: a second open is a no-op rather than a re-run.
+        let conn = open_db(&db_path).expect("reopening a migrated database");
+        assert_eq!(
+            session_markers(&conn, "opencode", "ses_compact")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// An in-flight consumer keeps the shape it was promised.
+    ///
+    /// A bootstrap or an export fixes a rowid cutoff and then reads its pages
+    /// over time. The capture triggers keep that view immutable by writing the
+    /// OLD row into `delivery_shadow` whenever a row inside an unread bound
+    /// changes -- so a resumed consumer reads the preimage, not whatever the
+    /// row became.
+    ///
+    /// This migration retires those triggers before it rewrites anything, so
+    /// nothing shadows the rows it rewrites. A consumer whose cutoff predates
+    /// the shape change would resume and read `payload_json` where its
+    /// snapshot promised `detail_json` -- and unlike the journal, this cannot
+    /// be repaired afterwards: once the column is dropped the preimage does not
+    /// exist anywhere to reconstruct from.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn an_unfinished_consumer_keeps_the_marker_preimage_it_was_promised() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("preimage.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','pre','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            // A job part way through its bootstrap, whose marker bound still
+            // covers this row: exactly the consumer the shadow exists for.
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor, bootstrap_done, \
+                  bootstrap_kind, bootstrap_rowid) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0,0,0,0)",
+                [],
+            )
+            .unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('j1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM delivery_shadow", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "the premise: nothing shadowed yet"
+            );
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let preimage: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM delivery_shadow \
+                 WHERE job_id = 'j1' AND kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let preimage = preimage.expect("the row inside an unread bound must be shadowed");
+        let preimage: serde_json::Value = serde_json::from_str(&preimage).unwrap();
+        assert_eq!(
+            preimage.get("detail_json").and_then(|v| v.as_str()),
+            Some("{\"c\":1}"),
+            "a resumed consumer must read the shape its snapshot promised: {preimage}"
+        );
+
+        // Positive control: the live row really did move on, so this is a
+        // preimage rather than a copy of the current state.
+        let markers = session_markers(&conn, "grok", "pre").unwrap();
+        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
+        assert!(preimage.get("payload_json").is_none(), "{preimage}");
+    }
+
+    /// The preimage sweep must not crash on a database it cannot serve.
+    ///
+    /// `shadow_preimages` decides delivery is ready by looking for
+    /// `delivery_shadow`, `delivery_bootstrap_bounds` and `delivery_jobs` --
+    /// and then builds its statement around `CONSUMERS`, which also reads
+    /// `history_exports`. The three tables are created in the same batch as
+    /// the fourth today, so a database carrying them without it is an older
+    /// delivery-enabled install; and this runs from `init_db`, *before*
+    /// `init_schema` would put the missing table back.
+    ///
+    /// SQLite resolves table names when a statement is prepared, so the
+    /// missing table is not a degraded sweep -- it is a failed open, every
+    /// open, for as long as the database exists. Exactly the crash the probe
+    /// was added for, reached through the one table the probe forgot.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_delivery_database_missing_history_exports_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = |conn: &Connection| {
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','old','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        };
+
+        // An older delivery-enabled install: every delivery table this sweep
+        // probes for, and not the one it forgot to probe for.
+        let older = dir.path().join("older-delivery.db");
+        {
+            let conn = open_db(&older).unwrap();
+            v1(&conn);
+            // The table, and the capture triggers that name it -- an install
+            // from before `history_exports` existed had neither, and leaving
+            // the triggers behind would only prove that a trigger cannot read
+            // a table that is gone, which is not the claim under test.
+            let dependents: Vec<String> = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                     AND sql LIKE '%history_exports%'",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                !dependents.is_empty(),
+                "the premise: some trigger does name it"
+            );
+            for trigger in dependents {
+                conn.execute_batch(&format!("DROP TRIGGER {trigger};"))
+                    .unwrap();
+            }
+            conn.execute_batch("DROP TABLE history_exports;").unwrap();
+            let probed: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                     ('delivery_shadow','delivery_bootstrap_bounds','delivery_jobs',\
+                      'history_exports')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                probed, 3,
+                "the premise: the three tables the probe asks about, and not the fourth"
+            );
+        }
+        let conn = open_db(&older).expect("a missing history_exports must not fail the open");
+        assert_eq!(
+            session_markers(&conn, "grok", "old").unwrap().len(),
+            1,
+            "and the migration must still have run"
+        );
+
+        // Positive control: the same database with all four tables and an
+        // in-flight export still takes the preimage, so this fixed the crash
+        // rather than switching the sweep off.
+        let whole = dir.path().join("whole-delivery.db");
+        {
+            let conn = open_db(&whole).unwrap();
+            v1(&conn);
+            init_delivery_schema(&conn).unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, selection_json, limits_json, cutoff, bootstrap_kind, bootstrap_rowid, \
+                  bootstrap_done, expires_at_ms, cursor) \
+                 VALUES ('e1','{}','{}',0,0,0,0,?,'c1')",
+                params![now_ms() + 3_600_000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&whole).unwrap();
+        let preimage: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM delivery_shadow \
+                 WHERE job_id = 'e1' AND kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let preimage = preimage.expect("an unexpired export is still owed its preimage");
+        assert!(preimage.contains("detail_json"), "{preimage}");
+    }
+
+    /// An export is a consumer too, and a build that cannot shadow must say so.
+    ///
+    /// `CONSUMERS` -- the set every capture trigger serves -- is live delivery
+    /// jobs **union** unexpired file exports. The refusal in a build without
+    /// the delivery feature asked only about jobs, so a database whose only
+    /// in-flight consumer was an export migrated happily and dropped
+    /// `detail_json` with no preimage taken. The export then resumes and reads
+    /// v2 payloads where its cutoff promised v1 -- the same unrecoverable loss
+    /// the refusal exists to prevent, reached by the other half of the union.
+    #[cfg(not(feature = "delivery"))]
+    #[test]
+    fn a_no_delivery_build_refuses_to_migrate_under_an_unfinished_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("export-consumer.db");
+        let v1 = |conn: &Connection| {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','exp','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        };
+        // The delivery tables as a delivery-enabled build would have left them,
+        // built here by hand because this build cannot create them.
+        let delivery_tables = "
+            CREATE TABLE IF NOT EXISTS delivery_jobs (
+                id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                bootstrap_kind INTEGER NOT NULL DEFAULT 0,
+                bootstrap_rowid INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS history_exports (
+                id TEXT PRIMARY KEY, bootstrap_kind INTEGER NOT NULL DEFAULT 0,
+                bootstrap_rowid INTEGER NOT NULL DEFAULT 0,
+                bootstrap_done INTEGER NOT NULL DEFAULT 0,
+                expires_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS delivery_bootstrap_bounds (
+                job_id TEXT NOT NULL, kind TEXT NOT NULL, max_rowid INTEGER NOT NULL,
+                PRIMARY KEY(job_id,kind)
+            );";
+
+        {
+            let conn = open_db(&db_path).unwrap();
+            v1(&conn);
+            conn.execute_batch(delivery_tables).unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM session_markers", [], |row| row.get(0))
+                .unwrap();
+            // No delivery job at all -- only an unexpired export still reading.
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
+                 VALUES ('e1', 0, 0, 0, ?)",
+                params![now_ms() + 3_600_000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',?)",
+                params![rowid],
+            )
+            .unwrap();
+        }
+        let refused =
+            open_db(&db_path).expect_err("an in-flight export must not be migrated out from under");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("delivery"),
+            "the refusal must name the remedy: {message}"
+        );
+        // And it must not have destroyed anything on the way to refusing.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('session_markers') \
+                 WHERE name = 'detail_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "refusing must leave the old column in place");
+
+        // Positive control: the same build, the same tables, but the export has
+        // expired -- nobody is owed a preimage, so it migrates normally.
+        let other = dir.path().join("expired-export.db");
+        {
+            let conn = open_db(&other).unwrap();
+            v1(&conn);
+            conn.execute_batch(delivery_tables).unwrap();
+            conn.execute(
+                "INSERT INTO history_exports \
+                 (id, bootstrap_kind, bootstrap_rowid, bootstrap_done, expires_at_ms) \
+                 VALUES ('e1', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_bootstrap_bounds(job_id, kind, max_rowid) \
+                 VALUES ('e1','session_marker',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_db(&other).expect("an expired export owes nothing");
+        assert_eq!(session_markers(&conn, "grok", "exp").unwrap().len(), 1);
+    }
+
+    /// The unpaged marker read is one snapshot, not one per page.
+    ///
+    /// `session_markers` walks the keyset cursor across several statements to
+    /// return every marker. With no enclosing transaction each page reads its
+    /// own snapshot, so a sync writing between them can move a row's `ts_ms` --
+    /// part of the keyset -- and the walk hands back a marker it has already
+    /// returned. The caller gets a list that existed at no instant.
+    ///
+    /// `session_markers_page` keeps its old behaviour: a caller paging across
+    /// time is deliberately reading the database as it changes.
+    ///
+    /// The write has to land *between* two pages or it proves nothing -- one
+    /// that commits before the walk starts is simply an earlier snapshot,
+    /// which every implementation reports consistently. So the first page's
+    /// cost is measured in progress ticks, and the write is injected just past
+    /// it. Same technique as
+    /// `a_user_turn_page_reads_one_snapshot_even_while_a_sync_writes`.
+    #[test]
+    fn the_unpaged_marker_read_stays_on_one_snapshot_while_a_sync_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("snapshot.db");
+        let total = 1_200usize;
+        {
+            let conn = open_db(&db_path).unwrap();
+            for index in 0..total {
+                insert_session_marker(
+                    &conn,
+                    "codex",
+                    "busy",
+                    &NewSessionMarker {
+                        marker_uid: &format!("m{index:05}"),
+                        ts_ms: Some(index as i64),
+                        kind: "unknown",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        // What one page costs, measured against the same data.
+        let page_ticks = {
+            let probe = open_db(&db_path).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            probe.progress_handler(
+                1,
+                Some(move || {
+                    let _ = tx.send(());
+                    false
+                }),
+            );
+            let page = session_markers_page(&probe, "codex", "busy", 1_000, None).unwrap();
+            assert_eq!(page.markers.len(), 1_000, "the fixture must span two pages");
+            probe.progress_handler(0, None::<fn() -> bool>);
+            let mut ticks = 0u32;
+            while rx.try_recv().is_ok() {
+                ticks += 1;
+            }
+            ticks
+        };
+        assert!(page_ticks > 0, "a page must cost some ticks");
+
+        // From just past the first page onwards, move an already-returned row
+        // to the far end of the keyset. The statement is idempotent, so it
+        // does not matter how many ticks fire; what matters is that the first
+        // one falls between the two pages.
+        let writer_path = db_path.clone();
+        let tick = std::sync::atomic::AtomicU32::new(0);
+        let conn = open_db(&db_path).unwrap();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                // Exactly once, on the first tick past the first page. Opening
+                // a connection on every later tick would be the same write and
+                // would take minutes to do nothing.
+                if tick.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == page_ticks {
+                    let writer = Connection::open(&writer_path).unwrap();
+                    let _ = writer.execute(
+                        "UPDATE session_markers SET ts_ms = 99999 \
+                         WHERE source = 'codex' AND session_id = 'busy' \
+                           AND marker_uid = 'm00001'",
+                        [],
+                    );
+                }
+                false
+            }),
+        );
+        let markers = session_markers(&conn, "codex", "busy").unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+
+        let uids: std::collections::HashSet<&str> =
+            markers.iter().map(|m| m.marker_uid.as_str()).collect();
+        assert_eq!(
+            uids.len(),
+            markers.len(),
+            "no marker may be returned twice by one walk"
+        );
+        assert_eq!(markers.len(), total, "and none may be stepped over");
     }
 
     /// The project-identity columns, marker and index reach a database that

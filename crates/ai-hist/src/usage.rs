@@ -1364,6 +1364,7 @@ mod tests {
             is_meta: None,
             turn_id: None,
             request_span: None,
+            raw_kind: None,
         }
     }
 

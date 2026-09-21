@@ -40,6 +40,42 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- Stop dropping the record types neither parser could normalize. A new
+  `session_markers` table records compaction and summary boundaries, provider
+  `system` rows, non-text content blocks (`image`, `document`,
+  `redacted_thinking`, thinking `signature`s), tool-replacement metadata, and
+  Codex lifecycle events (`compacted`, `turn_diff`, `stream_error`,
+  `*_begin`, `task_started`/`task_complete`, review mode, `subagent_*`,
+  encrypted `reasoning`). A provider type no classifier knows is stored as
+  `kind = "unknown"` carrying its verbatim type in `subkind` — the table has
+  no CHECK constraint, because a constraint would turn tomorrow's unknown
+  record back into today's silent drop. `payload_json` is always bounded —
+  every string at 128 characters and every container at 32 entries,
+  recursively — so an image or document block contributes its size, never its
+  bytes. Where this parser classifies the record it names the fields it keeps;
+  where the payload is a provider's own document whose keys are theirs (Grok's
+  `signals` sidecar, a compaction checkpoint) the document is bounded whole,
+  because enumerating their keys would silently drop whatever they add next. Read one bounded page with
+  `session_markers_page(conn, source, session_id, limit, after)`, which uses
+  the same `(ts_ms IS NULL, ts_ms, id)` keyset as tool calls and file edits,
+  or, from an embedder on the crate's default features,
+  `SessionStore::session_markers_page` — a marker an embedder can sync and
+  cannot read back is a write-only table for everyone outside this workspace.
+  `SessionEvent` gains `raw_kind`, the provider-native record or block type an
+  event came from, returned by both `session_events` and `session_events_page`
+  and carried by the normalized source-evidence row contract, so a
+  `tool_result` synthesized from a `system` subagent notification stays
+  distinguishable from one that came from a `tool_result` content block.
+  Grok's own markers, added separately, move onto this model: its `detail_json`
+  becomes `payload_json` and its readable `text` keeps a column of its own, so
+  one `kind` reads the same whichever provider wrote it. A database written by
+  the first marker shape is migrated forward by `session_markers_v2`, which
+  copies every payload across before the old column is dropped.
+  `HYDRATION_PARSER_VERSION` is 7 and the global sync state generations advance
+  to `claude_sessions_v4` / `codex_rollouts_v6`, so an existing install re-reads
+  each transcript once — a marker exists nowhere but the transcript, and the
+  parser version alone only invalidates targeted hydration checkpoints.
+  napi/TS/MCP exposure is not included.
 - Record per-tool-result fidelity on `session_events`: `tool_use_id`,
   `payload_bytes`, `payload_truncated`, `payload_hash`, `call_index`,
   `event_index`, `result_status`, `event_source`, `error_signal`,

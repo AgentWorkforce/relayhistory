@@ -1,8 +1,8 @@
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_db,
-    sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, SessionLocation, SessionMarker,
-    SessionScope,
+    sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
+    SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -1025,7 +1025,7 @@ impl Drop for SyncStateLock {
 /// once per source against the whole state map, and `codex_rollouts_v4` is still
 /// *read* by this version to seed the v5 migration. Sweeping unconditionally
 /// would drop it during an earlier source's checkpoint, before
-/// `sync_codex_rollouts` has written `codex_rollouts_v5`; a crash or an
+/// `sync_codex_rollouts` has written `codex_rollouts_v6`; a crash or an
 /// overlapping sync in that window would find neither map and force a full
 /// re-read of the archive. Requiring the successor in the same write closes that
 /// gap: the old map only leaves disk once its replacement is on the way there.
@@ -1242,10 +1242,12 @@ fn forget_unobserved_paths(
 }
 
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
-    ("codex_rollouts", "codex_rollouts_v5"),
-    ("codex_rollout_user_messages_v2", "codex_rollouts_v5"),
-    ("codex_rollouts_v3", "codex_rollouts_v5"),
-    ("codex_rollouts_v4", "codex_rollouts_v5"),
+    ("codex_rollouts", "codex_rollouts_v6"),
+    ("codex_rollout_user_messages_v2", "codex_rollouts_v6"),
+    ("codex_rollouts_v3", "codex_rollouts_v6"),
+    ("codex_rollouts_v4", "codex_rollouts_v6"),
+    ("codex_rollouts_v5", "codex_rollouts_v6"),
+    ("claude_sessions_v3", "claude_sessions_v4"),
     ("cursor", CURSOR_SYNC_STATE_KEY),
     ("cursor_events_v1", CURSOR_SYNC_STATE_KEY),
     ("grok_sessions", GROK_SYNC_STATE_KEY),
@@ -2032,12 +2034,19 @@ fn sync_codex(conn: &Connection, state: &mut Map<String, Value>, root: &Path) ->
 ///
 /// Replaces the earlier split walks (state keys `codex_rollouts` and
 /// `codex_rollout_user_messages_v2`) with one stamp map. The current
-/// `codex_rollouts_v5` generation repairs the user-message parser change
-/// and reclassifies existing `source.subagent` markers by re-reading unchanged
-/// files once. Its per-file record carries the session id and classification so
-/// a wiped database or an older standalone-guardian classification forces the
-/// necessary re-ingestion even when the file stamp is unchanged. (session cwds,
-/// session branches, prompts inserted).
+/// `codex_rollouts_v6` generation adds `session_markers`: lifecycle,
+/// compaction and streaming-failure lines that earlier versions parsed and
+/// discarded. There is no way to recover a marker from a database -- only from
+/// the rollout -- so unlike the v4 -> v5 upgrade, which could invalidate just
+/// the entries it knew were stale, this one has to re-read every file once.
+/// The map therefore starts empty and `codex_rollouts_v5` is retired, rather
+/// than being carried forward with stamps that would skip exactly the files
+/// that need re-reading. Earlier generations repaired the user-message parser
+/// and reclassified `source.subagent` markers. Each per-file record carries the
+/// session id and classification so a wiped database or an older
+/// standalone-guardian classification forces the necessary re-ingestion even
+/// when the file stamp is unchanged. (session cwds, session branches, prompts
+/// inserted).
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
 /// Reconcile the catalog registration for a locally observed subagent.
@@ -2125,26 +2134,29 @@ fn sync_codex_rollouts(
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
+    let has_v6 = state.contains_key("codex_rollouts_v6");
     let has_v5 = state.contains_key("codex_rollouts_v5");
     let has_v4 = state.contains_key("codex_rollouts_v4");
-    // v4 already repaired user-message parsing. Its only stale knowledge is
-    // the source.subagent classification, so a v4->v5 upgrade must not
-    // re-read the complete archive: invalidate only marked subagent entries.
-    let repair_user_messages = !has_v5 && !has_v4;
+    // v4 and v5 both already repaired user-message parsing, so an upgrade from
+    // either must not redo it; only a database that predates them needs it.
+    let repair_user_messages = !has_v6 && !has_v5 && !has_v4;
+    // Deliberately seeded from v6 alone. Carrying a v5 map forward would keep
+    // a matching stamp for every rollout, and the fast path below would then
+    // skip precisely the unchanged files whose markers are missing -- an
+    // upgrade that reports a clean, fully-synced run and writes nothing.
     let mut seen = state
-        .get("codex_rollouts_v5")
-        .or_else(|| state.get("codex_rollouts_v4"))
+        .get("codex_rollouts_v6")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    if !has_v5 && has_v4 {
-        seen.retain(|_, record| record.get("subagent").and_then(Value::as_bool) != Some(true));
-    }
     // Superseded stamp maps from the split-walk era; keeping them would carry
-    // three path->stamp maps over the same 2K-file tree in .sync-state.json.
+    // several path->stamp maps over the same 2K-file tree in .sync-state.json.
+    // The in-memory removes cannot reach disk on their own -- see
+    // RETIRED_SYNC_STATE_KEYS, which is what actually sweeps them.
     state.remove("codex_rollouts");
     state.remove("codex_rollout_user_messages_v2");
     state.remove("codex_rollouts_v4");
+    state.remove("codex_rollouts_v5");
     let backfill_fidelity = fidelity_backfill_pending(state, CODEX_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CODEX_RAW_MESSAGE_FACTS_KEY);
     // A root the stamp map has entries for but whose rollouts this run cannot
@@ -2183,7 +2195,7 @@ fn sync_codex_rollouts(
         // question is asked per path, not per root.
         if known_here {
             let missing = unobserved_known_paths(&seen, &root, &rollouts);
-            if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v5", missing) {
+            if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v6", missing) {
                 walked_every_known_root = false;
             }
         }
@@ -2241,7 +2253,7 @@ fn sync_codex_rollouts(
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
                     Some(id)
-                        if codex_session_events_exist(conn, id)?
+                        if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
                                 && tool_results_lack_fidelity(conn, "codex", id)?)
                             && !(backfill_raw_facts
@@ -2368,10 +2380,10 @@ fn sync_codex_rollouts(
     // Only the unreadable rollouts the state already knew about count against
     // the pass; one it never indexed has nothing to repair.
     unreadable.retain(|key| seen.contains_key(key));
-    if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v5", unreadable) {
+    if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v6", unreadable) {
         walked_every_known_root = false;
     }
-    state.insert("codex_rollouts_v5".to_string(), Value::Object(seen));
+    state.insert("codex_rollouts_v6".to_string(), Value::Object(seen));
     if walked_every_known_root {
         record_fidelity_backfill(state, CODEX_FIDELITY_GENERATION_KEY);
     }
@@ -2517,6 +2529,28 @@ fn grok_catalog_row_exists(conn: &Connection, session_id: &str) -> Result<bool> 
 fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
+        params![source, session_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+/// Whether a session has any evidence this parser wrote, of any kind.
+///
+/// Not just `session_events`: a lifecycle-only rollout -- one that started,
+/// streamed an error and never produced a message -- writes markers and no
+/// events. Asking only about events answers "nothing indexed" forever for
+/// those, so the stamp fast path re-reads and re-upserts the file on every
+/// sync and the cost never converges. Nothing is lost by that, which is why it
+/// survived review once; it is pure waste that grows with the archive.
+fn codex_session_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    Ok(session_events_exist(conn, "codex", session_id)?
+        || session_markers_exist(conn, "codex", session_id)?)
+}
+
+fn session_markers_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source = ? AND session_id = ? LIMIT 1)",
         params![source, session_id],
         |row| row.get(0),
     )?;
@@ -3055,6 +3089,15 @@ pub(crate) fn ingest_codex_rollout(
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut line_index = 0usize;
+    // What to record if the line being processed turns out to write nothing,
+    // and the row count to measure that against.
+    //
+    // The check runs at the top of the *next* iteration rather than at the end
+    // of this one, because the arms below exit through a dozen `continue`s and
+    // a tail check would be skipped by every one of them -- which is the exact
+    // shape of the bug this exists to prevent.
+    let mut unwritten_line: Option<UnwrittenCodexLine> = None;
+    let mut changes_before_line = conn.total_changes();
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -3089,7 +3132,64 @@ pub(crate) fn ingest_codex_rollout(
         }
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
-        if let Some(message) = human_messages.observe(&value) {
+        // Settle the previous line before starting this one. `total_changes`
+        // is SQLite's own count of rows written on this connection, so this
+        // measures what the arms actually did rather than trusting a list of
+        // what they are supposed to do.
+        flush_unwritten_codex_line(
+            conn,
+            session_id,
+            &mut unwritten_line,
+            conn.total_changes() == changes_before_line,
+        )?;
+        changes_before_line = conn.total_changes();
+        // A state-only line is never registered: it writes no row by design,
+        // and the allocation would land on the highest-volume lines in the file.
+        unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
+            UnwrittenCodexLine {
+                index,
+                ts_ms,
+                subkind: if payload_type.is_empty() {
+                    line_type.to_string()
+                } else {
+                    payload_type.to_string()
+                },
+                turn_id: payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }
+        });
+        // Lifecycle, compaction, streaming-failure and begin-side tool lines
+        // are not messages, so none of the arms below can hold them. Classify
+        // every line once, here, and keep whatever the event model drops.
+        if let Some(draft) = codex_marker_for_event(line_type, payload_type, payload) {
+            let marker_uid = format!("{index}:marker");
+            insert_session_marker(
+                conn,
+                "codex",
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &marker_uid,
+                    ts_ms: (ts_ms != 0).then_some(ts_ms),
+                    message_id: payload_str("id"),
+                    parent_id: draft.parent_id.as_deref(),
+                    turn_id: draft.turn_id.as_deref(),
+                    kind: draft.kind,
+                    subkind: draft.subkind.as_deref(),
+                    text: None,
+                    payload_json: draft.payload_json.as_deref(),
+                },
+            )?;
+        }
+        let human_outcome = human_messages.observe(&value);
+        if human_outcome == codex::HumanMessageOutcome::Suppressed {
+            // The mirrored encoding of the turn just stored. Its twin wrote
+            // the row, so this line is accounted for even though it writes
+            // nothing itself -- the one case where the exemption is earned.
+            unwritten_line = None;
+        }
+        if let codex::HumanMessageOutcome::Stored(message) = human_outcome {
             let suffix = match message.format {
                 codex::HumanMessageFormat::EventMessage => "user_message",
                 codex::HumanMessageFormat::ResponseItem => "response_item_user_message",
@@ -3597,6 +3697,12 @@ pub(crate) fn ingest_codex_rollout(
             _ => {}
         }
     }
+    flush_unwritten_codex_line(
+        conn,
+        session_id,
+        &mut unwritten_line,
+        conn.total_changes() == changes_before_line,
+    )?;
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
@@ -3638,6 +3744,99 @@ pub(crate) fn ingest_codex_rollout(
         Settle::EndOfFile,
     )?;
     Ok(outcome)
+}
+
+/// One Codex rollout line that has not yet been shown to write anything.
+struct UnwrittenCodexLine {
+    index: usize,
+    ts_ms: i64,
+    subkind: String,
+    turn_id: Option<String>,
+}
+
+/// Record a line that claimed to be modeled and then stored nothing.
+///
+/// Membership in [`codex_payload_is_modeled`] is a claim that an arm stores
+/// the line, but every one of those arms can write nothing for a payload that
+/// is empty or the wrong shape -- a blank `agent_message`, a `*_end` with no
+/// `call_id`. Trusting the claim fails unsafe: the line disappears. Measuring
+/// what was written fails safe: at worst a redundant marker.
+fn flush_unwritten_codex_line(
+    conn: &Connection,
+    session_id: &str,
+    line: &mut Option<UnwrittenCodexLine>,
+    wrote_nothing: bool,
+) -> Result<()> {
+    let Some(line) = line.take() else {
+        return Ok(());
+    };
+    if !wrote_nothing {
+        return Ok(());
+    }
+    let marker_uid = format!("{}:marker", line.index);
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (line.ts_ms != 0).then_some(line.ts_ms),
+            message_id: None,
+            parent_id: None,
+            turn_id: line.turn_id.as_deref(),
+            kind: "unknown",
+            subkind: Some(&line.subkind),
+            text: None,
+            payload_json: None,
+        },
+    )?;
+    Ok(())
+}
+
+/// Codex lines that legitimately write no row of their own.
+///
+/// These are state updates, not records, and their information is stored
+/// elsewhere: `session_meta` and `turn_context` populate the session catalog,
+/// `token_count` is folded into the adjacent assistant event's `token_json`,
+/// `thread_settings_applied` only carries the model forward, a `*_delta` is a
+/// fragment of an event recorded whole, and an assistant `message` is the
+/// mirrored twin of the `agent_message` that stores the text.
+///
+/// A *user* message is deliberately not on this list. The deduplicator stores
+/// one row for Codex's two representations of a turn, but only when it accepts
+/// the turn -- it refuses blank text, control wrappers, and content with no
+/// `input_text` part, and an exemption by type alone then swallowed those
+/// lines. The earned case, a mirrored twin, is handled at the call site, which
+/// knows that a row really was written.
+///
+/// This list is the inverse of [`codex_payload_is_modeled`] in the way that
+/// matters: a wrong entry here costs a redundant marker, where a wrong entry
+/// there costs a vanished line.
+fn codex_line_is_state_only(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> bool {
+    match line_type {
+        "session_meta" | "turn_context" => true,
+        "event_msg" => {
+            matches!(payload_type, "token_count" | "thread_settings_applied")
+                || payload_type.ends_with("_delta")
+        }
+        "response_item" => {
+            // An *assistant* `message` is the mirrored twin of the readable
+            // `agent_message` event, which stores the text. A `user` message
+            // is not exempt by type: the deduplicator stores it only when it
+            // accepts it, and it refuses blank text, control wrappers and
+            // content with no `input_text` part. Those are settled by
+            // measurement instead, and a role this does not recognize falls
+            // through to measurement too -- the safe direction.
+            (payload_type == "message"
+                && payload.get("role").and_then(Value::as_str) == Some("assistant"))
+                || payload_type.ends_with("_delta")
+        }
+        _ => false,
+    }
 }
 
 /// Whether the pass that is resolving buffered results knows the turn is over.
@@ -3824,16 +4023,24 @@ fn sync_claude_session_metadata(
     if !root.exists() {
         return Ok(());
     }
-    // The v3 key forces one full re-scan on upgrade so exact remote/local ids
-    // are cached for bounded post-discovery correlation. The earlier v2 pass
-    // healed sidechains that had been attributed to their parent.
+    // The v4 key forces one full re-scan on upgrade so every transcript passes
+    // through the marker parser once. A marker exists nowhere but the
+    // transcript, and the skip below is satisfied by a matching stamp plus any
+    // pre-existing events, so carrying the v3 map forward would leave an
+    // upgraded install with no markers at all while every sync reported
+    // success. v3 is retired rather than seeded for exactly that reason.
+    // The earlier v3 pass cached exact remote/local ids for bounded
+    // post-discovery correlation; v2 healed sidechains attributed to a parent.
     let mut session_state = state
-        .get("claude_sessions_v3")
+        .get("claude_sessions_v4")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // These in-memory removes cannot reach disk on their own; RETIRED_SYNC_STATE_KEYS
+    // is what sweeps a superseded map.
     state.remove("claude_sessions");
     state.remove("claude_sessions_v2");
+    state.remove("claude_sessions_v3");
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     // The first read failure, returned once the in-memory state has been
     // brought up to date. Continuing past it indexes the rest of the tree,
@@ -3849,7 +4056,7 @@ fn sync_claude_session_metadata(
     let transcripts = collect_matching_files(root, "", "jsonl")?;
     let missing = unobserved_known_paths(&session_state, root, &transcripts);
     let mut walked_every_known_root =
-        forget_unobserved_paths(state, &mut session_state, "claude_sessions_v3", missing);
+        forget_unobserved_paths(state, &mut session_state, "claude_sessions_v4", missing);
     // Transcripts this run enumerated and then could not read. Only the ones
     // the state already knew about count against the pass; one that was never
     // indexed has no rows to backfill.
@@ -3968,11 +4175,11 @@ fn sync_claude_session_metadata(
         }
     }
     unreadable.retain(|key| session_state.contains_key(key));
-    if !forget_unobserved_paths(state, &mut session_state, "claude_sessions_v3", unreadable) {
+    if !forget_unobserved_paths(state, &mut session_state, "claude_sessions_v4", unreadable) {
         walked_every_known_root = false;
     }
     state.insert(
-        "claude_sessions_v3".to_string(),
+        "claude_sessions_v4".to_string(),
         Value::Object(session_state),
     );
     if walked_every_known_root {
@@ -4019,15 +4226,28 @@ fn claude_sync_stamp(path: &Path) -> Result<String> {
 /// re-reads the file.
 fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
     let locator = path.to_string_lossy();
+    // Markers count, for the same reason they count in the two session
+    // probes: a sidecar whose records the event model cannot carry -- a
+    // compaction boundary, a system row, a non-text block -- indexes markers
+    // and no events. Asking only about events reads that as "this file left
+    // nothing behind", so an unchanged sidecar is re-parsed on every sync
+    // forever while the sync reports itself perfectly normal.
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1
             FROM session_relationships r
             WHERE r.source = 'claude' AND r.evidence_locator = ?
-              AND EXISTS(
-                SELECT 1 FROM session_events e
-                WHERE e.source = 'claude'
-                  AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+              AND (
+                EXISTS(
+                  SELECT 1 FROM session_events e
+                  WHERE e.source = 'claude'
+                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
+                OR EXISTS(
+                  SELECT 1 FROM session_markers m
+                  WHERE m.source = 'claude'
+                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                )
               )
             LIMIT 1
         )",
@@ -4227,6 +4447,14 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
     Ok(lacking != 0)
 }
 
+/// Whether this transcript has left any evidence behind, of any kind.
+///
+/// Not just `session_events`, for the same reason the Codex probe counts
+/// markers: a transcript can store only markers -- a summary, a compaction
+/// boundary, an image-only turn, a system row -- and asking about events alone
+/// answers "nothing indexed" forever for those, so the stamp fast path
+/// re-reads and re-upserts an unchanged file on every sync. Nothing is lost by
+/// that; the cost simply never converges.
 fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
     let raw_path = path.to_string_lossy();
     let exists: i64 = conn.query_row(
@@ -4236,8 +4464,14 @@ fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool
             JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
             WHERE s.source = 'claude' AND s.raw_path = ?
             LIMIT 1
+        ) OR EXISTS(
+            SELECT 1
+            FROM sessions s
+            JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+            WHERE s.source = 'claude' AND s.raw_path = ?
+            LIMIT 1
         )",
-        [raw_path.as_ref()],
+        [raw_path.as_ref(), raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
@@ -4486,6 +4720,13 @@ fn delete_claude_record_rows(
     conn.execute(
         "DELETE FROM file_edits WHERE source = 'claude' AND session_id = ? AND message_id = ?",
         params![session_id, message_uuid],
+    )?;
+    // Markers are derived from the same record and keyed on the same prefix,
+    // so they move with it rather than outliving it under the old identity.
+    conn.execute(
+        "DELETE FROM session_markers WHERE source = 'claude' AND session_id = ? \
+         AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
+        params![session_id, message_uuid, message_uuid],
     )?;
     Ok(())
 }
@@ -4792,10 +5033,41 @@ fn ingest_claude_transcript_as(
 ) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
+    // A compaction boundary reports no size of its own. The context it
+    // replaced is the cache read of the assistant message immediately before
+    // it, which is the only place the provider states how much was in flight
+    // when compaction fired.
+    //
+    // Keyed by session, and never written from a sidechain record. One
+    // transcript file can carry more than one identity -- a subagent sidecar's
+    // records name the parent's `sessionId`, and a named child is re-attributed
+    // to its own -- so a single file-wide value would let a delegated agent's
+    // cache read become the number a later parent boundary reports. A
+    // confidently wrong token count is worse than none, so an assistant record
+    // whose usage omits the field clears the entry rather than leaving the
+    // previous message's value standing.
+    let mut last_assistant_cache_read: HashMap<String, i64> = HashMap::new();
     // Ordering is assigned over the whole transcript, and this parser always
     // re-reads the file from the start, so a re-sync reproduces the same
     // indexes instead of advancing them.
     let mut indexer = tool_result_facts::ToolResultIndexer::default();
+    // The session this file belongs to, found before the loop rather than as
+    // it goes. Claude writes a conversation's summary as the *first* line and
+    // gives it `leafUuid` instead of `sessionId`, so a fallback that learned
+    // the id from earlier records would always be too late for the one record
+    // that needs it.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let file_session_id = text.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("sessionId")?
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    });
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -4806,7 +5078,36 @@ fn ingest_claude_transcript_as(
         };
         let record_session_id = match obj.get("sessionId").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
-            _ => continue,
+            // A record with no session of its own is still evidence about the
+            // transcript it sits in, and this guard runs before everything --
+            // so a summary, the one record type Claude writes without a
+            // `sessionId`, was dropped before the classifier ever saw it. That
+            // is the record type this table exists to keep, lost at the first
+            // gate.
+            //
+            // It is attributed to the file's own session, because a transcript
+            // has exactly one. Nothing else about such a record is ingested:
+            // it takes the marker path and then this iteration ends, so a
+            // future sessionless record type cannot become an event under a
+            // session it never named.
+            //
+            // A transcript that names no session anywhere has no answer, and
+            // inventing one would put the record on a session that does not
+            // exist. Those are still skipped.
+            _ => {
+                // `attributed_session_id` first, because that is the id the
+                // rest of this file is ingested under. A subagent sidecar
+                // carries the PARENT's `sessionId` on every row plus a
+                // per-child `agentId`, so reading the file's first
+                // `sessionId` would put the child's summary on the parent --
+                // the child losing it, and the parent gaining evidence from a
+                // conversation that is not its own. That is worse than the
+                // drop it replaced: a wrong attribution reads as a real one.
+                if let Some(session_id) = attributed_session_id.or(file_session_id.as_deref()) {
+                    insert_sessionless_record_marker(conn, session_id, obj, line, stem)?;
+                }
+                continue;
+            }
         };
         let session_id = attributed_session_id.unwrap_or(record_session_id);
         // Subagent sidecar transcripts share the parent's sessionId with
@@ -4835,19 +5136,12 @@ fn ingest_claude_transcript_as(
         // identities disjoint from the legacy positional `{stem}:{digits}`
         // namespace, so the legacy detector below can never select a row
         // the new parser wrote (an all-decimal hash would otherwise match).
-        let digest = Sha256::digest(line.as_bytes());
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session");
-        let fallback_uid = format!(
-            "{stem}:sha256:{}",
-            digest
-                .iter()
-                .take(8)
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        // Derived by `claude_record_identity`, shared with the sessionless
+        // path above. The same line reaches both -- a summary read locally
+        // carries no `sessionId`, and the same summary in a remote snapshot
+        // has one injected -- so a rule per path made one record into two rows
+        // the unique key could not collapse.
+        let fallback_uid = claude_record_identity(obj, line, stem);
         // A pre-upgrade parse stored id-less records under a positional
         // `{stem}:{line}` identity that no current parse emits. Heals remove
         // exactly the current identity and never guess the historical one:
@@ -4857,9 +5151,7 @@ fn ingest_claude_transcript_as(
         // positional leftovers are preserved by design — retention-safe
         // duplication, bounded to id-less files — rather than healed by
         // position.
-        let message_uuid = uuid
-            .or_else(|| message.and_then(|m| m.get("id")).and_then(Value::as_str))
-            .unwrap_or(&fallback_uid);
+        let message_uuid = fallback_uid.as_str();
         let id_less = uuid.is_none()
             && message
                 .and_then(|m| m.get("id"))
@@ -4907,6 +5199,20 @@ fn ingest_claude_transcript_as(
             // needs no span.
             request_span: None,
         };
+        if message_role == "assistant" && !sidechain {
+            match message
+                .and_then(|m| m.get("usage"))
+                .and_then(|usage| usage.get("cache_read_input_tokens"))
+                .and_then(Value::as_i64)
+            {
+                Some(cache_read) => {
+                    last_assistant_cache_read.insert(session_id.to_string(), cache_read);
+                }
+                None => {
+                    last_assistant_cache_read.remove(session_id);
+                }
+            }
+        }
         // Heal what an earlier parser version wrote for this record: it
         // attributed every sidechain row to the parent, and stored the rows
         // this guard now skips. Re-reading the file removes the stale rows
@@ -4929,6 +5235,49 @@ fn ingest_claude_transcript_as(
                     token_json.as_deref(),
                 )?;
             }
+        }
+        // How many rows this record produced, counted rather than predicted.
+        //
+        // Every record must leave at least one row behind, and the only
+        // trustworthy way to know whether it did is to count what was written.
+        // Predicting it from the shape of `content` needs a rule per emptiness
+        // -- absent, `null`, `""`, `[]`, blocks that are all blank -- and every
+        // rule that is missed is a record that silently disappears while the
+        // code looks correct.
+        let mut record_rows = 0usize;
+        // Classified here, before the handlers below start to `continue`: a
+        // system line that names no delegated child, and any record with no
+        // message body, are dropped further down, and a marker written after
+        // that point would never be reached for exactly the records this table
+        // exists to keep.
+        //
+        // A skipped sidechain record is deliberately excluded. Its rows are
+        // deleted rather than stored, so a marker would be the one trace left
+        // of a record the parser has decided not to keep.
+        let record_draft = if skipped_sidechain {
+            None
+        } else {
+            claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
+        };
+        if let Some(draft) = &record_draft {
+            record_rows += 1;
+            let marker_uid = format!("{message_uuid}:marker");
+            insert_session_marker(
+                conn,
+                "claude",
+                session_id,
+                &NewSessionMarker {
+                    marker_uid: &marker_uid,
+                    ts_ms: (ts_ms != 0).then_some(ts_ms),
+                    message_id: Some(message_uuid),
+                    parent_id: draft.parent_id.as_deref().or(parent_id),
+                    turn_id: draft.turn_id.as_deref(),
+                    kind: draft.kind,
+                    subkind: draft.subkind.as_deref(),
+                    text: None,
+                    payload_json: draft.payload_json.as_deref(),
+                },
+            )?;
         }
         // Claude reports a finished subagent as a `type: "system"` line with
         // no message body, so the block walk below never sees it. It is the
@@ -4954,7 +5303,11 @@ fn ingest_claude_transcript_as(
                     .get("content")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty());
-                insert_session_event(
+                // `raw_kind` is what keeps this row apart from a real
+                // `tool_result` content block: both normalize to
+                // `kind = "tool_result"`, and the normalized vocabulary is
+                // deliberately not widened to carry the distinction.
+                insert_session_event_with_provenance(
                     conn,
                     "claude",
                     session_id,
@@ -4969,10 +5322,15 @@ fn ingest_claude_transcript_as(
                     notification_text,
                     None,
                     None,
+                    // Claude records neither an inference provider nor a
+                    // stop reason on this record.
+                    None,
+                    None,
                     identity,
                     &format!("{message_uuid}:subagent_notification"),
                     Some(&tool_facts),
                     raw_facts,
+                    Some("system_subagent_notification"),
                 )?;
                 continue;
             }
@@ -5000,6 +5358,18 @@ fn ingest_claude_transcript_as(
             continue;
         }
         let Some(content) = message.and_then(|m| m.get("content")) else {
+            // Nothing below can run for this record, so whether it left a row
+            // behind is already settled: it is the marker above, or nothing.
+            if record_rows == 0 {
+                insert_unknown_record_marker(
+                    conn,
+                    session_id,
+                    message_uuid,
+                    ts_ms,
+                    parent_id,
+                    obj.get("type").and_then(Value::as_str).unwrap_or(""),
+                )?;
+            }
             continue;
         };
         if !sidechain && message_role == "user" && is_meta != Some(true) {
@@ -5059,15 +5429,36 @@ fn ingest_claude_transcript_as(
                     None,
                     raw_facts,
                 )?;
+                record_rows += 1;
             }
-            continue;
         }
-        let Some(blocks) = content.as_array() else {
-            continue;
-        };
-        for (block_index, block) in blocks.iter().enumerate() {
+        for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             let event_uid = format!("{message_uuid}:{block_index}");
+            // Everything the normalized event model cannot carry off this
+            // block — an unsupported block type, a thinking signature, tool
+            // replacement metadata, a delegated result's agent id — is
+            // recorded here, before the arms that handle what it can.
+            for (suffix, draft) in claude_markers_for_block(block_type, block) {
+                let marker_uid = format!("{event_uid}:{suffix}");
+                insert_session_marker(
+                    conn,
+                    "claude",
+                    session_id,
+                    &NewSessionMarker {
+                        marker_uid: &marker_uid,
+                        ts_ms: (ts_ms != 0).then_some(ts_ms),
+                        message_id: Some(message_uuid),
+                        parent_id: draft.parent_id.as_deref().or(parent_id),
+                        turn_id: draft.turn_id.as_deref(),
+                        kind: draft.kind,
+                        subkind: draft.subkind.as_deref(),
+                        text: None,
+                        payload_json: draft.payload_json.as_deref(),
+                    },
+                )?;
+                record_rows += 1;
+            }
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -5097,6 +5488,7 @@ fn ingest_claude_transcript_as(
                                 None,
                                 raw_facts,
                             )?;
+                            record_rows += 1;
                         }
                     }
                 }
@@ -5126,6 +5518,7 @@ fn ingest_claude_transcript_as(
                             None,
                             raw_facts,
                         )?;
+                        record_rows += 1;
                     }
                 }
                 "tool_use" => {
@@ -5154,6 +5547,7 @@ fn ingest_claude_transcript_as(
                         None,
                         raw_facts,
                     )?;
+                    record_rows += 1;
                     if !tool_use_id.is_empty() && !name.is_empty() {
                         let args_json =
                             serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
@@ -5203,7 +5597,7 @@ fn ingest_claude_transcript_as(
                     let facts = tool_result_facts::claude_tool_result_facts(block)
                         .with_ordering(call_index, event_index);
                     let text = materialize_tool_result_text(content);
-                    insert_session_event(
+                    insert_session_event_with_provenance(
                         conn,
                         "claude",
                         session_id,
@@ -5218,11 +5612,15 @@ fn ingest_claude_transcript_as(
                         text.as_deref(),
                         model,
                         token_json.as_deref(),
+                        None,
+                        None,
                         identity,
                         &event_uid,
                         Some(&facts),
                         raw_facts,
+                        Some("tool_result_block"),
                     )?;
+                    record_rows += 1;
                     let is_error = block.get("is_error").and_then(Value::as_bool);
                     if !tool_use_id.is_empty() {
                         if let Some(err) = is_error {
@@ -5246,8 +5644,639 @@ fn ingest_claude_transcript_as(
                 _ => {}
             }
         }
+        // The invariant: every record leaves a row. A record whose content was
+        // present but empty -- `""`, `[]`, or blocks that are all blank --
+        // reaches none of the inserts above, and without this it would be
+        // absent from both tables with nothing to show it was ever there.
+        if record_rows == 0 {
+            insert_unknown_record_marker(
+                conn,
+                session_id,
+                message_uuid,
+                ts_ms,
+                parent_id,
+                obj.get("type").and_then(Value::as_str).unwrap_or(""),
+            )?;
+        }
     }
     Ok(())
+}
+
+/// The identity the Claude record loop keys a record by.
+///
+/// Named so the sessionless path and the ordinary path cannot derive it
+/// differently for the same line -- which is exactly what turned one summary
+/// into two rows when each had its own rule.
+fn claude_record_identity(obj: &Map<String, Value>, line: &str, stem: &str) -> String {
+    if let Some(uuid) = obj
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return uuid.to_string();
+    }
+    if let Some(id) = obj
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return id.to_string();
+    }
+    if let Some(leaf) = obj
+        .get("leafUuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return leaf.to_string();
+    }
+    let digest = Sha256::digest(line.as_bytes());
+    format!(
+        "{stem}:sha256:{}",
+        digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Record a transcript line that names no session, under the file's own.
+///
+/// Keyed by whatever identity the record does carry -- Claude's summaries have
+/// `leafUuid` -- and falling back to a hash of the line, so re-reading the same
+/// transcript upserts rather than accumulating. The line is hashed rather than
+/// counted by position because a record inserted above it would otherwise
+/// renumber every marker below.
+fn insert_sessionless_record_marker(
+    conn: &Connection,
+    session_id: &str,
+    obj: &Map<String, Value>,
+    line: &str,
+    stem: &str,
+) -> Result<()> {
+    let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("record");
+    // The same identity the ordinary record path derives, in the same order.
+    //
+    // These two paths see the same line: a summary read locally has no
+    // `sessionId`, and the same summary in a remote snapshot has one injected,
+    // so it goes the other way. Deriving the uid differently on each made one
+    // summary into two rows that the unique key could not collapse -- not a
+    // crash, just a count every consumer quietly gets wrong. `leafUuid` is
+    // consulted last, as an identity a summary has and the record path has no
+    // reason to look for, so it can only break a tie the shared derivation
+    // does not already settle.
+    let identity = claude_record_identity(obj, line, stem);
+    let marker_uid = format!("{identity}:marker");
+    let draft = claude_marker_for_record(obj, None)
+        .unwrap_or_else(|| MarkerDraft::new("unknown", Some(record_type)));
+    // Read from the record, not left at their defaults.
+    //
+    // Sharing one identity with the ordinary path is what stops a summary
+    // becoming two rows -- and it makes them the same row, so whichever pass
+    // runs last decides every column. `insert_session_marker` upserts and
+    // overwrites, so any column this path leaves empty is a column it erases
+    // from what an earlier pass stored. Dedup and erasure are one mechanism
+    // seen twice.
+    let ts_ms = obj
+        .get("timestamp")
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(parse_iso_ms)
+                .or_else(|| value.as_i64())
+        })
+        .filter(|ts| *ts != 0);
+    // The *derived* identity, not the native `uuid`, because that is what the
+    // ordinary path stores -- and a summary, the record this path exists for,
+    // usually has no `uuid` at all. Reading the native field here left
+    // `message_id` null on exactly those records, so a later local pass erased
+    // the identity a remote snapshot had stored. Same column, same mechanism,
+    // one field further in.
+    let message_id = Some(identity.as_str());
+    let parent_id = obj.get("parentUuid").and_then(Value::as_str);
+    insert_session_marker(
+        conn,
+        "claude",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms,
+            message_id,
+            parent_id: draft.parent_id.as_deref().or(parent_id),
+            turn_id: draft.turn_id.as_deref(),
+            kind: draft.kind,
+            subkind: draft.subkind.as_deref(),
+            text: None,
+            payload_json: draft.payload_json.as_deref(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Record that a provider record existed when nothing else did.
+///
+/// Called only when a record produced no event and no other marker, so it
+/// never competes with a classified marker for the same `marker_uid`. The
+/// provider's own record type goes in `subkind`; a record that does not even
+/// name its type is recorded as `record`, because "something was here" is
+/// still worth more than silence.
+fn insert_unknown_record_marker(
+    conn: &Connection,
+    session_id: &str,
+    message_uuid: &str,
+    ts_ms: i64,
+    parent_id: Option<&str>,
+    record_type: &str,
+) -> Result<()> {
+    let marker_uid = format!("{message_uuid}:marker");
+    insert_session_marker(
+        conn,
+        "claude",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms: (ts_ms != 0).then_some(ts_ms),
+            message_id: Some(message_uuid),
+            parent_id,
+            turn_id: None,
+            kind: "unknown",
+            subkind: Some(if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            }),
+            text: None,
+            payload_json: None,
+        },
+    )?;
+    Ok(())
+}
+
+/// Longest string any marker payload field keeps.
+///
+/// A marker records that a provider record existed and what shape it had, not
+/// its contents. Bounding every field here is what makes the "never store
+/// image or document bytes" rule structural rather than a promise: a payload
+/// cannot grow with the record it describes.
+pub(crate) const MARKER_PAYLOAD_FIELD_LIMIT: usize = 128;
+
+/// Most elements any array or object inside a marker payload keeps.
+///
+/// The element count is provider-chosen too, so bounding element *length*
+/// alone still lets a payload grow without limit.
+pub(crate) const MARKER_PAYLOAD_ARRAY_LIMIT: usize = 32;
+
+/// One marker a parser decided to record, before it is keyed and written.
+///
+/// Both parsers build these in helpers rather than inline so the record and
+/// content-block loops keep their existing shape; the loops gain one call
+/// each.
+#[derive(Debug, Clone, PartialEq)]
+struct MarkerDraft {
+    kind: &'static str,
+    subkind: Option<String>,
+    payload_json: Option<String>,
+    parent_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl MarkerDraft {
+    fn new(kind: &'static str, subkind: Option<&str>) -> Self {
+        Self {
+            kind,
+            subkind: subkind.map(str::to_string),
+            payload_json: None,
+            parent_id: None,
+            turn_id: None,
+        }
+    }
+
+    fn with_payload(mut self, fields: Vec<(&str, Value)>) -> Self {
+        self.payload_json = marker_payload(fields);
+        self
+    }
+}
+
+/// Serialize an allowlisted marker payload, bounding every string field.
+///
+/// Null fields are dropped so a payload says only what the provider actually
+/// recorded. Returns `None` for an empty object rather than storing `{}`.
+fn marker_payload(fields: Vec<(&str, Value)>) -> Option<String> {
+    let mut map = Map::new();
+    for (name, value) in fields {
+        if value.is_null() {
+            continue;
+        }
+        map.insert(name.to_string(), bound_marker_value(value));
+    }
+    if map.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(map)).ok()
+}
+
+/// Bound every string anywhere in a marker payload, not just the top level.
+///
+/// The bound has to be recursive because a payload field can be a container:
+/// `tool_replacement` carries `replaces` as an array of provider-supplied tool
+/// names, and a top-level-only truncation copied each element verbatim — 32
+/// names the provider chose the length of. A marker must never grow with the
+/// record it describes, and "only at the top level" is not that guarantee.
+/// Bound a payload that arrives as a provider's own JSON text.
+///
+/// The field-list builders above know their keys; a provider sidecar and a
+/// legacy `detail_json` do not, so they come through here instead. Text that
+/// does not parse is dropped rather than stored raw: this column's whole
+/// contract is that it is bounded, and an unparsed blob is exactly what the
+/// bound exists to keep out.
+pub(crate) fn bound_marker_json(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    serde_json::to_string(&bound_marker_value(value)).ok()
+}
+
+pub(crate) fn bound_marker_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(bound_marker_string(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .take(MARKER_PAYLOAD_ARRAY_LIMIT)
+                .map(bound_marker_value)
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .take(MARKER_PAYLOAD_ARRAY_LIMIT)
+                .map(|(name, value)| (bound_marker_string(&name), bound_marker_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn bound_marker_string(text: &str) -> String {
+    text.chars().take(MARKER_PAYLOAD_FIELD_LIMIT).collect()
+}
+
+fn marker_string(value: Option<&Value>) -> Value {
+    value
+        .and_then(Value::as_str)
+        .map(|text| Value::String(text.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+/// Classify a Claude transcript record that carries no `message.content`.
+///
+/// These are exactly the records the parser used to drop on the floor:
+/// `type: "summary"` rollups, `type: "system"` compaction boundaries and
+/// subagent notifications, and anything else a future provider version emits.
+/// An unclassified record is still recorded, as `kind = "unknown"` carrying
+/// its provider-native type — a stored row nobody understands is recoverable,
+/// a dropped one is not.
+///
+/// The outer `type` is the provider's own name for what a record *is*, and it
+/// is classified independently of whether the record also carries message
+/// content. Classifying only records without content would mean a future type
+/// that happens to carry some became an ordinary text event with its native
+/// type recorded nowhere.
+fn claude_marker_for_record(
+    obj: &Map<String, Value>,
+    tokens_before_compact: Option<i64>,
+) -> Option<MarkerDraft> {
+    let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    let subtype = obj.get("subtype").and_then(Value::as_str);
+    match record_type {
+        // `user` and `assistant` are the record types the event model is built
+        // on, so they are silent here -- a marker per message would double
+        // every transcript. They are still not allowed to vanish: the caller
+        // counts the rows a record actually produced and falls back to
+        // [`insert_unknown_record_marker`] when that count is zero.
+        "user" | "assistant" => None,
+        "summary" => Some(
+            MarkerDraft::new("summary", subtype.or(Some("summary"))).with_payload(vec![
+                ("summary", marker_string(obj.get("summary"))),
+                ("leaf_uuid", marker_string(obj.get("leafUuid"))),
+            ]),
+        ),
+        "system" => {
+            let compact_metadata = obj.get("compactMetadata");
+            let parent_tool_use_id = obj.get("parent_tool_use_id").and_then(Value::as_str);
+            let agent_id = obj.get("agent_id").and_then(Value::as_str);
+            let subagent_session_id = obj.get("subagent_session_id").and_then(Value::as_str);
+            if subtype == Some("compact_boundary") || compact_metadata.is_some() {
+                Some(
+                    MarkerDraft::new("compaction_boundary", subtype.or(Some("compact_boundary")))
+                        .with_payload(vec![
+                            (
+                                "tokens_before_compact",
+                                tokens_before_compact
+                                    .map(Value::from)
+                                    .unwrap_or(Value::Null),
+                            ),
+                            (
+                                "trigger",
+                                marker_string(compact_metadata.and_then(|m| m.get("trigger"))),
+                            ),
+                            (
+                                "pre_tokens",
+                                compact_metadata
+                                    .and_then(|m| m.get("preTokens"))
+                                    .and_then(Value::as_i64)
+                                    .map(Value::from)
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ]),
+                )
+            } else if parent_tool_use_id.is_some()
+                && (agent_id.is_some() || subagent_session_id.is_some())
+            {
+                let mut draft =
+                    MarkerDraft::new("subagent_notification", subtype.or(Some("system")))
+                        .with_payload(vec![
+                            (
+                                "parent_tool_use_id",
+                                marker_string(obj.get("parent_tool_use_id")),
+                            ),
+                            ("agent_id", marker_string(obj.get("agent_id"))),
+                            (
+                                "subagent_session_id",
+                                marker_string(obj.get("subagent_session_id")),
+                            ),
+                            ("status", marker_string(obj.get("status"))),
+                        ]);
+                // The spawning `tool_use` is the parent of a notification
+                // about it; the record's own `parentUuid` is only the previous
+                // line. Linking on the tool use id is what makes the marker
+                // reachable from the call it reports on.
+                draft.parent_id = parent_tool_use_id.map(str::to_string);
+                Some(draft)
+            } else {
+                Some(MarkerDraft::new("unknown", subtype.or(Some("system"))))
+            }
+        }
+        "" => None,
+        other => Some(MarkerDraft::new("unknown", Some(other))),
+    }
+}
+
+/// Classify what a Claude content block leaves behind after normalization.
+///
+/// `text` and `tool_use` are fully modeled as events and produce nothing. The
+/// rest are the drops: any block type the event model has no `kind` for, the
+/// `signature` on a thinking block, `_meta.replaces` / `_meta.collapsedCalls`
+/// tool-replacement metadata, and the `agentId` a delegated tool result
+/// carries. Several can apply to one block, so each marker brings the suffix
+/// that keys it.
+fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static str, MarkerDraft)> {
+    let mut markers = Vec::new();
+    match block_type {
+        "text" | "tool_use" => {}
+        "thinking" => {
+            if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                markers.push((
+                    "signature",
+                    MarkerDraft::new("unsupported_block", Some("thinking_signature")).with_payload(
+                        vec![
+                            ("bytes", Value::from(signature.len())),
+                            ("has_signature", Value::Bool(true)),
+                        ],
+                    ),
+                ));
+            }
+        }
+        "tool_result" => {
+            let meta = block.get("_meta");
+            let replaces = meta
+                .and_then(|m| m.get("replaces"))
+                .and_then(Value::as_array);
+            let collapsed = meta
+                .and_then(|m| m.get("collapsedCalls"))
+                .and_then(Value::as_i64);
+            if replaces.is_some() || collapsed.is_some() {
+                let replaced = replaces
+                    .map(|names| {
+                        Value::Array(
+                            names
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|name| Value::String(name.to_string()))
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or(Value::Null);
+                markers.push((
+                    "replacement",
+                    MarkerDraft::new("tool_replacement", Some("tool_result")).with_payload(vec![
+                        ("replaces", replaced),
+                        (
+                            "collapsedCalls",
+                            collapsed.map(Value::from).unwrap_or(Value::Null),
+                        ),
+                    ]),
+                ));
+            }
+            let tool_use_id = block
+                .get("tool_use_id")
+                .or_else(|| block.get("toolUseId"))
+                .and_then(Value::as_str);
+            if let Some(agent_id) = find_tool_use_result(block)
+                .and_then(|result| result.get("agentId"))
+                .and_then(Value::as_str)
+            {
+                let mut draft =
+                    MarkerDraft::new("subagent_notification", Some("tool_use_result_agent_id"))
+                        .with_payload(vec![
+                            ("agent_id", Value::String(agent_id.to_string())),
+                            (
+                                "tool_use_id",
+                                tool_use_id
+                                    .map(|id| Value::String(id.to_string()))
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ]);
+                draft.parent_id = tool_use_id.map(str::to_string);
+                markers.push(("agent", draft));
+            }
+        }
+        other => {
+            // `bytes` is the serialized size of the block, never its content:
+            // an `image` or `document` block is exactly what must not be
+            // copied into the ledger.
+            let bytes = serde_json::to_string(block)
+                .map(|text| text.len())
+                .unwrap_or(0);
+            let has_signature = block.get("signature").is_some();
+            markers.push((
+                "block",
+                MarkerDraft::new("unsupported_block", Some(other)).with_payload(vec![
+                    ("bytes", Value::from(bytes)),
+                    ("has_signature", Value::Bool(has_signature)),
+                ]),
+            ));
+        }
+    }
+    markers
+}
+
+/// Codex payload types the normalized event model already carries in full.
+///
+/// Listing them is what lets everything else fall through to a marker: the
+/// default is "record it", and a type is silent only when something else in
+/// the parser is known to have stored it. Membership here is a claim that an
+/// `event_msg` arm below persists the type -- entries with no such arm made
+/// the marker silent without anything taking its place, which is the drop this
+/// table exists to end. `every_codex_line_leaves_an_event_or_a_marker_behind`
+/// is the guard; check for a real arm before adding a name.
+fn codex_payload_is_modeled(line_type: &str, payload_type: &str) -> bool {
+    match line_type {
+        "event_msg" => matches!(
+            payload_type,
+            "user_message"
+                | "agent_message"
+                | "agent_reasoning"
+                | "token_count"
+                | "thread_settings_applied"
+                | "mcp_tool_call_end"
+                | "web_search_end"
+                | "patch_apply_end"
+                | "exec_command_end"
+        ),
+        "response_item" => matches!(
+            payload_type,
+            "function_call"
+                | "custom_tool_call"
+                | "function_call_output"
+                | "custom_tool_call_output"
+                | "message"
+        ),
+        _ => false,
+    }
+}
+
+/// Classify a Codex rollout line the event model does not turn into an event.
+///
+/// Called once per line, before the existing `match`, so the arms below keep
+/// their shape. A streaming `*_delta` fragment is silent because the final
+/// event it builds toward is already recorded; everything else that is not
+/// modeled becomes a marker, and an unrecognized type becomes
+/// `kind = "unknown"` carrying its verbatim provider type in `subkind`.
+fn codex_marker_for_event(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> Option<MarkerDraft> {
+    let mut draft = match line_type {
+        "session_meta" | "turn_context" => return None,
+        "compacted" => {
+            MarkerDraft::new("compaction_boundary", Some("compacted")).with_payload(vec![(
+                "replacement_items",
+                payload
+                    .get("replacement_history")
+                    .and_then(Value::as_array)
+                    .map(|items| Value::from(items.len()))
+                    .unwrap_or(Value::Null),
+            )])
+        }
+        "event_msg" | "response_item" => {
+            if payload_type.is_empty() || codex_payload_is_modeled(line_type, payload_type) {
+                return None;
+            }
+            // Deltas are fragments of an event that is recorded whole.
+            if payload_type.ends_with("_delta") {
+                return None;
+            }
+            codex_marker_for_payload(line_type, payload_type, payload)
+        }
+        other => MarkerDraft::new("unknown", Some(other)),
+    };
+    if draft.turn_id.is_none() {
+        draft.turn_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    Some(draft)
+}
+
+fn codex_marker_for_payload(
+    line_type: &str,
+    payload_type: &str,
+    payload: &Map<String, Value>,
+) -> MarkerDraft {
+    if line_type == "response_item" {
+        return match payload_type {
+            "reasoning" => {
+                MarkerDraft::new("encrypted_reasoning", Some("reasoning")).with_payload(vec![(
+                    "bytes",
+                    Value::from(
+                        payload
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .map(str::len)
+                            .unwrap_or(0),
+                    ),
+                )])
+            }
+            other => MarkerDraft::new("unknown", Some(other)),
+        };
+    }
+    match payload_type {
+        "task_started" => MarkerDraft::new("task_started", Some("task_started")),
+        "task_complete" => {
+            MarkerDraft::new("task_complete", Some("task_complete")).with_payload(vec![(
+                "duration_ms",
+                payload
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            )])
+        }
+        "turn_diff" => MarkerDraft::new("turn_diff", Some("turn_diff")).with_payload(vec![(
+            "bytes",
+            Value::from(
+                payload
+                    .get("unified_diff")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0),
+            ),
+        )]),
+        "stream_error" => MarkerDraft::new("stream_error", Some("stream_error"))
+            .with_payload(vec![("message", marker_string(payload.get("message")))]),
+        "context_compacted" | "compacted" => {
+            MarkerDraft::new("compaction_boundary", Some(payload_type))
+        }
+        "entered_review_mode" | "exited_review_mode" => {
+            MarkerDraft::new("review_mode", Some(payload_type))
+        }
+        other if other.ends_with("_begin") => MarkerDraft::new("tool_begin", Some(other))
+            .with_payload(vec![("call_id", marker_string(payload.get("call_id")))]),
+        other if other.starts_with("subagent_") => {
+            let mut draft =
+                MarkerDraft::new("subagent_notification", Some(other)).with_payload(vec![
+                    ("call_id", marker_string(payload.get("call_id"))),
+                    ("agent_id", marker_string(payload.get("agent_id"))),
+                    (
+                        "success",
+                        payload
+                            .get("success")
+                            .and_then(Value::as_bool)
+                            .map(Value::Bool)
+                            .unwrap_or(Value::Null),
+                    ),
+                ]);
+            draft.parent_id = payload
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            draft
+        }
+        other => MarkerDraft::new("unknown", Some(other)),
+    }
 }
 
 /// The verbatim stop reason an OpenCode `step-finish` part carries, if this is
@@ -5401,15 +6430,25 @@ fn insert_session_event(
         event_uid,
         tool_result_facts,
         raw_facts,
+        None,
     )
 }
 
-/// One normalized event, including the two columns only some providers can
-/// fill: `provider` (the upstream inference provider, which OpenCode records
-/// as `providerID`) and `stop_reason` (OpenCode's last `step-finish.reason`).
+/// One normalized event, including the columns only some providers can
+/// fill.
+///
+/// `provider` is the upstream inference provider, which OpenCode records as
+/// `providerID`, and `stop_reason` is OpenCode's last `step-finish.reason`.
 /// Both stay null for a provider that does not record them rather than being
 /// inferred from the model string, which is a consumer's job and not a
 /// parser's.
+///
+/// `raw_kind` is the provider-native record or block type the event came
+/// from. Two very different provider records normalize to
+/// `kind = "tool_result"`: a `tool_result` content block, and a
+/// `type: "system"` subagent notification reporting a delegated call
+/// finishing. It keeps them apart without widening the normalized `kind`
+/// vocabulary, which downstream readers switch on exhaustively.
 #[allow(clippy::too_many_arguments)]
 fn insert_session_event_with_provenance(
     conn: &Connection,
@@ -5432,6 +6471,7 @@ fn insert_session_event_with_provenance(
     event_uid: &str,
     tool_result_facts: Option<&ToolResultFacts>,
     raw_facts: RawMessageFacts<'_>,
+    raw_kind: Option<&str>,
 ) -> Result<()> {
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     let blank = ToolResultFacts::default();
@@ -5476,7 +6516,7 @@ fn insert_session_event_with_provenance(
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
-          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version) \
+          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -5484,7 +6524,7 @@ fn insert_session_event_with_provenance(
                 ELSE ?17 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
@@ -5506,7 +6546,7 @@ fn insert_session_event_with_provenance(
          stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
-         raw_facts_version=excluded.raw_facts_version",
+         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind",
         params![
             source,
             session_id,
@@ -5545,6 +6585,7 @@ fn insert_session_event_with_provenance(
             raw_facts.turn_id,
             raw_facts.request_span,
             RAW_MESSAGE_FACTS_VERSION,
+            raw_kind,
         ],
     )?;
     Ok(())
@@ -7388,17 +8429,18 @@ fn ingest_grok_session(
                     &mut outcome,
                 );
                 inherited = Some(ts);
+                let marker_uid = format!("r{idx}");
+                let marker_text = text.as_deref().map(truncate_marker_text);
                 outcome.markers += insert_session_marker(
                     conn,
-                    &SessionMarker {
-                        source: SOURCE.into(),
-                        session_id: sid.to_string(),
-                        marker_uid: format!("r{idx}"),
-                        kind: "system".into(),
-                        message_id: None,
+                    SOURCE,
+                    sid,
+                    &NewSessionMarker {
+                        marker_uid: &marker_uid,
+                        kind: "system",
                         ts_ms: Some(ts),
-                        text: text.as_deref().map(truncate_marker_text),
-                        detail_json: None,
+                        text: marker_text.as_deref(),
+                        ..Default::default()
                     },
                 )?;
             }
@@ -7416,20 +8458,22 @@ fn ingest_grok_session(
                         session.created_ms,
                         &mut outcome,
                     );
+                    let marker_uid = format!("r{idx}");
+                    let marker_text = truncate_marker_text(text);
+                    let payload_json = session.synthetic_reasons.get(&idx).and_then(|reason| {
+                        marker_payload(vec![("synthetic_reason", json!(reason))])
+                    });
                     outcome.markers += insert_session_marker(
                         conn,
-                        &SessionMarker {
-                            source: SOURCE.into(),
-                            session_id: sid.to_string(),
-                            marker_uid: format!("r{idx}"),
-                            kind: "synthetic_turn".into(),
-                            message_id: None,
+                        SOURCE,
+                        sid,
+                        &NewSessionMarker {
+                            marker_uid: &marker_uid,
+                            kind: "synthetic_turn",
                             ts_ms: Some(ts),
-                            text: Some(truncate_marker_text(text)),
-                            detail_json: session
-                                .synthetic_reasons
-                                .get(&idx)
-                                .map(|reason| json!({ "synthetic_reason": reason }).to_string()),
+                            text: Some(&marker_text),
+                            payload_json: payload_json.as_deref(),
+                            ..Default::default()
                         },
                     )?;
                     // A marker is still a record with a place in the file, so
@@ -7516,17 +8560,17 @@ fn ingest_grok_session(
                         // that Grok thought here is honest; inventing readable
                         // thinking for it would not be.
                         outcome.encrypted_reasoning += 1;
+                        let marker_uid = format!("r{idx}");
                         outcome.markers += insert_session_marker(
                             conn,
-                            &SessionMarker {
-                                source: SOURCE.into(),
-                                session_id: sid.to_string(),
-                                marker_uid: format!("r{idx}"),
-                                kind: "encrypted_reasoning".into(),
-                                message_id: None,
+                            SOURCE,
+                            sid,
+                            &NewSessionMarker {
+                                marker_uid: &marker_uid,
+                                kind: "encrypted_reasoning",
+                                subkind: Some("reasoning"),
                                 ts_ms: Some(ts),
-                                text: None,
-                                detail_json: None,
+                                ..Default::default()
                             },
                         )?;
                     }
@@ -7891,17 +8935,27 @@ fn ingest_grok_session_extras(
     const SOURCE: &str = "grok";
     let sid = session.session_id.as_str();
     if let Some(signals) = &session.signals {
+        let summary = grok_signals_summary(signals);
+        // The sidecar is the provider's own metrics document, so it is
+        // bounded as a whole rather than projected field by field -- same
+        // treatment as a compaction checkpoint below, and for the same reason:
+        // its keys are Grok's, not ours. Storing it whole bypassed the
+        // per-string and per-container bounds this column promises, which is
+        // the only thing that changes here; the shape is what it always was.
+        let payload_json =
+            serde_json::to_string(&bound_marker_value(Value::Object(signals.raw.clone())))
+                .unwrap_or_default();
         outcome.markers += insert_session_marker(
             conn,
-            &SessionMarker {
-                source: SOURCE.into(),
-                session_id: sid.to_string(),
-                marker_uid: "signals".into(),
-                kind: "signals".into(),
-                message_id: None,
+            SOURCE,
+            sid,
+            &NewSessionMarker {
+                marker_uid: "signals",
+                kind: "signals",
                 ts_ms: session.updates.last_ms.or(Some(session.last_ts)),
-                text: Some(grok_signals_summary(signals)),
-                detail_json: Some(Value::Object(signals.raw.clone()).to_string()),
+                text: Some(&summary),
+                payload_json: (!payload_json.is_empty()).then_some(payload_json.as_str()),
+                ..Default::default()
             },
         )?;
     }
@@ -7910,39 +8964,45 @@ fn ingest_grok_session_extras(
     // a later consumer can tell whether two sessions ran with the same
     // instructions.
     if let Some(context) = &session.prompt_context {
+        let payload_json = marker_payload(vec![
+            ("path", json!(context.path)),
+            ("sha256", json!(context.sha256)),
+            ("bytes", json!(context.bytes)),
+        ])
+        .unwrap_or_default();
         outcome.markers += insert_session_marker(
             conn,
-            &SessionMarker {
-                source: SOURCE.into(),
-                session_id: sid.to_string(),
-                marker_uid: "prompt_context".into(),
-                kind: "prompt_context".into(),
-                message_id: None,
-                ts_ms: None,
-                text: Some(context.path.clone()),
-                detail_json: Some(
-                    json!({
-                        "path": context.path,
-                        "sha256": context.sha256,
-                        "bytes": context.bytes,
-                    })
-                    .to_string(),
-                ),
+            SOURCE,
+            sid,
+            &NewSessionMarker {
+                marker_uid: "prompt_context",
+                kind: "prompt_context",
+                text: Some(&context.path),
+                payload_json: (!payload_json.is_empty()).then_some(payload_json.as_str()),
+                ..Default::default()
             },
         )?;
     }
     for checkpoint in &session.compactions {
+        let marker_uid = format!("compaction:{}", checkpoint.name);
+        // The checkpoint sidecar is the provider's own document, so it is
+        // bounded as a whole rather than projected field by field.
+        let payload_json = checkpoint
+            .detail_json
+            .as_deref()
+            .and_then(bound_marker_json);
         outcome.markers += insert_session_marker(
             conn,
-            &SessionMarker {
-                source: SOURCE.into(),
-                session_id: sid.to_string(),
-                marker_uid: format!("compaction:{}", checkpoint.name),
-                kind: "compaction_boundary".into(),
-                message_id: None,
+            SOURCE,
+            sid,
+            &NewSessionMarker {
+                marker_uid: &marker_uid,
+                kind: "compaction_boundary",
+                subkind: Some("compaction_checkpoint"),
                 ts_ms: checkpoint.ts_ms,
-                text: Some(checkpoint.locator.clone()),
-                detail_json: checkpoint.detail_json.clone(),
+                text: Some(&checkpoint.locator),
+                payload_json: payload_json.as_deref(),
+                ..Default::default()
             },
         )?;
     }
@@ -7983,7 +9043,7 @@ fn ingest_grok_session_extras(
 }
 
 /// The counters `signals.json` records, as one readable line. The file's own
-/// object is kept verbatim in the marker's `detail_json`; this is the part a
+/// object is kept verbatim in the marker's `payload_json`; this is the part a
 /// person reads.
 fn grok_signals_summary(signals: &grok::GrokSignals) -> String {
     let mut parts = Vec::new();
@@ -9569,7 +10629,7 @@ mod tests {
         );
     }
 
-    /// The v4->v5 migration drops `codex_rollouts_v4` from the in-memory map, but
+    /// A generation migration drops its predecessor from the in-memory map, but
     /// the merge only folds in the keys a run *has*, so on its own that deletion
     /// never reaches disk: the retired map is reloaded and rewritten forever.
     /// A Grok session a previous release already consumed must be re-read
@@ -10058,6 +11118,614 @@ mod tests {
         assert_eq!(saved.len(), 1, "only the readable session is checkpointed");
     }
 
+    /// A Grok sidecar cannot put an unbounded blob in `payload_json`.
+    ///
+    /// The column is documented as an allowlisted projection with every string
+    /// bounded at 128 characters and every container at 32 entries, and every
+    /// kind the Claude and Codex parsers write goes through that bounder. The
+    /// Grok signals and compaction writers stored their sidecar JSON whole, so
+    /// a single oversized nested string landed intact -- in the one place
+    /// nothing downstream expects to have to defend against it.
+    ///
+    /// Grok's readable prose is unaffected: it lives in `text`, which this does
+    /// not touch, so bounding the JSON loses nothing a reader wanted.
+    #[test]
+    fn grok_sidecar_payloads_are_bounded_like_every_other_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-bound-0001");
+        let huge = "x".repeat(5_000);
+        fs::write(
+            dir.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 2,
+                "contextTokensUsed": 10,
+                "note": huge,
+                "nested": { "deeper": huge },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let checkpoints = dir.join("compaction_checkpoints");
+        fs::create_dir_all(&checkpoints).unwrap();
+        fs::write(
+            checkpoints.join("c1.json"),
+            serde_json::json!({ "summary": huge }).to_string(),
+        )
+        .unwrap();
+
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let session = super::scan_grok_session_file(&chat).unwrap().unwrap();
+        super::ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+
+        let payload = |kind: &str| -> Value {
+            let raw: String = conn
+                .query_row(
+                    "SELECT payload_json FROM session_markers \
+                     WHERE source = 'grok' AND kind = ?",
+                    params![kind],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|err| panic!("a {kind} marker with a payload: {err}"));
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        // Every string anywhere in the payload, however deep, is bounded.
+        let longest = |value: &Value| -> usize {
+            fn walk(value: &Value, longest: &mut usize) {
+                match value {
+                    Value::String(text) => *longest = (*longest).max(text.chars().count()),
+                    Value::Array(items) => items.iter().for_each(|item| walk(item, longest)),
+                    Value::Object(fields) => fields.values().for_each(|field| walk(field, longest)),
+                    _ => {}
+                }
+            }
+            let mut result = 0;
+            walk(value, &mut result);
+            result
+        };
+        let signals = payload("signals");
+        assert_eq!(
+            longest(&signals),
+            MARKER_PAYLOAD_FIELD_LIMIT,
+            "the oversized signals string must be bounded: {signals}"
+        );
+        let compaction = payload("compaction_boundary");
+        assert_eq!(
+            longest(&compaction),
+            MARKER_PAYLOAD_FIELD_LIMIT,
+            "the oversized checkpoint string must be bounded: {compaction}"
+        );
+
+        // Positive control: the counters the sidecar really recorded survive,
+        // so this bounds the payload rather than emptying it.
+        assert_eq!(
+            signals.get("turnCount").and_then(Value::as_i64),
+            Some(2),
+            "bounding must not discard what the sidecar recorded: {signals}"
+        );
+        // And Grok's readable prose is untouched by any of it.
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT text FROM session_markers WHERE source = 'grok' AND kind = 'signals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.is_some_and(|text| !text.is_empty()));
+    }
+
+    /// A rollout that yields only markers is still indexed evidence.
+    ///
+    /// The stamp fast path asks "does this session have events?", which was the
+    /// whole question before markers existed. A lifecycle-only rollout -- a run
+    /// that started, streamed an error and never produced a message -- writes
+    /// markers and no events, so that question answers no forever: every sync
+    /// re-reads and re-upserts the file, and the cost never converges. Nothing
+    /// is lost, which is why it took a review to spot; it is pure waste that
+    /// grows with the archive.
+    #[test]
+    fn a_marker_only_rollout_stays_on_the_stamp_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-markers-only.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-markers-only","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"event_msg","payload":{"type":"task_started"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let codex = home.join(".codex");
+        let mut state = Map::new();
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+
+        // The premise: markers and no events at all.
+        let kinds = marker_kinds(&conn, "codex", "sess-markers-only");
+        assert!(
+            kinds.iter().any(|kind| kind == "task_started"),
+            "the fixture must produce markers: {kinds:?}"
+        );
+        assert!(
+            !super::session_events_exist(&conn, "codex", "sess-markers-only").unwrap(),
+            "the fixture must produce no events, or it proves nothing"
+        );
+
+        // A sentinel a re-ingest would overwrite, since the marker upsert
+        // rewrites every column it sets.
+        conn.execute(
+            "UPDATE session_markers SET subkind = 'sentinel' \
+             WHERE source = 'codex' AND session_id = 'sess-markers-only'",
+            [],
+        )
+        .unwrap();
+
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+        let survivors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'codex' AND session_id = 'sess-markers-only' \
+                 AND subkind = 'sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            survivors > 0,
+            "an unchanged marker-only rollout must not be re-read on every sync"
+        );
+    }
+
+    /// A summary with no `sessionId` of its own is still the session's summary.
+    ///
+    /// Claude writes the summary of a conversation as the first line of the
+    /// transcript, and it carries `leafUuid` rather than `sessionId`. The
+    /// identity guard at the top of the record loop drops any record without
+    /// one, so summaries were skipped before the classifier ever saw them --
+    /// the exact record type this table exists to keep, lost at the one gate
+    /// that runs before everything.
+    ///
+    /// A record with no session of its own still belongs to the file it is in,
+    /// and that file has exactly one owning session. That is the attribution
+    /// used here; nothing else about the record is ingested.
+    #[test]
+    fn a_summary_without_a_session_id_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summarised.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"What we did","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"summarised-session","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a0","sessionId":"summarised-session","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = crate::session_markers_page(&conn, "claude", "summarised-session", 100, None)
+            .unwrap()
+            .markers;
+        let summary = markers
+            .iter()
+            .find(|marker| marker.kind == "summary")
+            .unwrap_or_else(|| panic!("the summary must be recorded: {markers:?}"));
+        assert_eq!(summary.subkind.as_deref(), Some("summary"));
+        assert!(
+            summary
+                .payload_json
+                .as_deref()
+                .is_some_and(|payload| payload.contains("leaf-1")),
+            "and must keep what it did carry: {summary:?}"
+        );
+
+        // Positive control: the ordinary records are untouched by the fallback,
+        // so this widens the marker path rather than ingesting stray records.
+        let events = crate::session_events(&conn, "summarised-session", Some("claude")).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            markers.iter().all(|marker| marker.kind != "unknown"),
+            "no record gained a spurious unknown marker: {markers:?}"
+        );
+    }
+
+    /// A summary in a file whose session is never named has nowhere to go.
+    ///
+    /// The fallback attributes to the file's own session, so a transcript that
+    /// names none -- every record sessionless -- still has no answer. Recorded
+    /// as the deliberate limit rather than left to be rediscovered: inventing
+    /// an id would put the summary on a session that does not exist.
+    #[test]
+    fn a_summary_in_a_transcript_that_names_no_session_is_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anonymous.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"orphan","leafUuid":"leaf-9"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT count(*) FROM session_markers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "a marker with no session would be unreachable");
+    }
+
+    /// The Claude half of the marker-only fast path.
+    ///
+    /// Same defect as the Codex one, in the other parser: the stamp fast path
+    /// asks whether the transcript has `session_events`, which was the whole
+    /// question before markers existed. A transcript whose records are all
+    /// marker-only -- a summary, a compaction boundary, an image-only turn --
+    /// answers no forever, so an unchanged file is re-parsed and re-upserted
+    /// on every sync and the cost never converges.
+    #[test]
+    fn a_marker_only_claude_transcript_stays_on_the_stamp_fast_path() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude/projects/p");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marker-only.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"only a summary","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+
+        // The premise: markers, and no events at all.
+        assert!(
+            !super::session_events_exist(&conn, "claude", "claude-markers-only").unwrap(),
+            "the fixture must produce no events, or it proves nothing"
+        );
+        let markers = crate::session_markers_page(&conn, "claude", "claude-markers-only", 50, None)
+            .unwrap()
+            .markers;
+        assert!(!markers.is_empty(), "the fixture must produce markers");
+
+        // A sentinel a re-ingest would overwrite.
+        conn.execute(
+            "UPDATE session_markers SET subkind = 'sentinel' \
+             WHERE source = 'claude' AND session_id = 'claude-markers-only'",
+            [],
+        )
+        .unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+        let survivors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'claude-markers-only' \
+                 AND subkind = 'sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            survivors > 0,
+            "an unchanged marker-only transcript must not be re-read on every sync"
+        );
+
+        // Positive control: a file that really changed is still re-read.
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"only a summary","leafUuid":"leaf-1"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s2","sessionId":"claude-markers-only","cwd":"/tmp/p","timestamp":"2026-09-12T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        super::sync_claude_session_metadata(&conn, &mut state, home.path()).unwrap();
+        let after = crate::session_markers_page(&conn, "claude", "claude-markers-only", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            after.len() > markers.len(),
+            "a changed transcript must still be re-read: {after:?}"
+        );
+    }
+
+    /// A sidecar's summary belongs to the child, not to the parent.
+    ///
+    /// A Claude subagent transcript carries the PARENT's `sessionId` on every
+    /// row plus a per-child `agentId`, and when the provider records that id
+    /// the whole file is ingested under the child. My sessionless fallback
+    /// read the first `sessionId` in the file instead -- which in a sidecar is
+    /// the parent's. So the child lost its summary and the parent gained
+    /// evidence from a conversation that is not its own: worse than the drop
+    /// it replaced, because a wrong attribution reads as a real one.
+    ///
+    /// The attribution has to be the id the rest of the file is ingested
+    /// under, which is exactly what `attributed_session_id` already is.
+    #[test]
+    fn a_sidecar_summary_attaches_to_the_child_not_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"summary","summary":"what the subagent did","leafUuid":"leaf-kid"}"#, "\n",
+                r#"{"type":"assistant","uuid":"k1","sessionId":"parent-session","agentId":"child-session","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"working"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_claude_transcript_as(&conn, &path, Some("child-session")).unwrap();
+
+        let child = crate::session_markers_page(&conn, "claude", "child-session", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            child.iter().any(|marker| marker.kind == "summary"),
+            "the summary must land on the session the file is ingested under: {child:?}"
+        );
+        let parent = crate::session_markers_page(&conn, "claude", "parent-session", 50, None)
+            .unwrap()
+            .markers;
+        assert!(
+            parent.is_empty(),
+            "and the parent must gain nothing from a conversation that is not its own: {parent:?}"
+        );
+    }
+
+    /// One summary is one row, however it reached the database.
+    ///
+    /// A summary read locally has no `sessionId`; the same line arriving in a
+    /// remote snapshot has one injected, so it takes the ordinary record path.
+    /// Those two paths derived the marker uid differently -- one from
+    /// `leafUuid`, the other from `uuid` or a line hash -- so the unique key
+    /// could not collapse them and one summary became two rows. A duplicate is
+    /// not a crash; it is a count every consumer quietly gets wrong.
+    #[test]
+    fn one_summary_is_one_marker_however_it_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary = r#"{"type":"summary","summary":"same summary","leafUuid":"leaf-same"}"#;
+        let sessionless = dir.path().join("local.jsonl");
+        fs::write(
+            &sessionless,
+            format!(
+                "{summary}\n{}\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#
+            ),
+        )
+        .unwrap();
+        // What a remote snapshot looks like: the same line, with the session
+        // injected so it takes the ordinary record path.
+        let injected = dir.path().join("remote.jsonl");
+        fs::write(
+            &injected,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"summary","summary":"same summary","leafUuid":"leaf-same","sessionId":"dedup-session"}"#,
+                r#"{"type":"user","uuid":"u0","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:00.000Z","message":{"role":"user","content":"hi"}}"#
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &sessionless).unwrap();
+        ingest_claude_transcript(&conn, &injected).unwrap();
+
+        let summaries: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'dedup-session' AND kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 1, "one summary, one row, whichever path it took");
+
+        // Positive control: two genuinely different summaries stay two rows,
+        // so this collapses duplicates rather than collapsing summaries.
+        let other = dir.path().join("other.jsonl");
+        fs::write(
+            &other,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"summary","summary":"a different summary","leafUuid":"leaf-other"}"#,
+                r#"{"type":"user","uuid":"u1","sessionId":"dedup-session","cwd":"/tmp/p","timestamp":"2026-09-13T00:00:02.000Z","message":{"role":"user","content":"more"}}"#
+            ),
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &other).unwrap();
+        let summaries: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers \
+                 WHERE source = 'claude' AND session_id = 'dedup-session' AND kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 2, "distinct summaries must stay distinct");
+    }
+
+    /// A sessionless re-read must not blank what the record already carried.
+    ///
+    /// Sharing one identity between the two paths is what stops a summary
+    /// becoming two rows -- and it makes them the *same* row, so whichever
+    /// runs last decides every column. `insert_session_marker` upserts and
+    /// overwrites, so a sessionless pass that left `ts_ms`, `message_id` and
+    /// `parent_id` at their defaults wiped values an earlier pass had stored.
+    ///
+    /// Dedup and erasure are the same mechanism seen twice: any column the two
+    /// paths do not both populate is a column the later one destroys.
+    #[test]
+    fn a_sessionless_re_read_keeps_the_identity_the_record_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        // A summary as a remote snapshot carries it: `sessionId` injected, and
+        // -- like every real Claude summary -- no `uuid` of its own.
+        let with_session = dir.path().join("remote.jsonl");
+        fs::write(
+            &with_session,
+            concat!(
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","parentUuid":"par-1","sessionId":"keep-session","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        // The same record as it is read locally: no sessionId of its own.
+        let sessionless = dir.path().join("local.jsonl");
+        fs::write(
+            &sessionless,
+            concat!(
+                r#"{"type":"summary","summary":"s","leafUuid":"leaf-keep","parentUuid":"par-1","timestamp":"2026-09-14T00:00:00.000Z"}"#, "\n",
+                r#"{"type":"user","uuid":"u0","sessionId":"keep-session","cwd":"/tmp/p","timestamp":"2026-09-14T00:00:01.000Z","message":{"role":"user","content":"hi"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = |conn: &Connection| {
+            crate::session_markers_page(conn, "claude", "keep-session", 50, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .find(|m| m.kind == "summary")
+                .expect("the summary is recorded")
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &with_session).unwrap();
+        let before = summary(&conn);
+        assert!(before.ts_ms.is_some(), "the premise: it starts populated");
+        assert_eq!(
+            before.message_id.as_deref(),
+            Some("leaf-keep"),
+            "the premise: the record path stores the derived identity"
+        );
+
+        ingest_claude_transcript(&conn, &sessionless).unwrap();
+        // The whole row, not three fields of it. Naming the columns that broke
+        // is how this was fixed twice already: `ts_ms`, `message_id` and
+        // `parent_id` the first time, `message_id`'s *value* the second. The
+        // next column added to the struct is covered here without anyone
+        // remembering to add it.
+        assert_eq!(
+            summary(&conn),
+            before,
+            "a sessionless re-read must agree with the record path on every column"
+        );
+        // Positive control: still one row, so this did not fix erasure by
+        // reintroducing the duplicate.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_markers WHERE kind = 'summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// A sidecar whose only evidence is markers is still evidence.
+    ///
+    /// The two session probes were taught to count `session_markers`; this
+    /// third one -- the sidecar's, which reaches its session through
+    /// `session_relationships` rather than the catalog -- was not. A sidecar
+    /// carrying only records the event model cannot hold indexes markers and
+    /// no events, so the fast path read it as having left nothing behind and
+    /// re-parsed it on every sync, forever, while reporting a normal sync.
+    #[test]
+    fn a_marker_only_sidecar_is_not_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, named, _) = write_claude_parent_with_subagents(dir.path());
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        // Leave this sidecar's evidence as a marker and nothing else, which is
+        // the shape a compaction boundary or a system row produces.
+        conn.execute(
+            "DELETE FROM session_events WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        crate::insert_session_marker(
+            &conn,
+            "claude",
+            "abc",
+            &crate::NewSessionMarker {
+                marker_uid: "side-b:marker",
+                ts_ms: Some(11),
+                message_id: Some("side-b"),
+                parent_id: None,
+                turn_id: None,
+                kind: "compaction_boundary",
+                subkind: Some("compact_boundary"),
+                text: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        // Rewrite the sidecar and record the rewritten file as already seen: a
+        // walk that cannot see the marker reads this as unindexed and ingests
+        // it despite the matching stamp.
+        fs::write(
+            &named,
+            concat!(
+                r#"{"sessionId":"claude-root","agentId":"abc","isSidechain":true,"uuid":"side-b","cwd":"/work/app","type":"assistant","message":{"role":"assistant","content":"later result"},"timestamp":"2026-08-31T11:00:06Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let key = named.to_string_lossy().to_string();
+        state
+            .get_mut("claude_sessions_v4")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(key, json!(claude_sync_stamp(&named).unwrap()));
+
+        let sentinel = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                 WHERE source='claude' AND session_id='abc' AND event_uid='side-b:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sentinel(&conn), 0, "a marker is evidence: do not re-read");
+
+        // Positive control: take the marker away and the same unchanged stamp
+        // reads the file again, so this skips a sidecar that left something
+        // rather than skipping every sidecar.
+        conn.execute(
+            "DELETE FROM session_markers WHERE source='claude' AND session_id='abc'",
+            [],
+        )
+        .unwrap();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sentinel(&conn), 1);
+    }
+
     /// Every sidecar read obeys the same three-way rule: absent is nothing,
     /// malformed-but-present is evidence, unreadable is an error.
     ///
@@ -10082,7 +11750,7 @@ mod tests {
         };
         let marker = |conn: &Connection, kind: &str| -> Option<(Option<String>, Option<String>)> {
             conn.query_row(
-                "SELECT text, detail_json FROM session_markers \
+                "SELECT text, payload_json FROM session_markers \
                  WHERE source = 'grok' AND kind = ?",
                 params![kind],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -10925,15 +12593,22 @@ mod tests {
             json!({"u.jsonl": "1:1"}),
         );
         on_disk.insert("codex_rollouts_v3".into(), json!({"v3.jsonl": "1:1"}));
+        on_disk.insert(
+            "codex_rollouts_v5".into(),
+            json!({"a.jsonl": {"stamp": "1:1"}}),
+        );
+        on_disk.insert("claude_sessions_v3".into(), json!({"s.jsonl": "1:1"}));
         on_disk.insert("claude".into(), json!({"keep.jsonl": 7}));
         save_sync_state(&path, &on_disk).unwrap();
 
-        // What a post-migration run holds: v5 written, the retired keys removed.
+        // What a post-migration run holds: the current generations written, the
+        // retired keys removed.
         let mut ours = Map::new();
         ours.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
+        ours.insert("claude_sessions_v4".into(), json!({"s.jsonl": "2:2"}));
         checkpoint_sync_state(&path, &ours);
 
         let saved = load_sync_state(&path).unwrap();
@@ -10944,9 +12619,10 @@ mod tests {
             );
         }
         assert_eq!(
-            saved["codex_rollouts_v5"],
+            saved["codex_rollouts_v6"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
+        assert_eq!(saved["claude_sessions_v4"], json!({"s.jsonl": "2:2"}));
         // A source this run never touched must still be preserved -- absence from
         // `ours` is not a deletion, which is why retirement has to be declared.
         assert_eq!(saved["claude"], json!({"keep.jsonl": 7}));
@@ -10956,44 +12632,44 @@ mod tests {
         assert!(super::merged_sync_state(&path, &ours).unwrap().is_none());
     }
 
-    /// `checkpoint_sync_state` runs once per source, and `codex_rollouts_v4` is
-    /// still read to seed the v5 migration. An earlier source's checkpoint must
+    /// `checkpoint_sync_state` runs once per source, and a predecessor map is
+    /// still read during its migration. An earlier source's checkpoint must
     /// therefore not drop it: if a crash landed between that checkpoint and
-    /// `sync_codex_rollouts` writing v5, neither map would survive and the next
-    /// run would re-read the whole archive.
+    /// `sync_codex_rollouts` writing the successor, neither map would survive
+    /// and the next run would re-read the whole archive.
     #[test]
     fn a_retired_key_survives_until_its_successor_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
         on_disk.insert(
-            "codex_rollouts_v4".into(),
+            "codex_rollouts_v5".into(),
             json!({"a.jsonl": {"stamp": "1:1"}}),
         );
         save_sync_state(&path, &on_disk).unwrap();
 
         // An earlier source checkpoints first; codex has not run yet, so nothing
-        // in this write supersedes v4.
+        // in this write supersedes v5.
         let mut early = Map::new();
         early.insert("claude".into(), json!({"c.jsonl": 3}));
         checkpoint_sync_state(&path, &early);
         assert_eq!(
-            load_sync_state(&path).unwrap()["codex_rollouts_v4"],
+            load_sync_state(&path).unwrap()["codex_rollouts_v5"],
             json!({"a.jsonl": {"stamp": "1:1"}}),
-            "v4 must still be readable until v5 replaces it"
+            "v5 must still be readable until v6 replaces it"
         );
 
-        // Codex then runs and writes v5 in the same state map.
+        // Codex then runs and writes v6 in the same state map.
         let mut after_codex = early.clone();
         after_codex.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({"a.jsonl": {"stamp": "2:2"}}),
         );
         checkpoint_sync_state(&path, &after_codex);
         let saved = load_sync_state(&path).unwrap();
-        assert!(!saved.contains_key("codex_rollouts_v4"));
+        assert!(!saved.contains_key("codex_rollouts_v5"));
         assert_eq!(
-            saved["codex_rollouts_v5"],
+            saved["codex_rollouts_v6"],
             json!({"a.jsonl": {"stamp": "2:2"}})
         );
     }
@@ -14188,7 +15864,7 @@ mod tests {
         );
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v3".to_string(),
+            "claude_sessions_v4".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -14603,7 +16279,7 @@ mod tests {
         sync_claude_session_metadata(&conn, &mut state, dir.path())
             .expect_err("a discovered transcript was not indexed");
         let stamps = state
-            .get("claude_sessions_v3")
+            .get("claude_sessions_v4")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
@@ -15868,7 +17544,7 @@ mod tests {
         };
         let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
             state
-                .get("codex_rollouts_v5")
+                .get("codex_rollouts_v6")
                 .and_then(Value::as_object)
                 .map(|map| map.keys().cloned().collect())
                 .unwrap_or_default()
@@ -15985,7 +17661,7 @@ mod tests {
         };
         let stamped = |state: &Map<String, Value>, path: &std::path::Path| -> bool {
             state
-                .get("claude_sessions_v3")
+                .get("claude_sessions_v4")
                 .and_then(Value::as_object)
                 .is_some_and(|map| map.contains_key(path.to_string_lossy().as_ref()))
         };
@@ -16203,7 +17879,7 @@ mod tests {
         };
         let stamped = |state: &Map<String, Value>, path: &std::path::Path| -> bool {
             state
-                .get("codex_rollouts_v5")
+                .get("codex_rollouts_v6")
                 .and_then(Value::as_object)
                 .is_some_and(|map| map.contains_key(path.to_string_lossy().as_ref()))
         };
@@ -16272,7 +17948,7 @@ mod tests {
         };
         let stamped_paths = |state: &Map<String, Value>| -> Vec<String> {
             state
-                .get("claude_sessions_v3")
+                .get("claude_sessions_v4")
                 .and_then(Value::as_object)
                 .map(|map| map.keys().cloned().collect())
                 .unwrap_or_default()
@@ -16642,7 +18318,7 @@ mod tests {
         .unwrap();
         let key = named.to_string_lossy().to_string();
         state
-            .get_mut("claude_sessions_v3")
+            .get_mut("claude_sessions_v4")
             .and_then(Value::as_object_mut)
             .unwrap()
             .insert(key, json!(claude_sync_stamp(&named).unwrap()));
@@ -16732,7 +18408,7 @@ mod tests {
         }
         let mut state = Map::new();
         state.insert(
-            "claude_sessions_v3".to_string(),
+            "claude_sessions_v4".to_string(),
             Value::Object(claude_sessions),
         );
 
@@ -16825,6 +18501,1140 @@ mod tests {
 
     fn codex_meta(path: &std::path::Path) -> super::CodexSessionMeta {
         super::read_codex_session_meta(path).unwrap().unwrap()
+    }
+
+    /// Every marker recorded for one session, oldest first, as
+    /// `(kind, subkind, payload_json)`.
+    fn markers_of(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+    ) -> Vec<(String, String, String)> {
+        crate::session_markers_page(conn, source, session_id, 1_000, None)
+            .unwrap()
+            .markers
+            .into_iter()
+            .map(|marker| {
+                (
+                    marker.kind,
+                    marker.subkind.unwrap_or_default(),
+                    marker.payload_json.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn marker_kinds(conn: &Connection, source: &str, session_id: &str) -> Vec<String> {
+        markers_of(conn, source, session_id)
+            .into_iter()
+            .map(|(kind, _, _)| kind)
+            .collect()
+    }
+
+    /// Claiming a payload type is "modeled" is a claim that something else in
+    /// the parser stores it. For these two nothing did: they had no `event_msg`
+    /// arm, so listing them silenced the marker without anything taking their
+    /// place, and the line vanished entirely. The invariant this locks in is
+    /// the one the whole table exists for -- every line leaves a row behind.
+    #[test]
+    fn every_codex_line_leaves_an_event_or_a_marker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/11");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-reasoning.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-11T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-reason","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_reasoning_raw_content","text":"raw chain of thought"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning_section_break"}}"#, "\n",
+                r#"{"timestamp":"2026-09-11T00:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-reason");
+        for payload_type in [
+            "agent_reasoning_raw_content",
+            "agent_reasoning_section_break",
+        ] {
+            assert!(
+                markers
+                    .iter()
+                    .any(|(_, subkind, _)| subkind == payload_type),
+                "{payload_type} produced neither an event nor a marker: {markers:?}"
+            );
+        }
+
+        // The readable stream is still an event, not a second marker: a type
+        // something else really does store must stay silent here.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND text='done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        assert!(
+            !markers
+                .iter()
+                .any(|(_, subkind, _)| subkind == "agent_message"),
+            "a modeled type must not also produce a marker: {markers:?}"
+        );
+    }
+
+    /// A record's outer `type` is the provider's own name for what the record
+    /// *is*, and it is recorded independently of whether the record also
+    /// carries message content. Classifying only on the empty-content path
+    /// meant a future record type that happens to carry content became an
+    /// ordinary text event with its native type nowhere in the ledger.
+    #[test]
+    fn claude_unknown_record_types_are_recorded_even_when_they_carry_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u0","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":"an ordinary prompt"}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f1","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"user","content":"notice"}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f2","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"blocked notice"}]}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f3","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:03.000Z","message":{"role":"user","content":null}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"future-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:04.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"ok"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_markers_page(&conn, "claude", "future-session", 100, None)
+            .unwrap()
+            .markers;
+        let notices = page
+            .iter()
+            .filter(|marker| marker.subkind.as_deref() == Some("future_notice"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            3,
+            "string, array and null content must each keep the native type: {page:?}"
+        );
+        assert!(notices.iter().all(|marker| marker.kind == "unknown"));
+        assert_eq!(
+            notices
+                .iter()
+                .filter_map(|marker| marker.message_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["f1", "f2", "f3"],
+            "each record keys its own marker"
+        );
+
+        // The content that *is* modeled still becomes an event, so the marker
+        // records the record's identity rather than replacing its contents.
+        let texts: Vec<String> = conn
+            .prepare("SELECT text FROM session_events WHERE source='claude' ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(texts.iter().any(|text| text == "notice"));
+        assert!(texts.iter().any(|text| text == "blocked notice"));
+
+        // An ordinary message record is fully modeled and must not gain a
+        // marker, or every transcript doubles in rows.
+        assert!(
+            page.iter()
+                .all(|marker| marker.subkind.as_deref() != Some("user")
+                    && marker.subkind.as_deref() != Some("assistant")),
+            "modeled record types must stay silent: {page:?}"
+        );
+    }
+
+    /// The exception list's own failure mode, which I flagged as the risk when
+    /// I added it and then still got wrong: `response_item/message` was
+    /// exempted unconditionally on the grounds that the deduplicator stores
+    /// one row for Codex's two representations of a turn. It does — but only
+    /// when it accepts the message. A user message whose content carries no
+    /// `input_text` part (an image-only turn) is rejected, nothing is written,
+    /// and the blanket exemption then swallowed the line.
+    ///
+    /// The same holds for a blank `user_message` and for an
+    /// application-injected control wrapper: the deduplicator refuses both.
+    ///
+    /// The exemption now has to be earned: it holds for a mirrored duplicate,
+    /// whose twin really did write, and not for a message the deduplicator
+    /// simply refused.
+    #[test]
+    fn a_codex_message_the_deduplicator_rejects_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/13");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-image.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-image","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                // Image-only user turn: no `input_text` part, so the
+                // deduplicator rejects it and nothing stores it.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
+                // Blank text, and an application-injected control wrapper:
+                // the deduplicator refuses both, so nothing stores them
+                // either.
+                r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp/proj</environment_context>"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "the image-only turn reaches no event");
+
+        let markers = markers_of(&conn, "codex", "sess-image");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("unknown", "message"),
+                ("unknown", "user_message"),
+                ("unknown", "user_message"),
+            ],
+            "every user line nothing stored must leave a row: {markers:?}"
+        );
+        // No marker payload carries the image or the wrapper text, only the
+        // fact that the line was there.
+        assert!(
+            markers.iter().all(|(_, _, payload)| payload.is_empty()),
+            "the marker records that the line existed, not its contents"
+        );
+    }
+
+    /// The other side of the same exemption: a genuine mirror pair must still
+    /// produce exactly one event and no marker, or every user turn in every
+    /// rollout gains a spurious `unknown` row.
+    #[test]
+    fn a_mirrored_codex_user_turn_writes_one_row_and_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/13");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-mirror.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-mirror","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                // The same turn in both representations, adjacent: Codex's
+                // mirror pair. One row, and the twin is legitimately silent.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"fix the importer"}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:01.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the importer"}]}}"#, "\n",
+                r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+                // The assistant's own mirrored twin of `agent_message`.
+                r#"{"timestamp":"2026-09-13T00:00:02.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let texts: Vec<String> = conn
+            .prepare(
+                "SELECT text FROM session_events WHERE source='codex' AND session_id='sess-mirror' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            texts,
+            vec!["fix the importer".to_string(), "done".to_string()],
+            "one row per turn, not one per representation"
+        );
+        let markers = markers_of(&conn, "codex", "sess-mirror");
+        assert!(
+            markers.is_empty(),
+            "a mirrored twin wrote through its partner, so it earns its silence: {markers:?}"
+        );
+    }
+
+    /// The Codex twin of the Claude counting rule. Being on the "modeled" list
+    /// is a claim that an arm below stores the line, but every one of those
+    /// arms can write nothing for a payload that is empty or the wrong shape:
+    /// a blank `agent_message`, a `*_end` with no `call_id`. The claim was
+    /// trusted, so those lines produced neither an event nor a marker.
+    ///
+    /// Trusting the list is what fails unsafe. Counting what was actually
+    /// written fails safe -- at worst a redundant marker.
+    #[test]
+    fn modeled_codex_lines_that_write_nothing_still_leave_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-empty.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-empty","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"   "}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":""}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:03.000Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"s","tool":"t"}}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:04.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"","query":"q"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:05.000Z","type":"event_msg","payload":{"type":"exec_command_end","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:06.000Z","type":"event_msg","payload":{"type":"patch_apply_end","turn_id":"t1","success":true}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        // Every line above is either session metadata or a modeled type whose
+        // handler had nothing to store, so nothing reaches an event.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "none of these lines yields an event");
+        let calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE source='codex' AND session_id='sess-empty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 0, "and none of them yields a tool call");
+
+        let subkinds: Vec<String> = markers_of(&conn, "codex", "sess-empty")
+            .into_iter()
+            .map(|(_, subkind, _)| subkind)
+            .collect();
+        for expected in [
+            "agent_message",
+            "agent_reasoning",
+            "mcp_tool_call_end",
+            "web_search_end",
+            "exec_command_end",
+            "patch_apply_end",
+        ] {
+            assert!(
+                subkinds.iter().any(|subkind| subkind == expected),
+                "{expected} wrote nothing and left no marker: {subkinds:?}"
+            );
+        }
+        // Session metadata is a state update, not a record: it populates the
+        // catalog rather than the ledger, and must stay silent or every
+        // rollout gains two markers it does not need.
+        assert!(
+            !subkinds
+                .iter()
+                .any(|s| s == "session_meta" || s == "turn_context"),
+            "state-only lines must not produce markers: {subkinds:?}"
+        );
+    }
+
+    /// The other half of the rule: a modeled type that *does* write must stay
+    /// silent, or the fallback would double every rollout.
+    #[test]
+    fn modeled_codex_lines_that_write_stay_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/12");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-written.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-12T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-written","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"thinking it over"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"call_1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:04.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"t1","exit_code":0}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","id":"fco_1","call_id":"call_1","output":"done"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:06.000Z","type":"event_msg","payload":{"type":"agent_message","message":"finished"}}"#, "\n",
+                r#"{"timestamp":"2026-09-12T00:00:07.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":15}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        super::ingest_codex_rollout(&conn, &rollout, &codex_meta(&rollout)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-written");
+        assert!(
+            markers.iter().all(|(kind, _, _)| kind != "unknown"),
+            "every line here either wrote a row or is state-only: {markers:?}"
+        );
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sess-written'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events >= 4, "the modeled lines really did write: {events}");
+    }
+
+    /// Content that is *present* but reaches no event is the same as no
+    /// content at all, for the purpose of "did this record leave a row?".
+    /// Treating `""` or `[]` as event-bearing suppressed the fallback marker
+    /// while nothing was inserted, so the record was absent from both tables.
+    #[test]
+    fn claude_records_with_empty_content_still_leave_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-content.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"future_notice","uuid":"f1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":""}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"user","content":[]}}"#, "\n",
+                r#"{"type":"user","uuid":"u1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:02.000Z","message":{"role":"user","content":""}}"#, "\n",
+                r#"{"type":"user","uuid":"u2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:03.000Z","message":{"role":"user","content":[]}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:04.000Z","message":{"role":"assistant","model":"m","content":"   "}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:05.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"   "}]}}"#, "\n",
+                r#"{"type":"future_notice","uuid":"f3","sessionId":"empty-content","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:06.000Z","message":{"role":"user","content":[{"type":"text","text":""},{"type":"thinking","thinking":"  "}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        // Nothing here reaches an event, so every one of these records has to
+        // be accounted for by a marker or it has silently disappeared.
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND session_id='empty-content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "none of these records yields an event");
+
+        let recorded: Vec<String> =
+            crate::session_markers_page(&conn, "claude", "empty-content", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .filter_map(|marker| marker.message_id)
+                .collect();
+        assert_eq!(
+            recorded,
+            vec!["f1", "f2", "u1", "u2", "a1", "a2", "f3"],
+            "every record that produced no event must still be recorded, \
+             including blocks that are present but entirely blank"
+        );
+    }
+
+    /// The converse of the rule above: a record whose outer type *is* modeled
+    /// but which produced no event at all is still not allowed to vanish.
+    #[test]
+    fn a_message_record_that_yields_no_event_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"empty-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:00.000Z","message":{"role":"user","content":null}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","sessionId":"empty-session","cwd":"/tmp/p","timestamp":"2026-09-11T00:00:01.000Z","message":{"role":"assistant","model":"m"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "empty-session");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("unknown", "user"), ("unknown", "assistant")],
+            "a record that produced nothing is recorded as having existed: {markers:?}"
+        );
+    }
+
+    /// A marker exists nowhere but the transcript, so the only way an existing
+    /// install gets one is by re-reading a file whose bytes never changed.
+    /// `HYDRATION_PARSER_VERSION` does not reach this path -- it only
+    /// invalidates targeted hydration checkpoints -- so the global sync state
+    /// generation has to advance too. Seeded exactly as an upgraded install
+    /// looks: a current-at-the-time stamp map plus events already in the
+    /// database, which together satisfy the skip.
+    #[test]
+    fn a_claude_upgrade_re_reads_unchanged_transcripts_once_for_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"upgrade-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"upgrade-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],"usage":{"cache_read_input_tokens":9000}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"upgrade-session","timestamp":"2026-04-20T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // What the previous release left behind: the catalog row and events
+        // are present, so `claude_transcript_events_exist` is satisfied.
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, cwd, raw_path) VALUES ('upgrade-session', 'claude', '/tmp/p', ?)",
+            [path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'upgrade-session', 1, 'assistant', 'text', 'hi', 'a1:0')",
+            [],
+        )
+        .unwrap();
+
+        let mut old_state = Map::new();
+        old_state.insert(
+            path.to_string_lossy().to_string(),
+            json!(claude_sync_stamp(&path).unwrap()),
+        );
+        let mut state = Map::new();
+        state.insert("claude_sessions_v3".to_string(), Value::Object(old_state));
+
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+
+        let markers = markers_of(&conn, "claude", "upgrade-session");
+        assert_eq!(
+            markers.len(),
+            1,
+            "the upgrade must re-read the unchanged transcript once: {markers:?}"
+        );
+        assert_eq!(markers[0].0, "compaction_boundary");
+
+        // And the new generation is what is written, so the next run is fast
+        // again rather than re-reading forever.
+        assert!(state.get("claude_sessions_v4").is_some());
+        assert!(state.get("claude_sessions_v3").is_none());
+        let before = markers_of(&conn, "claude", "upgrade-session");
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(
+            markers_of(&conn, "claude", "upgrade-session"),
+            before,
+            "a second run is a no-op, not a second re-read"
+        );
+    }
+
+    /// The Codex half of the same upgrade. A `codex_rollouts_v5` record whose
+    /// stamp matches and whose session already has events takes the fast path
+    /// and is skipped, so the generation has to advance for markers to land.
+    #[test]
+    fn a_codex_upgrade_re_reads_unchanged_rollouts_once_for_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let day = home.join(".codex/sessions/2026/09/10");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-upgrade.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-09-10T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-upgrade","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:02.000Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('codex', 'sess-upgrade', 1, 'assistant', 'text', 'done', 'retained')",
+            [],
+        )
+        .unwrap();
+
+        let mut state = Map::new();
+        state.insert(
+            "codex_rollouts_v5".into(),
+            json!({
+                rollout.to_string_lossy().to_string(): {
+                    "stamp": file_stamp(&rollout).unwrap(),
+                    "session": "sess-upgrade",
+                    "subagent": false
+                }
+            }),
+        );
+
+        let codex = home.join(".codex");
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+
+        let kinds = marker_kinds(&conn, "codex", "sess-upgrade");
+        assert!(
+            kinds.iter().any(|kind| kind == "stream_error")
+                && kinds.iter().any(|kind| kind == "task_started"),
+            "the upgrade must re-read the unchanged rollout once: {kinds:?}"
+        );
+        assert!(state.get("codex_rollouts_v6").is_some());
+        assert!(state.get("codex_rollouts_v5").is_none());
+
+        let before = marker_kinds(&conn, "codex", "sess-upgrade");
+        super::sync_codex_rollouts(&conn, &mut state, &codex).unwrap();
+        assert_eq!(
+            marker_kinds(&conn, "codex", "sess-upgrade"),
+            before,
+            "a second run is a no-op, not a second re-read"
+        );
+    }
+
+    /// The payload bound has to be recursive. `replaces` is an array of
+    /// provider-supplied tool names, and truncating only top-level strings
+    /// copied every element verbatim -- a marker that grows without limit with
+    /// the record it is supposed to merely describe.
+    #[test]
+    fn marker_payload_bounds_strings_inside_containers_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-replacement.jsonl");
+        let huge_name = "N".repeat(4096);
+        let names = (0..64)
+            .map(|index| format!("{huge_name}{index}"))
+            .collect::<Vec<_>>();
+        let record = json!({
+            "type": "user",
+            "uuid": "u-huge",
+            "sessionId": "huge-session",
+            "cwd": "/tmp/p",
+            "timestamp": "2026-09-10T00:00:00.000Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": "ok",
+                    "_meta": { "replaces": names, "collapsedCalls": 9 }
+                }]
+            }
+        });
+        fs::write(&path, format!("{record}\n")).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "huge-session");
+        let replacement = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "tool_replacement")
+            .unwrap_or_else(|| panic!("no tool_replacement marker in {markers:?}"));
+        assert!(
+            replacement.2.len() < 8 * 1024,
+            "a marker payload must not grow with the record: {} bytes",
+            replacement.2.len()
+        );
+        let payload: Value = serde_json::from_str(&replacement.2).unwrap();
+        let replaces = payload["replaces"].as_array().unwrap();
+        assert_eq!(replaces.len(), super::MARKER_PAYLOAD_ARRAY_LIMIT);
+        for name in replaces {
+            assert_eq!(
+                name.as_str().unwrap().chars().count(),
+                super::MARKER_PAYLOAD_FIELD_LIMIT
+            );
+        }
+        assert_eq!(payload["collapsedCalls"], json!(9));
+    }
+
+    /// `raw_kind` is only worth writing if a reader returns it. Without it a
+    /// notification synthesized from a `type: "system"` row and a real
+    /// `tool_result` block are the same row through the API.
+    #[test]
+    fn raw_kind_comes_back_through_the_event_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-kind.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"rk-session","cwd":"/tmp/p","timestamp":"2026-04-24T01:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"description":"explore"}}]}}"#, "\n",
+                r#"{"type":"user","uuid":"u1","parentUuid":"a1","sessionId":"rk-session","cwd":"/tmp/p","timestamp":"2026-04-24T01:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result text"}]}}"#, "\n",
+                r#"{"type":"system","subtype":"subagent_completed","sessionId":"rk-session","timestamp":"2026-04-24T01:00:02.000Z","parent_tool_use_id":"toolu_1","agent_id":"agent-1","status":"completed","content":"subagent completed"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_events_page(&conn, "rk-session", Some("claude"), 100, None)
+            .unwrap()
+            .events;
+        let raw_kinds = page
+            .iter()
+            .filter(|event| event.kind == "tool_result")
+            .map(|event| event.raw_kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            raw_kinds,
+            vec![
+                Some("tool_result_block".to_string()),
+                Some("system_subagent_notification".to_string())
+            ],
+            "both tool_result rows must be distinguishable through the reader"
+        );
+
+        // The unpaged reader carries it too, so the two are not inconsistent.
+        let all = crate::session_events(&conn, "rk-session", Some("claude")).unwrap();
+        assert!(all
+            .iter()
+            .any(|event| event.raw_kind.as_deref() == Some("system_subagent_notification")));
+        assert!(
+            all.iter()
+                .any(|event| event.kind == "tool_use" && event.raw_kind.is_none()),
+            "an event nothing set raw_kind on reads back as None, not as a guess"
+        );
+    }
+
+    /// A stale token count is worse than none. The tracker used to update only
+    /// when the field was present, so an assistant message without a cache
+    /// read left the previous message's number standing and the next boundary
+    /// reported it as its own.
+    #[test]
+    fn a_compaction_boundary_does_not_inherit_an_older_messages_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-tokens.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"stale-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"one"}],"usage":{"cache_read_input_tokens":9000}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"stale-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"two"}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"stale-session","timestamp":"2026-04-20T00:00:02.000Z","compactMetadata":{"trigger":"manual"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "stale-session");
+        assert_eq!(markers.len(), 1);
+        let payload: Value = serde_json::from_str(&markers[0].2).unwrap();
+        assert_eq!(payload["trigger"], json!("manual"));
+        assert!(
+            payload.get("tokens_before_compact").is_none(),
+            "an absent cache read must clear the tracker, not inherit 9000: {payload}"
+        );
+    }
+
+    /// One transcript file can carry more than one identity: a subagent
+    /// sidecar's records name the *parent's* `sessionId`. A file-wide tracker
+    /// therefore let a delegated agent's cache read become the number the
+    /// parent's own compaction boundary reported.
+    #[test]
+    fn a_compaction_boundary_does_not_take_a_sidechain_agents_token_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidechain-tokens.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","uuid":"a1","sessionId":"side-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"parent"}],"usage":{"cache_read_input_tokens":120}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","isSidechain":true,"sessionId":"side-session","cwd":"/tmp/p","timestamp":"2026-04-20T00:00:01.000Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"child"}],"usage":{"cache_read_input_tokens":987654}}}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","uuid":"s1","sessionId":"side-session","timestamp":"2026-04-20T00:00:02.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "side-session");
+        assert_eq!(markers.len(), 1);
+        let payload: Value = serde_json::from_str(&markers[0].2).unwrap();
+        assert_eq!(
+            payload["tokens_before_compact"],
+            json!(120),
+            "the parent's boundary reports the parent's context, not a delegated agent's"
+        );
+    }
+
+    /// A compaction boundary carries no size of its own, so the only honest
+    /// answer for "how much context did this replace?" is the cache read of
+    /// the assistant message immediately before it.
+    #[test]
+    fn claude_compact_boundary_is_recorded_with_the_context_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hello"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_c_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":9000,"cache_creation_input_tokens":200}},"type":"assistant","uuid":"u-asst-1","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+                r#"{"type":"system","subtype":"compact_boundary","sessionId":"compact-session","timestamp":"2026-04-20T00:00:02.000Z","uuid":"s-compact-1","compactMetadata":{"trigger":"auto","preTokens":9200}}"#, "\n",
+                r#"{"parentUuid":"u-asst-1","isSidechain":false,"type":"user","message":{"role":"user","content":"continue"},"uuid":"u-user-2","timestamp":"2026-04-20T00:00:03.000Z","cwd":"/tmp/project","sessionId":"compact-session"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "compact-session");
+        assert_eq!(markers.len(), 1, "one boundary, one marker: {markers:?}");
+        let (kind, subkind, payload) = &markers[0];
+        assert_eq!(
+            (kind.as_str(), subkind.as_str()),
+            ("compaction_boundary", "compact_boundary")
+        );
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["tokens_before_compact"], json!(9000));
+        assert_eq!(payload["trigger"], json!("auto"));
+        assert_eq!(payload["pre_tokens"], json!(9200));
+
+        // Re-reading the same transcript heals rather than duplicates.
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_eq!(markers_of(&conn, "claude", "compact-session").len(), 1);
+    }
+
+    /// A `type: "system"` subagent notification reports a delegated call
+    /// finishing. It must reach the `tool_use` that spawned it, and the event
+    /// it normalizes to must stay distinguishable from a real `tool_result`
+    /// content block.
+    #[test]
+    fn claude_system_subagent_notification_links_to_the_spawning_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_system_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_system","name":"Agent","input":{"subagent_type":"Explore","description":"inspect the tree"}}],"usage":{"input_tokens":8,"output_tokens":4}},"type":"assistant","uuid":"u-system-asst","timestamp":"2026-04-24T01:00:00.000Z","cwd":"/tmp/project","sessionId":"sub-session"}"#, "\n",
+                r#"{"type":"system","subtype":"subagent_completed","sessionId":"sub-session","timestamp":"2026-04-24T01:00:01.000Z","parent_tool_use_id":"toolu_system","agent_id":"agent-system-1","subagent_session_id":"session-system-child","status":"completed","content":"subagent completed"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let page = crate::session_markers_page(&conn, "claude", "sub-session", 10, None).unwrap();
+        assert_eq!(page.markers.len(), 1);
+        let marker = &page.markers[0];
+        assert_eq!(marker.kind, "subagent_notification");
+        assert_eq!(marker.subkind.as_deref(), Some("subagent_completed"));
+        assert_eq!(
+            marker.parent_id.as_deref(),
+            Some("toolu_system"),
+            "the notification must point at the call it reports on"
+        );
+        assert!(marker.message_id.is_some());
+        let payload: Value = serde_json::from_str(marker.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["agent_id"], json!("agent-system-1"));
+        assert_eq!(
+            payload["subagent_session_id"],
+            json!("session-system-child")
+        );
+        assert_eq!(payload["status"], json!("completed"));
+
+        let spawned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE source='claude' AND tool_use_id='toolu_system'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(spawned, 1, "the spawning tool_use is still recorded");
+
+        let raw_kinds: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT kind, raw_kind FROM session_events WHERE source='claude' AND session_id='sub-session' AND kind='tool_result'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            raw_kinds,
+            vec![(
+                "tool_result".to_string(),
+                Some("system_subagent_notification".to_string())
+            )],
+            "the notification lands as a tool_result that says where it came from"
+        );
+    }
+
+    /// Tool-replacement metadata and a delegated result's `agentId` are two
+    /// separate facts about the same block, so each keeps its own marker.
+    #[test]
+    fn claude_tool_result_metadata_is_recorded_beside_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replacement.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"search the repo"},"uuid":"u-user-1","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+                r#"{"parentUuid":"u-user-1","isSidechain":false,"message":{"model":"claude-sonnet-4-6","id":"msg_rm_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_search_1","name":"relaywash__Search","input":{"query":"foo"}},{"type":"tool_use","id":"tu_task_1","name":"Task","input":{"description":"explore"}}]},"type":"assistant","uuid":"u-asst-1","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+                r#"{"parentUuid":"u-asst-1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_search_1","content":"results...","_meta":{"replaces":["Glob","Grep","Read"],"collapsedCalls":9}},{"type":"tool_result","tool_use_id":"tu_task_1","content":"done","toolUseResult":{"agentId":"agent-77"}}]},"uuid":"u-user-2","timestamp":"2026-04-20T00:00:02.000Z","cwd":"/tmp/project","sessionId":"replacement-session"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "replacement-session");
+        let replacement = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "tool_replacement")
+            .unwrap_or_else(|| panic!("no tool_replacement marker in {markers:?}"));
+        let payload: Value = serde_json::from_str(&replacement.2).unwrap();
+        assert_eq!(payload["replaces"], json!(["Glob", "Grep", "Read"]));
+        assert_eq!(payload["collapsedCalls"], json!(9));
+
+        let delegated = markers
+            .iter()
+            .find(|(_, subkind, _)| subkind == "tool_use_result_agent_id")
+            .unwrap_or_else(|| panic!("no delegated-result marker in {markers:?}"));
+        assert_eq!(delegated.0, "subagent_notification");
+        let payload: Value = serde_json::from_str(&delegated.2).unwrap();
+        assert_eq!(payload["agent_id"], json!("agent-77"));
+        assert_eq!(payload["tool_use_id"], json!("tu_task_1"));
+
+        let raw_kinds: Vec<Option<String>> = conn
+            .prepare("SELECT raw_kind FROM session_events WHERE source='claude' AND kind='tool_result' ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            raw_kinds,
+            vec![
+                Some("tool_result_block".to_string()),
+                Some("tool_result_block".to_string())
+            ]
+        );
+    }
+
+    /// Summaries, non-text blocks and thinking signatures are all recorded,
+    /// and none of them brings its bytes along. The `image` block below is
+    /// deliberately far larger than any marker payload is allowed to be.
+    #[test]
+    fn claude_summary_and_non_text_blocks_are_recorded_without_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markers.jsonl");
+        let image_data = "A".repeat(4096);
+        let signature = "S".repeat(600);
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"summary","summary":"Refactored the transcript parser","leafUuid":"u-asst-1","sessionId":"marker-session","timestamp":"2026-09-10T00:00:00.000Z","uuid":"sum-1"}}"#, "\n",
+                    r#"{{"type":"user","uuid":"u1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:01.000Z","message":{{"role":"user","content":"look at this screenshot"}}}}"#, "\n",
+                    r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:02.000Z","message":{{"role":"assistant","model":"claude-test","content":[{{"type":"thinking","thinking":"weighing the options","signature":"{signature}"}},{{"type":"redacted_thinking","data":"encrypted-reasoning-blob"}},{{"type":"text","text":"I can see it"}}]}}}}"#, "\n",
+                    r#"{{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"marker-session","cwd":"/tmp/project","timestamp":"2026-09-10T00:00:03.000Z","message":{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{image_data}"}}}}]}}}}"#, "\n",
+                ),
+                signature = signature,
+                image_data = image_data,
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        let markers = markers_of(&conn, "claude", "marker-session");
+        let by_subkind = |name: &str| {
+            markers
+                .iter()
+                .find(|(_, subkind, _)| subkind == name)
+                .unwrap_or_else(|| panic!("no {name} marker in {markers:?}"))
+        };
+
+        let summary = by_subkind("summary");
+        assert_eq!(summary.0, "summary");
+        let payload: Value = serde_json::from_str(&summary.2).unwrap();
+        assert_eq!(
+            payload["summary"],
+            json!("Refactored the transcript parser")
+        );
+        assert_eq!(payload["leaf_uuid"], json!("u-asst-1"));
+
+        assert_eq!(by_subkind("redacted_thinking").0, "unsupported_block");
+        let thinking_signature = by_subkind("thinking_signature");
+        assert_eq!(thinking_signature.0, "unsupported_block");
+        let payload: Value = serde_json::from_str(&thinking_signature.2).unwrap();
+        assert_eq!(payload["has_signature"], json!(true));
+        assert_eq!(payload["bytes"], json!(signature.len()));
+
+        let image = by_subkind("image");
+        assert_eq!(image.0, "unsupported_block");
+        let payload: Value = serde_json::from_str(&image.2).unwrap();
+        assert!(
+            payload["bytes"].as_i64().unwrap() > 4096,
+            "the block's size is recorded"
+        );
+
+        // The point of the whole payload contract: a marker never grows with
+        // the record it describes.
+        for (kind, subkind, payload) in &markers {
+            if kind == "unsupported_block" {
+                assert!(
+                    payload.len() < 256,
+                    "{subkind} payload must stay bounded: {payload}"
+                );
+            }
+            assert!(
+                !payload.contains(&image_data[..64]),
+                "{subkind} payload must never carry block bytes"
+            );
+        }
+        assert!(
+            !markers.iter().any(|(_, subkind, _)| subkind == "text"),
+            "fully modeled blocks produce no marker: {markers:?}"
+        );
+
+        // The readable half of the thinking block is still an event.
+        let thinking: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source='claude' AND kind='thinking'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thinking, 1);
+    }
+
+    /// Every Codex line the event model drops becomes a marker, and a type no
+    /// classifier knows is stored as `unknown` rather than discarded.
+    #[test]
+    fn codex_lifecycle_and_unknown_events_are_recorded_as_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-markers.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-09-10T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-markers","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.200Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.300Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call_1","turn_id":"t1","command":["ls"]}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.400Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"par"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.500Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-blob"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.600Z","type":"event_msg","payload":{"type":"turn_diff","turn_id":"t1","unified_diff":"@@\n+a\n-b"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.700Z","type":"event_msg","payload":{"type":"stream_error","message":"upstream reset"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.800Z","type":"event_msg","payload":{"type":"zzz_future","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:00.900Z","type":"event_msg","payload":{"type":"entered_review_mode","turn_id":"t1"}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.000Z","type":"event_msg","payload":{"type":"subagent_message_complete","call_id":"call_1","agent_id":"agent_42","success":true}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.100Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message"},{"type":"compaction"}]}}"#, "\n",
+                r#"{"timestamp":"2026-09-10T00:00:01.200Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+
+        let markers = markers_of(&conn, "codex", "sess-markers");
+        let kinds = marker_kinds(&conn, "codex", "sess-markers");
+        for expected in [
+            "task_started",
+            "tool_begin",
+            "encrypted_reasoning",
+            "turn_diff",
+            "stream_error",
+            "unknown",
+            "review_mode",
+            "subagent_notification",
+            "compaction_boundary",
+            "task_complete",
+        ] {
+            assert!(
+                kinds.iter().any(|kind| kind == expected),
+                "missing {expected} in {markers:?}"
+            );
+        }
+        assert_eq!(
+            kinds.len(),
+            10,
+            "a streaming delta is a fragment of an event that is already \
+             recorded whole, and turn_context is modeled: {markers:?}"
+        );
+
+        let unknown = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "unknown")
+            .unwrap();
+        assert_eq!(
+            unknown.1, "zzz_future",
+            "an unclassified type keeps its provider-native name"
+        );
+
+        let reasoning = markers
+            .iter()
+            .find(|(kind, _, _)| kind == "encrypted_reasoning")
+            .unwrap();
+        let payload: Value = serde_json::from_str(&reasoning.2).unwrap();
+        assert_eq!(payload["bytes"], json!("opaque-blob".len()));
+        assert!(
+            !reasoning.2.contains("opaque-blob"),
+            "only the size of an encrypted block is kept"
+        );
+
+        let turn_ids: Vec<Option<String>> =
+            crate::session_markers_page(&conn, "codex", "sess-markers", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .map(|marker| marker.turn_id)
+                .collect();
+        assert!(
+            turn_ids
+                .iter()
+                .filter(|id| id.as_deref() == Some("t1"))
+                .count()
+                >= 5,
+            "a marker keeps the turn it belongs to: {turn_ids:?}"
+        );
+
+        // Idempotent under a re-parse: uids are derived from file position.
+        super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
+        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 10);
     }
 
     /// The tool-result row answering one call, whatever its position. A
@@ -17897,7 +20707,7 @@ mod tests {
             .unwrap();
         assert_eq!(tool_count, 1);
         assert!(state.get("codex_rollouts_v3").is_none());
-        assert!(state.get("codex_rollouts_v5").is_some());
+        assert!(state.get("codex_rollouts_v6").is_some());
 
         super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
         let second_counts: (i64, i64, i64, i64) = conn
@@ -18055,7 +20865,7 @@ mod tests {
         let key = rollout.to_string_lossy().to_string();
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v5".into(),
+            "codex_rollouts_v6".into(),
             json!({
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
@@ -18105,7 +20915,7 @@ mod tests {
     fn unchanged_subagent_state(rollout: &std::path::Path, session_id: &str) -> Map<String, Value> {
         let mut state = Map::new();
         state.insert(
-            "codex_rollouts_v4".into(),
+            "codex_rollouts_v6".into(),
             json!({
                 rollout.to_string_lossy().to_string(): {
                     "stamp": file_stamp(rollout).unwrap(),
@@ -18243,8 +21053,9 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // Existing events make the old v4 entries eligible for the fast path.
-        // They carry the current raw-facts generation so this test exercises the
+        // Existing events would have made the old v4 entries eligible for the
+        // fast path under a generation that seeded itself from them. They carry
+        // the current raw-facts generation, so what this test exercises is the
         // guardian reclassification and not the raw-facts backfill.
         for session_id in [
             "sess-top",
@@ -18263,8 +21074,8 @@ mod tests {
             )
             .unwrap();
         }
-        // The normal root has an existing catalog row and should stay on the
-        // stamp fast path during this targeted migration.
+        // The normal root has an existing catalog row. A v6 upgrade re-reads it
+        // anyway -- see below -- but its catalog identity must survive that.
         conn.execute(
             "INSERT INTO sessions (session_id, source, cwd) \
              VALUES ('sess-top', 'codex', '/tmp/proj')",
@@ -18327,7 +21138,12 @@ mod tests {
 
         let (_, _, inserted) =
             super::sync_codex_rollouts(&conn, &mut state, &home.join(".codex")).unwrap();
-        assert_eq!(inserted, 1, "standalone guardian prompt is newly indexed");
+        // `codex_rollouts_v6` is not seeded from an older map, because a marker
+        // exists nowhere but the rollout and a carried-forward stamp would skip
+        // the files whose markers are missing. So both non-subagent rollouts are
+        // re-read and re-index their one prompt each; the linked guardian stays a
+        // subagent and indexes none.
+        assert_eq!(inserted, 2, "both root and standalone prompts are indexed");
         let sessions: Vec<String> = conn
             .prepare("SELECT session_id FROM sessions WHERE source='codex' ORDER BY session_id")
             .unwrap()
@@ -18362,12 +21178,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            root_history, 0,
-            "the unchanged root stayed on the fast path"
+            root_history, 1,
+            "an old cache costs one full re-read, which is what materializes markers"
+        );
+        let root_markers = crate::session_markers_page(&conn, "codex", "sess-top", 100, None)
+            .unwrap()
+            .markers;
+        assert!(
+            !root_markers.is_empty(),
+            "the re-read is only worth its cost if it produces the markers"
         );
         assert!(state.get("codex_rollouts_v4").is_none());
         let records = state
-            .get("codex_rollouts_v5")
+            .get("codex_rollouts_v6")
             .and_then(Value::as_object)
             .expect("upgraded rollout cache");
         assert_eq!(
@@ -19413,7 +22236,7 @@ mod tests {
         let mut state = Map::new();
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         let generation = state
-            .get("claude_sessions_v3")
+            .get("claude_sessions_v4")
             .and_then(Value::as_object)
             .cloned()
             .unwrap();
@@ -19449,7 +22272,7 @@ mod tests {
         assert_eq!(edge, ("origin".to_string(), Some("continued".to_string())));
         assert_eq!(
             state
-                .get("claude_sessions_v3")
+                .get("claude_sessions_v4")
                 .and_then(Value::as_object)
                 .unwrap(),
             &generation,
@@ -19494,7 +22317,7 @@ mod tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        let generation = state.get("codex_rollouts_v5").cloned().unwrap();
+        let generation = state.get("codex_rollouts_v6").cloned().unwrap();
 
         forget_continuity_evidence(&conn);
         conn.execute(
@@ -19528,7 +22351,7 @@ mod tests {
             ("prior-thread".to_string(), Some("forked".to_string()))
         );
         assert_eq!(
-            state.get("codex_rollouts_v5").unwrap(),
+            state.get("codex_rollouts_v6").unwrap(),
             &generation,
             "the stamp map is untouched: this is a repair, not a generation reset"
         );
@@ -20110,9 +22933,15 @@ mod capture_progress_tests {
         )
         .unwrap_err();
         assert!(error.is::<CaptureCancelled>());
-        assert!(!state.contains_key("claude_sessions_v3"));
+        // The current Claude stamp map. This branch advanced the generation to
+        // v4 so an upgraded install re-reads each transcript once for markers;
+        // a test that names the retired key still compiles and then panics on
+        // the second index, which is how this one arrived here from main.
+        // Whoever advances it again has to come through this line.
+        let stamp_map = "claude_sessions_v4";
+        assert!(!state.contains_key(stamp_map));
         sync_claude_session_metadata(&conn, &mut state, &dir.path().join("projects")).unwrap();
-        assert!(state["claude_sessions_v3"]
+        assert!(state[stamp_map]
             .get(path.to_string_lossy().as_ref())
             .is_some());
         assert_eq!(
@@ -20298,5 +23127,28 @@ mod capture_progress_tests {
         let mut files = vec![];
         collect_trajectory_json(&wanted, &mut files).unwrap();
         assert_eq!(files, vec![wanted.join("completed/month/run.json")]);
+    }
+}
+
+/// Whether a parsed marker payload already satisfies the bound.
+///
+/// Structural rather than a string comparison against
+/// [`bound_marker_json`]: re-serialising can reorder keys or change spacing
+/// without exceeding anything, and a checker that failed on that would reject
+/// payloads that are perfectly within contract.
+pub(crate) fn marker_payload_is_bounded(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT,
+        Value::Array(items) => {
+            items.len() <= MARKER_PAYLOAD_ARRAY_LIMIT && items.iter().all(marker_payload_is_bounded)
+        }
+        Value::Object(fields) => {
+            fields.len() <= MARKER_PAYLOAD_ARRAY_LIMIT
+                && fields.iter().all(|(name, field)| {
+                    name.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT
+                        && marker_payload_is_bounded(field)
+                })
+        }
+        _ => true,
     }
 }

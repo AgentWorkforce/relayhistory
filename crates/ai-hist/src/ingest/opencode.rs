@@ -31,7 +31,7 @@ use crate::relationship_capture::{
 use crate::{insert_history, prompt_hash, HistoryEntry};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -1370,6 +1370,7 @@ fn normalize_session(
                     &event_uid,
                     None,
                     RawMessageFacts::default(),
+                    None,
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1433,6 +1434,7 @@ fn normalize_session(
                     &event_uid,
                     None,
                     RawMessageFacts::default(),
+                    None,
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1486,6 +1488,7 @@ fn normalize_session(
                 &format!("tool_use:{}", tool.call_id),
                 None,
                 RawMessageFacts::default(),
+                None,
             )?;
             keys.events.insert(format!("tool_use:{}", tool.call_id));
             keys.tool_calls.insert(tool.call_id.to_string());
@@ -1548,6 +1551,7 @@ fn normalize_session(
                         &format!("tool_result:{}", tool.call_id),
                         None,
                         RawMessageFacts::default(),
+                        None,
                     )?;
                     keys.events.insert(format!("tool_result:{}", tool.call_id));
                     counts.events += 1;
@@ -1700,6 +1704,18 @@ fn last_part_index_per_call(parts: &[OpencodePart]) -> BTreeMap<&str, usize> {
 
 /// Record one session-level marker. Returns how many rows the write added, so
 /// re-ingesting the same session does not inflate the count.
+/// One OpenCode marker, through the one marker writer.
+///
+/// This used to be a private `INSERT` naming `detail_json` directly. That
+/// column no longer exists: the v2 marker model renamed it to `payload_json`
+/// and the migration drops it, so the statement would have failed when it was
+/// *prepared* -- on every OpenCode sync of any database that had been
+/// migrated, which is all of them after one open.
+///
+/// A second writer is what made that possible, so the fix is not to rename the
+/// column here but to stop having one. `payload_json` is built by
+/// `marker_payload`, which is what bounds it; a hand-rolled `format!` bypassed
+/// that promise as well as the schema.
 fn insert_session_marker(
     conn: &Connection,
     session_id: &str,
@@ -1709,17 +1725,20 @@ fn insert_session_marker(
     auto: Option<bool>,
     marker_uid: &str,
 ) -> Result<usize> {
-    crate::mark_session_presence(conn, "opencode", session_id, crate::SessionLocation::Local)?;
-    let detail_json = auto.map(|auto| format!("{{\"auto\":{auto}}}"));
-    Ok(conn.execute(
-        "INSERT INTO session_markers \
-         (source, session_id, kind, message_id, ts_ms, detail_json, marker_uid) \
-         VALUES ('opencode', ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, session_id, marker_uid) DO UPDATE SET \
-         kind=excluded.kind, message_id=excluded.message_id, ts_ms=excluded.ts_ms, \
-         detail_json=excluded.detail_json",
-        params![session_id, kind, message_id, ts_ms, detail_json, marker_uid],
-    )?)
+    let payload_json = super::marker_payload(vec![("auto", json!(auto))]);
+    crate::insert_session_marker(
+        conn,
+        "opencode",
+        session_id,
+        &crate::NewSessionMarker {
+            marker_uid,
+            ts_ms: Some(ts_ms),
+            message_id,
+            kind,
+            payload_json: payload_json.as_deref(),
+            ..Default::default()
+        },
+    )
 }
 
 #[cfg(test)]

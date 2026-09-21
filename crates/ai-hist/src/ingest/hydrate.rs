@@ -54,7 +54,29 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// Two different re-parses cannot share a number: a database that ran the
 /// Cursor 7 would report the usage 7 as already done and keep answering with
 /// the old grouping forever.
-const HYDRATION_PARSER_VERSION: i64 = 8;
+///
+/// Version 9 extends `session_markers` to the Claude and Codex parsers, for
+/// the record types they used to drop -- compaction and summary boundaries,
+/// system rows, non-text content blocks and Codex lifecycle events -- and
+/// carries Grok's own markers onto the merged marker model. A database
+/// checkpointed at 8 or earlier has the Claude and Codex rows nowhere, and
+/// nothing short of re-reading the transcript can recover them, so every
+/// session re-parses once.
+///
+/// It is 9 for the third time of asking, and that is the point worth keeping.
+/// It was 7 until Cursor's event-level parser took 7; 8 until usage grouping
+/// took 8. Two branches that each need a one-time re-parse will both pick
+/// `main + 1` while they are open, and the collision is an identical-line
+/// change that merges cleanly and passes every gate -- each value is correct
+/// in isolation, so there is nothing here for a test to catch. Whoever merges
+/// main onto this branch next must re-read this number from main and take
+/// main's plus one if it has moved again.
+///
+/// At the time of writing #204 also holds 9, with main still at 8, so
+/// whichever of the two merges second owes the other a 10. The rule is the
+/// number, not the branch: read main, add one, never assume the value that was
+/// right when the branch opened is still right.
+const HYDRATION_PARSER_VERSION: i64 = 9;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -743,7 +765,17 @@ fn hydrate_remote_claude_observed(
         .iter()
         .any(|other| observation.is_some_and(|current| other.key != current.key));
     if !had_local_presence && !other_observation {
-        for table in ["history", "session_events", "tool_calls", "file_edits"] {
+        // `session_markers` belongs in this list for the same reason the
+        // others do: a marker is evidence, and one left behind after the
+        // provider stopped sending the record it describes tells a caller
+        // something is still there that is not.
+        for table in [
+            "history",
+            "session_events",
+            "tool_calls",
+            "file_edits",
+            "session_markers",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE source = 'claude' AND session_id = ?"),
                 [&options.session_id],
@@ -2786,7 +2818,7 @@ pub fn normalize_source_evidence(
     session_id: &str,
     evidence: crate::sources::AcquiredEvidence,
 ) -> Result<crate::source_intake::NormalizedSourceEvidence> {
-    use crate::source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+    use crate::source_evidence::{self, EvidenceKind, EvidenceRecord, PARSED_SESSION_KINDS};
     use crate::sources::AcquiredEvidence;
     let (source_stamp, source_bytes, covered_kinds, records) = match evidence {
         AcquiredEvidence::Events(evidence) => {
@@ -2839,12 +2871,16 @@ pub fn normalize_source_evidence(
             let conn = Connection::open_in_memory()?;
             crate::init_db(&conn)?;
             ingest_claude_transcript(&conn, transcript.path())?;
+            // Projected through PARSED_SESSION_KINDS, not the connector
+            // capability list: this is our own parser's output coming back out
+            // of a temporary database, so the projection has to name every
+            // table it just wrote or the rows are dropped here.
             let records =
-                source_evidence::read_session(&conn, source, session_id, FULL_SESSION_KINDS)?;
+                source_evidence::read_session(&conn, source, session_id, PARSED_SESSION_KINDS)?;
             (
                 source_stamp,
                 source_bytes,
-                FULL_SESSION_KINDS.to_vec(),
+                PARSED_SESSION_KINDS.to_vec(),
                 records,
             )
         }
@@ -6650,6 +6686,72 @@ mod tests {
         assert_eq!(result.related_session_ids, vec!["related-child"]);
         assert_eq!(result.evidence.events, 1);
         assert_eq!(result.diagnostics[0].code, "CONNECTOR_NOT_CONFIGURED");
+    }
+
+    /// A complete remote snapshot is a replacement, not an addition: the rows
+    /// it no longer contains are deleted before the new ones land. A marker is
+    /// evidence exactly like an event, so one left behind tells a caller
+    /// something is still there that the provider has removed.
+    #[test]
+    fn a_full_remote_snapshot_removes_markers_it_no_longer_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let mut conn = open_db(&db).unwrap();
+        remote_catalog_row(&conn, "claude", "session_01marked");
+        let options = HydrateSessionOptions {
+            source: "claude".into(),
+            session_id: "session_01marked".into(),
+            scope: SessionScope::Remote,
+            include_related: true,
+        };
+        let prompt = serde_json::json!({
+            "sessionId": "session_01marked", "uuid": "u1", "type": "user", "timestamp": 1,
+            "message": {"role": "user", "content": "remote prompt"}
+        });
+        let boundary = serde_json::json!({
+            "sessionId": "session_01marked", "uuid": "s1", "type": "system",
+            "subtype": "compact_boundary", "timestamp": 2
+        });
+
+        let marker_kinds = |conn: &Connection| -> Vec<String> {
+            crate::session_markers_page(conn, "claude", "session_01marked", 100, None)
+                .unwrap()
+                .markers
+                .into_iter()
+                .map(|marker| marker.kind)
+                .collect()
+        };
+
+        hydrate_remote_claude(
+            &mut conn,
+            &options,
+            vec![prompt.clone(), boundary],
+            "teleport:marked".into(),
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker_kinds(&conn),
+            vec!["compaction_boundary".to_string()],
+            "the first snapshot records the boundary"
+        );
+
+        // The provider no longer sends the boundary record.
+        hydrate_remote_claude(
+            &mut conn,
+            &options,
+            vec![prompt],
+            "teleport:unmarked".into(),
+            50,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(
+            marker_kinds(&conn).is_empty(),
+            "a marker the provider removed must not survive a full snapshot: {:?}",
+            marker_kinds(&conn)
+        );
     }
 
     #[test]

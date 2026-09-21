@@ -86,7 +86,7 @@ pub use session_usage::{
     RequestKeySource, SessionRequest, SessionRequestCursor, SessionRequestPage,
     SessionUsageSummary, UsageDiagnostic, SESSION_USAGE_CONTRACT_VERSION,
 };
-pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS};
+pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS, PARSED_SESSION_KINDS};
 pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,
@@ -99,8 +99,9 @@ pub(crate) use session_usage::{session_requests_page, session_usage_summary};
 
 #[cfg(not(feature = "unstable-internal"))]
 pub use store::{
-    HistoryEntry, SessionEvent, SessionEventCursor, SessionFileEdit, SessionLocation, SessionScope,
-    SessionToolCall, SessionUserTurn, SessionUserTurnBlock, SessionUserTurnPage,
+    HistoryEntry, SessionEvent, SessionEventCursor, SessionEvidenceCursor, SessionFileEdit,
+    SessionLocation, SessionMarker, SessionMarkerPage, SessionScope, SessionToolCall,
+    SessionUserTurn, SessionUserTurnBlock, SessionUserTurnPage,
 };
 
 #[cfg(feature = "unstable-internal")]
