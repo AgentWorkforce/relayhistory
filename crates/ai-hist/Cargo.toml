@@ -34,6 +34,7 @@ notify = { version = "8", default-features = false, features = [
     "macos_fsevent",
 ], optional = true }
 rusqlite ={ version = "0.32", features = ["bundled", "functions"] }
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -8688,7 +8688,7 @@ impl ClaudeTranscriptSnapshot {
     /// Open once, validate that exact handle, and only then read its bytes.
     pub(crate) fn open_checked(
         path: &Path,
-        validate: impl FnOnce(&fs::Metadata) -> Result<()>,
+        validate: impl FnOnce(&fs::File) -> Result<()>,
     ) -> Result<Self> {
         let mut file = fs::File::open(path)
             .with_context(|| format!("opening Claude transcript {}", path.display()))?;
@@ -8698,7 +8698,7 @@ impl ClaudeTranscriptSnapshot {
             "{} is not a regular file",
             path.display()
         );
-        validate(&metadata)?;
+        validate(&file)?;
         let mut text = String::with_capacity(metadata.len() as usize);
         file.read_to_string(&mut text)
             .with_context(|| format!("reading Claude transcript {}", path.display()))?;
@@ -8742,35 +8742,17 @@ impl ClaudeTranscriptSnapshot {
 /// The hook validates the path between `open` and `read`; matching filesystem
 /// identity binds that validation to the handle, so swapping a symlink or a
 /// directory entry cannot redirect the later read outside the provider root.
-pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::Metadata) -> Result<()> {
-    let current = fs::metadata(path)
+pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::File) -> Result<()> {
+    let opened = same_file::Handle::from_file(opened.try_clone()?)
+        .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
+    let current = same_file::Handle::from_path(path)
         .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
     anyhow::ensure!(
-        same_file_identity(opened, &current),
+        opened == current,
         "Claude transcript changed while its provider path was validated: {}",
         path.display()
     );
     Ok(())
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.created().ok() == right.created().ok()
 }
 
 fn file_stamp(path: &Path) -> Result<String> {
