@@ -386,6 +386,19 @@ fn install(options: Install) -> Result<()> {
         },
     };
     let include_existing = sharing_mode == bridge::SharingMode::All;
+    // Cloud authentication is the desktop login boundary. Report it before
+    // provisioning the optional RelayHistory upload session so a History or
+    // RelayAuth outage cannot turn a successful Agent Relay login into a
+    // signed-out state. The desktop keeps consuming this process and reports
+    // any later failure as degraded upload setup.
+    if bridge::json_mode() {
+        bridge::emit(
+            serde_json::json!({"event":"authenticated", "account_id":who.user_id,
+            "account_email":who.email, "account_name":who.name,
+            "account_avatar_url":who.avatar_url,
+            "workspace_id":workspace, "directory":directory}),
+        );
+    }
     // The workspace bridge, not this binary, selects the RelayHistory stage and
     // the scope it grants; the shared implementation checks both.
     let session = cloud::workspace_session(
