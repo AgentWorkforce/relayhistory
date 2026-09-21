@@ -3,7 +3,7 @@ import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   packageName,
@@ -387,4 +387,34 @@ test("re-stamping the consumer example at its current version keeps its lock che
   // must be a no-op, not a lock entry stripped of a checksum that is correct.
   await setReleaseVersion(version, root);
   assert.equal(await readFile(lockPath, "utf8"), resolved);
+});
+
+test("every file the script writes is staged by the release workflow's version commit", async () => {
+  // The publish job runs this script and then `git add`s an explicit list;
+  // anything the script writes but the list omits is discarded by the
+  // `git reset --hard` before tagging, so the tag and the persisted branch
+  // silently keep the old value. That is how the consumer example's
+  // requirement stayed on the previous release: the script moved it, the
+  // workflow never committed it.
+  const workflow = await readFile(
+    join(scripts, "..", ".github", "workflows", "publish.yml"),
+    "utf8",
+  );
+  const block = /node scripts\/set-release-version\.mjs "\$VERSION"\n\s*git add \\\n([\s\S]*?)\n(?![^\n]*\\\n)/.exec(workflow);
+  assert.ok(block, "publish.yml no longer stages files right after running this script");
+  const staged = block[1]
+    .split("\n")
+    .map((line) => line.trim().replace(/\s*\\$/, ""))
+    .filter(Boolean);
+  const root = await stagePlugins();
+  const written = (await setReleaseVersion("9.9.9", root)).map((path) =>
+    relative(root, path).split("\\").join("/"),
+  );
+  assert.ok(written.length > 0);
+  for (const path of written) {
+    assert.ok(
+      staged.includes(path),
+      `${path} is rewritten by set-release-version.mjs but not staged by publish.yml's version commit; add it to that git add list`,
+    );
+  }
 });

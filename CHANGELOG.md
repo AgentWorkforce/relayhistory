@@ -146,8 +146,12 @@ Notable changes to the native `ai-hist` CLI are documented here.
   matches_canonical, remove, write}` — the four methods that took a raw
   `rusqlite::Connection` on the default features — are crate-private now; they
   had no caller outside the crate, and they were the only `rusqlite` types in
-  the surface. `scripts/set-release-version.mjs` stamps the example's
-  dependency and lock entry so a release keeps both CI variants honest.
+  the surface. `Source::ALL` lists every source, since the enum is
+  `#[non_exhaustive]` and a list an embedder keeps by hand cannot learn about
+  a new variant; an in-crate exhaustive `match` and a comparison with
+  `SOURCE_CHOICES` keep it complete. `scripts/set-release-version.mjs` stamps
+  the example's dependency and lock entry, and the release workflow's version
+  commit stages both files, so a release keeps both CI variants honest.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

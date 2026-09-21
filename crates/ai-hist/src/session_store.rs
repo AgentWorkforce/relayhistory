@@ -59,6 +59,23 @@ pub enum Source {
 }
 
 impl Source {
+    /// Every source, in ledger order.
+    ///
+    /// `Source` is `#[non_exhaustive]`, so a crate outside this one cannot
+    /// enumerate it with a `match` and any list it keeps by hand goes stale
+    /// the day a variant is added. This is the one list an embedder (or a
+    /// doc test) iterates; the unit test below is an exhaustive `match` over
+    /// the enum, so adding a variant without adding it here fails to compile.
+    pub const ALL: &'static [Source] = &[
+        Self::Claude,
+        Self::Codex,
+        Self::Cursor,
+        Self::Grok,
+        Self::Relay,
+        Self::Trajectory,
+        Self::OpenCode,
+    ];
+
     /// Canonical lowercase identifier stored in the ledger.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -257,6 +274,36 @@ fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Source::ALL` is the enumeration an embedder gets. The `match` here is
+    /// exhaustive on purpose: a new variant that is not in `ALL` breaks the
+    /// build here rather than quietly leaving every iterator over `ALL` a
+    /// source short. The names are then checked against `SOURCE_CHOICES`,
+    /// the ledger's own registry, so the two cannot drift apart either.
+    #[test]
+    fn every_source_is_in_all_and_in_the_ledger_registry() {
+        for source in Source::ALL {
+            let listed = match source {
+                Source::Claude
+                | Source::Codex
+                | Source::Cursor
+                | Source::Grok
+                | Source::Relay
+                | Source::Trajectory
+                | Source::OpenCode => Source::ALL.contains(source),
+            };
+            assert!(listed, "{source:?} is missing from Source::ALL");
+        }
+        let mut names: Vec<&str> = Source::ALL.iter().map(|source| source.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut choices: Vec<&str> = crate::store::SOURCE_CHOICES.to_vec();
+        choices.sort_unstable();
+        assert_eq!(
+            names, choices,
+            "Source::ALL and SOURCE_CHOICES name different sources"
+        );
+    }
 
     #[test]
     fn open_creates_the_database() {

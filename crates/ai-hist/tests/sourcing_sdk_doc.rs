@@ -11,19 +11,6 @@
 use ai_hist::{declared_evidence_kinds, source_accounting, EvidenceKind, Source};
 use std::path::Path;
 
-/// Every `Source`, in the order the guide lists them. `Source` is
-/// `#[non_exhaustive]`, so a new variant is added here by hand — and the guide
-/// then gains a row.
-const SOURCES: &[Source] = &[
-    Source::Claude,
-    Source::Codex,
-    Source::Cursor,
-    Source::Grok,
-    Source::OpenCode,
-    Source::Relay,
-    Source::Trajectory,
-];
-
 /// The evidence kinds a provider adapter can declare, as table columns.
 const COLUMNS: &[EvidenceKind] = &[
     EvidenceKind::History,
@@ -48,7 +35,12 @@ fn generated_table() -> String {
         ),
         format!("| --- |{} --- |", " --- |".repeat(COLUMNS.len())),
     ];
-    for source in SOURCES {
+    // `Source::ALL`, not a list kept here: the enum is `#[non_exhaustive]`,
+    // so a hand-written slice in this crate could miss a new variant and this
+    // test would still pass. `ALL` is checked exhaustively inside the crate.
+    let mut sources = Source::ALL.to_vec();
+    sources.sort_by_key(|source| source.as_str());
+    for source in &sources {
         let declared = declared_evidence_kinds(source.as_str());
         let cells = COLUMNS
             .iter()

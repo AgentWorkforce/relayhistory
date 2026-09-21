@@ -178,7 +178,9 @@ read*; a session that is still being written grows past it.
 
 `Source` names the harness: `Claude`, `Codex`, `Cursor`, `Grok`, `OpenCode`,
 `Relay`, `Trajectory`. It is `#[non_exhaustive]` — a `match` needs a wildcard
-arm — and `as_str()` is the lowercase ledger spelling.
+arm — `as_str()` is the lowercase ledger spelling, and `Source::ALL` is the
+list to iterate when you need every source, since a list you keep yourself
+cannot learn about a new variant.
 
 **Enumerating sessions is not on the facade yet.** A consumer today must know
 the id it asks for (from its own configuration, from a transcript it can see,
@@ -287,10 +289,12 @@ rules as above. Until then they are reachable only through `unstable-internal`.
 
 ### What each source populates
 
-Generated from what each provider adapter declares
+Generated over `Source::ALL` from what each provider adapter declares
 (`ai_hist::declared_evidence_kinds`) and the crate's accounting table
 (`ai_hist::source_accounting`); `crates/ai-hist/tests/sourcing_sdk_doc.rs`
-fails when this table and the code disagree. A `—` means the source *cannot*
+fails when this table and the code disagree, and `ALL` is checked
+exhaustively against the enum and the ledger's source registry inside the
+crate, so a new source cannot be added without this table gaining a row. A `—` means the source *cannot*
 report that kind — different from a session that happens to have none. Markers
 are parser-derived and are written for every source the crate's own parsers
 handle.
