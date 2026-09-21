@@ -21,18 +21,11 @@ pub struct HistoryExportPage {
 pub fn create_export(
     conn: &Connection,
     selection: &ExportSelection,
-    limits: &DeliveryLimits,
+    limits: &ExportLimits,
     ttl_ms: i64,
     now_ms: i64,
 ) -> Result<ExportHandle> {
-    validate(&DeliveryJobConfig {
-        destination_id: "export".into(),
-        instance_id: "export".into(),
-        account_id: "local".into(),
-        mapping_version: "1".into(),
-        selection: selection.clone(),
-        limits: limits.clone(),
-    })?;
+    validate_export(selection, limits)?;
     ensure!(
         (1..=86_400_000).contains(&ttl_ms) && now_ms >= 0,
         "invalid export TTL/clock"
@@ -92,7 +85,7 @@ pub fn export_page(conn: &Connection, cursor: &str, now_ms: i64) -> Result<Histo
         page.records = records;
         return Ok(page);
     }
-    let limits: DeliveryLimits = serde_json::from_str(&limits_json)?;
+    let limits: ExportLimits = serde_json::from_str(&limits_json)?;
     let origin_id = tx.query_row(
         "SELECT origin_id FROM delivery_state WHERE singleton=1",
         [],

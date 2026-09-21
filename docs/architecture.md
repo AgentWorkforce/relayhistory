@@ -54,15 +54,17 @@ must expose.
 ## Optional services and package boundaries
 
 The local Rust workspace publishes one crate, `ai-hist`, containing storage,
-identity, observations, evidence, relationships, local parsing and generic
-durable delivery. CLI parsing and presentation live in unpublished
+identity, observations, evidence, relationships, local parsing, consistent
+export snapshots and transactional change capture. CLI parsing and presentation live in unpublished
 `ai-hist-cli`; the N-API addon is unpublished `ai-hist-napi`.
 The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
 
 `plugins/relayhistory` owns commercial auth, convergence/outbox mapping, legacy
-push/replay/share and the new delivery transport. `plugins/provider-sources`
+push/replay/share and the entire probe upload lifecycle: sharing consent,
+queues, prepared payloads, leases, acknowledgments, retries and transport.
+These are required parts of the probe, not optional delivery services within it. `plugins/provider-sources`
 owns remote provider credentials/transports. Their Rust helpers depend on
 public local-history APIs and ship in optional platform packages. Their JS
 packages share the installed SDK's public error classes. No second addon or
@@ -344,21 +346,28 @@ There is no alternate runtime after any native-load error.
 
 ## Durable delivery and snapshot export
 
-`ai-hist::delivery` owns opt-in journaling, bounded snapshots, immutable
-queue/payload persistence, exact acknowledgments, retention, and fenced leases.
-The drain loop itself - round-robin scheduling, leases and their keepalive,
-payload persistence, the eligibility recheck before transport, acknowledgment
-checking and failure classification - runs once, in the Rust core worker, for
-both foreground and background delivery. The SDK host is a thin adapter: it
-registers explicitly selected destination modules, describes them to the worker,
-and answers the worker's prepare/send calls. Native contract 16 includes a
-typed serialized delivery/export bridge to the existing addon. No TypeScript or
-plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
-selection, failure states, background operation, and the independent NDJSON path.
+`ai-hist::export` owns evidence records, bounded snapshots, preimages, tombstones
+and durable change subscriptions. These storage primitives know no destination,
+account, upload acknowledgment or retry state. File/NDJSON exports remain in the
+local SDK through native contract 20's `historyExport` bridge. Ordinary core
+opens create no upload job, batch or membership tables.
 
-Core maintenance is bounded. The host expires abandoned snapshots and compacts
-consumed journal/receipt rows during drains; status exposes retained bytes and
-limits. Destination plugins own endpoint/account fences and transport mapping;
-the generic coordinator owns retries, leases, immutable payloads and exact
-acknowledgments. The RelayHistory server protocol is tested with the real SDK
-coordinator, helper and migrated database under lost-receipt/restart conditions.
+`plugins/relayhistory/rust::delivery` owns the probe's upload state machine and
+worker. The probe manages sharing consent and advances storage subscriptions in
+the same SQLite transaction as its queue. Indexed session snapshot/change APIs
+keep provider traversal in core. The worker retains immutable payloads, renews
+leases, checks consent/account fences before dispatch, and validates exact
+acknowledgments. The plugin SDK is a cancellable bridge to that Rust helper;
+there is no JavaScript upload coordinator and no new generic delivery crate.
+
+Existing databases retain their disk table names. Core imports live legacy
+capture subscriptions transactionally before its next write, leaving upload
+state untouched even if the probe has not restarted. The probe reuses jobs,
+batch IDs, prepared bytes, leases, retries and selected membership in place.
+See the [ownership ADR](decisions/2026-09-21-probe-owns-uploads.md) and
+[delivery guide](history-delivery.md) for compatibility and operation.
+
+Storage and uploads still share a retention budget in an enabled database.
+An unread durable subscription can therefore hold evidence and exhaust capacity;
+capture fails visibly and rolls back instead of losing records. Moving code
+ownership does not provide resource isolation.

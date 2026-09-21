@@ -1,10 +1,10 @@
 //! Real local acquisition under capture-capacity failure. One test owns HOME
 //! for this process; no operator files, credentials, or transports are used.
-use ai_hist::{delivery::*, open_db};
 use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, sync_scoped_at, DiscoverOptions,
     HydrateSessionOptions, SessionScope,
 };
+use relayhistory_plugin::delivery::*;
 use serde_json::{json, Value};
 use std::{fs, path::Path};
 
