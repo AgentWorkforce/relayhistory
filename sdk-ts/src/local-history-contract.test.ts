@@ -255,6 +255,8 @@ test('per-message raw provider facts reach the SDK unnormalized', async () => {
     );
     assert.deepEqual(events.map((event) => event.isMeta), [null, null, null]);
     assert.deepEqual(events.map((event) => event.turnId), [null, null, null]);
+    // A genuine prompt and model output carry no control kind.
+    assert.deepEqual(events.map((event) => event.controlKind), [null, null, null]);
 
     // A page carries the same shape as the whole-session read.
     const page = await getSessionEventsPage('facts-session', { source: 'claude', dbPath });

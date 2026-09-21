@@ -42,6 +42,7 @@
   "quirk": "a continuation whose first record's `parentUuid` only exists in the other file — the link is cross-file, not in-file",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-original-user:0",
       "git_branch": null,
@@ -58,6 +59,7 @@
       "ts_ms": 1776815940000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-original-asst:0",
       "git_branch": null,
@@ -74,6 +76,7 @@
       "ts_ms": 1776815941000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-cross-1:0",
       "git_branch": null,
@@ -90,6 +93,7 @@
       "ts_ms": 1776816000000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-cross:0",
       "git_branch": null,
@@ -106,6 +110,7 @@
       "ts_ms": 1776816001000
     }
   ],
+  "session_markers": [],
   "session_relationships": [
     {
       "child_agent_name": null,

@@ -10,7 +10,8 @@ ai-hist (published Rust crate)
         │ typed Rust functions
         ▼
 ai-hist-native (Node-API, async worker tasks)
-        │ typed native objects
+        │ typed native objects, plus one JSON dispatcher
+        │ (`sessionStoreCall`) over the `SessionStore` facade
         ▼
 ai-hist TypeScript SDK
         ├── ai-hist Node CLI
@@ -21,14 +22,29 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 19, catalog contract version 4, hydration contract version 3,
+version 20, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-2 and session usage contract version 3, normalizes nullable fields, maps native
+3 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
+
+The native addon exposes two kinds of entry point. The older operations are
+hand-mirrored typed functions with their own option and result objects. Reads
+added since the `SessionStore` facade go through one JSON dispatcher instead:
+`sessionStoreCall(op, argsJson)` takes `{dbPath?, source, sessionId?, limit?,
+after?}` and answers with the same camelCase document the typed function for
+that read returns, so the SDK normalizes both with one set of functions. The
+ops are `markers`, `requests`, `usage_summary`, `user_turns` and
+`capabilities`; `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
+in the SDK that spells them, and the SDK's request, usage and user-turn reads
+use the dispatcher. The dispatcher calls only the facade and the crate's pure
+capability tables — no connection, no SQL — and a new facade read is one new
+arm there rather than another typed native function. The typed
+`getSessionRequestsPage` / `getSessionUsage` / `getSessionUserTurnsPage`
+exports stay for compatibility until a later major.
 
 ## Session sourcing ownership
 
@@ -54,15 +70,17 @@ must expose.
 ## Optional services and package boundaries
 
 The local Rust workspace publishes one crate, `ai-hist`, containing storage,
-identity, observations, evidence, relationships, local parsing and generic
-durable delivery. CLI parsing and presentation live in unpublished
+identity, observations, evidence, relationships, local parsing, consistent
+export snapshots and transactional change capture. CLI parsing and presentation live in unpublished
 `ai-hist-cli`; the N-API addon is unpublished `ai-hist-napi`.
 The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
 
 `plugins/relayhistory` owns commercial auth, convergence/outbox mapping, legacy
-push/replay/share and the new delivery transport. `plugins/provider-sources`
+push/replay/share and the entire probe upload lifecycle: sharing consent,
+queues, prepared payloads, leases, acknowledgments, retries and transport.
+These are required parts of the probe, not optional delivery services within it. `plugins/provider-sources`
 owns remote provider credentials/transports. Their Rust helpers depend on
 public local-history APIs and ship in optional platform packages. Their JS
 packages share the installed SDK's public error classes. No second addon or
@@ -154,20 +172,27 @@ archive relocation.
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
 | `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
-| `SessionStore::session_user_turns_page` | none | bounded keyset page plus ordered block reads on one snapshot | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
+| `SessionStore::sessions` | none | keyset-paged catalog reads, one page at a time | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
+| `SessionStore::session` | none | every evidence table for one session on one read snapshot; `kinds` skips tables, `include_text: false` never moves the text column | `None` for an uncatalogued session |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
-| `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
+| `getSessionMarkersPage`, `session_markers_page` (`SessionStore::session` carries the same markers untruncated) | none | bounded keyset page over one source's session | empty page; a read-only `SessionStore::open` over a database older than the marker page index is refused, naming the remedy (the native dispatcher then reopens writable and migrates, as the typed reads do) |
+| `getSessionRequestsPage`, `getSessionUsage` | none | bounded keyset page / streamed rollup over the derived request view | empty page / summary with no requests |
+| `getSourceCapabilities` | none | none: answered from the provider capability tables | the same answer |
+| `SessionStore::changes_since` (no SDK/MCP surface yet) | none | one indexed revision-range read per kind per page, plus one for tombstones; `commit` writes one cursor row | not reached: `SessionStore::open` created the database (writable) or already failed (read-only); a read-only store over a database older than the change-feed schema is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
+| `SessionStore::sync`, `SessionStore::watch` | full local scan (fingerprint-gated; forced on fs-event ticks) | the `local` sync under `SyncRunLock`; a held lock is `SyncLocked` after the caller's timeout, never a silent skip | not reached: created at `open` |
+| `SessionStore::hydrate` | one session by id, or one transcript by path (hook fast path, Claude only) | as `hydrateSession`; a missing transcript is a status, not an error | `SESSION_NOT_FOUND` for an id; `Missing` for a path |
 
 A writable `SessionStore::open` migrates the database it opens; a read-only
 one cannot, so it refuses a database older than the shape this version reads
 and names the remedy, rather than handing back a store whose first read fails
-inside a query.
+inside a query. The facade's full surface, its error codes and lock semantics
+are in [`docs/sourcing-sdk.md`](sourcing-sdk.md).
 
 No read operation invokes discovery or sync. A common cold start is:
 
@@ -280,9 +305,11 @@ holds that record, and two or more transcripts carrying one in-log session id.
 
 A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
 human types, and the control wrapper Claude Code actually stores —
-`<command-name>/resume</command-name>` with the target in `<command-args>`,
-which this crate already classifies as a control prompt. Matching only the bare
-form matched the one shape a real transcript never contains.
+`<command-name>/resume</command-name>` with the target in `<command-args>`.
+Both are control rows (`session_events.control_kind` = `resume_marker` and
+`slash_command_invocation`; see `src/ingest/control.rs`), so neither is a
+prompt. Matching only the bare form matched the one shape a real transcript
+never contains.
 
 Unlike delegation, continuity is not observable inside a single transcript, so
 each transcript's evidence is banked in `session_continuity_evidence`, keyed by
@@ -333,6 +360,94 @@ the tail. Relationship ordering is `(spawned_at_ms, relationship_uid)`, also
 with null timestamps at the tail. These total orders prevent duplicate or
 omitted rows at timestamp ties.
 
+## Change feed
+
+A downstream consumer that keeps its own materialised view — burn's watch
+loop — reads "what changed since my last tick" through
+`SessionStore::changes_since` rather than rescanning the catalog or watching
+provider files itself.
+
+Every row of `sessions`, `session_events`, `tool_calls`, `file_edits`,
+`session_markers` and `session_relationships` carries a `revision`: one value
+per row write, drawn from the database-wide `observation_clock`, stamped by
+`change_feed_<table>_{insert,update,delete}` triggers. Stamping lives in
+triggers rather than in each writer because the ledger has well over a hundred
+write sites, and a write site that forgot the stamp would be a row the feed
+silently never reports. A deleted row — a sidechain heal moving records onto
+the child, a session leaving the catalog and the cascade under it — leaves a
+tombstone in `evidence_tombstones(kind, source, session_id, record_key,
+revision)`; a later insert of the same key clears it. Every fed table has a
+`(revision)` index and the tombstone table a `(kind, revision)` one, so each
+page of the feed is an indexed range read with no scan and no sort. A catalog
+row's `locations` is derived from `session_presences`, so a presence arriving
+or leaving re-stamps its `sessions` row too: a consumer sees the row replaced
+even though nothing wrote `sessions` itself.
+
+Each page is read in two passes: a covering read of each stream's revision
+index finds the page's cut (the `batch`-th smallest revision across streams),
+and only the rows below it are then fetched, so at most one page of typed rows
+is resident however many kinds are fed. Both passes read one snapshot, so a
+writer re-stamping or deleting the page's rows between them cannot empty the
+window the cut describes; and an empty window steps the position forward rather
+than declaring the head, so exhaustion is only ever what the key pass proved.
+The drain's start and its head are
+resolved from one read snapshot, so a sibling drain committing the cursor while
+this one opens can never make a valid cursor look ahead of the head. A
+read-only handle over a database the feed has not migrated reports
+`Watermark::START` as its head; its pre-feed `observation_clock` is not a feed
+position.
+
+`changes_since(from, ChangeQuery { kinds, consumer, batch })` yields
+`Change { kind, source, session_id, record_key, revision, op }` in
+`(revision, kind, record_key)` order, where `op` is `Upsert(EvidenceRow)` —
+the typed row, `ShallowSession`, `SessionEvent`, `SessionToolCall`,
+`SessionFileEdit`, `SessionMarker` or `SessionRelationship` — or `Delete`.
+`record_key` is the record's provider-native identity within its session and
+kind: `event_uid`, `tool_use_id`, `marker_uid`, `relationship_uid`, or the
+session id for a catalog row. The drain is bounded to the head revision at
+open and pages in `batch`-sized reads, at most 10,000. `ChangeKind` is not
+`EvidenceKind`: the catalog row is fed and is not adapter evidence.
+
+Three rules a consumer must hold:
+
+- **A re-seen key is a replace.** Every upsert re-stamps, so a parser-version
+  re-parse re-reports every row of that session at a new revision. Applying
+  the feed in order onto a keyed map reconstructs the tables (modulo rows
+  whose tombstones it also applied); `crates/ai-hist/tests/change_feed.rs`
+  pins that over the fixture corpus after each of a sequence of syncs.
+- **The cursor moves only on commit, and only forward.** With
+  `ChangeQuery::consumer` set, `Watermark::CONSUMER` resumes from that
+  consumer's last committed position (`consumer_cursors`, inside the store, so
+  it survives the consumer's own ledger reset), and `Changes::commit()`
+  persists `position()` and returns the cursor as stored. A drain that fails
+  partway re-reads from the previous commit rather than skipping what it had
+  reached. A stale commit — an older drain committing after a newer one, or a
+  replay from an explicit watermark under a name that has moved past it —
+  leaves the cursor where it is; a consumer that wants to reprocess drains from
+  an explicit `from` and does not commit. Two consumers advance independently.
+- **A consumer name is scoped to one kind set.** A cursor is a position in a
+  stream, and a stream is defined by its kinds: a drain over events alone that
+  reaches the head and commits has accounted for no relationship, marker or
+  catalog row on the way. So `consumer_cursors` records the normalized kind
+  set a cursor was committed for, and a `Watermark::CONSUMER` drain or a
+  `commit()` under a different kind set fails with
+  `ErrorKind::ConsumerKindsMismatch` rather than silently skipping the other
+  kinds. Use another consumer name for another filter.
+- **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
+  and `SyncReport::head_revision` report the head; a stored watermark beyond it
+  fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full
+  resync from `Watermark::START`.
+
+An in-progress message is never in the feed. Incremental hydration holds a
+Claude message whose `stop_reason` is still `null` and writes nothing for it;
+when it completes, its blocks arrive together, each exactly once, with the
+usage they ended with. `session_requests` is a view over `session_events`, so
+a request is not fed as a row of its own: the events that make it up are, and
+`session_requests_page` reads the grouped result.
+
+Push or subscription callbacks and the cloud delivery coordinator are
+unchanged; the feed is a pull cursor for an in-process consumer.
+
 ## Native errors
 
 The SDK distinguishes unsupported platform, supported platform package
@@ -342,21 +457,28 @@ There is no alternate runtime after any native-load error.
 
 ## Durable delivery and snapshot export
 
-`ai-hist::delivery` owns opt-in journaling, bounded snapshots, immutable
-queue/payload persistence, exact acknowledgments, retention, and fenced leases.
-The drain loop itself - round-robin scheduling, leases and their keepalive,
-payload persistence, the eligibility recheck before transport, acknowledgment
-checking and failure classification - runs once, in the Rust core worker, for
-both foreground and background delivery. The SDK host is a thin adapter: it
-registers explicitly selected destination modules, describes them to the worker,
-and answers the worker's prepare/send calls. Native contract 16 includes a
-typed serialized delivery/export bridge to the existing addon. No TypeScript or
-plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
-selection, failure states, background operation, and the independent NDJSON path.
+`ai-hist::export` owns evidence records, bounded snapshots, preimages, tombstones
+and durable change subscriptions. These storage primitives know no destination,
+account, upload acknowledgment or retry state. File/NDJSON exports remain in the
+local SDK through native contract 21's `historyExport` bridge. Ordinary core
+opens create no upload job, batch or membership tables.
 
-Core maintenance is bounded. The host expires abandoned snapshots and compacts
-consumed journal/receipt rows during drains; status exposes retained bytes and
-limits. Destination plugins own endpoint/account fences and transport mapping;
-the generic coordinator owns retries, leases, immutable payloads and exact
-acknowledgments. The RelayHistory server protocol is tested with the real SDK
-coordinator, helper and migrated database under lost-receipt/restart conditions.
+`plugins/relayhistory/rust::delivery` owns the probe's upload state machine and
+worker. The probe manages sharing consent and advances storage subscriptions in
+the same SQLite transaction as its queue. Indexed session snapshot/change APIs
+keep provider traversal in core. The worker retains immutable payloads, renews
+leases, checks consent/account fences before dispatch, and validates exact
+acknowledgments. The plugin SDK is a cancellable bridge to that Rust helper;
+there is no JavaScript upload coordinator and no new generic delivery crate.
+
+Existing databases retain their disk table names. Core imports live legacy
+capture subscriptions transactionally before its next write, leaving upload
+state untouched even if the probe has not restarted. The probe reuses jobs,
+batch IDs, prepared bytes, leases, retries and selected membership in place.
+See the [ownership ADR](decisions/2026-09-21-probe-owns-uploads.md) and
+[delivery guide](history-delivery.md) for compatibility and operation.
+
+Storage and uploads still share a retention budget in an enabled database.
+An unread durable subscription can therefore hold evidence and exhaust capacity;
+capture fails visibly and rolls back instead of losing records. Moving code
+ownership does not provide resource isolation.

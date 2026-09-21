@@ -35,6 +35,7 @@
   "quirk": "legacy layout with a summarized/compacted message",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_u1_text",
       "git_branch": null,
@@ -51,6 +52,7 @@
       "ts_ms": 1776999001000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_summary_1_text",
       "git_branch": null,
@@ -67,6 +69,7 @@
       "ts_ms": 1776999004000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "text:prt_u2_text",
       "git_branch": null,
@@ -81,6 +84,21 @@
       "text": "continue working",
       "token_json": null,
       "ts_ms": 1776999005000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "compaction_boundary",
+      "marker_uid": "part:prt_uc_compaction",
+      "message_id": "msg_compact_uc",
+      "parent_id": null,
+      "payload_json": "{\"auto\":true}",
+      "session_id": "ses_compact",
+      "source": "opencode",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1776999003000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

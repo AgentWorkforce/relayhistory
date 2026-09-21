@@ -1,8 +1,9 @@
 //! An out-of-tree embedder of the published `ai-hist` crate.
 //!
 //! Stages a few transcripts from the repository's fixture corpus into a
-//! throwaway `HOME`, opens a `SessionStore` there, syncs, and prints each
-//! session's normalized usage totals by model. It is the smoke test for the
+//! throwaway `HOME`, opens a `SessionStore` there, syncs, walks the catalog,
+//! prints each session's normalized usage totals by model, and drains the
+//! change feed under a named consumer cursor. It is the smoke test for the
 //! published artefact: an embedder that cannot do this is broken, whatever
 //! the workspace's own tests say.
 //!
@@ -14,8 +15,9 @@
 //! repository checkout.
 
 use ai_hist::{
-    NormalizedUsage, SessionRequestCursor, SessionStore, Source, StoreOptions, SyncOptions,
-    UsageAccounting,
+    CatalogQuery, ChangeKind, ChangeOp, ChangeQuery, NormalizedUsage, ProviderRoots,
+    SessionEvidence, SessionQuery, SessionStore, Source, StoreOptions, SyncOptions,
+    UsageAccounting, Watermark,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -31,20 +33,8 @@ use std::process::ExitCode;
 const CLAUDE_FIXTURES: &[&str] = &["simple-turn", "multi-block-turn", "files-touched"];
 const CODEX_FIXTURES: &[&str] = &["simple-turn", "multi-turn", "with-tool-call"];
 
-/// Provider-root overrides the crate honours from the environment.
-///
-/// `SessionStore` resolves each provider's root from `StoreOptions::home`
-/// unless one of these names another directory, so a developer whose shell
-/// exports `CODEX_HOME` would otherwise sync their real rollouts into this
-/// example's temporary store. Cleared before the store is opened.
-const PROVIDER_ROOT_OVERRIDES: &[&str] = &[
-    "AI_HIST_DB",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "GROK_HOME",
-    "OPENCODE_DB",
-    "OPENCODE_STORAGE_DIR",
-];
+/// The name this example's change-feed cursor is kept under inside the store.
+const CONSUMER: &str = "rust-consumer-example";
 
 fn main() -> ExitCode {
     match run() {
@@ -57,65 +47,88 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    for name in PROVIDER_ROOT_OVERRIDES {
-        std::env::remove_var(name);
-    }
-
     let fixtures = fixture_root()?;
     let home =
         tempfile::tempdir().map_err(|error| format!("creating a temporary HOME: {error}"))?;
-    let sessions = stage_corpus(&fixtures, home.path())?;
+    let staged = stage_corpus(&fixtures, home.path())?;
     println!(
         "staged {} sessions under {}",
-        sessions.len(),
+        staged.len(),
         home.path().display()
     );
 
     // `StoreOptions` is `#[non_exhaustive]`, so an outside crate sets fields on
-    // the default rather than naming them all. With `home` set and no
-    // `db_path`, the database is `<home>/.local/share/ai-hist/ai-history.db`.
+    // the default rather than naming them all. `home` puts the database at
+    // `<home>/.local/share/ai-hist/ai-history.db`; `roots` names every provider
+    // root outright, so a developer whose shell exports `CODEX_HOME` cannot
+    // have their real rollouts swept into this example's temporary store. The
+    // roots are resolved once here and drive `sync` and every read after it.
     let mut options = StoreOptions::default();
     options.home = Some(home.path().to_path_buf());
+    options.roots = Some(ProviderRoots::from_home(
+        home.path().to_path_buf(),
+        home.path().join(".local/share/opencode/opencode.db"),
+    ));
     let store =
         SessionStore::open(options).map_err(|error| format!("opening the store: {error}"))?;
 
-    // A full local scan. Another process holding the sync lock makes this
-    // return without scanning rather than block; see docs/sourcing-sdk.md.
+    // A full local scan. Another process holding the sync lock is
+    // `Error::SyncLocked` after `lock_timeout_ms`, never a silent skip; see
+    // docs/sourcing-sdk.md.
     let report = store
         .sync(SyncOptions::default())
         .map_err(|error| format!("syncing: {error}"))?;
     println!(
-        "sync finished ({} refs reported changed)",
-        report.changed.len()
+        "sync finished (swept={}, {} refs reported changed, head revision {})",
+        report.swept,
+        report.changed.len(),
+        report.head_revision,
     );
 
-    // TODO(#178): iterate `store.sessions()` once the facade enumerates
-    // sessions. Until then the ids come from the files this example staged.
+    // The catalog, newest first. The ids come from the store, not from the
+    // files this example staged; the staged set is only what the run is
+    // checked against at the end.
     let mut sessions_with_usage = 0;
-    for staged in &sessions {
+    let mut catalogued: BTreeSet<(Source, String)> = BTreeSet::new();
+    for row in store.sessions(CatalogQuery::default()) {
+        let row = row.map_err(|error| format!("walking the catalog: {error}"))?;
+        catalogued.insert((row.source, row.session_id.clone()));
+        let Some(evidence) = store
+            .session(&row.session_ref(), SessionQuery::default())
+            .map_err(|error| format!("reading session {}: {error}", row.session_id))?
+        else {
+            continue;
+        };
         println!();
-        println!(
-            "== {} session {}",
-            staged.source.as_str(),
-            staged.session_id
-        );
-        if report_session(&store, staged)? {
+        println!("== {} session {}", row.source.as_str(), row.session_id);
+        if report_session(&evidence) {
             sessions_with_usage += 1;
         }
     }
 
     println!();
-    // TODO(#179): drain `store.changes_since(watermark)` once with a named
-    // consumer cursor and commit it; the change feed is not on the published
-    // crate yet.
-    println!("change feed: not available in this ai-hist release (tracked by relayhistory#179)");
+    drain_changes(&store)?;
 
-    if sessions_with_usage == 0 {
-        return Err("no staged session reported usage; the store did not sync the corpus".into());
+    let missing: Vec<String> = staged
+        .iter()
+        .filter(|session| !catalogued.contains(&(session.source, session.session_id.clone())))
+        .map(|session| format!("{} {}", session.source.as_str(), session.session_id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the sweep did not catalogue {}",
+            missing.join(", ")
+        ));
     }
+    if sessions_with_usage == 0 {
+        return Err(
+            "no catalogued session reported usage; the store did not sync the corpus".into(),
+        );
+    }
+    println!();
     println!(
-        "{sessions_with_usage} of {} staged sessions reported normalized usage",
-        sessions.len()
+        "{sessions_with_usage} of {} catalogued sessions reported normalized usage",
+        catalogued.len()
     );
     Ok(())
 }
@@ -128,19 +141,13 @@ struct StagedSession {
 
 /// Print a session's usage rollup and its per-model totals. Returns whether
 /// the store recorded any request for it.
-fn report_session(store: &SessionStore, staged: &StagedSession) -> Result<bool, String> {
-    let source = staged.source;
-    let id = staged.session_id.as_str();
-
+fn report_session(evidence: &SessionEvidence) -> bool {
     // The whole-session rollup. `None` is "no request recorded"; `Some` with
     // `usage: None` is "requests recorded, usage not establishable", and the
     // diagnostics say why.
-    let Some(summary) = store
-        .session_usage(source, id)
-        .map_err(|error| format!("reading usage for {id}: {error}"))?
-    else {
+    let Some(summary) = &evidence.usage else {
         println!("   no requests recorded");
-        return Ok(false);
+        return false;
     };
     println!(
         "   requests: {} measured of {} recorded; accounting: {}; models: {}",
@@ -156,38 +163,33 @@ fn report_session(store: &SessionStore, staged: &StagedSession) -> Result<bool, 
         );
     }
 
-    // Per-model totals, folded over the request pages. One request is the
-    // unit here -- the facade has already grouped the provider's several
-    // stored rows into it -- so adding requests together is exact for the
-    // `per-request`, `per-message` and `cumulative-delta` modes.
+    // Per-model totals folded over `requests`. One request is the unit here --
+    // the facade has already grouped the provider's several stored rows into
+    // it -- so adding requests together is exact for the `per-request`,
+    // `per-message` and `cumulative-delta` modes.
     let mut by_model: BTreeMap<String, NormalizedUsage> = BTreeMap::new();
     let mut modes: BTreeSet<UsageAccounting> = BTreeSet::new();
-    let mut cursor: Option<SessionRequestCursor> = None;
-    loop {
-        let page = store
-            .session_requests_page(source, id, 100, cursor.as_ref())
-            .map_err(|error| format!("reading requests for {id}: {error}"))?;
-        for request in &page.requests {
-            let Some(usage) = &request.usage else {
-                continue;
-            };
-            modes.insert(usage.accounting);
-            let model = request
-                .model
-                .clone()
-                .unwrap_or_else(|| "(unknown model)".into());
-            let total = match by_model.get(&model) {
-                Some(existing) => existing
-                    .checked_add(usage)
-                    .ok_or_else(|| format!("usage total for {model} overflowed"))?,
-                None => usage.clone(),
-            };
-            by_model.insert(model, total);
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
+    let mut overflowed = false;
+    for request in &evidence.requests {
+        let Some(usage) = &request.usage else {
+            continue;
+        };
+        modes.insert(usage.accounting);
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| "(unknown model)".into());
+        let total = match by_model.get(&model) {
+            Some(existing) => match existing.checked_add(usage) {
+                Some(total) => total,
+                None => {
+                    overflowed = true;
+                    continue;
+                }
+            },
+            None => usage.clone(),
+        };
+        by_model.insert(model, total);
     }
     for (model, usage) in &by_model {
         println!(
@@ -202,25 +204,82 @@ fn report_session(store: &SessionStore, staged: &StagedSession) -> Result<bool, 
                 .unwrap_or_default(),
         );
     }
+    if overflowed {
+        println!("   (a per-model total exceeded u64 and was left at its last exact value)");
+    }
     if modes.contains(&UsageAccounting::ContextProxy) {
         println!("   (context-proxy records are occupancy figures; the totals above must not be read as spend)");
     }
 
-    // Two more reads on the same surface, to show they are there: the human
-    // turns with their measured block sizes, and the markers the normalized
-    // event model cannot carry.
-    let turns = store
-        .session_user_turns_page(source, id, 100, None)
-        .map_err(|error| format!("reading user turns for {id}: {error}"))?;
-    let markers = store
-        .session_markers_page(source, id, 100, None)
-        .map_err(|error| format!("reading markers for {id}: {error}"))?;
+    // Three more reads on the same `SessionEvidence`, to show they are there:
+    // the human turns with their measured block sizes, the markers the
+    // normalized event model cannot carry, and the user-role blocks the
+    // facade classified as something other than a prompt.
+    let control_blocks = evidence
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter(|block| block.control.is_some())
+        .count();
     println!(
-        "   {} user turns on the first page, {} markers",
-        turns.user_turns.len(),
-        markers.markers.len()
+        "   {} user turns, {} markers, {control_blocks} classified control blocks",
+        evidence.user_turns.len(),
+        evidence.markers.len(),
     );
-    Ok(summary.total_request_count > 0)
+    println!(
+        "   coverage: {}",
+        join(evidence.coverage.iter().map(|kind| kind.as_str()))
+    );
+    summary.total_request_count > 0
+}
+
+/// Drain the change feed from the example's named cursor and commit it.
+///
+/// A consumer keeps its position inside the store: the first run replays from
+/// `Watermark::START`, and a later one resumes from what `commit` stored. The
+/// cursor moves only on commit, so a consumer that fails mid-drain re-reads
+/// its page rather than skipping it.
+fn drain_changes(store: &SessionStore) -> Result<(), String> {
+    let mut changes = store
+        .changes_since(
+            Watermark::CONSUMER,
+            ChangeQuery::default().consumer(CONSUMER),
+        )
+        .map_err(|error| format!("opening the change feed: {error}"))?;
+    let head = changes.head();
+    let mut upserts: BTreeMap<ChangeKind, usize> = BTreeMap::new();
+    let mut deletes: BTreeMap<ChangeKind, usize> = BTreeMap::new();
+    let mut other: BTreeMap<ChangeKind, usize> = BTreeMap::new();
+    for change in changes.by_ref() {
+        let change = change.map_err(|error| format!("draining the change feed: {error}"))?;
+        // `ChangeOp` is `#[non_exhaustive]`: an op a later release adds is
+        // counted as neither an upsert nor a delete here rather than making
+        // this example stop compiling on a minor bump.
+        match change.op {
+            ChangeOp::Upsert(_) => *upserts.entry(change.kind).or_default() += 1,
+            ChangeOp::Delete => *deletes.entry(change.kind).or_default() += 1,
+            _ => *other.entry(change.kind).or_default() += 1,
+        }
+    }
+    let committed = changes
+        .commit()
+        .map_err(|error| format!("committing the {CONSUMER} cursor: {error}"))?;
+    println!(
+        "change feed drained to revision {} (head {})",
+        committed.revision, head.revision
+    );
+    for kind in ChangeKind::ALL {
+        let upserted = upserts.get(kind).copied().unwrap_or(0);
+        let deleted = deletes.get(kind).copied().unwrap_or(0);
+        let unclassified = other.get(kind).copied().unwrap_or(0);
+        if upserted > 0 || deleted > 0 || unclassified > 0 {
+            println!(
+                "   {}: {upserted} upserted, {deleted} deleted, {unclassified} in an op this build does not know",
+                kind.as_str()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn join<'a>(items: impl Iterator<Item = &'a str>) -> String {

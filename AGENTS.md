@@ -47,7 +47,7 @@ classification, or similarity-based session linking.
 | [`docs/architecture.md`](docs/architecture.md)           | Production call graph, package boundaries, ledger and scope          |
 | [`docs/session-catalog.md`](docs/session-catalog.md)     | Shallow discovery, per-provider capability matrix, adding a provider |
 | [`docs/sourcing-contract.md`](docs/sourcing-contract.md) | Record types the Rust SDK must expose                                |
-| [`docs/sourcing-sdk.md`](docs/sourcing-sdk.md)           | Embedder guide: `SessionStore`, lifecycle, evidence model, semver    |
+| [`docs/sourcing-sdk.md`](docs/sourcing-sdk.md)           | Embedder guide: the `SessionStore` facade, its structs and errors, lifecycle and locks, evidence model, semver |
 | [`docs/decisions/`](docs/decisions/)                     | Architecture decision records                                        |
 | [`docs/getting-started.md`](docs/getting-started.md)     | Install and first run                                                |
 | [`docs/releasing.md`](docs/releasing.md)                 | npm and crates.io release pipelines, semver policy                   |

@@ -479,32 +479,9 @@ test('mounted export with no --out streams NDJSON to the host, as bytes', async 
   assert.ok(io.bytes > 0, 'streamed output must reach the host as Uint8Array chunks, not a decoded string');
 });
 
-test('mounted delivery run stops when the host cancels it', async (t) => {
-  const { root, db } = await historyFixture();
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const configPath = join(root, 'config.json');
-  await writeFile(configPath, JSON.stringify({ plugins: [] }));
-
-  // Run in a child process so a regression fails on the deadline rather than
-  // hanging this runner: `delivery run` loops until it is cancelled, so a
-  // surface that drops the host's signal never returns at all.
-  //
-  // The signal is the host's own — it is handed to the factory, and nothing in
-  // the surface installs a handler for it. That is the only cancellation route
-  // contract v1 leaves open, since `run` takes argv and io and nothing else.
-  const script = `
-    const { createRelayCliSurface } = await import(${JSON.stringify(new URL('./relay-cli.js', import.meta.url).href)});
-    const controller = new AbortController();
-    const io = { stdout: () => {}, stderr: () => {} };
-    setTimeout(() => controller.abort(), 150);
-    const code = await createRelayCliSurface({ signal: controller.signal }).run(
-      ['delivery', 'run', '--db', ${JSON.stringify(db)}, '--config', ${JSON.stringify(configPath)},
-       '--poll-ms', '10'],
-      io);
-    process.stdout.write(String(code));
-  `;
-  const result = await promisify(execFile)(process.execPath,
-    ['--input-type=module', '-e', script], { timeout: 20_000 });
-  assert.equal(result.stderr, '');
-  assert.equal(result.stdout, '0', 'cancelling the host\'s signal must end the mounted delivery loop');
+test('mounted legacy delivery command reports the probe migration', async () => {
+  const io = capture();
+  const code = await createRelayCliSurface().run(['delivery', 'run'], io);
+  assert.equal(code, 1);
+  assert.match(io.err, /HISTORY_DELIVERY_MOVED/);
 });

@@ -20,6 +20,7 @@
   "quirk": "a `system`/`subagent_completed` record reports a child session id the transcript never contains",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-system-asst:0",
       "git_branch": null,
@@ -36,6 +37,7 @@
       "ts_ms": 1776992400000
     },
     {
+      "control_kind": null,
       "cwd": null,
       "event_uid": "system-subagent-notification:sha256:8eb39d2ed8732bdf:subagent_notification",
       "git_branch": null,
@@ -50,6 +52,21 @@
       "text": "subagent completed",
       "token_json": null,
       "ts_ms": 1776992401000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "subagent_notification",
+      "marker_uid": "system-subagent-notification:sha256:8eb39d2ed8732bdf:marker",
+      "message_id": "system-subagent-notification:sha256:8eb39d2ed8732bdf",
+      "parent_id": "toolu_system",
+      "payload_json": "{\"agent_id\":\"agent-system-1\",\"parent_tool_use_id\":\"toolu_system\",\"status\":\"completed\",\"subagent_session_id\":\"session-system-child\"}",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "subkind": "subagent_completed",
+      "text": null,
+      "ts_ms": 1776992401000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

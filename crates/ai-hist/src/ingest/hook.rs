@@ -141,7 +141,7 @@ pub fn ingest_transcript_at_with_home(
     )
 }
 
-fn ingest_transcript_at_with_roots(
+pub(crate) fn ingest_transcript_at_with_roots(
     db_path: &Path,
     roots: &crate::ProviderRoots,
     source: &str,

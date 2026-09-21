@@ -28,6 +28,7 @@
   "quirk": "edit metadata only reaches the log on the tool_result, not on the tool_use",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-1:0",
       "git_branch": null,
@@ -44,6 +45,7 @@
       "ts_ms": 1776643200000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:0",
       "git_branch": null,
@@ -60,6 +62,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-1:1",
       "git_branch": null,
@@ -76,6 +79,7 @@
       "ts_ms": 1776643201000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:0",
       "git_branch": null,
@@ -92,6 +96,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-2:1",
       "git_branch": null,
@@ -108,6 +113,7 @@
       "ts_ms": 1776643202000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-2:0",
       "git_branch": null,
@@ -122,6 +128,21 @@
       "text": "done",
       "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100,\"input_tokens\":50,\"output_tokens\":10}",
       "ts_ms": 1776643203000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "tool_replacement",
+      "marker_uid": "u-user-2:0:replacement",
+      "message_id": "u-user-2",
+      "parent_id": "u-asst-1",
+      "payload_json": "{\"collapsedCalls\":9,\"replaces\":[\"Glob\",\"Grep\",\"Read\"]}",
+      "session_id": "replacement-session",
+      "source": "claude",
+      "subkind": "tool_result",
+      "text": null,
+      "ts_ms": 1776643202000,
+      "turn_id": null
     }
   ],
   "session_relationships": [],

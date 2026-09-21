@@ -66,6 +66,7 @@
   "quirk": "records arrive out of `parentUuid` order, so turn grouping cannot rely on file order",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-bug:0",
       "git_branch": null,
@@ -82,6 +83,7 @@
       "ts_ms": 1777593600000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-user-feature:0",
       "git_branch": null,
@@ -98,6 +100,7 @@
       "ts_ms": 1777593600500
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-bug:0",
       "git_branch": null,
@@ -114,6 +117,7 @@
       "ts_ms": 1777593602000
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "u-asst-feature:0",
       "git_branch": null,
@@ -130,6 +134,7 @@
       "ts_ms": 1777593603000
     }
   ],
+  "session_markers": [],
   "session_relationships": [],
   "sessions": [
     {

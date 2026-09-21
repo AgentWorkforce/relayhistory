@@ -37,7 +37,7 @@ Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for ma
 
 ## Embedding from Rust
 
-Rust embedders depend on the `ai-hist` crate on crates.io (`SessionStore::open` / `sync` / the paged evidence reads) on its default features — no raw database connection, no feature flags. Read [docs/sourcing-sdk.md](docs/sourcing-sdk.md), the embedder guide, and start from [examples/rust-consumer](examples/rust-consumer), a standalone Cargo project that stages the fixture corpus into a throwaway `HOME`, syncs, and prints per-session usage totals by model. CI builds that example against the workspace crate on every pull request and against the published crate nightly, and diffs the crate's public API against `crates/ai-hist/public-api.txt`.
+Rust embedders depend on the `ai-hist` crate on crates.io (`SessionStore::open` / `sync` / `sessions` / `session` / `changes_since`) on its default features — no raw database connection, no feature flags. Read [docs/sourcing-sdk.md](docs/sourcing-sdk.md), the embedder guide, alongside [crates/ai-hist/README.md](crates/ai-hist/README.md), and start from [examples/rust-consumer](examples/rust-consumer), a standalone Cargo project that stages the fixture corpus into a throwaway `HOME`, syncs, and prints per-session usage totals by model. CI builds that example against the workspace crate on every pull request and against the published crate nightly, and diffs the crate's public API against `crates/ai-hist/public-api.txt`.
 
 ## Every command
 
@@ -91,12 +91,12 @@ ai-hist search "auth rewrite" --all    # search both at once
 Commands that address one session by identity do not take a scope, and reject one rather than guessing — they already name a single session. They split by how they take that identity:
 
 ```sh
-ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits
+ai-hist sessions tree SOURCE SESSION_ID        # also relationships, tools, edits, markers, usage
 ai-hist session SESSION_ID [--source SOURCE]   # session and events take the id alone
 ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused id
 ```
 
-`sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
+`sessions tree`, `sessions relationships`, `sessions tools`, `sessions edits`, `sessions markers` and `sessions usage` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
 Optional: install `@relayhistory/capture` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
 

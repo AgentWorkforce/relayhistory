@@ -51,6 +51,7 @@
   "quirk": "user input arriving as `response_item` message blocks rather than `event_msg`",
   "session_events": [
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "2:response_item_user_message",
       "git_branch": null,
@@ -67,6 +68,7 @@
       "ts_ms": 1776729600100
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "4:function_call",
       "git_branch": null,
@@ -83,6 +85,7 @@
       "ts_ms": 1776729600400
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "6:function_call_output",
       "git_branch": null,
@@ -99,6 +102,7 @@
       "ts_ms": 1776729600600
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "9:response_item_user_message",
       "git_branch": null,
@@ -115,6 +119,7 @@
       "ts_ms": 1776729601100
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "12:function_call",
       "git_branch": null,
@@ -131,6 +136,7 @@
       "ts_ms": 1776729601400
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "14:function_call_output",
       "git_branch": null,
@@ -147,6 +153,7 @@
       "ts_ms": 1776729601600
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "15:custom_tool_call",
       "git_branch": null,
@@ -163,6 +170,7 @@
       "ts_ms": 1776729601700
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "17:custom_tool_call_output",
       "git_branch": null,
@@ -179,6 +187,7 @@
       "ts_ms": 1776729601800
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "22:function_call",
       "git_branch": null,
@@ -195,6 +204,7 @@
       "ts_ms": 1776729602400
     },
     {
+      "control_kind": null,
       "cwd": "/tmp/project",
       "event_uid": "24:function_call_output",
       "git_branch": null,
@@ -209,6 +219,86 @@
       "text": "done\n",
       "token_json": null,
       "ts_ms": 1776729602600
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "task_started",
+      "marker_uid": "3:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776729600200,
+      "turn_id": "turn_utb_1"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "8:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776729601000,
+      "turn_id": "turn_utb_1"
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "11:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776729601200,
+      "turn_id": "turn_utb_2"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "19:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776729602000,
+      "turn_id": "turn_utb_2"
+    },
+    {
+      "kind": "task_started",
+      "marker_uid": "21:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_started",
+      "text": null,
+      "ts_ms": 1776729602200,
+      "turn_id": "turn_utb_3"
+    },
+    {
+      "kind": "task_complete",
+      "marker_uid": "26:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": null,
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "task_complete",
+      "text": null,
+      "ts_ms": 1776729603000,
+      "turn_id": "turn_utb_3"
     }
   ],
   "session_relationships": [],

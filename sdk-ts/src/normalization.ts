@@ -79,6 +79,8 @@ import type {
   SessionRequest,
   RequestCursor,
   SessionFileEditsPage,
+  SessionMarker,
+  SourceCapabilities,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -244,6 +246,7 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
     isSidechain: nullableBoolean(value.isSidechain),
     isMeta: nullableBoolean(value.isMeta),
     turnId: nullableString(value.turnId),
+    controlKind: nullableString(value.controlKind) as SessionEvent['controlKind'],
   };
 }
 
@@ -335,6 +338,62 @@ export function sessionFileEdit(value: UnknownRecord): SessionFileEdit {
     tsMs: nullableNumber(value.tsMs),
     gitBranch: nullableString(value.gitBranch),
     cwd: nullableString(value.cwd),
+  };
+}
+
+export function sessionMarker(value: UnknownRecord): SessionMarker {
+  const payloadJson = nullableString(value.payloadJson);
+  return {
+    id: Number(value.id),
+    source: String(value.source) as Source,
+    sessionId: String(value.sessionId),
+    markerUid: String(value.markerUid),
+    tsMs: nullableNumber(value.tsMs),
+    messageId: nullableString(value.messageId),
+    parentId: nullableString(value.parentId),
+    turnId: nullableString(value.turnId),
+    kind: String(value.kind),
+    subkind: nullableString(value.subkind),
+    text: nullableString(value.text),
+    payload: parseStoredJson(payloadJson),
+    payloadJson,
+  };
+}
+
+/**
+ * Validate a list of evidence kinds rather than cast it: an unknown kind is a
+ * native contract mismatch, not a value to hand a caller that will branch on
+ * it. `what` names the field in the error.
+ */
+export function evidenceKindList(value: unknown, what: string): EvidenceKind[] {
+  if (!Array.isArray(value)) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned ${what} without a kind list.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  return value.map((kind) => {
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(String(kind))) {
+      throw new NativeContractMismatchError(
+        `ai-hist-native returned an unknown evidence kind in ${what}: ${JSON.stringify(kind)}. Reinstall matching ai-hist packages.`,
+        'NATIVE_CONTRACT_MISMATCH',
+      );
+    }
+    return kind as EvidenceKind;
+  });
+}
+
+export function sourceCapabilities(value: UnknownRecord): SourceCapabilities {
+  assertHydrationContract(Number(value.hydrationContractVersion));
+  assertRelationshipContract(Number(value.relationshipContractVersion));
+  return {
+    hydrationContractVersion: Number(value.hydrationContractVersion),
+    relationshipContractVersion: Number(value.relationshipContractVersion),
+    source: catalogSource(value.source),
+    evidenceKinds: evidenceKindList(value.evidenceKinds, 'source capabilities'),
+    missingEvidenceKinds: evidenceKindList(value.missingEvidenceKinds, 'source capabilities'),
+    fullCoverage: value.fullCoverage === true,
+    relationships: relationshipCapabilities(value.relationships),
   };
 }
 
@@ -784,14 +843,18 @@ export function combineHydration(
   };
 }
 
-export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
-  const contractVersion = Number(value.contractVersion);
+export function assertHydrationContract(contractVersion: number): void {
   if (contractVersion !== SESSION_HYDRATION_CONTRACT_VERSION) {
     throw new NativeContractMismatchError(
       `ai-hist expects hydration contract ${SESSION_HYDRATION_CONTRACT_VERSION}, but native returned ${contractVersion}.`,
       'NATIVE_CONTRACT_MISMATCH',
     );
   }
+}
+
+export function normalizeHydration(value: UnknownRecord): HydrateSessionResult {
+  const contractVersion = Number(value.contractVersion);
+  assertHydrationContract(contractVersion);
   if (
     !['hydrated', 'updated', 'unchanged', 'capability_limited'].includes(String(value.status)) ||
     !['full', 'partial', 'shallow_only'].includes(String(value.capability)) ||

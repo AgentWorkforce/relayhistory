@@ -71,6 +71,7 @@ import type {
   RequestPageOptions,
   UserTurnsPageOptions,
   SessionUserTurn,
+  SessionMarker,
   Stats,
   StatsOptions,
   SyncOptions,
@@ -120,6 +121,7 @@ import {
   getSessionFileEditsPage,
   getSessionRequestsPage,
   getSessionUserTurnsPage,
+  getSessionMarkersPage,
   getSessionChildrenPage,
 } from './operations.js';
 
@@ -332,6 +334,33 @@ export async function* sessionEventsIncludingDescendants(
     if (!node.hasEvents) continue;
     yield* sessionEvents(node.sessionId, events);
   }
+}
+
+/**
+ * Lazily walks a session's markers, oldest first, one bounded page at a time.
+ * Undated markers arrive last.
+ */
+export async function* sessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): AsyncGenerator<SessionMarker> {
+  let after: EvidenceCursor | undefined;
+  do {
+    const page = await getSessionMarkersPage(source, sessionId, { ...options, after });
+    for (const marker of page.markers) yield marker;
+    after = page.nextCursor ?? undefined;
+  } while (after);
+}
+
+export async function getSessionMarkers(
+  source: Source,
+  sessionId: string,
+  options: Omit<EvidencePageOptions, 'after'> = {},
+): Promise<SessionMarker[]> {
+  const markers: SessionMarker[] = [];
+  for await (const marker of sessionMarkers(source, sessionId, options)) markers.push(marker);
+  return markers;
 }
 
 export async function* sessionFileEdits(

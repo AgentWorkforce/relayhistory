@@ -10,16 +10,20 @@ cargo run
 ```
 
 It stages a handful of transcripts from `crates/ai-hist/tests/fixtures` into a
-throwaway `HOME`, opens a `SessionStore` there, runs a `sync`, and for each
-staged session prints the usage rollup, the normalized totals folded by model
-from the request pages, and how many user turns and markers the store holds for
-it. It exits non-zero when no session reported usage, so it is a real smoke
-test of the published artefact and not only of its compiler.
+throwaway `HOME`, opens a `SessionStore` there, runs a `sync`, walks the
+catalog with `sessions()`, and for each catalogued session prints the usage
+rollup from `session()`, the normalized totals folded by model over
+`SessionEvidence::requests`, and how many user turns, markers and classified
+control blocks the store holds for it. It then drains `changes_since` under a
+named consumer cursor and commits it. It exits non-zero when the sweep did not
+catalogue a staged session, or when no session reported usage, so it is a real
+smoke test of the published artefact and not only of its compiler.
 
 `RELAYHISTORY_FIXTURES` points it at the corpus when it is built away from the
-repository checkout. The provider-root environment overrides (`CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, …) are cleared at startup so a developer's real sessions never
-reach the temporary store.
+repository checkout. The store is opened with an explicit
+`StoreOptions::roots` (`ProviderRoots::from_home`), which reads nothing from
+the environment, so a developer's exported `CODEX_HOME` — or any other
+provider-root override — cannot reach the temporary store.
 
 Two CI jobs build it:
 
@@ -30,6 +34,5 @@ Two CI jobs build it:
   nightly and on dispatch, against the crate crates.io serves.
 
 The `ai-hist` requirement here is stamped by `scripts/set-release-version.mjs`
-at each release. Two lines are marked `TODO` for facade methods that are
-decided but not published yet: `sessions()` (#178) and the change-feed drain
-(#179). See [`docs/sourcing-sdk.md`](../../docs/sourcing-sdk.md).
+at each release, so the nightly job follows the facade onto each published
+version. See [`docs/sourcing-sdk.md`](../../docs/sourcing-sdk.md).
