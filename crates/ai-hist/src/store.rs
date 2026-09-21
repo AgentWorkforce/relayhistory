@@ -1608,6 +1608,24 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
              WHERE payload_json IS NULL AND detail_json IS NOT NULL",
             [],
         )?;
+        // The delivery capture triggers build their payload with a
+        // `json_object` over the column list as it stood when they were
+        // created, so on a v1 database all three name `detail_json`. SQLite
+        // validates dependent triggers when a column is dropped, so the drop
+        // below fails against them -- and it fails inside `open_db`, which
+        // makes every open of that database error rather than just the first.
+        //
+        // Retiring them here rather than working around the drop: they are
+        // rebuilt from `pragma_table_info` by `init_delivery_schema` later in
+        // this same open, so the window where capture is off does not outlive
+        // the migration, and the rebuilt triggers name the column list that
+        // now exists. `IF EXISTS` because a database opened by a build without
+        // the delivery feature has none of them.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS delivery_session_markers_insert; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_update; \
+             DROP TRIGGER IF EXISTS delivery_session_markers_delete;",
+        )?;
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
     }
     conn.execute(
@@ -1929,17 +1947,30 @@ pub fn upsert_session_presence(
 /// Every marker recorded for one session, oldest known time first. Markers
 /// with no recorded time sort last, in insertion order.
 ///
-/// A thin wrapper over [`session_markers_page`] rather than a second `SELECT`:
-/// one session's markers are bounded by its transcript, and callers that want
-/// them all should not get a different row shape or a different order from the
-/// paged read. The limit is the page cap; a session with more markers than
-/// that is read through the paged call.
+/// Built on [`session_markers_page`] rather than a second `SELECT`, so callers
+/// that want every marker do not get a different row shape or a different
+/// order from the paged read. It follows the cursor to the end: the paged call
+/// clamps at 1,000, and returning one page of a busier session would be a
+/// complete-looking answer computed over part of the data -- worse than an
+/// error, because the truncation is invisible and the cursor that would have
+/// reported it is discarded.
 pub fn session_markers(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionMarker>> {
-    Ok(session_markers_page(conn, source, session_id, 1_000, None)?.markers)
+    let mut markers = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = session_markers_page(conn, source, session_id, 1_000, cursor.as_ref())?;
+        markers.extend(page.markers);
+        match page.next_cursor {
+            // A cursor is handed back only alongside a full page, so this
+            // terminates on the first short page.
+            Some(next) => cursor = Some(next),
+            None => return Ok(markers),
+        }
+    }
 }
 
 pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<usize> {
@@ -5881,6 +5912,135 @@ mod tests {
                 .message_id
                 .as_deref(),
             Some("m1")
+        );
+    }
+
+    /// The same v1 migration, on a database whose delivery capture is live.
+    ///
+    /// The delivery triggers build their payload with a `json_object` over the
+    /// column list as it stood when they were created, so on a v1 database all
+    /// three name `detail_json`. SQLite validates dependent triggers when a
+    /// column is dropped, so `ALTER TABLE ... DROP COLUMN detail_json` fails
+    /// against them -- and it fails inside `open_db`, which means every open of
+    /// that database errors, not just the first. The migration therefore
+    /// retires the three triggers itself; `init_delivery_schema` recreates them
+    /// over the new column list later in the same open.
+    ///
+    /// The plain v1 test above cannot catch this: it opens a database whose
+    /// delivery schema was never initialised, so there are no triggers to
+    /// validate against and the drop succeeds.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn v1_markers_migrate_forward_on_a_database_with_live_delivery_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-delivery.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            // Rebuild the v1 table, then let the delivery schema build its
+            // triggers over that shape -- which is what a real v1 database has.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     ts_ms INTEGER,
+                     text TEXT,
+                     detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok', 'v1-d', 'c1', 'compaction_boundary', 11, 'compacted',
+                         '{\"checkpoint\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            init_delivery_schema(&conn).unwrap();
+            let trigger: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
+                     AND name = 'delivery_session_markers_insert'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the v1 database must really have the trigger this test is about");
+            assert!(
+                trigger.contains("detail_json"),
+                "the setup is only a control if the trigger names the dropped column: {trigger}"
+            );
+        }
+
+        // The whole finding: without the trigger drop this `open_db` fails, and
+        // fails again on every retry, because nothing about it is one-shot.
+        let conn = open_db(&db_path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
+        let markers = session_markers(&conn, "grok", "v1-d").unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0].payload_json.as_deref(),
+            Some("{\"checkpoint\":1}")
+        );
+        // The triggers came back over the new shape, not the old one. A
+        // recreated trigger still naming `detail_json` would deliver a column
+        // that no longer exists.
+        let trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' \
+                 AND name = 'delivery_session_markers_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delivery capture must be restored, not left dropped");
+        assert!(trigger.contains("payload_json"), "{trigger}");
+        assert!(!trigger.contains("detail_json"), "{trigger}");
+    }
+
+    /// Every marker for a session, not the first page of them.
+    ///
+    /// This wrapper's contract is "every marker recorded for one session", and
+    /// it delegates to the paged read, which clamps at 1,000 and hands back a
+    /// cursor. Calling it once and returning `.markers` silently truncates a
+    /// busier session and drops the cursor that would have said so -- a
+    /// complete-looking answer computed over part of the data, which is worse
+    /// than an error because nothing downstream can tell.
+    #[test]
+    fn session_markers_returns_every_marker_past_one_page() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let total = 1_002;
+        for index in 0..total {
+            insert_session_marker(
+                &conn,
+                "codex",
+                "busy",
+                &NewSessionMarker {
+                    marker_uid: &format!("m{index:04}"),
+                    ts_ms: Some(index as i64),
+                    kind: "unknown",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let markers = session_markers(&conn, "codex", "busy").unwrap();
+        assert_eq!(markers.len(), total, "every marker, not one page of them");
+        // Still one ordering, and still no duplicates across the page seam.
+        let uids: std::collections::HashSet<&str> =
+            markers.iter().map(|m| m.marker_uid.as_str()).collect();
+        assert_eq!(uids.len(), total, "a page boundary must not repeat a row");
+        assert_eq!(markers[0].marker_uid, "m0000");
+        assert_eq!(markers[total - 1].marker_uid, "m1001");
+        assert!(
+            markers
+                .windows(2)
+                .all(|pair| pair[0].ts_ms <= pair[1].ts_ms),
+            "the concatenated pages keep the paged order"
         );
     }
 
