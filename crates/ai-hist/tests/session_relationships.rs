@@ -5,11 +5,11 @@
 //! taken through the acquisition path a host actually uses (sync, discovery,
 //! targeted hydration) and then queried through the public relationship API.
 
-use ai_hist_core::{open_db, session_relationships, session_tree, SessionTreeOptions};
-use ai_hist_engine::{
+use ai_hist::{
     discover_sessions_scoped_at, hydrate_session_at, sync_scoped_at, DiscoverOptions,
     HydrateSessionOptions, SessionScope,
 };
+use ai_hist::{open_db, session_relationships, session_tree, SessionTreeOptions};
 use std::fs;
 use std::path::Path;
 
@@ -112,6 +112,9 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("GROK_HOME");
     std::env::remove_var("AI_HIST_DB");
     let db = home.join("history.db");
 

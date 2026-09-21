@@ -69,7 +69,7 @@ for await (const event of sessionEvents(id, { limit: 200 })) consume(event);
 The local npm CLI covers sessions, search, recent, events, statistics, sync,
 export, and generic delivery/plugin operations. Cloud auth, sharing, and replay
 moved out of the mandatory native binding and SDK into the optional
-`@agent-relay/relayhistory` package. Replace imports of `accessToken`, `replay`,
+`@relayhistory/capture` package. Replace imports of `accessToken`, `replay`,
 `enableCloud`, and other cloud functions from `ai-hist` or `ai-hist/cloud` with
 imports from that package. Local Git linkage remains in `ai-hist`.
 
@@ -79,7 +79,7 @@ and `ai-hist delivery run` with explicit configuration and selection. Stop old
 managed push schedules before enabling a durable generation; existing positional
 cursors cannot be converted to acknowledgments. See [cloud setup](enable-cloud.md).
 
-Native contract 15 rejects older addons whose credential-driven source selection
+Native contract 16 rejects older addons whose credential-driven source selection
 or cloud exports would violate the new boundary. Optional source plugins use the
 fixed JSON observation/evidence intake; installing another source does not
 require rebuilding that addon. JavaScript and MCP hosts continue to use public

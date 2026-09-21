@@ -1,6 +1,6 @@
 //! Optional legacy RelayHistory recall source adapter. Explicit selection only.
-use ai_hist_core::{SessionLocation, SOURCE_CHOICES};
-use ai_hist_engine::discover::{
+use ai_hist::{SessionLocation, SOURCE_CHOICES};
+use ai_hist::discover::{
     Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider,
 };
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ fn home_dir() -> PathBuf {
 fn excerpt(text: &str) -> String {
     text.trim()
         .chars()
-        .take(ai_hist_engine::discover::EXCERPT_MAX_CHARS)
+        .take(ai_hist::discover::EXCERPT_MAX_CHARS)
         .collect()
 }
 /// Org-scoped recall resources, implemented in the shared cloud transport.

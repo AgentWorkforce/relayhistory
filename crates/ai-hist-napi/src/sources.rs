@@ -1,5 +1,5 @@
 //! Generic source plugins acquire externally; this boundary only validates and stores.
-use ai_hist_engine::source_intake as engine;
+use ai_hist::source_intake as engine;
 use napi_derive::napi;
 use serde::{de::DeserializeOwned, Serialize};
 fn execute<T: DeserializeOwned, R: Serialize>(

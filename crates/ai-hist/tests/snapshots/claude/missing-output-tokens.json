@@ -1,0 +1,87 @@
+{
+  "corpus_files": [
+    "claude/missing-output-tokens.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/missing-output-tokens",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "hello",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "usage carries `input_tokens` only — `output_tokens` is absent, which is not the same as zero",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "hello",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Hello!",
+      "token_json": "{\"input_tokens\":10}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "hello",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643201000,
+      "last_assistant_text": "Hello!",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/missing-output-tokens.jsonl",
+      "repo_url": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "source_stamp": "<n>:816",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

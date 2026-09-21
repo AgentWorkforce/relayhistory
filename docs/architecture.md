@@ -6,7 +6,7 @@ The local history packages have this production call graph:
 provider files / SQLite
         │
         ▼
-ai-hist-core + Rust ingestion engine
+ai-hist (published Rust crate)
         │ typed Rust functions
         ▼
 ai-hist-native (Node-API, async worker tasks)
@@ -21,25 +21,50 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 15, catalog contract version 3, hydration contract version 2,
-session-relationship contract version 1, and session evidence contract version
-1, normalizes nullable fields, maps native errors, and supplies pagination
+version 19, catalog contract version 4, hydration contract version 3,
+session-relationship contract version 2, and session evidence contract version
+2 and session usage contract version 3, normalizes nullable fields, maps native
+errors, and supplies pagination
 helpers.
 
 The CLI and MCP server import only the SDK's public functions. They do not
 open SQLite, import `ai-hist-native`, scan providers, or invoke another CLI.
 
+## Session sourcing ownership
+
+RelayHistory is the single owner of acquiring, parsing and storing session
+evidence for every harness. Downstream consumers — including
+[`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
+pricing, cost and analytics — read that evidence through the `ai-hist` crate's
+`SessionStore` facade rather than parsing harness logs themselves. New harnesses
+are added here and nowhere else.
+
+`ai-hist` is an in-process crate, so that buys one writer *implementation*, not
+one writer process: a consumer that calls `sync`, `hydrate` or `watch` holds a
+read-write connection in its own process, while every mutation still goes
+through this crate's schema, migrations, sync lock, hydration locks and WAL busy
+handler.
+
+See [ADR: relayhistory owns session
+sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md) for the
+decision, the rejected alternatives and the per-source capture matrix, and
+[`sourcing-contract.md`](sourcing-contract.md) for the record types the Rust SDK
+must expose.
+
 ## Optional services and package boundaries
 
-The local Rust workspace contains storage, identity, observations, evidence,
-relationships, local parsing and generic durable delivery. CLI parsing and
-presentation live in `ai-hist-cli`; reusable ingestion remains in the engine.
+The local Rust workspace publishes one crate, `ai-hist`, containing storage,
+identity, observations, evidence, relationships, local parsing, consistent
+export snapshots and transactional change capture. CLI parsing and presentation live in unpublished
+`ai-hist-cli`; the N-API addon is unpublished `ai-hist-napi`.
 The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
 
 `plugins/relayhistory` owns commercial auth, convergence/outbox mapping, legacy
-push/replay/share and the new delivery transport. `plugins/provider-sources`
+push/replay/share and the entire probe upload lifecycle: sharing consent,
+queues, prepared payloads, leases, acknowledgments, retries and transport.
+These are required parts of the probe, not optional delivery services within it. `plugins/provider-sources`
 owns remote provider credentials/transports. Their Rust helpers depend on
 public local-history APIs and ship in optional platform packages. Their JS
 packages share the installed SDK's public error classes. No second addon or
@@ -86,6 +111,37 @@ and do not open SQLite. Optional Rust compatibility implementations depend on
 public core storage operations; they do not move transport or credential
 dependencies back into the local engine. See [source plugins](remote-connectors.md).
 
+## Evidence retention
+
+Provider files are not the source of truth for what was already observed. A
+re-parse of the same provider file never deletes evidence an earlier parse
+stored for the same session: local re-ingests upsert by provider-native
+identity (Claude records carry their `uuid` into every derived `event_uid`),
+so rows the rewritten file no longer contains are left untouched in
+`session_events`, `tool_calls`, `file_edits` and `history`. Records without
+provider identity derive a content-hash fallback instead of a line index, so
+a compaction that drops the prefix or inserts summary rows cannot shift
+survivors onto earlier rows' identities. Byte-identical id-less rows share
+that identity by design: an ordinal would be positional identity by another
+name. Pre-upgrade positional leftovers heal onto a re-attributed record
+only on a unique full-record match — event text, timestamp, role, kind,
+model and token spend, or a session-unique tool use id — otherwise they
+stay preserved. Claude Code
+rewrites a transcript in place on resume/compact, and the compacted file is
+routinely missing assistant turns the pre-compaction file contained; those
+turns stay queryable. The only local deletion path is a targeted heal that
+names its exact rows (sidechain re-attribution moving a delegated thread's
+records onto the child). Retention/compaction deletion of a large database is
+explicit and opt-in, never a side effect of re-parsing. Codex rollout events
+are keyed by line position rather than provider identity, so the pinned
+guarantee there covers relocation (the `sessions/` to `archived_sessions/`
+move re-ingests under the same session id with no loss or duplication);
+content-stable identity for prefix-dropping rollout rewrites is future work
+for incremental hydration. `crates/ai-hist/tests/claude_rewrite_retention.rs`
+pins all of this: in-place compaction through `sync` and through targeted
+`hydrateSession`, an mtime-only rewrite at identical size, and the Codex
+archive relocation.
+
 ## Operation semantics
 
 | Operation | Provider I/O | Database work | Missing database |
@@ -99,13 +155,21 @@ dependencies back into the local engine. See [source plugins](remote-connectors.
 | `stats` (`local` / `remote` / `all`) | none | indexed aggregate reads | empty result |
 | `getSession` | none | indexed identity read | empty result |
 | `getSessionEventsPage` | none | bounded keyset page | empty page |
+| `getSessionUserTurnsPage` | none | bounded keyset page plus ordered block reads on one snapshot | empty page |
+| `SessionStore::session_user_turns_page` | none | bounded keyset page plus ordered block reads on one snapshot | not reached: `SessionStore::open` created the database (writable) or already failed (read-only) |
 | `getSessionRelationships` | none | indexed relationship reads | empty result |
 | `getSessionTree` | none | indexed relationship reads, one child query per emitted node | root-only tree |
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
+| `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
+
+A writable `SessionStore::open` migrates the database it opens; a read-only
+one cannot, so it refuses a database older than the shape this version reads
+and names the remedy, rather than handing back a store whose first read fails
+inside a query.
 
 No read operation invokes discovery or sync. A common cold start is:
 
@@ -125,15 +189,25 @@ hydration stays provider-bounded: Claude uses the CLI's private
 teleport-evidence contract, while Codex indexes the supported cloud diff and
 reports partial capability because no transcript export exists.
 
-## Delegation topology
+## Session topology
 
-`session_relationships` records one row per observed delegation, keyed by
+`session_relationships` records one row per observed relationship, keyed by
 `(source, parent_session_id, relationship_uid)`. Each row carries what
 established the link — `evidence_kind`, the provider file in
 `evidence_locator`, and the provider-native reference in `evidence_ref` (a
-Claude `toolUseId`, a Codex `parent_thread_id`) — plus whatever the provider
-recorded about the child: agent type, agent name, model, spawn depth, and the
+Claude `toolUseId`, a Codex `parent_thread_id`, the field name or the record
+uuid that established a continuity edge) — plus whatever the provider recorded
+about the child: agent type, agent name, model, spawn depth, and the
 provider's own spawn time.
+
+There are two kinds of relationship, and they answer different questions.
+**Delegation** (`delegated`, `materialized_local`) is one session starting a
+different thread of work. **Continuity** (`continuation`, `fork`, `resume`) is
+one conversation carrying on as another: a `/resume`d session, a branch taken
+from a shared origin, a transcript that opens by answering a record it does not
+contain. Continuity rows also carry `origin_session_id`: the conversation a
+fork or continuation came from, when the provider named one distinct from the
+parent.
 
 `identity_status` separates two honestly different things. An `observed` row
 names the child: `child_session_id` is the provider's own identity for it, and
@@ -188,6 +262,69 @@ infer one. The SDK's
 `sessionDescendants` walker applies the same `childCount` and `truncated`
 rules to the nodes it yields.
 
+### Continuity
+
+`getSessionTree` and `getSessionChildrenPage` take `relationshipKinds`. Omitted
+means delegation only — defined as *every kind that is not a continuity kind*,
+not as a whitelist of `delegated`, so `materialized_local` keeps traversing as
+it always has and a delegation-only database answers byte-identically to before
+continuity existed. Naming the continuity kinds instead expands from an origin
+to its resumed, continued, or forked descendants over the same bounded walk.
+`getSessionRelationships` reports continuity on its own `continuity` array, in
+both directions, leaving `asParent` and `asChild` delegation-only.
+
+Continuity is reconstructed from four signals, in that order of authority: the
+explicit fields a provider writes (`continuedFromSessionId`, `forkSessionId`,
+`sourceSessionId`), a `/resume <id>` or `/continue <id>` the human typed, a
+transcript's first `parentUuid` resolved against the session that actually
+holds that record, and two or more transcripts carrying one in-log session id.
+`evidence_ref` names which one produced the row.
+
+A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
+human types, and the control wrapper Claude Code actually stores —
+`<command-name>/resume</command-name>` with the target in `<command-args>`,
+which this crate already classifies as a control prompt. Matching only the bare
+form matched the one shape a real transcript never contains.
+
+Unlike delegation, continuity is not observable inside a single transcript, so
+each transcript's evidence is banked in `session_continuity_evidence`, keyed by
+the transcript. Reconciliation then runs over the stored rows rather than over
+a set of files held in memory, which is what makes it work during targeted
+hydration of one session. Evidence that cannot resolve yet — a parent record no
+session has indexed, a lone branch with no sibling, a resume marker naming no
+session — keeps a `pending_reason` and is reported as a
+`RELATIONSHIP_CONTINUITY_UNRESOLVED` diagnostic on both hydration and
+`getSessionRelationships`. Hydrating the file that supplies the missing piece
+resolves it without re-reading the first file.
+
+A re-read replaces what a transcript says, including retracting it. Every edge
+carries the `evidence_locator` that established it, and a reconciliation pass
+removes that locator's edges which the current read no longer produces — so a
+rewritten `/resume`, a changed explicit field, or a file that stops being a
+session at all cannot leave a stale edge queryable. Retraction is keyed on the
+whole row identity, not the uid alone: a `/resume` retyped against a different
+session keeps its uid and changes only the parent.
+
+The stamp maps decide whether a file is opened at all, so an install upgrading
+into continuity would otherwise skip exactly the files whose evidence has never
+been banked, and report a successful sync over an empty table. Both providers
+re-read once when a locator has no evidence row: Claude falls through to a full
+re-read, Codex reads only the `session_meta` line its continuity lives on. Every
+readable file writes a row — including one carrying no continuity at all — so
+the condition always clears and nothing is re-read forever. This is deliberately
+narrower than bumping a stamp-map generation, which would re-read the whole
+archive and discard the selective-repair state those maps carry.
+
+A fork branch is given a child identity only when the provider gave it one. Two
+transcripts carrying the same in-log `sessionId` are branches with no identity
+of their own, so each is recorded as unlinked evidence keyed on its transcript;
+a branch's identity is never taken from its file name, here or anywhere else.
+
+Codex records continuity only when a producer writes those explicit fields on
+`session_meta`. A plain `codex resume` opens with a fresh `payload.id` and
+leaves behind only a carried-over token baseline, which is a number and not a
+session, so no `resume` row is recorded for it.
+
 Events use `(ts_ms, id)` keyset pagination. Tool calls and file edits use the
 same keyset shape over `(ts_ms IS NULL, ts_ms, id)`: both tables allow a null
 timestamp, so undated rows sort last and the cursor carries a nullable
@@ -207,21 +344,28 @@ There is no alternate runtime after any native-load error.
 
 ## Durable delivery and snapshot export
 
-`ai-hist-core::delivery` owns opt-in journaling, bounded snapshots, immutable
-queue/payload persistence, exact acknowledgments, retention, and fenced leases.
-The drain loop itself - round-robin scheduling, leases and their keepalive,
-payload persistence, the eligibility recheck before transport, acknowledgment
-checking and failure classification - runs once, in the Rust core worker, for
-both foreground and background delivery. The SDK host is a thin adapter: it
-registers explicitly selected destination modules, describes them to the worker,
-and answers the worker's prepare/send calls. Native contract 15 includes a
-typed serialized delivery/export bridge to the existing addon. No TypeScript or
-plugin code queries SQLite. [Delivery documentation](history-delivery.md) describes
-selection, failure states, background operation, and the independent NDJSON path.
+`ai-hist::export` owns evidence records, bounded snapshots, preimages, tombstones
+and durable change subscriptions. These storage primitives know no destination,
+account, upload acknowledgment or retry state. File/NDJSON exports remain in the
+local SDK through native contract 20's `historyExport` bridge. Ordinary core
+opens create no upload job, batch or membership tables.
 
-Core maintenance is bounded. The host expires abandoned snapshots and compacts
-consumed journal/receipt rows during drains; status exposes retained bytes and
-limits. Destination plugins own endpoint/account fences and transport mapping;
-the generic coordinator owns retries, leases, immutable payloads and exact
-acknowledgments. The RelayHistory server protocol is tested with the real SDK
-coordinator, helper and migrated database under lost-receipt/restart conditions.
+`plugins/relayhistory/rust::delivery` owns the probe's upload state machine and
+worker. The probe manages sharing consent and advances storage subscriptions in
+the same SQLite transaction as its queue. Indexed session snapshot/change APIs
+keep provider traversal in core. The worker retains immutable payloads, renews
+leases, checks consent/account fences before dispatch, and validates exact
+acknowledgments. The plugin SDK is a cancellable bridge to that Rust helper;
+there is no JavaScript upload coordinator and no new generic delivery crate.
+
+Existing databases retain their disk table names. Core imports live legacy
+capture subscriptions transactionally before its next write, leaving upload
+state untouched even if the probe has not restarted. The probe reuses jobs,
+batch IDs, prepared bytes, leases, retries and selected membership in place.
+See the [ownership ADR](decisions/2026-09-21-probe-owns-uploads.md) and
+[delivery guide](history-delivery.md) for compatibility and operation.
+
+Storage and uploads still share a retention budget in an enabled database.
+An unread durable subscription can therefore hold evidence and exhaust capacity;
+capture fails visibly and rolls back instead of losing records. Moving code
+ownership does not provide resource isolation.

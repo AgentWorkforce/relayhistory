@@ -59,9 +59,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use ai_hist_core::{
-    open_db_readonly, upsert_session_presence, SessionLocation, SessionScope, SOURCE_CHOICES,
+use crate::project_identity::ProjectKeyMethod;
+use crate::{
+    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
+use crate::ingest::opencode::OpencodeLayout;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -71,7 +74,9 @@ use serde_json::Value;
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
 /// payloads changes in a way a consumer must notice.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
+/// 4 adds `project_key` / `project_key_method` to every catalog row and the
+/// `project_key` filter to the listing.
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -79,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 3;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 3;
+pub const SHALLOW_SCANNER_VERSION: u32 = 5;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -87,6 +92,22 @@ pub const SHALLOW_SCANNER_VERSION: u32 = 3;
 /// is this version, and reusing 2 would leave those catalogs permanently missing
 /// the sessions. Kept as a compile-time guard so the pair cannot drift apart.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 2);
+
+/// Version 3 shipped the prompt-only Cursor reader: it recorded a first
+/// prompt and an mtime, and nothing else. Version 4 extracts the injected turn
+/// times, the models and the last assistant reply, and a Cursor transcript's
+/// bytes do not change when the release does — so without this bump every row
+/// an earlier install wrote would be served from cache with those fields null
+/// forever. Kept as a compile-time guard for the same reason as the pair
+/// above.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 3);
+
+/// Version 4 stored OpenCode model IDs without their provider prefix. Version
+/// 5 qualifies them consistently with full ingestion (for example,
+/// `anthropic/claude-sonnet`). An unchanged provider database keeps the same
+/// change marker, so only the scanner-version prefix can force those cached
+/// rows through the corrected reader once.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 4);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -131,15 +152,19 @@ pub struct ShallowSession {
     /// Git branch the provider reported, last observed value. Observed.
     pub git_branch: Option<String>,
     /// Earliest activity timestamp the provider records. Observed. `None`
-    /// when the provider records no timestamps at all (cursor).
+    /// when the provider recorded none — for cursor that means the build
+    /// wrote no `<timestamp>` tag into any turn it read, not that cursor
+    /// never records a time.
     pub first_activity_ms: Option<i64>,
     /// Latest activity timestamp. Observed where the provider records one;
-    /// filesystem-derived (file mtime) for cursor, which records none.
+    /// for cursor that is the last readable injected `<timestamp>`, falling
+    /// back to the file mtime when the read found none.
     pub last_activity_ms: Option<i64>,
     /// Bounded excerpt of the first substantive human prompt. **Derived.**
     pub first_prompt: Option<String>,
-    /// Bounded excerpt of the last assistant text. Observed; only populated by
-    /// the full-ingest path, so a purely shallow row leaves it `None`.
+    /// Bounded excerpt of the last assistant text. Observed. Most providers
+    /// populate it only on the full-ingest path, so their shallow rows leave
+    /// it `None`; cursor fills it from the bounded tail read.
     pub last_assistant_text: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
@@ -157,6 +182,15 @@ pub struct ShallowSession {
     pub initial_commit: Option<String>,
     /// Extra workspace roots, when the provider records them. Observed.
     pub workspace_roots: Vec<String>,
+    /// Canonical project identity: the `origin` remote canonicalized to
+    /// `host/owner/repo`, or the working directory when no remote resolves.
+    /// **Derived** — see [`crate::project_identity`]. `None` only while the
+    /// row has neither a `cwd` nor a `repo_url` to derive one from.
+    pub project_key: Option<String>,
+    /// How [`ShallowSession::project_key`] was arrived at: `remote`, `path`,
+    /// or `inherited` from a delegating parent. Read this rather than
+    /// guessing from whether the key looks like a path.
+    pub project_key_method: Option<String>,
     /// Path of the provider file or database this row came from, when local.
     pub raw_path: Option<String>,
     /// Change stamp of the raw source at scan time, `v{scanner}:{provider stamp}`.
@@ -254,18 +288,39 @@ impl CounterCell {
 pub struct DiscoveryEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: PathBuf,
+    /// Claude Code configuration root.
+    pub claude_config_dir: PathBuf,
+    /// Codex state root.
+    pub codex_home: PathBuf,
+    /// Grok state root.
+    pub grok_home: PathBuf,
     /// Path to the opencode database.
     pub opencode_db: PathBuf,
+    /// Root of OpenCode's legacy `storage/` JSON tree, read only when there
+    /// is no `opencode.db`.
+    pub opencode_storage_dir: PathBuf,
     conn: &'a Connection,
     counters: CounterCell,
 }
 
 impl<'a> DiscoveryEnv<'a> {
-    /// Build an environment from the process environment (`HOME`, `OPENCODE_DB`).
+    /// Build an environment from the process environment.
     pub fn new(conn: &'a Connection) -> Self {
+        let roots = crate::ProviderRoots::from_env(crate::home_dir());
+        Self::with_provider_roots(conn, roots)
+    }
+
+    pub(crate) fn with_provider_roots(
+        conn: &'a Connection,
+        roots: crate::ProviderRoots,
+    ) -> Self {
         Self {
-            home: crate::home_dir(),
-            opencode_db: crate::default_opencode_db_path(),
+            home: roots.home,
+            claude_config_dir: roots.claude,
+            codex_home: roots.codex,
+            grok_home: roots.grok,
+            opencode_db: roots.opencode_db,
+            opencode_storage_dir: roots.opencode_storage_dir,
             conn,
             counters: CounterCell::default(),
         }
@@ -275,12 +330,43 @@ impl<'a> DiscoveryEnv<'a> {
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
     /// process-wide environment variables).
     pub fn with_roots(conn: &'a Connection, home: PathBuf, opencode_db: PathBuf) -> Self {
-        Self {
-            home,
-            opencode_db,
+        Self::with_provider_roots(conn, crate::ProviderRoots::from_home(home, opencode_db))
+    }
+
+    /// Build an environment with every provider root supplied explicitly.
+    pub fn with_all_roots(
+        conn: &'a Connection,
+        home: PathBuf,
+        claude_config_dir: PathBuf,
+        codex_home: PathBuf,
+        grok_home: PathBuf,
+        opencode_db: PathBuf,
+    ) -> Self {
+        let opencode_storage_dir = opencode_db
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
+        Self::with_provider_roots(
             conn,
-            counters: CounterCell::default(),
-        }
+            crate::ProviderRoots {
+                home,
+                claude: claude_config_dir,
+                codex: codex_home,
+                grok: grok_home,
+                opencode_db,
+                opencode_storage_dir,
+                use_env_roots: false,
+            },
+        )
+    }
+
+    /// Point the legacy JSON tree somewhere other than beside the database.
+    /// Hosts that set `OPENCODE_STORAGE_DIR` independently of `OPENCODE_DB`
+    /// need this; so do tests, which must not mutate process-wide variables.
+    #[must_use]
+    pub fn with_opencode_storage_dir(mut self, storage_dir: PathBuf) -> Self {
+        self.opencode_storage_dir = storage_dir;
+        self
     }
 
     /// The catalog connection. `relay` discovers from already-synced local
@@ -295,7 +381,11 @@ impl<'a> DiscoveryEnv<'a> {
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
             home: &self.home,
+            claude_config_dir: &self.claude_config_dir,
+            codex_home: &self.codex_home,
+            grok_home: &self.grok_home,
             opencode_db: &self.opencode_db,
+            opencode_storage_dir: &self.opencode_storage_dir,
             counters: &self.counters,
         }
     }
@@ -329,8 +419,16 @@ impl<'a> DiscoveryEnv<'a> {
 pub struct ScanEnv<'a> {
     /// Home directory the file-backed providers are rooted at.
     pub home: &'a Path,
+    /// Claude Code configuration root.
+    pub claude_config_dir: &'a Path,
+    /// Codex state root.
+    pub codex_home: &'a Path,
+    /// Grok state root.
+    pub grok_home: &'a Path,
     /// Path to the opencode database.
     pub opencode_db: &'a Path,
+    /// Root of OpenCode's legacy `storage/` JSON tree.
+    pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
 }
 
@@ -356,6 +454,363 @@ impl ScanEnv<'_> {
     }
 }
 
+/// Where the local providers' evidence lives, without the catalog connection
+/// a [`DiscoveryEnv`] carries. What [`ShallowSessionProvider::watch_roots`]
+/// resolves its directories against.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRoots<'a> {
+    /// Home directory the file-backed providers are rooted at.
+    ///
+    /// Only for providers that have no configurable root of their own. A
+    /// provider whose root *is* configurable reads its own field below, so
+    /// that `CLAUDE_CONFIG_DIR` and friends move the watch as well as the
+    /// sweep; `paths::tests::provider_roots_have_one_owner` holds that line.
+    pub home: &'a Path,
+    /// Claude Code configuration root.
+    pub claude: &'a Path,
+    /// Codex state root.
+    pub codex: &'a Path,
+    /// Grok state root.
+    pub grok: &'a Path,
+    /// Path to the opencode database.
+    pub opencode_db: &'a Path,
+}
+
+/// One path the live-capture watcher monitors, and how deeply.
+///
+/// Depth is not a detail. A transcript root has to be watched recursively,
+/// because a new session is a new file inside a directory that may not exist
+/// yet. A flat log such as `~/.claude/history.jsonl` is watched through its
+/// *parent*, non-recursively: watching the file itself stops firing the moment
+/// the file is replaced rather than appended to, and watching the parent
+/// recursively would pull in everything else under `~/.claude` — the todo
+/// files and shell snapshots a busy session rewrites constantly — so every one
+/// of those would wake a full fingerprint walk.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WatchRoot {
+    pub path: PathBuf,
+    /// How much of `path` is watched.
+    pub depth: WatchDepth,
+    /// The same root with its symlinks resolved, once the filesystem has been
+    /// asked — see [`WatchRoot::resolve`]. `None` until then, and for a root
+    /// whose registration path does not exist yet.
+    pub canonical: Option<PathBuf>,
+}
+
+/// How much of a [`WatchRoot`]'s path is watched.
+///
+/// Ordered narrowest-first, so merging two claims on the same path is a `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchDepth {
+    /// Only the one file the root names.
+    ///
+    /// Registered through the file's *parent*, because a watch on the file
+    /// itself stops firing the moment an atomic rewrite replaces it — but
+    /// every other entry in that parent is filtered back out. That distinction
+    /// matters for a `TRAJECTORY_ROOT` naming a single JSON file: its parent
+    /// can be `$HOME`, or `/`, and watching that as a tree would turn every
+    /// unrelated write on the machine into a forced sweep.
+    File,
+    /// This directory's own entries, and nothing below them.
+    Directory,
+    /// This path and its whole subtree.
+    Tree,
+}
+
+/// One path in the single spelling every comparison uses.
+///
+/// A watch root and a backend event have to be comparable, and they arrive
+/// spelled differently: a root can be given relatively (`TRAJECTORY_ROOT=
+/// trajectory.json`), while the backend reports what it was registered
+/// with — so a relative root and an absolute event never match and the file
+/// is watched but never seen to change. The fix is not to compare cleverly
+/// but to hold one spelling: every root is absolute from the moment it is
+/// built, so the registration is absolute too, and an event path is put
+/// through the same function before it is matched.
+///
+/// Lexical, not canonical: `.` and `..` are resolved textually and symlinks
+/// are left alone. Resolving symlinks would mean a filesystem call per event
+/// and a different answer for a root whose target moves; textual resolution
+/// is the same answer on both sides, which is what matching needs.
+pub(crate) fn watch_path(path: &Path) -> PathBuf {
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_default()
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
+}
+
+impl WatchRoot {
+    /// Watch this path and everything under it.
+    pub fn tree(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: watch_path(&path.into()),
+            depth: WatchDepth::Tree,
+            canonical: None,
+        }
+    }
+
+    /// Watch only this directory's own entries.
+    pub fn directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: watch_path(&path.into()),
+            depth: WatchDepth::Directory,
+            canonical: None,
+        }
+    }
+
+    /// Watch only this one file, through its parent directory.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: watch_path(&path.into()),
+            depth: WatchDepth::File,
+            canonical: None,
+        }
+    }
+
+    /// The path actually handed to the filesystem backend.
+    ///
+    /// Only a [`WatchDepth::File`] root differs from the path it names: it is
+    /// registered through its parent directory.
+    ///
+    /// The path is already absolute — [`watch_path`] made it so when the root
+    /// was built — so the parent is a real directory rather than the empty
+    /// path a bare relative name would have yielded, and the backend reports
+    /// events under it in the same spelling the root holds.
+    pub fn registered_path(&self) -> &Path {
+        match self.depth {
+            WatchDepth::File => self.path.parent().unwrap_or(self.path.as_path()),
+            _ => self.path.as_path(),
+        }
+    }
+
+    /// Ask the filesystem what this root's registration path really is, and
+    /// remember it alongside the spelling the root was given.
+    ///
+    /// Two spellings, because the two backends disagree about which one they
+    /// report. inotify echoes the path the watch was registered with; macOS
+    /// FSEvents reports the *real* path — `/private/var/...` for anything
+    /// under `/var`, and the resolved target of any symlink on the way. A
+    /// root reached through a symlink therefore registers, is reported as
+    /// watched, and never matches an event, which is the failure that looks
+    /// most like everything working.
+    ///
+    /// Resolving the *registration* path rather than the root itself is what
+    /// makes this work for a file that does not exist yet: the directory it
+    /// will appear in does, so the canonical spelling is known before the
+    /// first write. Called once per registration, never per event.
+    pub fn resolve(&mut self) {
+        let Ok(directory) = std::fs::canonicalize(self.registered_path()) else {
+            // Not there yet. The root stays pending and this is asked again
+            // when it is retried.
+            self.canonical = None;
+            return;
+        };
+        self.canonical = Some(match self.depth {
+            WatchDepth::File => match self.path.file_name() {
+                Some(name) => directory.join(name),
+                None => directory,
+            },
+            _ => directory,
+        });
+    }
+
+    /// The registration path in its resolved spelling, when one is known.
+    pub fn canonical_registered_path(&self) -> Option<&Path> {
+        let canonical = self.canonical.as_deref()?;
+        Some(match self.depth {
+            WatchDepth::File => canonical.parent().unwrap_or(canonical),
+            _ => canonical,
+        })
+    }
+
+    /// The one key this root's registration is known by.
+    ///
+    /// Everything that looks a registration up by path — registering it,
+    /// dropping it, recording that the backend reported it gone, and asking
+    /// whether it was — has to use this and only this. Two keys for one
+    /// registration is how a removal gets recorded under a spelling the
+    /// lookup does not use, and a root then stays "watched" over a watch the
+    /// kernel has already dropped.
+    ///
+    /// The resolved spelling once the filesystem has been asked, because that
+    /// is what is registered; the lexical one until then, when there is
+    /// nothing else to go on.
+    pub fn registration_key(&self) -> &Path {
+        self.canonical_registered_path()
+            .unwrap_or_else(|| self.registered_path())
+    }
+
+    /// Whether `path` is one of the spellings this root registers under.
+    pub fn registers_at(&self, path: &Path) -> bool {
+        self.registered_path() == path || self.canonical_registered_path() == Some(path)
+    }
+
+    /// Whether an event on `path` is one this root asked for.
+    pub fn covers(&self, path: &Path) -> bool {
+        // Either spelling. The lexical one is what inotify reports back, the
+        // resolved one is what FSEvents reports, and a root is the same root
+        // under both.
+        self.covers_as(&self.path, path)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|canonical| self.covers_as(canonical, path))
+    }
+
+    fn covers_as(&self, root: &Path, path: &Path) -> bool {
+        match self.depth {
+            WatchDepth::Tree => path.starts_with(root),
+            WatchDepth::Directory => path == root || path.parent() == Some(root),
+            WatchDepth::File => path == root,
+        }
+    }
+}
+
+/// Every path the live-capture watcher should monitor for the given adapters,
+/// deduplicated and ordered.
+///
+/// Roots that do not exist are kept rather than dropped: a provider installed
+/// after the watcher started still has to become covered, so the loop retries
+/// them, and a caller can report which ones are not covered yet.
+///
+/// A path named both ways keeps the wider watch.
+pub fn watch_roots(
+    providers: &[Box<dyn ShallowSessionProvider>],
+    roots: &ProviderRoots<'_>,
+) -> Vec<WatchRoot> {
+    let mut widest: BTreeMap<PathBuf, WatchDepth> = BTreeMap::new();
+    let mut order = Vec::new();
+    for provider in providers {
+        for root in provider.watch_roots(roots) {
+            match widest.get_mut(&root.path) {
+                Some(depth) => *depth = (*depth).max(root.depth),
+                None => {
+                    widest.insert(root.path.clone(), root.depth);
+                    order.push(root.path);
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let depth = widest[&path];
+            WatchRoot {
+                path,
+                depth,
+                canonical: None,
+            }
+        })
+        .collect()
+}
+
+/// A stat-only fold over everything discovery would enumerate, cheap enough to
+/// run on every watch tick.
+///
+/// The value is `"{candidates}:{bytes}:{hash}"`. It is a change *detector*, not
+/// a content hash: two distinct source states could in principle collide. For
+/// append-only transcripts inside one inter-tick window that is not a practical
+/// concern, and the worst case is one skipped no-op sweep — never lost
+/// evidence, because the per-session stamps still catch up on the next tick
+/// whose fingerprint differs.
+///
+/// `bytes` is the size each adapter's stamp reports, summed; it is a cheap
+/// guard that makes an accidental collision harder to hit, and the hash is the
+/// load-bearing part. Nothing here opens a file, so a tick over unchanged
+/// sources leaves [`DiscoveryCounters::files_opened`] at zero.
+pub fn source_fingerprint(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+) -> Result<String> {
+    source_fingerprint_with(env, providers, &[])
+}
+
+/// [`source_fingerprint`] plus inputs no adapter owns.
+///
+/// A sweep can read sources discovery never enumerates — flat per-harness
+/// logs, and records that are deliberately [`DISCOVERY_EXEMPTIONS`] entries.
+/// Anything the sweep reads has to be in the fold, or the fast path will skip
+/// a sweep that had work to do.
+pub fn source_fingerprint_with(
+    env: &DiscoveryEnv<'_>,
+    providers: &[&dyn ShallowSessionProvider],
+    extra: &[Candidate],
+) -> Result<String> {
+    let mut candidates: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut hash: u64 = 0;
+    let mut fold = |candidate: &Candidate| {
+        candidates = candidates.wrapping_add(1);
+        bytes = bytes.wrapping_add(stamp_reported_bytes(&candidate.stamp));
+        hash = hash.wrapping_add(fingerprint_hash(
+            candidate.source,
+            &candidate.locator,
+            &candidate.stamp,
+        ));
+    };
+    for provider in providers {
+        for candidate in provider.fingerprint_inputs(env)? {
+            fold(&candidate);
+        }
+    }
+    for candidate in extra {
+        fold(candidate);
+    }
+    Ok(format!("{candidates}:{bytes}:{hash:016x}"))
+}
+
+/// [`source_fingerprint`] over the built-in adapters.
+pub fn source_fingerprint_for(
+    env: &DiscoveryEnv<'_>,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Result<String> {
+    let refs = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    source_fingerprint(env, &refs)
+}
+
+/// The byte count a file stamp reports, best effort.
+///
+/// File stamps are `"{mtime_nanos}:{len}"`, joined with `|` where one session
+/// is stamped from several files (grok's chat plus its summary). A stamp that
+/// is not shaped that way — a database adapter's `"{updated}:{count}"` — still
+/// contributes through the hash, so an unparseable size costs nothing.
+fn stamp_reported_bytes(stamp: &str) -> u64 {
+    stamp
+        .split('|')
+        .filter_map(|part| part.rsplit(':').next())
+        .filter_map(|len| len.parse::<u64>().ok())
+        .fold(0u64, |total, len| total.wrapping_add(len))
+}
+
+/// FNV-1a over one candidate's identity and change stamp. Summed rather than
+/// chained across candidates so the fold does not depend on enumeration order.
+pub(crate) fn fingerprint_hash(source: &str, locator: &str, stamp: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut hash = OFFSET;
+    for bytes in [source.as_bytes(), b"\0", locator.as_bytes(), b"\0", stamp.as_bytes()] {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
+}
+
 /// What a provider's [`read_shallow`](ShallowSessionProvider::read_shallow)
 /// needs access to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +823,17 @@ pub enum ShallowReadAccess {
     Catalog,
 }
 
+/// Opaque lifetime guard held by the discovery engine for one provider pass.
+///
+/// Most adapters are stateless and use no guard. An adapter that pins live
+/// provider state can return a lock guard so two calls through a reusable
+/// registry cannot replace each other's snapshot between enumeration and
+/// shallow reads.
+#[doc(hidden)]
+pub trait DiscoveryPassGuard {}
+
+impl<T> DiscoveryPassGuard for T {}
+
 /// One provider's shallow adapter.
 ///
 /// Implementations must be cheap: [`enumerate`](ShallowSessionProvider::enumerate)
@@ -377,6 +843,12 @@ pub enum ShallowReadAccess {
 /// not a session" (a codex subagent thread, a file with no usable metadata) —
 /// it is not an error.
 pub trait ShallowSessionProvider: Sync {
+    /// Start one enumerate/read cycle. The returned guard remains alive until
+    /// every candidate from this pass has been consumed.
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        Ok(None)
+    }
+
     /// Stable acquisition identity, independent of the evidence source.
     fn connector_id(&self) -> &str {
         self.source()
@@ -395,7 +867,7 @@ pub trait ShallowSessionProvider: Sync {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::CapabilityLimited {
             code: "PROVIDER_CAPABILITY_LIMITED",
@@ -405,6 +877,21 @@ pub trait ShallowSessionProvider: Sync {
 
     /// The `SOURCE_CHOICES` name this adapter covers.
     fn source(&self) -> &'static str;
+    /// Which evidence kinds this source's local parser is *able* to produce.
+    ///
+    /// Declared, not measured: it is the ceiling on what a completed local
+    /// hydration can have indexed, and it is a property of the adapter rather
+    /// than of any one session or database — the same shape as
+    /// [`crate::relationship_capabilities`]. Hydration derives its reported
+    /// `capability` from it, so a prompt-only provider reports `partial`
+    /// instead of claiming `full` over evidence it never parses.
+    ///
+    /// The default is "nothing declared", which reports `partial`. A new
+    /// adapter therefore understates its coverage until someone writes the
+    /// list down, rather than silently overstating it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
     /// Where this adapter's evidence lives. Local file-backed adapters keep
     /// the default; remote connectors (see [`crate::remote`]) override it, and
     /// the engine records their presences and stamps under that location.
@@ -422,6 +909,37 @@ pub trait ShallowSessionProvider: Sync {
     /// What [`read_shallow`](ShallowSessionProvider::read_shallow) touches.
     fn read_access(&self) -> ShallowReadAccess {
         ShallowReadAccess::Filesystem
+    }
+    /// Directories the live-capture watcher should monitor for this adapter's
+    /// evidence, watched recursively.
+    ///
+    /// Return the widest directory whose subtree the provider writes into, not
+    /// the individual transcripts: a new session is a *new file*, and a watch
+    /// on a path that does not exist yet never fires. Adapters with no local
+    /// files (remote connectors, the relay adapter reading our own catalog)
+    /// return none, and the watcher skips roots that do not exist.
+    fn watch_roots(&self, _roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        Vec::new()
+    }
+    /// The change signal [`source_fingerprint`] folds for this adapter.
+    ///
+    /// The default is [`enumerate`](ShallowSessionProvider::enumerate), which
+    /// for the file-backed adapters is a directory walk plus one `stat` per
+    /// file and opens nothing — exactly the cost the watch fast path is
+    /// willing to pay every tick. Override when enumeration costs more than a
+    /// stat (a database query), returning the cheapest signal that still moves
+    /// whenever the provider's sources move; return none when the adapter's
+    /// rows are derived from RelayHistory's own catalog, where only our own
+    /// writes can move them.
+    ///
+    /// A remote connector contributes nothing by default: its enumeration is a
+    /// network listing, which is not a cost a per-tick fast path may pay, and
+    /// watch mode does not drive remote acquisition in the first place.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        if self.location() != SessionLocation::Local {
+            return Ok(Vec::new());
+        }
+        self.enumerate(env, None)
     }
     /// Bounded read of one candidate into a catalog row.
     ///
@@ -468,6 +986,30 @@ pub fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
     ]
 }
 
+/// Declared local evidence coverage for one source, resolved from the shallow
+/// provider registry.
+///
+/// A pure table: it opens nothing, so it answers the same way for a source
+/// whose database is missing, and a source with no registered adapter (or one
+/// that has not declared its kinds) declares nothing.
+pub fn declared_evidence_kinds(source: &str) -> &'static [EvidenceKind] {
+    shallow_providers()
+        .iter()
+        .find(|provider| provider.source() == source)
+        .map_or(&[][..], |provider| provider.evidence_kinds())
+}
+
+/// The `FULL_SESSION_KINDS` a source's local parser does not produce, in the
+/// canonical order. Empty means the source's declared coverage is complete.
+pub fn missing_evidence_kinds(source: &str) -> Vec<EvidenceKind> {
+    let declared = declared_evidence_kinds(source);
+    FULL_SESSION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !declared.contains(kind))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // bounded reads
 // ---------------------------------------------------------------------------
@@ -496,6 +1038,26 @@ fn keep_complete_lines(buffer: &mut Vec<u8>) {
         Some(last_newline) => buffer.truncate(last_newline + 1),
         None => buffer.clear(),
     }
+}
+
+/// Keep newline-terminated records plus a parseable final object.
+///
+/// Used only for bytes already captured by a hook through one immutable file
+/// handle. A live bounded read still drops its trailing line because the
+/// harness may be writing it concurrently; once the snapshot is complete, a
+/// valid final JSON object is evidence even when the producer omitted `\n`.
+fn keep_snapshot_records(buffer: &mut Vec<u8>) {
+    if buffer.ends_with(b"\n") {
+        return;
+    }
+    let final_start = buffer
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    if parse_record(&buffer[final_start..]).is_some_and(|value| value.is_object()) {
+        return;
+    }
+    keep_complete_lines(buffer);
 }
 
 fn trimmed_record(line: &[u8]) -> Option<&[u8]> {
@@ -608,6 +1170,52 @@ fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
     Ok(BoundedJsonl { head, tail })
 }
 
+/// Build the same bounded head/tail view from bytes already captured through
+/// one open file handle. Hook ingestion uses this so identity validation,
+/// shallow cataloging, and full ingestion all describe one immutable read.
+fn bounded_jsonl_from_bytes(bytes: &[u8]) -> BoundedJsonl {
+    if bytes.len() as u64 <= HEAD_SCAN_MAX_BYTES {
+        let mut head = bytes.to_vec();
+        keep_snapshot_records(&mut head);
+        return BoundedJsonl {
+            head,
+            tail: Vec::new(),
+        };
+    }
+
+    let mut head = bytes[..HEAD_SCAN_MAX_BYTES as usize].to_vec();
+    keep_complete_lines(&mut head);
+    let tail_start = bytes.len().saturating_sub(TAIL_SCAN_MAX_BYTES as usize);
+    let mut tail = bytes[tail_start..].to_vec();
+    if let Some(first_newline) = tail.iter().position(|&byte| byte == b'\n') {
+        tail.drain(..=first_newline);
+    } else {
+        tail.clear();
+    }
+    keep_snapshot_records(&mut tail);
+    BoundedJsonl { head, tail }
+}
+
+fn claude_session_id_from_bounded(bounded: &BoundedJsonl) -> Result<Option<String>> {
+    let session_ids = bounded
+        .head_records()
+        .chain(bounded.tail_records_rev())
+        .filter_map(parse_record)
+        .filter_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        session_ids.len() <= 1,
+        "conflicting sessionId values in Claude transcript"
+    );
+    Ok(session_ids.into_iter().next())
+}
+
 pub(crate) fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
 }
@@ -701,12 +1309,36 @@ impl ShallowSessionProvider for ClaudeProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
     fn source(&self) -> &'static str {
         "claude"
+    }
+    /// The transcript parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.claude.join("projects"))]
+    }
+
+    /// Claude's enumeration collects `*.jsonl`, but a subagent transcript's
+    /// `agent-<id>.meta.json` sidecar is evidence too — `source_snapshot`
+    /// stamps it, so a sidecar arriving or changing on its own re-hydrates the
+    /// session. Left out of the fold, a tick whose only change was a sidecar
+    /// would sit behind an unchanged fingerprint and never run.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = self.enumerate(env, None)?;
+        inputs.extend(file_candidates(
+            "claude",
+            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "json")?,
+            crate::file_stamp_and_modified,
+        )?);
+        Ok(inputs)
     }
 
     fn enumerate(
@@ -716,7 +1348,7 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::collect_matching_files(&env.home.join(".claude/projects"), "", "jsonl")?,
+            crate::collect_matching_files(&env.claude_config_dir.join("projects"), "", "jsonl")?,
             crate::file_stamp_and_modified,
         )
     }
@@ -729,13 +1361,30 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Option<ShallowSession>> {
         let path = PathBuf::from(&candidate.locator);
         let bounded = read_bounded_jsonl(scan, &path)?;
+        read_claude_shallow(candidate, &path, &bounded)
+    }
+}
+
+pub(crate) fn claude_shallow_session_from_bytes(
+    candidate: &Candidate,
+    bytes: &[u8],
+) -> Result<Option<ShallowSession>> {
+    let path = PathBuf::from(&candidate.locator);
+    read_claude_shallow(candidate, &path, &bounded_jsonl_from_bytes(bytes))
+}
+
+fn read_claude_shallow(
+    candidate: &Candidate,
+    path: &Path,
+    bounded: &BoundedJsonl,
+) -> Result<Option<ShallowSession>> {
         let mut session = ShallowSession {
             source: "claude".into(),
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
         };
         let mut models = Vec::new();
-        let mut session_id = None;
+        let session_id = claude_session_id_from_bounded(bounded)?;
         // A subagent sidecar transcript is its own file whose records carry the
         // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
         // as a session would emit the parent twice per run and let the two
@@ -763,13 +1412,6 @@ impl ShallowSessionProvider for ClaudeProvider {
                 } else {
                     primary_record_seen = true;
                 }
-            }
-            if session_id.is_none() {
-                session_id = value
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
             }
             if session.cwd.is_none() {
                 session.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
@@ -858,7 +1500,6 @@ impl ShallowSessionProvider for ClaudeProvider {
         session.session_id = session_id;
         session.models = models;
         Ok(Some(session))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,12 +1512,24 @@ impl ShallowSessionProvider for CodexProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
     fn source(&self) -> &'static str {
         "codex"
+    }
+    /// The rollout parser writes prompts, events, tool calls, file edits and
+    /// child-thread relationships: every kind a full session is made of.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![
+            WatchRoot::tree(roots.codex.join("sessions")),
+            WatchRoot::tree(roots.codex.join("archived_sessions")),
+        ]
     }
 
     fn enumerate(
@@ -886,8 +1539,8 @@ impl ShallowSessionProvider for CodexProvider {
     ) -> Result<Vec<Candidate>> {
         let mut files = Vec::new();
         for root in [
-            env.home.join(".codex/sessions"),
-            env.home.join(".codex/archived_sessions"),
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
         ] {
             files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
         }
@@ -1022,12 +1675,27 @@ impl ShallowSessionProvider for CursorProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
     fn source(&self) -> &'static str {
         "cursor"
+    }
+    /// The transcript parser writes prompts, events, tool calls and file edits.
+    /// Delegation is deliberately absent: a Cursor `Task` block names no child
+    /// transcript, so no relationship row is ever written.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::ToolCall,
+            EvidenceKind::FileEdit,
+        ]
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.home.join(".cursor/projects"))]
     }
 
     fn enumerate(
@@ -1077,10 +1745,45 @@ impl ShallowSessionProvider for CursorProvider {
             .head_records()
             .filter_map(|line| {
                 let line = String::from_utf8_lossy(line);
-                ai_hist_core::parse_cursor_text(&line).ok().flatten()
+                crate::parse_cursor_text(&line).ok().flatten()
             })
             .map(|prompt| excerpt(&prompt))
             .find(|prompt| !prompt.is_empty());
+        // Cursor writes no timestamp field and no model on its records. The
+        // only time signal in the file is the localized `<timestamp>` tag its
+        // client injects into a human turn, so the head read looks for that
+        // and reports nothing when the build did not write one. `models` is
+        // read from `message.model` for the builds that write it; an empty
+        // list means "not seen", never "no model".
+        let mut head_times = bounded.head_records().filter_map(cursor_record_time);
+        let first_activity_ms = head_times.next();
+        // For a transcript past the head budget the tail is a separate region,
+        // so a turn time that only appears in the head is unreachable from the
+        // tail scan. A long run of assistant and tool records after one dated
+        // human turn is the ordinary shape of that: the tail finds no tag,
+        // because only a human turn carries one, and falling straight to the
+        // mtime reported a session as having last spoken "now". Full ingestion
+        // disagrees — those records inherit the open turn's time — and because
+        // the discovery upsert merges `last_activity_ms` with `MAX`, the mtime
+        // would also re-expand a window a rebuild had just retracted. The last
+        // time the head could read is the best recorded evidence there is; the
+        // mtime stays for a transcript with no readable turn time at all.
+        let last_head_ms = head_times.last().or(first_activity_ms);
+        let last_activity_ms = bounded
+            .tail_records_rev()
+            .find_map(cursor_record_time)
+            .or(last_head_ms)
+            .or_else(|| crate::file_modified_ms(&path));
+        let mut models = Vec::new();
+        for model in bounded.head_records().filter_map(cursor_record_model) {
+            if !models.contains(&model) {
+                models.push(model);
+            }
+        }
+        let last_assistant_text = bounded
+            .tail_records_rev()
+            .find_map(cursor_assistant_text)
+            .map(|text| excerpt(&text));
         let cwd = path
             .parent()
             .and_then(Path::parent)
@@ -1092,17 +1795,61 @@ impl ShallowSessionProvider for CursorProvider {
             source: "cursor".into(),
             session_id,
             cwd,
-            // Cursor transcripts carry no per-message timestamps at all. The
-            // file mtime is the only time signal, so it is reported as
-            // last_activity (filesystem-derived) and first_activity stays
-            // NULL rather than being invented.
-            first_activity_ms: None,
-            last_activity_ms: crate::file_modified_ms(&path),
+            first_activity_ms,
+            last_activity_ms,
             first_prompt,
+            last_assistant_text,
+            models,
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
         }))
     }
+}
+
+/// Epoch milliseconds for one Cursor record, from the injected `<timestamp>`
+/// tag or from a record `timestamp` field if a build writes one.
+fn cursor_record_time(line: &[u8]) -> Option<i64> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if let Some(ts) = obj.get("timestamp").and_then(|v| {
+        v.as_str()
+            .and_then(crate::parse_iso_ms)
+            .or_else(|| v.as_i64())
+    }) {
+        return Some(ts);
+    }
+    crate::ingest::cursor::injected_turn_time(
+        crate::ingest::cursor::record_role(obj),
+        &crate::ingest::cursor::record_blocks(obj),
+    )
+}
+
+/// `message.model` for the Cursor builds that record one.
+fn cursor_record_model(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let model = value.get("message")?.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// The assistant prose in one Cursor record, ignoring tool and marker blocks.
+fn cursor_assistant_text(line: &[u8]) -> Option<String> {
+    let value = parse_record(line)?;
+    let obj = value.as_object()?;
+    if crate::ingest::cursor::record_role(obj) != Some("assistant") {
+        return None;
+    }
+    // One assistant record can hold several text blocks — prose, a tool call,
+    // then more prose. Full ingestion walks them in order and keeps the last
+    // non-empty one, so the summary is the reply's closing line. Taking the
+    // first here instead would make the catalog advertise the opening line and
+    // hydration silently rewrite it.
+    crate::ingest::cursor::record_blocks(obj)
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .rfind(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,12 +1862,23 @@ impl ShallowSessionProvider for GrokProvider {
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
     fn source(&self) -> &'static str {
         "grok"
+    }
+    /// The directory parser writes prompts, events, tool calls, file edits and
+    /// subagent relationships: every kind a full session is made of. Grok still
+    /// records no per-turn billing tokens; that absence is a diagnostic, not a
+    /// missing evidence kind, so capability follows this table.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        vec![WatchRoot::tree(roots.grok.join("sessions"))]
     }
 
     fn enumerate(
@@ -1131,7 +1889,7 @@ impl ShallowSessionProvider for GrokProvider {
         file_candidates(
             "grok",
             crate::collect_matching_files(
-                &env.home.join(".grok/sessions"),
+                &env.grok_home.join("sessions"),
                 "chat_history",
                 "jsonl",
             )?,
@@ -1147,12 +1905,20 @@ impl ShallowSessionProvider for GrokProvider {
     ) -> Result<Option<ShallowSession>> {
         let chat = PathBuf::from(&candidate.locator);
         let summary_path = chat.with_file_name("summary.json");
-        let summary = if summary_path.is_file() {
-            scan.note_open();
-            scan.note_bytes(fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
-            crate::read_grok_summary(&summary_path)
-        } else {
-            None
+        // Absent vs unreadable vs present: `is_file()` collapses the first two
+        // into "no summary", which would name the session from its folder and
+        // strand identity the way ingest already refuses to. `read_grok_summary`
+        // fails an unreadable or malformed file and only falls back when the
+        // sidecar is genuinely not there.
+        let summary = match crate::read_grok_summary(&summary_path)? {
+            Some(value) => {
+                scan.note_open();
+                if let Ok(metadata) = fs::metadata(&summary_path) {
+                    scan.note_bytes(metadata.len());
+                }
+                Some(value)
+            }
+            None => None,
         };
         let fallback_session = chat
             .parent()
@@ -1183,16 +1949,29 @@ impl ShallowSessionProvider for GrokProvider {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let first_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("created_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms);
-        let last_activity_ms = summary
-            .as_ref()
-            .and_then(|s| s.get("updated_at"))
-            .and_then(Value::as_str)
-            .and_then(crate::parse_iso_ms)
+        // `updates.jsonl` is where Grok records real per-event times;
+        // `summary.json` records only when the session was opened and last
+        // touched, and a session restored from a checkpoint carries a
+        // `created_at` older than anything it did. Read the stream's first and
+        // last record from the same bounded head/tail scan every other adapter
+        // uses, and fall back to the summary when there is no stream.
+        let (stream_first, stream_last) =
+            grok_update_bounds(scan, &chat.with_file_name("updates.jsonl"))?;
+        let first_activity_ms = stream_first.or_else(|| {
+            summary
+                .as_ref()
+                .and_then(|s| s.get("created_at"))
+                .and_then(Value::as_str)
+                .and_then(crate::parse_iso_ms)
+        });
+        let last_activity_ms = stream_last
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .and_then(|s| s.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .and_then(crate::parse_iso_ms)
+            })
             .or_else(|| crate::file_modified_ms(&chat));
         let mut models = Vec::new();
         push_unique(
@@ -1230,6 +2009,35 @@ impl ShallowSessionProvider for GrokProvider {
     }
 }
 
+/// The first and last times `updates.jsonl` recorded.
+///
+/// Both are `None` when there is no readable stream or when its bounding
+/// records carried no time — Grok's own absence, reported as such rather than
+/// replaced with a file mtime here.
+fn grok_update_bounds(
+    scan: &ScanEnv<'_>,
+    updates: &Path,
+) -> Result<(Option<i64>, Option<i64>)> {
+    match fs::metadata(updates) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", updates.display()))
+        }
+        Ok(metadata) if !metadata.is_file() => return Ok((None, None)),
+        Ok(_) => {}
+    }
+    let bounded = read_bounded_jsonl(scan, updates)?;
+    let first = bounded
+        .head_records()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    let last = bounded
+        .tail_records_rev()
+        .filter_map(parse_record)
+        .find_map(|record| crate::ingest::grok::line_timestamp_ms(&record));
+    Ok((first, last))
+}
+
 // ---------------------------------------------------------------------------
 // opencode
 // ---------------------------------------------------------------------------
@@ -1247,6 +2055,7 @@ impl ShallowSessionProvider for GrokProvider {
 /// but prompt/model extraction is omitted when it would require a table scan.
 #[derive(Default)]
 struct OpencodeProvider {
+    pass: Mutex<()>,
     live: Mutex<Option<OpencodeReadSnapshot>>,
 }
 
@@ -1273,13 +2082,24 @@ struct OpencodeReadSnapshot {
 
 impl OpencodeProvider {
     /// Open the provider once, read-only, and start the transaction that pins
-    /// the run's SQLite snapshot. `None` means there is no OpenCode store.
+    /// the run's SQLite snapshot. `None` means this host is not on the SQLite
+    /// layout — either it has the legacy JSON tree, or it has no OpenCode
+    /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeReadSnapshot>>> {
         let mut guard = self.live.lock().expect("opencode live snapshot lock");
-        if guard.is_none() && scan.opencode_db.exists() {
+        if guard.is_none() && matches!(scan.opencode_layout(), Some(OpencodeLayout::Sqlite(_))) {
             *guard = Some(open_opencode_snapshot(scan)?);
         }
         Ok(guard)
+    }
+}
+
+impl ScanEnv<'_> {
+    /// Which OpenCode layout this host actually has. `opencode.db` wins when
+    /// both are present: newer releases write SQLite and leave the old tree
+    /// behind, so preferring the tree would serve stale history.
+    pub(crate) fn opencode_layout(&self) -> Option<OpencodeLayout> {
+        OpencodeLayout::detect(self.opencode_db, self.opencode_storage_dir)
     }
 }
 
@@ -1378,15 +2198,69 @@ fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        let pass = self.pass.lock().expect("opencode discovery pass lock");
+        // A SourceRegistry retains this adapter across calls. Drop the last
+        // call's SQLite transaction before detecting this call's layout, while
+        // the pass lock prevents a concurrent call from replacing the state
+        // between enumeration and reads.
+        *self.live.lock().expect("opencode live snapshot lock") = None;
+        Ok(Some(Box::new(pass)))
+    }
+
     fn acquire(
         &self,
         _home: &Path,
-        _observation: &ai_hist_core::observations::SessionObservation,
+        _observation: &crate::observations::SessionObservation,
     ) -> Result<crate::sources::AcquiredEvidence> {
         Ok(crate::sources::AcquiredEvidence::LocalFiles)
     }
     fn source(&self) -> &'static str {
         "opencode"
+    }
+    /// Both supported OpenCode layouts produce prompts, events, tool calls,
+    /// file edits and child-session relationships.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        FULL_SESSION_KINDS
+    }
+
+    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
+        // The database file is rewritten in place and SQLite's -wal and -shm
+        // siblings move with it, so the directory is what actually sees every
+        // write. Its own entries are enough — opencode keeps unrelated state
+        // in subdirectories, and waking on those would cost a fingerprint walk
+        // each time.
+        roots
+            .opencode_db
+            .parent()
+            .map(|dir| vec![WatchRoot::directory(dir)])
+            .unwrap_or_default()
+    }
+
+    /// Opencode's enumeration is a SQL query against the provider database, so
+    /// it costs an open plus a scan — far more than the watch fast path should
+    /// pay per tick. The database file's own size and mtime (plus its
+    /// write-ahead log, where a commit lands first) move whenever a session or
+    /// message does, and cost three stats.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let db = &env.opencode_db;
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: "opencode",
+                locator: path.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+        Ok(out)
     }
 
     fn enumerate(
@@ -1395,6 +2269,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let scan = env.scan();
+        if let Some(OpencodeLayout::JsonTree(root)) = scan.opencode_layout() {
+            return enumerate_opencode_json_tree(&scan, &root);
+        }
         let mut guard = self.snapshot(&scan)?;
         let Some(snapshot) = guard.as_mut() else {
             return Ok(Vec::new());
@@ -1498,7 +2375,16 @@ impl ShallowSessionProvider for OpencodeProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        let guard = self.snapshot(scan)?;
+        // Layout is encoded by the candidate shape: SQLite enumeration uses
+        // the session id itself as the locator, while the JSON tree uses its
+        // session-file path (and may have no session id for an unreadable
+        // directory). Do not re-detect the host here: OpenCode can create its
+        // SQLite store after JSON enumeration, and those locators must still
+        // be read by the layout that produced them.
+        if candidate.session_id.as_deref() != Some(candidate.locator.as_str()) {
+            return read_shallow_opencode_json_tree(scan, candidate);
+        }
+        let guard = self.live.lock().expect("opencode live snapshot lock");
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
         };
@@ -1538,6 +2424,7 @@ impl ShallowSessionProvider for OpencodeProvider {
                  WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
                  AND json_extract(m.data, '$.role') = 'user' \
                  AND json_extract(p.data, '$.type') = 'text' \
+                 AND COALESCE(json_type(p.data, '$.synthetic'), 'null') <> 'true' \
                  AND json_type(p.data, '$.text') = 'text' \
                  AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
                  ORDER BY {order} ASC LIMIT 1"
@@ -1570,16 +2457,47 @@ impl ShallowSessionProvider for OpencodeProvider {
         {
             scan.note_query();
             let model = {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT COALESCE(json_extract(data, '$.modelID'), \
-                                            json_extract(data, '$.model.modelID')) \
+                // Match `parse_message` and `OpencodeSession::first_model`:
+                // payload time wins, the relational column is its fallback,
+                // and a message with neither is not parseable. Checking for a
+                // JSON integer mirrors `Value::as_i64`; a string that merely
+                // looks numeric must not take precedence here.
+                let payload_created = "CASE WHEN json_type(data, '$.time.created') = 'integer' \
+                                       AND typeof(json_extract(data, '$.time.created')) = 'integer' \
+                                       THEN json_extract(data, '$.time.created') END";
+                let created = if snapshot.message_columns.contains("time_created") {
+                    format!("COALESCE({payload_created}, time_created)")
+                } else {
+                    payload_created.to_string()
+                };
+                let order_by = if snapshot.message_columns.contains("id") {
+                    format!("ORDER BY {created} ASC, id ASC")
+                } else {
+                    format!("ORDER BY {created} ASC")
+                };
+                let sql = format!(
+                    "SELECT json_extract(data, '$.providerID'), \
+                            COALESCE(json_extract(data, '$.modelID'), \
+                                     json_extract(data, '$.model.modelID')) \
                      FROM message WHERE session_id = ? AND json_valid(data) \
-                     AND COALESCE(json_extract(data, '$.modelID'), \
-                                  json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
-                )?;
-                stmt.query_row([&candidate.locator], |row| row.get::<_, Option<String>>(0))
-                    .optional()?
-                    .flatten()
+                     AND json_extract(data, '$.role') = 'assistant' \
+                     AND {created} IS NOT NULL \
+                     AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
+                          OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
+                                             json_extract(data, '$.model.modelID')), '') IS NOT NULL) \
+                     {order_by} LIMIT 1"
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
+                stmt.query_row([&candidate.locator], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .optional()?
+                .and_then(|(provider, model)| {
+                    crate::ingest::opencode::build_model(provider.as_deref(), model.as_deref())
+                })
             };
             scan.note_records(u64::from(model.is_some()));
             push_unique(&mut models, model.as_deref());
@@ -1598,6 +2516,194 @@ impl ShallowSessionProvider for OpencodeProvider {
             ..Default::default()
         }))
     }
+}
+
+/// Enumerate the legacy tree's `session/<scope>/ses_*.json` files.
+///
+/// The tree has no index, so both the stamp and the recency hint are computed
+/// over *every file that composes a session* — the session JSON, its messages
+/// and their parts — by the same helper hydration stamps with.
+///
+/// Two things make that necessary rather than thorough. OpenCode appends a
+/// turn by writing new files under `message/` and `part/` without touching the
+/// session JSON, so a stamp over that file alone reports an active session as
+/// unchanged and the cache serves its stale first prompt and model forever;
+/// with a `--limit`, ordering on the same unchanged timestamp also ranks a
+/// busy session as old and can drop it from the page entirely. And the birth
+/// time `file_generation_time` prefers does not move when a session file is
+/// rewritten in place, so it cannot be the change signal here either — the
+/// helper reads modification time, and carries a file count and a byte total
+/// so an edit that preserves both size and mtime still moves the stamp.
+///
+/// The cost is one `stat` per file in the tree, no reads and no parsing, and
+/// it is paid before the limit because a limit applied to stale recency is
+/// the bug above.
+fn enumerate_opencode_json_tree(scan: &ScanEnv<'_>, root: &Path) -> Result<Vec<Candidate>> {
+    // One session's failure is that session's failure. The stamp reads files
+    // now, so an unlistable `message/` directory or an unreadable recent part
+    // can fail it -- and propagating that out of the enumeration would take
+    // every healthy session in the same tree down with it, neither cataloged
+    // nor indexed for as long as the one path stays broken. `read_shallow`
+    // already isolates exactly this failure per locator; the enumeration has
+    // to as well.
+    //
+    // The candidate is still emitted, and deliberately not with a stamp that
+    // could match a stored one: this run cannot say the session is unchanged,
+    // and a stamp that compares equal is how the cached-skip path turns a read
+    // failure into a permanent omission. A token unique to this run bypasses
+    // that, `read_shallow` reaches the same failure, and the engine reports it
+    // as a diagnostic against this locator alone -- no skip row, no catalog row
+    // stamped as current.
+    let unreadable = format!(
+        "unreadable:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let listing = crate::ingest::opencode::list_json_tree_session_files(root);
+    let mut rows = Vec::new();
+    // A directory the walk could not list is emitted as a candidate of its
+    // own. `read_shallow` reaches the same failure and the engine reports it
+    // against that path -- which is the difference between "there are no
+    // sessions under here" and "we could not look".
+    for dir in &listing.unreadable {
+        rows.push((
+            String::new(),
+            dir.path.clone(),
+            session_file_mtime_ns(&dir.path),
+            None,
+            unreadable.clone(),
+        ));
+    }
+    for path in listing.sessions {
+        let Some(session_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let (order_ns, recency_hint_ms, stamp) =
+            match crate::ingest::opencode::stamp_json_tree_session(&path, &session_id) {
+                Ok(stamp) => (stamp.newest_ns, stamp.newest_ms(), stamp.token()),
+                Err(_) => {
+                    // Order it by the one file that is certainly its own, so a
+                    // broken session neither jumps the queue nor sinks out of
+                    // sight of a bounded page.
+                    let own_ns = session_file_mtime_ns(&path);
+                    (
+                        own_ns,
+                        i64::try_from(own_ns / 1_000_000).ok(),
+                        unreadable.clone(),
+                    )
+                }
+            };
+        rows.push((session_id, path, order_ns, recency_hint_ms, stamp));
+    }
+    // Newest first, then by id, so the engine takes the same bounded head
+    // every run and the tie-break is total.
+    //
+    // Not truncated here. A `ses_*.json` file is a *candidate*, and
+    // `read_shallow` is what decides whether it is a session -- truncating
+    // first lets a newest malformed file consume the whole of a `--limit 1`
+    // and the valid session behind it is never discovered at all. The engine
+    // stops after the requested number of sessions it actually emitted, which
+    // is the contract the candidate window is written to. (The SQLite side
+    // still limits in SQL, because there a `session` row *is* a session.)
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    scan.note_records(rows.len() as u64);
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, path, _, recency_hint_ms, stamp)| Candidate {
+            source: "opencode",
+            locator: path.to_string_lossy().into_owned(),
+            // Empty for an unlistable directory: it names no session, and
+            // claiming one would have the engine reject the read as a mismatched
+            // identity instead of reporting what actually went wrong.
+            session_id: Some(session_id).filter(|id| !id.is_empty()),
+            recency_hint_ms,
+            stamp,
+        })
+        .collect())
+}
+
+/// A session file's own modification time in nanoseconds, or zero.
+fn session_file_mtime_ns(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One session's catalog row from the legacy tree. This reads the session
+/// file plus that session's own messages and parts — never the whole tree.
+fn read_shallow_opencode_json_tree(
+    scan: &ScanEnv<'_>,
+    candidate: &Candidate,
+) -> Result<Option<ShallowSession>> {
+    let path = Path::new(&candidate.locator);
+    scan.note_open();
+    if path.is_dir() {
+        // Enumeration hands the directory it could not walk straight through
+        // to here, so the failure is reported against that path.
+        fs::read_dir(path)
+            .with_context(|| format!("listing OpenCode session directory {}", path.display()))?;
+        // It lists now, so the outage was transient. It is still not a session,
+        // and the next run walks what is under it.
+        return Ok(None);
+    }
+    let Some(loaded) = crate::ingest::opencode::load_from_json_tree(path)? else {
+        return Ok(None);
+    };
+    scan.note_records(loaded.messages.len() as u64);
+    let first_prompt = loaded
+        .first_user_text()
+        .map(excerpt)
+        .filter(|text| !text.is_empty());
+    let mut models = Vec::new();
+    push_unique(&mut models, loaded.first_model().as_deref());
+    let times: Vec<i64> = loaded
+        .messages
+        .iter()
+        .map(|message| message.time_created)
+        .collect();
+    Ok(Some(ShallowSession {
+        source: "opencode".into(),
+        session_id: loaded.session.id.clone(),
+        cwd: loaded
+            .messages
+            .iter()
+            .find_map(|message| message.path_cwd.clone())
+            .or_else(|| loaded.session.directory.clone()),
+        first_activity_ms: loaded
+            .session
+            .created_ms
+            .or_else(|| times.iter().min().copied()),
+        // The later of the two, not whichever exists. OpenCode appends a
+        // turn without rewriting the session JSON, so `updated` routinely
+        // lags its own newest message -- and preferring it catalogued a busy
+        // session as last active whenever its JSON last changed, which sorts
+        // it behind genuinely older sessions in the newest-first listing and
+        // lets a bounded page drop it. Neither value supersedes the other, so
+        // either one alone stands when the other is absent.
+        last_activity_ms: match (loaded.session.updated_ms, times.iter().max().copied()) {
+            (Some(updated), Some(newest)) => Some(updated.max(newest)),
+            (Some(updated), None) => Some(updated),
+            (None, newest) => newest,
+        },
+        first_prompt,
+        models,
+        // The concrete session file, so hydration can stamp exactly what
+        // discovery read.
+        raw_path: Some(candidate.locator.clone()),
+        ..Default::default()
+    }))
 }
 
 fn file_generation_time(metadata: &fs::Metadata) -> u128 {
@@ -1648,6 +2754,46 @@ struct RelayProvider;
 impl ShallowSessionProvider for RelayProvider {
     fn source(&self) -> &'static str {
         "relay"
+    }
+    /// Relay rows are enumerated out of already-ingested `history`; there is no
+    /// relay parser, and targeted hydration is unsupported for it.
+    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
+        &[]
+    }
+
+    /// Relay rows come from RelayHistory's own `history` table, so there is no
+    /// file to stat — but "no file" is not "cannot change". `ai-hist import`
+    /// writes relay history straight into that table without going through a
+    /// sweep, and nothing else in the fingerprint moves when it does. Left out
+    /// of the fold entirely, an import would land rows that discovery then
+    /// declined to look at, and the imported sessions would never reach the
+    /// catalog.
+    ///
+    /// So the signal is a generation for the relay slice: how many rows there
+    /// are and the highest one. Both move on an insert, and the count alone
+    /// moves on a delete. It is one range scan of `idx_history_session`, whose
+    /// leading column is `source`, so the cost is proportional to the relay
+    /// rows rather than the table.
+    ///
+    /// This does not invalidate itself: no local sweep source writes
+    /// `source = 'relay'`, so a tick that folds this value cannot be the
+    /// reason it changed next time.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let (rows, highest) = env.conn().query_row(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM history WHERE source = 'relay'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Candidate {
+            source: "relay",
+            locator: "history:relay".into(),
+            session_id: None,
+            recency_hint_ms: None,
+            stamp: format!("{rows}:{highest}"),
+        }])
     }
 
     fn enumerate(
@@ -1757,7 +2903,7 @@ fn file_candidates(
 const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, \
+     discovery_state, project_key, project_key_method, \
      CASE \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
         AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
@@ -1795,7 +2941,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
         discovery_state: row
             .get::<_, Option<String>>(16)?
             .unwrap_or_else(|| "full".to_string()),
-        locations: json_string_list(row.get(17)?),
+        project_key: row.get(17)?,
+        project_key_method: row.get(18)?,
+        locations: json_string_list(row.get(19)?),
         from_cache: true,
     })
 }
@@ -1834,6 +2982,12 @@ pub struct CatalogListOptions {
     pub before_ms: Option<i64>,
     /// Precise continuation from the previous page's `next_cursor`.
     pub after: Option<CatalogCursor>,
+    /// Restrict to one canonical project identity, as
+    /// [`ShallowSession::project_key`] spells it (`host/owner/repo`, or the
+    /// working directory for a checkout with no remote). Exact match, not a
+    /// prefix: `github.com/org/repo` and `github.com/org/repo-fork` are
+    /// different projects.
+    pub project_key: Option<String>,
 }
 
 /// One page of the catalog plus the cursor that continues it.
@@ -1878,6 +3032,10 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
         for source in &options.sources {
             args.push(Box::new(source.clone()));
         }
+    }
+    if let Some(project_key) = options.project_key.as_ref() {
+        sql.push_str(" AND project_key = ?");
+        args.push(Box::new(project_key.clone()));
     }
     match options.after.as_ref() {
         // Everything strictly after the cursor in the catalog's total order.
@@ -2022,8 +3180,8 @@ fn observation_key(
     provider: &dyn ShallowSessionProvider,
     source: &str,
     session_id: &str,
-) -> ai_hist_core::observations::ObservationKey {
-    ai_hist_core::observations::ObservationKey {
+) -> crate::observations::ObservationKey {
+    crate::observations::ObservationKey {
         source: source.into(),
         session_id: session_id.into(),
         location: provider.location(),
@@ -2043,7 +3201,7 @@ fn fetch_observed_candidate(
     };
     let Some(id) = id else { return Ok(None) };
     let Some(observation) =
-        ai_hist_core::observations::get(conn, &observation_key(provider, candidate.source, &id))?
+        crate::observations::get(conn, &observation_key(provider, candidate.source, &id))?
     else {
         return Ok(None);
     };
@@ -2102,22 +3260,132 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// Re-resolve the project identity of a row served straight from the catalog.
+///
+/// The stamp shortcut is right about everything the transcript says and wrong
+/// about the one field derived from the filesystem beside it. A session first
+/// seen before its checkout had an `origin` would otherwise keep its path key
+/// on every later pass, because the transcript never changes and so the row is
+/// never reconsidered.
+///
+/// This runs where the row is read rather than as a sweep at the end of the
+/// pass, because the row is *streamed*: `on_row` hands it to the caller as
+/// soon as the window is decided, so a later correction would fix the catalog
+/// and still have emitted the stale value — the JSONL a consumer parses would
+/// disagree with the database it came from.
+///
+/// For the same reason, the answer it streams must be the answer the
+/// end-of-pass refresh will store, so a cached child that is about to inherit
+/// its parent's repository is given that key here rather than the path its own
+/// directory resolves to.
+///
+/// Only a key that is absent, a path, or inherited can change, and an
+/// inherited one only for the child's own `remote`. A `remote` key is never
+/// touched, and inheritance is never traded for a path. The write is skipped
+/// entirely when the answer is the one already stored, which is the usual
+/// case: these are reconsidered because they *might* be upgradable, and almost
+/// never are.
+fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    let stored = row.project_key_method.as_deref();
+    if stored == Some(ProjectKeyMethod::Remote.as_str()) {
+        // The strongest answer there is. Nothing this function can learn
+        // improves on it, so do not even touch the filesystem.
+        return Ok(());
+    }
+    let resolved =
+        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref());
+    let candidate = match resolved {
+        // The session's own repository beats anything borrowed.
+        Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
+        // Anything weaker has to be weighed against what the end-of-pass
+        // refresh is about to do to this row. Deciding that here, and not only
+        // in the pass, is what keeps the row this function streams equal to
+        // the row the pass will store: a consumer reading
+        // `sessions discover --json` beside the catalog must not be told two
+        // different projects.
+        //
+        // `inheritable_parent_project_key` is asked even when this row already
+        // holds a borrowed key, because the key it borrowed can go stale — the
+        // same refresh may promote its parent to a `remote` of its own, and
+        // pass 2 then lends the new one down.
+        weaker => {
+            match crate::store::inheritable_parent_project_key(
+                conn,
+                &row.source,
+                &row.session_id,
+            )? {
+                Some(parent) => Some((parent, ProjectKeyMethod::Inherited)),
+                // An inherited key is borrowed, so it outranks a path: a child
+                // whose directory still resolves to nothing canonical keeps
+                // the parent's repository, which is the point of inheriting it.
+                None if stored == Some(ProjectKeyMethod::Inherited.as_str()) => None,
+                None => weaker,
+            }
+        }
+    };
+    let Some((key, method)) = candidate else {
+        return Ok(());
+    };
+    if row.project_key.as_deref() == Some(key.as_str()) && stored == Some(method.as_str()) {
+        return Ok(());
+    }
+    // The same precedence the merge and the refresh pass apply, as a guard:
+    // this runs outside any transaction, so a hydrate or a concurrent sync may
+    // have settled the row since it was read.
+    let changed = conn.execute(
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
+         WHERE source = ?3 AND session_id = ?4 \
+           AND (project_key IS NULL \
+                OR project_key_method = 'path' \
+                OR (project_key_method = 'inherited' \
+                    AND ?2 IN ('remote', 'inherited')))",
+        params![key, method.as_str(), row.source, row.session_id],
+    )?;
+    if changed == 0 {
+        // Refused: someone else knows better. Stream what the catalog holds
+        // rather than what this function wanted it to hold — an emitted key no
+        // row anywhere agrees with is worse than a stale one, because nothing
+        // downstream can tell it is wrong.
+        if let Some((key, method)) = conn
+            .query_row(
+                "SELECT project_key, project_key_method FROM sessions \
+                 WHERE source = ?1 AND session_id = ?2",
+                params![row.source, row.session_id],
+                |stored| Ok((stored.get(0)?, stored.get(1)?)),
+            )
+            .optional()?
+        {
+            row.project_key = key;
+            row.project_key_method = method;
+        }
+        return Ok(());
+    }
+    row.project_key = Some(key);
+    row.project_key_method = Some(method.as_str().to_string());
+    Ok(())
+}
+
 static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
+    let project_key_merge = crate::store::project_key_merge_sql();
     format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
+          project_key, project_key_method, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
+         {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = CASE \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.first_activity_ms, sessions.first_activity_ms) \
              WHEN excluded.first_activity_ms IS NULL THEN sessions.first_activity_ms \
              WHEN sessions.first_activity_ms IS NULL THEN excluded.first_activity_ms \
              ELSE MIN(sessions.first_activity_ms, excluded.first_activity_ms) END, \
          last_activity_ms = CASE \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.last_activity_ms, sessions.last_activity_ms) \
              WHEN excluded.last_activity_ms IS NULL THEN sessions.last_activity_ms \
              WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
              ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
@@ -2145,11 +3413,13 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
 /// Never nulls out a value the catalog already holds, never lowers
-/// `first_activity_ms` past what a fuller pass observed, and never downgrades
-/// a fully indexed row to `'shallow'` — including a row from a database that
-/// predates `discovery_state`, whose NULL readers deliberately interpret as
-/// `'full'`. A shallow rescan of such a row still refreshes its metadata and
-/// stamp.
+/// `first_activity_ms` past what a fuller pass observed for append-only
+/// providers, and never downgrades a fully indexed row to `'shallow'` —
+/// including a row from a database that predates `discovery_state`, whose NULL
+/// readers deliberately interpret as `'full'`. Grok is the exception on the
+/// activity bounds: a session directory is a replacement snapshot, so a later
+/// compaction can move the start forward and the end backward. A shallow
+/// rescan of such a row still refreshes its metadata and stamp.
 ///
 /// The returned row is what the catalog now holds (including a preserved
 /// `full` state), read back through the write's own `RETURNING` clause so the
@@ -2225,6 +3495,28 @@ fn upsert_shallow_session_in_transaction(
         session.source_stamp.as_deref(),
         Some(&session.discovery_state),
     )?;
+    // One resolution per upsert, from the shallow row's own observations. A
+    // provider-recorded remote (codex's `session_meta.payload.git`) is
+    // preferred over walking the working directory, which may no longer exist
+    // by the time the transcript is read. Resolving here rather than in each
+    // provider's shallow reader keeps every source on one code path.
+    let resolved = session.project_key.clone().map(|key| {
+        (
+            key,
+            session
+                .project_key_method
+                .clone()
+                .unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().to_string()),
+        )
+    });
+    let resolved = resolved.or_else(|| {
+        crate::project_identity::identity_for(session.cwd.as_deref(), session.repo_url.as_deref())
+            .map(|(key, method)| (key, method.as_str().to_string()))
+    });
+    let (project_key, project_key_method) = match resolved {
+        Some((key, method)) => (Some(key), Some(method)),
+        None => (None, None),
+    };
     let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
@@ -2249,6 +3541,8 @@ fn upsert_shallow_session_in_transaction(
                 SessionLocation::Local => "local",
                 SessionLocation::Remote => "remote",
             },
+            project_key,
+            project_key_method,
         ],
         row_to_session,
     )?;
@@ -2527,6 +3821,11 @@ pub fn discover_sessions_with_provider_refs(
     providers: &[&dyn ShallowSessionProvider],
     mut on_row: impl FnMut(&ShallowSession),
 ) -> Result<DiscoverySummary> {
+    // A pass is the unit over which the filesystem is treated as fixed, so it
+    // is also the unit the project-identity cache may span. A host that stays
+    // up across many passes must not keep answering from a checkout's state at
+    // the first one.
+    crate::project_identity::begin_acquisition_pass();
     let mut identities = std::collections::HashSet::new();
     for provider in providers {
         observation_key(*provider, provider.source(), "validation").validate()?;
@@ -2540,6 +3839,15 @@ pub fn discover_sessions_with_provider_refs(
             "INVALID_ARGUMENT: duplicate source connector instance"
         );
     }
+    // Provider instances can belong to a reusable SourceRegistry. Validate
+    // the whole set before taking any non-reentrant pass lock: callers of the
+    // public ref API may accidentally repeat the same provider instance.
+    // Hold each guard across enumeration, parallel reads and writes so a
+    // concurrent call cannot replace live provider state mid-pass.
+    let _pass_guards = providers
+        .iter()
+        .map(|provider| provider.begin_discovery_pass())
+        .collect::<Result<Vec<_>>>()?;
     let conn = env.conn();
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
@@ -2575,6 +3883,7 @@ pub fn discover_sessions_with_provider_refs(
     let mut candidates: Vec<(usize, Candidate)> = Vec::new();
     let mut failed_providers = 0usize;
     for (provider_index, provider) in providers.iter().enumerate() {
+        crate::ingest::check_capture_cancelled()?;
         let entry = summary
             .providers
             .entry(provider.source().to_string())
@@ -2648,6 +3957,7 @@ pub fn discover_sessions_with_provider_refs(
     let mut position = 0usize;
 
     while position < candidates.len() {
+        crate::ingest::check_capture_cancelled()?;
         let window_cap = if emitted >= limit {
             MAX_READ_WINDOW
         } else {
@@ -2656,6 +3966,7 @@ pub fn discover_sessions_with_provider_refs(
         let mut entries: Vec<WindowEntry<'_>> = Vec::new();
         let mut potential = 0usize;
         while position < candidates.len() && potential < window_cap {
+            crate::ingest::check_capture_cancelled()?;
             let (provider_index, candidate) = &candidates[position];
             position += 1;
             if emitted >= limit
@@ -2668,9 +3979,14 @@ pub fn discover_sessions_with_provider_refs(
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
             let cached = fetch_observed_candidate(conn, provider, candidate)?;
-            if let Some(cached) =
+            if let Some(mut cached) =
                 cached.filter(|row| row.source_stamp.as_deref() == Some(&expected))
             {
+                // Before the row is queued for emission, not after the pass:
+                // `on_row` streams these to the caller as they are decided, so
+                // correcting the catalog at the end of the pass would still
+                // have handed every consumer the stale key.
+                upgrade_cached_project_identity(conn, &mut cached)?;
                 env.note_skipped();
                 summary.skipped_unchanged += 1;
                 if let Some(entry) = summary.providers.get_mut(candidate.source) {
@@ -2759,6 +4075,9 @@ pub fn discover_sessions_with_provider_refs(
                 }
             }
         }
+
+        // Shallow reads are bounded; stop before opening the next write transaction.
+        crate::ingest::check_capture_cancelled()?;
 
         // Writes for the whole window share one transaction; a fresh archive
         // costs one commit per window instead of one per row. Cached-only
@@ -2880,9 +4199,9 @@ pub fn discover_sessions_with_provider_refs(
                     break 'apply;
                 }
             };
-            if let Err(error) = ai_hist_core::observations::upsert(
+            if let Err(error) = crate::observations::upsert(
                 conn,
-                &ai_hist_core::observations::SessionObservation {
+                &crate::observations::SessionObservation {
                     key: observation_key(provider, &session.source, &session.session_id),
                     raw_locator: Some(candidate.locator.clone()),
                     source_stamp: session.source_stamp.clone(),
@@ -2958,6 +4277,24 @@ pub fn discover_sessions_with_provider_refs(
         }
     }
 
+    // A candidate whose bytes have not changed is served from the catalog
+    // without ever reaching `upsert_shallow_session_in_transaction`, so the
+    // stamp shortcut is also a shortcut past project-identity resolution. A
+    // session first discovered before its checkout had an `origin` would then
+    // keep its path key on every later `sessions discover`, no matter how many
+    // times it ran: the transcript is unchanged, so the row is never revisited.
+    //
+    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
+    // path key is not final for, and probes before writing, so a pass with
+    // nothing to upgrade stays read-only. Reporting rather than failing, for
+    // the same reason the sync path does: the rows this discovery wrote are
+    // already committed, and every key here is derived from them.
+    if let Err(error) = crate::store::refresh_project_identity(env.conn) {
+        eprintln!(
+            "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+             (project keys stay as they were; the next pass retries)"
+        );
+    }
     summary.counters = env.counters();
     Ok(summary)
 }

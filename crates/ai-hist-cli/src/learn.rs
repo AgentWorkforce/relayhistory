@@ -1,4 +1,4 @@
-use ai_hist_core::privacy::normalize_home_path;
+use ai_hist::privacy::normalize_home_path;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use rusqlite::{params, Connection};
@@ -765,7 +765,7 @@ pub fn provider_from_str(value: &str) -> Result<LearnProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history, prompt_hash, HistoryEntry};
+    use ai_hist::{init_db, insert_history, prompt_hash, HistoryEntry};
     use tempfile::tempdir;
 
     fn mem() -> Connection {
@@ -855,7 +855,7 @@ mod tests {
         let compacted = learn_rollup_from_output(&id, &transcript, output).unwrap();
         upsert_learn_rollup(&conn, &transcript, &compacted).unwrap();
 
-        let stored = ai_hist_core::storage::trajectories_after(&conn, 0, 0, 10).unwrap();
+        let stored = ai_hist::storage::trajectories_after(&conn, 0, 0, 10).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id, id);
         assert!(stored[0]

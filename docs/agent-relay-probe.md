@@ -8,9 +8,9 @@ Node.js, npm, NAPI addon or separately installed Agent Relay CLI.
 ## Source ownership
 
 Keep the binary in `plugins/relayhistory/rust/src/probe/` in this repository. It
-links the existing `ai-hist-engine` capture engine, `ai-hist-core` delivery queue
-and optional `relayhistory-plugin` transport. A separate repository would need to
-coordinate versions of these same components without adding a runtime boundary.
+links the existing `ai-hist` evidence engine and owns its upload queue, worker,
+sharing policy and transport within `relayhistory-plugin`. Moving the probe to
+relay-desktop is a separate follow-up; provider acquisition remains here.
 The core local SDK remains independent of the Cloud package.
 
 This binary is separate from `relayhistory-plugin`, whose JSON bridge, package
@@ -78,6 +78,19 @@ Run setup again after restarting the machine. It preserves the existing queue.
 
 ## State and delivery
 
+Selected-session delivery runs before targeted hydration and independently of
+unrelated provider discovery. An old selected queue at its retention cap can
+reclaim consumed journal entries and retry its atomic membership migration.
+This preserves the cap, queued batches, snapshot preimages, and other jobs'
+unread revisions. If nothing can safely be reclaimed, migration stays pending.
+
+The desktop status `last_cycle` includes an optional, allowlisted `error_class`
+and a safe message for local retention, database corruption, disk-space,
+contention, and permission failures. These also cover failures before capture
+starts. No raw SQLite/provider error, transcript, credential, or path is
+included. Database corruption requires separate recovery from a preserved copy;
+the collector does not delete or recreate a damaged queue automatically.
+
 Each `(site origin, user, workspace)` has an independent SHA-256-named directory
 under `~/.agentworkforce/probe/`. It contains an SDK-owned `history.db`, persisted
 selection/job metadata, scoped RelayHistory auth, a log, a runtime record and a
@@ -86,8 +99,8 @@ No Cloud bearer credential is persisted by the probe. Tokens are never command
 arguments, and provider errors, response bodies and session content are not logged.
 The device approval URL is intentionally displayed in the interactive terminal.
 
-Each cycle delivers through the shared core delivery worker — the same bounded
-drain the SDK uses — carrying the RelayHistory receiver. The worker owns
+Each cycle delivers through the probe-owned Rust worker. The plugin helper
+uses that same bounded drain and RelayHistory receiver. The worker owns
 immutable batches, leases and their keepalive, prepared-byte persistence, the
 eligibility recheck immediately before dispatch, retry/backoff, acknowledgment
 and compaction; the receiver owns only the consent and destination guards and
@@ -97,9 +110,18 @@ job waits out its own backoff, which is normal operation rather than a fault.
 Transport credentials refresh through the existing RelayHistory auth
 implementation.
 
-The probe sends the onboarding heartbeat only after a successful capture and
-delivery cycle. Cloud determines whether session data has actually arrived. A
-running process alone does not mark the dashboard's data step complete.
+Local capture progress is written to private `progress.json` and emitted as
+`event: "progress"` on the desktop install JSON stream every three seconds.
+Source names, files processed/total, and sessions captured never leave the Mac.
+Cloud heartbeats contain only delivery progress for permitted records; the legacy
+capture fields are empty/zero for wire compatibility, and capture-only monitors
+never send heartbeats. Changed delivery progress reports at most every three
+seconds. Completion and failure transitions report immediately. Unchanged delivery
+progress uses a jittered 270–330 second presence heartbeat; empty background
+cycles do not produce extra requests. Failed reports retry no faster than every 30 seconds,
+except for a new terminal transition or explicit setup/one-shot confirmation.
+Cloud determines whether session data has actually arrived. A running process
+alone does not mark the dashboard's data step complete.
 
 An OS file lock permits one collector per destination directory. Stop requests
 carry the startup identity, so an old stop file cannot stop a new run. There is
@@ -163,7 +185,7 @@ installer. The CI job builds and tests on macOS/Linux but publishes nothing.
 ```sh
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --bin agent-relay-probe --locked
 cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --lib cloud:: --locked
-cargo test -p ai-hist-core identity_pages --locked
+cargo test -p ai-hist --features export identity_pages --locked
 ```
 
 Regression tests cover Cloud's `201 Created` device grant, authorization polling,
@@ -186,3 +208,92 @@ Claude session, reads that exact stored session, checks Cloud's `receiving` stat
 verifies private storage and stops the collector. It keeps credentials and the
 captured approval URL out of the test output, then removes its fixture directory.
 It refuses remote origins and must never run against production.
+
+## Desktop bridge v1
+
+The macOS companion uses `agent-relay-probe` for authentication, local credential
+storage, capture and delivery. All bridge commands accept `--json`; every JSON
+object has `bridge_version: 1`. Status output contains no credentials. Existing
+human-readable install/status/stop commands remain available.
+
+- `installs --json`: discover configured probe directories.
+- `cloud install --json --include-existing|--new-sessions-only|--selected-sessions-only`:
+  emit NDJSON `approval`, `connected`, and `ready` events. The browser approves
+  the device; the probe stores Cloud and workspace RelayHistory credentials.
+  JSON setup requires one explicit sharing choice and runs in the background.
+- `start`, `status`, `pause`, `resume`, `disconnect`: pass `--account ID`,
+  `--workspace ID`, and optionally `--site-url URL`, plus `--json`.
+- `sessions list <target> --json --limit 500`: newest sessions with title,
+  source, project path, activity and upload status. `uploading` means a record
+  from the session is in the currently leased batch; `queued` means a pending
+  batch. `shared` is used while a session's acknowledgement is not established.
+- `sessions include|exclude <target> --json --session SOURCE:ID …`: explicitly
+  share one session or a batch, or stop sharing them. This does not erase
+  already uploaded history.
+- `sharing set <target> --json --mode all|new|selected`: share everything,
+  establish a new-only baseline, or share only explicitly selected sessions.
+  Previously selected sessions are retained across mode changes.
+
+Selected mode uses the core's normalized, deny-by-default session membership.
+Adding a session creates its own immutable historical snapshot and indexed
+journal cursor. Adding B keeps A's acknowledged progress and pending immutable
+batch; repeating an inclusion is a no-op. A removal fences an in-flight lease
+and is checked again before dispatch. Re-inclusion takes a fresh snapshot, so
+previously skipped records are backfilled. New discoveries stay private without
+writing an exclusion for every catalog row. The selected-session manifest is
+still written for desktop compatibility; its size follows explicit selections,
+not the machine's history. Session lists and status remain read-only.
+
+Selected delivery drains captured records before targeted hydration and keeps
+draining a backlog before reading provider files. Hydration uses the core's
+parser, observation locks, cancellation and checkpoints. A separate periodic
+shallow inventory worker refreshes catalog metadata; slow provider enumeration
+never runs on the selected delivery scheduler. Selected setup does not run a
+full-history capture. Paused selected jobs do not hydrate or deliver; the
+background inventory can still discover metadata. All/new sharing modes retain
+their capture behavior, with eligible delivery attempted before capture.
+
+Sharing mutations serialize on `desktop.lock`, stop the collector, and take
+its lock. A durable `sharing-change.json` records the intended change before
+any writes; replay completes it before delivery can restart. Selected-mode
+include/exclude operations update only changed membership. Explicit sharing
+mode changes retain generation replacement semantics and preserve pause state.
+
+On the first writable use of an older selected install, core adopts the same
+job in place: destination generation, pending/prepared batches, acknowledgments,
+retry state, paused/blocked state, historical bounds and preimages survive.
+This one-time upgrade copies only explicitly selected snapshots and can require
+retention headroom; a capacity error rolls the entire adoption back. New delivery
+indexes are built once during schema upgrade. Existing exclusions remain
+privacy guards, including exclusions needed by another active destination.
+No destructive queue migration occurs. Read-only commands also accept the old
+schema before the writable upgrade.
+
+`capture-diagnostic.json` reports capture stage, elapsed time, counts and an
+allowlisted error class; inventory diagnostics use a separate file. Logs never
+include raw provider errors, transcript content, paths or credentials. A
+successful include command means consent and preparation were recorded, not
+that a receiver acknowledged the session. `shared`, `queued`, `uploading` and
+`uploaded` retain their existing bridge meanings. The historical 77/86-second
+capture failures cannot be diagnosed from the old generic logs; their cause
+remains unknown until a redacted diagnostic is reproduced.
+
+Disconnect stops the collector, cancels jobs, best-effort revokes the workspace
+RelayHistory token, and removes this install's stage credentials/configuration.
+The local history database is retained. It does not remove shared Cloud login
+credentials belonging to other Cloud clients.
+
+### Local title preview
+
+`agent-relay-probe sessions preview --json --limit 100 [--refresh]` has no
+Cloud target, credentials, or transport. `--refresh` uses RelayHistory's existing
+shallow discovery adapters and a separate private metadata catalog under
+`~/.agentworkforce/session-preview/`; it does not contend with full capture's
+writer or change inclusion. The cache-only form lists recent metadata and writes
+`sessions.json` for immediate desktop startup. Both return the desktop session
+shape with `included: false` and `status: "unknown"`. These rows are previews;
+only the normal target-scoped session list can make them selectable for upload.
+
+The desktop prewarms discovery during sign-in and displays cached titles before
+awaiting capture or delivery status. The preview is limited to 100 recent sessions;
+full browsing continues through the normal session list when preparation finishes.

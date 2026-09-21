@@ -1,27 +1,125 @@
 [package]
-name = "ai-hist-engine"
-version = "0.2.0"
+name = "ai-hist"
+version = "0.24.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+description = "Local coding-agent session history: ingest, store, and query Claude, Codex, Cursor, Grok, OpenCode, and Agent Relay sessions."
+readme = "README.md"
+keywords = ["ai", "history", "claude", "codex", "session"]
+categories = ["development-tools", "database"]
+include = ["src/**/*", "README.md"]
 
 [lib]
-name = "ai_hist_engine"
+name = "ai_hist"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Legacy feature alias; upload APIs now belong to relayhistory-plugin.
+delivery = ["export"]
+export = []
+# Filesystem-event driver for the live-capture watch loop. Optional so the
+# crate still builds with --no-default-features on a host with no watcher
+# backend; without it `watch` falls back to polling.
+fs-events = ["dep:notify"]
+opencode-backup = ["dep:tempfile", "rusqlite/backup"]
+git-hooks = ["dep:url"]
+unstable-internal = []
+
 [dependencies]
-ai-hist-core = { path = "../ai-hist-core" }
 anyhow = "1"
-atomicwrites = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-fs2 = "0.4"
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["backup", "bundled", "functions"] }
+notify = { version = "8", default-features = false, features = [
+    "macos_fsevent",
+], optional = true }
+rusqlite ={ version = "0.32", features = ["bundled", "functions"] }
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
-url = "2"
+tempfile = { version = "3", optional = true }
+url = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: `progress_handler` is the only way to commit a write from a
+# second connection *between* the two reads `session_user_turns_page` makes,
+# which is the race the single-snapshot transaction exists to close. The
+# feature adds no dependencies and is not enabled for the published library.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
+
+[[test]]
+name = "fixture_corpus"
+required-features = ["unstable-internal"]
+
+# Already a dependency of the crate on every platform; declared here too so the
+# live-capture suite can take the sync path's advisory lock from a second
+# handle, which is the only way to test a contended sweep honestly.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[[test]]
+name = "live_capture"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "relative_watch_roots"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "local_history_boundary"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "hydration_preflight"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "opencode_parity"
+required-features = ["export", "unstable-internal"]
+
+[[test]]
+name = "session_continuity"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "env_roots"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "session_relationships"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "session_usage_plan"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "project_identity_discovery"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "source_intake"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "source_registry"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "sync_silence"
+required-features = ["unstable-internal"]
+
+[[test]]
+name = "claude_rewrite_retention"
+required-features = ["unstable-internal"]

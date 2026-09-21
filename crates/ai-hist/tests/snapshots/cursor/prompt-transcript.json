@@ -1,0 +1,209 @@
+{
+  "corpus_files": [
+    "cursor/prompt-transcript"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "src/client.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "cursor:372",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "structured_patch_json": null,
+      "tool_name": "edit_file",
+      "tool_use_id": "toolu_cursor_1",
+      "ts_ms": 1776643200000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "cursor/prompt-transcript",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "add a retry to the client",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now write the test\n\nignored second block",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "wrapped query",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "0:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "cursor:0",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "add a retry to the client",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "163:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "cursor:163",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "now write the test",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "163:1",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "cursor:163",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "ignored second block",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "293:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "cursor:293",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "wrapped query",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "372:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "cursor:372",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "edit_file src/client.ts",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "518:0",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "cursor:518",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "ok",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "66:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "cursor:66",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "text": "on it",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "add a retry to the client",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643200000,
+      "last_assistant_text": "on it",
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.cursor/projects/tmp-project/agent-transcripts/cur-00000001/cur-00000001.jsonl",
+      "repo_url": null,
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "source_stamp": "<n>:688",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "cursor",
+  "tool_calls": [
+    {
+      "args_json": "{\"target_file\":\"src/client.ts\"}",
+      "is_error": 0,
+      "message_id": "cursor:372",
+      "name": "edit_file",
+      "session_id": "cur-00000001",
+      "source": "cursor",
+      "target": "src/client.ts",
+      "tool_use_id": "toolu_cursor_1",
+      "ts_ms": 1776643200000
+    }
+  ]
+}

@@ -613,8 +613,8 @@ transport in a release.
 
 The local workspace contains `ai-hist-core`, `ai-hist-engine`, `ai-hist-cli`, and
 `ai-hist-napi`; the npm SDK remains `ai-hist`. Optional composition lives in
-`plugins/relayhistory` (`@agent-relay/relayhistory`) and
-`plugins/provider-sources` (`@agent-relay/history-provider-sources`). Each optional
+`plugins/relayhistory` (`@relayhistory/capture`) and
+`plugins/provider-sources` (`@relayhistory/provider-sources`). Each optional
 package uses a platform-specific Rust executable and the one local native addon.
 These concrete package names replace the provisional names used in earlier steps.
 

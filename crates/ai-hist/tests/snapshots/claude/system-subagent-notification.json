@@ -1,0 +1,91 @@
+{
+  "corpus_files": [
+    "claude/system-subagent-notification.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/system-subagent-notification",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "a `system`/`subagent_completed` record reports a child session id the transcript never contains",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-system-asst:0",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "u-system-asst",
+      "model": "claude-sonnet-4-6",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "Agent {\"description\":\"inspect the tree\",\"subagent_type\":\"Explore\"}",
+      "token_json": "{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":8,\"output_tokens\":4}",
+      "ts_ms": 1776992400000
+    },
+    {
+      "cwd": null,
+      "event_uid": "system-subagent-notification:sha256:8eb39d2ed8732bdf:subagent_notification",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "system-subagent-notification:sha256:8eb39d2ed8732bdf",
+      "model": null,
+      "parent_id": null,
+      "project": null,
+      "role": "tool_result",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "text": "subagent completed",
+      "token_json": null,
+      "ts_ms": 1776992401000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.98",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776992400000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776992401000,
+      "last_assistant_text": null,
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/system-subagent-notification.jsonl",
+      "repo_url": null,
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "source_stamp": "<n>:899",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": [
+    {
+      "args_json": "{\"description\":\"inspect the tree\",\"subagent_type\":\"Explore\"}",
+      "is_error": null,
+      "message_id": "u-system-asst",
+      "name": "Agent",
+      "session_id": "22222222-2222-2222-2222-222222222222",
+      "source": "claude",
+      "target": null,
+      "tool_use_id": "toolu_system",
+      "ts_ms": 1776992400000
+    }
+  ]
+}

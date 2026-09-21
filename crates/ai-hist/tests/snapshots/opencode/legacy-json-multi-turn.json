@@ -1,0 +1,136 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-multi-turn"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "opencode/legacy-json-multi-turn",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_child",
+      "source": "opencode",
+      "status": "hydrated"
+    },
+    {
+      "related_session_ids": [
+        "ses_child"
+      ],
+      "session_id": "ses_multi",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy layout with a `ses_child` session carrying `parentID`",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:toolu_bash_multi",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_multi_a2",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_multi_u2",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_multi",
+      "source": "opencode",
+      "text": "clean",
+      "token_json": "{\"cache\":{\"read\":15000,\"write\":3000},\"input\":5,\"output\":200,\"reasoning\":50}",
+      "ts_ms": 1776988824000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:toolu_bash_multi",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_multi_a2",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_multi_u2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_multi",
+      "source": "opencode",
+      "text": "bash git status",
+      "token_json": "{\"cache\":{\"read\":15000,\"write\":3000},\"input\":5,\"output\":200,\"reasoning\":50}",
+      "ts_ms": 1776988824000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 0,
+      "child_model": "anthropic/claude-haiku-4-5",
+      "child_session_id": "ses_child",
+      "evidence_kind": "opencode_parent_id",
+      "evidence_locator": "<home>/.local/share/opencode/storage/session/global/ses_child.json",
+      "evidence_ref": "ses_child",
+      "identity_status": "observed",
+      "parent_session_id": "ses_multi",
+      "relationship": "delegated",
+      "relationship_uid": "child:ses_child",
+      "source": "opencode",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776988822500
+    }
+  ],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776988822500,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776988823700,
+      "last_assistant_text": null,
+      "models_json": "[\"anthropic/claude-haiku-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_child.json",
+      "repo_url": null,
+      "session_id": "ses_child",
+      "source": "opencode",
+      "source_stamp": "993:4:<n>:3fc9ab016cf1893f",
+      "workspace_roots_json": null
+    },
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776988820000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776988825000,
+      "last_assistant_text": null,
+      "models_json": "[\"anthropic/claude-sonnet-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_multi.json",
+      "repo_url": null,
+      "session_id": "ses_multi",
+      "source": "opencode",
+      "source_stamp": "1986:8:<n>:d38fb05dec856e9d",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "opencode",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"git status\"}",
+      "is_error": 0,
+      "message_id": "msg_multi_a2",
+      "name": "bash",
+      "session_id": "ses_multi",
+      "source": "opencode",
+      "target": "git status",
+      "tool_use_id": "toolu_bash_multi",
+      "ts_ms": 1776988824000
+    }
+  ]
+}

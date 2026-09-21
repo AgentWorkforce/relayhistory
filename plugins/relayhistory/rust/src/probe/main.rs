@@ -1,5 +1,11 @@
 //! Standalone Cloud collector. Reuses ai-hist capture/queue and the optional transport.
+// Machine-readable commands must never mix progress prose into stdout.
+macro_rules! humanln {
+    ($($arg:tt)*) => { if !crate::bridge::json_mode() { println!($($arg)*); } };
+}
+mod bridge;
 mod collector;
+mod progress;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -22,6 +28,8 @@ use std::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    #[arg(long, global = true)]
+    json: bool,
 }
 #[derive(Subcommand)]
 enum Commands {
@@ -38,6 +46,19 @@ enum Commands {
     },
     Stop(Target),
     Status(Target),
+    Installs,
+    Start(Target),
+    Pause(Target),
+    Resume(Target),
+    Disconnect(Target),
+    Sessions {
+        #[command(subcommand)]
+        command: bridge::SessionCommand,
+    },
+    Sharing {
+        #[command(subcommand)]
+        command: bridge::SharingCommand,
+    },
 }
 #[derive(Subcommand)]
 enum CloudCommands {
@@ -60,10 +81,12 @@ struct Install {
     account: Option<String>,
     #[arg(long)]
     workspace: Option<String>,
-    #[arg(long, conflicts_with = "new_sessions_only")]
+    #[arg(long, conflicts_with_all = ["new_sessions_only", "selected_sessions_only"])]
     include_existing: bool,
     #[arg(long)]
     new_sessions_only: bool,
+    #[arg(long, conflicts_with = "new_sessions_only")]
+    selected_sessions_only: bool,
     #[arg(long)]
     force_login: bool,
     #[arg(long)]
@@ -85,6 +108,8 @@ struct Config {
     job_id: String,
     include_existing: bool,
     #[serde(default)]
+    sharing_mode: Option<bridge::SharingMode>,
+    #[serde(default)]
     acknowledge_uninspected_schedules: bool,
 }
 #[derive(Debug)]
@@ -98,12 +123,17 @@ impl std::error::Error for UserError {}
 fn user_error(message: &'static str) -> anyhow::Error {
     UserError(message).into()
 }
+/// Dispatch probe commands and report only explicitly safe user-facing errors.
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let cli = Cli::parse();
+    bridge::set_json(cli.json);
+    if let Err(error) = run(cli) {
         // Provider errors can contain bodies, credentials or history; never print them.
         if let Some(safe) = error.downcast_ref::<UserError>() {
             eprintln!("{safe}");
         } else if let Some(safe) = error.downcast_ref::<cloud::CloudAuthError>() {
+            eprintln!("{safe}");
+        } else if let Some(safe) = collector::local_failure_message(&error) {
             eprintln!("{safe}");
         } else {
             eprintln!("Probe could not finish. Check your connection and run setup again. Credentials and session content were not logged.");
@@ -121,7 +151,15 @@ fn run(cli: Cli) -> Result<()> {
             startup_id,
         } => collector::run_background(&directory, &startup_id),
         Commands::Stop(target) => collector::stop(&target.directory()?),
+        Commands::Status(target) if bridge::json_mode() => bridge::status(&target.directory()?),
         Commands::Status(target) => collector::print_status(&target.directory()?),
+        Commands::Installs => bridge::installs(),
+        Commands::Start(target) => bridge::start(&target.directory()?),
+        Commands::Pause(target) => bridge::pause(&target.directory()?, true),
+        Commands::Resume(target) => bridge::pause(&target.directory()?, false),
+        Commands::Disconnect(target) => bridge::disconnect(&target.directory()?),
+        Commands::Sessions { command } => bridge::sessions(command),
+        Commands::Sharing { command } => bridge::sharing(command),
     }
 }
 impl Target {
@@ -214,8 +252,8 @@ fn choose_import() -> Result<Option<bool>> {
     if !io::stdin().is_terminal() {
         return Err(user_error("Use an interactive terminal, or explicitly pass --include-existing or --new-sessions-only."));
     }
-    println!("Share coding session content with this Cloud workspace:");
-    println!(
+    humanln!("Share coding session content with this Cloud workspace:");
+    humanln!(
         "  1. Existing and future sessions\n  2. Only sessions started after setup\n  3. Cancel"
     );
     print!("Choose 1, 2 or 3: ");
@@ -241,7 +279,22 @@ fn check_legacy_schedules(acknowledge_uninspected_schedules: bool) -> Result<()>
     }
     Ok(())
 }
+fn validate_setup_mode(options: &Install, json: bool) -> Result<()> {
+    ensure!(
+        !json || (!options.foreground && !options.once),
+        user_error("JSON setup requires background mode. Omit --once and --foreground.")
+    );
+    ensure!(
+        !json
+            || options.include_existing
+            || options.new_sessions_only
+            || options.selected_sessions_only,
+        user_error("JSON setup requires an explicit sharing choice: --include-existing, --new-sessions-only, or --selected-sessions-only.")
+    );
+    Ok(())
+}
 fn install(options: Install) -> Result<()> {
+    validate_setup_mode(&options, bridge::json_mode())?;
     let site = cloud::site_origin(&options.site_url)?;
     let api_url = cloud::cloud_api_url(Some(&format!("{site}/cloud")))?;
     for id in [options.account.as_deref(), options.workspace.as_deref()]
@@ -251,7 +304,7 @@ fn install(options: Install) -> Result<()> {
         validate_id(id)?;
     }
     check_legacy_schedules(options.acknowledge_uninspected_schedules)?;
-    println!("Connecting to Agent Relay Cloud…");
+    humanln!("Connecting to Agent Relay Cloud…");
     // Setup is always run by a person at a keyboard, but its stdin may be a
     // pipe (the composed local harness runs it that way), so the approval URL
     // is printed rather than gated on a terminal.
@@ -260,14 +313,19 @@ fn install(options: Install) -> Result<()> {
         cloud::CloudBearerOptions {
             force_login: options.force_login,
             interactive: true,
-            client_name: "Agent Relay Probe",
+            client_name: "Agent Relay Session Recorder",
             announce: &mut |approval: &cloud::DeviceApproval| {
-                println!(
+                if bridge::json_mode() {
+                    bridge::emit(
+                        serde_json::json!({"event":"approval", "verification_uri":approval.verification_uri, "user_code":approval.user_code}),
+                    );
+                }
+                humanln!(
                     "Open this URL to authorize your computer:\n{}",
                     approval.verification_uri
                 );
                 if let Some(code) = &approval.user_code {
-                    println!("Code: {code}");
+                    humanln!("Code: {code}");
                 }
             },
         },
@@ -288,34 +346,40 @@ fn install(options: Install) -> Result<()> {
     validate_id(&who.user_id)?;
     validate_id(&workspace)?;
     let directory = directory(&site, &who.user_id, &workspace)?;
+    let _control = bridge::control_lock(&directory)?;
     let guard = lock(&directory)?;
+    bridge::recover(&directory)?;
     let existing = if directory.join("config.json").exists() {
         Some(read_config(&directory)?)
     } else {
         None
     };
     let requested = if options.include_existing {
-        Some(true)
+        Some(bridge::SharingMode::All)
     } else if options.new_sessions_only {
-        Some(false)
+        Some(bridge::SharingMode::New)
+    } else if options.selected_sessions_only {
+        Some(bridge::SharingMode::Selected)
     } else {
         None
     };
     if let Some(previous) = &existing {
-        if requested.is_some_and(|choice| choice != previous.include_existing) {
+        if requested.is_some_and(|choice| choice != bridge::mode(previous)) {
             return Err(user_error("A saved sharing choice exists. Changing selection requires explicitly replacing its delivery generation."));
         }
     }
-    let include_existing = match existing.as_ref().map(|v| v.include_existing).or(requested) {
+    let sharing_mode = match existing.as_ref().map(bridge::mode).or(requested) {
         Some(choice) => choice,
         None => match choose_import()? {
-            Some(choice) => choice,
+            Some(true) => bridge::SharingMode::All,
+            Some(false) => bridge::SharingMode::New,
             None => {
-                println!("Setup cancelled. No sessions shared.");
+                humanln!("Setup cancelled. No sessions shared.");
                 return Ok(());
             }
         },
     };
+    let include_existing = sharing_mode == bridge::SharingMode::All;
     // The workspace bridge, not this binary, selects the RelayHistory stage and
     // the scope it grants; the shared implementation checks both.
     let session = cloud::workspace_session(
@@ -338,29 +402,34 @@ fn install(options: Install) -> Result<()> {
     }
     std::env::set_var("RELAYHISTORY_HOME", &directory);
     cloud::save_auth(&session)?;
+    if bridge::json_mode() {
+        bridge::emit(
+            serde_json::json!({"event":"connected", "account_id":who.user_id,
+            "workspace_id":workspace, "org_id":org_id, "directory":directory}),
+        );
+    }
     let db_path = directory.join("history.db");
-    println!("Preparing local session capture…");
-    ensure!(
-        ai_hist_engine::sync_local_at(&db_path)?,
-        "capture did not complete"
-    );
-    let conn = ai_hist_core::open_db(&db_path)?;
+    if sharing_mode != bridge::SharingMode::Selected {
+        humanln!("Preparing local session capture…");
+        collector::capture(&directory, &history_url)?;
+    }
+    let conn = relayhistory_plugin::delivery::open_db(&db_path)?;
     let config = match existing {
         Some(mut config) => {
             config.acknowledge_uninspected_schedules = options.acknowledge_uninspected_schedules;
             save_json(&directory.join("config.json"), &config)?;
-            let job = ai_hist_core::delivery::status(&conn, &config.job_id)?;
+            let job = relayhistory_plugin::delivery::status(&conn, &config.job_id)?;
             ensure!(
                 job.config.account_id == account,
                 "invalid saved delivery account"
             );
             if job.state == "blocked" && options.force_login {
-                ai_hist_core::delivery::retry_job(&conn, &config.job_id)?;
+                relayhistory_plugin::delivery::retry_job(&conn, &config.job_id)?;
             }
             config
         }
         None => {
-            let job_config = ai_hist_core::delivery::DeliveryJobConfig {
+            let job_config = relayhistory_plugin::delivery::DeliveryJobConfig {
                 destination_id: "relayhistory".into(),
                 instance_id: "teams-probe".into(),
                 account_id: account.clone(),
@@ -371,7 +440,7 @@ fn install(options: Install) -> Result<()> {
             // A generation outlives an interrupted setup: create_job commits
             // before config.json is written. Adopt that job instead of recording
             // a second baseline behind a generation nothing can reach.
-            let adopted = ai_hist_core::delivery::list_jobs(&conn)?
+            let adopted = relayhistory_plugin::delivery::list_jobs(&conn)?
                 .into_iter()
                 .find(|job| {
                     job.state != "cancelled"
@@ -395,8 +464,22 @@ fn install(options: Install) -> Result<()> {
                 None => {
                     // No generation to inherit a baseline from, so the exclusion
                     // table has to be brought in line with this choice first.
-                    collector::record_baseline(&conn, include_existing)?;
-                    ai_hist_core::delivery::create_job(&conn, &job_config, collector::now())?.job_id
+                    if sharing_mode == bridge::SharingMode::Selected {
+                        relayhistory_plugin::delivery::create_session_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
+                    } else {
+                        collector::record_baseline(&conn, include_existing)?;
+                        relayhistory_plugin::delivery::create_job(
+                            &conn,
+                            &job_config,
+                            collector::now(),
+                        )?
+                        .job_id
+                    }
                 }
             };
             let config = Config {
@@ -409,6 +492,7 @@ fn install(options: Install) -> Result<()> {
                 delivery_account: account,
                 job_id,
                 include_existing,
+                sharing_mode: Some(sharing_mode),
                 acknowledge_uninspected_schedules: options.acknowledge_uninspected_schedules,
             };
             save_json(&directory.join("config.json"), &config)?;
@@ -416,9 +500,14 @@ fn install(options: Install) -> Result<()> {
         }
     };
     drop(conn);
-    collector::cycle(&directory, &config)?;
+    bridge::enforce_selection(&directory, &config)?;
+    // Desktop setup becomes ready after capture/credentials; the supervised
+    // collector handles delivery and offline retries without blocking login.
+    if options.once || !bridge::json_mode() {
+        collector::finish_setup(&directory, &config, options.once)?;
+    }
     if options.once {
-        println!("One capture/delivery cycle completed.");
+        humanln!("One capture/delivery cycle completed.");
         return Ok(());
     }
     drop(guard);
@@ -428,7 +517,11 @@ fn install(options: Install) -> Result<()> {
             &format!("{}-{}", std::process::id(), collector::now()),
         )
     } else {
-        collector::start_background(&directory)
+        collector::start_background(&directory)?;
+        if bridge::json_mode() {
+            bridge::emit(serde_json::json!({"event":"ready", "running":true}));
+        }
+        Ok(())
     }
 }
 
@@ -446,6 +539,34 @@ mod tests {
         ])
         .is_err());
     }
+    #[test]
+    fn json_setup_reports_specific_safe_validation_errors() {
+        for (extra, expected) in [
+            (vec!["--once", "--include-existing"], "background mode"),
+            (
+                vec!["--foreground", "--selected-sessions-only"],
+                "background mode",
+            ),
+            (vec![], "explicit sharing choice"),
+        ] {
+            let cli =
+                Cli::try_parse_from([vec!["probe", "cloud", "install", "--json"], extra].concat())
+                    .unwrap();
+            let Commands::Cloud {
+                command: CloudCommands::Install(options),
+            } = cli.command
+            else {
+                panic!("install expected")
+            };
+            let error = validate_setup_mode(&options, cli.json).unwrap_err();
+            assert!(error
+                .downcast_ref::<UserError>()
+                .unwrap()
+                .to_string()
+                .contains(expected));
+        }
+    }
+
     #[test]
     fn stop_requests_only_match_their_run_identity() {
         let directory = tempfile::tempdir().unwrap();

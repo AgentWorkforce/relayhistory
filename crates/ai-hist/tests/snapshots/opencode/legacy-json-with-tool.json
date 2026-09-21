@@ -1,0 +1,193 @@
+{
+  "corpus_files": [
+    "opencode/legacy-json-with-tool"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/src/b.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "msg_tool_asst",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "structured_patch_json": null,
+      "tool_name": "edit",
+      "tool_use_id": "toolu_edit_1",
+      "ts_ms": 1776988812000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "opencode/legacy-json-with-tool",
+  "history": [],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "OpencodeLegacyJson",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "legacy layout with a `tool` part and its completed state",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:toolu_bash_1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "file listing",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:toolu_edit_1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "edited",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:toolu_read_1",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "...",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:toolu_bash_1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "bash ls -la",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:toolu_edit_1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "edit /src/b.ts",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:toolu_read_1",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_tool_asst",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_tool_user",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "text": "read /src/a.ts",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":20000},\"input\":6,\"output\":100,\"reasoning\":0}",
+      "ts_ms": 1776988812000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776988810000,
+      "first_prompt": null,
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776988813000,
+      "last_assistant_text": null,
+      "models_json": "[\"anthropic/claude-opus-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/storage/session/global/ses_tool.json",
+      "repo_url": null,
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "source_stamp": "1965:8:<n>:38641bf7d96c5c2b",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "opencode",
+  "tool_calls": [
+    {
+      "args_json": "{\"command\":\"ls -la\"}",
+      "is_error": 0,
+      "message_id": "msg_tool_asst",
+      "name": "bash",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "target": "ls -la",
+      "tool_use_id": "toolu_bash_1",
+      "ts_ms": 1776988812000
+    },
+    {
+      "args_json": "{\"filePath\":\"/src/b.ts\",\"newString\":\"b\",\"oldString\":\"a\"}",
+      "is_error": 0,
+      "message_id": "msg_tool_asst",
+      "name": "edit",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "target": "/src/b.ts",
+      "tool_use_id": "toolu_edit_1",
+      "ts_ms": 1776988812000
+    },
+    {
+      "args_json": "{\"filePath\":\"/src/a.ts\"}",
+      "is_error": 0,
+      "message_id": "msg_tool_asst",
+      "name": "read",
+      "session_id": "ses_tool",
+      "source": "opencode",
+      "target": "/src/a.ts",
+      "tool_use_id": "toolu_read_1",
+      "ts_ms": 1776988812000
+    }
+  ]
+}

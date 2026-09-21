@@ -4,7 +4,7 @@ Install `ai-hist` for local history. Install and explicitly configure a source
 or destination plugin to connect it to a cloud service. Neither login nor package
 installation automatically adds sources or starts uploads.
 
-For dependable delivery to RelayHistory, install `@agent-relay/relayhistory`,
+For dependable delivery to RelayHistory, install `@relayhistory/capture`,
 create a plugin config and selection, then enable and run a durable job:
 
 ```sh
@@ -19,7 +19,7 @@ plugin, and [NDJSON export](history-delivery.md#export-a-snapshot) can feed your
 own program.
 
 Existing `enableCloud()` and `pushCloud()` integrations move their imports from
-`ai-hist` or `ai-hist/cloud` to `@agent-relay/relayhistory`. The optional
+`ai-hist` or `ai-hist/cloud` to `@relayhistory/capture`. The optional
 `relayhistory-plugin enable-cloud --once` command retains legacy push behavior;
 it does not use the new durable delivery protocol.
 

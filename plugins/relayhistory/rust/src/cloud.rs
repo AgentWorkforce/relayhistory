@@ -142,7 +142,7 @@ fn authority_is_loopback(rest: &str) -> bool {
 }
 
 fn stage_key(base_url: &str) -> Result<String> {
-    Ok(ai_hist_core::prompt_hash(&normalized_stage(base_url)?))
+    Ok(ai_hist::prompt_hash(&normalized_stage(base_url)?))
 }
 
 fn stage_dir() -> PathBuf {
@@ -359,6 +359,51 @@ pub fn access_token(base_url: Option<&str>) -> Result<String> {
     Ok(auth.access_token)
 }
 
+/// Best-effort renewal for idle progress reporting. Never wait for another
+/// transport's refresh lock, and bound the refresh request including its body.
+/// The rotated credential pair is persisted through the same atomic store.
+pub fn try_progress_access_token(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>> {
+    let Some(mut auth) = load_selected_auth(Some(base_url))? else {
+        return Ok(None);
+    };
+    if !token_has_valid_lifetime(&auth) {
+        let path = refresh_lock_path(base_url)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let _lock = AuthRefreshLock { _file: file };
+        auth = load_selected_auth(Some(base_url))?.context("progress credentials disappeared")?;
+        if !token_has_valid_lifetime(&auth) {
+            let agent = ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout(timeout)
+                .build();
+            auth = refresh_auth_with_agent(&auth, &agent)
+                .map_err(|_| anyhow::anyhow!("progress credential renewal unavailable"))?;
+            save_auth(&auth)?;
+        }
+    }
+    Ok((token_has_valid_lifetime(&auth)
+        && auth.access_token.starts_with("rth_at_")
+        && auth
+            .access_token
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic()))
+    .then_some(auth.access_token))
+}
+
 fn token_has_valid_lifetime(auth: &StoredAuth) -> bool {
     let expiry = auth
         .access_token_expires_at
@@ -445,10 +490,7 @@ pub fn machine_id() -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let id = format!(
-        "m_{}",
-        ai_hist_core::prompt_hash(&format!("{host}:{nanos}"))
-    );
+    let id = format!("m_{}", ai_hist::prompt_hash(&format!("{host}:{nanos}")));
     write_private(&path, &id)?;
     Ok(id)
 }
@@ -487,7 +529,7 @@ fn hostname() -> String {
 pub fn batch_id(machine: &str, from: &SyncCursor, to: &SyncCursor, count: usize) -> String {
     format!(
         "b_{}",
-        ai_hist_core::prompt_hash(&format!(
+        ai_hist::prompt_hash(&format!(
             "{machine}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{count}",
             from.history_id,
             from.trajectory_rowid,
@@ -868,7 +910,7 @@ impl Ingestor for UreqIngestor {
     }
 }
 
-struct AuthRefreshLock {
+pub(crate) struct AuthRefreshLock {
     _file: fs::File,
 }
 
@@ -882,7 +924,7 @@ fn refresh_lock_path(base_url: &str) -> Result<PathBuf> {
     Ok(auth.with_file_name(name))
 }
 
-fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
+pub(crate) fn acquire_refresh_lock(base_url: &str) -> Result<AuthRefreshLock> {
     let path = refresh_lock_path(base_url)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -985,6 +1027,10 @@ fn refresh_and_save_auth(auth: &StoredAuth) -> Result<StoredAuth> {
 }
 
 fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
+    refresh_auth_with_agent(auth, &ureq::AgentBuilder::new().build())
+}
+
+fn refresh_auth_with_agent(auth: &StoredAuth, agent: &ureq::Agent) -> Result<StoredAuth> {
     require_secure_transport(&auth.base_url)?;
     let refresh_token = auth
         .refresh_token
@@ -994,7 +1040,8 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
         "{}/v1/auth/token/refresh",
         auth.base_url.trim_end_matches('/')
     );
-    let response = ureq::post(&url)
+    let response = agent
+        .post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({ "refreshToken": refresh_token }))
         .map_err(map_http_err)?;
@@ -1007,27 +1054,20 @@ fn refresh_auth(auth: &StoredAuth) -> Result<StoredAuth> {
             .and_then(|v| v.as_str())
             .map(String::from),
         refresh_token: Some(field(&payload, "refreshToken")?),
-        org_id: reported_tenancy(&payload, "orgId").or_else(|| auth.org_id.clone()),
-        workspace_id: reported_tenancy(&payload, "workspaceId")
-            .or_else(|| auth.workspace_id.clone()),
+        // Tenancy is issued by the service with the rotated token. Older
+        // services omit these fields, so preserve the cached values rather
+        // than erasing them during refresh.
+        org_id: nonblank_field(&payload, "orgId").or_else(|| auth.org_id.clone()),
+        workspace_id: nonblank_field(&payload, "workspaceId").or_else(|| auth.workspace_id.clone()),
     })
 }
 
-/// A tenancy field (`orgId`, `workspaceId`) the service reported for this session.
-///
-/// Sessions from `/v1/cli/login` were stored with no org because the service did not
-/// return one, and `recall_auth` refuses a session without an org, so every
-/// `--remote` read came back empty while push kept working. The service now reports
-/// tenancy on login and refresh; adopting it here repairs such a session on its next
-/// routine refresh, without a re-login. The service derives tenancy from the bearer,
-/// so its answer is authoritative for this token. A blank or absent value keeps what
-/// was stored, so an older service can never erase a known org.
-fn reported_tenancy(payload: &serde_json::Value, key: &str) -> Option<String> {
-    payload
+fn nonblank_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
         .get(key)
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
         .map(String::from)
 }
 
@@ -1684,13 +1724,37 @@ pub fn resolve_recall_auth(
     now: i64,
     allow_refresh: bool,
 ) -> Result<StoredAuth> {
-    let auth = load_selected_auth(base_url)?
+    let mut auth = load_selected_auth(base_url)?
         .context("no stored relayhistory session (run `ai-hist login`)")?;
     require_secure_transport(&auth.base_url)?;
     anyhow::ensure!(
         auth.access_token.starts_with("rth_at_"),
         "stored relayhistory session has no rth_at_ access token (run `ai-hist login`)"
     );
+    let needs_tenancy = auth.org_id.as_deref().is_none_or(|id| id.trim().is_empty());
+    // A session created before the service began returning tenancy can still
+    // recover it on refresh. Do this before the provenance check, under the
+    // same lock as every other token rotation, so a concurrent writer cannot
+    // overwrite the newly adopted tenancy with stale auth.
+    if allow_refresh && needs_tenancy {
+        let _refresh_lock = acquire_refresh_lock(&auth.base_url)?;
+        let current = load_auth(Some(&auth.base_url))?.unwrap_or_else(|| auth.clone());
+        let current_has_tenancy = current
+            .org_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        if current_has_tenancy {
+            auth = current;
+        } else if current
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            auth = refresh_and_save_auth(&current)?;
+        } else {
+            auth = current;
+        }
+    }
     let expiry = auth
         .access_token_expires_at
         .as_deref()
@@ -2398,7 +2462,7 @@ pub struct CloudPushOutcome {
 pub fn push_for_sdk(db_path: &std::path::Path, base_url: Option<&str>) -> Result<CloudPushOutcome> {
     let auth =
         load_selected_auth(base_url)?.context("cloud is not enabled; call enableCloud first")?;
-    let (conn, sync_skipped) = ai_hist_engine::prepare_local_sync_snapshot(db_path)?;
+    let (conn, sync_skipped) = ai_hist::prepare_local_sync_snapshot(db_path)?;
     let machine = MachineIdentity {
         id: machine_id()?,
         hostname: machine_hostname(),
@@ -2502,7 +2566,7 @@ pub fn create_share(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history, HistoryEntry};
+    use ai_hist::{init_db, insert_history, HistoryEntry};
     use std::cell::RefCell;
 
     fn mem() -> Connection {
@@ -2524,7 +2588,7 @@ pub(crate) mod tests {
                 session_id: Some(session.into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )
@@ -3328,6 +3392,83 @@ pub(crate) mod tests {
             server.join().unwrap();
             assert_eq!(refreshed.org_id.as_deref(), Some("org_a"));
             assert_eq!(refreshed.workspace_id.as_deref(), Some("ws_a"));
+        });
+    }
+
+    #[test]
+    fn idle_progress_refresh_is_bounded_and_respects_the_rotation_lock() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            save_auth(&StoredAuth {
+                base_url: base_url.clone(),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let lock = acquire_refresh_lock(&base_url).unwrap();
+            let start = std::time::Instant::now();
+            assert!(
+                try_progress_access_token(&base_url, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(start.elapsed() < std::time::Duration::from_millis(100));
+            drop(lock);
+            // The listening socket never responds: the refresh has a hard deadline.
+            let start = std::time::Instant::now();
+            assert!(
+                try_progress_access_token(&base_url, std::time::Duration::from_millis(100))
+                    .is_err()
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn idle_progress_refresh_persists_and_reuses_the_rotated_pair() {
+        with_temp_home(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            save_auth(&StoredAuth {
+                base_url: base_url.clone(),
+                access_token: "rth_at_expired".into(),
+                refresh_token: Some("rth_rt_old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (line, _, _) = read_http_request(&mut stream);
+                assert!(line.starts_with("POST /v1/auth/token/refresh "));
+                write_http_response(&mut stream, "200 OK", &serde_json::json!({
+                    "accessToken": "rth_at_fresh", "refreshToken": "rth_rt_fresh",
+                    "accessTokenExpiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+                }).to_string());
+            });
+            assert_eq!(
+                try_progress_access_token(&base_url, std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .as_deref(),
+                Some("rth_at_fresh")
+            );
+            server.join().unwrap();
+            // The listener is gone; a valid cached credential needs no network call.
+            assert_eq!(
+                try_progress_access_token(&base_url, std::time::Duration::from_secs(1))
+                    .unwrap()
+                    .as_deref(),
+                Some("rth_at_fresh")
+            );
+            assert_eq!(
+                load_selected_auth(Some(&base_url))
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rth_rt_fresh")
+            );
         });
     }
 
@@ -4172,6 +4313,9 @@ pub(crate) mod tests {
                         Err(_) => panic!("device client did not complete expected request"),
                     }
                 };
+                // Accepted sockets inherit nonblocking mode on macOS. The
+                // request reader below intentionally uses blocking reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                     .unwrap();

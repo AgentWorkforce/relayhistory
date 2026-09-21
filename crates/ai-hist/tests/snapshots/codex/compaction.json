@@ -1,0 +1,126 @@
+{
+  "corpus_files": [
+    "codex/compaction.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/compaction",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "start",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "timestamp_ms": 1776654000300
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "keep going",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "timestamp_ms": 1776654004200
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "CodexRollout",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "3:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "3:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "text": "start",
+      "token_json": null,
+      "ts_ms": 1776654000300
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "4:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "4:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "text": "Reading the repository.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":1000,\"input_tokens\":3000,\"output_tokens\":200,\"reasoning_output_tokens\":50,\"total_tokens\":3200}",
+      "ts_ms": 1776654000900
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "11:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "11:user_message",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "text": "keep going",
+      "token_json": null,
+      "ts_ms": 1776654004200
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "12:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "12:agent_message",
+      "model": "gpt-5.4",
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "text": "Continuing after compaction.",
+      "token_json": "{\"cache_write_input_tokens\":0,\"cached_input_tokens\":500,\"input_tokens\":3500,\"output_tokens\":250,\"reasoning_output_tokens\":40,\"total_tokens\":3750}",
+      "ts_ms": 1776654004900
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776654000000,
+      "first_prompt": "start",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776654006000,
+      "last_assistant_text": "Continuing after compaction.",
+      "models_json": "[\"gpt-5.4\"]",
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-compaction.jsonl",
+      "repo_url": null,
+      "session_id": "sess_codex_compact",
+      "source": "codex",
+      "source_stamp": "<n>:2246",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

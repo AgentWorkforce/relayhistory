@@ -1,7 +1,7 @@
+import { createHistoryDelivery, historyDeliveryStatus, controlHistoryDelivery, drainProbeDelivery } from './delivery.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
-  createHistoryDelivery,
   DEFAULT_DELIVERY_LIMITS,
   HistoryDeliveryError,
   InvalidArgumentError,
@@ -435,7 +435,29 @@ export function relayHistorySource(options: RelayHistoryPluginOptions = {}): His
         'relationship',
         'commit_link',
       ] as const;
-      const covered = allowed.filter((kind) => rows.some((row) => row.kind === kind));
+      // Coverage is what this listing actually carried.
+      //
+      // It would be better to declare what the export *examined* -- a covered
+      // kind with no rows then means "this session has none", which is the
+      // distinction the contract exists to carry. But a delivery job exports
+      // only the kinds in its configured selection, so an absent kind here
+      // means either that or "no job ever exported it", and this listing
+      // cannot tell them apart: the records come from the cloud's
+      // `/v1/delivery/records`, while the selections belong to jobs that may
+      // have run on other machines entirely. Deriving coverage from the
+      // contributing selections needs that metadata on the read response,
+      // which is a server-side change, not one this plugin can make.
+      //
+      // Until then, row presence is the honest answer available. It
+      // understates a sparse session -- one with no file edits reports
+      // `partial` -- and understating is the side to be wrong on: claiming a
+      // kind nobody exported is the "well-formed answer computed over nothing"
+      // this contract removes.
+      const delivered = new Set(rows.map((row) => row.kind));
+      const covered = allowed.filter(
+        (kind) =>
+          delivered.has(kind) && (kind !== 'relationship' || context.includeRelated !== false),
+      );
       const records = canonicalDeliveredEvidence(rows)
         .filter(
           (row) =>
@@ -540,6 +562,23 @@ export function createHistoryPlugin(options: RelayHistoryPluginOptions = {}): Hi
         }),
       },
       {
+        name: 'relayhistory-delivery',
+        run: async (args) => {
+          const f = flags(args);
+          const selected = { ...options, dbPath: typeof f.db === 'string' ? f.db : undefined };
+          const job = typeof f.job === 'string' ? f.job : undefined;
+          const action = f.action ?? 'status';
+          if (action === 'status') return historyDeliveryStatus(job, selected);
+          if (action === 'drain') return drainProbeDelivery({ ...selected,
+            instanceId: relayHistoryInstance(selected), expectedAccount: await deliveryAccount(selected),
+            jobIds: job ? [job] : undefined,
+          });
+          if (!job || !['pause', 'resume', 'retry', 'cancel'].includes(String(action)))
+            throw new InvalidArgumentError('--job and a valid --action are required', 'INVALID_ARGUMENT');
+          return controlHistoryDelivery(job, action as 'pause' | 'resume' | 'retry' | 'cancel', selected);
+        },
+      },
+      {
         name: 'relayhistory-enable',
         run: async (args) => {
           const f = flags(args);
@@ -565,7 +604,7 @@ export function createHistoryPlugin(options: RelayHistoryPluginOptions = {}): Hi
               selection,
               limits: DEFAULT_DELIVERY_LIMITS,
             },
-            { dbPath: typeof f.db === 'string' ? f.db : undefined },
+            { ...selected, dbPath: typeof f.db === 'string' ? f.db : undefined },
           );
         },
       },

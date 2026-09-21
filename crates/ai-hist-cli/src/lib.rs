@@ -1,10 +1,10 @@
-use ai_hist_core::{
+use ai_hist::{
     default_db_path, import_json, insert_history, normalize_tag_name, open_db, open_db_readonly,
     prompt_hash, recent, resume_command, schema_is_current, search, session, session_events,
-    session_file_edits, session_tool_calls, untag_session, HistoryEntry, QueryFilter,
-    SOURCE_CHOICES,
+    session_file_edits, session_tool_calls, untag_session, HistoryEntry, ProjectGrouping,
+    QueryFilter, SOURCE_CHOICES,
 };
-pub use ai_hist_core::{SessionLocation, SessionScope};
+pub use ai_hist::{SessionLocation, SessionScope};
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
@@ -16,13 +16,13 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
 
-use ai_hist_engine::diagnostics::{doctor_report, human_bytes, DoctorReport};
-use ai_hist_engine::git_helpers::*;
-use ai_hist_engine::history_search::{search_all, SearchRole, SearchRow};
-use ai_hist_engine::paths::{default_opencode_db_path, home_dir};
-use ai_hist_engine::{discover, remote, *};
+use ai_hist::diagnostics::{doctor_report, human_bytes, DoctorReport};
+use ai_hist::git_helpers::*;
+use ai_hist::history_search::{search_all, SearchRole, SearchRow};
+use ai_hist::paths::{default_opencode_db_path, home_dir};
+use ai_hist::{discover, remote, *};
 mod learn;
 #[derive(Args, Debug, Clone, Copy, Default)]
 #[group(id = "session_scope", multiple = false)]
@@ -168,6 +168,11 @@ enum Command {
         scope: SessionScopeArgs,
         #[arg(long)]
         tag: Option<String>,
+        /// Group `top_projects` by the raw working directory instead of the
+        /// canonical project key. The default merges two checkouts of one
+        /// repository; this restores the pre-#175 per-directory grouping.
+        #[arg(long)]
+        by_cwd: bool,
         #[arg(long)]
         json: bool,
     },
@@ -235,11 +240,40 @@ enum Command {
         interval: u64,
     },
     /// Repeatedly sync agent history using the requested configured connectors.
+    ///
+    /// Wakes on filesystem events under the providers' session roots, with a
+    /// slow poll as a backstop. Falls back to pure polling at `--interval`
+    /// when no root can be watched.
     Watch {
         #[command(flatten)]
         scope: SessionScopeArgs,
+        /// Seconds between polls. Used as the only cadence when filesystem
+        /// events are unavailable or disabled.
         #[arg(long, default_value_t = 60)]
         interval: u64,
+        /// Poll only. Use on filesystems where change notifications are
+        /// unreliable (network mounts, some container filesystems).
+        #[arg(long)]
+        no_fsevents: bool,
+        /// Milliseconds of filesystem events to collapse into one sweep.
+        #[arg(long, default_value_t = ai_hist::watch::DEFAULT_DEBOUNCE_MS)]
+        debounce_ms: u64,
+    },
+    /// Ingest one agent session from a lifecycle hook payload on stdin.
+    ///
+    /// Reads the harness's hook JSON (`session_id`, `transcript_path`, …) and
+    /// hydrates exactly that transcript. Always exits 0: a hook that fails
+    /// would fail the tool call the agent is in the middle of.
+    Ingest {
+        /// Harness whose hook payload is on stdin. Only `claude` today.
+        #[arg(long, value_name = "HARNESS")]
+        hook: String,
+        /// Say nothing at all, on any stream. Wins over --json.
+        #[arg(long)]
+        quiet: bool,
+        /// Print the ingest report as JSON on stdout. Ignored under --quiet.
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose database health: size, WAL, free space, and who holds the write lock.
     Doctor {
@@ -329,6 +363,12 @@ enum SessionsAction {
         /// Restrict to a source (repeatable). Defaults to every discoverable source.
         #[arg(long)]
         source: Vec<String>,
+        /// Restrict to one canonical project key, as `project_key` reports it:
+        /// `host/owner/repo` (for example `github.com/AgentWorkforce/relayhistory`),
+        /// or the working directory for a checkout with no git remote. Exact
+        /// match — this is the key, not a path or a search term.
+        #[arg(long)]
+        project: Option<String>,
         /// Maximum rows (default 50). Must not be negative.
         #[arg(long)]
         limit: Option<i64>,
@@ -556,11 +596,28 @@ pub fn run() -> Result<()> {
             )
             .map(|_| ());
         }
-        Command::Watch { scope, interval } => {
+        Command::Watch {
+            scope,
+            interval,
+            no_fsevents,
+            debounce_ms,
+        } => {
             if scope.resolve() == SessionScope::Remote {
                 remote::ensure_selected_remote_connectors_configured_for("sync", &[], &connectors)?;
             }
-            return watch_loop_with_connectors(&db_path, *interval, scope.resolve(), &connectors);
+            return watch_loop_with_connectors(
+                &db_path,
+                *interval,
+                scope.resolve(),
+                &connectors,
+                WatchDrivers {
+                    use_fs_events: !*no_fsevents,
+                    debounce_ms: *debounce_ms,
+                },
+            );
+        }
+        Command::Ingest { hook, quiet, json } => {
+            return run_hook_ingest(&db_path, hook, *quiet, *json);
         }
         Command::Sessions {
             action: SessionsAction::Discover { scope, source, .. },
@@ -719,8 +776,18 @@ pub fn run() -> Result<()> {
                 json,
             )
         }
-        Command::Stats { scope, tag, json } => {
-            print_stats(&conn, scope.resolve(), tag.as_deref(), json)
+        Command::Stats {
+            scope,
+            tag,
+            by_cwd,
+            json,
+        } => {
+            let grouping = if by_cwd {
+                ProjectGrouping::Cwd
+            } else {
+                ProjectGrouping::ProjectKey
+            };
+            print_stats(&conn, scope.resolve(), tag.as_deref(), grouping, json)
         }
         Command::Tag {
             session_id,
@@ -833,7 +900,10 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::SyncOpencode { .. } | Command::Sync { .. } | Command::Watch { .. } => {
+        Command::SyncOpencode { .. }
+        | Command::Sync { .. }
+        | Command::Watch { .. }
+        | Command::Ingest { .. } => {
             unreachable!("sync commands are handled before opening the shared database")
         }
         Command::Export {
@@ -975,6 +1045,7 @@ pub fn run() -> Result<()> {
             SessionsAction::List {
                 scope,
                 source,
+                project,
                 limit,
                 before_ms,
                 after_source,
@@ -1009,6 +1080,7 @@ pub fn run() -> Result<()> {
                         limit,
                         before_ms,
                         after,
+                        project_key: project,
                     },
                 )?;
                 print_session_catalog(&page, json)
@@ -1311,9 +1383,9 @@ fn fmt_search_row(row: &SearchRow) -> String {
 
 fn print_session_events(
     session_id: &str,
-    events: Vec<ai_hist_core::SessionEvent>,
-    tool_calls: Vec<ai_hist_core::SessionToolCall>,
-    file_edits: Vec<ai_hist_core::SessionFileEdit>,
+    events: Vec<ai_hist::SessionEvent>,
+    tool_calls: Vec<ai_hist::SessionToolCall>,
+    file_edits: Vec<ai_hist::SessionFileEdit>,
     width: usize,
     json: bool,
 ) -> Result<()> {
@@ -1323,9 +1395,9 @@ fn print_session_events(
         // references and serializing at write time keeps peak memory at the
         // fetched rows themselves, not a second serialized copy.
         enum ReplayRecord<'a> {
-            Event(&'a ai_hist_core::SessionEvent),
-            ToolCall(&'a ai_hist_core::SessionToolCall),
-            FileEdit(&'a ai_hist_core::SessionFileEdit),
+            Event(&'a ai_hist::SessionEvent),
+            ToolCall(&'a ai_hist::SessionToolCall),
+            FileEdit(&'a ai_hist::SessionFileEdit),
         }
         let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
         for event in &events {
@@ -1607,6 +1679,7 @@ fn print_stats(
     conn: &Connection,
     scope: SessionScope,
     tag: Option<&str>,
+    grouping: ProjectGrouping,
     as_json: bool,
 ) -> Result<()> {
     let tag_norm = tag.map(normalize_tag_name);
@@ -1632,10 +1705,14 @@ fn print_stats(
         .iter()
         .cloned()
         .collect::<serde_json::Map<_, _>>();
-    let project_where = format!("{where_sql} AND project IS NOT NULL");
+    let project_key = grouping.expression();
+    let project_where = format!("{where_sql} AND {project_key} IS NOT NULL");
     let top_projects = query_pairs(
         conn,
-        &format!("SELECT project, COUNT(*) FROM history h {project_where} GROUP BY project ORDER BY COUNT(*) DESC LIMIT 10"),
+        &format!(
+            "SELECT {project_key}, COUNT(*) FROM history h {project_where} \
+             GROUP BY {project_key} ORDER BY COUNT(*) DESC LIMIT 10"
+        ),
         &params_vec,
     )?
     .into_iter()
@@ -1653,6 +1730,10 @@ fn print_stats(
                 "total": total,
                 "by_source": by_source,
                 "top_projects": top_projects,
+                // Which key `top_projects` is bucketed by. A consumer that
+                // reads counts without reading this cannot tell a canonical
+                // repository rollup from a per-directory one.
+                "grouped_by": grouping.as_str(),
                 "first_timestamp_ms": first,
                 "last_timestamp_ms": last,
                 "tag": tag_norm,
@@ -1681,7 +1762,7 @@ fn print_stats(
         println!("\nDate range:");
         println!("  {} to {}", format_date(first), format_date(last));
     }
-    println!("\nTop 10 projects:");
+    println!("\nTop 10 projects (by {}):", grouping.as_str());
     for item in top_projects {
         println!(
             "  {:>6}  {}",
@@ -1885,7 +1966,7 @@ fn export_history(
         );
         let _ = fs::remove_file(dest);
         let dst = Connection::open(dest)?;
-        ai_hist_core::init_db(&dst)?;
+        ai_hist::init_db(&dst)?;
         let mut inserted = 0;
         for entry in &rows {
             inserted += insert_history(&dst, entry)?;
@@ -2053,12 +2134,25 @@ fn doctor(db_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// How `watch` should be driven. Both knobs exist because filesystem change
+/// notifications are not uniformly trustworthy: `--no-fsevents` is the escape
+/// hatch for a filesystem that lies, and the debounce window is how long a
+/// burst of events is allowed to collapse for.
+struct WatchDrivers {
+    use_fs_events: bool,
+    debounce_ms: u64,
+}
+
 fn watch_loop(db_path: &Path, interval: u64, scope: SessionScope) -> Result<()> {
     watch_loop_with_connectors(
         db_path,
         interval,
         scope,
         &remote::SourceConnectorSelection::default(),
+        WatchDrivers {
+            use_fs_events: true,
+            debounce_ms: ai_hist::watch::DEFAULT_DEBOUNCE_MS,
+        },
     )
 }
 
@@ -2067,15 +2161,179 @@ fn watch_loop_with_connectors(
     interval: u64,
     scope: SessionScope,
     connectors: &remote::SourceConnectorSelection,
+    drivers: WatchDrivers,
 ) -> Result<()> {
-    println!("Watching every {interval}s (Ctrl-C to stop)...");
-    loop {
-        match sync_scoped_at_with_output(db_path, scope, connectors, SyncOutput::Progress) {
-            Ok(_) => {}
-            Err(err) => eprintln!("Error: {err:#}"),
-        }
-        std::thread::sleep(Duration::from_secs(interval));
+    let roots = watch_roots_for_scope(scope);
+    let remote_only = scope == SessionScope::Remote;
+    let db = db_path.to_path_buf();
+    let connectors = connectors.clone();
+    let tick: ai_hist::watch::TickFn = Arc::new(move |force| {
+        let tick = sync_tick_at(&db, scope, &connectors, SyncOutput::Progress, force)?;
+        Ok(ai_hist::watch::TickOutcome::from(tick))
+    });
+    let mut watch = ai_hist::watch::WatchLoop::new(tick)
+        .with_roots(roots)
+        .with_fs_events(drivers.use_fs_events)
+        .with_debounce_ms(drivers.debounce_ms)
+        .with_poll_interval_ms(interval.saturating_mul(1000))
+        .with_immediate(true)
+        .on_error(Arc::new(|error| eprintln!("Error: {error:#}")))
+        .on_driver(Arc::new(move |status| {
+            match status.driver {
+                ai_hist::watch::WatchDriver::FsEvents => println!(
+                    "Watching {} session root(s) for changes (debounce {}ms, {}s backstop; Ctrl-C to stop)...",
+                    status.watched.len(),
+                    drivers.debounce_ms,
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000
+                ),
+                ai_hist::watch::WatchDriver::Polling if remote_only => println!(
+                    "Watching remote connectors every {interval}s (Ctrl-C to stop)..."
+                ),
+                ai_hist::watch::WatchDriver::Polling => {
+                    println!("Watching every {interval}s (Ctrl-C to stop)...")
+                }
+            }
+            // Saying which roots are uncovered is the difference between "live
+            // capture is on" and "live capture is on for the providers that
+            // were installed when you started it".
+            if !status.pending.is_empty() {
+                println!(
+                    "  not watched yet (retried every {}s): {}",
+                    ai_hist::watch::DEFAULT_SLOW_POLL_MS / 1000,
+                    status
+                        .pending
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }));
+    if !remote_only {
+        // A project that grows a `.trajectories` directory after the run
+        // started is a root whose name could not have been known at startup,
+        // so the pending-retry path alone would never reach it.
+        watch = watch.with_roots_refresh(Arc::new(|| watch_roots_for_scope(SessionScope::Local)));
     }
+    watch.run().map(|_| ())
+}
+
+/// The roots watch installs for a scope.
+///
+/// A remote-scoped watch installs none. Local provider roots would otherwise
+/// select the filesystem-event driver, and every local Claude or Codex write —
+/// which a remote-only run is not collecting at all — would fire the remote
+/// connectors, plus the 30s backstop on top. The user asked for remote at
+/// `--interval`; that is what they get.
+fn watch_roots_for_scope(scope: SessionScope) -> Vec<ai_hist::discover::WatchRoot> {
+    if scope == SessionScope::Remote {
+        return Vec::new();
+    }
+    sync_watch_roots(&home_dir(), &default_opencode_db_path())
+}
+
+/// `ingest --hook <harness>`: read one lifecycle-hook payload from stdin and
+/// ingest the transcript it names.
+///
+/// Never returns `Err`. A hook runs inside the agent's tool call, and a
+/// non-zero exit there is a failed tool call — so a missing transcript, an
+/// unparseable payload, or a locked database are all reported and shrugged off.
+/// `--quiet` silences the reporting, not the shrug.
+fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Result<()> {
+    let note = |message: String| {
+        if !quiet {
+            eprintln!("ai-hist ingest: {message}");
+        }
+    };
+    if !ai_hist::HOOK_HARNESSES.contains(&hook) {
+        note(format!(
+            "unsupported hook harness '{hook}'; known: {}",
+            ai_hist::HOOK_HARNESSES.join(", ")
+        ));
+        return Ok(());
+    }
+    let mut payload = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut payload) {
+        note(format!("could not read the hook payload: {error}"));
+        return Ok(());
+    }
+    if payload.trim().is_empty() {
+        note("empty hook payload; nothing to do".into());
+        return Ok(());
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            note(format!("hook payload is not JSON: {error}"));
+            return Ok(());
+        }
+    };
+    // Mirrors the harness contract: a payload with no `session_id` is not a
+    // session lifecycle event we can attribute, so it is ignored rather than
+    // guessed at.
+    let Some(session_id) = parsed
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        note("hook payload has no session_id; ignoring".into());
+        return Ok(());
+    };
+    let transcript = parsed
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+
+    let outcome = match &transcript {
+        // Some hook events elide `transcript_path`. Falling back to a forced
+        // sweep still makes progress rather than dropping the event: forced,
+        // because the hook fired precisely because something just changed.
+        None => {
+            note("hook payload has no transcript_path; running a full sweep".into());
+            sync_tick_at(
+                db_path,
+                SessionScope::Local,
+                &remote::SourceConnectorSelection::default(),
+                SyncOutput::Silent,
+                true,
+            )
+            .map(|tick| {
+                serde_json::json!({
+                    "source": hook,
+                    "status": if tick.swept { "swept" } else { "skipped" },
+                })
+            })
+        }
+        // The payload names both the session and the file. Passing the
+        // session through is what lets the ingest refuse a pairing the two
+        // disagree about, rather than hydrating whatever the file turns out
+        // to be.
+        Some(path) => ai_hist::ingest_transcript_at(db_path, hook, path, Some(session_id), true)
+            .and_then(|report| Ok(serde_json::to_value(&report)?)),
+    };
+    match outcome {
+        Ok(report) => {
+            // `--quiet` outranks `--json`. A hook's contract is "exit 0, say
+            // nothing"; a caller passing both asked for silence and for a
+            // shape to parse if anything *is* said, and silence is the
+            // stronger of the two. Printing anyway would put JSON on the
+            // stdout of a hook that was told to stay out of the way.
+            match (quiet, json) {
+                (true, _) => {}
+                (false, true) => println!("{report}"),
+                (false, false) => {
+                    let status = report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("done");
+                    eprintln!("ai-hist ingest: {hook} {status}");
+                }
+            }
+        }
+        Err(error) => note(format!("{error:#}")),
+    }
+    Ok(())
 }
 
 /// A background service managed by ai-hist. Both the local `sync` job and the
@@ -2127,6 +2385,64 @@ fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
     command
 }
 
+const PROVIDER_ENV_VARS: [&str; 4] = [
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "OPENCODE_DB",
+];
+
+fn scheduler_environment_value(name: &str, value: std::ffi::OsString) -> Result<Option<String>> {
+    let value = value.into_string().map_err(|_| {
+        anyhow::anyhow!(
+            "cannot install sync service: {name} contains non-UTF-8 bytes; use a UTF-8 provider path"
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.contains(['\n', '\r']) {
+        anyhow::bail!(
+            "cannot install sync service: {name} contains a newline, which scheduler files cannot represent safely"
+        );
+    }
+    Ok(Some(value))
+}
+
+fn service_provider_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
+    if spec.subcommand != "sync" {
+        return Ok(Vec::new());
+    }
+    let mut environment = Vec::new();
+    for name in PROVIDER_ENV_VARS {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        if let Some(value) = scheduler_environment_value(name, value)? {
+            environment.push((name, value));
+        }
+    }
+    Ok(environment)
+}
+
+fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
+    if environment.is_empty() {
+        return String::new();
+    }
+    let entries = environment
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>",
+                xml_escape(name),
+                xml_escape(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}\n    </dict>\n")
+}
+
 fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
     let bin = service_binary()?;
     let bin = bin.to_string_lossy();
@@ -2148,6 +2464,12 @@ fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -
 /// the binary path don't break the scheduled command.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote one shell word and then protect `%` from cron's command-to-stdin
+/// splitting. The added backslash is consumed by cron before the shell sees it.
+fn cron_shell_word(s: &str) -> String {
+    shell_single_quote(s).replace('%', "\\%")
 }
 
 /// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
@@ -2211,6 +2533,8 @@ fn install_launchd_service(
         .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    let environment = service_provider_environment(spec)?;
+    let environment_xml = launchd_environment_xml(&environment);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2223,7 +2547,7 @@ fn install_launchd_service(
         <string>{bin}</string>
 {command_args}
     </array>
-    <key>StartInterval</key>
+{environment_xml}    <key>StartInterval</key>
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <true/>
@@ -2237,6 +2561,7 @@ fn install_launchd_service(
         label = spec.label,
         bin = xml_escape(bin),
         command_args = command_args,
+        environment_xml = environment_xml,
         interval = interval,
         log_stem = spec.log_stem,
     );
@@ -2308,11 +2633,15 @@ fn install_cron_service(
         );
     }
     let marker = cron_marker(spec);
-    let command = std::iter::once(shell_single_quote(bin))
+    let environment = service_provider_environment(spec)?;
+    let command = environment
+        .iter()
+        .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
+        .chain(std::iter::once(cron_shell_word(bin)))
         .chain(
             service_command_args(spec, args)
                 .iter()
-                .map(|arg| shell_single_quote(arg)),
+                .map(|arg| cron_shell_word(arg)),
         )
         .collect::<Vec<_>>()
         .join(" ");
@@ -2522,7 +2851,7 @@ fn link_git_commit(
             Err(_) => {}
         }
     }
-    ai_hist_core::mark_session_presence(
+    ai_hist::mark_session_presence(
         conn,
         &candidate.source,
         &candidate.session_id,
@@ -2888,7 +3217,7 @@ fn tag_session_with_count(
     source: Option<&str>,
     color: Option<&str>,
 ) -> Result<(Vec<serde_json::Value>, usize)> {
-    let sessions = ai_hist_core::matching_sessions(conn, session_id, source)?;
+    let sessions = ai_hist::matching_sessions(conn, session_id, source)?;
     if sessions.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -3071,10 +3400,29 @@ fn format_datetime(ts_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history, open_db, prompt_hash, HistoryEntry};
+    use ai_hist::{init_db, insert_history, open_db, prompt_hash, HistoryEntry};
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::fs;
+
+    /// A remote-scoped watch must install no local roots. If it did, the
+    /// filesystem-event driver would be selected by local writes the run is
+    /// not even collecting, and every one of them would fire the remote
+    /// connectors — plus the 30s backstop, instead of the requested interval.
+    #[test]
+    fn a_remote_watch_installs_no_local_roots() {
+        assert!(
+            watch_roots_for_scope(SessionScope::Remote).is_empty(),
+            "remote scope must not watch local provider roots"
+        );
+        for scope in [SessionScope::Local, SessionScope::All] {
+            assert!(
+                !watch_roots_for_scope(scope).is_empty(),
+                "{scope:?} must still watch local provider roots"
+            );
+        }
+    }
+
     #[test]
     fn cron_schedule_maps_intervals_to_step_expressions() {
         assert_eq!(cron_schedule(60).0, "* * * * *");
@@ -3104,6 +3452,7 @@ mod tests {
         assert!(super::is_read_only(&super::Command::Stats {
             scope: super::SessionScopeArgs::default(),
             tag: None,
+            by_cwd: false,
             json: false
         }));
         assert!(super::is_read_only(&super::Command::Show {
@@ -3147,7 +3496,7 @@ mod tests {
         assert!(locations.is_empty());
         assert!(command.is_some());
 
-        ai_hist_core::mark_session_presence(
+        ai_hist::mark_session_presence(
             &conn,
             "codex",
             "cloud-session",
@@ -3158,7 +3507,7 @@ mod tests {
         assert_eq!(locations, vec!["remote"]);
         assert!(command.is_none());
 
-        ai_hist_core::mark_session_presence(
+        ai_hist::mark_session_presence(
             &conn,
             "codex",
             "cloud-session",
@@ -3187,6 +3536,46 @@ mod tests {
             xml_escape("/usr/local/bin/ai-hist"),
             "/usr/local/bin/ai-hist"
         );
+    }
+
+    #[test]
+    fn service_environment_rendering_preserves_relocated_provider_roots() {
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR", "/srv/Claude & tools".to_string()),
+            ("CODEX_HOME", "/srv/codex's 100% \\archive".to_string()),
+        ];
+        let xml = launchd_environment_xml(&environment);
+        assert!(xml.contains("<key>EnvironmentVariables</key>"));
+        assert!(xml.contains("<key>CLAUDE_CONFIG_DIR</key>"));
+        assert!(xml.contains("<string>/srv/Claude &amp; tools</string>"));
+        assert!(xml.contains("<key>CODEX_HOME</key>"));
+
+        let cron = environment
+            .iter()
+            .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            cron,
+            r"CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\''s 100\% \archive'"
+        );
+    }
+
+    #[test]
+    fn scheduler_environment_rejects_line_breaks() {
+        let error =
+            scheduler_environment_value("CODEX_HOME", "/srv/codex\narchive".into()).unwrap_err();
+        assert!(error.to_string().contains("contains a newline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_environment_rejects_non_utf8_paths_without_changing_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(b"/srv/codex-\xff".to_vec());
+        let error = scheduler_environment_value("CODEX_HOME", value).unwrap_err();
+        assert!(error.to_string().contains("contains non-UTF-8 bytes"));
     }
 
     #[test]

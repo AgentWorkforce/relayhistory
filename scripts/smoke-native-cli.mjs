@@ -25,12 +25,19 @@ function run(args) {
 
 function assertEmptyStoreSearch() {
   const result = run(args);
-  assert.equal(result.status, 1, `empty store search must fail closed:\n${result.stderr}${result.stdout}`);
-  assert.deepEqual(JSON.parse(result.stdout), {
+  const diagnostics = `exit=${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+  assert.equal(result.status, 1, `empty store search must fail closed:\n${diagnostics}`);
+  let payload;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch (cause) {
+    throw new Error(`empty store search did not return valid JSON:\n${diagnostics}`, { cause });
+  }
+  assert.deepEqual(payload, {
     status: 'empty',
     indexed_prompts: 0,
     message: 'No searchable local sessions found. Start a coding-agent session, then run ai-hist again.',
-  }, 'Unindexed store must not masquerade as zero matches');
+  }, `Unindexed store must not masquerade as zero matches:\n${diagnostics}`);
   console.log('PASS: ai-hist search on empty store (native addon loaded)');
 }
 

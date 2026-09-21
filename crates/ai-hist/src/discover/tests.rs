@@ -11,7 +11,7 @@
 //! listing performs no file I/O at all.
 
 use super::*;
-use ai_hist_core::{init_db, mark_session_presence, upsert_session_presence};
+use crate::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -26,7 +26,14 @@ fn catalog() -> Connection {
 }
 
 fn env_at<'a>(conn: &'a Connection, home: &Path) -> DiscoveryEnv<'a> {
-    DiscoveryEnv::with_roots(conn, home.to_path_buf(), home.join("opencode.db"))
+    DiscoveryEnv::with_all_roots(
+        conn,
+        home.to_path_buf(),
+        home.join(".claude"),
+        home.join(".codex"),
+        home.join(".grok"),
+        home.join("opencode.db"),
+    )
 }
 
 fn write(path: &Path, contents: &str) {
@@ -158,9 +165,69 @@ fn only(sources: &[&str]) -> DiscoverOptions {
     }
 }
 
+struct PassCountingProvider {
+    pass_starts: AtomicUsize,
+}
+
+impl ShallowSessionProvider for PassCountingProvider {
+    fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
+        self.pass_starts.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn source(&self) -> &'static str {
+        "codex"
+    }
+
+    fn enumerate(
+        &self,
+        _env: &DiscoveryEnv<'_>,
+        _requested_limit: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
+        Ok(Vec::new())
+    }
+
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_provider_is_rejected_before_pass_guards_are_acquired() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = PassCountingProvider {
+        pass_starts: AtomicUsize::new(0),
+    };
+
+    let error = discover_sessions_with_provider_refs(
+        &env,
+        &DiscoverOptions::default(),
+        &[&provider, &provider],
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("duplicate source connector instance"),
+        "{error:#}"
+    );
+    assert_eq!(
+        provider.pass_starts.load(Ordering::Relaxed),
+        0,
+        "validation must finish before any provider pass lock is taken"
+    );
+}
 
 #[test]
 fn every_source_is_either_discoverable_or_explicitly_exempt() {
@@ -794,10 +861,395 @@ fn cursor_reports_mtime_as_last_activity_and_leaves_first_activity_null() {
     let row = found.row("cursor-1");
     assert_eq!(row.first_prompt.as_deref(), Some("fix the flaky test"));
     assert_eq!(row.cwd.as_deref(), Some("/work/app"));
-    // Cursor records no per-message timestamps, so mtime is the only signal
-    // and it is reported as last activity only.
+    // This transcript's turns carry no readable time, so mtime is the only
+    // signal and it is reported as last activity only — never as a first
+    // activity the provider did not record.
     assert_eq!(row.last_activity_ms, Some(1_750_000_400_000));
     assert_eq!(row.first_activity_ms, None);
+    assert!(row.models.is_empty());
+}
+
+/// A turn time that only the head can see still sets the catalog's recency.
+///
+/// Reported by Devin as "head timestamp lost from recency". Past
+/// `HEAD_SCAN_MAX_BYTES` the tail is a separate region, so a transcript whose
+/// one dated human turn is followed by a long run of assistant and tool
+/// records has a tail with no `<timestamp>` in it — only a human turn carries
+/// one. `last_activity_ms` fell straight to the file mtime, so the catalog
+/// reported the session as having last spoken "now", while full ingestion had
+/// those records inheriting the open turn's time. Worse, the discovery upsert
+/// merges `last_activity_ms` with `MAX`, so that mtime would also re-expand a
+/// window a rebuild had just retracted.
+///
+/// Positive control: without the head fallback this failed at
+/// `a head-only turn time must outrank the mtime: left: Some(1750000400000),
+/// right: Some(1789587420000)` — the mtime, not the turn.
+#[test]
+fn cursor_recency_uses_a_turn_time_only_the_head_can_see() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // One dated human turn, then enough assistant prose to push the tail
+    // region past the head budget. The tail therefore holds only assistant
+    // records, none of which carries a tag.
+    let mut body = String::new();
+    body.push_str(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>start</user_query>"}]}}"#,
+    );
+    body.push('\n');
+    let filler = "x".repeat(2048);
+    while body.len() < (super::HEAD_SCAN_MAX_BYTES + super::TAIL_SCAN_MAX_BYTES) as usize * 2 {
+        body.push_str(&format!(
+            r#"{{"role":"assistant","message":{{"content":[{{"type":"text","text":"{filler}"}}]}}}}"#
+        ));
+        body.push('\n');
+    }
+    cursor_session(home.path(), "work-app", "cursor-head-time", &body, 1_750_000_400_000);
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-head-time");
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "a head-only turn time must outrank the mtime"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// The catalog's `first_prompt` and the indexed `history` row are the same
+/// string for a turn Cursor split into several text blocks.
+///
+/// Reported by Devin as "multi-block first prompts stay truncated".
+/// `parse_cursor_text` stopped at the first text block while the event parser
+/// joins them all, so a two-block opening turn was stored whole in `history`
+/// and truncated in the catalog — and hydration does not rewrite
+/// `sessions.first_prompt`, so the short version survived full indexing.
+/// Both now go through `cursor::human_turn_prompt`.
+///
+/// Positive control: with the `break` in `parse_cursor_text` this failed at
+/// `discovery and ingestion must agree on the first prompt:
+/// left: Some("now write the test"), right: Some("now write the
+/// test\n\ninclude the timeout case")`.
+#[test]
+fn cursor_first_prompt_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-split",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>now write the test</user_query>"},{"type":"text","text":"include the timeout case"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-split").first_prompt.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-split",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    let indexed: Option<String> = ingest_conn
+        .query_row(
+            "SELECT prompt FROM history WHERE source = 'cursor' \
+             AND session_id = 'cursor-split' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    assert_eq!(
+        discovered, indexed,
+        "discovery and ingestion must agree on the first prompt"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("now write the test\n\ninclude the timeout case"),
+    );
+}
+
+/// The catalog's activity window comes from human turns, not from an
+/// assistant that quotes a `<timestamp>` tag back.
+///
+/// `cursor_record_time` ran the same unrestricted block scan the event parser
+/// did, so a model explaining the transcript format moved `first_activity_ms`
+/// and `last_activity_ms` and re-sorted the session in the catalog. Both paths
+/// now share `cursor::injected_turn_time`, which reads the tag only out of a
+/// human turn's own text blocks.
+///
+/// Positive control: with the scan unrestricted this failed at
+/// `assistant prose must not move the catalog window: left: Some(1789587660000),
+/// right: Some(1789587420000)` — the quoted instant became the session's last
+/// activity.
+#[test]
+fn cursor_activity_ignores_a_timestamp_quoted_by_the_assistant() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-quoted",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>when was this?</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Cursor writes <timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp> into the turn."}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-quoted");
+    // Both endpoints are the human turn's own time. The mtime is not reached
+    // either: a readable turn time outranks it.
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_587_420_000),
+        "assistant prose must not move the catalog window"
+    );
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+}
+
+/// Discovery's session summary and the one full ingestion writes have to be
+/// the same string, or hydrating a session silently rewrites its summary.
+///
+/// A Cursor assistant record can hold several text blocks — prose, a tool
+/// call, then more prose. Ingestion walks the blocks in order and keeps the
+/// last non-empty one, so discovery must too.
+///
+/// Positive control: with `.find()` in `cursor_assistant_text` this failed
+/// with `discovery and ingestion must agree on the session summary:
+/// left: Some("Let me check the test."), right: Some("Fixed it.")` — the
+/// catalog advertised the opening line and hydration replaced it with the
+/// closing one.
+#[test]
+fn cursor_summary_is_the_same_before_and_after_hydration() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-multi",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>fix it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}},{"type":"text","text":"Fixed it."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-multi").last_assistant_text.clone();
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-multi",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on the session summary"
+    );
+    assert_eq!(
+        discovered.as_deref(),
+        Some("Fixed it."),
+        "the summary is the reply's last word, not its first"
+    );
+}
+
+/// Discovery caps `last_assistant_text` at `EXCERPT_MAX_CHARS`. Ingestion
+/// used to keep the full block, so hydrating a long Cursor reply rewrote the
+/// catalog summary.
+#[test]
+fn cursor_summary_stays_capped_after_ingestion() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let long = "x".repeat(EXCERPT_MAX_CHARS + 80);
+    let transcript = cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-long",
+        &format!(
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"<user_query>go</user_query>\"}}]}}}}\n\
+             {{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let discovered = found.row("cursor-long").last_assistant_text.clone();
+    assert_eq!(
+        discovered.as_ref().map(|text| text.chars().count()),
+        Some(EXCERPT_MAX_CHARS)
+    );
+
+    let ingest_conn = Connection::open_in_memory().unwrap();
+    init_db(&ingest_conn).unwrap();
+    let outcome = crate::ingest::ingest_cursor_transcript(
+        &ingest_conn,
+        &transcript,
+        "cursor-long",
+        Some("/work/app"),
+        1_750_000_400_000,
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    assert_eq!(
+        discovered, outcome.last_assistant_text,
+        "discovery and ingestion must agree on a long session summary"
+    );
+}
+
+#[test]
+fn cursor_reports_the_injected_turn_times_when_the_build_writes_them() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-2",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Reading the test."},{"type":"tool_use","name":"Read","input":{"path":"t.rs"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:41 PM (UTC-4)</timestamp>\n<user_query>now ship it</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = found.row("cursor-2");
+    // The injected tag is a real recorded time, so it is preferred over mtime
+    // at both ends.
+    assert_eq!(row.first_activity_ms, Some(1_789_587_420_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_587_660_000));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+}
+
+/// A catalog row written by the scanner that shipped *before* this change
+/// carries `v3:` and the fields that reader never extracted: no
+/// `first_activity_ms`, no `models`, no `last_assistant_text`. The stamp is
+/// compared before the provider reader is invoked, so if the scanner version
+/// does not move, those rows are served from cache and stay null forever —
+/// the transcript's bytes never change, so nothing else can ever invalidate
+/// them.
+///
+/// Positive control: with `SHALLOW_SCANNER_VERSION` left at 3 this failed at
+/// `a row from the previous scanner must be read again: left: None, right:
+/// Some(1789587420000)` — the upgraded install kept serving the prompt-only
+/// row.
+#[test]
+fn a_cursor_row_from_the_previous_scanner_is_read_again_after_the_upgrade() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-upgrade",
+        concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Wednesday, Sep 16, 2026, 3:37 PM (UTC-4)</timestamp>\n<user_query>fix the flaky test</user_query>"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"model":"claude-4.5-sonnet","content":[{"type":"text","text":"Shipped."},{"type":"turn_ended","status":"success"}]}}"#,
+            "\n"
+        ),
+        1_750_000_400_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(
+        found.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
+
+    // Rewrite the catalog into what the previous scanner left behind: the same
+    // bytes, its own version prefix, and none of the fields this one learned
+    // to extract. The stamp lives in three places and the cache check reads
+    // the observation, so all three move together.
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'cursor' \
+             AND session_id = 'cursor-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1
+        .to_string();
+    let previous = format!("v3:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, first_activity_ms = NULL, \
+         last_assistant_text = NULL WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'cursor' \
+         AND session_id = 'cursor-upgrade'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["cursor"]));
+    let row = upgraded.row("cursor-upgrade");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_587_420_000),
+        "a row from the previous scanner must be read again"
+    );
+    assert_eq!(row.last_assistant_text.as_deref(), Some("Shipped."));
+    assert_eq!(row.models, vec!["claude-4.5-sonnet".to_string()]);
+    assert_eq!(
+        upgraded.summary.counters.shallow_reads, 1,
+        "the re-read is the point: the row must not have come from cache"
+    );
+
+    // Control: the bump costs exactly one re-read. The pass after it is
+    // cached again, so this is a one-time migration and not a permanent
+    // rescan of every unchanged transcript.
+    let settled = discover(&conn, home.path(), &only(&["cursor"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+    assert_eq!(
+        settled.row("cursor-upgrade").first_activity_ms,
+        Some(1_789_587_420_000)
+    );
 }
 
 #[test]
@@ -863,6 +1315,259 @@ fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
     );
 }
 
+/// `summary.json` says when the session was opened and last touched;
+/// `updates.jsonl` says when it actually did things. The stream wins, and a
+/// session restored from a checkpoint — whose `created_at` predates its own
+/// first event — is the case that makes the difference visible.
+#[test]
+fn grok_activity_comes_from_the_update_stream_when_there_is_one() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-stream",
+        r#"{"info":{"id":"grok-stream","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:30:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-stream/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789560138,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","totalTokens":9210},"_meta":{"agentTimestampMs":1789560138000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-stream");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_560_138_000));
+}
+
+/// Grok compaction can drop earlier and later stream records. Discovery
+/// assigns the current snapshot's bounds rather than merging them with MIN/MAX,
+/// which would keep activity the files no longer contain.
+#[test]
+fn grok_discovery_replaces_activity_bounds_after_compaction() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-compact",
+        r#"{"info":{"id":"grok-compact","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T11:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"go\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-compact/updates.jsonl");
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789560000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789560000000}}}"#,
+            "\n",
+            r#"{"timestamp":1789563600,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789563600000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_500_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(row.first_activity_ms, Some(1_789_560_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_789_563_600_000));
+
+    write(
+        &updates,
+        concat!(
+            r#"{"timestamp":1789561800,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1789561800000}}}"#,
+            "\n",
+            r#"{"timestamp":1789562700,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed"},"_meta":{"agentTimestampMs":1789562700000}}}"#,
+            "\n"
+        ),
+    );
+    set_mtime(&updates, 1_750_000_600_000);
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    let row = found.row("grok-compact");
+    assert_eq!(
+        row.first_activity_ms,
+        Some(1_789_561_800_000),
+        "compaction moved the start later; the catalog has to follow"
+    );
+    assert_eq!(
+        row.last_activity_ms,
+        Some(1_789_562_700_000),
+        "compaction moved the end earlier; MIN/MAX merge would have kept 11:00"
+    );
+}
+
+/// An unreadable `summary.json` fails the shallow read instead of naming the
+/// session from its folder. A sibling with a valid summary still catalogs.
+#[cfg(unix)]
+#[test]
+fn grok_discovery_fails_an_unreadable_summary_rather_than_naming_the_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-ok",
+        r#"{"info":{"id":"grok-ok","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ok\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-blocked",
+        r#"{"info":{"id":"grok-blocked","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"secret\"}\n",
+        1_750_000_500_000,
+    );
+    let summary = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-blocked/summary.json");
+    // A file the walk can stat but cannot read: the stamp still covers it, so
+    // the candidate reaches the shallow reader instead of being skipped, and
+    // the identity sidecar is the one that must fail closed.
+    let mut permissions = fs::metadata(&summary).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&summary, permissions.clone()).unwrap();
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    permissions.set_mode(0o644);
+    fs::set_permissions(&summary, permissions).unwrap();
+    assert_eq!(found.ids(), vec!["grok:grok-ok"]);
+    assert!(
+        found
+            .summary
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.source == "grok"
+                && diagnostic.locator.as_deref().is_some_and(|locator| {
+                    locator.contains("grok-blocked")
+                })),
+        "unreadable identity has to be a diagnostic, not a folder-named row: {:?}",
+        found.summary.diagnostics
+    );
+    assert!(
+        found.rows.iter().all(|row| row.session_id != "grok-blocked"
+            && row.session_id != "local-folder"),
+        "the folder name must not become the session id: {:?}",
+        found.ids()
+    );
+}
+
+/// Discovery strips the `<user_query>` envelope, because hydration does.
+///
+/// Grok wraps a typed prompt in `<user_query>…</user_query>`. The full read
+/// unwraps it; the shallow read did not, so `sessions.first_prompt` held the
+/// XML envelope while `history.prompt` held the typed text -- for the *same*
+/// prompt of the *same* session. Catalog search and the session list showed
+/// the wrapper, and nothing said which of the two was the prompt.
+#[test]
+fn grok_discovery_unwraps_a_user_query_envelope_exactly_as_hydration_does() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-wrapped",
+        r#"{"info":{"id":"grok-wrapped","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"<user_query>ship it</user_query>\"}\n",
+        1_750_000_500_000,
+    );
+    // The positive control, in the same store: a prompt with no envelope is
+    // passed through untouched, so the fix cannot be "strip angle brackets".
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-plain",
+        r#"{"info":{"id":"grok-plain","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"ship it\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-embedded",
+        r#"{"info":{"id":"grok-embedded","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"Compare a <user_query>x</user_query> element with HTML\"}\n",
+        1_750_000_500_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(
+        found.row("grok-wrapped").first_prompt.as_deref(),
+        Some("ship it"),
+        "the catalog stores what the person typed, not Grok's envelope"
+    );
+    assert_eq!(
+        found.row("grok-plain").first_prompt.as_deref(),
+        Some("ship it"),
+        "and an unwrapped prompt is unchanged"
+    );
+    assert_eq!(
+        found.row("grok-embedded").first_prompt.as_deref(),
+        Some("Compare a <user_query>x</user_query> element with HTML"),
+        "a tag inside the typed prompt is not the envelope"
+    );
+
+    // And the two readers agree, so they cannot drift apart again: the
+    // record interpretation the full read uses gives the same answer.
+    let wrapped = serde_json::json!({
+        "type": "user",
+        "content": "<user_query>ship it</user_query>",
+    });
+    let line = crate::ingest::grok::parse_chat_record(&wrapped);
+    match line.record {
+        crate::ingest::grok::GrokRecord::User { text, .. } => assert_eq!(
+            text.as_deref(),
+            found.row("grok-wrapped").first_prompt.as_deref(),
+            "shallow and full reads must store the same prompt"
+        ),
+        other => panic!("expected a user record, got {other:?}"),
+    }
+}
+
+/// A session whose update stream grew has new evidence even when the
+/// transcript is byte-identical, so the change stamp has to cover it.
+#[test]
+fn grok_rescan_sees_a_grown_update_stream() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "grok-grow",
+        r#"{"info":{"id":"grok-grow","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"hey\"}\n",
+        1_750_000_500_000,
+    );
+    let updates = home
+        .path()
+        .join(".grok/sessions/%2Fwork%2Fgrok/grok-grow/updates.jsonl");
+    write(&updates, "{}\n");
+    set_mtime(&updates, 1_750_000_500_000);
+    discover(&conn, home.path(), &only(&["grok"]));
+
+    write(&updates, "{}\n{}\n");
+    set_mtime(&updates, 1_750_000_900_000);
+    let second = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(second.summary.skipped_unchanged, 0);
+    assert_eq!(second.summary.counters.shallow_reads, 1);
+}
+
 #[test]
 fn grok_rescan_is_stamp_guarded() {
     let conn = catalog();
@@ -892,7 +1597,9 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     opencode_db(
         home.path(),
         r#"INSERT INTO session VALUES ('oc-1', '/work/oc', 1750000600000, 1750000700000);
-           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","modelID":"claude-sonnet"}');
+           INSERT INTO message VALUES ('m1', 'oc-1', 1750000600000, '{"role":"user","providerID":"openai","modelID":"gpt-5"}');
+           INSERT INTO message VALUES ('m2', 'oc-1', NULL, '{"role":"assistant","time":{"created":200},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m3', 'oc-1', 100, '{"role":"assistant","time":{"created":100},"providerID":"anthropic","modelID":"claude-sonnet"}');
            INSERT INTO part VALUES ('p1', 'm1', 'oc-1', 1750000600000, '{"type":"text","text":"port the parser"}');"#,
     );
 
@@ -902,7 +1609,7 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     assert_eq!(row.first_prompt.as_deref(), Some("port the parser"));
     assert_eq!(row.first_activity_ms, Some(1_750_000_600_000));
     assert_eq!(row.last_activity_ms, Some(1_750_000_700_000));
-    assert_eq!(row.models, vec!["claude-sonnet".to_string()]);
+    assert_eq!(row.models, vec!["anthropic/claude-sonnet".to_string()]);
     assert_eq!(
         row.raw_path.as_deref(),
         Some(home.path().join("opencode.db").to_string_lossy().as_ref()),
@@ -912,6 +1619,93 @@ fn opencode_sessions_come_from_the_session_table_with_a_first_prompt() {
     let second = discover(&conn, home.path(), &only(&["opencode"]));
     assert_eq!(second.summary.skipped_unchanged, 1);
     assert_eq!(second.summary.counters.shallow_reads, 0);
+}
+
+/// Version 4 learned the provider from OpenCode messages but stored only the
+/// bare model ID. Since the provider database can remain byte-for-byte
+/// unchanged across an ai-hist upgrade, the scanner version is the only cache
+/// key that can make the corrected reader qualify an existing catalog row.
+#[test]
+fn an_opencode_row_from_scanner_v4_is_read_again_to_qualify_its_model() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-v4', '/work/oc', 1750000600000, 1750000700000);
+           INSERT INTO message VALUES ('m1', 'oc-v4', 1750000600000, '{"role":"user"}');
+           INSERT INTO message VALUES ('m2', 'oc-v4', 1750000700000, '{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet"}');
+           INSERT INTO part VALUES ('p1', 'm1', 'oc-v4', 1750000600000, '{"type":"text","text":"qualify the cached model"}');"#,
+    );
+
+    let initial = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        initial.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+
+    let stored: String = conn
+        .query_row(
+            "SELECT source_stamp FROM sessions WHERE source = 'opencode' \
+             AND session_id = 'oc-v4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw = stored
+        .split_once(':')
+        .expect("stored stamps carry a version prefix")
+        .1;
+    let previous = format!("v4:{raw}");
+    conn.execute(
+        "UPDATE sessions SET source_stamp = ?, models_json = '[\"claude-sonnet\"]' \
+         WHERE source = 'opencode' AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_presences SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ? WHERE source = 'opencode' \
+         AND session_id = 'oc-v4'",
+        params![previous],
+    )
+    .unwrap();
+
+    let upgraded = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(upgraded.summary.counters.shallow_reads, 1);
+    assert_eq!(upgraded.summary.skipped_unchanged, 0);
+    assert_eq!(
+        upgraded.row("oc-v4").models,
+        vec!["anthropic/claude-sonnet"],
+        "the v4 cached model must be replaced with the provider-qualified ID"
+    );
+
+    let settled = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(settled.summary.counters.shallow_reads, 0);
+    assert_eq!(settled.summary.skipped_unchanged, 1);
+}
+
+#[test]
+fn opencode_model_order_rejects_payload_times_outside_i64() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    opencode_db(
+        home.path(),
+        r#"INSERT INTO session VALUES ('oc-overflow', '/work/oc', 1, 2);
+           INSERT INTO message VALUES ('m1', 'oc-overflow', 1, '{"role":"assistant","time":{"created":9223372036854775808},"providerID":"anthropic","modelID":"claude-opus"}');
+           INSERT INTO message VALUES ('m2', 'oc-overflow', 2, '{"role":"assistant","time":{"created":2},"providerID":"anthropic","modelID":"claude-sonnet"}');"#,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        found.row("oc-overflow").models,
+        vec!["anthropic/claude-opus"],
+        "the out-of-i64 payload time must fall back to relational time_created"
+    );
 }
 
 /// A single opencode part can hold a whole pasted file. The excerpt is cut in
@@ -978,6 +1772,96 @@ fn empty_and_minimal_opencode_schemas_are_tolerated() {
     assert_eq!(row.cwd, None);
     assert_eq!(row.first_prompt, None);
     assert!(row.models.is_empty());
+
+    // `time_created` is optional in older message schemas. Discovery still
+    // filters to assistant messages and deterministically falls back to id.
+    fs::remove_file(home.path().join("opencode.db")).unwrap();
+    let db = Connection::open(home.path().join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE INDEX message_session_id_idx ON message(session_id, id); \
+         INSERT INTO session VALUES ('ses_legacy_message'); \
+         INSERT INTO message VALUES ('m1', 'ses_legacy_message', \
+             '{\"role\":\"user\",\"time\":{\"created\":1},\"providerID\":\"openai\",\"modelID\":\"gpt-5\"}'); \
+         INSERT INTO message VALUES ('m2', 'ses_legacy_message', \
+             '{\"role\":\"assistant\",\"time\":{\"created\":2},\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let legacy = discover(&conn, home.path(), &only(&["opencode"]));
+    assert_eq!(
+        legacy.row("ses_legacy_message").models,
+        vec!["anthropic/claude-sonnet"]
+    );
+}
+
+#[test]
+fn opencode_pins_the_json_layout_between_enumeration_and_read() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let storage = home.path().join("storage");
+    write(
+        &storage.join("session/global/ses_tree.json"),
+        r#"{"id":"ses_tree","directory":"/work/tree","time":{"created":10,"updated":20}}"#,
+    );
+    write(
+        &storage.join("message/ses_tree/msg_tree.json"),
+        r#"{"id":"msg_tree","sessionID":"ses_tree","role":"user","time":{"created":10}}"#,
+    );
+    write(
+        &storage.join("part/msg_tree/part_tree.json"),
+        r#"{"id":"part_tree","sessionID":"ses_tree","messageID":"msg_tree","type":"text","text":"tree prompt"}"#,
+    );
+
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let candidate = provider.enumerate(&env, None).unwrap().remove(0);
+    assert!(candidate.locator.ends_with("ses_tree.json"));
+
+    // Current OpenCode creates SQLite while this discovery pass still holds
+    // JSON-tree locators. Re-detecting here would look up the file path as a
+    // SQLite session id and silently return no row.
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_sqlite', '/work/sqlite', 30, 40);",
+    );
+    let row = provider
+        .read_shallow(&env.scan(), None, &candidate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id, "ses_tree");
+    assert_eq!(row.first_prompt.as_deref(), Some("tree prompt"));
+}
+
+#[test]
+fn opencode_redetects_its_layout_on_the_next_registry_pass() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let env = env_at(&conn, home.path());
+    let provider = OpencodeProvider::default();
+    let providers: [&dyn ShallowSessionProvider; 1] = [&provider];
+    let options = only(&["opencode"]);
+
+    let first = discover_sessions_with_provider_refs(&env, &options, &providers, |_| {}).unwrap();
+    assert_eq!(first.providers["opencode"].candidates, 0);
+
+    opencode_db(
+        home.path(),
+        "INSERT INTO session VALUES ('ses_later', '/work/later', 30, 40);",
+    );
+    let mut rows = Vec::new();
+    discover_sessions_with_provider_refs(&env, &options, &providers, |row| {
+        rows.push(row.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_later"],
+        "a reusable registry must not keep the previous pass's absent layout"
+    );
 }
 
 #[test]
@@ -1025,6 +1909,11 @@ fn opencode_fixed_limit_does_not_inspect_unrelated_history() {
         db.execute(
             "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"user\",\"modelID\":\"bounded-model\"}')",
             params![message, id, index],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, ?, ?, '{\"role\":\"assistant\",\"modelID\":\"bounded-model\"}')",
+            params![format!("assistant_{index:06}"), id, index + 1],
         )
         .unwrap();
         db.execute(
@@ -1147,10 +2036,27 @@ fn opencode_selected_session_queries_use_provider_indexes() {
 
     let model = explain_details(
         &db,
-        "SELECT COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
+        "SELECT json_extract(data, '$.providerID'),
+                COALESCE(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID'))
          FROM message WHERE session_id = 'selected' AND json_valid(data)
-         AND COALESCE(json_extract(data, '$.modelID'),
-                      json_extract(data, '$.model.modelID')) IS NOT NULL LIMIT 1",
+         AND json_extract(data, '$.role') = 'assistant'
+         AND COALESCE(
+               CASE WHEN json_type(data, '$.time.created') = 'integer'
+                    AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                    THEN json_extract(data, '$.time.created') END,
+               time_created
+             ) IS NOT NULL
+         AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL
+              OR NULLIF(COALESCE(json_extract(data, '$.modelID'),
+                                 json_extract(data, '$.model.modelID')), '') IS NOT NULL)
+         ORDER BY COALESCE(
+                    CASE WHEN json_type(data, '$.time.created') = 'integer'
+                         AND typeof(json_extract(data, '$.time.created')) = 'integer'
+                         THEN json_extract(data, '$.time.created') END,
+                    time_created
+                  ) ASC,
+                  id ASC
+         LIMIT 1",
         [],
     );
     assert!(
@@ -1240,8 +2146,9 @@ fn current_opencode_schema_without_recency_index_uses_primary_key_fallback() {
          CREATE INDEX part_message_id_id_idx ON part(message_id, id);
          INSERT INTO session VALUES ('ses_ffffffffffffold', '/old', 1, 1000);
          INSERT INTO session VALUES ('ses_000000000000new', '/new', 2, 2);
-         INSERT INTO message VALUES ('m_new', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"fallback-model\"}');
-         INSERT INTO part VALUES ('p_new', 'm_new', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
+         INSERT INTO message VALUES ('m_new_user', 'ses_000000000000new', 2, '{\"role\":\"user\",\"modelID\":\"requested-model\"}');
+         INSERT INTO message VALUES ('m_new_assistant', 'ses_000000000000new', 3, '{\"role\":\"assistant\",\"modelID\":\"fallback-model\"}');
+         INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_000000000000new', 2, '{\"type\":\"text\",\"text\":\"fallback prompt\"}');",
     )
     .unwrap();
     let plan = explain_details(
@@ -1280,8 +2187,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     opencode_db(
         home.path(),
         "INSERT INTO session VALUES ('ses_snapshot', '/work/oc', 10, 20);
-         INSERT INTO message VALUES ('m_old', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-model\"}');
-         INSERT INTO part VALUES ('p_old', 'm_old', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
+         INSERT INTO message VALUES ('m_old_user', 'ses_snapshot', 10, '{\"role\":\"user\",\"modelID\":\"old-requested-model\"}');
+         INSERT INTO message VALUES ('m_old_assistant', 'ses_snapshot', 11, '{\"role\":\"assistant\",\"modelID\":\"old-model\"}');
+         INSERT INTO part VALUES ('p_old', 'm_old_user', 'ses_snapshot', 10, '{\"type\":\"text\",\"text\":\"coherent old prompt\"}');",
     );
     let writer = Connection::open(home.path().join("opencode.db")).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -1291,8 +2199,9 @@ fn opencode_wal_append_does_not_tear_the_read_snapshot() {
     let candidate = provider.enumerate(&env, Some(1)).unwrap().remove(0);
     writer
         .execute_batch(
-            "INSERT INTO message VALUES ('m_new', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-model\"}');
-             INSERT INTO part VALUES ('p_new', 'm_new', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
+            "INSERT INTO message VALUES ('m_new_user', 'ses_snapshot', 5, '{\"role\":\"user\",\"modelID\":\"new-requested-model\"}');
+             INSERT INTO message VALUES ('m_new_assistant', 'ses_snapshot', 6, '{\"role\":\"assistant\",\"modelID\":\"new-model\"}');
+             INSERT INTO part VALUES ('p_new', 'm_new_user', 'ses_snapshot', 5, '{\"type\":\"text\",\"text\":\"new prompt outside snapshot\"}');
              UPDATE session SET time_updated = 30 WHERE id = 'ses_snapshot';",
         )
         .unwrap();
@@ -1401,9 +2310,9 @@ fn relay_discovers_from_already_synced_rows_and_never_touches_the_network() {
         ("ch:general", "[ana] deploy is red", 1_750_000_800_000_i64),
         ("ch:general", "[bo] rolling back", 1_750_000_900_000),
     ] {
-        ai_hist_core::insert_history(
+        crate::insert_history(
             &conn,
-            &ai_hist_core::HistoryEntry {
+            &crate::HistoryEntry {
                 id: 0,
                 source: "relay".into(),
                 session_id: Some(id.into()),
@@ -2330,4 +3239,502 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
     let rescan = discover(&conn, home.path(), &only(&["claude"]));
     assert_eq!(rescan.summary.counters.shallow_reads, 1);
     assert_eq!(rescan.summary.skipped_unchanged, 0);
+}
+
+// ---------------------------------------------------------------------------
+// project identity on the cached path
+// ---------------------------------------------------------------------------
+
+fn stored_key(conn: &Connection, source: &str, session_id: &str) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT project_key, project_key_method FROM sessions WHERE source = ? AND session_id = ?",
+        params![source, session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or_else(|error| panic!("reading {source}/{session_id}: {error}"))
+}
+
+/// A codex rollout whose only interesting property is where it ran.
+fn codex_in(home: &Path, id: &str, cwd: &Path, mtime_ms: i64) {
+    let body = format!(
+        "{}\n{}\n",
+        format_args!(
+            r#"{{"timestamp":"2026-06-20T11:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+            cwd.display()
+        ),
+        r#"{"timestamp":"2026-06-20T11:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"delegated work"}}"#,
+    );
+    codex_rollout(home, id, &body, mtime_ms);
+}
+
+/// What discovery streams for a cached row must be what the pass then stores.
+///
+/// The cached-row upgrade resolves the working directory, which for a
+/// delegated child is frequently not a repository at all — a path key. The
+/// end-of-pass refresh then replaces that path with the parent's repository,
+/// because a borrowed key beats a machine-local directory. If the upgrade
+/// emits its own answer, the JSONL a consumer parses says one project and the
+/// database it came from says another, with nothing anywhere recording the
+/// disagreement.
+#[test]
+fn a_cached_child_is_streamed_the_key_the_refresh_pass_will_store() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/child");
+    fs::create_dir_all(&work).unwrap();
+    codex_in(home.path(), "child", &work, 1_750_000_000_000);
+
+    // Nothing to inherit from yet, so the child's own directory is all there
+    // is, and it is not a repository.
+    let first = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(
+        first.row("child").project_key_method.as_deref(),
+        Some(ProjectKeyMethod::PathFallback.as_str()),
+        "the premise is a child that resolved to nothing canonical"
+    );
+
+    // The delegating parent lands, keyed to the repository it ran in.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    // The child's transcript is untouched, so this pass serves it by its stamp.
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let emitted = second.row("child");
+    let inherited = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        inherited,
+        "discovery streamed a path key for a child the refresh pass then made inherited"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        inherited,
+        "the streamed row and the stored row must not disagree"
+    );
+}
+
+/// An upgrade the catalog refuses must not be reported as if it happened.
+///
+/// The cached-row upgrade reads the row, resolves, and writes — three steps
+/// with no transaction around them, so a hydrate or a concurrent sync can
+/// settle the same session in between. The write is guarded and correctly
+/// declines to downgrade the settled key; the row streamed to the caller has
+/// to decline with it. Reporting the key the write *wanted* invents a value no
+/// row anywhere holds, which is worse than a stale one because nothing
+/// downstream can tell it is wrong.
+#[test]
+fn a_cached_upgrade_the_catalog_refuses_streams_the_stored_key() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work/api");
+    fs::create_dir_all(&work).unwrap();
+    // A row from before project identity existed: no key at all.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, last_activity_ms, discovery_state) \
+         VALUES ('codex', 'settled', ?, 1, 'shallow')",
+        params![work.to_string_lossy()],
+    )
+    .unwrap();
+    let mut row = fetch_catalog_row(&conn, "codex", "settled")
+        .unwrap()
+        .expect("the row was just inserted");
+
+    // Between that read and the upgrade, a hydrate settles the session on the
+    // repository it actually belongs to.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/api', project_key_method = 'remote' \
+         WHERE source = 'codex' AND session_id = 'settled'",
+        [],
+    )
+    .unwrap();
+
+    crate::project_identity::begin_acquisition_pass();
+    upgrade_cached_project_identity(&conn, &mut row).unwrap();
+
+    let settled = (
+        Some("github.com/acme/api".to_string()),
+        Some(ProjectKeyMethod::Remote.as_str().to_string()),
+    );
+    assert_eq!(
+        (row.project_key.clone(), row.project_key_method.clone()),
+        settled,
+        "the streamed row reported a key the catalog refused to store"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "settled"),
+        settled,
+        "a settled remote key must never be overwritten by a path"
+    );
+}
+
+/// The streamed key must survive the *whole* refresh, not just its first pass.
+///
+/// A cached row is decided and handed to the caller before the end-of-pass
+/// refresh runs at all. Asking the catalog what the parent holds right now is
+/// not enough to agree with what that refresh will store: the same refresh can
+/// promote the parent off a path and onto a `remote` of its own (pass 1) and
+/// only then lend it down (pass 2) — by which time the child has been streamed
+/// with a path key, and the JSONL a consumer parses disagrees with the
+/// database it came from.
+#[test]
+fn a_cached_child_is_streamed_the_key_its_parent_is_about_to_resolve() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The delegating parent is a checkout that has an `origin` — but the
+    // catalog still has it on a path key, exactly as a session first seen
+    // before its checkout was cloned would be. Pass 1 is what fixes that, and
+    // pass 1 has not run since.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/parent.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) VALUES ('codex', 'parent', ?1, ?1, 'path', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let expected = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        expected,
+        "the streamed key did not account for the promotion its own pass was about to make"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        expected,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent"),
+        (
+            Some("github.com/acme/parent".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the parent was not promoted, so nothing above was actually tested"
+    );
+}
+
+/// The streamed key must be the key the refresh will *leave*, which is not the
+/// same as the key the filesystem resolves.
+///
+/// Pass 1 never rewrites a `remote`: a session that resolved its repository
+/// once keeps that answer even if the checkout has since been re-pointed at a
+/// fork, because a settled canonical key is not something a later pass may
+/// quietly change underneath every consumer that has already grouped by it. A
+/// read-time walk that asks the filesystem instead would hand the caller the
+/// fork's key and then watch the refresh write the original back — the two
+/// disagreeing on every single pass, not just once.
+#[test]
+fn a_cached_child_is_streamed_the_settled_key_its_parent_keeps() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The parent settled on `acme/parent` at some earlier pass; its checkout
+    // now points somewhere else entirely.
+    let parent_dir = home.path().join("work/parent");
+    let git_dir = parent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/fork.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', ?, 'github.com/acme/parent', 'remote', 1, 'shallow')",
+        params![parent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+         child_session_id, relationship, identity_status, evidence_kind, created_ms, updated_ms) \
+         VALUES ('codex', 'parent', 'rel', 'child', 'delegation', 'observed', 'fixture', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let settled = (
+        Some("github.com/acme/parent".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        settled,
+        "the streamed key came from the checkout rather than from the row the pass will leave"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        settled,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "parent").0.as_deref(),
+        Some("github.com/acme/parent"),
+        "a settled remote key must not be rewritten by a later pass"
+    );
+}
+
+/// A stand-in follows the ancestor it stands in for, all the way down.
+///
+/// When pass 1 promotes a grandparent onto a `remote` of its own, pass 2
+/// carries that key through every borrowed key beneath it. A read-time walk
+/// that stops at the first ancestor already wearing a borrowed key answers
+/// with the stand-in the refresh is about to replace — so the row goes out on
+/// the wire naming one project while the database ends up naming another.
+#[test]
+fn a_cached_child_is_streamed_the_key_a_promoted_ancestor_will_lend() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted: its checkout has an `origin`
+    // but the catalog still has it wearing a key it borrowed.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The middle generation and the child both borrowed that same old key.
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'parent', 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "parent", "gp->p"),
+        ("parent", "child", "p->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed key was the stand-in the refresh was about to replace"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
+}
+
+/// The streamed key must see what the stored key sees — including past a
+/// generation the catalog does not hold.
+///
+/// A delegated thread is evidence, not a session, so the generation between a
+/// root and its grandchild routinely has no catalog row. The refresh walks
+/// past it; a read-time walk that inner-joined `sessions` could not, so a
+/// cached grandchild was streamed with the stand-in it already wore while the
+/// same pass stored the promoted ancestor's key. Two answers for one session,
+/// one in `sessions discover --json` and one in the database, with nothing in
+/// either recording that they disagree.
+#[test]
+fn a_cached_grandchild_is_streamed_the_key_the_refresh_lends_across_a_gap() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let child_dir = home.path().join("work/child");
+    fs::create_dir_all(&child_dir).unwrap();
+    codex_in(home.path(), "child", &child_dir, 1_750_000_000_000);
+    discover(&conn, home.path(), &only(&["codex"]));
+
+    // The grandparent is about to be promoted onto a `remote` of its own; the
+    // catalog still has it wearing a borrowed key.
+    let grandparent_dir = home.path().join("work/grandparent");
+    let git_dir = grandparent_dir.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:acme/new.git\n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, cwd, project_key, project_key_method, \
+         last_activity_ms, discovery_state) \
+         VALUES ('codex', 'grandparent', ?, 'github.com/acme/old', 'inherited', 1, 'shallow')",
+        params![grandparent_dir.to_string_lossy()],
+    )
+    .unwrap();
+    // The generation in between is evidence only: a relationship, no row.
+    conn.execute(
+        "UPDATE sessions SET project_key = 'github.com/acme/old', \
+         project_key_method = 'inherited' WHERE source = 'codex' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    for (parent, child, uid) in [
+        ("grandparent", "middle", "gp->m"),
+        ("middle", "child", "m->c"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_relationships (source, parent_session_id, relationship_uid, \
+             child_session_id, relationship, identity_status, evidence_kind, created_ms, \
+             updated_ms) \
+             VALUES ('codex', ?1, ?2, ?3, 'delegation', 'observed', 'fixture', 1, 1)",
+            params![parent, uid, child],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'middle'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the premise of this test is that the middle generation has no catalog row"
+    );
+
+    let second = discover(&conn, home.path(), &only(&["codex"]));
+    assert!(
+        second.summary.skipped_unchanged > 0,
+        "the premise of this test is the cached branch; {:?}",
+        second.summary
+    );
+    let promoted = (
+        Some("github.com/acme/new".to_string()),
+        Some(ProjectKeyMethod::Inherited.as_str().to_string()),
+    );
+    let emitted = second.row("child");
+    assert_eq!(
+        (
+            emitted.project_key.clone(),
+            emitted.project_key_method.clone()
+        ),
+        promoted,
+        "the streamed walk stopped at the uncataloged generation the refresh walks past"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "child"),
+        promoted,
+        "the streamed row and the stored row must not disagree"
+    );
+    assert_eq!(
+        stored_key(&conn, "codex", "grandparent"),
+        (
+            Some("github.com/acme/new".to_string()),
+            Some(ProjectKeyMethod::Remote.as_str().to_string())
+        ),
+        "the grandparent was not promoted, so nothing above was actually tested"
+    );
 }

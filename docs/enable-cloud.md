@@ -4,7 +4,7 @@ History stays local until you explicitly export it or enable a destination.
 Install RelayHistory separately from the local SDK:
 
 ```sh
-npm install ai-hist @agent-relay/relayhistory
+npm install ai-hist @relayhistory/capture
 ```
 
 Other services can implement the same source and destination interfaces. A source
@@ -40,13 +40,13 @@ limits, cancellation, and building a destination for another service.
 
 ## Existing cloud API migration
 
-Cloud functions are exported by `@agent-relay/relayhistory`. Neither `ai-hist`
+Cloud functions are exported by `@relayhistory/capture`. Neither `ai-hist`
 nor the removed `ai-hist/cloud` entrypoint exports them. Git hooks and commit
 linking remain in the local SDK:
 
 ```ts
 import { installGitHooks } from 'ai-hist';
-import { enableCloud, createShareableTrace } from '@agent-relay/relayhistory';
+import { enableCloud, createShareableTrace } from '@relayhistory/capture';
 
 // Compatibility with an existing legacy cloud workflow, not durable delivery.
 const cloud = await enableCloud({ watch: false });

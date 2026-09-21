@@ -4,12 +4,12 @@
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
 #![deny(clippy::all)]
 
-pub mod delivery;
+pub mod export;
 pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist_core::{
+use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
     schema_is_read_current, schema_is_relationship_read_current, search as core_search,
@@ -18,23 +18,43 @@ use ai_hist_core::{
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
     session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
-    stats_scoped as core_stats_scoped, HistoryEntry, QueryFilter,
+    session_user_turns_page as core_session_user_turns_page,
+    stats_scoped_by as core_stats_scoped_by, HistoryEntry, QueryFilter,
     RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
-    RelationshipDiagnostic as CoreRelationshipDiagnostic, SessionEvent as CoreSessionEvent,
+    RelationshipDiagnostic as CoreRelationshipDiagnostic,
+    RelationshipKinds as CoreRelationshipKinds, SessionEvent as CoreSessionEvent,
     SessionEventCursor as CoreEventCursor, SessionEvidenceCursor as CoreEvidenceCursor,
     SessionFileEdit as CoreSessionFileEdit, SessionRelationship as CoreSessionRelationship,
     SessionRelationships as CoreSessionRelationships, SessionScope,
     SessionToolCall as CoreSessionToolCall, SessionTree as CoreSessionTree,
     SessionTreeNode as CoreSessionTreeNode, SessionTreeOptions as CoreSessionTreeOptions,
+    SessionUserTurn as CoreSessionUserTurn, SessionUserTurnBlock as CoreSessionUserTurnBlock,
     DEFAULT_CHILDREN_PAGE_LIMIT, DEFAULT_TREE_MAX_DEPTH, DEFAULT_TREE_MAX_NODES,
     MAX_CHILDREN_PAGE_LIMIT, MAX_TREE_MAX_DEPTH, MAX_TREE_MAX_NODES,
     SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_RELATIONSHIP_CONTRACT_VERSION,
 };
+use ai_hist::{
+    schema_is_usage_read_current, session_requests_page as core_session_requests_page,
+    session_usage_summary as core_session_usage_summary, NormalizedUsage as CoreNormalizedUsage,
+    SessionRequest as CoreSessionRequest, SessionRequestCursor as CoreRequestCursor,
+    SessionUsageSummary as CoreSessionUsageSummary, SESSION_USAGE_CONTRACT_VERSION,
+};
 use napi_derive::napi;
 
 /// Bump whenever native object shapes or semantics require an SDK change.
-pub const NATIVE_CONTRACT_VERSION: u32 = 15;
+/// 16 added `project_key` to catalog rows and session events, plus
+/// `project_key_method` on the catalog row and the `project_key` listing
+/// filter.
+/// 17 adds the per-tool-result fidelity fields to session events and the
+/// `getSessionUserTurnsPage` operation. It is 17 rather than 16 because that
+/// work and the project-identity work were developed in parallel and both
+/// claimed 16; a merged addon carries both, so it cannot answer with a
+/// number either side already published.
+/// 18 was claimed independently by the upstream `provider` field and the
+/// per-request usage surface. The merged addon exposes both shapes, so it is
+/// 19 rather than identifying itself as either incompatible contract 18.
+pub const NATIVE_CONTRACT_VERSION: u32 = 20;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -136,10 +156,10 @@ fn ensure_acquisition_scope_supported(
     scope: SessionScope,
     operation: &str,
     sources: &[String],
-    connectors: &ai_hist_engine::remote::SourceConnectorSelection,
+    connectors: &ai_hist::remote::SourceConnectorSelection,
 ) -> napi::Result<()> {
     if scope == SessionScope::Remote {
-        ai_hist_engine::remote::ensure_selected_remote_connectors_configured_for(
+        ai_hist::remote::ensure_selected_remote_connectors_configured_for(
             operation, sources, connectors,
         )
         .map_err(|error| native_error("UNSUPPORTED_OPERATION", format!("{error:#}")))?;
@@ -149,8 +169,8 @@ fn ensure_acquisition_scope_supported(
 
 fn source_connector_selection(
     ids: Option<Vec<String>>,
-) -> napi::Result<ai_hist_engine::remote::SourceConnectorSelection> {
-    ids.map(ai_hist_engine::remote::SourceConnectorSelection::new)
+) -> napi::Result<ai_hist::remote::SourceConnectorSelection> {
+    ids.map(ai_hist::remote::SourceConnectorSelection::new)
         .transpose()
         .map(|selection| selection.unwrap_or_default())
         .map_err(|error| native_error("INVALID_ARGUMENT", error.to_string()))
@@ -251,6 +271,8 @@ pub struct NativeSessionEvent {
     pub source: String,
     pub session_id: String,
     pub project: Option<String>,
+    /// Canonical project identity, denormalized from the owning session.
+    pub project_key: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub message_id: Option<String>,
@@ -261,7 +283,38 @@ pub struct NativeSessionEvent {
     pub text: Option<String>,
     pub model: Option<String>,
     pub token_json: Option<String>,
+    /// The upstream inference provider the harness named, when it names one
+    /// (OpenCode's `providerID`). Null elsewhere rather than inferred.
+    pub provider: Option<String>,
     pub event_uid: String,
+    /// Per-tool-result fidelity. Null on every row that is not a tool result,
+    /// and on a tool-result row whose provider does not record the fact.
+    pub tool_use_id: Option<String>,
+    /// Raw UTF-8 byte length of the provider's result payload.
+    pub payload_bytes: Option<i64>,
+    /// True when the harness had already truncated the payload.
+    pub payload_truncated: Option<bool>,
+    /// First 16 hex characters of the payload's sha256.
+    pub payload_hash: Option<String>,
+    /// n-th result recorded for this `toolUseId`, from zero.
+    pub call_index: Option<i64>,
+    /// Position of this result in the transcript's tool-result order.
+    pub event_index: Option<i64>,
+    /// `running` / `completed` / `errored` / `cancelled` / `unknown`.
+    pub result_status: Option<String>,
+    /// `tool_result` / `subagent_notification` / `function_call_output`.
+    pub event_source: Option<String>,
+    /// Which provider signal set the error.
+    pub error_signal: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub request_id: Option<String>,
+    /// Why the turn ended, as the harness reported it.
+    pub stop_reason: Option<String>,
+    pub agent_version: Option<String>,
+    pub is_sidechain: Option<bool>,
+    pub is_meta: Option<bool>,
+    pub turn_id: Option<String>,
 }
 
 impl From<CoreSessionEvent> for NativeSessionEvent {
@@ -271,6 +324,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             source: event.source,
             session_id: event.session_id,
             project: event.project,
+            project_key: event.project_key,
             cwd: event.cwd,
             git_branch: event.git_branch,
             message_id: event.message_id,
@@ -281,7 +335,25 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             text: event.text,
             model: event.model,
             token_json: event.token_json,
+            provider: event.provider,
             event_uid: event.event_uid,
+            tool_use_id: event.tool_use_id,
+            payload_bytes: event.payload_bytes,
+            payload_truncated: event.payload_truncated.map(|value| value != 0),
+            payload_hash: event.payload_hash,
+            call_index: event.call_index,
+            event_index: event.event_index,
+            result_status: event.result_status,
+            event_source: event.event_source,
+            error_signal: event.error_signal,
+            subagent_session_id: event.subagent_session_id,
+            agent_id: event.agent_id,
+            request_id: event.request_id,
+            stop_reason: event.stop_reason,
+            agent_version: event.agent_version,
+            is_sidechain: event.is_sidechain.map(|value| value != 0),
+            is_meta: event.is_meta.map(|value| value != 0),
+            turn_id: event.turn_id,
         }
     }
 }
@@ -399,6 +471,81 @@ pub struct EvidencePageOptions {
 }
 
 #[napi(object)]
+pub struct NativeSessionUserTurnBlock {
+    /// `text` or `tool_result`.
+    pub kind: String,
+    pub tool_use_id: Option<String>,
+    /// Measured payload bytes when the parser recorded them, otherwise the
+    /// UTF-8 length of the stored text.
+    pub byte_len: i64,
+    /// True when the result is known to have failed, false when it is known
+    /// to have succeeded, null when the provider has not said.
+    pub is_error: Option<bool>,
+}
+
+impl From<CoreSessionUserTurnBlock> for NativeSessionUserTurnBlock {
+    fn from(block: CoreSessionUserTurnBlock) -> Self {
+        Self {
+            kind: block.kind,
+            tool_use_id: block.tool_use_id,
+            byte_len: block.byte_len,
+            is_error: block.is_error.map(|value| value != 0),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionUserTurn {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub message_id: Option<String>,
+    /// The nearest messages recorded either side of this turn, from either
+    /// side of the conversation. Null only when the session recorded no named
+    /// message on that side; an event the provider left unnamed is passed
+    /// over rather than nulling the field.
+    pub preceding_message_id: Option<String>,
+    pub following_message_id: Option<String>,
+    pub ts_ms: i64,
+    pub blocks: Vec<NativeSessionUserTurnBlock>,
+}
+
+impl From<CoreSessionUserTurn> for NativeSessionUserTurn {
+    fn from(turn: CoreSessionUserTurn) -> Self {
+        Self {
+            id: turn.id,
+            source: turn.source,
+            session_id: turn.session_id,
+            message_id: turn.message_id,
+            preceding_message_id: turn.preceding_message_id,
+            following_message_id: turn.following_message_id,
+            ts_ms: turn.ts_ms,
+            blocks: turn
+                .blocks
+                .into_iter()
+                .map(NativeSessionUserTurnBlock::from)
+                .collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct UserTurnsPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<EventCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUserTurnsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub user_turns: Vec<NativeSessionUserTurn>,
+    pub next_cursor: Option<EventCursor>,
+}
+
+#[napi(object)]
 pub struct SessionToolCallsPage {
     pub contract_version: u32,
     pub source: String,
@@ -414,6 +561,262 @@ pub struct SessionFileEditsPage {
     pub session_id: String,
     pub file_edits: Vec<NativeSessionFileEdit>,
     pub next_cursor: Option<EvidenceCursor>,
+}
+
+/// Normalized usage for one request or one session.
+///
+/// The optional fields stay optional across the boundary: `null` means the
+/// provider did not report that counter, which is a different fact from a
+/// reported zero and the only thing that makes `coverage` interpretable.
+#[napi(object)]
+pub struct NativeNormalizedUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    #[napi(js_name = "cacheWrite5mTokens")]
+    pub cache_write5m_tokens: Option<i64>,
+    #[napi(js_name = "cacheWrite1hTokens")]
+    pub cache_write1h_tokens: Option<i64>,
+    pub provider_total_tokens: Option<i64>,
+    pub reported_cost_usd: Option<f64>,
+    /// `per-request`, `per-message`, `cumulative-delta`, `context-proxy`, or
+    /// `mixed` on a summary spanning more than one.
+    pub accounting: String,
+    pub has_input_tokens: bool,
+    pub has_output_tokens: bool,
+    pub has_reasoning_tokens: bool,
+    pub has_cache_read_tokens: bool,
+    pub has_cache_write_tokens: bool,
+}
+
+/// The largest integer a JavaScript number represents exactly
+/// (`Number.MAX_SAFE_INTEGER`).
+///
+/// This, not `i64::MAX`, is the real ceiling of the boundary: above it a
+/// `number` silently stops being the value it was given, so a count that does
+/// not fit cannot be handed over at all.
+pub(crate) const MAX_JS_SAFE_COUNT: u64 = 9_007_199_254_740_991;
+
+/// Stable code for a count that JavaScript cannot represent exactly.
+const COUNT_NOT_REPRESENTABLE: &str = "USAGE_COUNT_NOT_REPRESENTABLE";
+const COUNT_NOT_REPRESENTABLE_DIAGNOSTIC: &str = "count-not-representable";
+
+/// A token count as a JavaScript-safe integer, or `None` when it is not one.
+///
+/// Core accepts every counter up to `u64::MAX`; this boundary accepts only
+/// what survives the crossing. Saturating to `i64::MAX` would hand JavaScript
+/// a plausible number that is neither the stored value nor representable —
+/// the exact shape of failure this crate refuses everywhere else.
+pub(crate) fn js_count(value: u64) -> Option<i64> {
+    (value <= MAX_JS_SAFE_COUNT).then_some(value as i64)
+}
+
+/// `None` stays `None`; a reported count that is not representable makes the
+/// whole record unrepresentable rather than quietly dropping one field.
+fn js_count_optional(value: Option<u64>) -> Option<Option<i64>> {
+    match value {
+        None => Some(None),
+        Some(value) => js_count(value).map(Some),
+    }
+}
+
+impl NativeNormalizedUsage {
+    /// Convert a normalized record, or `None` when any count it carries
+    /// cannot cross the boundary intact.
+    pub(crate) fn from_core(usage: &CoreNormalizedUsage, accounting: String) -> Option<Self> {
+        Some(Self {
+            input_tokens: js_count(usage.input_tokens)?,
+            output_tokens: js_count(usage.output_tokens)?,
+            reasoning_tokens: js_count_optional(usage.reasoning_tokens)?,
+            cache_read_tokens: js_count(usage.cache_read_tokens)?,
+            cache_write_tokens: js_count(usage.cache_write_tokens)?,
+            cache_write5m_tokens: js_count_optional(usage.cache_write_5m_tokens)?,
+            cache_write1h_tokens: js_count_optional(usage.cache_write_1h_tokens)?,
+            provider_total_tokens: js_count_optional(usage.provider_total_tokens)?,
+            reported_cost_usd: usage.reported_cost_usd,
+            accounting,
+            has_input_tokens: usage.coverage.has_input_tokens,
+            has_output_tokens: usage.coverage.has_output_tokens,
+            has_reasoning_tokens: usage.coverage.has_reasoning_tokens,
+            has_cache_read_tokens: usage.coverage.has_cache_read_tokens,
+            has_cache_write_tokens: usage.coverage.has_cache_write_tokens,
+        })
+    }
+}
+
+#[napi(object)]
+pub struct NativeSessionRequest {
+    pub id: i64,
+    pub source: String,
+    pub session_id: String,
+    pub request_key: String,
+    /// `request-id`, `provider-message-id`, `request-span` or `record-id`.
+    pub request_key_source: String,
+    pub message_ids: Vec<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub first_ts_ms: i64,
+    pub last_ts_ms: i64,
+    /// Absent when the request carried no usage evidence, or when the
+    /// evidence could not be trusted — `diagnostics` says which.
+    pub usage: Option<NativeNormalizedUsage>,
+    pub usage_error: Option<String>,
+    pub tool_use_ids: Vec<String>,
+    pub has_thinking: bool,
+    pub event_count: i64,
+    pub diagnostics: Vec<String>,
+}
+
+impl From<CoreSessionRequest> for NativeSessionRequest {
+    fn from(request: CoreSessionRequest) -> Self {
+        let mut diagnostics: Vec<String> = request
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.as_str().to_string())
+            .collect();
+        let mut usage_error = request.usage_error;
+        let usage = request.usage.as_ref().and_then(|usage| {
+            let accounting = usage.accounting.as_str().to_string();
+            let converted = NativeNormalizedUsage::from_core(usage, accounting);
+            if converted.is_none() {
+                // The row normalized; it just cannot be expressed here. Say
+                // so rather than serve a rounded number.
+                usage_error = Some(COUNT_NOT_REPRESENTABLE.to_string());
+                diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+            }
+            converted
+        });
+        Self {
+            id: request.id,
+            source: request.source,
+            session_id: request.session_id,
+            request_key: request.request_key,
+            request_key_source: request.request_key_source.as_str().to_string(),
+            message_ids: request.message_ids,
+            model: request.model,
+            provider: request.provider,
+            first_ts_ms: request.first_ts_ms,
+            last_ts_ms: request.last_ts_ms,
+            usage,
+            usage_error,
+            tool_use_ids: request.tool_use_ids,
+            has_thinking: request.has_thinking,
+            event_count: request.event_count,
+            diagnostics,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RequestCursor {
+    pub ts_ms: i64,
+    pub id: i64,
+}
+
+#[napi(object)]
+pub struct RequestPageOptions {
+    pub db_path: Option<String>,
+    pub limit: Option<i64>,
+    pub after: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionRequestsPage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub requests: Vec<NativeSessionRequest>,
+    pub next_cursor: Option<RequestCursor>,
+}
+
+#[napi(object)]
+pub struct SessionUsageOptions {
+    pub db_path: Option<String>,
+}
+
+/// One session's usage rollup. `usage` is absent when the session has no
+/// usage evidence at all — not zeroed, because zero is a claim.
+#[napi(object)]
+pub struct SessionUsage {
+    pub contract_version: u32,
+    pub source: String,
+    pub session_id: String,
+    pub usage: Option<NativeNormalizedUsage>,
+    /// Requests that contributed to `usage`.
+    pub request_count: i64,
+    /// Requests seen, including ones with no usage.
+    pub total_request_count: i64,
+    /// Every accounting mode present. More than one means the totals mix
+    /// units and should be read per mode.
+    pub accounting: Vec<String>,
+    pub models: Vec<String>,
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    pub diagnostics: Vec<String>,
+    /// The totals exceeded what can be represented and must not be used.
+    pub overflowed: bool,
+}
+
+fn session_usage(
+    source: String,
+    session_id: String,
+    summary: Option<CoreSessionUsageSummary>,
+) -> SessionUsage {
+    let Some(summary) = summary else {
+        return SessionUsage {
+            contract_version: SESSION_USAGE_CONTRACT_VERSION,
+            source,
+            session_id,
+            usage: None,
+            request_count: 0,
+            total_request_count: 0,
+            accounting: Vec::new(),
+            models: Vec::new(),
+            first_ts_ms: None,
+            last_ts_ms: None,
+            diagnostics: Vec::new(),
+            overflowed: false,
+        };
+    };
+    let mut diagnostics: Vec<String> = summary
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.as_str().to_string())
+        .collect();
+    // A summary's mode list can be plural; the single-mode field carries a
+    // real mode only when there is exactly one, so a session that mixes units
+    // cannot be read as if it had one.
+    let accounting = match summary.accounting.as_slice() {
+        [mode] => mode.as_str().to_string(),
+        _ => "mixed".to_string(),
+    };
+    let usage = summary.usage.as_ref().and_then(|usage| {
+        let converted = NativeNormalizedUsage::from_core(usage, accounting);
+        if converted.is_none() {
+            diagnostics.push(COUNT_NOT_REPRESENTABLE_DIAGNOSTIC.to_string());
+        }
+        converted
+    });
+    SessionUsage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source,
+        session_id,
+        usage,
+        request_count: js_count(summary.request_count).unwrap_or(i64::MAX),
+        total_request_count: js_count(summary.total_request_count).unwrap_or(i64::MAX),
+        accounting: summary
+            .accounting
+            .iter()
+            .map(|mode| mode.as_str().to_string())
+            .collect(),
+        models: summary.models,
+        first_ts_ms: Some(summary.first_ts_ms),
+        last_ts_ms: Some(summary.last_ts_ms),
+        diagnostics,
+        overflowed: summary.overflowed,
+    }
 }
 
 #[napi(object)]
@@ -434,6 +837,10 @@ pub struct NativeStats {
     pub total: i64,
     pub by_source: Vec<SourceCount>,
     pub by_project: Vec<ProjectCount>,
+    /// Which key `by_project` is bucketed by: `project_key` or `cwd`. Read it
+    /// rather than assuming -- the two produce different counts for the same
+    /// database.
+    pub grouped_by: String,
     pub first_timestamp_ms: Option<i64>,
     pub last_timestamp_ms: Option<i64>,
 }
@@ -443,6 +850,9 @@ pub struct StatsOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub tag: Option<String>,
+    /// Bucket `by_project` by the raw working directory instead of the
+    /// canonical project key. Defaults to false.
+    pub by_cwd: Option<bool>,
 }
 
 async fn read_database<T, F>(path: PathBuf, empty: T, operation: F) -> napi::Result<T>
@@ -640,7 +1050,7 @@ pub async fn get_session_tool_calls_page(
     let (page_source, page_session_id) = (source.clone(), session_id.clone());
     read_database_with_schema(
         path,
-        ai_hist_core::SessionToolCallPage {
+        ai_hist::SessionToolCallPage {
             tool_calls: Vec::new(),
             next_cursor: None,
         },
@@ -658,6 +1068,58 @@ pub async fn get_session_tool_calls_page(
             .map(NativeSessionToolCall::from)
             .collect(),
         next_cursor: page.next_cursor.map(evidence_cursor),
+    })
+}
+
+/// One bounded page of user turns for one session, oldest first.
+///
+/// Each turn carries the ordered blocks the provider attached to one user
+/// message: the human's own text and the tool results that came back with it,
+/// with the measured payload size of each. Computed from `session_events`
+/// rather than a table of its own, so it cannot disagree with the transcript.
+#[napi]
+pub async fn get_session_user_turns_page(
+    source: String,
+    session_id: String,
+    options: Option<UserTurnsPageOptions>,
+) -> napi::Result<SessionUserTurnsPage> {
+    let options = options.unwrap_or(UserTurnsPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreEventCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionUserTurnPage {
+            user_turns: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_event_read_current,
+        move |conn| core_session_user_turns_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionUserTurnsPage {
+        contract_version: SESSION_EVIDENCE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        user_turns: page
+            .user_turns
+            .into_iter()
+            .map(NativeSessionUserTurn::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| EventCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
     })
 }
 
@@ -681,7 +1143,7 @@ pub async fn get_session_file_edits_page(
     let (page_source, page_session_id) = (source.clone(), session_id.clone());
     read_database_with_schema(
         path,
-        ai_hist_core::SessionFileEditPage {
+        ai_hist::SessionFileEditPage {
             file_edits: Vec::new(),
             next_cursor: None,
         },
@@ -702,6 +1164,75 @@ pub async fn get_session_file_edits_page(
     })
 }
 
+/// One bounded page of a session's model requests, oldest first.
+///
+/// Both halves of the identity are required for the same reason the evidence
+/// pages require them: provider session ids collide across providers.
+#[napi]
+pub async fn get_session_requests_page(
+    source: String,
+    session_id: String,
+    options: Option<RequestPageOptions>,
+) -> napi::Result<SessionRequestsPage> {
+    let options = options.unwrap_or(RequestPageOptions {
+        db_path: None,
+        limit: None,
+        after: None,
+    });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let limit = validate_limit(options.limit, DEFAULT_EVENT_LIMIT, 1_000)?;
+    let path = db_path(options.db_path);
+    let after = options.after.map(|cursor| CoreRequestCursor {
+        ts_ms: cursor.ts_ms,
+        id: cursor.id,
+    });
+    let (page_source, page_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(
+        path,
+        ai_hist::SessionRequestPage {
+            requests: Vec::new(),
+            next_cursor: None,
+        },
+        schema_is_usage_read_current,
+        move |conn| core_session_requests_page(conn, &source, &session_id, limit, after.as_ref()),
+    )
+    .await
+    .map(|page| SessionRequestsPage {
+        contract_version: SESSION_USAGE_CONTRACT_VERSION,
+        source: page_source,
+        session_id: page_session_id,
+        requests: page
+            .requests
+            .into_iter()
+            .map(NativeSessionRequest::from)
+            .collect(),
+        next_cursor: page.next_cursor.map(|cursor| RequestCursor {
+            ts_ms: cursor.ts_ms,
+            id: cursor.id,
+        }),
+    })
+}
+
+/// Provider-neutral usage rollup for one session.
+#[napi]
+pub async fn get_session_usage(
+    source: String,
+    session_id: String,
+    options: Option<SessionUsageOptions>,
+) -> napi::Result<SessionUsage> {
+    let options = options.unwrap_or(SessionUsageOptions { db_path: None });
+    let source = validate_identity(source, "source")?;
+    let session_id = validate_identity(session_id, "sessionId")?;
+    let path = db_path(options.db_path);
+    let (summary_source, summary_session_id) = (source.clone(), session_id.clone());
+    read_database_with_schema(path, None, schema_is_usage_read_current, move |conn| {
+        core_session_usage_summary(conn, &source, &session_id)
+    })
+    .await
+    .map(|summary| session_usage(summary_source, summary_session_id, summary))
+}
+
 /// Database statistics over already-indexed data.
 #[napi]
 pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
@@ -709,7 +1240,13 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
         scope: None,
         db_path: None,
         tag: None,
+        by_cwd: None,
     });
+    let grouping = if options.by_cwd.unwrap_or(false) {
+        ai_hist::ProjectGrouping::Cwd
+    } else {
+        ai_hist::ProjectGrouping::ProjectKey
+    };
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
     read_database(
@@ -719,11 +1256,12 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
             total: 0,
             by_source: Vec::new(),
             by_project: Vec::new(),
+            grouped_by: grouping.as_str().to_string(),
             first_timestamp_ms: None,
             last_timestamp_ms: None,
         },
         move |conn| {
-            let result = core_stats_scoped(conn, options.tag.as_deref(), scope)?;
+            let result = core_stats_scoped_by(conn, options.tag.as_deref(), scope, grouping)?;
             Ok(NativeStats {
                 scope: scope_name(scope),
                 total: result.total,
@@ -737,6 +1275,7 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
                     .into_iter()
                     .map(|(project, count)| ProjectCount { project, count })
                     .collect(),
+                grouped_by: result.grouping.as_str().to_string(),
                 first_timestamp_ms: result.first_timestamp_ms,
                 last_timestamp_ms: result.last_timestamp_ms,
             })
@@ -764,12 +1303,17 @@ pub struct CatalogSession {
     pub raw_path: Option<String>,
     pub source_stamp: Option<String>,
     pub discovery_state: String,
+    /// Canonical project identity: `host/owner/repo`, or the working
+    /// directory when no git remote resolves.
+    pub project_key: Option<String>,
+    /// `remote`, `path`, or `inherited`.
+    pub project_key_method: Option<String>,
     pub locations: Vec<String>,
     pub from_cache: bool,
 }
 
-impl From<ai_hist_engine::ShallowSession> for CatalogSession {
-    fn from(session: ai_hist_engine::ShallowSession) -> Self {
+impl From<ai_hist::ShallowSession> for CatalogSession {
+    fn from(session: ai_hist::ShallowSession) -> Self {
         Self {
             source: session.source,
             session_id: session.session_id,
@@ -788,6 +1332,8 @@ impl From<ai_hist_engine::ShallowSession> for CatalogSession {
             raw_path: session.raw_path,
             source_stamp: session.source_stamp,
             discovery_state: session.discovery_state,
+            project_key: session.project_key,
+            project_key_method: session.project_key_method,
             locations: session.locations,
             from_cache: session.from_cache,
         }
@@ -809,6 +1355,9 @@ pub struct ListCatalogOptions {
     pub limit: Option<i64>,
     pub before_ms: Option<i64>,
     pub after: Option<CatalogCursor>,
+    /// Exact canonical project key (`host/owner/repo`, or the working
+    /// directory when the checkout has no remote).
+    pub project_key: Option<String>,
 }
 
 #[napi(object)]
@@ -831,33 +1380,35 @@ pub async fn list_session_catalog_page(
         limit: None,
         before_ms: None,
         after: None,
+        project_key: None,
     });
     validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::CatalogListOptions {
+    let request = ai_hist::CatalogListOptions {
         scope,
         sources: options.sources.unwrap_or_default(),
         limit: options.limit,
         before_ms: options.before_ms,
-        after: options.after.map(|cursor| ai_hist_engine::CatalogCursor {
+        after: options.after.map(|cursor| ai_hist::CatalogCursor {
             last_activity_ms: cursor.last_activity_ms,
             source: cursor.source,
             session_id: cursor.session_id,
         }),
+        project_key: options.project_key,
     };
     read_database_with_schema(
         path,
-        ai_hist_engine::SessionCatalogPage {
+        ai_hist::SessionCatalogPage {
             scope,
             ..Default::default()
         },
         schema_is_catalog_read_current,
-        move |conn| ai_hist_engine::list_session_catalog_page(conn, &request),
+        move |conn| ai_hist::list_session_catalog_page(conn, &request),
     )
     .await
     .map(|page| SessionCatalogPage {
-        contract_version: ai_hist_engine::SESSION_CATALOG_CONTRACT_VERSION,
+        contract_version: ai_hist::SESSION_CATALOG_CONTRACT_VERSION,
         scope: scope_name(page.scope),
         sessions: page
             .sessions
@@ -951,13 +1502,13 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
     let connectors = source_connector_selection(options.source_connectors)?;
     ensure_acquisition_scope_supported(scope, "discovery", &sources, &connectors)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::DiscoverOptions {
+    let request = ai_hist::DiscoverOptions {
         scope,
         sources,
         limit: options.limit.map(|limit| limit as usize),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
+        ai_hist::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1054,6 +1605,16 @@ pub struct HydrateSessionResult {
     pub presence: String,
     pub indexed_through: HydrationIndexedThrough,
     pub evidence: HydrationEvidence,
+    /// Bytes read from provider files by this hydration. About the size of
+    /// the append when a live transcript grew, and small but **not zero** when
+    /// the session was unchanged: deciding nothing changed means validating
+    /// each cursor against a bounded window of the file it was written from.
+    /// Zero is reserved for a pass that opened no provider file at all.
+    pub bytes_read: i64,
+    /// Evidence kinds this hydration can have indexed, as wire names
+    /// (`history`, `session_event`, `tool_call`, `file_edit`,
+    /// `relationship`, `commit_link`).
+    pub coverage: Vec<String>,
     pub related_session_ids: Vec<String>,
     pub diagnostics: Vec<HydrationDiagnostic>,
 }
@@ -1084,14 +1645,14 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
     let connectors = source_connector_selection(options.source_connectors)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);
-    let request = ai_hist_engine::HydrateSessionOptions {
+    let request = ai_hist::HydrateSessionOptions {
         source: options.source,
         session_id: options.session_id,
         scope,
         include_related: options.include_related.unwrap_or(true),
     };
     let result = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::hydrate_session_at_with_connectors(&path, &request, &connectors)
+        ai_hist::hydrate_session_at_with_connectors(&path, &request, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1115,6 +1676,12 @@ pub async fn hydrate_session(options: HydrateSessionOptions) -> napi::Result<Hyd
             file_edits: result.evidence.file_edits as i64,
             related_sessions: result.evidence.related_sessions as i64,
         },
+        bytes_read: result.bytes_read,
+        coverage: result
+            .coverage
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
         related_session_ids: result.related_session_ids,
         diagnostics: result
             .diagnostics
@@ -1182,6 +1749,7 @@ pub struct NativeSessionRelationship {
     pub spawned_at_ms: Option<i64>,
     pub created_ms: i64,
     pub relationship_uid: String,
+    pub origin_session_id: Option<String>,
 }
 
 impl From<CoreSessionRelationship> for NativeSessionRelationship {
@@ -1203,6 +1771,7 @@ impl From<CoreSessionRelationship> for NativeSessionRelationship {
             spawned_at_ms: relationship.spawned_at_ms,
             created_ms: relationship.created_ms,
             relationship_uid: relationship.relationship_uid,
+            origin_session_id: relationship.origin_session_id,
         }
     }
 }
@@ -1252,6 +1821,7 @@ pub struct NativeSessionRelationships {
     pub session_id: String,
     pub as_parent: Vec<NativeSessionRelationship>,
     pub as_child: Vec<NativeSessionRelationship>,
+    pub continuity: Vec<NativeSessionRelationship>,
     pub capabilities: NativeRelationshipCapabilities,
     pub diagnostics: Vec<NativeRelationshipDiagnostic>,
 }
@@ -1269,6 +1839,11 @@ impl From<CoreSessionRelationships> for NativeSessionRelationships {
                 .collect(),
             as_child: relationships
                 .as_child
+                .into_iter()
+                .map(NativeSessionRelationship::from)
+                .collect(),
+            continuity: relationships
+                .continuity
                 .into_iter()
                 .map(NativeSessionRelationship::from)
                 .collect(),
@@ -1376,6 +1951,9 @@ pub struct SessionTreeOptions {
     pub db_path: Option<String>,
     pub max_depth: Option<i64>,
     pub max_nodes: Option<i64>,
+    /// Which edges the walk follows. Omitted means delegation only, which is
+    /// what every caller got before continuity existed.
+    pub relationship_kinds: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -1385,6 +1963,35 @@ pub struct SessionChildrenPageOptions {
     pub db_path: Option<String>,
     pub limit: Option<i64>,
     pub after: Option<RelationshipCursor>,
+    pub relationship_kinds: Option<Vec<String>>,
+}
+
+/// Every relationship kind a caller may name, so a typo is refused at the
+/// boundary rather than answered with a silently empty page.
+const RELATIONSHIP_KIND_CHOICES: &[&str] = &[
+    "delegated",
+    "materialized_local",
+    "continuation",
+    "fork",
+    "resume",
+];
+
+fn validate_relationship_kinds(kinds: Option<Vec<String>>) -> napi::Result<CoreRelationshipKinds> {
+    let Some(kinds) = kinds else {
+        return Ok(CoreRelationshipKinds::delegation());
+    };
+    for kind in &kinds {
+        if !RELATIONSHIP_KIND_CHOICES.contains(&kind.as_str()) {
+            return Err(native_error(
+                "INVALID_ARGUMENT",
+                format!(
+                    "relationshipKinds must name only {}, got '{kind}'",
+                    RELATIONSHIP_KIND_CHOICES.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(CoreRelationshipKinds::only(kinds))
 }
 
 /// Direct delegation relationships for one session, in both directions.
@@ -1405,6 +2012,7 @@ pub async fn get_session_relationships(
         session_id: session_id.clone(),
         as_parent: Vec::new(),
         as_child: Vec::new(),
+        continuity: Vec::new(),
         capabilities: relationship_capabilities(&source).into(),
         diagnostics: Vec::new(),
     };
@@ -1434,6 +2042,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
         DEFAULT_TREE_MAX_NODES,
         MAX_TREE_MAX_NODES,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1471,6 +2080,7 @@ pub async fn get_session_tree(options: SessionTreeOptions) -> napi::Result<Nativ
                 &CoreSessionTreeOptions {
                     max_depth,
                     max_nodes,
+                    relationship_kinds,
                 },
             )?;
             Ok(tree.into())
@@ -1491,6 +2101,7 @@ pub async fn get_session_children_page(
         DEFAULT_CHILDREN_PAGE_LIMIT,
         MAX_CHILDREN_PAGE_LIMIT,
     )?;
+    let relationship_kinds = validate_relationship_kinds(options.relationship_kinds)?;
     let path = db_path(options.db_path);
     let source = options.source;
     let session_id = options.session_id;
@@ -1506,8 +2117,14 @@ pub async fn get_session_children_page(
         },
         schema_is_relationship_read_current,
         move |conn| {
-            let page =
-                core_session_children_page(conn, &source, &session_id, limit, after.as_ref())?;
+            let page = core_session_children_page(
+                conn,
+                &source,
+                &session_id,
+                limit,
+                after.as_ref(),
+                &relationship_kinds,
+            )?;
             Ok(NativeSessionChildrenPage {
                 children: page
                     .children
@@ -1552,7 +2169,7 @@ pub async fn sync(options: Option<SyncOptions>) -> napi::Result<SyncResult> {
     let path = db_path(options.db_path);
     let result_path = path.display().to_string();
     let completed = napi::tokio::task::spawn_blocking(move || {
-        ai_hist_engine::sync_scoped_at_with_connectors(&path, scope, &connectors)
+        ai_hist::sync_scoped_at_with_connectors(&path, scope, &connectors)
     })
     .await
     .map_err(worker_error)?
@@ -1578,7 +2195,7 @@ pub async fn install_git_hooks(
 ) -> napi::Result<String> {
     napi::tokio::task::spawn_blocking(move || {
         let options = serde_json::from_str(&options_json)?;
-        ai_hist_engine::git_sdk::install(options, &node, &sdk_url)
+        ai_hist::git_sdk::install(options, &node, &sdk_url)
     })
     .await
     .map_err(worker_error)?
@@ -1589,9 +2206,38 @@ pub async fn install_git_hooks(
 pub async fn link_git_commit(options_json: String) -> napi::Result<String> {
     napi::tokio::task::spawn_blocking(move || {
         let options = serde_json::from_str(&options_json)?;
-        ai_hist_engine::git_sdk::link(options)
+        ai_hist::git_sdk::link(options)
     })
     .await
     .map_err(worker_error)?
     .map_err(|error: anyhow::Error| native_error("GIT_LINK_FAILED", format!("{error:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{js_count, MAX_JS_SAFE_COUNT};
+
+    /// The boundary is `Number.MAX_SAFE_INTEGER`, not `i64::MAX`: beyond it a
+    /// JavaScript number is no longer the value it was handed.
+    #[test]
+    fn a_count_javascript_cannot_represent_is_refused_not_rounded() {
+        assert_eq!(js_count(0), Some(0));
+        assert_eq!(js_count(43), Some(43));
+        assert_eq!(
+            js_count(MAX_JS_SAFE_COUNT),
+            Some(9_007_199_254_740_991_i64),
+            "the largest exactly representable integer still crosses"
+        );
+        assert_eq!(js_count(MAX_JS_SAFE_COUNT + 1), None);
+        assert_eq!(js_count(u64::MAX), None);
+    }
+
+    /// The regression this replaced: `i64::try_from(u64::MAX)` saturating to
+    /// `i64::MAX` handed JavaScript a number that is neither the stored value
+    /// nor representable.
+    #[test]
+    fn the_old_i64_ceiling_is_not_the_boundary() {
+        assert!(i64::try_from(u64::MAX).is_err());
+        assert_eq!(js_count(i64::MAX as u64), None);
+    }
 }

@@ -1,6 +1,9 @@
-use ai_hist_core::{observations, SessionEvent};
-use ai_hist_engine::{
-    sources::{AcquiredEvidence, ConnectorEvidence, ConnectorIdentity, SourceRegistry},
+use ai_hist::{observations, EvidenceKind, EvidenceRecord, SessionEvent};
+use ai_hist::{
+    sources::{
+        AcquiredEvidence, ConnectorEvidence, ConnectorIdentity, NormalizedSourceEvidence,
+        SourceRegistry,
+    },
     Candidate, DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, ScanEnv, SessionLocation,
     SessionScope, ShallowSession, ShallowSessionProvider,
 };
@@ -70,6 +73,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         source: "claude".into(),
         session_id: "session".into(),
         project: None,
+        project_key: None,
         cwd: None,
         git_branch: None,
         message_id: Some(uid.into()),
@@ -80,7 +84,33 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         text: Some(text.into()),
         model: None,
         token_json: None,
+        provider: None,
+        // A connector that knows the provider's request identity supplies it
+        // here; the round trip through evidence must preserve it, or a
+        // remotely hydrated session loses the grouping its records had.
+        request_id: Some(format!("req-{uid}")),
+        provider_message_id: Some(format!("msg-{uid}")),
         event_uid: uid.into(),
+        raw_kind: None,
+        // A synthetic assistant text event: none of the tool-result fidelity
+        // facts apply to it, and the absence is the honest answer.
+        tool_use_id: None,
+        payload_bytes: None,
+        payload_truncated: None,
+        payload_hash: None,
+        call_index: None,
+        event_index: None,
+        result_status: None,
+        event_source: None,
+        error_signal: None,
+        subagent_session_id: None,
+        agent_id: None,
+        stop_reason: None,
+        agent_version: None,
+        is_sidechain: None,
+        is_meta: None,
+        turn_id: None,
+        request_span: None,
     }
 }
 impl ShallowSessionProvider for Fixture {
@@ -182,6 +212,130 @@ fn hydration() -> HydrateSessionOptions {
     }
 }
 
+/// A connector that hands back a normalized snapshot containing a delegation
+/// edge, whatever the caller asked for.
+///
+/// `ShallowSessionProvider::acquire` takes no `include_related`, so this is not
+/// a misbehaving adapter -- it is every adapter that has not been told, which
+/// includes any third-party one. The option is a property of the request, so
+/// the engine has to enforce it rather than trust each connector to.
+#[derive(Clone)]
+struct RelatedFixture;
+impl RelatedFixture {
+    fn identity(&self) -> ConnectorIdentity {
+        ConnectorIdentity::new("related", "default")
+    }
+    fn locator(&self) -> String {
+        "related://default/session".to_string()
+    }
+}
+impl ShallowSessionProvider for RelatedFixture {
+    fn connector_id(&self) -> &str {
+        "related"
+    }
+    fn source(&self) -> &'static str {
+        "claude"
+    }
+    fn location(&self) -> SessionLocation {
+        SessionLocation::Remote
+    }
+    fn enumerate(&self, _env: &DiscoveryEnv<'_>, _limit: Option<usize>) -> Result<Vec<Candidate>> {
+        Ok(vec![Candidate {
+            source: "claude",
+            locator: self.locator(),
+            session_id: Some("session".into()),
+            recency_hint_ms: Some(1),
+            stamp: "v1".into(),
+        }])
+    }
+    fn read_shallow(
+        &self,
+        _scan: &ScanEnv<'_>,
+        _catalog: Option<&Connection>,
+        _candidate: &Candidate,
+    ) -> Result<Option<ShallowSession>> {
+        Ok(Some(ShallowSession {
+            source: "claude".into(),
+            session_id: "session".into(),
+            raw_path: Some(self.locator()),
+            ..Default::default()
+        }))
+    }
+    fn acquire(
+        &self,
+        _home: &Path,
+        _observation: &observations::SessionObservation,
+    ) -> Result<AcquiredEvidence> {
+        Ok(AcquiredEvidence::Normalized(NormalizedSourceEvidence {
+            source_stamp: "v1".into(),
+            source_bytes: 2,
+            covered_kinds: vec![EvidenceKind::SessionEvent, EvidenceKind::Relationship],
+            records: vec![
+                EvidenceRecord {
+                    kind: EvidenceKind::SessionEvent,
+                    payload: serde_json::json!({"source":"claude","session_id":"session","event_uid":"turn","role":"assistant","kind":"text","ts_ms":1,"text":"answer"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    record_id: None,
+                    revision_id: None,
+                },
+                EvidenceRecord {
+                    kind: EvidenceKind::Relationship,
+                    payload: serde_json::json!({"source":"claude","parent_session_id":"session","relationship_uid":"child-1","child_session_id":"child","relationship":"delegated","identity_status":"observed","evidence_kind":"transcript","created_ms":1,"updated_ms":1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    record_id: None,
+                    revision_id: None,
+                },
+            ],
+        }))
+    }
+}
+
+fn edges(db: &Path) -> Result<i64> {
+    Ok(ai_hist::open_db(db)?.query_row(
+        "SELECT COUNT(*) FROM session_relationships",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// `include_related: false` asks for the selected thread alone. Honouring it
+/// only in the response -- suppressing related ids while still writing the edge
+/// and reporting `relationship` coverage -- tells the caller their opt-out was
+/// applied when the evidence went in anyway.
+#[test]
+fn declining_related_evidence_is_enforced_against_a_provider_that_returns_it() -> Result<()> {
+    let fixture = RelatedFixture;
+    let mut registry = SourceRegistry::new();
+    registry.register(Box::new(fixture.clone()))?;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
+
+    let thread_only = registry.hydrate_at(&db, &hydration(), &fixture.identity())?;
+    assert!(
+        !thread_only.coverage.contains(&EvidenceKind::Relationship),
+        "coverage still claims delegation: {:?}",
+        thread_only.coverage
+    );
+    assert_eq!(thread_only.capability, "partial");
+    assert!(thread_only.related_session_ids.is_empty());
+    assert_eq!(edges(&db)?, 0, "the declined edge was persisted anyway");
+
+    // Positive control: the same snapshot, asked for in full. Without this the
+    // assertions above would also pass for a fixture whose edge never arrived.
+    let mut related = hydration();
+    related.include_related = true;
+    let full = registry.hydrate_at(&db, &related, &fixture.identity())?;
+    assert!(full.coverage.contains(&EvidenceKind::Relationship));
+    assert_eq!(edges(&db)?, 1);
+    assert_eq!(full.related_session_ids, vec!["child".to_string()]);
+    Ok(())
+}
+
 #[test]
 fn explicit_registry_rejects_unknown_and_duplicate_before_auth_or_db() -> Result<()> {
     let fixture = Fixture::new("installed", "account1");
@@ -252,7 +406,7 @@ fn independent_connector_snapshots_are_canonical_in_both_scan_and_hydration_orde
                 "unchanged"
             );
         }
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         let observations = observations::list(&conn, "claude", "session")?;
         assert_eq!(observations.len(), 2);
         for observation in &observations {
@@ -352,7 +506,7 @@ fn independent_connector_snapshots_are_canonical_in_both_scan_and_hydration_orde
             .hydrate_at(&db, &hydration(), &b.identity())
             .is_err());
         drop(conn);
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
     }
     Ok(())
@@ -368,7 +522,7 @@ fn connector_instances_and_failed_capture_keep_independent_retry_state() -> Resu
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     registry.sync_at(&db, SessionScope::Remote, &[a.identity(), b.identity()])?;
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     conn.execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON observation_hydration_checkpoints BEGIN SELECT RAISE(ABORT,'delivery capture full'); END;")?;
     assert!(registry
         .hydrate_at(&db, &hydration(), &a.identity())
@@ -441,7 +595,7 @@ fn local_and_remote_observations_keep_the_local_projection_in_either_order() -> 
         local_options.scope = SessionScope::Local;
         registry.hydrate_at(&db, &local_options, &local.identity())?;
         registry.hydrate_at(&db, &hydration(), &remote.identity())?;
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 2);
         assert_eq!(
             conn.query_row("SELECT raw_path FROM sessions", [], |row| row
@@ -476,7 +630,7 @@ fn one_connectors_non_session_skip_cannot_hide_another_connectors_same_locator()
     registry.discover_at(&db, &options(), &[a.identity()], |_| {})?;
     let result = registry.discover_at(&db, &options(), &[b.identity()], |_| {})?;
     assert_eq!(result.discovered, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(observations::list(&conn, "claude", "session")?.len(), 1);
     assert_eq!(
         conn.query_row(
@@ -528,7 +682,7 @@ fn provider_and_two_recall_instances_keep_four_observations_one_session_two_loca
             let result = registry.hydrate_at(&db, &options, &adapter.identity())?;
             assert_eq!(result.capability, "partial");
         }
-        let conn = ai_hist_core::open_db(&db)?;
+        let conn = ai_hist::open_db(&db)?;
         assert_eq!(observations::list(&conn, "claude", "session")?.len(), 4);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
@@ -566,7 +720,7 @@ fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_i
     assert_eq!(first.discovered, 1);
     let second = registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
     assert_eq!(second.skipped_unchanged, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(
         observations::list(&conn, "claude", "session")?[0]
             .raw_locator
@@ -643,7 +797,7 @@ fn limited_discovery_defers_unknown_aliases_without_losing_existing_observations
     let both = [a.identity(), b.identity()];
     let limited = registry.discover_at(&db, &options(), &both, |_| {})?;
     assert_eq!(limited.counters.shallow_reads, 1);
-    let conn = ai_hist_core::open_db(&db)?;
+    let conn = ai_hist::open_db(&db)?;
     assert_eq!(observations::list(&conn, "claude", "session")?.len(), 1);
     // Selecting the opaque connector directly gives it its own discovery budget.
     registry.discover_at(&db, &options(), &[b.identity()], |_| {})?;

@@ -5,8 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import type { Writable } from 'node:stream';
 import {
-  controlHistoryDelivery, createHistoryDelivery, defaultDbPath, drainHistoryDelivery, exportHistoryNdjson,
-  historyDeliveryStatus, historyDeliveryRetention, loadHistoryPlugins, runHistoryDelivery, InvalidArgumentError,
+  deliveryRequest, defaultDbPath, exportHistoryNdjson,
+  loadHistoryPlugins, InvalidArgumentError,
   type DeliveryJobConfig, type HistoryExportSelection, type HistoryPluginModule,
 } from './index.js';
 
@@ -20,48 +20,29 @@ export async function loadHistoryApplicationConfig(path: string) {
   return { config, registry: await loadHistoryPlugins(config.plugins, { baseDirectory: dirname(absolute) }) };
 }
 
-export async function runDeliveryCommand(action: string, options: {
+/** Where a delivery run's output goes. Structurally the CLI's own `CliIo`. */
+export interface DeliveryIo {
+  stdout(chunk: string): void;
+  stderr(chunk: string): void;
+}
+
+/** Legacy CLI entry point: explicit migration error, with no receiver or DB access. */
+export async function runDeliveryCommand(action: string, io: DeliveryIo, options: {
   dbPath?: string; configPath?: string; jobId?: string; pollIntervalMs?: number; requestTimeoutMs?: number;
-}): Promise<void> {
-  const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
-  if (action === 'status') { output({ jobs: await historyDeliveryStatus(options.jobId, options), retention: await historyDeliveryRetention(options) }); return; }
-  if (['pause', 'resume', 'retry', 'cancel'].includes(action)) {
-    if (!options.jobId) throw new InvalidArgumentError('delivery control requires a job ID', 'INVALID_ARGUMENT');
-    output(await controlHistoryDelivery(options.jobId, action as 'pause' | 'resume' | 'retry' | 'cancel', options));
-    return;
-  }
-  if (!options.configPath) throw new InvalidArgumentError('delivery enable/drain/run requires --config', 'INVALID_ARGUMENT');
-  const { config, registry } = await loadHistoryApplicationConfig(options.configPath);
-  if (action === 'enable') {
-    if (!config.job) throw new InvalidArgumentError('delivery enable requires a job in the config', 'INVALID_ARGUMENT');
-    const destination = registry.destination(config.job.destination_id, config.job.instance_id);
-    if (!destination || destination.mappingVersion !== config.job.mapping_version) throw new InvalidArgumentError('job requires its configured destination and mapping version', 'INVALID_ARGUMENT');
-    output(await createHistoryDelivery(config.job, options));
-    return;
-  }
-  const abort = new AbortController();
-  const stop = () => abort.abort();
-  process.once('SIGINT', stop); process.once('SIGTERM', stop);
-  const runOptions = { ...options, signal: abort.signal, jobIds: options.jobId ? [options.jobId] : undefined };
-  try {
-    if (action === 'drain') {
-      const result = await drainHistoryDelivery(registry, runOptions);
-      output(result);
-      if (result.issues.length || result.statuses.some((job) => job.state === 'blocked' || job.failure)) process.exitCode = 1;
-    } else if (action === 'run') {
-      await runHistoryDelivery(registry, { ...runOptions, onProgress: (value) => {
-        process.stderr.write(`${JSON.stringify(value)}\n`);
-      } });
-    } else throw new InvalidArgumentError('unknown delivery command', 'INVALID_ARGUMENT');
-  } finally {
-    process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
-  }
+  signal?: AbortSignal;
+}): Promise<number> {
+  void action; void io;
+  return deliveryRequest<number>({ operation: 'moved_to_probe' }, options);
 }
 
 async function write(stream: Writable, chunk: string): Promise<void> {
   await new Promise<void>((resolve, reject) => stream.write(chunk, (error) => error ? reject(error) : resolve()));
 }
-export async function runHistoryExportCommand(options: { dbPath?: string; selectionPath: string; outputPath?: string }): Promise<void> {
+export async function runHistoryExportCommand(
+  options: { dbPath?: string; selectionPath: string; outputPath?: string },
+  /** Destination when no `--out` is given. Required unless `outputPath` is set. */
+  stdoutStream?: Writable,
+): Promise<void> {
   const canonicalTarget = async (path: string): Promise<string> => {
     try { return await realpath(path); }
     catch (error) {
@@ -89,7 +70,10 @@ export async function runHistoryExportCommand(options: { dbPath?: string; select
   await assertSafeOutput();
   const selection = JSON.parse(await readFile(options.selectionPath, 'utf8')) as HistoryExportSelection;
   const temporary = options.outputPath ? `${resolve(options.outputPath)}.${randomUUID()}.tmp` : undefined;
-  const stream = temporary ? createWriteStream(temporary, { flags: 'wx', mode: 0o600 }) : process.stdout;
+  if (!temporary && !stdoutStream) {
+    throw new InvalidArgumentError('export without --out requires a destination stream', 'INVALID_ARGUMENT');
+  }
+  const stream: Writable = temporary ? createWriteStream(temporary, { flags: 'wx', mode: 0o600 }) : stdoutStream!;
   // Stream errors (e.g. a closed pipe) must exit nonzero, not become uncaught
   // events or a false claim that the full export completed.
   let streamError: Error | undefined;

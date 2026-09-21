@@ -34,13 +34,58 @@ export function nativeContractVersion(half = "sdk", root = repositoryRoot) {
   return Number(match[1]);
 }
 
+/**
+ * npm scope for the optional history plugins.
+ *
+ * `@relayhistory`, not `@agent-relay`: that scope belongs to the relay
+ * monorepo and carries its version line (cli-surface, cloud, sdk, fleet at
+ * 12.x). Publishing this repository's plugins into it made them read as relay
+ * packages at an unrelated version. Renamed while both were still unpublished,
+ * so no deprecation or alias was needed.
+ *
+ * The core packages (`ai-hist`, `ai-hist-native`, `ai-hist-mcp`) deliberately
+ * keep their unscoped names: they are published and depended on.
+ */
+/**
+ * Repository every published package must declare.
+ *
+ * `npm publish --provenance` verifies the manifest's `repository.url` against
+ * the repository recorded in the sigstore provenance bundle, and rejects a
+ * mismatch — an absent field included:
+ *
+ *   npm error code E422
+ *   npm error 422 Unprocessable Entity - Error verifying sigstore provenance
+ *     bundle: package.json: "repository.url" is "", expected to match
+ *     "https://github.com/AgentWorkforce/relayhistory" from provenance
+ *
+ * The core packages declare it in their checked-in manifests. The plugin
+ * packages did not, and the platform helpers are generated, so the value lives
+ * here and both paths read it.
+ */
+export const REPOSITORY_URL = "https://github.com/AgentWorkforce/relayhistory";
+
+/** The `repository` field for a package whose source lives at `directory`. */
+export function repositoryField(directory) {
+  return { type: "git", url: REPOSITORY_URL, directory };
+}
+
+export const SCOPE = "@relayhistory";
+
+/** Tarball filename prefix npm derives from SCOPE (`@x/y` packs as `x-y-...`). */
+const TARBALL_SCOPE = SCOPE.replace(/^@/, "");
+
 export const plugins = {
-  relayhistory: { name: "relayhistory", binary: "relayhistory-plugin" },
+  relayhistory: { name: "capture", binary: "relayhistory-plugin" },
   "provider-sources": {
-    name: "history-provider-sources",
+    name: "provider-sources",
     binary: "history-provider-sources",
   },
 };
+
+/** Published package name for a plugin, or for one of its platform helpers. */
+export function packageName(info, platform) {
+  return platform ? `${SCOPE}/${info.name}-${platform}` : `${SCOPE}/${info.name}`;
+}
 export const platforms = {
   "darwin-arm64": ["darwin", "arm64"],
   "darwin-x64": ["darwin", "x64"],
@@ -53,7 +98,15 @@ export const platforms = {
 export function validatePluginManifest(plugin, manifest) {
   const info = plugins[plugin];
   assert.ok(info, `Unknown history plugin: ${plugin}`);
-  assert.equal(manifest.name, `@agent-relay/${info.name}`);
+  assert.equal(manifest.name, packageName(info));
+  // Publishing uses --provenance, which rejects a manifest whose repository
+  // does not match the one in the sigstore bundle. Checked here so a missing
+  // field fails the packaging gate rather than the publish.
+  assert.equal(
+    manifest.repository?.url,
+    REPOSITORY_URL,
+    `${manifest.name} must declare repository.url ${REPOSITORY_URL}`,
+  );
   assert.match(manifest.version, /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/);
   assert.ok(
     manifest.peerDependencies?.["ai-hist"],
@@ -65,7 +118,7 @@ export function validatePluginManifest(plugin, manifest) {
   );
   for (const platform of Object.keys(platforms)) {
     assert.equal(
-      manifest.optionalDependencies?.[`@agent-relay/${info.name}-${platform}`],
+      manifest.optionalDependencies?.[packageName(info, platform)],
       manifest.version,
       `${manifest.name} must pin its ${platform} helper to its own version`,
     );
@@ -75,7 +128,7 @@ export function validatePluginManifest(plugin, manifest) {
 export function helperTarball(plugin, platform, manifest) {
   const info = validatePluginManifest(plugin, manifest);
   assert.ok(platforms[platform], `Unsupported history platform: ${platform}`);
-  return `agent-relay-${info.name}-${platform}-${manifest.version}.tgz`;
+  return `${TARBALL_SCOPE}-${info.name}-${platform}-${manifest.version}.tgz`;
 }
 
 // npm.cmd cannot be executed directly by spawnSync on Windows. Locate npm's

@@ -31,7 +31,11 @@ ai-hist search "the thing i was working on"
 
 The bare `ai-hist` command bootstraps a searchable database on first use: it discovers your most recent local sessions and indexes their evidence, then tells you what it found. It leaves an already-populated database alone. Run `ai-hist sync` any time you want a full re-ingest rather than the bounded first-run pass.
 
+RelayHistory follows each harness's configured state directory. Set `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GROK_HOME` to relocate Claude Code, Codex, or Grok data; unset or empty values fall back to `~/.claude`, `~/.codex`, and `~/.grok`. OpenCode uses `OPENCODE_DB`, defaulting to `~/.local/share/opencode/opencode.db`.
+
 Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows x64 — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
+
+Rust embedders depend on the `ai-hist` crate (`SessionStore::open` / `sync`). See [crates/ai-hist/README.md](crates/ai-hist/README.md).
 
 ## Every command
 
@@ -50,6 +54,14 @@ ai-hist stats                                        # how much history is index
 
 `ai-hist resume` prints a native resume command for Claude Code, Codex, Cursor, and Grok sessions. OpenCode and Agent Relay sessions are searchable and packable, but have no native resume command to print, so use `ai-hist pack` to carry that context forward instead.
 
+OpenCode is read from whichever of its two stores the machine has: the SQLite
+`opencode.db` that current releases write (`OPENCODE_DB`), or the older JSON
+tree under `storage/` (`OPENCODE_STORAGE_DIR`). Either way you get the full
+turn — text, tool calls and their results, file edits, per-message token
+counts, the provider-qualified model, why the turn stopped, compaction
+boundaries, and the link from a subagent session to the session that spawned
+it.
+
 ## MCP
 
 ```sh
@@ -58,7 +70,7 @@ npx -y ai-hist-mcp
 
 Exposes `search_history`, `list_sessions`, `get_session_events`, `get_session_tool_calls`, `get_session_file_edits`, `get_session_tree`, `history_stats`, and more as MCP tools. Wire it into any MCP-capable agent so it can query its own history mid-session.
 
-The optional `@agent-relay/relayhistory` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
+The optional `@relayhistory/capture` plugin adds `get_session_thread` and durable evidence readback when explicitly configured. The default MCP server contains only local history and generic delivery operations.
 
 The optional plugin owns stage credentials and token rotation through its Rust
 helper. The default MCP server does not load that helper or read its auth store.
@@ -84,9 +96,9 @@ ai-hist events SESSION_ID [--source SOURCE]    # --source only narrows a reused 
 
 `sessions tree`, `sessions relationships`, `sessions tools` and `sessions edits` require both positionals and fail without `SOURCE`. `session` and `events` take `SESSION_ID` on its own and reject a `SOURCE` positional; pass `--source` only to disambiguate an id two harnesses happen to share. (`sessions hydrate` also takes `SOURCE SESSION_ID`, but it is an acquisition command and does accept a scope.)
 
-Optional: install `@agent-relay/relayhistory` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
+Optional: install `@relayhistory/capture` to add authentication, durable delivery, readback, sharing and replay. Other services can implement the same public destination/source interfaces. See [optional cloud setup](docs/enable-cloud.md).
 
-Install `@agent-relay/history-provider-sources` and configure it explicitly for
+Install `@relayhistory/provider-sources` and configure it explicitly for
 remote provider acquisition. Its connectors reuse sign-ins you already have: `claude-web` lists your claude.ai/code sessions from the Claude Code CLI's stored OAuth token, and `codex-cloud` lists Codex cloud tasks through `codex cloud list --json`. With no connector configured, `--remote` fails loudly rather than silently falling back to local. See [remote connectors](docs/remote-connectors.md).
 
 The optional compatibility CLI reads sessions available through the legacy cloud API:
@@ -107,7 +119,7 @@ for authentication, durable delivery, readback, and the legacy sharing API.
 ## Why `ai-hist`
 
 - **Every harness, one search.** Claude Code, Codex, Cursor, Grok, OpenCode, Agent Relay — indexed side-by-side. No per-harness silo.
-- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened.
+- **Provider-aware evidence.** Prompts, tool calls, and edits are preserved as raw evidence, not summarized away — as much of it as each harness actually exposes. Hydration reports `full`, `partial`, or `shallow_only` per session, so you can tell thin coverage from a thing that never happened. Where a harness records less than the others, the gap is named. Cursor transcripts carry the assistant's prose and every tool call, but no tool output, model id, token usage or timestamp field — those are reported as unavailable, and a turn whose injected `<timestamp>` tag cannot be read is stamped from the file mtime with `CURSOR_TIMESTAMP_FROM_MTIME`. Grok logs no per-turn billing tokens, so its only token fact is a context-window proxy, and its hydration says so every time. The per-field detail is in [the session catalog](docs/session-catalog.md).
 - **Local by default.** SQLite on your machine. Export and delivery require an explicit selection; remote acquisition requires an installed source plugin.
 - **Handoff-native.** `pack` and `resume` are first-class commands, not afterthoughts.
 - **MCP-native.** Your agent queries its own memory the same way you do.

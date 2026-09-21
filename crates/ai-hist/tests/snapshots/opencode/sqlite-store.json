@@ -1,0 +1,270 @@
+{
+  "corpus_files": [
+    "opencode/sqlite-store.sql"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [
+    {
+      "cwd": "/tmp/project",
+      "file_path": "/tmp/project/src/client.ts",
+      "git_branch": null,
+      "lines_added": null,
+      "lines_removed": null,
+      "message_id": "msg_sqlite_a1",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "structured_patch_json": null,
+      "tool_name": "edit",
+      "tool_use_id": "toolu_sqlite_edit",
+      "ts_ms": 1776643210000,
+      "user_modified": null
+    }
+  ],
+  "fixture": "opencode/sqlite-store",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "review the retry change",
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "timestamp_ms": 1776643230000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "add a retry to the client",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "timestamp_ms": 1776643200000
+    },
+    {
+      "project": "/tmp/project",
+      "prompt": "now write the test",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "timestamp_ms": 1776643250000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "status": "hydrated"
+    },
+    {
+      "related_session_ids": [
+        "ses_sqlite_child"
+      ],
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "OpencodeSqlite",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "the current SQLite store: two sessions (one a child through `parent_id`), text/tool/step-finish parts, provider+model and token payloads on the assistant messages",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_child_u1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_child_u1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "text": "review the retry change",
+      "token_json": null,
+      "ts_ms": 1776643230000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_child_a1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_child_a1",
+      "model": "anthropic/claude-haiku-4-5",
+      "parent_id": "msg_sqlite_child_u1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "text": "The retry looks correct.",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":2000},\"input\":3,\"output\":50,\"reasoning\":0}",
+      "ts_ms": 1776643240000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_u1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_u1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "add a retry to the client",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_a1_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_a1",
+      "model": "anthropic/claude-sonnet-4-5",
+      "parent_id": "msg_sqlite_u1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "Reading the client.",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":9000},\"input\":7,\"output\":120,\"reasoning\":0}",
+      "ts_ms": 1776643210000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_result:toolu_sqlite_edit",
+      "git_branch": null,
+      "kind": "tool_result",
+      "message_id": "msg_sqlite_a1",
+      "model": "anthropic/claude-sonnet-4-5",
+      "parent_id": "msg_sqlite_u1",
+      "project": "/tmp/project",
+      "role": "tool_result",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "edited 1 file",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":9000},\"input\":7,\"output\":120,\"reasoning\":0}",
+      "ts_ms": 1776643210000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "tool_use:toolu_sqlite_edit",
+      "git_branch": null,
+      "kind": "tool_use",
+      "message_id": "msg_sqlite_a1",
+      "model": "anthropic/claude-sonnet-4-5",
+      "parent_id": "msg_sqlite_u1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "edit /tmp/project/src/client.ts",
+      "token_json": "{\"cache\":{\"read\":0,\"write\":9000},\"input\":7,\"output\":120,\"reasoning\":0}",
+      "ts_ms": 1776643210000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_u2_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_u2",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "now write the test",
+      "token_json": null,
+      "ts_ms": 1776643250000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "text:prt_sqlite_a2_text",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "msg_sqlite_a2",
+      "model": "anthropic/claude-opus-4-5",
+      "parent_id": "msg_sqlite_u2",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "text": "Added the test.",
+      "token_json": "{\"cache\":{\"read\":9000,\"write\":1200},\"input\":9,\"output\":210,\"reasoning\":40}",
+      "ts_ms": 1776643260000
+    }
+  ],
+  "session_relationships": [
+    {
+      "child_agent_name": null,
+      "child_agent_type": null,
+      "child_has_events": 1,
+      "child_model": "anthropic/claude-haiku-4-5",
+      "child_session_id": "ses_sqlite_child",
+      "evidence_kind": "opencode_parent_id",
+      "evidence_locator": "<home>/.local/share/opencode/opencode.db",
+      "evidence_ref": "ses_sqlite_child",
+      "identity_status": "observed",
+      "parent_session_id": "ses_sqlite_root",
+      "relationship": "delegated",
+      "relationship_uid": "child:ses_sqlite_child",
+      "source": "opencode",
+      "spawn_depth": null,
+      "spawned_at_ms": 1776643230000
+    }
+  ],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643230000,
+      "first_prompt": "review the retry change",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643240000,
+      "last_assistant_text": "The retry looks correct.",
+      "models_json": "[\"anthropic/claude-haiku-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/opencode.db",
+      "repo_url": null,
+      "session_id": "ses_sqlite_child",
+      "source": "opencode",
+      "source_stamp": "<n>:<n>",
+      "workspace_roots_json": null
+    },
+    {
+      "agent_version": null,
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "add a retry to the client",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643260000,
+      "last_assistant_text": "Added the test.",
+      "models_json": "[\"anthropic/claude-sonnet-4-5\"]",
+      "originator": null,
+      "raw_path": "<home>/.local/share/opencode/opencode.db",
+      "repo_url": null,
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "source_stamp": "<n>:<n>",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "opencode",
+  "tool_calls": [
+    {
+      "args_json": "{\"filePath\":\"/tmp/project/src/client.ts\"}",
+      "is_error": 0,
+      "message_id": "msg_sqlite_a1",
+      "name": "edit",
+      "session_id": "ses_sqlite_root",
+      "source": "opencode",
+      "target": "/tmp/project/src/client.ts",
+      "tool_use_id": "toolu_sqlite_edit",
+      "ts_ms": 1776643210000
+    }
+  ]
+}

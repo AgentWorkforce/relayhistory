@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -11,6 +11,8 @@ import { bootstrapLocal, InvalidArgumentError } from './index.js';
 const run = promisify(execFile);
 const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
 const sdk = new URL('./index.js', import.meta.url).href;
+const sqlite = await import('node:sqlite').catch(() => null);
+const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 
 test('bootstrap validates its work budget before loading native code', async () => {
   for (const limit of [0, -1, 1001, 1.5, NaN]) {
@@ -55,6 +57,48 @@ test('SDK bootstrap retries an empty home, indexes native evidence, and skips a 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+// Bootstrap hydrates with includeRelated: false, so the relationship evidence
+// it declined must not make a full provider look limited. OpenCode now writes
+// the complete normalized evidence shape, making it a useful regression case.
+test('bootstrap does not report declined evidence as a provider limitation', { skip: needsNodeSqlite }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ai-hist-bootstrap-coverage-'));
+  const env = { ...process.env, HOME: home, USERPROFILE: home, AI_HIST_DB: join(home, 'history.db') };
+  const call = async () => JSON.parse((await run(process.execPath, ['--input-type=module', '-e',
+    `import { bootstrapLocal } from ${JSON.stringify(sdk)}; console.log(JSON.stringify(await bootstrapLocal()));`,
+  ], { env })).stdout) as {
+    status: string; diagnostics: Array<{ source: string; code: string; message: string }>;
+  };
+  try {
+    await writeOpencodePrompt(home, 'oc-boot', 'bootstrap opencode prompt');
+    const result = await call();
+    const limited = result.diagnostics.find(
+      (item) => item.source === 'opencode' && item.code === 'CAPABILITY_LIMITED',
+    );
+    assert.equal(limited, undefined, 'declining relationships does not limit the provider');
+    assert.equal(result.status, 'ready');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+async function writeOpencodePrompt(home: string, sessionId: string, prompt: string): Promise<void> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const path = join(home, '.local', 'share', 'opencode', 'opencode.db');
+  await mkdir(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  db.exec(`
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+  `);
+  db.prepare('INSERT INTO session VALUES (?, ?, ?)').run(sessionId, '/work/app', 1);
+  db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('m1', sessionId, 1, JSON.stringify({ role: 'user' }));
+  db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run(
+    'p1', 'm1', sessionId, 2, JSON.stringify({ type: 'text', text: prompt }),
+  );
+  db.close();
+}
 
 test('bare CLI discovers and indexes on first invocation with an explicit database', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ai-hist-first-cli-'));

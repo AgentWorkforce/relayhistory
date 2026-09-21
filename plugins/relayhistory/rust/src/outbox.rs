@@ -17,9 +17,9 @@ use crate::convergence::{
     resolve_project_id, ConvergenceEnvelope, SessionCommitLink, TokenUsage, TrajectoryRow,
     UNKNOWN_PROJECT,
 };
-use ai_hist_core::{
-    session_events, session_file_edits, session_file_edits_page, HistoryEntry, SessionEvent,
-    SessionEvidenceCursor, SessionFileEdit,
+use ai_hist::{
+    session_events, session_file_edits, session_file_edits_page, HistoryEntry, NormalizedUsage,
+    SessionEvent, SessionEvidenceCursor, SessionFileEdit,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -165,7 +165,7 @@ pub fn build_outbox_batch(
     limit: usize,
     incognito: &HashSet<String>,
 ) -> Result<OutboxBatch> {
-    let limit = limit.clamp(1, ai_hist_core::storage::MAX_SCAN_LIMIT);
+    let limit = limit.clamp(1, ai_hist::storage::MAX_SCAN_LIMIT);
     // The server caps an ingest batch at 1000 records. A single trajectory row — especially
     // a compacted roll-up — expands to many convergence events (decisions + findings +
     // reflections), so the batch must be bounded on EMITTED records, not rows scanned, or a
@@ -182,7 +182,7 @@ pub fn build_outbox_batch(
 
     // --- history (prompts) — append-only, watermark on id ---
     {
-        for entry in ai_hist_core::storage::history_after(conn, cursor.history_id, limit)? {
+        for entry in ai_hist::storage::history_after(conn, cursor.history_id, limit)? {
             // Stop before consuming this row if the batch is full, so the cursor does not
             // advance past an un-emitted row (the next batch resumes from here).
             if records.len() >= MAX_RECORDS {
@@ -217,7 +217,7 @@ pub fn build_outbox_batch(
 
     // --- trajectories (decisions/retro) — keyset on (updated_ms, rowid) ---
     {
-        for t in ai_hist_core::storage::trajectories_after(
+        for t in ai_hist::storage::trajectories_after(
             conn,
             cursor.trajectory_updated_ms,
             cursor.trajectory_rowid,
@@ -258,7 +258,7 @@ pub fn build_outbox_batch(
 
     // --- session_commit_links → kind=session_outcome (one envelope per link row) ---
     {
-        for link in ai_hist_core::storage::commit_links_after(conn, cursor.commit_link_id, limit)? {
+        for link in ai_hist::storage::commit_links_after(conn, cursor.commit_link_id, limit)? {
             if records.len() + 2 > MAX_RECORDS {
                 break;
             }
@@ -312,7 +312,7 @@ pub fn build_outbox_batch(
     // --- file_edits that grew after the last prompt envelope for a session ---
     {
         for hit in
-            ai_hist_core::storage::changed_file_sessions_after(conn, cursor.file_edit_id, limit)?
+            ai_hist::storage::changed_file_sessions_after(conn, cursor.file_edit_id, limit)?
         {
             if records.len() >= MAX_RECORDS {
                 break;
@@ -349,7 +349,7 @@ pub fn build_outbox_batch(
     })
 }
 
-use ai_hist_core::storage::latest_history_for_session;
+use ai_hist::storage::latest_history_for_session;
 
 type PromptKey = (i64, String);
 type UsageCache = HashMap<(String, String), HashMap<PromptKey, TokenUsage>>;
@@ -385,191 +385,44 @@ fn session_usage_for_entry(
         .cloned())
 }
 
-struct UsageMessage {
-    id: String,
-    parent: Option<String>,
-    ts: i64,
-    role: String,
-    text: String,
-    usage: Option<TokenUsage>,
-}
-
+/// Attribute each prompt's usage, in the shape convergence sends.
+///
+/// The rule itself — group by message, deduplicate Claude's per-block usage
+/// copies, walk `parent_id` to the owning prompt, refuse wherever ownership
+/// is ambiguous — lives in `ai_hist::attribute_usage_to_prompts`, because it
+/// is a property of how providers record sessions rather than of how this
+/// plugin publishes them. This is the thin caller.
 fn attribute_session_usage(
     events: &[SessionEvent],
     source: &str,
 ) -> HashMap<PromptKey, TokenUsage> {
-    let mut groups: HashMap<&str, Vec<&SessionEvent>> = HashMap::new();
-    for event in events {
-        if let Some(id) = event.message_id.as_deref().filter(|id| !id.is_empty()) {
-            groups.entry(id).or_default().push(event);
-        }
-    }
-    let messages: HashMap<String, UsageMessage> = groups
+    ai_hist::attribute_usage_to_prompts(events, source)
         .into_iter()
-        .filter_map(|(id, rows)| {
-            let first = rows[0];
-            if rows.iter().any(|r| {
-                r.ts_ms != first.ts_ms || r.role != first.role || r.parent_id != first.parent_id
-            }) {
-                return None;
-            }
-            // Claude copies message.usage onto every content block. Counting rows
-            // would multiply one model request by its thinking/text/tool block count.
-            let tokens: Option<Vec<serde_json::Value>> = rows
-                .iter()
-                .filter_map(|r| r.token_json.as_deref())
-                .map(|raw| serde_json::from_str(raw).ok())
-                .collect();
-            let usage = tokens.and_then(|tokens| {
-                let first = tokens.first()?;
-                if tokens.iter().any(|value| value != first) {
-                    return None;
-                }
-                parse_token_usage(first, source)
-            });
-            let text = rows
-                .iter()
-                .filter(|r| r.kind == "text")
-                .filter_map(|r| r.text.as_deref())
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Some((
-                id.to_string(),
-                UsageMessage {
-                    id: id.to_string(),
-                    parent: first.parent_id.clone(),
-                    ts: first.ts_ms,
-                    role: first.role.clone(),
-                    text,
-                    usage,
-                },
-            ))
-        })
-        .collect();
-    // Keep even unidentifiable user events as boundaries; dropping one would
-    // incorrectly charge its answer to the preceding identifiable prompt.
-    let mut boundaries: Vec<_> = events.iter().filter(|e| e.role == "user").collect();
-    boundaries.sort_by_key(|e| e.ts_ms);
-    // Parsers use zero when time is missing. Such a turn could fall anywhere,
-    // so timestamp-only ownership is unsafe for the session.
-    let timestamps_known = boundaries.iter().all(|e| e.ts_ms > 0);
-    let mut prompt_counts = HashMap::new();
-    for user in messages.values().filter(|m| m.role == "user") {
-        *prompt_counts
-            .entry((user.ts, user.text.clone()))
-            .or_insert(0) += 1;
-    }
-    let mut attributed: HashMap<PromptKey, Option<TokenUsage>> = HashMap::new();
-    for message in messages.values().filter(|m| m.role == "assistant") {
-        let Some(usage) = &message.usage else {
-            continue;
-        };
-        let owner = if message.parent.is_some() {
-            parent_prompt(message, &messages)
-        } else if source == "codex" && message.ts > 0 && timestamps_known {
-            // Codex persists no parent IDs. Only its ordered human-turn stream
-            // establishes ownership: a tie at either boundary is ambiguous, and
-            // an explicit but broken parent link must never fall back to time.
-            let boundary = boundaries.partition_point(|u| u.ts_ms < message.ts);
-            if boundaries
-                .get(boundary)
-                .is_some_and(|u| u.ts_ms == message.ts)
-            {
-                None
-            } else {
-                boundary.checked_sub(1).and_then(|i| {
-                    let user = boundaries[i];
-                    if user.ts_ms <= 0 || (i > 0 && boundaries[i - 1].ts_ms == user.ts_ms) {
-                        return None;
-                    }
-                    messages.get(user.message_id.as_deref()?)
-                })
-            }
-        } else {
-            None
-        };
-        let Some(owner) = owner else { continue };
-        let key = (owner.ts, owner.text.clone());
-        // Identical text and timestamps cannot distinguish two user messages.
-        // Assigning both to a single history row would conceal a bad join.
-        if owner.text.is_empty() || prompt_counts.get(&key) != Some(&1) {
-            continue;
-        }
-        let total = attributed
-            .entry(key)
-            .or_insert_with(|| Some(TokenUsage::default()));
-        *total = total.as_ref().and_then(|total| add_usage(total, usage));
-    }
-    attributed
-        .into_iter()
-        .filter_map(|(key, usage)| usage.map(|u| (key, u)))
+        .filter_map(|(key, usage)| Some((key, collapse_usage(&usage)?)))
         .collect()
 }
 
-fn parent_prompt<'a>(
-    message: &'a UsageMessage,
-    messages: &'a HashMap<String, UsageMessage>,
-) -> Option<&'a UsageMessage> {
-    let mut current = message;
-    let mut visited = HashSet::new();
-    while visited.insert(current.id.as_str()) {
-        if current.role == "user" {
-            return Some(current);
-        }
-        current = messages.get(current.parent.as_deref()?)?;
-    }
-    // Broken/cyclic ancestry is missing evidence, not permission to charge the
-    // nearest prompt (which could belong to another conversation branch).
-    None
-}
-
-fn parse_token_usage(value: &serde_json::Value, source: &str) -> Option<TokenUsage> {
-    let obj = value.as_object()?;
-    let get = |key: &str| match obj.get(key) {
-        None => Some(0),
-        Some(value) => value.as_u64(),
+/// Collapse core's normalized usage into the five categories convergence
+/// carries, or `None` when every one of them is zero.
+///
+/// Core deliberately keeps more than this — the `ephemeral_5m`/`1h` cache
+/// split that burn prices differently, the provider's own reported total,
+/// and which counters the provider actually wrote. Dropping them is this
+/// wire format's decision, so it happens here rather than in the normalizer,
+/// and a consumer that needs them reads `NormalizedUsage` instead.
+///
+/// An all-zero result is not sent: a provider total with no token categories
+/// (`{"total_tokens": 100}`) collapses to nothing convergence can express,
+/// and publishing zeros would assert a measurement that was never made.
+fn collapse_usage(usage: &NormalizedUsage) -> Option<TokenUsage> {
+    let collapsed = TokenUsage {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        reasoning: usage.reasoning_tokens.unwrap_or(0),
+        cache_read: usage.cache_read_tokens,
+        cache_create: usage.cache_write_tokens,
     };
-    let (input, cache_read, cache_create) = match source {
-        "codex" => {
-            let cached = get("cached_input_tokens")?;
-            // CodexTokenTotals::to_token_json preserves inclusive input even
-            // after snapshot differencing. Emit exclusive input so cache reads
-            // cannot be counted again when convergence sums token categories.
-            (
-                get("input_tokens")?.checked_sub(cached)?,
-                cached,
-                get("cache_write_input_tokens")?,
-            )
-        }
-        // Claude stores native message.usage: input already excludes cache reads
-        // and writes. Subtracting them here would under-report ordinary input.
-        "claude" => (
-            get("input_tokens")?,
-            get("cache_read_input_tokens")?,
-            get("cache_creation_input_tokens")?,
-        ),
-        _ => return None,
-    };
-    let usage = TokenUsage {
-        input,
-        cache_read,
-        cache_create,
-        output: get("output_tokens")?,
-        reasoning: get("reasoning_output_tokens")?,
-    };
-    (usage != TokenUsage::default()).then_some(usage)
-}
-
-fn add_usage(a: &TokenUsage, b: &TokenUsage) -> Option<TokenUsage> {
-    Some(TokenUsage {
-        input: a.input.checked_add(b.input)?,
-        output: a.output.checked_add(b.output)?,
-        reasoning: a.reasoning.checked_add(b.reasoning)?,
-        cache_read: a.cache_read.checked_add(b.cache_read)?,
-        cache_create: a.cache_create.checked_add(b.cache_create)?,
-    })
+    (collapsed != TokenUsage::default()).then_some(collapsed)
 }
 
 /// The git branch a session was working on, cached per `(source, session_id)`.
@@ -587,7 +440,7 @@ fn session_branch_for_entry(
     branches
         .entry(key)
         .or_insert_with(|| {
-            ai_hist_core::storage::session_metadata(conn, &entry.source, sid)
+            ai_hist::storage::session_metadata(conn, &entry.source, sid)
                 .ok()
                 .flatten()
                 .and_then(|metadata| metadata.git_branch)
@@ -622,7 +475,7 @@ fn git_remote_for_entry(
 }
 
 fn session_cwd(conn: &Connection, source: &str, session_id: &str) -> Option<String> {
-    ai_hist_core::storage::session_metadata(conn, source, session_id)
+    ai_hist::storage::session_metadata(conn, source, session_id)
         .ok()
         .flatten()
         .and_then(|metadata| metadata.cwd)
@@ -630,19 +483,19 @@ fn session_cwd(conn: &Connection, source: &str, session_id: &str) -> Option<Stri
         .filter(|s| !s.is_empty())
 }
 
+/// The session's `origin` remote, through the one shared implementation.
+///
+/// Previously `git -C <cwd> remote get-url origin`. A subprocess is the wrong
+/// tool here on three counts: `git` is not guaranteed to be on `PATH` where a
+/// push runs, a non-zero exit is indistinguishable from "this checkout has no
+/// remote" (and so silently downgraded a real repository to the cwd basename,
+/// which is how the project store fragmented), and the outbox would be a
+/// second implementation of remote discovery that can drift from the one
+/// stamping `sessions.project_key`. `ai_hist::project_identity` reads
+/// `.git/config` directly and understands linked worktrees, which the old
+/// `is_dir` guard plus subprocess did not.
 fn git_origin_url(cwd: &str) -> Option<String> {
-    if !Path::new(cwd).is_dir() {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .args(["-C", cwd, "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!url.is_empty()).then_some(url)
+    ai_hist::project_identity::origin_remote_url(Path::new(cwd))
 }
 
 fn session_project_id(
@@ -652,7 +505,7 @@ fn session_project_id(
     repo: Option<&str>,
     remotes: &mut HashMap<String, Option<String>>,
 ) -> String {
-    let project = ai_hist_core::storage::session_project(conn, source, session_id)
+    let project = ai_hist::storage::session_project(conn, source, session_id)
         .ok()
         .flatten();
     let remote = session_cwd(conn, source, session_id).and_then(|cwd| {
@@ -745,7 +598,7 @@ fn learn_origin_session(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_hist_core::{init_db, insert_history};
+    use ai_hist::{init_db, insert_history};
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -772,7 +625,7 @@ mod tests {
                 session_id: Some(session.into()),
                 project: project.map(str::to_string),
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )
@@ -809,7 +662,7 @@ mod tests {
                 session_id: Some("usage-session".into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             },
         )
@@ -1128,7 +981,7 @@ mod tests {
                 session_id: Some(sid.into()),
                 project: None,
                 prompt: prompt.into(),
-                prompt_hash: Some(ai_hist_core::prompt_hash(prompt)),
+                prompt_hash: Some(ai_hist::prompt_hash(prompt)),
                 timestamp_ms: ts,
             };
             assert_eq!(
@@ -1173,7 +1026,7 @@ mod tests {
             session_id: Some(sid.into()),
             project: None,
             prompt: "ask".into(),
-            prompt_hash: Some(ai_hist_core::prompt_hash("ask")),
+            prompt_hash: Some(ai_hist::prompt_hash("ask")),
             timestamp_ms: 100,
         };
         let usage = session_usage_for_entry(&conn, &entry, &mut HashMap::new()).unwrap();
@@ -1270,10 +1123,16 @@ mod tests {
             "{\"input_tokens\":\"10\"}",
             "{\"input_tokens\":10,\"cached_input_tokens\":20}",
         ] {
-            assert!(
-                parse_token_usage(&serde_json::from_str(raw).unwrap(), "codex").is_none(),
-                "{raw}"
-            );
+            // The composition the publishing path uses: core normalizes (or
+            // refuses), and this plugin decides whether what is left is
+            // something convergence can carry.
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let collapsed = ai_hist::normalize_usage("codex", &value)
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(collapse_usage);
+            assert!(collapsed.is_none(), "{raw}");
         }
         let conn = mem();
         usage_prompt(&conn, "claude", "u1", 100, "first");
@@ -1315,17 +1174,6 @@ mod tests {
         let batch =
             build_outbox_batch(&conn, &SyncCursor::default(), 100, &HashSet::new()).unwrap();
         assert!(batch.records[0].usage.is_none());
-        assert!(add_usage(
-            &TokenUsage {
-                input: u64::MAX,
-                ..TokenUsage::default()
-            },
-            &TokenUsage {
-                input: 1,
-                ..TokenUsage::default()
-            }
-        )
-        .is_none());
     }
 
     /// A path-valued `project` must NOT suppress the remote lookup.
@@ -1539,7 +1387,7 @@ mod tests {
     fn unacknowledged_outbox_rebuilds_identically_after_reopening_unchanged_storage() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("history.db");
-        let conn = ai_hist_core::open_db(&db).unwrap();
+        let conn = ai_hist::open_db(&db).unwrap();
         add_history(&conn, "retry-session", "first prompt", 1);
         add_history(&conn, "retry-session", "second prompt", 2);
         // A transcript checkpoint is independent of convergence delivery.
@@ -1555,7 +1403,7 @@ mod tests {
         drop(conn);
 
         // Simulate a lost response: the caller persisted no acknowledgment.
-        let conn = ai_hist_core::open_db(&db).unwrap();
+        let conn = ai_hist::open_db(&db).unwrap();
         let resumed: SyncCursor = serde_json::from_str(&stored_cursor).unwrap();
         let retry = build_outbox_batch(&conn, &resumed, 1, &HashSet::new()).unwrap();
         assert_eq!(retry, first);

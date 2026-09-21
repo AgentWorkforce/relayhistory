@@ -1,0 +1,87 @@
+{
+  "corpus_files": [
+    "claude/incomplete-then-complete.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "claude/incomplete-then-complete",
+  "history": [
+    {
+      "project": "/tmp/project",
+      "prompt": "hi",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "ClaudeTranscript",
+  "notes": [],
+  "origin": "burn",
+  "quirk": "a complete assistant message is followed by an in-progress one (`stop_reason: null`)",
+  "session_events": [
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-user-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-user-1",
+      "model": null,
+      "parent_id": null,
+      "project": "/tmp/project",
+      "role": "user",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "hi",
+      "token_json": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "cwd": "/tmp/project",
+      "event_uid": "u-asst-1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u-asst-1",
+      "model": "claude-sonnet-4-6",
+      "parent_id": "u-user-1",
+      "project": "/tmp/project",
+      "role": "assistant",
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "text": "done",
+      "token_json": "{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":5,\"output_tokens\":2}",
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "2.1.96",
+      "cwd": "/tmp/project",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "hi",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643202000,
+      "last_assistant_text": "working...",
+      "models_json": "[\"claude-sonnet-4-6\"]",
+      "originator": null,
+      "raw_path": "<home>/.claude/projects/corpus/incomplete-then-complete.jsonl",
+      "repo_url": null,
+      "session_id": "33333333-3333-3333-3333-333333333333",
+      "source": "claude",
+      "source_stamp": "<n>:1418",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "claude",
+  "tool_calls": []
+}

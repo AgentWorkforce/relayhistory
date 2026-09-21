@@ -34,10 +34,29 @@ jobs:
         run: node --test scripts/*.test.mjs
 
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
 
       - name: Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
+
+      # Runs after "Rust tests" on purpose: that step has already compiled the
+      # sync_bench target in this profile, so the gate spends its time
+      # measuring rather than building. See docs/benchmarks.md.
+      - name: Sync and hydration throughput gate
+        run: node scripts/benchmark-sync.mjs --gate
+
+      # `test`, not `build`: it compiles everything `build` did and then runs
+      # what only exists in this configuration. Two whole classes of test are
+      # invisible to the `--all-features` run above -- the `#[cfg(not(feature
+      # = "delivery"))]` ones, and the integration tests that exercise the
+      # public surface an embedder actually gets, where `unstable-internal`
+      # is not there to re-export the internals. Both were passing locally
+      # and gated by nothing.
+      - name: Published crate builds and tests without optional features
+        run: cargo test -p ai-hist --no-default-features
+
+      - name: Crate publish dry-run
+        run: cargo publish --dry-run -p ai-hist --allow-dirty
 
       - name: Native binding contract
         working-directory: crates/ai-hist-napi
@@ -56,6 +75,14 @@ jobs:
 
       - name: Installed local SDK and CLI smoke test
         run: node scripts/smoke-history-packages.mjs
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: MSRV check
+        run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
     runs-on: ubuntu-latest
@@ -84,7 +111,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify repeated private-state replacement
-        run: cargo test -p ai-hist-engine write_private_replaces_existing_state
+        run: cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml write_private_replaces_existing_state
 
   optional-history-plugins:
     runs-on: ubuntu-latest
@@ -107,7 +134,18 @@ jobs:
             npm --prefix "plugins/$plugin/sdk" ci --ignore-scripts
             npm --prefix "plugins/$plugin/sdk" run build
           done
-      - name: Optional plugin tests
+      # Neither plugin is a workspace member, and each declares its own
+      # [workspace], so `cargo test --workspace` in `verify` cannot reach them —
+      # that job deletes `plugins/` first in any case. The build above compiles
+      # only the bin and lib targets, never `#[cfg(test)]` code, and
+      # `native-cloud-probe` tests the probe binary alone. Without this step the
+      # crates' own test suites never run anywhere, which is how a test calling
+      # a private function reached main with every check green.
+      - name: Optional plugin Rust tests
+        run: |
+          cargo test --manifest-path plugins/relayhistory/rust/Cargo.toml --locked
+          cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+      - name: Optional plugin SDK tests
         env:
           RELAYHISTORY_PLUGIN_BIN: ${{ github.workspace }}/plugins/relayhistory/rust/target/debug/relayhistory-plugin
           HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources

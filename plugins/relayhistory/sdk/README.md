@@ -1,8 +1,7 @@
 # Optional RelayHistory plugin
 
-Install alongside the local SDK: `npm install ai-hist @agent-relay/relayhistory`.
-This package owns RelayHistory authentication, legacy sharing/replay, a durable
-destination, and explicit readback/source adapters. It depends on the public
+Install alongside the local SDK: `npm install ai-hist @relayhistory/capture`.
+This package owns RelayHistory authentication, legacy sharing/replay, the probe upload engine, and explicit readback/source adapters. It depends on the public
 local SDK; installing or configuring it does not log in, read credentials, or
 start uploads. `ai-hist` itself has no cloud package dependency.
 
@@ -26,13 +25,13 @@ whose approval URL it writes to that terminal. A run with no terminal and no
 credential fails immediately rather than waiting for an approval nobody sees.
 
 These commands intentionally remain in the optional package. Replace imports
-from `ai-hist/cloud` with `@agent-relay/relayhistory`; local Git hook/commit-link
+from `ai-hist/cloud` with `@relayhistory/capture`; local Git hook/commit-link
 functions stay in `ai-hist`.
 
 Create an explicit plugin config, located beside the application's node_modules:
 
 ```json
-{"plugins":[{"module":"@agent-relay/relayhistory","options":{"baseUrl":"https://history.agentrelay.com","instanceId":"personal"}}]}
+{"plugins":[{"module":"@relayhistory/capture","options":{"baseUrl":"https://history.agentrelay.com","instanceId":"personal"}}]}
 ```
 
 Create a selection file before enabling delivery:
@@ -44,8 +43,8 @@ Create a selection file before enabling delivery:
 ```sh
 ai-hist plugin relayhistory-migration-status --config history.json
 ai-hist plugin relayhistory-enable --config history.json -- --selection selection.json
-ai-hist delivery run --config history.json
-ai-hist delivery status
+ai-hist plugin relayhistory-delivery --config history.json -- --action drain
+ai-hist plugin relayhistory-delivery --config history.json -- --action status
 ```
 
 Enable creates a new explicit delivery generation. It never interprets a legacy
@@ -55,8 +54,9 @@ acknowledged away. If the inspection is unavailable, explicitly set
 `acknowledgeUninspectedLegacySchedules: true` after checking your own schedules;
 this acknowledges an uninspected state, not a verified clear state. Arbitrary
 user-created supervisors remain their owner's responsibility. Migration checks
-are read-only and repeat before prepare/send. Background operation uses the same
-`ai-hist delivery run` coordinator under your existing supervisor.
+are read-only and repeat before prepare/send. Background operation runs in `agent-relay-probe`; bounded foreground drains
+use the same probe-owned Rust worker. Core `ai-hist delivery` commands now return
+`HISTORY_DELIVERY_MOVED`.
 
 Jobs bind both the canonical service endpoint and the auth-derived organization/
 workspace account. Changing endpoint requires a new instance/job; changing
@@ -76,7 +76,7 @@ engine through revision-fenced public source APIs, with independent connector
 provenance and per-kind snapshots.
 
 ```ts
-import { getDeliveredSession, getSessionThreadWithHistory } from '@agent-relay/relayhistory';
+import { getDeliveredSession, getSessionThreadWithHistory } from '@relayhistory/capture';
 const evidence = await getDeliveredSession({source:'claude',sessionId:'session-id'}, options);
 const thread = await getSessionThreadWithHistory({source:'claude',sessionId:'session-id'}, options);
 ```

@@ -1,7 +1,12 @@
 {
-  "name": "@agent-relay/relayhistory",
-  "version": "0.16.0",
+  "name": "@relayhistory/capture",
+  "version": "0.24.0",
   "description": "Optional RelayHistory destination, auth, sharing and recall plugin for ai-hist.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgentWorkforce/relayhistory",
+    "directory": "plugins/relayhistory/sdk"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -14,6 +19,7 @@
   "files": [
     "dist/index.*",
     "dist/helper.*",
+    "dist/delivery.*",
     "dist/plugin.*",
     "dist/cloud-client.*",
     "dist/cloud-auth-runtime.*",
@@ -27,7 +33,7 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "peerDependencies": {
-    "ai-hist": "^0.17.0"
+    "ai-hist": "^0.24.0"
   },
   "devDependencies": {
     "ai-hist": "file:../../../sdk-ts",
@@ -42,13 +48,13 @@
     "relayhistory-plugin": "./dist/cli.js"
   },
   "optionalDependencies": {
-    "@agent-relay/relayhistory-darwin-arm64": "0.16.0",
-    "@agent-relay/relayhistory-darwin-x64": "0.16.0",
-    "@agent-relay/relayhistory-linux-x64-gnu": "0.16.0",
-    "@agent-relay/relayhistory-linux-arm64-gnu": "0.16.0",
-    "@agent-relay/relayhistory-linux-x64-musl": "0.16.0",
-    "@agent-relay/relayhistory-linux-arm64-musl": "0.16.0",
-    "@agent-relay/relayhistory-win32-x64-msvc": "0.16.0"
+    "@relayhistory/capture-darwin-arm64": "0.24.0",
+    "@relayhistory/capture-darwin-x64": "0.24.0",
+    "@relayhistory/capture-linux-x64-gnu": "0.24.0",
+    "@relayhistory/capture-linux-arm64-gnu": "0.24.0",
+    "@relayhistory/capture-linux-x64-musl": "0.24.0",
+    "@relayhistory/capture-linux-arm64-musl": "0.24.0",
+    "@relayhistory/capture-win32-x64-msvc": "0.24.0"
   },
   "publishConfig": {
     "access": "public"

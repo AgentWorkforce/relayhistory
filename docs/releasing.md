@@ -1,11 +1,11 @@
 # Release and platform validation
 
 One workflow releases everything: `Publish RelayHistory release`
-(`.github/workflows/publish-napi.yml`; the file name is bound to npm OIDC
-trusted publishing and must not change). All public packages share one version:
-`ai-hist`, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
-`@agent-relay/relayhistory`, `@agent-relay/history-provider-sources` and their
-seven platform helper packages each. The SDK checks the current native contract
+(`.github/workflows/publish.yml`; the file name is bound to npm OIDC
+trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
+the `ai-hist` npm package, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
+`@relayhistory/capture`, `@relayhistory/provider-sources` and their
+seven platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).
 
@@ -43,16 +43,41 @@ and `crates/ai-hist-napi/src/lib.rs`).
    `ai-hist-native`, `ai-hist` and `ai-hist-mcp` in that order. The SDK root is
    never published before its platform artifacts, because npm multi-package
    publication is not atomic.
-4. After the clean registry install and the older-glibc CLI smoke tests pass,
-   `publish` pushes the version commit — only if the branch has not advanced —
-   and creates the `sdk-ts-v<version>` tag and GitHub Release.
-5. `plugins` checks out that persisted commit, packages each helper binary at
+4. `publish-crate` publishes the `ai-hist` crate to crates.io at that same
+   version via GitHub OIDC trusted publishing. `rust-lang/crates-io-auth-action`
+   exchanges the workflow's OIDC identity for a short-lived crates.io token and
+   passes it as `CARGO_REGISTRY_TOKEN` to `cargo publish`. There is no
+   long-lived crates.io secret. If the version already exists, the job skips
+   rather than failing. `dry_run` runs `cargo publish --dry-run -p ai-hist` and
+   publishes nothing. A crates.io-only retry uses `skip_core` with the
+   already-published `custom_version`; the job checks out `sdk-ts-v<version>`
+   and publishes the crate from that tag.
+5. After the clean registry install and the older-glibc CLI smoke tests pass,
+   `publish` tags the published tree as `sdk-ts-v<version>` and creates the
+   GitHub Release. A separate `persist-version` job rebases the version-only
+   commit onto the current branch tip and pushes, so a merge that landed
+   during publish does not drop the tag. Crate, plugins and probe depend on
+   `publish` (the tag), not on that persist. A rebase conflict still leaves
+   the tag and Release in place; `skip_core` with this `custom_version`
+   finishes anything that did not. The registry smoke installs `ai-hist` as
+   an ordinary dependency with npm's `--libc` set to this runner's family so
+   `ai-hist-native-linux-x64-gnu` (or musl) is selected.
+6. `plugins` checks out the tagged published tree, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
    at each plugin's peer minimum, then publishes the seven helpers of each
-   plugin before its JavaScript package.
-6. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
-   the same Release. See [agent-relay-probe.md](agent-relay-probe.md) for the
-   asset names the website mirrors.
+   plugin before its JavaScript package. Post-publish verification waits for
+   all 16 exact-version manifests to become visible on npm, then installs the
+   JavaScript packages as ordinary dependencies with npm's `--libc` set to this
+   runner's family (`glibc` or `musl`) so the matching platform helper is
+   selected, and loads the plugins. Missing versions (`E404`/`ETARGET`) are
+   retried up to 60 times, five seconds apart; other lookup errors or invalid
+   metadata fail immediately. Exhausted retries include npm's original error
+   output.
+7. `probe` attaches `agent-relay-probe-<platform>` and a matching `.sha256` to
+   the same Release. If the tag exists and the Release does not — a
+   `skip_core` retry after `gh release create` failed — probe creates the
+   Release from that tag first. See [agent-relay-probe.md](agent-relay-probe.md)
+   for the asset names the website mirrors.
 
 `scripts/set-release-version.mjs <version>` is the only place that knows what a
 plugin release version touches (version, the seven helper pins, the `ai-hist`
@@ -61,6 +86,29 @@ of each plugin's Rust crate plus that crate's own `Cargo.lock` entry — the
 helper and probe executables report `CARGO_PKG_VERSION`). It is idempotent, and
 the helper matrix, the version commit and the plugin job all run it, so what was
 compiled, what was committed and what is published cannot diverge.
+
+## Rust crate
+
+The published crate is `ai-hist` on crates.io. It shares the npm version line,
+so `sdk-ts-v0.18.8` is also `ai-hist@0.18.8` on crates.io. `ai-hist-cli` and
+`ai-hist-napi` stay unpublished workspace members (`publish = false`).
+
+Cargo semver is the Rust contract — there is no separate Rust contract-version
+constant. Any change to a public struct field, enum variant, or behaviour a
+consumer observes is a minor bump pre-1.0 and gets a `### Rust API` entry in
+`CHANGELOG.md`. Default features expose `SessionStore`, evidence structs,
+`Source`, and `Error`. Optional features (`delivery`, `opencode-backup`,
+`git-hooks`, `unstable-internal`) stay off for embedders.
+
+```bash
+cargo add ai-hist
+```
+
+```rust
+use ai_hist::SessionStore;
+let store = SessionStore::open(Default::default())?;
+store.sync(Default::default())?;
+```
 
 ## Dry runs
 
@@ -85,6 +133,77 @@ further.
 Because the re-run builds from the tag, it only works for releases cut by this
 workflow: a tag whose tree predates these scripts fails loudly at checkout or
 build time rather than shipping something mismatched.
+
+## Claiming a new package name
+
+npm OIDC trusted publishing can publish a new *version* of a package that
+already exists, but it cannot *create* a name. This workflow is tokenless, so a
+name's very first publish fails:
+
+```
+npm error code E404
+npm error 404 Not Found - PUT https://registry.npmjs.org/@relayhistory%2fcapture-darwin-arm64
+npm error 404 The requested resource '@relayhistory/capture-darwin-arm64@0.18.3'
+              could not be found or you do not have permission to access it.
+```
+
+The name must exist once, published from a human npm account; CI owns it after
+that. This applies to every name a release publishes — each plugin and each of
+its per-platform helpers — so **adding a plugin or a supported platform means
+claiming its names before the next release**.
+
+From the repository root, signed in to npm:
+
+```bash
+node scripts/claim-plugin-package-names.mjs --dry-run   # what is missing
+node scripts/claim-plugin-package-names.mjs             # claim it
+```
+
+It publishes a placeholder, not the real package: the platform helpers each
+carry a cross-compiled binary for their target, so no one machine can build them
+all. The real artifacts come from the release that follows.
+
+Placeholders are published at `0.0.0`. A version publishes exactly once, so
+claiming a name at a release version would fail the next release with
+`EPUBLISHCONFLICT`. `0.0.0` is below every release, is transparently not a real
+build, and never resolves — each plugin pins its helpers to its own exact
+version, so nothing asks for `0.0.0`.
+
+The script reads names from `scripts/history-package-contract.mjs`, skips
+anything already on the registry, and is safe to re-run.
+
+## Renaming this workflow
+
+Don't, unless you are prepared to repoint every package. npm OIDC trusted
+publishing binds a package to a repository **and a workflow file name**. Rename
+the file and every package whose trusted publisher still names the old file
+fails its next publish with:
+
+```
+npm error code E404
+npm error 404 The requested resource '<package>@<version>' could not be found
+              or you do not have permission to access it.
+```
+
+That message reads as "no such package". It is npm declining to say whether a
+package exists, and the real cause is authorization. **A name that plainly
+exists, failing with E404, means the trusted publisher does not match the
+workflow that is asking.**
+
+This file was `publish-napi.yml` until the optional plugins were first
+published. Every other AgentWorkforce repository publishes from `publish.yml`,
+and the mismatch cost a release cycle: the plugins' trusted publishers were set
+to `publish.yml` by analogy with the sibling repos, and the E404 that followed
+was read as a missing package rather than a wrong workflow name.
+
+If it has to change again, the cutover is not atomic, and the order is:
+
+1. Rename the file and merge, with no release in flight.
+2. Repoint every package's trusted publisher to the new file name.
+3. Release.
+
+Between 1 and 2 nothing can publish, so keep the gap short. Every package this
+workflow publishes is listed at the top of this document.
 
 ## Supported matrix
 

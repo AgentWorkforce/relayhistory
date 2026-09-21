@@ -16,8 +16,8 @@ pub struct SyncPushOutcome {
 }
 
 pub fn sync_and_push() -> Result<SyncPushOutcome> {
-    let db_path = ai_hist_core::default_db_path();
-    let (conn, sync_skipped) = ai_hist_engine::prepare_local_sync_snapshot(&db_path)?;
+    let db_path = ai_hist::default_db_path();
+    let (conn, sync_skipped) = ai_hist::prepare_local_sync_snapshot(&db_path)?;
 
     // The in-process runtime has no CLI argument channel. Keep it pinned to the normal Cloud
     // origin rather than following whichever stage happened to be logged into most recently.
