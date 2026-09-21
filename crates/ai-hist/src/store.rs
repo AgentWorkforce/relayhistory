@@ -1374,6 +1374,9 @@ VALUES ('session_presences_local_backfill_v1');
     migrate_session_markers_v2(conn)?;
     crate::observations::init_schema(conn)?;
     init_delivery_schema(conn)?;
+    // Only now, with the capture triggers rebuilt and the journal certain to
+    // exist, is the debt the marker migration recorded payable.
+    resolve_marker_journal_backfill(conn)?;
     Ok(())
 }
 
@@ -1387,19 +1390,45 @@ fn init_delivery_schema(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Tell subscribed destinations about rows the marker migration rewrote.
+/// Pay off what the marker migration recorded, once the schema can take it.
 ///
-/// Feature-gated the same way the capture triggers are: a build without
-/// delivery has no journal to write to, and a database it migrates is
-/// journalled by the next delivery-enabled open, which finds the triggers
-/// absent and rebuilds them.
+/// The migration has to retire the capture triggers -- SQLite validates them
+/// when a column is dropped -- so every write it makes is invisible to
+/// delivery, and so is every marker written afterwards until the triggers come
+/// back. Rebuilt triggers only ever see future writes, and a no-op touch
+/// cannot wake them either: their `WHEN old_payload <> new_payload` guard is
+/// false for a row whose values did not change.
+///
+/// So the gap is closed by journalling the marker table once, here, after
+/// `init_delivery_schema` has rebuilt the triggers. Every row rather than the
+/// migrated ones, because the gap covers both: in a build without the delivery
+/// feature the migration runs, the triggers stay down for the rest of that
+/// process, and the markers a sync writes in the meantime are captured by
+/// nothing. That build leaves the flag set and the next delivery-enabled open
+/// settles all of it.
+///
+/// The upserts are idempotent at the destination -- they carry the same record
+/// key capture would -- so paying a little more than is strictly owed is the
+/// safe direction, and the alternative is a revision that exists nowhere.
 #[cfg(feature = "delivery")]
-fn journal_migrated_markers(conn: &Connection, ids: &[i64]) -> Result<()> {
-    crate::delivery::journal_migrated_rows(conn, "session_markers", ids)
+fn resolve_marker_journal_backfill(conn: &Connection) -> Result<()> {
+    if !migration_applied(conn, "session_markers_v2_journal_pending")? {
+        return Ok(());
+    }
+    crate::delivery::journal_migrated_rows(conn, "session_markers")?;
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE name = 'session_markers_v2_journal_pending'",
+        [],
+    )?;
+    Ok(())
 }
 
+/// Without the delivery feature there is no journal to write to and no trigger
+/// DDL reachable to rebuild, so the flag is left standing for a build that has
+/// both. Doing nothing is the point: clearing it here would retire a debt
+/// nobody paid.
 #[cfg(not(feature = "delivery"))]
-fn journal_migrated_markers(_conn: &Connection, _ids: &[i64]) -> Result<()> {
+fn resolve_marker_journal_backfill(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -1668,12 +1697,32 @@ fn migrate_session_markers_v2(conn: &Connection) -> Result<()> {
             migrated.push(id);
         }
         conn.execute("ALTER TABLE session_markers DROP COLUMN detail_json", [])?;
-        // Now that the table has its final shape, tell any subscribed
-        // destination what these rows became. The rebuilt triggers cannot: they
-        // only see future writes, and a no-op touch would not wake them either,
-        // since their guard is false for a row whose values did not change.
-        // Journalled once, in one shape, built from the table as it now is.
-        journal_migrated_markers(conn, &migrated)?;
+        // Record that these rows still owe delivery a revision; do not pay it
+        // here. Two reasons, and each on its own is fatal:
+        //
+        // This runs *before* `init_delivery_schema`, so `delivery_journal` may
+        // not exist yet -- delivery is opt-in, and a database only ever opened
+        // by builds without the feature has none of its tables. A statement
+        // naming a missing table fails when it is prepared, before any `WHERE`
+        // clause can spare it, so journalling inline turns the most ordinary
+        // upgrade into a failed open.
+        //
+        // And this migration is not feature-gated while the journal is, so a
+        // build without delivery gets here, drops the capture triggers it
+        // cannot rebuild, and can neither journal now nor be made to later.
+        // A flag it leaves set is the one thing that survives it.
+        //
+        // `migrated` is deliberately not recorded with the flag. What is owed
+        // is not "these rows" but "every marker row", because capture is off
+        // from here until the triggers come back -- in a no-delivery process
+        // that is the rest of the run, including markers a sync writes after
+        // this point.
+        let _ = migrated;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) \
+             VALUES ('session_markers_v2_journal_pending')",
+            [],
+        )?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_v2')",
@@ -6255,6 +6304,204 @@ mod tests {
             payload.get("detail_json").is_none(),
             "and never the retired column: {payload}"
         );
+    }
+
+    /// The common upgrade: a v1 database that has never had delivery at all.
+    ///
+    /// Delivery is opt-in, so its tables exist only if a delivery-enabled build
+    /// has opened this database. The migration runs inside `init_db` *before*
+    /// `init_delivery_schema`, so anything it writes to `delivery_journal`
+    /// names a table that may not exist yet -- and a statement against a
+    /// missing table fails when it is prepared, whatever its `WHERE` clause
+    /// says. That is a hard failure on open, for the most ordinary install
+    /// there is.
+    #[test]
+    fn a_v1_database_that_never_had_delivery_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-no-delivery.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','v1-nd','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+            // Everything the delivery schema creates is removed, so the state
+            // is the self-consistent one a database only ever opened by builds
+            // without the delivery feature is in -- no journal, no jobs, no
+            // capture triggers. Enumerated rather than listed by hand, so this
+            // keeps matching the schema as it grows.
+            let objects: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT type, name FROM sqlite_master \
+                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for (kind, name) in objects {
+                if kind == "trigger" || kind == "table" || kind == "index" {
+                    conn.execute_batch(&format!("DROP {kind} IF EXISTS \"{name}\";"))
+                        .unwrap();
+                }
+            }
+            // The premise, asserted rather than assumed, and non-vacuous in
+            // both feature configurations: a build without delivery never
+            // creates these, and one with delivery has just had them removed.
+            let left: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE name LIKE 'delivery%' OR name LIKE 'history_export%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "the premise: nothing of delivery is present");
+        }
+
+        let conn = open_db(&db_path).expect("a v1 database without delivery must still open");
+        let markers = session_markers(&conn, "grok", "v1-nd").unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].payload_json.as_deref(), Some("{\"c\":1}"));
+    }
+
+    /// A build without the delivery feature must not silently swallow the debt.
+    ///
+    /// It runs this migration too -- the migration is not feature-gated, and
+    /// cannot be, since the column shape is not optional. It therefore drops
+    /// capture triggers it has no way to rebuild: the trigger DDL lives in the
+    /// delivery module, which is compiled out. Everything it writes afterwards,
+    /// including markers a sync adds later in the same process, is captured by
+    /// nothing.
+    ///
+    /// The flag is what survives that process. This build's whole job is to
+    /// leave it standing.
+    #[cfg(not(feature = "delivery"))]
+    #[test]
+    fn a_no_delivery_build_leaves_the_marker_journal_debt_for_a_build_that_can_pay_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1-nodelivery-build.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE session_markers;
+                 CREATE TABLE session_markers (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, session_id TEXT NOT NULL,
+                     marker_uid TEXT NOT NULL, kind TEXT NOT NULL,
+                     ts_ms INTEGER, text TEXT, detail_json TEXT,
+                     UNIQUE(source, session_id, marker_uid)
+                 );
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, ts_ms, text, detail_json)
+                 VALUES ('grok','v1-nb','c1','compaction_boundary',11,'compacted','{\"c\":1}');
+                 DELETE FROM schema_migrations WHERE name = 'session_markers_v2';",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        // The migration ran, so the rows are readable in the new shape...
+        assert!(schema_is_current(&conn).unwrap());
+        assert_eq!(session_markers(&conn, "grok", "v1-nb").unwrap().len(), 1);
+        // ...and the debt is still on the books for a build that can settle it.
+        assert!(
+            migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
+            "a build that cannot journal must leave the flag standing"
+        );
+    }
+
+    /// Settling that debt, from the state the build above leaves behind.
+    ///
+    /// Cross-feature cannot be exercised in one test binary, so this starts
+    /// from that build's output rather than running it: the table already
+    /// migrated, the capture triggers gone, the flag set, and -- the part that
+    /// matters -- a marker written *after* the migration, which no trigger saw.
+    /// A backfill that covered only the migrated rows would leave that one
+    /// unjournalled forever.
+    #[cfg(feature = "delivery")]
+    #[test]
+    fn a_delivery_open_settles_what_a_no_delivery_build_could_not_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("handover.db");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO delivery_jobs \
+                 (id, destination_id, instance_id, account_id, generation, config_json, \
+                  state, created_ms, cutoff, journal_cursor) \
+                 VALUES ('j1','d1','i1','a1',1,'{}','active',1,0,0)",
+                [],
+            )
+            .unwrap();
+            // What the other build left: triggers down, flag up, one migrated
+            // row and one written blind afterwards.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS delivery_session_markers_insert;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_update;
+                 DROP TRIGGER IF EXISTS delivery_session_markers_delete;
+                 INSERT INTO session_markers
+                     (source, session_id, marker_uid, kind, payload_json)
+                 VALUES ('grok','hand','migrated','compaction_boundary','{\"c\":1}'),
+                        ('codex','hand','written-blind','stream_error',NULL);
+                 INSERT OR IGNORE INTO schema_migrations (name)
+                 VALUES ('session_markers_v2_journal_pending');
+                 DELETE FROM delivery_journal;",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let keys: Vec<String> = conn
+            .prepare(
+                "SELECT record_key FROM delivery_journal \
+                 WHERE kind = 'session_marker' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            2,
+            "both the migrated row and the one written while capture was off: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("written-blind")),
+            "{keys:?}"
+        );
+        assert!(keys.iter().any(|key| key.contains("migrated")), "{keys:?}");
+        assert!(
+            !migration_applied(&conn, "session_markers_v2_journal_pending").unwrap(),
+            "a paid debt is cleared, or every open repeats it"
+        );
+
+        // Positive control: reopening a settled database journals nothing more.
+        let conn = open_db(&db_path).unwrap();
+        let again: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM delivery_journal WHERE kind = 'session_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, 2, "a cleared flag must not re-journal on every open");
     }
 
     /// The project-identity columns, marker and index reach a database that
