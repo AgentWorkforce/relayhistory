@@ -306,6 +306,8 @@ fn opencode_reaches_event_level_parity_across_both_storage_layouts() {
     a_failed_session_query_does_not_checkpoint_an_empty_session();
     one_unreadable_session_does_not_end_the_sqlite_sweep();
     a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event();
+    the_exclusive_sync_reads_whichever_layout_the_host_has();
+    a_hydration_does_not_move_catalog_recency_backwards();
 }
 
 fn targeted_sync_honors_the_configured_legacy_storage_root() {
@@ -2707,6 +2709,202 @@ fn a_long_assistant_turn_is_excerpted_in_the_catalog_and_whole_in_its_event() {
         texts.iter().map(|text| text.chars().count()).max(),
         Some(long.chars().count()),
         "the event must keep the whole turn"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `sync --opencode` takes an exclusive lock and indexes one store. It asked
+/// for SQLite outright instead of classifying, so a host that only has the
+/// legacy `storage/` tree got discovery's catalog rows with no evidence behind
+/// them -- and an `OPENCODE_DB` naming a directory was opened as SQLite and
+/// failed rather than falling through to the tree beside it. `sync --local`
+/// has classified through `OpencodeLayout::detect` since the layout gate
+/// landed; this path was never brought along.
+fn the_exclusive_sync_reads_whichever_layout_the_host_has() {
+    let root = temp_root("exclusive-layout");
+
+    // Control: a host that does have a SQLite store still indexes from it, so
+    // the assertions below are about classification and not about this path
+    // having started to work by accident.
+    {
+        let home = root.join("sqlite-home");
+        let store = home.join(".local/share/opencode/opencode.db");
+        build_sqlite_store(&store);
+        use_layout(&home, Some(&store), None);
+        let db_path = root.join("sqlite.db");
+        assert!(sync_opencode_at(&db_path, &store, SyncOutput::Silent).unwrap());
+        assert!(
+            !session_events(
+                &open_db(&db_path).unwrap(),
+                "ses_sqlite_root",
+                Some("opencode")
+            )
+            .unwrap()
+            .is_empty(),
+            "the SQLite host must still index"
+        );
+    }
+
+    // A host with only the legacy tree. `OPENCODE_DB` names a path that is not
+    // there, which is exactly what such a host has.
+    {
+        let home = root.join("tree-home");
+        let tree = home.join(".local/share/opencode/storage");
+        copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+        let absent_db = home.join(".local/share/opencode/opencode.db");
+        assert!(!absent_db.exists(), "precondition: no SQLite store here");
+        use_layout(&home, Some(&absent_db), Some(&tree));
+        let db_path = root.join("tree.db");
+        assert!(sync_opencode_at(&db_path, &absent_db, SyncOutput::Silent).unwrap());
+        assert!(
+            !session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "a host with only the legacy tree must still have its evidence indexed"
+        );
+    }
+
+    // `OPENCODE_DB` naming a directory: `exists()` is true for one, so the old
+    // guard sent it to `Connection::open`. It must fall through to the tree
+    // beside it instead of failing on a path that is not a database.
+    {
+        let home = root.join("dir-home");
+        let tree = home.join(".local/share/opencode/storage");
+        copy_tree(&fixtures().join("legacy-json-simple/storage"), &tree);
+        let db_like = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(&db_like).unwrap();
+        assert!(
+            db_like.exists() && !db_like.is_file(),
+            "precondition: the fixture must be a directory that exists"
+        );
+        use_layout(&home, Some(&db_like), Some(&tree));
+        let db_path = root.join("dir.db");
+        let synced = sync_opencode_at(&db_path, &db_like, SyncOutput::Silent)
+            .expect("a directory at OPENCODE_DB must not fail the sync as a bad database");
+        assert!(synced);
+        assert!(
+            !session_events(&open_db(&db_path).unwrap(), "ses_simple", Some("opencode"))
+                .unwrap()
+                .is_empty(),
+            "and the tree beside it must be what gets indexed"
+        );
+        // The same guard, asked of the store-level entry point directly: a
+        // directory is answered like an absent store, not with an open error.
+        let conn = open_db(&root.join("direct.db")).unwrap();
+        assert_eq!(sync_opencode_db(&conn, &db_like).unwrap(), 0);
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Discovery's shallow read takes the later of the session's `updated` and its
+/// newest message; `normalize` took the newest message whenever one existed.
+/// Two paths deciding one field differently, and hydration writes only through
+/// `normalize` -- so for a session whose JSON is *ahead* of its messages, the
+/// value hydration computes for the catalog is behind the one discovery
+/// computed for the same session.
+///
+/// The column itself is defended: `upsert_session` merges it as
+/// `MAX(COALESCE(sessions.last_activity_ms, excluded…), excluded…)`, so the
+/// smaller value cannot land on top of the larger one. That defence is why the
+/// divergence is invisible in an ordinary run, and it is also why a test that
+/// merely hydrates and re-reads the column proves nothing -- the first version
+/// of this one passed with the defect in place for exactly that reason. What
+/// is under test is the value `normalize` produces, so the column is cleared
+/// first and hydration is left as its only writer.
+fn a_hydration_does_not_move_catalog_recency_backwards() {
+    let root = temp_root("recency-backwards");
+    let home = root.join("home");
+    let tree = home.join(".local/share/opencode/storage");
+    // `updated` is a minute past the only message's `created`.
+    write_json(
+        &tree.join("session/global/ses_ahead.json"),
+        r#"{"id":"ses_ahead","directory":"/tmp/project","time":{"created":1777500000000,"updated":1777500060000}}"#,
+    );
+    write_json(
+        &tree.join("message/ses_ahead/msg_ahead.json"),
+        r#"{"id":"msg_ahead","sessionID":"ses_ahead","role":"user","time":{"created":1777500001000},"path":{"cwd":"/tmp/project"}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_ahead/prt_ahead.json"),
+        r#"{"id":"prt_ahead","sessionID":"ses_ahead","messageID":"msg_ahead","type":"text","text":"a turn"}"#,
+    );
+    use_layout(&home, None, Some(&tree));
+    let db_path = root.join("history.db");
+
+    discover_sessions_scoped_at(&db_path, &opencode_only()).unwrap();
+    assert_eq!(
+        catalog_row(&db_path, "ses_ahead").1,
+        Some(1777500060000),
+        "precondition: discovery catalogs the later of the two"
+    );
+
+    // Clear it, so what hydration writes is what the column holds rather than
+    // what the merge kept.
+    let clear = |db_path: &Path| {
+        open_db(db_path)
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET last_activity_ms = NULL \
+                 WHERE source='opencode' AND session_id='ses_ahead'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(catalog_row(db_path, "ses_ahead").1, None);
+    };
+    clear(&db_path);
+
+    let hydrated = hydrate(&db_path, "ses_ahead");
+    assert!(
+        hydrated.evidence.events > 0,
+        "precondition: the hydration must actually have done its work, got {:?}",
+        hydrated.evidence
+    );
+    assert_eq!(
+        catalog_row(&db_path, "ses_ahead").1,
+        Some(1777500060000),
+        "hydration must compute the same recency discovery does, not a value \
+         behind it that only the column's merge hides"
+    );
+
+    // Positive control for the other direction, so this is not a rule that
+    // simply prefers the session file: the usual OpenCode shape is a session
+    // JSON that lags its own newest message, and there the message must win.
+    write_json(
+        &tree.join("message/ses_ahead/msg_later.json"),
+        r#"{"id":"msg_later","sessionID":"ses_ahead","role":"user","time":{"created":1777500120000},"path":{"cwd":"/tmp/project"}}"#,
+    );
+    write_json(
+        &tree.join("part/msg_later/prt_later.json"),
+        r#"{"id":"prt_later","sessionID":"ses_ahead","messageID":"msg_later","type":"text","text":"a later turn"}"#,
+    );
+    clear(&db_path);
+    let hydrated = hydrate(&db_path, "ses_ahead");
+    assert!(hydrated.evidence.events > 1);
+    assert_eq!(
+        catalog_row(&db_path, "ses_ahead").1,
+        Some(1777500120000),
+        "a message past the session's `updated` must still advance it"
+    );
+
+    // And the merge that hid all this is pinned, because it is the only reason
+    // the divergence never surfaced: with a value already in the column, no
+    // hydration can lower it.
+    open_db(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET last_activity_ms = 1888000000000 \
+             WHERE source='opencode' AND session_id='ses_ahead'",
+            [],
+        )
+        .unwrap();
+    clear_opencode_evidence(&db_path);
+    hydrate(&db_path, "ses_ahead");
+    assert_eq!(
+        catalog_row(&db_path, "ses_ahead").1,
+        Some(1888000000000),
+        "the catalog merge keeps the later value, whatever a writer offers"
     );
 
     fs::remove_dir_all(&root).ok();

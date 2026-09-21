@@ -741,15 +741,35 @@ fn sync_opencode_exclusive(db_path: &Path, opencode_path: &Path) -> Result<bool>
         return Ok(false);
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let inserted = sync_opencode_db(&conn, opencode_path)
-        .map_err(|error| enrich_sync_error(db_path, error))?;
-    sync_note!("  [opencode] +{inserted} rows");
+    // Through `detect`, like every other path that has to decide what an
+    // OpenCode store *is*. This one asked for SQLite outright, so a host that
+    // only has the legacy `storage/` tree got discovery's catalog rows and no
+    // evidence at all behind them -- and an `OPENCODE_DB` naming a directory
+    // was opened as SQLite and failed, rather than falling through to the tree
+    // beside it. `sync --local` has classified this way since the layout gate
+    // landed; this path was simply never brought along.
+    let storage_dir = default_opencode_storage_dir();
+    let layout = crate::ingest::opencode::OpencodeLayout::detect(opencode_path, &storage_dir);
+    let inserted = match &layout {
+        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(db)) => sync_opencode_db(&conn, db),
+        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_opencode_storage_dir(&conn, tree)
+        }
+        None => Ok(0),
+    }
+    .map_err(|error| enrich_sync_error(db_path, error))?;
+    match &layout {
+        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_note!("  [opencode] +{inserted} rows from {}", tree.display());
+        }
+        _ => sync_note!("  [opencode] +{inserted} rows"),
+    }
     let home = home_dir();
     let env = DiscoveryEnv::with_provider_roots(
         &conn,
         crate::ProviderRoots::from_home(home, opencode_path.to_path_buf()),
     )
-    .with_opencode_storage_dir(default_opencode_storage_dir());
+    .with_opencode_storage_dir(storage_dir);
     let options = DiscoverOptions {
         sources: vec!["opencode".into()],
         ..Default::default()

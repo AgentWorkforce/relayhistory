@@ -1268,12 +1268,25 @@ fn normalize_session(
         .map(|message| message.time_created)
         .or(loaded.session.created_ms)
         .unwrap_or(0);
-    let last_ts = loaded
-        .messages
-        .last()
-        .map(|message| message.time_created)
-        .or(loaded.session.updated_ms)
-        .unwrap_or(first_ts);
+    // The later of the two, which is what discovery's shallow read already
+    // computes for the same session. Taking the newest message whenever one
+    // exists is right for the usual case -- OpenCode appends a turn without
+    // rewriting the session JSON, so `updated` lags it -- but it is not
+    // symmetric: a session whose JSON is *ahead* of its messages then has its
+    // catalog recency moved backwards by a successful hydration, because
+    // hydration writes through here and nothing else. Two paths deciding the
+    // same field differently is the drift; neither value supersedes the
+    // other, so the later one stands and either alone stands when the other
+    // is absent.
+    let last_ts = match (
+        loaded.messages.last().map(|message| message.time_created),
+        loaded.session.updated_ms,
+    ) {
+        (Some(newest), Some(updated)) => newest.max(updated),
+        (Some(newest), None) => newest,
+        (None, Some(updated)) => updated,
+        (None, None) => first_ts,
+    };
 
     let mut last_assistant_text: Option<String> = None;
 

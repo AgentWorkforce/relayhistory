@@ -3667,7 +3667,13 @@ fn opencode_backup_requested() -> bool {
 /// cost is proportional to the history actually read rather than to the size
 /// of the provider's database.
 pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> {
-    if !opencode_db.exists() {
+    // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
+    // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
+    // looser guard let a directory reach `Connection::open` and fail there --
+    // a caller that classified first would never send one, and one that did
+    // not deserves the same answer as an absent store rather than an SQLite
+    // error about a path that is not a database.
+    if !opencode_db.is_file() {
         return Ok(0);
     }
     #[cfg(feature = "opencode-backup")]
