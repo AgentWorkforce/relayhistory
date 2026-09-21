@@ -2900,7 +2900,7 @@ fn file_candidates(
 // catalog reads and writes
 // ---------------------------------------------------------------------------
 
-const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
+pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
      discovery_state, project_key, project_key_method, \
@@ -2920,7 +2920,7 @@ fn json_string_list(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
+pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
     Ok(ShallowSession {
         source: row.get(0)?,
         session_id: row.get(1)?,

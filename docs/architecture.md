@@ -160,6 +160,7 @@ archive relocation.
 | `getSessionChildrenPage` | none | bounded keyset page | empty page |
 | `getSessionToolCallsPage`, `getSessionFileEditsPage` | none | bounded keyset page over one source's session | empty page |
 | `session_markers_page`, `SessionStore::session_markers_page` (no SDK/MCP surface yet) | none | bounded keyset page over one source's session | empty page; a read-only store over a database older than the marker page index is refused, naming the remedy |
+| `SessionStore::changes_since` (no SDK/MCP surface yet) | none | one indexed revision-range read per kind per page, plus one for tombstones; `commit` writes one cursor row | not reached: `SessionStore::open` created the database (writable) or already failed (read-only); a read-only store over a database older than the change-feed schema is refused, naming the remedy |
 | `sync` (`local`, default) | full explicit scan | migrations + ingestion | creates DB |
 | `sync` (`remote`) | explicitly selected source plugins (error when none) | observations, normalized evidence, checkpoints | creates DB |
 | `sync` (`all`) | full local scan + explicitly selected source plugins | migrations + ingestion | creates DB |
@@ -332,6 +333,65 @@ session id alone can name one session per provider. Catalog ordering is
 the tail. Relationship ordering is `(spawned_at_ms, relationship_uid)`, also
 with null timestamps at the tail. These total orders prevent duplicate or
 omitted rows at timestamp ties.
+
+## Change feed
+
+A downstream consumer that keeps its own materialised view — burn's watch
+loop — reads "what changed since my last tick" through
+`SessionStore::changes_since` rather than rescanning the catalog or watching
+provider files itself.
+
+Every row of `sessions`, `session_events`, `tool_calls`, `file_edits`,
+`session_markers` and `session_relationships` carries a `revision`: one value
+per row write, drawn from the database-wide `observation_clock`, stamped by
+`change_feed_<table>_{insert,update,delete}` triggers. Stamping lives in
+triggers rather than in each writer because the ledger has well over a hundred
+write sites, and a write site that forgot the stamp would be a row the feed
+silently never reports. A deleted row — a sidechain heal moving records onto
+the child, a session leaving the catalog and the cascade under it — leaves a
+tombstone in `evidence_tombstones(kind, source, session_id, record_key,
+revision)`; a later insert of the same key clears it. Every fed table has a
+`(revision)` index and the tombstone table a `(kind, revision)` one, so each
+page of the feed is an indexed range read with no scan and no sort.
+
+`changes_since(from, ChangeQuery { kinds, consumer, batch })` yields
+`Change { kind, source, session_id, record_key, revision, op }` in
+`(revision, kind, record_key)` order, where `op` is `Upsert(EvidenceRow)` —
+the typed row, `ShallowSession`, `SessionEvent`, `SessionToolCall`,
+`SessionFileEdit`, `SessionMarker` or `SessionRelationship` — or `Delete`.
+`record_key` is the record's provider-native identity within its session and
+kind: `event_uid`, `tool_use_id`, `marker_uid`, `relationship_uid`, or the
+session id for a catalog row. The drain is bounded to the head revision at
+open and pages in `batch`-sized reads, at most 10,000. `ChangeKind` is not
+`EvidenceKind`: the catalog row is fed and is not adapter evidence.
+
+Three rules a consumer must hold:
+
+- **A re-seen key is a replace.** Every upsert re-stamps, so a parser-version
+  re-parse re-reports every row of that session at a new revision. Applying
+  the feed in order onto a keyed map reconstructs the tables (modulo rows
+  whose tombstones it also applied); `crates/ai-hist/tests/change_feed.rs`
+  pins that over the fixture corpus after each of a sequence of syncs.
+- **The cursor moves only on commit.** With `ChangeQuery::consumer` set,
+  `Watermark::CONSUMER` resumes from that consumer's last committed position
+  (`consumer_cursors`, inside the store, so it survives the consumer's own
+  ledger reset), and `Changes::commit()` persists `position()`. A drain that
+  fails partway re-reads from the previous commit rather than skipping what it
+  had reached. Two consumers advance independently.
+- **A watermark ahead of the head is a reset.** `SessionStore::head_revision`
+  and `SyncReport::head_revision` report the head; a stored watermark beyond it
+  fails with `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full
+  resync from `Watermark::START`.
+
+An in-progress message is never in the feed. Incremental hydration holds a
+Claude message whose `stop_reason` is still `null` and writes nothing for it;
+when it completes, its blocks arrive together, each exactly once, with the
+usage they ended with. `session_requests` is a view over `session_events`, so
+a request is not fed as a row of its own: the events that make it up are, and
+`session_requests_page` reads the grouped result.
+
+Push or subscription callbacks and the cloud delivery coordinator are
+unchanged; the feed is a pull cursor for an in-process consumer.
 
 ## Native errors
 

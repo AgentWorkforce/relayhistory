@@ -9,6 +9,14 @@ fn main() -> Result<(), ai_hist::Error> {
     let store = SessionStore::open(Default::default())?;
     let _report = store.sync(Default::default())?;
     let _turns = store.session_user_turns_page(ai_hist::Source::Claude, "session-id", 100, None)?;
+
+    // Incremental: everything since this consumer's last commit, oldest first.
+    let query = ai_hist::ChangeQuery::default().consumer("my-ingest");
+    let mut changes = store.changes_since(ai_hist::Watermark::CONSUMER, query)?;
+    for change in changes.by_ref() {
+        let _change = change?; // `Upsert(EvidenceRow)` or `Delete`, keyed by kind + record_key
+    }
+    changes.commit()?; // the cursor moves only here
     Ok(())
 }
 ```

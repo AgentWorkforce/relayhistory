@@ -343,7 +343,11 @@ CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BE
     INSERT INTO session_events_fts(rowid, text, role, project)
     VALUES (new.id, new.text, new.role, new.project);
 END;
-CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
+-- `UPDATE OF`, not every update: the change feed re-stamps a row's
+-- `revision` after each insert, and the project-identity pass rewrites
+-- `project_key` in bulk. Neither touches what the index holds, and an
+-- unconditional trigger re-indexed every event twice.
+CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE OF text, role, project ON session_events BEGIN
     INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
     VALUES('delete', old.id, old.text, old.role, old.project);
     INSERT INTO session_events_fts(rowid, text, role, project)
@@ -769,6 +773,10 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_delete_continuity_reopen_v1",
     "session_events_raw_facts_v1",
     "session_project_key_v1",
+    // The FTS update trigger narrowed to the columns it indexes. `CREATE
+    // TRIGGER IF NOT EXISTS` keeps an existing database's unconditional body,
+    // so the marker is what makes the rebuild happen exactly once.
+    "session_events_fts_update_of_v1",
 ];
 #[cfg(feature = "delivery")]
 const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &["delivery_v1"];
@@ -785,7 +793,8 @@ const REQUIRED_DELIVERY_MIGRATIONS: &[&str] = &[];
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
         && delivery_schema_is_current(conn)?
-        && crate::observations::schema_is_current(conn)?)
+        && crate::observations::schema_is_current(conn)?
+        && crate::change_feed::schema_is_current(conn)?)
 }
 
 #[cfg(feature = "delivery")]
@@ -1077,6 +1086,11 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 "#;
 
 fn init_db_locked(conn: &Connection) -> Result<()> {
+    // Same shape as the hydration-state trigger below: a body change has to
+    // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
+    if !migration_applied(conn, "session_events_fts_update_of_v1")? {
+        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
+    }
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1236,7 +1250,8 @@ END;
     // The triggers above are current now, including the rebuilt one.
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
-         VALUES ('session_delete_continuity_reopen_v1');",
+         VALUES ('session_delete_continuity_reopen_v1'), \
+                ('session_events_fts_update_of_v1');",
     )?;
     migrate_session_relationships_v2(conn)?;
     migrate_tool_result_fidelity_v1(conn)?;
@@ -1485,6 +1500,10 @@ VALUES ('session_presences_local_backfill_v1');
     // upgraded database already sees every request its events describe.
     crate::session_usage::ensure_session_requests_view(conn)?;
     crate::observations::init_schema(conn)?;
+    // After the observation schema: the stamping triggers draw on its clock.
+    // Before delivery: its capture triggers are built from the tables' column
+    // lists and leave the stamp out, so the order is only about the clock.
+    crate::change_feed::init_schema(conn)?;
     init_delivery_schema(conn)?;
     // Only now, with the capture triggers rebuilt and the journal certain to
     // exist, is the debt the marker migration recorded payable.
@@ -1605,7 +1624,7 @@ fn resolve_marker_journal_backfill(_conn: &Connection) -> Result<()> {
 
 /// Whether a named migration has already run, on a database that may predate
 /// the `schema_migrations` table itself.
-fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
+pub(crate) fn migration_applied(conn: &Connection, name: &str) -> Result<bool> {
     let table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'schema_migrations')",
@@ -1772,7 +1791,11 @@ fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Res
 /// [`ensure_text_columns`]. `session_events` needs the types because its
 /// raw-fact columns are a mix of TEXT and INTEGER, and the hydration cursor
 /// columns need the defaults.
-fn ensure_columns(conn: &Connection, table: &str, required: &[(&str, &str)]) -> Result<()> {
+pub(crate) fn ensure_columns(
+    conn: &Connection,
+    table: &str,
+    required: &[(&str, &str)],
+) -> Result<()> {
     let existing: HashSet<String> = conn
         .prepare("SELECT name FROM pragma_table_info(?)")?
         .query_map([table], |row| row.get::<_, String>(0))?
@@ -2565,14 +2588,14 @@ pub struct SessionMarkerPage {
 /// each spelled its own `SELECT` the two drifted the moment a column was
 /// added, and the mismatch only surfaces as a positional `row.get` reading the
 /// wrong field.
-const SESSION_EVENT_COLUMNS: &str =
+pub(crate) const SESSION_EVENT_COLUMNS: &str =
     "id, source, session_id, project, project_key, cwd, git_branch, message_id, parent_id, \
      ts_ms, role, kind, text, model, token_json, provider, event_uid, tool_use_id, payload_bytes, \
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind";
 
-fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2714,15 +2737,17 @@ pub fn session_file_edits(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-const TOOL_CALL_COLUMNS: &str = "id, source, session_id, message_id, tool_use_id, name, target, \
+pub(crate) const TOOL_CALL_COLUMNS: &str =
+    "id, source, session_id, message_id, tool_use_id, name, target, \
                                  args_json, is_error, ts_ms";
-const FILE_EDIT_COLUMNS: &str =
+pub(crate) const FILE_EDIT_COLUMNS: &str =
     "id, source, session_id, message_id, tool_use_id, file_path, tool_name, lines_added, \
      lines_removed, structured_patch_json, user_modified, ts_ms, git_branch, cwd";
-const SESSION_MARKER_COLUMNS: &str = "id, source, session_id, marker_uid, ts_ms, message_id, \
+pub(crate) const SESSION_MARKER_COLUMNS: &str =
+    "id, source, session_id, marker_uid, ts_ms, message_id, \
                                       parent_id, turn_id, kind, subkind, text, payload_json";
 
-fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
+pub(crate) fn row_to_session_marker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMarker> {
     Ok(SessionMarker {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2846,7 +2871,7 @@ pub fn insert_session_marker(
     Ok(changed)
 }
 
-fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
+pub(crate) fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall> {
     Ok(SessionToolCall {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -2861,7 +2886,7 @@ fn row_to_tool_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionToolCall
     })
 }
 
-fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit> {
+pub(crate) fn row_to_file_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFileEdit> {
     Ok(SessionFileEdit {
         id: row.get(0)?,
         source: row.get(1)?,

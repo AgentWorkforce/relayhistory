@@ -731,7 +731,19 @@ mod tests {
         // an installed adapter contributed claim a parser generation that
         // never ran over it, and the backfill probes that read the column
         // would then skip exactly the rows they exist to repair.
-        const LOCAL_ONLY: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
+        //
+        // `revision` is the change feed's stamp: the position of a row's
+        // last write in this database's own clock. It is set by trigger on
+        // every write and means nothing outside the database it was written
+        // in, so an adapter can neither supply it nor be held to it.
+        const LOCAL_ONLY: &[(&str, &str)] = &[
+            ("session_events", "raw_facts_version"),
+            ("session_events", "revision"),
+            ("tool_calls", "revision"),
+            ("file_edits", "revision"),
+            ("session_relationships", "revision"),
+            ("session_markers", "revision"),
+        ];
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();
         // An exemption for a column that is in fact projected would sit here

@@ -187,11 +187,19 @@ Claude one.
 
 ## 9. Change feed
 
-`changes_since(Watermark)` with named consumer cursors
+Shipped as `SessionStore::changes_since(from, ChangeQuery)` with named
+consumer cursors
 ([#179](https://github.com/AgentWorkforce/relayhistory/issues/179)). burn
-replaces its per-file cursors and fs-event watching with this. Paging must be
-keyset on a revision stamp, never an offset, and the tiebreak must be total —
-two events in one session routinely share a timestamp.
+replaces its per-file cursors and fs-event watching with this. Paging is keyset
+on a per-row `revision` stamp, never an offset; the order is
+`(revision, kind, record_key)` and revisions are unique per write, so the order
+is total whatever the timestamps say. Each `Upsert` carries the typed row, so
+a consumer needs no second read. Two obligations on the consumer, both
+documented in [`architecture.md`](architecture.md#change-feed): a re-seen
+`record_key` is a replace, and a watermark ahead of `head_revision` means the
+store was reset and the consumer must resync from `Watermark::START`. Requests
+(section 7) are not fed as rows of their own — `session_requests` is a view —
+the events that compose one are.
 
 ## Out of scope for this contract
 

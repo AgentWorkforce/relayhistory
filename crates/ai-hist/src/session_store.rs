@@ -12,20 +12,48 @@ use crate::store::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// What class of failure an [`Error`] is, for the callers that act on one
+/// rather than only report it.
+///
+/// Most failures are `Other` and carry their explanation in the message. The
+/// named kinds exist where a consumer has a distinct recovery: a change-feed
+/// consumer whose stored watermark is ahead of the store cannot resume, it
+/// has to resync from [`crate::Watermark::START`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    Other,
+    /// A change-feed watermark names a revision this store has not reached:
+    /// the database was reset or replaced under a consumer that kept its
+    /// cursor elsewhere. See [`SessionStore::changes_since`].
+    WatermarkAheadOfStore,
+}
 
 /// Recoverable failure from [`SessionStore`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Error {
     message: String,
+    kind: ErrorKind,
 }
 
 impl Error {
     pub(crate) fn from_anyhow(error: anyhow::Error) -> Self {
+        Self::new(ErrorKind::Other, format!("{error:#}"))
+    }
+
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
-            message: format!("{error:#}"),
+            message: message.into(),
+            kind,
         }
+    }
+
+    /// Which class of failure this is.
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
     }
 }
 
@@ -100,6 +128,10 @@ pub enum SessionRef {
 #[non_exhaustive]
 pub struct SyncReport {
     pub changed: Vec<SessionRef>,
+    /// The store's change-feed head after this sync: the revision of the
+    /// newest stamped row. A consumer compares its stored watermark against
+    /// it before resuming; see [`SessionStore::changes_since`].
+    pub head_revision: u64,
 }
 
 /// The single public entry point for embedding `ai-hist` from Rust.
@@ -125,13 +157,14 @@ impl SessionStore {
         if opts.read_only {
             let conn = open_db_readonly(&db_path)?;
             if !schema_is_event_read_current(&conn)? {
-                return Err(Error {
-                    message: format!(
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!(
                         "{} predates the session-event schema this version reads; \
                          open it writable once (or run a sync) to migrate it",
                         db_path.display()
                     ),
-                });
+                ));
             }
         } else {
             let _ = open_db(&db_path)?;
@@ -146,9 +179,7 @@ impl SessionStore {
     /// Full local scan into this store.
     pub fn sync(&self, _opts: SyncOptions) -> Result<SyncReport, Error> {
         if self.read_only {
-            return Err(Error {
-                message: "SessionStore is read-only".to_string(),
-            });
+            return Err(Error::new(ErrorKind::Other, "SessionStore is read-only"));
         }
         let _ran = match &self.home {
             Some(home) => sync_local_at_with_home(&self.db_path, home)?,
@@ -156,6 +187,7 @@ impl SessionStore {
         };
         Ok(SyncReport {
             changed: Vec::new(),
+            head_revision: crate::change_feed::head_revision_at(&self.db_path)?.revision,
         })
     }
 
@@ -198,13 +230,14 @@ impl SessionStore {
     ) -> Result<SessionMarkerPage, Error> {
         let conn = open_db_readonly(&self.db_path)?;
         if !schema_is_evidence_read_current(&conn).map_err(Error::from_anyhow)? {
-            return Err(Error {
-                message: format!(
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
                     "{} predates the session-marker schema this version reads; \
                      open it writable once (or run a sync) to migrate it",
                     self.db_path.display()
                 ),
-            });
+            ));
         }
         session_markers_page(&conn, source.as_str(), session_id, limit, after)
             .map_err(Error::from_anyhow)
@@ -241,6 +274,16 @@ impl SessionStore {
     ) -> Result<Option<SessionUsageSummary>, Error> {
         let conn = open_db_readonly(&self.db_path)?;
         session_usage_summary(&conn, source.as_str(), session_id).map_err(Error::from_anyhow)
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 

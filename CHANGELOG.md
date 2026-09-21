@@ -127,6 +127,38 @@ Notable changes to the native `ai-hist` CLI are documented here.
 
 ### Rust API
 
+- A revision-stamped change feed for incremental downstream ingest:
+  `SessionStore::changes_since(from, ChangeQuery)`. Every row of `sessions`,
+  `session_events`, `tool_calls`, `file_edits`, `session_markers` and
+  `session_relationships` now carries a `revision` drawn from the
+  database-wide `observation_clock`, stamped by triggers on every insert and
+  update so no write site can forget it, and indexed per table. A deleted
+  row leaves a tombstone in `evidence_tombstones` at its own revision, which
+  a later insert of the same key clears. The drain yields `Change { kind,
+  source, session_id, record_key, revision, op }` in `(revision, kind,
+  record_key)` order, where `op` is `Upsert(EvidenceRow)` — the typed row,
+  so no second read is needed — or `Delete`; it is bounded to the head at
+  open, pages through the store in `batch`-sized indexed reads (at most
+  10,000), and exposes `head()` and `position()`. Named consumers keep their
+  progress in `consumer_cursors` inside the store: pass
+  `Watermark::CONSUMER` with `ChangeQuery::consumer` to resume from the last
+  commit, and call `Changes::commit()` to advance — an uncommitted drain
+  moves nothing, so a consumer that fails mid-batch resumes from its last
+  commit. `SessionStore::head_revision()` and `SyncReport::head_revision`
+  report the head; a stored watermark beyond it (the database was reset)
+  fails with `ErrorKind::WatermarkAheadOfStore`, read through the new
+  `Error::kind()`. A re-parse re-stamps every row it upserts, so a consumer
+  must treat a re-seen `record_key` as a replace, never a duplicate. A
+  message still being written is never in the feed: incremental hydration
+  holds it until it completes, and its blocks then arrive together, once.
+  An existing database is stamped once on its first writable open, so a
+  replay from `Watermark::START` reports everything it already held. The
+  `session_events` FTS update trigger now fires only for `text`, `role` and
+  `project`, so the stamp — and the bulk `project_key` pass — no longer
+  re-index every event. The delivery capture payload leaves `revision` out;
+  it is this database's bookkeeping, not a fact about the record.
+  `ShallowSession` and `SessionRelationship` are re-exported on the default
+  feature set as the rows a catalog or relationship change carries.
 - Stop dropping the record types neither parser could normalize. A new
   `session_markers` table records compaction and summary boundaries, provider
   `system` rows, non-text content blocks (`image`, `document`,

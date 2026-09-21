@@ -35,6 +35,7 @@ workspace_mod!(remote);
 workspace_mod!(source_intake);
 workspace_mod!(sources);
 workspace_mod!(watch);
+mod change_feed;
 mod file_lock;
 mod jsonl_temp;
 mod session_store;
@@ -72,9 +73,14 @@ pub use store::*;
 #[cfg(not(feature = "unstable-internal"))]
 pub(crate) use store::*;
 
-pub use discover::{declared_evidence_kinds, missing_evidence_kinds};
+pub use change_feed::{
+    Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, Watermark,
+    DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
+};
+pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use relationship_graph::SessionRelationship;
 pub use session_store::{
-    Error, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
+    Error, ErrorKind, SessionRef, SessionStore, Source, StoreOptions, SyncOptions, SyncReport,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session_requests_page`] and
